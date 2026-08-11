@@ -10,6 +10,7 @@ from importlib import import_module
 _MODULES = {
     "bp": "pepsy.bp",
     "mera": "pepsy.optimizers.qmera",
+    "mps_fit": "pepsy.experimental.mps_fit",
     "qmera": "pepsy.optimizers.qmera",
     "stabilizer": "pepsy.optimizers.stabilizer_tn",
     "symmetry": "pepsy.tensors.symmetric",

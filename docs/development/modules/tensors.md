@@ -69,6 +69,12 @@ Backend helpers manage package-wide defaults and optional linalg shims:
 
 - `set_default_array_backend(...)` / `get_default_array_backend()`
 - `set_default_grad_backend(...)` / `get_default_grad_backend()`
+- `TorchLinalgConfig` / `get_torch_linalg_config()` — the single structured
+  process-global Torch SVD/QR policy. One `config.register()` call installs
+  native or relative-regularized SVD autodiff, the matching QR policy, CPU or
+  CUDA driver choices, optional fallbacks, and (when requested) Quimb's raw
+  Symmray split drivers. `register_torch_linalg(...)` remains a compatibility
+  constructor for this class.
 - `reset_default_backends()`
 - torch and JAX linalg/stop-gradient registrations. Use
   `register_torch_linalg(...)` as the canonical public setup. Its explicit

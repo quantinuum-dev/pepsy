@@ -18,7 +18,7 @@ from ...backends import (
     backend_numpy,
     backend_torch,
     infer_backend_converter_from_sample,
-    register_torch_linalg,
+    TorchLinalgConfig,
 )
 from ...tensors import build_optimizer, reg_rel_svd_jax
 from ..global_opt import GlobalOptimizer
@@ -291,11 +291,15 @@ class PepsEnergyOptimizer:
         dtype_name = cls._autodiff_dtype_name(state, terms)
         mode = "complex" if "complex" in str(dtype_name).lower() else "real"
         try:
-            register_torch_linalg(
+            # Energy optimization differentiates through both SVD and QR.
+            # Keep those registrations together in the public policy class so
+            # the optimizer cannot accidentally regularize one decomposition
+            # while leaving the other on an incompatible backend.
+            TorchLinalgConfig(
                 mode=mode,
                 stabilized=True,
                 quimb_split_drivers=quimb_split_drivers,
-            )
+            ).register()
         except ImportError:
             # TNOptimizer will report a missing requested backend if it is
             # actually needed; preserve the optional-dependency behavior.

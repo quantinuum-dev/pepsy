@@ -32,6 +32,10 @@ skills:
     path: .github/skills/mps-optimizer
     role: core
     upload: [SKILL.md]
+  - name: tensor-fitting
+    path: .github/skills/tensor-fitting
+    role: core
+    upload: [SKILL.md, references/**]
   - name: tree-optimizer
     path: .github/skills/tree-optimizer
     role: core

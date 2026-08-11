@@ -12,11 +12,14 @@ tests before editing.
 
 ## Execution modes
 
-- `dmrg`: local FIT/DMRG-style fitting of two-site targets.
+- `fit` / `dmrg`: local variational compression. Compose with
+  [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
+  growth, symmetry, stability, or profiling changes.
 - `mpo`: direct non-local gate/MPO replay with bond truncation.
 - `svd`: local SVD compression; `swap`: swap-and-split with swap-back.
 - `perm`: swap-and-split with lazy logical-to-physical tracking.
-- `mix`: MPO warmup followed by DMRG with per-step fallback.
+- `mix`: transactional FIT with per-step MPO fallback. Two-site FIT grows
+  active bonds directly; fixed-rank one-site FIT retains MPO rank warm-up.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
 
 Keep `exact` separate from MPS code. When switching from exact to an MPS mode,
@@ -63,6 +66,10 @@ deprecated compatibility path that temporarily reorders, runs, and swaps back.
 - Every rebuilt/replaced live MPS needs its known canonical span recorded.
 - Temporary target copies (`p.copy()`) must use isolated metadata and must not
   overwrite the live `info_c` dictionary.
+- FIT may consume an optimizer-owned guess/target to remove redundant copies,
+  but mixed mode must still isolate the complete trial before mutation.
+- After FIT, reuse its final center and norm for stabilization and canonical
+  metadata instead of scanning or canonicalizing the active interval again.
 
 After a mutation that invalidates canonicality, either canonicalize explicitly
 or invalidate the cache before any canonical-only operation. Unitary one-site
@@ -92,7 +99,7 @@ guarded with `pytest.importorskip("symmray")`.
 Activate the shared environment first:
 
 ```bash
-source ~/envs/py312/bin/activate
+source /Users/rezah/envs/genpy/bin/activate
 ```
 
 Focused optimizer validation:

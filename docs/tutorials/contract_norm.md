@@ -41,20 +41,51 @@ bdy = pepsy.BdyMPS(
 res = pepsy.contract_boundary(
     norm=norm,
     bdy=bdy,
+    fit_mode="two-site",
+    fit_max_bond=64,
+    fit_sweep_sequence="RL",
+    fit_cutoff=1e-12,
+    fit_rtol=1e-8,
+    fit_min_iter=2,
     direction="y",
-    n_iter=2,
+    n_iter=8,
     max_separation=0,
     track_boundary_fidelity=True,
+    fit_timing=True,
 )
 
 print("cost:", res.cost)
 print("fidel entries:", len(res.fidel))
+for fit in res.fit_diagnostics:
+    print(
+        fit.boundary_key,
+        fit.iterations,
+        fit.convergence_reason,
+        fit.elapsed_seconds,
+    )
 ```
 
 ## Notes on parameters
 
 - `chi`: higher means potentially better accuracy, higher runtime/memory.
 - `n_iter`: more local fit sweeps per boundary update.
+- `fit_mode="two-site"`: optimize neighboring boundary tensors and compress
+  their middle bond with a native SVD. New boundaries start at bond 1 and grow
+  locally up to the cap. The default remains `"eff"`.
+- `fit_max_bond`: two-site SVD cap. `peps_norm(..., chi=...)` supplies `chi`
+  automatically; direct `contract_boundary(...)` calls can set it explicitly.
+- `fit_sweep_sequence`: use `"RL"` to alternate left-to-right and
+  right-to-left sweeps.
+- `fit_rtol`, `fit_min_iter`, and `fit_patience`: opt into adaptive stopping.
+  Leave `fit_rtol=None` to run exactly `n_iter` sweeps.
+- `fit_cutoff` and `fit_cutoff_mode`: direct `contract_boundary(...)`
+  two-site SVD policy. The higher-level `peps_norm(...)` API uses `cutoff`
+  with `fit_cutoff_mode`.
+- `fit_timing`: opt into elapsed and detailed two-site sweep timings. Cheap
+  iteration and convergence metadata is present in `fit_diagnostics` even
+  when timing is disabled.
+- `return_info=True`: use this with `peps_norm(...)` or `boundary_norm(...)`
+  when the high-level scalar helpers should return `BoundaryContractResult`.
 - `direction`: `y`, `y_left`, `y_right`, `x`, `x_left`, `x_right`.
 - `max_separation`: currently `0` or `1`.
 

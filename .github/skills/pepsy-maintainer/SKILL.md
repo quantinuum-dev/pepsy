@@ -26,6 +26,7 @@ router, not a replacement for the domain skills below.
 ## Domain routing
 
 - MPS replay, layouts, or canonicalization → [`mps-optimizer`](../mps-optimizer/SKILL.md)
+- FIT sweeps, variational compression, active rank growth, or FIT profiling → [`tensor-fitting`](../tensor-fitting/SKILL.md)
 - Tree replay, TTN layout, trajectories, or measurement → [`tree-optimizer`](../tree-optimizer/SKILL.md)
 - Stabilizer tensor networks → [`stabilizer-tensor-networks`](../stabilizer-tensor-networks/SKILL.md)
 - Tree stabilizer simulation → [`tree-stabilizer-optimizer`](../tree-stabilizer-optimizer/SKILL.md)

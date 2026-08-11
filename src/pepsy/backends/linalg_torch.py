@@ -1,5 +1,6 @@
-"""Torch-side linalg registrations with stabilized autodiff rules."""
+"""Torch-side linalg registrations with configurable SVD policies."""
 
+import contextvars
 import warnings
 
 import autoray as ar
@@ -16,6 +17,14 @@ except ImportError:  # pragma: no cover - optional dependency
 _SVD_EPS_REL = 1.0e-6
 _QR_EPS_REL = 1.0e-6
 _REGISTERED_FUNCTIONS = {}
+_SVD_WRAPPERS = {}
+_SVD_FORWARD_OPTIONS = contextvars.ContextVar(
+    "pepsy_torch_svd_forward_options",
+    default=None,
+)
+_SVD_DRIVERS = {"auto", "gesvdj", "gesvda", "gesvd"}
+_CPU_SVD_BACKENDS = {"torch", "scipy_gesdd", "scipy_gesvd"}
+_SVD_FALLBACKS = {"auto", "none", "scipy_gesdd", "scipy_gesvd"}
 _QR_RANK_POLICIES = {"warn", "native", "error"}
 _QR_RANK_POLICY = "warn"
 _QR_RANK_TOL_FACTOR = 1.0
@@ -81,12 +90,15 @@ def safe_inverse_2(x, eps):
     return x.clamp_min(eps).reciprocal()
 
 
-def _scipy_gesvd(A, exc):
-    """Compute a thin SVD through SciPy's more robust ``gesvd`` driver."""
+def _scipy_svd(A, lapack_driver="gesvd", exc=None):
+    """Compute a thin CPU SVD through an explicit SciPy LAPACK driver."""
     if scipy_linalg is None:
-        raise RuntimeError(
-            "torch.linalg.svd failed and scipy is unavailable for gesvd fallback."
-        ) from exc
+        message = (
+            "SciPy is required for the requested CPU SVD backend or fallback."
+        )
+        if exc is not None:
+            raise RuntimeError(message) from exc
+        raise ImportError(message)
 
     A_np = A.detach().cpu().numpy()
     batch_shape = A_np.shape[:-2]
@@ -104,7 +116,7 @@ def _scipy_gesvd(A, exc):
                 scipy_linalg.svd(
                     mat,
                     full_matrices=False,
-                    lapack_driver="gesvd",
+                    lapack_driver=lapack_driver,
                 )
                 for mat in flat
             ]
@@ -121,13 +133,85 @@ def _scipy_gesvd(A, exc):
         U_np, S_np, Vh_np = scipy_linalg.svd(
             A_np,
             full_matrices=False,
-            lapack_driver="gesvd",
+            lapack_driver=lapack_driver,
         )
 
     U = torch.from_numpy(np.asarray(U_np)).to(device=A.device, dtype=A.dtype)
     S = torch.from_numpy(np.asarray(S_np)).to(device=A.device, dtype=A.real.dtype)
     Vh = torch.from_numpy(np.asarray(Vh_np)).to(device=A.device, dtype=A.dtype)
     return U, S, Vh
+
+
+def _scipy_gesvd(A, exc):
+    """Compute a thin SVD through SciPy's robust ``gesvd`` fallback."""
+    return _scipy_svd(A, lapack_driver="gesvd", exc=exc)
+
+
+def _resolve_svd_options(*, driver="auto", cpu_svd="torch", fallback="auto"):
+    """Validate and normalize the low-level Torch SVD policy."""
+    if driver not in _SVD_DRIVERS:
+        choices = ", ".join(sorted(_SVD_DRIVERS))
+        raise ValueError(f"svd_driver must be one of: {choices}")
+    if cpu_svd not in _CPU_SVD_BACKENDS:
+        choices = ", ".join(sorted(_CPU_SVD_BACKENDS))
+        raise ValueError(f"cpu_svd must be one of: {choices}")
+    if fallback not in _SVD_FALLBACKS:
+        choices = ", ".join(sorted(_SVD_FALLBACKS))
+        raise ValueError(f"svd_fallback must be one of: {choices}")
+    return driver, cpu_svd, fallback
+
+
+def _svd_forward(
+    A,
+    *,
+    driver="auto",
+    cpu_svd="torch",
+    fallback="auto",
+    stabilized=False,
+):
+    """Execute one configured thin SVD, including explicit CPU fallbacks."""
+    driver, cpu_svd, fallback = _resolve_svd_options(
+        driver=driver,
+        cpu_svd=cpu_svd,
+        fallback=fallback,
+    )
+    if fallback == "auto":
+        fallback = "scipy_gesvd" if stabilized else "none"
+
+    if A.device.type == "cpu" and cpu_svd != "torch":
+        if A.requires_grad and not stabilized:
+            raise RuntimeError(
+                "cpu_svd={!r} is forward-only for stabilized=False. Use "
+                "cpu_svd='torch' or stabilized=True for autodiff.".format(cpu_svd)
+            )
+        return _scipy_svd(A, lapack_driver=cpu_svd.removeprefix("scipy_"))
+
+    kwargs = {"full_matrices": False}
+    if A.is_cuda:
+        if driver == "auto":
+            # Preserve the historical stabilized path's robust CUDA choice,
+            # while native Torch keeps its own default (currently gesvdj with
+            # a gesvd fallback in supported CUDA builds).
+            if stabilized:
+                kwargs["driver"] = "gesvd"
+        else:
+            kwargs["driver"] = driver
+
+    try:
+        return torch.linalg.svd(A, **kwargs)
+    except Exception as exc:  # pragma: no cover - backend failure dependent
+        if fallback == "none":
+            raise
+        return _scipy_svd(A, lapack_driver=fallback.removeprefix("scipy_"), exc=exc)
+
+
+def _configured_svd_call(function, A, *, driver, cpu_svd, fallback):
+    """Call a regularized SVD with options scoped to this synchronous forward."""
+    token = _SVD_FORWARD_OPTIONS.set((driver, cpu_svd, fallback))
+    try:
+        return function.apply(A)
+    finally:
+        _SVD_FORWARD_OPTIONS.reset(token)
 
 
 class SVD(torch.autograd.Function):
@@ -143,13 +227,16 @@ class SVD(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
-        try:
-            if A.is_cuda:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver="gesvd")
-            else:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False)
-        except Exception as exc:  # pragma: no cover - backend failure dependent
-            U, S, Vh = _scipy_gesvd(A, exc)
+        options = _SVD_FORWARD_OPTIONS.get()
+        if options is None:
+            options = ("auto", "torch", "scipy_gesvd")
+        U, S, Vh = _svd_forward(
+            A,
+            driver=options[0],
+            cpu_svd=options[1],
+            fallback=options[2],
+            stabilized=True,
+        )
         ctx.save_for_backward(U, S, Vh)
         return U, S, Vh
 
@@ -273,13 +360,16 @@ class SVD_real(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
-        try:
-            if A.is_cuda:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver="gesvd")
-            else:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False)
-        except Exception as exc:  # pragma: no cover - backend failure dependent
-            U, S, Vh = _scipy_gesvd(A, exc)
+        options = _SVD_FORWARD_OPTIONS.get()
+        if options is None:
+            options = ("auto", "torch", "scipy_gesvd")
+        U, S, Vh = _svd_forward(
+            A,
+            driver=options[0],
+            cpu_svd=options[1],
+            fallback=options[2],
+            stabilized=True,
+        )
         ctx.save_for_backward(U, S, Vh)
         return U, S, Vh
 
@@ -645,9 +735,96 @@ def _native_svd(A, *args, **kwargs):
     return torch.linalg.svd(A, *args, **kwargs)
 
 
-def reg_native_svd_torch():
-    """Register native Torch SVD with Pepsy's thin-factor default."""
-    _register_once("linalg.svd", _native_svd)
+def _native_svd_configured(A, *args, driver="auto", cpu_svd="torch", **kwargs):
+    """Run native Torch SVD with an explicit backend policy."""
+    kwargs.setdefault("full_matrices", False)
+    if A.device.type == "cpu" and cpu_svd != "torch":
+        if A.requires_grad:
+            raise RuntimeError(
+                "cpu_svd={!r} is forward-only for stabilized=False. Use "
+                "cpu_svd='torch' or stabilized=True for autodiff.".format(cpu_svd)
+            )
+        return _scipy_svd(
+            A,
+            lapack_driver=cpu_svd.removeprefix("scipy_"),
+        )
+    if A.is_cuda and driver != "auto":
+        kwargs.setdefault("driver", driver)
+    return torch.linalg.svd(A, *args, **kwargs)
+
+
+def _get_native_svd_wrapper(*, driver="auto", cpu_svd="torch"):
+    """Return a cached Autoray wrapper for one native SVD policy."""
+    _resolve_svd_options(driver=driver, cpu_svd=cpu_svd, fallback="none")
+    if driver == "auto" and cpu_svd == "torch":
+        return _native_svd
+    key = ("native", driver, cpu_svd)
+    function = _SVD_WRAPPERS.get(key)
+    if function is None:
+        def function(A, *args, **kwargs):
+            return _native_svd_configured(
+                A,
+                *args,
+                driver=driver,
+                cpu_svd=cpu_svd,
+                **kwargs,
+            )
+
+        function.__name__ = f"native_svd_{driver}_{cpu_svd}"
+        _SVD_WRAPPERS[key] = function
+    return _SVD_WRAPPERS[key]
+
+
+def _get_stabilized_svd_wrapper(
+    *,
+    mode="complex",
+    driver="auto",
+    cpu_svd="torch",
+    fallback="scipy_gesvd",
+):
+    """Return a cached regularized SVD wrapper for one explicit policy."""
+    _resolve_svd_options(
+        driver=driver,
+        cpu_svd=cpu_svd,
+        fallback=fallback,
+    )
+    function_class = SVD_real if mode == "real" else SVD
+    if (
+        driver == "auto"
+        and cpu_svd == "torch"
+        and fallback == "scipy_gesvd"
+    ):
+        return function_class.apply
+    key = ("stabilized", mode, driver, cpu_svd, fallback)
+    function = _SVD_WRAPPERS.get(key)
+    if function is None:
+        def function(A):
+            return _configured_svd_call(
+                function_class,
+                A,
+                driver=driver,
+                cpu_svd=cpu_svd,
+                fallback=fallback,
+            )
+
+        function.__name__ = (
+            f"{mode}_stabilized_svd_{driver}_{cpu_svd}_{fallback}"
+        )
+        _SVD_WRAPPERS[key] = function
+    return _SVD_WRAPPERS[key]
+
+
+def reg_native_svd_torch(*, svd_driver="auto", cpu_svd="torch"):
+    """Register native Torch SVD with an optional backend policy.
+
+    ``svd_driver`` applies only to CUDA tensors. ``cpu_svd`` can explicitly
+    select Torch's native CPU LAPACK path or a SciPy LAPACK driver. SciPy
+    backends are forward-only when the input requires gradients.
+    """
+    _register_once(
+        "linalg.svd",
+        _get_native_svd_wrapper(driver=svd_driver, cpu_svd=cpu_svd),
+    )
 
 
 def reset_torch_linalg_registrations():
@@ -658,23 +835,49 @@ def reset_torch_linalg_registrations():
     reg_complex_qr_torch()
 
 
-def reg_rel_svd_torch():
-    """Register the relative-regularized torch SVD rule in autoray."""
-    _register_once("linalg.svd", SVD.apply)
+def reg_rel_svd_torch(
+    *,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="scipy_gesvd",
+):
+    """Register the relative-regularized Torch SVD rule in Autoray."""
+    _register_once(
+        "linalg.svd",
+        _get_stabilized_svd_wrapper(
+            mode="complex",
+            driver=svd_driver,
+            cpu_svd=cpu_svd,
+            fallback=svd_fallback,
+        ),
+    )
 
 
-def reg_complex_svd_torch():
+def reg_complex_svd_torch(**kwargs):
     """Register the complex torch SVD autograd implementation in autoray.
 
     This compatibility name installs the same relative-regularized SVD rule as
     :func:`reg_rel_svd_torch`.
     """
-    reg_rel_svd_torch()
+    reg_rel_svd_torch(**kwargs)
 
 
-def reg_real_svd_torch():
-    """Register the real torch SVD autograd implementation in autoray."""
-    _register_once("linalg.svd", SVD_real.apply)
+def reg_real_svd_torch(
+    *,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="scipy_gesvd",
+):
+    """Register the real Torch SVD autograd implementation in Autoray."""
+    _register_once(
+        "linalg.svd",
+        _get_stabilized_svd_wrapper(
+            mode="real",
+            driver=svd_driver,
+            cpu_svd=cpu_svd,
+            fallback=svd_fallback,
+        ),
+    )
 
 
 def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
@@ -693,7 +896,13 @@ def reg_complex_qr_torch():
     _register_once("linalg.qr", torch.linalg.qr)
 
 
-def reg_quimb_torch_split_drivers(mode="real"):
+def reg_quimb_torch_split_drivers(
+    mode="real",
+    *,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="scipy_gesvd",
+):
     """Advanced helper for Quimb raw-block split drivers.
 
     Quimb's composed ``qr_stabilized`` and ``svd_truncated`` drivers receive
@@ -766,9 +975,20 @@ def reg_quimb_torch_split_drivers(mode="real"):
         absorb_i = qd._ABSORB_MAP[absorb]
         cutoff_mode_i = qd._CUTOFF_MODE_MAP[cutoff_mode]
         if mode == "real" and not x.is_complex():
-            U, s, VH = SVD_real.apply(x)
+            svd_function = _get_stabilized_svd_wrapper(
+                mode="real",
+                driver=svd_driver,
+                cpu_svd=cpu_svd,
+                fallback=svd_fallback,
+            )
         else:
-            U, s, VH = SVD.apply(x)
+            svd_function = _get_stabilized_svd_wrapper(
+                mode="complex",
+                driver=svd_driver,
+                cpu_svd=cpu_svd,
+                fallback=svd_fallback,
+            )
+        U, s, VH = svd_function(x)
         return qd._trim_and_renorm_svd_result(
             U,
             s,

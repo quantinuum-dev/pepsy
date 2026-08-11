@@ -17,11 +17,12 @@ from .metrics import (
     quimb_ctmrg_projector_compat,
 )
 from .states import BdyMPS, make_numpy_array_caster
-from .sweeps import CompBdy
+from .sweeps import BoundaryFitDiagnostic, CompBdy
 
 __all__ = [
     "BdyMPS",
     "BoundaryContractResult",
+    "BoundaryFitDiagnostic",
     "CompBdy",
     "boundary_norm",
     "build_bra_ket",

@@ -5,12 +5,13 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Mapping
+from dataclasses import replace
 from numbers import Integral
 from typing import Any
 
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import peps_normalize as boundary_normalize
-from ...backends import register_torch_linalg
+from ...backends import TorchLinalgConfig
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
 from ..global_opt import GlobalOptimizer
 from ..sweep import SweepOptimizer
@@ -254,9 +255,16 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     global_fallback_kwargs : mapping, optional
         Global fallback controls used if an optional NLopt run raises an NLopt
         runtime error. Defaults to one LBFGS step.
+    torch_linalg_config : TorchLinalgConfig | None, optional
+        One policy for Torch SVD autodiff, QR autodiff, CUDA/CPU SVD drivers,
+        and Quimb's raw Symmray split paths. When omitted, global Torch
+        cleanup creates a stabilized policy and infers ``mode`` from the
+        state. Pass a policy explicitly when choosing native versus
+        regularized SVD or a specific exact backend.
     register_torch_svd : bool, default=True
-        Configure Pepsy's canonical stabilized Torch linalg rules before Torch
-        global optimization. The legacy name is retained for compatibility.
+        Automatically register the Torch linalg policy before Torch global
+        optimization. The legacy name is retained for compatibility; prefer
+        ``torch_linalg_config=TorchLinalgConfig(...)`` for new code.
     accept_if_improved : bool, default=True
         Keep the pre-optimization warm start when measured cleanup does not
         improve the local infidelity.
@@ -298,6 +306,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         global_kwargs: Mapping[str, Any] | None = None,
         global_optimize_kwargs: Mapping[str, Any] | None = None,
         global_fallback_kwargs: Mapping[str, Any] | None = None,
+        torch_linalg_config: TorchLinalgConfig | None = None,
         register_torch_svd=True,
         accept_if_improved=True,
     ):
@@ -356,6 +365,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             _DEFAULT_GLOBAL_FALLBACK_KWARGS,
             global_fallback_kwargs,
         )
+        if torch_linalg_config is not None and not isinstance(
+            torch_linalg_config,
+            TorchLinalgConfig,
+        ):
+            raise TypeError(
+                "torch_linalg_config must be a TorchLinalgConfig instance or None."
+            )
+        self.torch_linalg_config = torch_linalg_config
         self.register_torch_svd = bool(register_torch_svd)
         self.accept_if_improved = bool(accept_if_improved)
 
@@ -1040,12 +1057,25 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         backend = opt_kwargs.get("autodiff_backend", "torch")
         if not isinstance(backend, str) or backend.strip().lower() != "torch":
             return
-        try:
-            register_torch_linalg(
+
+        symmray_blocks = uses_symmray_arrays(state, target)
+        config = self.torch_linalg_config
+        if config is None:
+            # Global PEPS cleanup differentiates through SVD/QR. The default
+            # therefore favors finite autodiff over the native-only policy,
+            # while keeping the dtype-dependent real/complex choice automatic.
+            config = TorchLinalgConfig(
                 mode=self._torch_linalg_mode(state, target),
                 stabilized=True,
-                quimb_split_drivers=uses_symmray_arrays(state, target),
+                quimb_split_drivers=symmray_blocks,
             )
+        elif symmray_blocks and not config.quimb_split_drivers:
+            # Raw Symmray blocks bypass Autoray. Preserve the user's SVD/QR
+            # choices but enable the matching Quimb registrations so the
+            # configured policy actually covers the PEPS split path.
+            config = replace(config, quimb_split_drivers=True)
+        try:
+            config.register()
         except ImportError as exc:
             warnings.warn(
                 f"Could not configure Torch linalg: {exc}",

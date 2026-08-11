@@ -127,6 +127,32 @@ The tree-native operator API lives in `pepsy.optimizers.tree.operators`:
   invariants. Emit explicit warnings for intentional compatibility coercions.
 - Do not vendor upstream internals.
 
+## Torch SVD/QR policy
+
+Keep Torch linear-algebra registration behind the single public
+`pepsy.TorchLinalgConfig` class. Its `register()` operation configures the
+Autoray SVD and QR rules together and can additionally configure Quimb's raw
+Symmray split drivers. Do not add a new optimizer call that independently
+combines `reg_*_torch` helpers or `register_torch_linalg(...)` arguments.
+
+- `stabilized=False` is the native, fastest default for ordinary simulation.
+  `stabilized=True` is the autodiff policy: it installs Pepsy's
+  relative-regularized SVD VJP and the configured rank-aware QR behavior for
+  difficult or rank-deficient tensor-network splits.
+- `svd_driver="gesvdj"` and `"gesvd"`, plus CPU Torch/Scipy `gesdd`/`gesvd`,
+  are non-approximate choices. `gesvda` is approximate and must remain behind
+  `allow_approximate=True`.
+- `quimb_split_drivers=True` is required when raw Torch Symmray blocks enter
+  Quimb's `svd_truncated` or `qr_stabilized` paths, because those blocks bypass
+  ordinary Autoray dispatch. PEPS optimizers should enable it automatically
+  when Symmray data is detected.
+- `PepsOptimizer` accepts `torch_linalg_config=TorchLinalgConfig(...)` and
+  should use that policy for global Torch cleanup. The legacy
+  `register_torch_svd` switch remains only for compatibility.
+- Preserve dtype/device behavior: driver selection changes the underlying
+  decomposition, not `complex64`/`complex128` promotion. Add a focused
+  reconstruction or gradient test when changing a backend route.
+
 ## Cyclic CTMRG compatibility
 
 - Use `pepsy.boundary.quimb_ctmrg_projector_compat` around Quimb CTMRG calls

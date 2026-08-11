@@ -33,8 +33,10 @@ For `direction="x"`, use `split = ket.Lx // 2`.
 
 1. Increase `chi`.
 2. Increase `n_iter`.
-3. Try `fit_mode="global"` for better local solves.
-4. Compare `direction="y"` vs `"x"` and choose the stabler one.
+3. Try `fit_mode="two-site"` with `fit_sweep_sequence="RL"` so the boundary
+   can discover better bond subspaces up to `chi`.
+4. Try `fit_mode="global"` as a slower reference solve.
+5. Compare `direction="y"` vs `"x"` and choose the stabler one.
 
 ## Pitfall
 

@@ -21,6 +21,81 @@ Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
 gates, plus intervening one-site gates, into one PEPS target before truncating
 to `chi` and optionally running the sweep/global cleanup.
 
+## Two-site boundary FIT
+
+Dense DMRG boundaries can opt into native-SVD two-site updates through
+`boundary_kwargs`:
+
+```python
+optimizer = pepsy.PepsOptimizer(
+    state,
+    gates,
+    chi=32,
+    boundary_chi=(64, 96),
+    boundary_engine="dmrg",
+    boundary_kwargs={
+        "fit_mode": "two-site",
+        "fit_sweep_sequence": "RL",
+        "fit_rtol": 1e-8,
+        "fit_min_iter": 2,
+        "fit_patience": 2,
+        "cutoff": 1e-12,
+    },
+)
+```
+
+For sweep cleanup, tuple `boundary_chi` values cap the norm and overlap
+boundaries independently. Normalization and diagnostic contractions receive
+the corresponding scalar `chi`. DMRG two-site boundaries start at bond 1 and
+grow through local SVDs instead of global padding. `fit_mode="eff"` remains
+the default while two-site accuracy and wall time are workload-dependent.
+
+## One Torch SVD/QR policy
+
+Torch autodiff through PEPS cleanup uses both SVD and QR. Configure both with
+one `TorchLinalgConfig` object instead of registering the individual legacy
+helpers separately:
+
+```python
+import pepsy
+
+torch_linalg = pepsy.TorchLinalgConfig(
+    mode="complex",          # selects complex-safe SVD/QR rules
+    stabilized=True,          # finite SVD/QR VJPs for autodiff
+    svd_driver="auto",       # CUDA: native Torch's driver selection
+    cpu_svd="torch",         # CPU: native Torch LAPACK
+    qr_rank_policy="warn",   # warn if a real QR block is rank deficient
+    quimb_split_drivers=True, # required for raw Symmray blocks
+)
+
+optimizer = pepsy.PepsOptimizer(
+    state,
+    gates,
+    chi=64,
+    mode="global",
+    torch_linalg_config=torch_linalg,
+)
+```
+
+`stabilized=True` changes the reverse-mode rule, not the exact forward
+factorization: it regularizes singular-gap and QR-pivot terms only where the
+ordinary derivative is undefined or ill-conditioned. Use `stabilized=False`
+for the fastest native forward/backward path when those gradients are not
+needed. For non-approximate speed experiments, use CUDA `svd_driver="gesvdj"`
+or CPU `cpu_svd="scipy_gesdd"`; `gesvda` is approximate and requires an
+explicit `allow_approximate=True` acknowledgement.
+
+For dense states, `quimb_split_drivers` can remain `False`. For Symmray PEPS,
+set it to `True` because Quimb receives raw Torch charge blocks that do not
+pass through ordinary Autoray dispatch. `PepsOptimizer` enables this flag
+automatically when it detects Symmray blocks, while preserving the other
+settings in a supplied policy. `register_torch_svd=False` is retained only as
+a compatibility escape hatch for disabling automatic registration.
+
+The lower-level `reg_*_torch` functions and `register_torch_linalg(...)`
+remain compatibility APIs; new optimizer code should pass or construct
+`TorchLinalgConfig` so SVD and QR cannot silently diverge.
+
 `SimpleUpdateGen` preserves quimb's arbitrary-geometry simple-update sweep and
 energy bookkeeping, but routes every gate through `pepsy.gate_simple(...)`.
 This lets sequential simple update handle long-range PEPS terms via Pepsy's

@@ -23,6 +23,30 @@ def test_mpo_optimizer_accepts_svd_mode():
     assert opt.mode == "svd"
 
 
+def test_fit_two_site_preserves_mpo_view_and_dense_readout():
+    """Direct FIT on an MPO must return a functional MPO, not an MPS view."""
+    guess = qtn.MPO_rand(
+        3, bond_dim=1, phys_dim=2, dtype="complex128", seed=212
+    )
+    target = qtn.MPO_rand(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=213
+    )
+    fit = py.FIT(target, p=guess, range_int=[0, 2])
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+    )
+
+    assert isinstance(fit.p, qtn.MatrixProductOperator)
+    assert fit.p.upper_ind_id == guess.upper_ind_id
+    assert fit.p.lower_ind_id == guess.lower_ind_id
+    assert fit.p.to_dense().shape == (8, 8)
+    assert fit.p.max_bond() <= 2
+
+
 def test_mpo_prepare_gate_pair_uses_matrix_transpose_for_2q_quimb_gate():
     """For rank-2 two-site gates, use direct matrix transpose on ket only."""
     gate = qu.CNOT()

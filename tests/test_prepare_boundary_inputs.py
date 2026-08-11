@@ -357,6 +357,99 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
     assert comp.fidel == [0.5, 0.5]
 
 
+def test_compbdy_two_site_routes_cached_full_boundary_controls():
+    """Two-site boundaries should use the cached full-interval FIT kernel."""
+    captured = {}
+
+    class _Fit:
+        range_int = None
+
+        @staticmethod
+        def run_gate(**kwargs):
+            captured.update(kwargs)
+
+    class _Boundary:
+        L = 4
+
+        @staticmethod
+        def max_bond():
+            return 3
+
+    comp = object.__new__(pepsy.CompBdy)
+    comp.fit_mode = "two-site"
+    comp.fit_max_bond = 7
+    comp.fit_sweep_sequence = "LR"
+    comp.fit_cutoff = 2.0e-9
+    comp.fit_cutoff_mode = "rel"
+    comp.fit_min_iter = 2
+    comp.fit_rtol = 3.0e-8
+    comp.fit_patience = 4
+    comp.n_iter = 9
+
+    fit = _Fit()
+    comp._run_fit_solver(fit, _Boundary())
+
+    assert fit.range_int == (0, 3)
+    assert captured == {
+        "n_iter": 9,
+        "verbose": False,
+        "block_size": 2,
+        "sweep_sequence": "LR",
+        "max_bond": 7,
+        "cutoff": 2.0e-9,
+        "cutoff_mode": "rel",
+        "min_iter": 2,
+        "rtol": 3.0e-8,
+        "patience": 4,
+        "collect_split_diagnostics": False,
+    }
+
+
+def test_compbdy_two_site_falls_back_to_current_boundary_cap():
+    """Direct CompBdy use must never leave two-site bond growth uncapped."""
+    captured = {}
+
+    class _Fit:
+        range_int = None
+
+        @staticmethod
+        def run_gate(**kwargs):
+            captured.update(kwargs)
+
+    class _Boundary:
+        L = 3
+
+        @staticmethod
+        def max_bond():
+            return 5
+
+    comp = object.__new__(pepsy.CompBdy)
+    comp.fit_mode = "two-site"
+    comp.fit_max_bond = None
+    comp.fit_sweep_sequence = "RL"
+    comp.fit_cutoff = 1.0e-12
+    comp.fit_cutoff_mode = "rsum2"
+    comp.fit_min_iter = None
+    comp.fit_rtol = None
+    comp.fit_patience = 1
+    comp.n_iter = 2
+
+    comp._run_fit_solver(_Fit(), _Boundary())
+
+    assert captured["max_bond"] == 5
+
+
+def test_compbdy_fit_mode_is_canonicalized_and_validated_early():
+    """Mode aliases should be stable and mistakes should fail at construction."""
+    norm = type("TaggedNorm", (), {"tags": {"X0", "Y0"}})()
+
+    assert pepsy.CompBdy(norm, {}, fit_mode="two_site").fit_mode == "two-site"
+    assert pepsy.CompBdy(norm, {}, fit_mode="one-site").fit_mode == "eff"
+
+    with pytest.raises(ValueError, match="Unknown fit_mode"):
+        pepsy.CompBdy(norm, {}, fit_mode="two-sites")
+
+
 def test_compbdy_run_reuses_equalized_boundaries_without_stale_exponent():
     """Switching equalize modes should not reuse stale boundary exponents."""
     ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=31, dtype="complex128")
@@ -551,6 +644,58 @@ def test_contract_boundary_includes_input_network_exponent():
     assert abs(out.cost - exact) / abs(exact) < 1.0e-10
 
 
+def test_peps_norm_two_site_is_exact_and_reuses_boundary_holder():
+    """Two-site PEPS norms should retain accuracy and warm boundary storage."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=43, dtype="complex128")
+    exact = ket.make_norm().contract(all, optimize="greedy")
+    holder = {}
+    kwargs = {
+        "chi": 16,
+        "bdy": holder,
+        "fit_mode": "two-site",
+        "fit_sweep_sequence": "RL",
+        "n_iter": 4,
+        "cutoff": 0.0,
+        "contraction_opt": "greedy",
+        "progress": False,
+    }
+
+    first = pepsy.peps_norm(ket, **kwargs)
+    boundary_id = id(holder["bdy"])
+    second = pepsy.peps_norm(ket, **kwargs)
+
+    assert abs(first - exact) / abs(exact) < 1.0e-10
+    assert abs(second - exact) / abs(exact) < 1.0e-10
+    assert id(holder["bdy"]) == boundary_id
+    assert all(mps.max_bond() <= 16 for mps in holder["bdy"].mps_b.values())
+
+
+def test_peps_norm_two_site_can_grow_from_rank_one_without_padding(monkeypatch):
+    """An explicit fit cap should let pair updates discover boundary rank."""
+    ket = qtn.PEPS.rand(Lx=4, Ly=4, bond_dim=2, seed=47, dtype="complex128")
+    _, norm = pepsy.build_bra_ket(ket=ket.copy())
+    bdy = pepsy.BdyMPS(tn_double=norm, chi=1)
+
+    assert max(mps.max_bond() for mps in bdy.mps_b.values()) == 1
+
+    def fail_expand(*_args, **_kwargs):
+        raise AssertionError("two-site reuse should not globally pad the boundary")
+
+    monkeypatch.setattr(bdy, "expand_bnd", fail_expand)
+    pepsy.peps_norm(
+        ket,
+        chi=4,
+        bdy=bdy,
+        fit_mode="two-site",
+        n_iter=2,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert max(mps.max_bond() for mps in bdy.mps_b.values()) == 4
+
+
 class _DummyNorm:
     """Minimal norm-like object with copy() for contract_boundary tests."""
 
@@ -600,6 +745,116 @@ def test_contract_boundary_includes_requested_metadata(monkeypatch):
     assert out.direction == "x"
     assert out.n_iter == 3
     assert out.max_separation == 1
+    assert out.fit_diagnostics == ()
+
+
+def test_peps_norm_can_return_typed_fit_convergence_and_timing():
+    """High-level PEPS norms should expose every adaptive boundary FIT."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=49, dtype="complex128")
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        method="dmrg",
+        fit_mode="two-site",
+        fit_sweep_sequence="RL",
+        n_iter=8,
+        fit_min_iter=2,
+        fit_rtol=1.0e9,
+        fit_patience=1,
+        fit_timing=True,
+        return_info=True,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert isinstance(result, pepsy.BoundaryContractResult)
+    assert abs(result.cost - exact) / abs(exact) < 1.0e-10
+    assert result.fit_diagnostics
+    for diagnostic in result.fit_diagnostics:
+        assert isinstance(diagnostic, pepsy.BoundaryFitDiagnostic)
+        assert diagnostic.fit_mode == "two-site"
+        assert diagnostic.status == "complete"
+        assert diagnostic.iterations == 2
+        assert diagnostic.converged is True
+        assert diagnostic.convergence_reason == "relative_tolerance"
+        assert diagnostic.elapsed_seconds >= 0.0
+        assert len(diagnostic.sweep_timings) == 2
+        assert [record["direction"] for record in diagnostic.sweep_timings] == [
+            "R",
+            "L",
+        ]
+        assert all(record["timing_schema"] == 2 for record in diagnostic.sweep_timings)
+        assert all(record["active_site_count"] == 3 for record in diagnostic.sweep_timings)
+        assert all(
+            record["svd_seconds"]
+            == pytest.approx(
+                sum(
+                    site_timing["svd_seconds"]
+                    for site_timing in record["site_timings"]
+                )
+            )
+            for record in diagnostic.sweep_timings
+        )
+
+
+def test_peps_norm_fit_diagnostics_are_cheap_without_timing():
+    """Convergence metadata should not enable per-site timers implicitly."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=51, dtype="complex128")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=4,
+        method="dmrg",
+        fit_mode="two-site",
+        n_iter=2,
+        fit_rtol=None,
+        return_info=True,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.iterations == 2
+        and diagnostic.convergence_reason == "max_sweeps"
+        and diagnostic.elapsed_seconds is None
+        and diagnostic.sweep_timings == ()
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+@pytest.mark.parametrize("fit_mode", ["eff", "global"])
+def test_peps_norm_reports_legacy_fit_solvers_without_changing_them(fit_mode):
+    """Reference and cached one-site FIT should remain fixed-sweep solvers."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=71, dtype="complex128")
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        method="dmrg",
+        fit_mode=fit_mode,
+        n_iter=1,
+        fit_timing=True,
+        return_info=True,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert abs(result.cost - exact) / abs(exact) < 1.0e-10
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == fit_mode
+        and diagnostic.iterations == 1
+        and diagnostic.converged is False
+        and diagnostic.convergence_reason == "fixed_sweeps"
+        and diagnostic.elapsed_seconds >= 0.0
+        and diagnostic.sweep_timings == ()
+        for diagnostic in result.fit_diagnostics
+    )
 
 
 def test_contract_boundary_can_return_stripped_exponent(monkeypatch):
@@ -646,6 +901,45 @@ def test_contract_boundary_accepts_bdy_object(monkeypatch):
     out = pepsy.contract_boundary(norm=_DummyNorm(), bdy=bdy)
     assert out.cost == 3.0
     assert captured["mps_boundaries"] is bdy.mps_b
+
+
+def test_contract_boundary_forwards_two_site_policy_and_target_chi(monkeypatch):
+    """The boundary API should preserve every two-site convergence control."""
+    captured = {}
+
+    class _FakeCompBdy:
+        def __init__(self, _norm, _mps_boundaries, **kwargs):
+            captured.update(kwargs)
+            self.fidel = []
+
+        def run(self, **_kwargs):
+            return 3.0
+
+    class _BdyObj:
+        mps_b = {"Y0_l": object()}
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "CompBdy", _FakeCompBdy)
+    pepsy.contract_boundary(
+        norm=_DummyNorm(),
+        bdy=_BdyObj(),
+        fit_mode="two-site",
+        fit_max_bond=11,
+        fit_sweep_sequence="LR",
+        fit_cutoff=2.0e-9,
+        fit_cutoff_mode="rel",
+        fit_min_iter=2,
+        fit_rtol=3.0e-8,
+        fit_patience=4,
+    )
+
+    assert captured["fit_mode"] == "two-site"
+    assert captured["fit_max_bond"] == 11
+    assert captured["fit_sweep_sequence"] == "LR"
+    assert captured["fit_cutoff"] == 2.0e-9
+    assert captured["fit_cutoff_mode"] == "rel"
+    assert captured["fit_min_iter"] == 2
+    assert captured["fit_rtol"] == 3.0e-8
+    assert captured["fit_patience"] == 4
 
 
 def test_contract_boundary_accepts_bdy_holder_dict(monkeypatch):
@@ -1412,6 +1706,44 @@ def test_contract_flat_dmrg_uses_flat_boundary_path(monkeypatch):
     assert captured["contract_kwargs"]["flat"] is True
 
 
+def test_contract_flat_two_site_starts_rank_one_with_requested_svd_cap(monkeypatch):
+    """Two-site boundary creation should avoid eager global chi padding."""
+    captured = {}
+    tn = type("Flat2D", (), {"Lx": 2, "Ly": 2, "tags": {"X0", "Y0"}})()
+
+    class _FakeBdy:
+        mps_b = {"Y0_l": object()}
+
+    def fake_bdymps(**kwargs):
+        captured["bdymps_kwargs"] = kwargs
+        return _FakeBdy()
+
+    def fake_contract_boundary(**kwargs):
+        captured["contract_kwargs"] = kwargs
+        return pepsy.BoundaryContractResult(
+            cost=7.0,
+            fidel=[],
+            direction=kwargs["direction"],
+            n_iter=kwargs["n_iter"],
+            max_separation=kwargs["max_separation"],
+        )
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
+
+    out = pepsy.contract_flat(
+        tn,
+        chi=7,
+        method="dmrg",
+        fit_mode="two-site",
+        progress=False,
+    )
+
+    assert out == 7.0
+    assert captured["bdymps_kwargs"]["chi"] == 1
+    assert captured["contract_kwargs"]["fit_max_bond"] == 7
+
+
 def test_contract_flat_default_auto_uses_quimb_for_3d():
     """method='auto' should avoid PEPSY's 2D-only DMRG path for 3D TNs."""
     captured = {}
@@ -1662,6 +1994,9 @@ def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
     assert out["bdy"] is bdy["bdy"]
     assert out["bdy_target"] is bdy_target["bdy"]
     assert out["bdy_overlap"] is bdy_overlap["bdy"]
+    assert isinstance(out["norm_result"], pepsy.BoundaryContractResult)
+    assert isinstance(out["norm_target_result"], pepsy.BoundaryContractResult)
+    assert isinstance(out["overlap_result"], pepsy.BoundaryContractResult)
     assert len(captured["contract_calls"]) == 3
 
 
@@ -1832,6 +2167,14 @@ def test_peps_metric_aliases(monkeypatch):
 
     assert pepsy.peps_norm("p", chi=4) == 2.0
     assert pepsy.peps_fidelity("p", "q", chi=5) == pytest.approx(0.75)
+    fidelity_info = pepsy.peps_fidelity(
+        "p",
+        "q",
+        chi=6,
+        return_info=True,
+    )
+    assert fidelity_info["fidelity"] == pytest.approx(0.75)
+    assert fidelity_info["infidelity"] == pytest.approx(0.25)
     assert calls[0][0] == "norm"
     assert calls[0][1] == ("p",)
     assert calls[0][2]["chi"] == 4
@@ -1840,6 +2183,9 @@ def test_peps_metric_aliases(monkeypatch):
     assert calls[1][1] == ("p", "q")
     assert calls[1][2]["chi"] == 5
     assert calls[1][2]["method"] == "dmrg"
+    assert calls[2][1] == ("p", "q")
+    assert calls[2][2]["chi"] == 6
+    assert calls[2][2]["method"] == "dmrg"
 
 
 def test_infidelity_reuses_existing_bdy_holder_entries(monkeypatch):

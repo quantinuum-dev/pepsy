@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tensor Fitting"
+  short_description: "Review and extend Pepsy FIT solvers"
+  default_prompt: "Use $tensor-fitting to implement or review Pepsy FIT compression."

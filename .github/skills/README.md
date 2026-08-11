@@ -19,6 +19,7 @@ catalog or skill-package change.
 ## Core workflows
 
 - [MPS optimizer](mps-optimizer/SKILL.md)
+- [Tensor fitting](tensor-fitting/SKILL.md)
 - [Tree optimizer](tree-optimizer/SKILL.md)
 - [qMERA energy optimizer](qmera-energy-optimizer/SKILL.md)
 

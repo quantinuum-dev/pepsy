@@ -3893,6 +3893,56 @@ def test_symmps_gate_stream_runs_mps_optimizer_mpo_heisenberg():
     assert np.isfinite(np.real((out.H & out).contract(all, optimize="auto-hq")))
 
 
+def test_u1u1_fermionic_mps_optimizer_two_site_fit_stays_native():
+    """Two-site FIT must preserve spin-resolved sectors and graded metadata."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations(
+            [(1, 0), (0, 1), (1, 0), (0, 1)]
+        ),
+        seed=205,
+        dtype="complex128",
+    )
+    gates = state.build_hamiltonian(
+        t=1.0,
+        U=4.0,
+        mu=0.0,
+    ).gate_stream(0.001)
+
+    optimizer = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        gates,
+        chi=16,
+        mode="dmrg",
+    )
+    out = optimizer.run(
+        progbar=False,
+        n_iter=2,
+        cutoff=1.0e-10,
+        fit_block_size=2,
+        fit_sweep_sequence="RL",
+    )
+
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray"
+        for tensor in out.tensors
+    )
+    reference = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        gates,
+        chi=16,
+        mode="mpo",
+    ).run(progbar=False, cutoff=0.0)
+
+    assert out.max_bond() <= 16
+    assert _finite_double_layer_norm(out)
+    assert float(
+        np.real(pepsy.tn_fidelity(out, reference, contraction_opt="auto-hq"))
+    ) == pytest.approx(1.0, abs=1.0e-9)
+
+
 def test_symmps_mps_optimizer_handles_spinful_fermi_hubbard_dims():
     """MpsOptimizer MPO mode should accept 4-state Fermi-Hubbard gates."""
     state = SymMPS.for_model(
@@ -4107,8 +4157,8 @@ def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode)
         assert opt.get_normalizations() == []
 
 
-def test_symmps_mps_optimizer_symmray_dmrg_expansion_caveat_is_explicit():
-    """DMRG should fail clearly when Symmray bond expansion would be required."""
+def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
+    """Native two-site FIT should replace dense-style Symmray bond padding."""
     state = SymMPS.random(
         4,
         symmetry="Z2",
@@ -4150,10 +4200,31 @@ def test_symmps_mps_optimizer_symmray_dmrg_expansion_caveat_is_explicit():
         assert out.L == 4
         assert out.max_bond() <= 2
 
-    with pytest.raises(ValueError, match="bond_dim >= chi"):
-        pepsy.MpsOptimizer(state.tn.copy(), nearest_gates, chi=4, mode="dmrg").run(
-            progbar=False
-        )
+    grown = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        nearest_gates,
+        chi=4,
+        mode="dmrg",
+    ).run(progbar=False, fit_block_size=2)
+    assert _all_tensor_data_symmray(grown)
+    assert grown.max_bond() <= 4
+    assert _finite_double_layer_norm(grown)
+
+    with pytest.raises(ValueError, match="fit_target_strategy='layered'"):
+        pepsy.MpsOptimizer(
+            state.tn.copy(),
+            nearest_gates,
+            chi=4,
+            mode="dmrg",
+        ).run(progbar=False, fit_target_strategy="layered")
+
+    with pytest.raises(ValueError, match="fit_block_size=2"):
+        pepsy.MpsOptimizer(
+            state.tn.copy(),
+            nonlocal_gates,
+            chi=4,
+            mode="dmrg",
+        ).run(progbar=False, fit_block_size=1)
 
 
 @pytest.mark.parametrize("mode", ["mpo", "svd"])

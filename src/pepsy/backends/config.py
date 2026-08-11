@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+
 import autoray as ar
 import numpy as np
 
@@ -12,6 +15,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 __all__ = [
     "build_backend", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
+    "TorchLinalgConfig", "get_torch_linalg_config",
     "register_torch_linalg", "register_jax_linalg", "reg_native_svd_torch",
     "reg_native_svd_jax", "reg_rel_svd_torch", "reg_real_svd_torch",
     "reg_complex_svd_torch", "reg_real_qr_torch", "reg_complex_qr_torch",
@@ -24,6 +28,201 @@ __all__ = [
 
 _DEFAULT_ARRAY_BACKEND = None
 _DEFAULT_GRAD_BACKEND = None
+_ACTIVE_TORCH_LINALG_CONFIG = None
+
+
+@dataclass(frozen=True)
+class TorchLinalgConfig:
+    """Explicit policy for Pepsy's process-global Torch linalg dispatch.
+
+    ``register()`` installs the complete policy: SVD forward selection,
+    stabilized SVD reverse-mode differentiation when requested, QR
+    differentiation, and optional Quimb raw-block split drivers. Keeping these
+    decisions in one immutable object is important because Autoray and Quimb
+    registrations are process-global.
+
+    Parameters
+    ----------
+    mode : {"complex", "real"}, default="complex"
+        Select the stabilized SVD/QR rule when ``stabilized=True``.
+    stabilized : bool, default=False
+        Use Pepsy's relative-regularized SVD VJP and the configured QR policy.
+        Set this to ``True`` for Torch autodiff through difficult or
+        rank-deficient tensor-network splits. The default keeps native Torch
+        forward and backward behavior and is the recommended setting for
+        ordinary non-differentiable simulation.
+    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="auto"
+        CUDA cuSOLVER driver. ``"auto"`` leaves the choice to Torch. The
+        approximate ``"gesvda"`` driver requires ``allow_approximate=True``.
+        This option has no effect on CPU tensors.
+    cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
+        CPU forward SVD implementation. SciPy choices are useful for explicit
+        LAPACK experimentation and forward-only MPS runs. With
+        ``stabilized=True``, the custom backward remains available.
+    svd_fallback : {"auto", "none", "scipy_gesdd", "scipy_gesvd"}, default="auto"
+        Backend used after a Torch SVD failure. ``"auto"`` means no fallback
+        for native SVD and ``"scipy_gesvd"`` for stabilized SVD.
+    allow_approximate : bool, default=False
+        Safety acknowledgement required for CUDA's approximate ``gesvda``.
+    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+        Rank-deficiency response for the stabilized real QR VJP. ``"warn"``
+        reports a potentially ill-conditioned native fallback, ``"native"``
+        accepts it silently, and ``"error"`` stops the optimization.
+    qr_rank_tol_factor : float, default=1.0
+        Scale-relative multiplier used by the stabilized real QR rule.
+    quimb_split_drivers : bool, default=False
+        Also install the configured safe SVD/QR split drivers into Quimb's
+        raw-block registry. Raw Symmray blocks bypass Autoray, so this must be
+        ``True`` for Torch-autodiff PEPS/Symmray workflows. Dense workflows
+        normally leave it disabled.
+
+    Notes
+    -----
+    Autoray and Quimb registrations are process-global. Prefer
+    ``config.register()`` at application startup, or ``with
+    config.activated():`` for a scoped experiment.
+    """
+
+    mode: str = "complex"
+    stabilized: bool = False
+    svd_driver: str = "auto"
+    cpu_svd: str = "torch"
+    svd_fallback: str = "auto"
+    allow_approximate: bool = False
+    qr_rank_policy: str = "warn"
+    qr_rank_tol_factor: float = 1.0
+    quimb_split_drivers: bool = False
+
+    def __post_init__(self):
+        mode = str(self.mode).strip().lower()
+        svd_driver = "auto" if self.svd_driver is None else str(self.svd_driver)
+        cpu_svd = "torch" if self.cpu_svd is None else str(self.cpu_svd)
+        svd_fallback = "auto" if self.svd_fallback is None else str(self.svd_fallback)
+        qr_rank_policy = str(self.qr_rank_policy).strip().lower()
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "svd_driver", svd_driver)
+        object.__setattr__(self, "cpu_svd", cpu_svd)
+        object.__setattr__(self, "svd_fallback", svd_fallback)
+        object.__setattr__(self, "qr_rank_policy", qr_rank_policy)
+        self.validate()
+
+    def validate(self):
+        """Validate this policy and return ``self`` for fluent setup."""
+        if self.mode not in {"complex", "real"}:
+            raise ValueError("mode must be 'complex' or 'real'")
+        if self.svd_driver not in {"auto", "gesvdj", "gesvda", "gesvd"}:
+            raise ValueError(
+                "svd_driver must be one of: auto, gesvdj, gesvda, gesvd"
+            )
+        if self.cpu_svd not in {"torch", "scipy_gesdd", "scipy_gesvd"}:
+            raise ValueError(
+                "cpu_svd must be one of: torch, scipy_gesdd, scipy_gesvd"
+            )
+        if self.svd_fallback not in {
+            "auto", "none", "scipy_gesdd", "scipy_gesvd"
+        }:
+            raise ValueError(
+                "svd_fallback must be one of: auto, none, scipy_gesdd, scipy_gesvd"
+            )
+        if self.svd_driver == "gesvda" and not self.allow_approximate:
+            raise ValueError(
+                "svd_driver='gesvda' is approximate; pass "
+                "allow_approximate=True to enable it explicitly."
+            )
+        if self.qr_rank_policy not in {"warn", "native", "error"}:
+            raise ValueError("qr_rank_policy must be one of: warn, native, error")
+        try:
+            qr_factor = float(self.qr_rank_tol_factor)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("qr_rank_tol_factor must be a positive finite number") from exc
+        if not np.isfinite(qr_factor) or qr_factor <= 0.0:
+            raise ValueError("qr_rank_tol_factor must be a positive finite number")
+        object.__setattr__(self, "qr_rank_tol_factor", qr_factor)
+        return self
+
+    @property
+    def resolved_svd_fallback(self):
+        """Return the concrete fallback selected by ``svd_fallback``."""
+        if self.svd_fallback != "auto":
+            return self.svd_fallback
+        return "scipy_gesvd" if self.stabilized else "none"
+
+    @property
+    def approximate(self):
+        """Whether this policy permits an approximate CUDA SVD driver."""
+        return self.svd_driver == "gesvda"
+
+    @property
+    def exact(self):
+        """Whether the selected SVD driver is a non-approximate algorithm."""
+        return not self.approximate
+
+    def to_dict(self):
+        """Return JSON-friendly policy fields and resolved decisions."""
+        return {
+            "mode": self.mode,
+            "stabilized": self.stabilized,
+            "svd_driver": self.svd_driver,
+            "cpu_svd": self.cpu_svd,
+            "svd_fallback": self.svd_fallback,
+            "resolved_svd_fallback": self.resolved_svd_fallback,
+            "allow_approximate": self.allow_approximate,
+            "approximate": self.approximate,
+            "exact": self.exact,
+            "qr_rank_policy": self.qr_rank_policy,
+            "qr_rank_tol_factor": self.qr_rank_tol_factor,
+            "quimb_split_drivers": self.quimb_split_drivers,
+        }
+
+    def describe(self):
+        """Return policy fields together with available runtime backends."""
+        info = self.to_dict()
+        info["torch_version"] = None if torch is None else torch.__version__
+        info["cuda_available"] = bool(torch is not None and torch.cuda.is_available())
+        try:
+            from . import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+            info["scipy_available"] = lr.scipy_linalg is not None
+        except ImportError:  # pragma: no cover - optional dependency
+            info["scipy_available"] = False
+        return info
+
+    def register(self):
+        """Install the SVD, QR, and optional Quimb split policy.
+
+        This is intentionally the one high-level registration operation. It
+        keeps the forward SVD choice, the autodiff SVD rule, and the QR rule
+        on the same policy instead of allowing separate registrations to
+        silently disagree.
+        """
+        _install_torch_linalg_config(self)
+        return self
+
+    @contextmanager
+    def activated(self):
+        """Temporarily install this policy and restore the previous policy."""
+        previous = get_torch_linalg_config()
+        if not self.quimb_split_drivers:
+            from . import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+            lr.reset_quimb_torch_split_drivers()
+        self.register()
+        try:
+            yield self
+        finally:
+            if previous is None:
+                reset_linalg_registrations(backend="torch")
+            else:
+                if not previous.quimb_split_drivers:
+                    from . import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+                    lr.reset_quimb_torch_split_drivers()
+                previous.register()
+
+
+def get_torch_linalg_config():
+    """Return the last Pepsy Torch linalg policy, or ``None`` if unknown."""
+    return _ACTIVE_TORCH_LINALG_CONFIG
 
 def _patch_unhashable_device_namespace_key():
     """Patch autoray namespace cache keys for unhashable backend device objects."""
@@ -341,10 +540,76 @@ def backend_jax(device="cpu", dtype=None):
     return cast_array
 
 
+def _install_torch_linalg_config(config):
+    """Install one validated Torch linalg policy."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "Torch linalg configuration requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    # SVD registration: native Torch is the fast/default path, while the
+    # stabilized classes provide finite reverse-mode derivatives at repeated
+    # or tiny singular values. ``svd_driver`` and ``cpu_svd`` only select the
+    # forward decomposition; they do not silently change the tensor dtype.
+    fallback = config.resolved_svd_fallback
+    if config.stabilized:
+        if config.mode == "complex":
+            lr.reg_rel_svd_torch(
+                svd_driver=config.svd_driver,
+                cpu_svd=config.cpu_svd,
+                svd_fallback=fallback,
+            )
+        else:
+            lr.reg_real_svd_torch(
+                svd_driver=config.svd_driver,
+                cpu_svd=config.cpu_svd,
+                svd_fallback=fallback,
+            )
+        # QR registration: the real rule adds rank diagnostics and a finite
+        # VJP for singular pivots. Complex ordinary Autoray QR stays native
+        # for speed; its safe complex rule is used by the Quimb raw-block
+        # split path below when that path is enabled.
+        if config.mode == "real":
+            lr.reg_real_qr_torch(
+                rank_policy=config.qr_rank_policy,
+                rank_tol_factor=config.qr_rank_tol_factor,
+            )
+        else:
+            lr.reg_complex_qr_torch()
+    else:
+        lr.reg_native_svd_torch(
+            svd_driver=config.svd_driver,
+            cpu_svd=config.cpu_svd,
+        )
+        lr.reg_complex_qr_torch()
+
+    # Quimb registration: raw Symmray blocks bypass Autoray, so PEPS
+    # autodiff needs the same stabilized SVD/QR choices installed in Quimb's
+    # ``svd_truncated`` and ``qr_stabilized`` registries as well.
+    if config.quimb_split_drivers:
+        lr.reg_quimb_torch_split_drivers(
+            mode=config.mode,
+            svd_driver=config.svd_driver,
+            cpu_svd=config.cpu_svd,
+            # Quimb's optional raw-block driver is the stabilized custom
+            # split path even when the ordinary Autoray path is native.
+            svd_fallback=fallback if config.stabilized else "scipy_gesvd",
+        )
+
+    global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
+    _ACTIVE_TORCH_LINALG_CONFIG = config
+
+
 def register_torch_linalg(
     mode="complex",
     *,
     stabilized=False,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="auto",
+    allow_approximate=False,
     qr_rank_policy="warn",
     qr_rank_tol_factor=1.0,
     quimb_split_drivers=False,
@@ -362,6 +627,17 @@ def register_torch_linalg(
     stabilized : bool, default=False
         Keep native Torch SVD/QR by default. Set this to ``True`` to install
         Pepsy's relative-regularized SVD and validated real-QR rules.
+    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="auto"
+        CUDA cuSOLVER driver. ``"gesvda"`` is approximate and requires
+        ``allow_approximate=True``. CPU tensors ignore this option.
+    cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
+        CPU SVD implementation. SciPy choices are forward-only for native
+        ``stabilized=False`` registration, and require SciPy at runtime.
+    svd_fallback : {"auto", "none", "scipy_gesdd", "scipy_gesvd"}, default="auto"
+        SVD failure fallback. ``"auto"`` means ``"none"`` for native SVD and
+        ``"scipy_gesvd"`` for stabilized SVD.
+    allow_approximate : bool, default=False
+        Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
         Response to rank-deficient inputs when stabilized real QR is active.
     qr_rank_tol_factor : float, default=1.0
@@ -376,34 +652,18 @@ def register_torch_linalg(
         drivers unchanged; use :func:`reset_linalg_registrations` to restore
         Quimb's defaults explicitly.
     """
-    if torch is None:  # pragma: no cover - exercised in no-torch CI
-        raise ImportError(
-            "register_torch_linalg requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
-        )
-    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
-
-    if mode == "complex":
-        if stabilized:
-            lr.reg_rel_svd_torch()
-        else:
-            lr.reg_native_svd_torch()
-        lr.reg_complex_qr_torch()
-    elif mode == "real":
-        if stabilized:
-            lr.reg_real_svd_torch()
-            lr.reg_real_qr_torch(
-                rank_policy=qr_rank_policy,
-                rank_tol_factor=qr_rank_tol_factor,
-            )
-        else:
-            lr.reg_native_svd_torch()
-            lr.reg_complex_qr_torch()
-    else:
-        raise ValueError("mode must be 'complex' or 'real'")
-
-    if quimb_split_drivers:
-        lr.reg_quimb_torch_split_drivers(mode=mode)
+    config = TorchLinalgConfig(
+        mode=mode,
+        stabilized=stabilized,
+        svd_driver=svd_driver,
+        cpu_svd=cpu_svd,
+        svd_fallback=svd_fallback,
+        allow_approximate=allow_approximate,
+        qr_rank_policy=qr_rank_policy,
+        qr_rank_tol_factor=qr_rank_tol_factor,
+        quimb_split_drivers=quimb_split_drivers,
+    )
+    return config.register()
 
 
 def register_jax_linalg(*, stabilized=False):
@@ -454,6 +714,8 @@ def reset_linalg_registrations(backend="all"):
 
             lr.reset_torch_linalg_registrations()
             lr.reset_quimb_torch_split_drivers()
+            global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
+            _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig()
 
     if backend in {"jax", "all"}:
         try:
@@ -480,6 +742,8 @@ def reg_native_svd_torch():
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     lr.reg_native_svd_torch()
+    global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
+    _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig()
 
 
 def reg_native_svd_jax():
@@ -512,6 +776,11 @@ def reg_rel_svd_torch():
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     lr.reg_rel_svd_torch()
+    global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
+    _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig(
+        mode="complex",
+        stabilized=True,
+    )
 
 
 def reg_complex_svd_torch():
@@ -527,6 +796,11 @@ def reg_complex_svd_torch():
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     lr.reg_rel_svd_torch()
+    global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
+    _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig(
+        mode="complex",
+        stabilized=True,
+    )
 
 
 def reg_real_svd_torch():
@@ -547,6 +821,11 @@ def reg_real_svd_torch():
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     lr.reg_real_svd_torch()
+    global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
+    _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig(
+        mode="real",
+        stabilized=True,
+    )
 
 
 def reg_complex_qr_torch():
