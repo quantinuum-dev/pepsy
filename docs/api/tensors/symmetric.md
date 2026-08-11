@@ -933,6 +933,8 @@ helper tensors. ``mode="exact"`` is useful as a small-system reference.
 ``fit_block_size=2`` and can grow visited bonds without dense padding: the
 effective two-site tensor is split by Symmray's native block SVD, preserving
 U1/U1xU1 charges, dual legs, fermionic dummy modes, and graded phases.
+``fit_block_size=3`` is also available for a three-site effective tensor and
+performs two native block SVD splits with the same metadata preservation.
 `fit_target_strategy="auto"` deliberately selects the native routed-MPS target
 for these arrays; the lazy layered target optimization is currently limited to
 ordinary NumPy/Torch/CuPy tensors because graded gate-layer tagging needs a

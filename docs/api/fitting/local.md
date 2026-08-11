@@ -9,6 +9,21 @@ guess to a target tensor network. There are three sweep entry points:
 - `run_gate()` is the cached active-window solver used by MPS/MPO circuit FIT
   and by `fit_mode="two-site"` boundary contraction over the full interval.
 
+Choose the entry point by the scope of the fit:
+
+| Entry point | Scope | Typical consumer |
+| --- | --- | --- |
+| `run()` | Full chain, simple reference contractions | Debugging and compatibility checks |
+| `run_eff()` | Full chain, cached one-site environments | Boundary and sampling workflows |
+| `run_gate()` | `range_int` only, one-, two-, or three-site updates | MPS/MPO circuit compression |
+
+The distinction is deliberate: `run_eff()` must not replace `run_gate()` for a
+local gate target, because refitting sites outside the active interval changes
+the circuit-compression algorithm. The FIT implementation follows the same
+high-level order in each path: own and validate the target/state, prepare
+effective environments, update the requested sites, then record optional
+fidelity or timing diagnostics.
+
 For circuit compression, set `range_int=(xmin, xmax)` and use:
 
 ```python
@@ -35,11 +50,15 @@ fit.run_gate(
 compressed = fit.p
 ```
 
-`block_size=2` is recommended. Each update forms the two-site wavefunction
-with two outer virtual legs and both physical groups, then calls Quimb
-`Tensor.split` across the middle bond. This permits active rank growth and
-dispatches natively for dense NumPy/Torch/CuPy and Symmray U1/U1xU1 fermionic
-arrays. `block_size=1` retains the fixed-rank compatibility update.
+`block_size=2` is recommended for the usual DMRG compression. Each update
+forms the two-site wavefunction with two outer virtual legs and both physical
+groups, then calls Quimb `Tensor.split` across the middle bond. This permits
+active rank growth and dispatches natively for dense NumPy/Torch/CuPy and
+Symmray U1/U1xU1 fermionic arrays. `block_size=3` forms a three-site
+wavefunction and performs two direction-aware native SVD splits, while
+`block_size=1` retains the fixed-rank compatibility update. Three-site FIT is
+useful when a larger local window is worth the extra SVD cost; it is not a
+dense `from_dense` conversion.
 
 For an interval containing exactly one neighboring pair,
 `single_pair_fast_path=True` marks structural convergence after one update:
@@ -56,10 +75,21 @@ uses the general native-safe `"generic"` route. The two strategies implement
 the same objective for targets supported by both; the explicit setting is
 mainly useful for profiling and regression comparison.
 
+When consecutive sweeps reverse direction, `run_gate()` reuses the canonical
+form produced by the preceding block update instead of repeating the boundary
+canonicalization pass. The first sweep and consecutive same-direction sweeps
+still prepare their required gauge explicitly.
+
 With `timing=True`, `get_timing()` returns completed and failed partial sweep
-records, including direction, block size, environment strategy, pair/site
-times, and convergence status. Pair records break out effective contraction,
-SVD, writeback/norm, and moving-environment time. Add
+records, including a `timing_schema` version, direction, block size, active
+window size, update count, environment strategy, block/site times, and
+convergence status. Every update has the same four stage fields:
+`effective_seconds`, `svd_seconds`, `writeback_seconds`, and
+`environment_seconds`; one-site updates report `svd_seconds=0.0`. The sweep
+record aggregates each stage as well as `elapsed_seconds`, making one-, two-,
+and three-site runs directly comparable in benchmark output. Block records
+break out effective contraction, SVD, writeback/norm, and moving-environment
+time. Add
 `timing_sync_device=True` for device-complete Torch CUDA, CuPy, or JAX timing;
 normal runs never pay for these synchronization barriers. FIT also exposes
 `final_center_site`, `final_norm`, `final_direction`, and

@@ -26,6 +26,10 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Low-level backend and tensor-network helpers
+# ---------------------------------------------------------------------------
+
 def internal_inds(psi):
     """Return all internal (non-open) indices of ``psi``."""
     open_inds = psi.outer_inds()
@@ -82,7 +86,29 @@ def _synchronize_tensor_network(tn):
 
 
 class FIT:  # pylint: disable=too-many-instance-attributes
-    """Local tensor fitting of an MPS/MPO against a target tensor network.
+    """Variationally fit an open-boundary MPS or MPO to a target network.
+
+    ``FIT`` is the shared local-compression kernel used by MPS, MPO, PEPS
+    boundary, and sampling workflows.  The public sweep methods deliberately
+    represent three different workloads:
+
+    ``run``
+        Small, full-contraction reference solver.  It is useful for simple
+        compatibility paths and debugging, but it does not reuse environments.
+    ``run_eff``
+        Cached one-site solver for a complete MPS/MPO.  It is the historical
+        full-chain boundary/sampling path and keeps fixed-sweep semantics.
+    ``run_gate``
+        Cached active-window solver for circuit compression.  It only updates
+        ``range_int`` and optionally performs one-, two-, or three-site updates;
+        the block updates use native SVDs with adaptive convergence and timing
+        diagnostics.
+
+    The implementation is organized in four stages: input ownership and
+    tagging, effective-environment construction, one-, two-, or three-site
+    updates, and optional diagnostics. Keeping those responsibilities explicit
+    is important because the same class must support dense arrays, Torch/CuPy
+    arrays, and native Symmray tensors without converting or densifying them.
 
     Parameters
     ----------
@@ -119,7 +145,30 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Copy ``tn`` before its internal indices are randomized. Optimizer
         integrations that construct a disposable target can pass ``False``
         and transfer ownership, avoiding one complete target-network copy.
+
+    Attributes
+    ----------
+    tn : qtn.TensorNetwork
+        Owned target network. Its internal indices are randomized during
+        construction so it can safely share physical outer indices with ``p``.
+    p : qtn.MatrixProductState | qtn.MatrixProductOperator
+        Current fitted network. This is a copy unless ``inplace=True``.
+    range_int : list[int]
+        Inclusive active interval represented as ``[start, stop]`` for
+        :meth:`run_gate`; an empty list means no gate window was requested.
+    environment_strategy : {"mps-direct", "generic"}
+        Resolved effective-environment implementation selected during
+        construction.
+    timing_records : list[dict]
+        Copy-safe per-sweep timing records collected by ``run_gate(timing=True)``.
+    info : dict
+        Caller-owned diagnostics channel. Two- and three-site split metadata
+        is appended here when ``collect_split_diagnostics=True``.
     """
+
+    # ------------------------------------------------------------------
+    # Construction and configuration
+    # ------------------------------------------------------------------
 
     def __init__(
         self,
@@ -139,6 +188,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         copy_target: bool = True,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
 
+        # Validate the fitted network before taking ownership of either input.
         if p is None:
             raise ValueError("Initial MPS/MPO `p` must be provided for FIT.")
         if not isinstance(p, (qtn.MatrixProductState, qtn.MatrixProductOperator)):
@@ -152,11 +202,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         self.L = int(p.L)
 
+        # FIT owns the working state and, by default, its target.  The
+        # ``copy_target=False`` escape hatch is reserved for integrations that
+        # have already created a disposable target network.
         self.p = p if inplace else p.copy()
-
-        # Reindexing below is structural and therefore requires ownership.
-        # Public callers keep the safe copying default; MpsOptimizer hands FIT
-        # a freshly built disposable target and can transfer it explicitly.
         self.tn = tn.copy() if copy_target else tn
 
         if site_tag_id:
@@ -183,10 +232,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         self.site_tag_id = site_tag_id
 
-        # Contraction path optimizer spec.
+        # Store numerical and contraction controls before building caches.
         self.contraction_opt = contraction_opt
-
-        # cutoffs and underlying backend
         self.cutoffs = cutoffs
         self.backend = backend
 
@@ -196,11 +243,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 "environment_strategy must be 'auto', 'mps-direct', or 'generic'."
             )
 
-        # warnings being printed or not
+        # Initialize user-facing diagnostics. These values describe the most
+        # recent run and are reset by ``run_gate`` before a new sweep sequence.
         self.warning = warning
         self.timing_records: List[Dict[str, Any]] = []
-
-        # Diagnostics collected during sweeps.
         self.fidelity_trace: List[float] = []
         self.local_norm_trace: List[float] = []
         self.sweep_norm_trace: List[float] = []
@@ -212,8 +258,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.final_direction: Optional[str] = None
         self.final_norm = None
         self._timing_sync_device = False
-        # Preserve an explicitly supplied empty dictionary: callers use this
-        # object as a live diagnostics channel during and after a FIT run.
+        # Preserve an explicitly supplied empty dictionary: callers may use
+        # ``info`` as a live diagnostics channel during and after a run.
         self.info: Dict[str, Any] = info if info is not None else {}
         self.range_int: List[int] = list(range_int) if range_int is not None else []
         if self.range_int:
@@ -226,21 +272,21 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if start >= stop:
                 raise ValueError("range_int must satisfy start < stop.")
 
-
-        # Reindex tensor network with random UUIDs for internal indices
+        # Randomize only internal target indices. Physical outer indices must
+        # remain aligned with the fitted network for the overlap objective.
         self.tn.reindex_({idx: qtn.rand_uuid() for idx in self.tn.inner_inds()})
 
         if set(self.tn.outer_inds()) != set(self.p.outer_inds()):
             raise ValueError("tn and p have different outer indices.")
 
-        # Re-tag TN for effective environments when requested.
+        # Optional retagging makes layered or otherwise untagged targets
+        # compatible with the fitted network's site tags.
         if retag:
             self._re_tag()
 
         # Resolve the local contraction route only after reindexing and
-        # optional retagging. In particular, ``retag=True`` can turn an
-        # initially untagged dense MPS/MPO into a valid one-tensor-per-site
-        # target for the direct route.
+        # retagging. In particular, ``retag=True`` can turn an initially
+        # untagged dense target into a valid one-tensor-per-site cache.
         self._target_site_tensors = self._build_target_site_cache()
         direct_available = (
             self._target_site_tensors is not None
@@ -263,6 +309,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             or (environment_strategy == "auto" and direct_available)
             else "generic"
         )
+
+    # ------------------------------------------------------------------
+    # Target cache, public inspection, and visualization
+    # ------------------------------------------------------------------
 
     def _build_target_site_cache(self):
         """Return one target tensor per site, or ``None`` for a layered TN.
@@ -315,9 +365,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             highlight_inds=self.p.outer_inds(),
         )
 
-    # -------------------------
-    # Tagging methods
-    # -------------------------
+    # ------------------------------------------------------------------
+    # Target tagging and structural preparation
+    # ------------------------------------------------------------------
     def _deep_tag(self):
         """
         Propagates tags through the tensor network to ensure every tensor
@@ -379,7 +429,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             self._deep_tag()
 
     def run(self, n_iter=6, verbose=False):
-        """Run basic left-to-right local fitting sweeps.
+        """Run the simple full-contraction reference sweeps.
+
+        This is intentionally the least-specialized solver. It updates every
+        site left-to-right and contracts the complete local objective at each
+        update. Use :meth:`run_eff` for cached full-chain fitting or
+        :meth:`run_gate` for an active circuit window.
 
         Parameters
         ----------
@@ -422,6 +477,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if verbose:
                 fidelity = tn_fidelity(self.tn, psi)
                 self.fidelity_trace.append(ar.do("real", fidelity))
+
+    # ------------------------------------------------------------------
+    # Legacy full-chain solvers
+    # ------------------------------------------------------------------
 
     def _build_env_right(self, psi, env_right):
         """Build inclusive right environments for all sites.
@@ -569,6 +628,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if verbose:
                 fidelity = tn_fidelity(self.tn, psi)
                 self.fidelity_trace.append(ar.do("real", fidelity))
+
+    # ------------------------------------------------------------------
+    # Effective-environment and target assembly helpers
+    # ------------------------------------------------------------------
 
     def _target_components(self, sites, *, reindex=None):
         """Return target tensors for ``sites`` without changing the target.
@@ -733,7 +796,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         right_environment=None,
         output_inds,
     ):
-        """Form the one- or two-site variational target tensor."""
+        """Form the active one-, two-, or three-site variational target."""
         mapping = self._active_boundary_reindex(psi, sites, start, stop)
         components = self._target_components(sites, reindex=mapping)
         if left_environment is not None:
@@ -750,6 +813,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError("sweep_sequence must contain only 'R' and 'L'.")
         return sequence
 
+    # ------------------------------------------------------------------
+    # Active gate-window solver
+    # ------------------------------------------------------------------
+
     def _run_gate_one_site_sweep(
         self,
         psi,
@@ -758,19 +825,27 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         *,
         direction,
         timing_record,
+        reuse_canonical_form=False,
     ):
         """Perform one cached one-site FIT sweep in ``direction``."""
+        # An R sweep leaves every site strictly to the left of ``stop``
+        # left-canonical, and an L sweep leaves every site strictly to the
+        # right of ``start`` right-canonical. When the next sweep reverses
+        # direction, that is exactly the gauge preparation it needs. Reusing
+        # it avoids repeating a full boundary canonicalization pass.
         if direction == "R":
-            for site in range(stop, start, -1):
-                psi.right_canonize_site(site, bra=None)
+            if not reuse_canonical_form:
+                for site in range(stop, start, -1):
+                    psi.right_canonize_site(site, bra=None)
             fixed_environments = self._build_active_environments(
                 psi, start, stop, "R"
             )
             moving_environments = {}
             sites = range(start, stop + 1)
         else:
-            for site in range(start, stop):
-                psi.left_canonize_site(site, bra=None)
+            if not reuse_canonical_form:
+                for site in range(start, stop):
+                    psi.left_canonize_site(site, bra=None)
             fixed_environments = self._build_active_environments(
                 psi, start, stop, "L"
             )
@@ -801,8 +876,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             norm_f = (f.H & f).contract(
                 all, optimize=self.contraction_opt
             ) ** 0.5
+            effective_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
             self.local_norm_trace.append(ar.do("real", norm_f))
             psi[site].modify(data=f.data)
+            writeback_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
 
             if direction == "R" and site < stop:
                 psi.left_canonize_site(site, bra=None)
@@ -824,14 +905,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
 
             if timing_record is not None:
-                site_finished = self._timing_mark()
+                environment_finished = self._timing_mark()
                 timing_record["site_timings"].append(
                     {
                         "site": int(site),
                         "sites": (int(site),),
                         "block_size": 1,
+                        "effective_seconds": float(
+                            effective_finished - site_started
+                        ),
+                        "svd_seconds": 0.0,
+                        "writeback_seconds": float(
+                            writeback_finished - effective_finished
+                        ),
+                        "environment_seconds": float(
+                            environment_finished - writeback_finished
+                        ),
                         "elapsed_seconds": float(
-                            site_finished - site_started
+                            environment_finished - site_started
                         ),
                     }
                 )
@@ -848,6 +939,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         cutoff_mode,
         timing_record,
         collect_split_diagnostics,
+        reuse_canonical_form=False,
     ):
         """Optimize dense two-site wavefunctions and split their middle bond.
 
@@ -856,17 +948,22 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         for U1, U1xU1, and fermionic arrays. Calling ``numpy.linalg.svd`` would
         silently destroy charge sectors, dual-leg metadata, and graded signs.
         """
+        # The previous opposite-direction sweep already produced the
+        # canonical gauge required here. Same-direction sweeps, and the first
+        # sweep of a run, still perform the explicit preparation pass.
         if direction == "R":
-            for site in range(stop, start, -1):
-                psi.right_canonize_site(site, bra=None)
+            if not reuse_canonical_form:
+                for site in range(stop, start, -1):
+                    psi.right_canonize_site(site, bra=None)
             fixed_environments = self._build_active_environments(
                 psi, start, stop, "R"
             )
             moving_environments = {}
             pairs = ((site, site + 1) for site in range(start, stop))
         else:
-            for site in range(start, stop):
-                psi.left_canonize_site(site, bra=None)
+            if not reuse_canonical_form:
+                for site in range(start, stop):
+                    psi.left_canonize_site(site, bra=None)
             fixed_environments = self._build_active_environments(
                 psi, start, stop, "L"
             )
@@ -996,6 +1093,268 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
 
+    def _run_gate_three_site_sweep(
+        self,
+        psi,
+        start,
+        stop,
+        *,
+        direction,
+        max_bond,
+        cutoff,
+        cutoff_mode,
+        timing_record,
+        collect_split_diagnostics,
+        reuse_canonical_form=False,
+    ):
+        """Optimize three-site wavefunctions using two native SVD splits.
+
+        The effective tensor is formed exactly like the two-site update, but
+        its three physical site groups are split sequentially. In an ``R``
+        sweep the first split makes the left site left-canonical and the
+        second split makes the middle site left-canonical. In an ``L`` sweep
+        the order is reversed, leaving the right site(s) right-canonical and
+        the leftmost site as the retained center. No dense MPS conversion is
+        used, so the same path remains available to Torch, CuPy, Symmray, and
+        fermionic tensor backends.
+        """
+        # As with the one- and two-site paths, an opposite-direction sweep
+        # can consume the canonical form produced by the previous sweep.
+        if direction == "R":
+            if not reuse_canonical_form:
+                for site in range(stop, start, -1):
+                    psi.right_canonize_site(site, bra=None)
+            fixed_environments = self._build_active_environments(
+                psi, start, stop, "R"
+            )
+            moving_environments = {}
+            blocks = (
+                (site, site + 1, site + 2)
+                for site in range(start, stop - 1)
+            )
+        else:
+            if not reuse_canonical_form:
+                for site in range(start, stop):
+                    psi.left_canonize_site(site, bra=None)
+            fixed_environments = self._build_active_environments(
+                psi, start, stop, "L"
+            )
+            moving_environments = {}
+            blocks = (
+                (site, site + 1, site + 2)
+                for site in range(stop - 2, start - 1, -1)
+            )
+
+        for left_site, middle_site, right_site in blocks:
+            site_started = self._timing_mark() if timing_record is not None else None
+            left_tensor = psi[left_site]
+            middle_tensor = psi[middle_site]
+            right_tensor = psi[right_site]
+            (left_bond,) = left_tensor.bonds(middle_tensor)
+            (right_bond,) = middle_tensor.bonds(right_tensor)
+            left_inds = tuple(
+                index for index in left_tensor.inds if index != left_bond
+            )
+            middle_inds = tuple(
+                index
+                for index in middle_tensor.inds
+                if index not in (left_bond, right_bond)
+            )
+            right_inds = tuple(
+                index for index in right_tensor.inds if index != right_bond
+            )
+            left_environment = (
+                moving_environments.get(left_site - 1)
+                if direction == "R"
+                else fixed_environments.get(left_site - 1)
+            )
+            right_environment = (
+                fixed_environments.get(right_site + 1)
+                if direction == "R"
+                else moving_environments.get(right_site + 1)
+            )
+            theta = self._effective_tensor(
+                psi,
+                (left_site, middle_site, right_site),
+                start,
+                stop,
+                left_environment=left_environment,
+                right_environment=right_environment,
+                output_inds=left_inds + middle_inds + right_inds,
+            )
+            effective_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
+
+            split_info_left = {} if collect_split_diagnostics else None
+            split_info_right = {} if collect_split_diagnostics else None
+            if direction == "R":
+                new_left, middle_right = theta.split(
+                    left_inds=left_inds,
+                    right_inds=middle_inds + right_inds,
+                    method="svd",
+                    absorb="right",
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    bond_ind=left_bond,
+                    ltags=left_tensor.tags,
+                    rtags=middle_tensor.tags | right_tensor.tags,
+                    get="tensors",
+                    info=split_info_left,
+                )
+                middle_left_inds = tuple(
+                    index
+                    for index in middle_right.inds
+                    if index in (set(middle_inds) | {left_bond})
+                )
+                new_middle, new_right = middle_right.split(
+                    left_inds=middle_left_inds,
+                    right_inds=right_inds,
+                    method="svd",
+                    absorb="right",
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    bond_ind=right_bond,
+                    ltags=middle_tensor.tags,
+                    rtags=right_tensor.tags,
+                    get="tensors",
+                    info=split_info_right,
+                )
+            else:
+                left_middle, new_right = theta.split(
+                    left_inds=left_inds + middle_inds,
+                    right_inds=right_inds,
+                    method="svd",
+                    absorb="left",
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    bond_ind=right_bond,
+                    ltags=left_tensor.tags | middle_tensor.tags,
+                    rtags=right_tensor.tags,
+                    get="tensors",
+                    info=split_info_right,
+                )
+                middle_right_inds = tuple(
+                    index
+                    for index in left_middle.inds
+                    if index in (set(middle_inds) | {right_bond})
+                )
+                new_left, new_middle = left_middle.split(
+                    left_inds=left_inds,
+                    right_inds=middle_right_inds,
+                    method="svd",
+                    absorb="left",
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    bond_ind=left_bond,
+                    ltags=left_tensor.tags,
+                    rtags=middle_tensor.tags,
+                    get="tensors",
+                    info=split_info_left,
+                )
+            split_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
+
+            new_left.transpose_like_(left_tensor)
+            new_middle.transpose_like_(middle_tensor)
+            new_right.transpose_like_(right_tensor)
+            left_tensor.modify(
+                data=new_left.data,
+                left_inds=new_left.left_inds,
+            )
+            middle_tensor.modify(
+                data=new_middle.data,
+                left_inds=new_middle.left_inds,
+            )
+            right_tensor.modify(
+                data=new_right.data,
+                left_inds=new_right.left_inds,
+            )
+
+            # The final sweep-facing tensor carries the retained center norm
+            # after both truncations, just as in the two-site path.
+            center = right_tensor if direction == "R" else left_tensor
+            self.local_norm_trace.append(ar.do("real", center.norm()))
+            if collect_split_diagnostics:
+                self.info.setdefault("three_site_splits", []).append(
+                    {
+                        "sites": (
+                            int(left_site),
+                            int(middle_site),
+                            int(right_site),
+                        ),
+                        "direction": direction,
+                        "bonds": (left_bond, right_bond),
+                        "bond_dims": (
+                            int(psi.bond_size(left_site, middle_site)),
+                            int(psi.bond_size(middle_site, right_site)),
+                        ),
+                        "max_bond": (
+                            None if max_bond is None else int(max_bond)
+                        ),
+                        "cutoff": float(cutoff),
+                        "cutoff_mode": str(cutoff_mode),
+                        "truncation_errors": (
+                            split_info_left.get("error"),
+                            split_info_right.get("error"),
+                        ),
+                    }
+                )
+            writeback_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
+
+            if direction == "R":
+                moving_environments[left_site] = self._overlap_environment_site(
+                    psi,
+                    left_site,
+                    start,
+                    stop,
+                    prior=moving_environments.get(left_site - 1),
+                )
+            else:
+                moving_environments[right_site] = self._overlap_environment_site(
+                    psi,
+                    right_site,
+                    start,
+                    stop,
+                    prior=moving_environments.get(right_site + 1),
+                )
+
+            if timing_record is not None:
+                environment_finished = self._timing_mark()
+                timing_record["site_timings"].append(
+                    {
+                        "site": int(left_site),
+                        "sites": (
+                            int(left_site),
+                            int(middle_site),
+                            int(right_site),
+                        ),
+                        "block_size": 3,
+                        "effective_seconds": float(
+                            effective_finished - site_started
+                        ),
+                        "svd_seconds": float(
+                            split_finished - effective_finished
+                        ),
+                        "writeback_seconds": float(
+                            writeback_finished - split_finished
+                        ),
+                        "environment_seconds": float(
+                            environment_finished - writeback_finished
+                        ),
+                        "elapsed_seconds": float(
+                            environment_finished - site_started
+                        ),
+                    }
+                )
+
     def run_gate(
         self,
         n_iter=6,
@@ -1021,9 +1380,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         DMRG/FIT update. ``block_size=1`` updates one tensor with fixed bond
         dimensions. ``block_size=2`` forms a wavefunction tensor with the two
         outer virtual legs and both sites' physical legs, then performs a
-        native SVD across the middle bond. The latter can discover and grow
-        useful bond subspaces up to ``max_bond`` without globally padding the
-        MPS.
+        native SVD across the middle bond. ``block_size=3`` forms the analogous
+        three-site tensor and performs two direction-aware native SVDs. The
+        block updates can discover and grow useful bond subspaces up to
+        ``max_bond`` without globally padding the MPS.
 
         ``run_eff`` implements the same environment-reuse idea for a complete
         MPS. Keeping this method separate is intentional: MpsOptimizer uses
@@ -1047,8 +1407,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
-        if not isinstance(block_size, Integral) or int(block_size) not in {1, 2}:
-            raise ValueError("block_size must be 1 or 2.")
+        if not isinstance(block_size, Integral) or int(block_size) not in {1, 2, 3}:
+            raise ValueError("block_size must be 1, 2, or 3.")
         block_size = int(block_size)
         sweep_sequence = self._validate_sweep_sequence(sweep_sequence)
         if max_bond is not None:
@@ -1110,11 +1470,20 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"range_int={self.range_int} is out of bounds for L={L}.")
         if stop == start:
             raise ValueError("run_gate requires range_int spanning at least two sites.")
+        if block_size == 3 and stop - start + 1 < 3:
+            raise ValueError(
+                "block_size=3 requires range_int to span at least three sites."
+            )
 
         previous_sweep_norm = None
         stable_sweeps = 0
+        previous_direction = None
         for sweep in range(1, n_iter + 1):
             direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
+            reuse_canonical_form = (
+                previous_direction is not None
+                and previous_direction != direction
+            )
             sweep_timing = self._start_timing_record(
                 sweep,
                 timing,
@@ -1131,19 +1500,35 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         stop,
                         direction=direction,
                         timing_record=sweep_timing,
+                        reuse_canonical_form=reuse_canonical_form,
                     )
                 else:
-                    self._run_gate_two_site_sweep(
-                        psi,
-                        start,
-                        stop,
-                        direction=direction,
-                        max_bond=max_bond,
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                        timing_record=sweep_timing,
-                        collect_split_diagnostics=collect_split_diagnostics,
-                    )
+                    if block_size == 2:
+                        self._run_gate_two_site_sweep(
+                            psi,
+                            start,
+                            stop,
+                            direction=direction,
+                            max_bond=max_bond,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            timing_record=sweep_timing,
+                            collect_split_diagnostics=collect_split_diagnostics,
+                            reuse_canonical_form=reuse_canonical_form,
+                        )
+                    else:
+                        self._run_gate_three_site_sweep(
+                            psi,
+                            start,
+                            stop,
+                            direction=direction,
+                            max_bond=max_bond,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            timing_record=sweep_timing,
+                            collect_split_diagnostics=collect_split_diagnostics,
+                            reuse_canonical_form=reuse_canonical_form,
+                        )
 
                 self.final_direction = direction
                 self.final_center_site = stop if direction == "R" else start
@@ -1230,10 +1615,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     self._finish_timing_record(sweep_timing, status="failed")
                 raise
             else:
+                previous_direction = direction
                 if sweep_timing is not None:
                     self._finish_timing_record(sweep_timing, status="complete")
                 if should_stop:
                     break
+
+    # ------------------------------------------------------------------
+    # Timing and diagnostics
+    # ------------------------------------------------------------------
 
     def _start_timing_record(
         self,
@@ -1248,8 +1638,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             return None
         started = self._timing_mark()
         return {
+            "timing_schema": 2,
             "sweep": int(sweep),
             "range_int": tuple(self.range_int),
+            "active_site_count": int(self.range_int[1] - self.range_int[0] + 1),
             "direction": str(direction),
             "block_size": int(block_size),
             "environment_strategy": self.environment_strategy,
@@ -1267,6 +1659,16 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         record["site_elapsed_seconds"] = float(
             sum(site["elapsed_seconds"] for site in record["site_timings"])
         )
+        record["update_count"] = record["site_count"]
+        for stage in (
+            "effective_seconds",
+            "svd_seconds",
+            "writeback_seconds",
+            "environment_seconds",
+        ):
+            record[stage] = float(
+                sum(site.get(stage, 0.0) for site in record["site_timings"])
+            )
         record["non_site_elapsed_seconds"] = max(
             0.0,
             record["elapsed_seconds"] - record["site_elapsed_seconds"],

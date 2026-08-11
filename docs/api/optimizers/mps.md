@@ -106,12 +106,17 @@ the MPS by one site.
 to native two-site FIT. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
 to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
-not need an MPO rank warm-up. `fit_block_size=1` retains the fixed-rank
-compatibility algorithm, for which mixed mode still warms short active bonds
-through MPO. Standalone one-site gates use the exact direct/MPO path; ordinary
-DMRG target blocks can absorb intervening one-site gates before the block's
-shared compression. `fit_layer_size` is the clear name for `k_2q_batch`; it
-counts two-site gates in a contiguous paper-style target block. If a DMRG/FIT batch
+not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
+wavefunction and two direction-aware native SVD splits, and is useful when a
+larger local window is worth the extra decomposition cost. An adjacent
+two-site gate span automatically falls back to `fit_block_size=2`. Both block
+sizes preserve native dense and Symmray backends. `fit_block_size=1` retains
+the fixed-rank compatibility algorithm, for which mixed mode still warms short
+active bonds through MPO. Standalone one-site gates use the exact direct/MPO
+path; ordinary DMRG target blocks can absorb intervening one-site gates before
+the block's shared compression. `fit_layer_size` is the clear name for
+`k_2q_batch`; it counts two-site gates in a contiguous paper-style target
+block. If a DMRG/FIT batch
 raises, produces non-finite data, or exceeds `chi`, the optimizer restores the
 complete pre-batch state (including canonical and infidelity metadata) and
 replays the batch through MPO. Interrupts restore the trial state and are
@@ -146,12 +151,14 @@ transfer one Boolean to the host.
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
 the effective tensor is built from cached contractions on the left and right,
-then the MPS is swept repeatedly. Recommended `fit_block_size=2` forms a local
-wavefunction with the two outer virtual legs and both sites' physical groups,
-then splits its middle bond with `Tensor.split`. This dispatches to configured
-dense SVD drivers and, crucially, Symmray's native block SVD for U1, U1xU1,
-and fermionic tensors. `fit_sweep_sequence="RL"` alternates canonical
-directions; `"R"` preserves a one-way sweep when required.
+then the MPS is swept repeatedly. Recommended `fit_block_size=2` forms a
+local wavefunction with the two outer virtual legs and both sites' physical
+groups, then splits its middle bond with `Tensor.split`. `fit_block_size=3`
+forms the analogous three-site tensor and splits it twice, absorbing singular
+values toward the sweep direction. Both dispatch to configured dense SVD
+drivers and, crucially, Symmray's native block SVD for U1, U1xU1, and fermionic
+tensors. `fit_sweep_sequence="RL"` alternates canonical directions; `"R"`
+preserves a one-way sweep when required.
 
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
@@ -210,10 +217,11 @@ overlap with the mode replay total; use them to identify the dominant work,
 not to add into a second total. DMRG and mixed-mode timing also exposes
 `fit_steps`: one record per completed or failed FIT sweep, including its FIT
 call index, global record index, direction, block size, active interval, sweep
-time, per-site/pair update times, and non-site sweep overhead. Two-site pair
-records separate effective-environment contraction, native SVD, writeback/norm,
-and moving-environment time. Ordinary runs retain no per-gate timer overhead.
-These are host wall-clock measurements by default. Use
+time, per-site/block update times, and non-site sweep overhead. Every block
+size reports effective-environment contraction, native SVD, writeback/norm, and
+moving-environment time; one-site records use `svd_seconds=0.0`. Ordinary runs
+retain no per-gate timer overhead. These are host wall-clock measurements by
+default. Use
 `run(timing=True, timing_sync_device=True)` for kernel-complete Torch CUDA,
 CuPy, or JAX timings; the added barriers intentionally make profiling slower
 and are recorded as `timing_sync_device=True` in both replay and FIT records.
@@ -297,7 +305,7 @@ trace as the current retained norm.
 Temporary fallback targets never modify the live `info_c` cache.
 When tracking is enabled, the `mpo`, `swap`, and `svd` progress bars show the
 same cumulative `infidelity` field, starting at zero before the first
-compressed two-site gate.
+compressed gate.
 `mode="exact"` and `mode="su"` deliberately skip canonical metadata; switching back to an MPS
 mode rebuilds and canonicalizes the contracted state.
 
@@ -312,8 +320,8 @@ opt.get_normalizations()      # scale events and accumulated exponents
 opt.reset_infidelity_tracking()  # start a new fidelity accounting interval
 ```
 
-When enabled, infidelity is recorded automatically whenever a compressed
-two-site update occurs. `get_infidelities()` is the cheap cumulative trace for
+When enabled, infidelity is recorded automatically whenever a compressed gate
+update occurs. `get_infidelities()` is the cheap cumulative trace for
 progress and stopping criteria. Use
 `get_infidelity_samples()` when the target norm, retained norm, local ratio, or
 step metadata is needed.

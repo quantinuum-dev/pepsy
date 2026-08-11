@@ -76,6 +76,22 @@ def _nonuniform_product_mps():
     )
 
 
+def _three_site_ghz_target():
+    """Return a four-site GHZ-like target embedded in a five-site MPS."""
+    state = qtn.MPS_computational_state("00000", dtype="complex128")
+    target = state.copy()
+    target.gate_(qu.hadamard(), 0, contract=True)
+    for where in ((0, 1), (1, 2), (2, 3)):
+        target.gate_(
+            qu.CNOT(),
+            where,
+            contract="split",
+            max_bond=2,
+            cutoff=0.0,
+        )
+    return state, target
+
+
 def _assert_event_sites_locally_normalized(mps, event):
     """Check that every tensor rescaled by an event has local norm one."""
     for site in event["sites"]:
@@ -829,6 +845,20 @@ def test_fit_gate_timing_records_sweep_and_site_steps():
     assert all(record["status"] == "complete" for record in records)
     assert all(record["range_int"] == (0, 2) for record in records)
     assert all(record["site_count"] == 3 for record in records)
+    assert all(record["timing_schema"] == 2 for record in records)
+    assert all(record["active_site_count"] == 3 for record in records)
+    assert all(record["update_count"] == 3 for record in records)
+    assert all(record["svd_seconds"] == 0.0 for record in records)
+    assert all(
+        {
+            "effective_seconds",
+            "svd_seconds",
+            "writeback_seconds",
+            "environment_seconds",
+        }.issubset(site_timing)
+        for record in records
+        for site_timing in record["site_timings"]
+    )
 
 
 def test_fit_gate_two_site_grows_only_active_bonds():
@@ -863,6 +893,145 @@ def test_fit_gate_two_site_grows_only_active_bonds():
         abs=1.0e-10,
     )
     assert [record["direction"] for record in fit.get_timing()] == []
+
+
+def test_fit_gate_three_site_native_splits_and_keeps_outside_bonds():
+    """Three-site FIT should use two native splits within the active window."""
+    initial, target = _three_site_ghz_target()
+    fit = py.FIT(target, p=initial, range_int=[0, 3])
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=3,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+        timing=True,
+    )
+
+    assert float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+    assert fit.p.bond_size(3, 4) == 1
+    assert len(fit.info["three_site_splits"]) == 4
+    assert all(
+        len(record["truncation_errors"]) == 2
+        for record in fit.info["three_site_splits"]
+    )
+    timing = fit.get_timing()
+    assert [record["direction"] for record in timing] == ["R", "L"]
+    assert all(record["block_size"] == 3 for record in timing)
+    assert all(
+        len(site_timing["sites"]) == 3
+        for record in timing
+        for site_timing in record["site_timings"]
+    )
+
+
+@pytest.mark.parametrize("block_size", [1, 2, 3])
+def test_fit_gate_large_window_block_sizes_compare_with_timing(block_size):
+    """Large active windows compare rank growth and expose benchmark stages."""
+    length = 14
+    max_bond = 8
+    initial = qtn.MPS_rand_state(
+        length,
+        bond_dim=1,
+        phys_dim=2,
+        dtype="complex128",
+        seed=921,
+    )
+    target = qtn.MPS_rand_state(
+        length,
+        bond_dim=max_bond,
+        phys_dim=2,
+        dtype="complex128",
+        seed=922,
+    )
+    fit = py.FIT(target, p=initial, range_int=[0, length - 1], cutoffs=1.0e-10)
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=block_size,
+        sweep_sequence="RL",
+        max_bond=max_bond,
+        cutoff=1.0e-10,
+        timing=True,
+    )
+
+    fidelity = float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    )
+    records = fit.get_timing()
+    assert [record["direction"] for record in records] == ["R", "L"]
+    assert all(record["timing_schema"] == 2 for record in records)
+    assert all(record["active_site_count"] == length for record in records)
+    assert all(record["block_size"] == block_size for record in records)
+    assert all(
+        record["update_count"] == length - block_size + 1 for record in records
+    )
+    assert all(
+        all(
+            site_timing[stage] >= 0.0
+            for site_timing in record["site_timings"]
+            for stage in (
+                "effective_seconds",
+                "svd_seconds",
+                "writeback_seconds",
+                "environment_seconds",
+            )
+        )
+        for record in records
+    )
+    assert all(
+        record["svd_seconds"]
+        == pytest.approx(
+            sum(site_timing["svd_seconds"] for site_timing in record["site_timings"])
+        )
+        for record in records
+    )
+
+    if block_size == 1:
+        assert fit.p.max_bond() == 1
+        assert fidelity < 0.1
+    elif block_size == 2:
+        assert 1 < fit.p.max_bond() < max_bond
+        assert 0.4 < fidelity < 0.9
+    else:
+        assert fit.p.max_bond() == max_bond
+        assert fidelity > 0.99
+
+
+def test_fit_gate_three_site_direct_and_generic_routes_match():
+    """Three-site dense direct environments must match the generic route."""
+    initial, target = _three_site_ghz_target()
+    options = {
+        "n_iter": 2,
+        "block_size": 3,
+        "sweep_sequence": "RL",
+        "max_bond": 2,
+        "cutoff": 0.0,
+    }
+    direct = py.FIT(
+        target,
+        p=initial,
+        range_int=[0, 3],
+        environment_strategy="mps-direct",
+    )
+    generic = py.FIT(
+        target,
+        p=initial,
+        range_int=[0, 3],
+        environment_strategy="generic",
+    )
+
+    direct.run_gate(**options)
+    generic.run_gate(**options)
+
+    assert np.allclose(
+        direct.p.to_dense(),
+        generic.p.to_dense(),
+        atol=1.0e-10,
+    )
 
 
 def test_fit_dense_direct_environment_matches_generic_route():
@@ -1135,6 +1304,59 @@ def test_fit_gate_two_site_timing_reports_pairs_and_directions():
     )
 
 
+def test_fit_alternating_sweeps_reuse_opposite_canonical_form(monkeypatch):
+    """An R/L pair should not repeat the canonicalization boundary pass."""
+    initial = qtn.MPS_rand_state(
+        5, bond_dim=2, phys_dim=2, dtype="complex128", seed=220
+    )
+    target = initial.copy()
+    target.gate_nonlocal_(
+        qu.CNOT(),
+        (0, 3),
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+    options = {
+        "block_size": 2,
+        "max_bond": 3,
+        "cutoff": 1.0e-12,
+    }
+
+    # Two separate calls intentionally force the old, conservative
+    # preparation pass before the L sweep and provide a numerical reference.
+    reference = py.FIT(target, p=initial.copy(), range_int=[0, 3])
+    reference.run_gate(n_iter=1, sweep_sequence="R", **options)
+    reference.run_gate(n_iter=1, sweep_sequence="L", **options)
+
+    counts = {"left": 0, "right": 0}
+    original_left = qtn.MatrixProductState.left_canonize_site
+    original_right = qtn.MatrixProductState.right_canonize_site
+
+    def count_left(state, *args, **kwargs):
+        counts["left"] += 1
+        return original_left(state, *args, **kwargs)
+
+    def count_right(state, *args, **kwargs):
+        counts["right"] += 1
+        return original_right(state, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductState, "left_canonize_site", count_left)
+    monkeypatch.setattr(qtn.MatrixProductState, "right_canonize_site", count_right)
+
+    optimized = py.FIT(target, p=initial.copy(), range_int=[0, 3])
+    optimized.run_gate(n_iter=2, sweep_sequence="RL", **options)
+
+    # The first R sweep prepares sites 3, 2, and 1. The following L sweep
+    # consumes the canonical form produced by the R sweep's SVDs directly.
+    assert counts == {"left": 0, "right": 3}
+    assert np.allclose(
+        optimized.p.to_dense(),
+        reference.p.to_dense(),
+        atol=1.0e-10,
+    )
+
+
 def test_dmrg_synchronized_timing_marks_device_complete_stages(monkeypatch):
     """Opt-in synchronized profiling should be visible in every timing layer."""
     synchronizations = []
@@ -1253,6 +1475,166 @@ def test_dmrg_torch_complex64_two_site_fit_grows_native_dense_bond():
     assert out.max_bond() == 2
     assert all(tensor.data.dtype == torch.complex64 for tensor in out.tensors)
     assert np.allclose(out.to_dense().cpu().numpy().reshape(-1), expected, atol=2.0e-6)
+
+
+def test_fit_gate_three_site_torch_complex64_uses_native_splits():
+    """Torch complex64 three-site FIT should preserve the backend dtype."""
+    torch = pytest.importorskip("torch")
+    initial, target = _three_site_ghz_target()
+    initial.apply_to_arrays(py.backend_torch(dtype=torch.complex64, device="cpu"))
+    target.apply_to_arrays(py.backend_torch(dtype=torch.complex64, device="cpu"))
+    fit = py.FIT(target, p=initial, range_int=[0, 3])
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=3,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+    )
+
+    assert all(tensor.data.dtype == torch.complex64 for tensor in fit.p.tensors)
+    assert np.allclose(
+        fit.p.to_dense().cpu().numpy(),
+        target.to_dense().cpu().numpy(),
+        atol=2.0e-5,
+    )
+
+
+def test_fit_gate_three_site_symmray_uses_native_block_splits():
+    """Symmray three-site FIT should preserve charge and fermionic blocks."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        3,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0)),
+        seed=1,
+        dtype="complex128",
+    )
+    fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
+
+    fit.run_gate(
+        n_iter=1,
+        block_size=3,
+        sweep_sequence="R",
+        max_bond=4,
+        cutoff=0.0,
+    )
+
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray"
+        for tensor in fit.p.tensors
+    )
+    assert fit.info["three_site_splits"][0]["truncation_errors"] == (
+        0.0,
+        0.0,
+    )
+
+
+def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
+    """MpsOptimizer should use three-site FIT and shorten adjacent windows."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="dmrg",
+    )
+    optimizer.run(
+        progbar=False,
+        n_iter=1,
+        fit_rtol=None,
+        fit_block_size=3,
+        timing=True,
+    )
+    assert optimizer._last_dmrg_fit_diagnostics["block_size"] == 3
+    assert optimizer.get_run_timing()["fit_steps"][0]["block_size"] == 3
+
+    adjacent = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+    adjacent.run(
+        progbar=False,
+        n_iter=1,
+        fit_rtol=None,
+        fit_block_size=3,
+        timing=True,
+    )
+    assert adjacent._last_dmrg_fit_diagnostics["block_size"] == 2
+
+
+def test_mps_optimizer_fit_block_sizes_report_warm_start_infidelity():
+    """A warm-started bond space lets every FIT block solve the update."""
+    length = 8
+    where = (0, length - 1)
+    state = qtn.MPS_computational_state("0" * length, dtype="complex128")
+    state.gate_(qu.hadamard(), 0, contract=True)
+    state.gate_nonlocal_(
+        qu.CNOT(),
+        where,
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+    target = state.copy()
+    target.gate_nonlocal_(
+        qu.CNOT(),
+        where,
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+
+    results = {}
+    for block_size in (1, 2, 3):
+        optimizer = py.MpsOptimizer(
+            state.copy(),
+            gates=[(qu.CNOT(), where)],
+            chi=2,
+            mode="dmrg",
+        )
+        optimizer.run(
+            progbar=False,
+            n_iter=4,
+            fit_rtol=None,
+            fit_block_size=block_size,
+            cutoff=0.0,
+            target_cutoff=0.0,
+            fit_single_pair_fast_path=False,
+            timing=True,
+        )
+        actual_fidelity = float(
+            np.real(py.tn_fidelity(optimizer.p, target, contraction_opt="greedy"))
+        )
+        timing = optimizer.get_run_timing()
+        results[block_size] = {
+            "reported_infidelity": optimizer.get_infidelities()[-1],
+            "actual_infidelity": 1.0 - actual_fidelity,
+            "samples": optimizer.get_infidelity_samples(),
+            "timing": timing,
+        }
+
+    for result in results.values():
+        assert result["reported_infidelity"] == pytest.approx(0.0, abs=1.0e-10)
+    for block_size, result in results.items():
+        assert result["reported_infidelity"] == pytest.approx(
+            result["actual_infidelity"], abs=1.0e-10
+        )
+        assert len(result["samples"]) == 1
+        assert all(
+            step["local_infidelity"] >= 0.0 for step in result["samples"]
+        )
+        assert result["timing"]["fit_steps"]
+        assert {
+            step["block_size"] for step in result["timing"]["fit_steps"]
+        } == {block_size}
 
 
 def test_unitary_fit_stabilization_preserves_recorded_compression_loss():

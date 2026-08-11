@@ -786,6 +786,18 @@ def test_peps_norm_can_return_typed_fit_convergence_and_timing():
             "R",
             "L",
         ]
+        assert all(record["timing_schema"] == 2 for record in diagnostic.sweep_timings)
+        assert all(record["active_site_count"] == 3 for record in diagnostic.sweep_timings)
+        assert all(
+            record["svd_seconds"]
+            == pytest.approx(
+                sum(
+                    site_timing["svd_seconds"]
+                    for site_timing in record["site_timings"]
+                )
+            )
+            for record in diagnostic.sweep_timings
+        )
 
 
 def test_peps_norm_fit_diagnostics_are_cheap_without_timing():
