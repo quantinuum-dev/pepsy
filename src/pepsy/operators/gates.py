@@ -2104,6 +2104,10 @@ def gate_loop_cluster(
     gauges=None,
     *,
     boundary_messages=None,
+    input_mode: str = "auto",
+    run_bp: bool = True,
+    bp_runner: str = "plain",
+    bp_opts=None,
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
     which=None,
@@ -2116,6 +2120,10 @@ def gate_loop_cluster(
     psd_project: bool = True,
     psd_floor: float = 0.0,
     optimize="auto-hq",
+    cost_check: bool = False,
+    max_flops_log10: float | None = None,
+    max_peak_memory_log2: float | None = None,
+    on_budget: str = "raise",
     smudge: float = 0.0,
     als_opts=None,
     regauge_opts=None,
@@ -2127,8 +2135,11 @@ def gate_loop_cluster(
     This is the gate-stream bridge for
     :func:`pepsy.bp.apply_reduced_loop_cluster_gate`. Adjacent two-site gates
     are updated by the open-leg loop-cluster metric and re-gauged into the
-    supplied SU ``gauges`` dictionary. Alternatively, pass frozen directed
-    D2BP ``boundary_messages`` keyed by ``(bond_index, destination_tid)``;
+    supplied SU ``gauges`` dictionary. ``input_mode="su_core"`` makes that
+    representation explicit; ``input_mode="physical"`` treats gauges as
+    boundary-only closures for an already gauged network. Alternatively, pass
+    frozen directed D2BP ``boundary_messages`` keyed by
+    ``(bond_index, destination_tid)``;
     these close the omitted cluster boundary and are copied by the reduced
     update and PSD-projected by default. Set ``message_psd_project=False`` for
     diagnostic use with raw matrices. When using messages without gauges, pass
@@ -2143,11 +2154,6 @@ def gate_loop_cluster(
         where = None
     if gauges is None:
         gauges = {}
-    if boundary_messages is None and not gauges:
-        raise TypeError(
-            "gate_loop_cluster() requires SU gauges or D2BP boundary_messages."
-        )
-
     tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
     entries = _normalize_gate_entries(
         G, where=where, allow_empty=True, allow_which=True
@@ -2280,6 +2286,10 @@ def gate_loop_cluster(
                     gate_payload,
                     where=where_norm,
                     boundary_messages=boundary_messages,
+                    input_mode=input_mode,
+                    run_bp=run_bp,
+                    bp_runner=bp_runner,
+                    bp_opts=bp_opts,
                     message_psd_project=message_psd_project,
                     message_psd_floor=message_psd_floor,
                     max_bond=max_bond,
@@ -2290,6 +2300,10 @@ def gate_loop_cluster(
                     psd_project=psd_project,
                     psd_floor=psd_floor,
                     optimize=optimize,
+                    cost_check=cost_check,
+                    max_flops_log10=max_flops_log10,
+                    max_peak_memory_log2=max_peak_memory_log2,
+                    on_budget=on_budget,
                     smudge=smudge,
                     als_opts=als_opts,
                     regauge_opts=regauge_opts_use,

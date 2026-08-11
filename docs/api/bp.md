@@ -48,8 +48,11 @@ not the direct route for an open PEPO with ket/bra physical indices.
 For the first-pass local full-update style compression, use
 `compress_reduced_loop_cluster`. It selects the active bond, fills a finite
 cluster by `max_distance`, closes its cut bonds with either SU vectors or
-directed D2BP matrices, and solves the reduced `R/L` ALS problem. This works
-for dense PEPS and dense PEPOs. For a PEPO, Quimb's lower and upper physical
+directed D2BP matrices, and solves the reduced `L/R` problem. This works
+for ordinary Quimb PEPS and PEPOs backed by NumPy, Torch, JAX, or CuPy arrays
+where the selected Quimb contraction and linalg operations support that
+backend. Tensor-shaped intermediates remain native; no compression step
+converts the network to NumPy. For a PEPO, Quimb's lower and upper physical
 legs are fused only on the private reduced-update copy and restored before the
 result is returned. Pass messages from a separately solved `two_norm_bp` run
 without first changing the tensor network into an SU gauge:
@@ -68,14 +71,24 @@ result = compress_reduced_loop_cluster(
 )
 ```
 
+If neither boundary data source is supplied, the helper runs a fresh D2BP
+solve automatically. Use `run_bp=False` only for a system-covering cluster or
+when an unresolved-boundary error is intentional. With `input_mode="auto"`, a
+supplied SU gauge mapping means that `tn` is an SU core; set
+`input_mode="physical"` when `tn` already contains the gauge factors and the
+vectors should be used only as diagonal closures.
+
 Set `regauge=True` to refresh SU gauges after truncation; the default returns
 the compressed physical network without refreshing them. Set
 `max_loop_size>0` to add the open-leg loop-cluster correction on top of the
 finite base cluster. Supplied D2BP boundary messages are Hermitian/PSD
 projected by default (`message_psd_project=True`); set
 `message_psd_project=False` only for diagnostic raw-message experiments.
-The ALS options accept `solver="auto"` (the default), `solver="quimb"`,
-`solver="qr"`, or `solver="normal"`, plus a relative `regularization` value.
+The solver options accept `solver="auto"` (the default), `solver="quimb"`,
+`solver="autodiff"`, `solver="qr"`, or `solver="normal"`, plus a relative
+`regularization` value. The autodiff route uses Quimb's public autodiff
+fitter after factorizing the reduced open environment, so it retains the same
+weighted objective without converting tensors to NumPy.
 The automatic and explicit Quimb modes use Quimb's public
 `tensor_network_fit_als` with prebuilt open-leg `tnAA`/`tnAB` overlap networks;
 QR mode is the regularized dense fallback, and automatic mode falls back to
@@ -91,17 +104,29 @@ separate work.
 For explicit dense diagnostics, use `problem.dense_metric()` and
 `problem.dense_linear_term()`. Direct problem builders also accept
 `materialize_metric=True`, but this is unnecessary for the native Quimb path.
+All reduced problem builders Hermitianize and PSD-project the smaller open
+environment by default. `problem.raw_min_eigenvalue` and
+`problem.clipped_eigenvalues` expose the projection diagnostics.
 The three builder return types share the `ReducedUpdateProblem` type alias for
 annotations.
 
 The reduced-update message keys are `(bond_index, destination_tid)`, matching
-Quimb's D2BP layout. Messages are copied at preparation time and are not
+Quimb's D2BP layout. Messages are copied at preparation time and each directed
+pair is normalized with Quimb's message convention before use. They are not
 refreshed after a gate; rerun D2BP before another update if the fixed-point
 environment needs to track the changed state.
 
 For compatibility with gate streams, `apply_reduced_loop_cluster_gate` and
-`gate_loop_cluster` accept the same `boundary_messages=` option for adjacent
-two-site updates.
+`gate_loop_cluster` accept the same closure semantics for adjacent two-site
+updates: `input_mode`, fresh-BP controls, PSD message handling, and contraction
+cost budgets are forwarded through the wrapper.
+
+Pass `cost_check=True` to expose Cotengra's `flops_log10` and
+`peak_memory_log2` estimates. Supplying either `max_flops_log10` or
+`max_peak_memory_log2` enables preflight automatically; an over-budget
+contraction raises `CompressionBudgetError` before tensor values are
+contracted. `on_budget="warn"` additionally emits a warning, while
+`on_budget="ignore"` reports and continues.
 
 ## Selected-bond PEPS/PEPO compression
 
@@ -125,6 +150,19 @@ result = compress_bond_cluster(
 compressed = result.compressed
 ```
 
+The same helper can run fresh D2BP when `boundary_messages` and `gauges` are
+omitted:
+
+```python
+result = compress_bond_cluster(
+    peps,
+    where=((0, 0), (1, 0)),
+    max_bond=chi,
+    bp_opts={"max_iterations": 1000, "tol": 1e-10},
+    cost_check=True,
+)
+```
+
 `result.bond_maps[result.bond_ind]` contains the fitted `(L, R)` pair with
 shapes `(D, chi)` and `(chi, D)`. These are ordinary rectangular variational
 tensors; no isometry, orthogonality, or adjoint constraint is imposed. The
@@ -136,15 +174,24 @@ bond marginals of `B_reduce` and takes their dominant `chi` subspaces as the
 ALS starting maps. Use `init="projector"` or `init="random"` for simpler
 initializations.
 
-For a radius-zero cluster, every cut bond needs either a directed D2BP message
-or an SU gauge vector. SU vectors are interpreted as `diag(lambda)` boundary
-closures. Set `b_reduce=True` (the default) to Hermitian/PSD-project the
+The selected-bond path uses the same native Quimb/Autoray backend policy as the
+reduced path: NumPy, Torch, JAX, and CuPy tensor data remain in place when the
+backend supports the requested contraction and ALS operations. Native
+block-sparse Symmray tensors still require their separate graded compression
+adapter.
+
+For a radius-zero cluster, every cut bond is closed by fresh D2BP messages,
+explicit directed D2BP messages, or SU vectors. SU vectors are interpreted as
+`diag(lambda)` boundary closures. Set `b_reduce=True` (the default) to
+Hermitian/PSD-project the
 contracted `B_reduce` before ALS; `result.B_reduce` exposes the retained
 four-leg environment in `(left_ket, right_ket, left_bra, right_bra)` order.
 This makes the local normal equations positive while avoiding the physical-leg
 fusion that produces `d^4` PEPS or `d^8` PEPO dense spaces. PEPO lower and upper
 legs remain separate. The cluster contraction can still be expensive as
-`max_distance` grows, so pass an appropriate Cotengra optimizer.
+`max_distance` grows, so pass an appropriate Cotengra optimizer and use
+`max_flops_log10` / `max_peak_memory_log2` to preflight it. The estimate is
+returned in `result.contraction_cost`.
 
 ## Long-range PEPS expectations
 

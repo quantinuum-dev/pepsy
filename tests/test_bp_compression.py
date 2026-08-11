@@ -6,6 +6,7 @@ import quimb.tensor as qtn
 
 from pepsy.bp import (
     BondClusterCompressionResult,
+    CompressionBudgetError,
     compress_bond_cluster,
     gauge_all_simple,
     two_norm_bp,
@@ -170,8 +171,22 @@ def test_selected_bond_accepts_su_vectors_as_boundary_closures():
     assert result.clipped_eigenvalues >= 0
 
 
-def test_selected_bond_requires_closures_for_an_open_cluster():
+def test_selected_bond_can_run_fresh_bp_for_an_open_cluster():
     peps = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, seed=53)
+    result = compress_bond_cluster(
+        peps,
+        where=((0, 0), (1, 0)),
+        max_distance=0,
+        max_bond=1,
+        steps=1,
+        bp_opts={"max_iterations": 1, "tol": 0.0, "diis": False},
+    )
+    assert result.bp_info["source"] == "fresh_bp"
+    assert result.boundary_inds
+
+
+def test_selected_bond_can_require_explicit_closures_and_preflight_cost():
+    peps = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, seed=54)
     with pytest.raises(ValueError, match="closure"):
         compress_bond_cluster(
             peps,
@@ -179,7 +194,47 @@ def test_selected_bond_requires_closures_for_an_open_cluster():
             max_distance=0,
             max_bond=1,
             steps=1,
+            run_bp=False,
         )
+
+    bp = two_norm_bp(peps, max_iterations=1, tol=0.0, diis=False)
+    result = compress_bond_cluster(
+        peps,
+        where=((0, 0), (1, 0)),
+        boundary_messages=bp.messages,
+        max_distance=0,
+        max_bond=1,
+        steps=1,
+        cost_check=True,
+    )
+    assert result.contraction_cost["flops_log10"] >= 0.0
+    assert result.contraction_cost["peak_memory_log2"] >= 0.0
+    with pytest.raises(CompressionBudgetError):
+        compress_bond_cluster(
+            peps,
+            where=((0, 0), (1, 0)),
+            boundary_messages=bp.messages,
+            max_distance=0,
+            max_bond=1,
+            steps=1,
+            max_flops_log10=-1.0,
+        )
+
+
+def test_selected_su_core_mode_returns_the_physical_network():
+    peps = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, dtype="float64", seed=55)
+    core, gauges, _ = gauge_all_simple(peps, max_iterations=2, tol=0.0)
+    result = compress_bond_cluster(
+        core,
+        gauges=gauges,
+        where=((0, 0), (1, 0)),
+        max_bond=2,
+        steps=1,
+    )
+    expected = core.copy()
+    expected.gauge_simple_insert(gauges)
+    assert np.allclose(result.compressed.to_dense(), expected.to_dense())
+    assert result.bp_info is None
 
 
 def test_selected_bond_validates_als_protected_options():
@@ -193,3 +248,34 @@ def test_selected_bond_validates_als_protected_options():
             max_bond=1,
             als_opts={"tags": "other"},
         )
+
+
+def test_selected_bond_preserves_torch_backend_arrays():
+    torch = pytest.importorskip("torch")
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=61,
+    )
+    for tensor in peps.tensor_map.values():
+        tensor.modify(data=torch.as_tensor(tensor.data))
+
+    bp = two_norm_bp(peps, max_iterations=1, tol=0.0, diis=False)
+    result = compress_bond_cluster(
+        peps,
+        where=((0, 0), (1, 0)),
+        boundary_messages=bp.messages,
+        max_bond=1,
+        steps=2,
+        tol=0.0,
+    )
+
+    assert isinstance(result.B_reduce, torch.Tensor)
+    left, right = result.bond_maps[result.bond_ind]
+    assert isinstance(left, torch.Tensor)
+    assert isinstance(right, torch.Tensor)
+    assert all(isinstance(tensor.data, torch.Tensor)
+               for tensor in result.compressed.tensor_map.values())

@@ -21,6 +21,37 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import autoray as ar
+
+from ._backend import (
+    abs as _backend_abs,
+    all_finite as _all_finite,
+    array as _backend_array,
+    cast_like as _cast_like,
+    conj as _conj,
+    copy as _copy_array,
+    dag as _dag,
+    dtype_name as _dtype_name,
+    eye as _eye,
+    einsum as _einsum,
+    is_complex as _is_complex,
+    native as _native,
+    normalize_message_pairs as _normalize_message_pairs,
+    real as _real,
+    reshape as _reshape,
+    scalar_bool as _scalar_bool,
+    scalar_float as _scalar_float,
+    scalar_int as _scalar_int,
+    transpose as _transpose,
+    zeros as _zeros,
+)
+from ._compression_utils import (
+    cost_check_requested,
+    contract_with_preflight,
+    prepare_working_network,
+    resolve_d2bp_boundaries,
+    validate_cost_options,
+)
 
 __all__ = [
     "BondClusterCompressionResult",
@@ -28,20 +59,8 @@ __all__ = [
 ]
 
 
-def _as_numpy(value) -> np.ndarray:
-    """Convert a dense or backend array to a NumPy array."""
-    if hasattr(value, "to_dense"):
-        value = value.to_dense()
-    try:
-        import autoray as ar
-
-        return np.asarray(ar.to_numpy(value))
-    except Exception:
-        return np.asarray(value)
-
-
 def _validate_dense_peps_like(tn) -> None:
-    """Validate the dense PEPS/PEPO subset used by this local route."""
+    """Validate the ordinary backend-array PEPS/PEPO subset used here."""
     required = ("inner_inds", "ind_map", "ind_size", "tensor_map", "copy")
     missing = tuple(name for name in required if not hasattr(tn, name))
     if missing:
@@ -57,11 +76,14 @@ def _validate_dense_peps_like(tn) -> None:
             "physical indices"
         )
     for tid, tensor in tn.tensor_map.items():
-        if not isinstance(tensor.data, np.ndarray):
+        try:
+            _native(tensor.data)
+            ar.infer_backend(tensor.data)
+        except (TypeError, ValueError) as exc:
             raise TypeError(
-                "compress_bond_cluster currently supports dense NumPy "
-                f"tensors only, got {type(tensor.data).__name__} at {tid!r}"
-            )
+                "compress_bond_cluster requires ordinary Quimb backend "
+                f"arrays, got {type(tensor.data).__name__} at {tid!r}"
+            ) from exc
 
 
 def _single_tid(tn, site):
@@ -85,45 +107,53 @@ def _site_physical_inds(tn, site) -> tuple[str, ...]:
 
 def _project_psd(matrix, *, psd_floor: float = 0.0):
     """Hermitian/PSD-project a square matrix and report the clipping."""
-    matrix = _as_numpy(matrix)
+    matrix = _native(matrix)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         raise ValueError(f"PSD projection requires a square matrix, got {matrix.shape}")
-    if not np.all(np.isfinite(matrix)):
+    if not _all_finite(matrix):
         raise ValueError("PSD projection received non-finite values")
-    hermitian = 0.5 * (matrix + matrix.conj().T)
-    eigenvalues, eigenvectors = np.linalg.eigh(hermitian)
-    scale = max(1.0, float(np.max(np.abs(eigenvalues)))) if eigenvalues.size else 1.0
+    hermitian = 0.5 * (matrix + _dag(matrix))
+    eigenvalues, eigenvectors = ar.do("linalg.eigh", hermitian)
+    scale = (
+        max(1.0, _scalar_float(ar.do("max", _backend_abs(eigenvalues))))
+        if eigenvalues.shape[0]
+        else 1.0
+    )
     floor = float(psd_floor) * scale
-    projected_values = np.maximum(eigenvalues, floor)
-    projected = (eigenvectors * projected_values) @ eigenvectors.conj().T
-    projected = 0.5 * (projected + projected.conj().T)
-    clipped = int(np.count_nonzero(eigenvalues < floor))
-    raw_min = float(eigenvalues[0]) if eigenvalues.size else 0.0
+    projected_values = ar.do(
+        "maximum",
+        eigenvalues,
+        _backend_array(floor, like=eigenvalues),
+    )
+    projected = (eigenvectors * projected_values) @ _dag(eigenvectors)
+    projected = 0.5 * (projected + _dag(projected))
+    clipped = _scalar_int(ar.do("sum", eigenvalues < floor))
+    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
     return projected, raw_min, clipped
 
 
-def _random_rectangular_map(dim: int, rank: int, *, dtype, rng) -> np.ndarray:
+def _random_rectangular_map(dim: int, rank: int, *, like, rng):
     """Generate a well-scaled dense rectangular map of shape ``(dim, rank)``."""
-    if np.issubdtype(np.dtype(dtype), np.complexfloating):
+    dtype = _dtype_name(like)
+    if dtype.startswith("complex"):
         data = rng.normal(size=(dim, rank)) + 1j * rng.normal(size=(dim, rank))
     else:
         data = rng.normal(size=(dim, rank))
-    return np.asarray(data / np.sqrt(dim), dtype=dtype)
+    return _backend_array(data / np.sqrt(dim), like=like)
 
 
-def _initial_maps(dim: int, rank: int, *, init: str, dtype, rng):
+def _initial_maps(dim: int, rank: int, *, init: str, like, rng):
     """Return a paired rectangular ``L`` and ``R`` initial guess."""
     if init == "random":
-        left = _random_rectangular_map(dim, rank, dtype=dtype, rng=rng)
+        left = _random_rectangular_map(dim, rank, like=like, rng=rng)
     elif init == "projector":
-        left = np.zeros((dim, rank), dtype=dtype)
-        left[np.arange(rank), np.arange(rank)] = 1
+        left = _eye(dim, like=like)[:, :rank]
     else:
         raise ValueError("init must be 'projector' or 'random'")
-    return left, left.conj().T.copy()
+    return left, _dag(left)
 
 
-def _b_reduce_initial_maps(b_reduce, rank: int):
+def _b_reduce_initial_maps(b_reduce, rank: int, *, optimize):
     """Get dominant rectangular map subspaces from ``B_reduce``.
 
     The two partial traces are contracted as small Quimb tensor networks. The
@@ -142,39 +172,43 @@ def _b_reduce_initial_maps(b_reduce, rank: int):
         inds=(left_ket, right_ket, left_bra, right_bra),
     )
     right_identity = qtn.Tensor(
-        np.eye(dimension, dtype=b_reduce.dtype),
+        _eye(dimension, like=b_reduce),
         inds=(right_ket, right_bra),
     )
     left_density = qtn.TensorNetwork(
         [b_tensor, right_identity],
         virtual=True,
-    ).contract(output_inds=(left_ket, left_bra), optimize="greedy")
-    left_density = _as_numpy(left_density.data)
+    ).contract(output_inds=(left_ket, left_bra), optimize=optimize)
+    left_density = _native(left_density.data)
 
     left_identity = qtn.Tensor(
-        np.eye(dimension, dtype=b_reduce.dtype),
+        _eye(dimension, like=b_reduce),
         inds=(left_ket, left_bra),
     )
     right_density = qtn.TensorNetwork(
         [b_tensor, left_identity],
         virtual=True,
-    ).contract(output_inds=(right_ket, right_bra), optimize="greedy")
-    right_density = _as_numpy(right_density.data)
+    ).contract(output_inds=(right_ket, right_bra), optimize=optimize)
+    right_density = _native(right_density.data)
 
-    left_density = 0.5 * (left_density + left_density.conj().T)
-    right_density = 0.5 * (right_density + right_density.conj().T)
-    left_values, left_vectors = np.linalg.eigh(left_density)
-    right_values, right_vectors = np.linalg.eigh(right_density)
-    left_values = np.maximum(left_values, 0.0)
-    right_values = np.maximum(right_values, 0.0)
+    left_density = 0.5 * (left_density + _dag(left_density))
+    right_density = 0.5 * (right_density + _dag(right_density))
+    left_values, left_vectors = ar.do("linalg.eigh", left_density)
+    right_values, right_vectors = ar.do("linalg.eigh", right_density)
+    zero_left = _backend_array(0.0, like=left_values)
+    zero_right = _backend_array(0.0, like=right_values)
+    left_values = ar.do("maximum", left_values, zero_left)
+    right_values = ar.do("maximum", right_values, zero_right)
 
-    if not np.any(left_values > 0.0) or not np.any(right_values > 0.0):
+    if not _scalar_bool(ar.do("any", left_values > 0.0)) or not _scalar_bool(
+        ar.do("any", right_values > 0.0)
+    ):
         raise np.linalg.LinAlgError(
             "B_reduce has no positive bond weight for environment initialization"
         )
 
     left = left_vectors[:, -rank:]
-    right = right_vectors[:, -rank:].conj().T
+    right = _dag(right_vectors[:, -rank:])
     return left, right
 
 
@@ -221,12 +255,12 @@ def _copy_boundary_message(
     gauges,
     message_psd_project: bool,
     message_psd_floor: float,
-) -> np.ndarray:
+) -> Any:
     """Get one cut closure from D2BP messages or an SU vector."""
     if boundary_messages is not None:
         key = (index, inside_tid)
         try:
-            message = _as_numpy(boundary_messages[key])
+            message = _native(boundary_messages[key])
         except KeyError as exc:
             raise ValueError(
                 "D2BP boundary cluster needs a message for every cut bond; "
@@ -238,16 +272,28 @@ def _copy_boundary_message(
                 "every cluster cut needs either a directed D2BP message or "
                 f"an SU gauge; missing closure for bond {index!r}"
             )
-        gauge = np.real_if_close(_as_numpy(gauges[index]))
+        gauge = _native(gauges[index])
         expected = (tn.ind_size(index),)
-        if gauge.shape != expected or np.iscomplexobj(gauge):
+        if gauge.shape != expected:
             raise ValueError(
                 f"SU gauge for {index!r} has shape {gauge.shape}, expected "
                 f"{expected} and must be real"
             )
-        if not np.all(np.isfinite(gauge)) or np.any(gauge < 0.0):
+        if _is_complex(gauge):
+            if _scalar_float(
+                ar.do("max", _backend_abs(ar.do("imag", gauge)))
+            ) > 1e-12:
+                raise ValueError(
+                    f"SU gauge for {index!r} has shape {gauge.shape}, expected "
+                    f"{expected} and must be real"
+                )
+            gauge = _real(gauge)
+        if not _all_finite(gauge) or _scalar_bool(ar.do("any", gauge < 0.0)):
             raise ValueError(f"SU gauge for {index!r} must be finite and nonnegative")
-        message = np.diag(gauge)
+        message = ar.do("diag", _real(gauge))
+
+    reference = tn.tensor_map[inside_tid].data
+    message = _cast_like(message, reference)
 
     expected = (tn.ind_size(index),) * 2
     if message.shape != expected:
@@ -255,11 +301,11 @@ def _copy_boundary_message(
             f"boundary closure {(index, inside_tid)!r} has shape {message.shape}, "
             f"expected {expected}"
         )
-    if not np.all(np.isfinite(message)):
+    if not _all_finite(message):
         raise ValueError(f"boundary closure {(index, inside_tid)!r} is non-finite")
     if message_psd_project:
         message, _, _ = _project_psd(message, psd_floor=message_psd_floor)
-    return np.array(message, copy=True)
+    return _copy_array(message)
 
 
 def _build_b_reduce(
@@ -275,9 +321,19 @@ def _build_b_reduce(
     b_reduce: bool,
     b_reduce_floor: float,
     optimize,
+    cost_check: bool,
+    max_flops_log10: float | None,
+    max_peak_memory_log2: float | None,
+    on_budget: str,
 ):
     """Contract the selected cluster to its four-leg bond environment."""
     import quimb.tensor as qtn
+
+    if boundary_messages is not None:
+        boundary_messages = _normalize_message_pairs(
+            boundary_messages,
+            tn.ind_map,
+        )
 
     cluster_tids = tuple(cluster_tids)
     retained = set(cluster_tids)
@@ -358,8 +414,17 @@ def _build_b_reduce(
 
     environment = qtn.TensorNetwork((*tensors, *bra_tensors), virtual=True)
     output_inds = (left_ket, right_ket, left_bra, right_bra)
-    environment = environment.contract(output_inds=output_inds, optimize=optimize)
-    data = _as_numpy(environment.data)
+    environment, contraction_cost = contract_with_preflight(
+        environment,
+        output_inds=output_inds,
+        optimize=optimize,
+        cost_check=cost_check,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+        on_budget=on_budget,
+        label="selected-bond environment",
+    )
+    data = _native(environment.data)
     expected = (dimension, dimension, dimension, dimension)
     if data.shape != expected:
         raise RuntimeError(
@@ -367,31 +432,27 @@ def _build_b_reduce(
             "the selected cluster has an uncontracted non-physical leg"
         )
 
-    matrix = data.transpose(2, 3, 0, 1).reshape(dimension**2, dimension**2)
-    hermitian = 0.5 * (matrix + matrix.conj().T)
-    eigenvalues = np.linalg.eigvalsh(hermitian)
-    raw_min = float(eigenvalues[0]) if eigenvalues.size else 0.0
+    matrix = _reshape(_transpose(data, (2, 3, 0, 1)), (dimension**2, dimension**2))
+    hermitian = 0.5 * (matrix + _dag(matrix))
+    eigenvalues = ar.do("linalg.eigvalsh", hermitian)
+    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
     clipped = 0
     if b_reduce:
         matrix, raw_min, clipped = _project_psd(
             matrix,
             psd_floor=b_reduce_floor,
         )
-        data = matrix.reshape(
-            dimension,
-            dimension,
-            dimension,
-            dimension,
-        ).transpose(2, 3, 0, 1)
+        data = _transpose(
+            _reshape(matrix, (dimension, dimension, dimension, dimension)),
+            (2, 3, 0, 1),
+        )
     else:
         # Keep the raw contraction available for diagnostics, but remove the
         # roundoff-level anti-Hermitian component before the non-PSD route.
-        data = hermitian.reshape(
-            dimension,
-            dimension,
-            dimension,
-            dimension,
-        ).transpose(2, 3, 0, 1)
+        data = _transpose(
+            _reshape(hermitian, (dimension, dimension, dimension, dimension)),
+            (2, 3, 0, 1),
+        )
 
     return (
         data,
@@ -399,6 +460,7 @@ def _build_b_reduce(
         raw_min,
         clipped,
         (left_ket, right_ket, left_bra, right_bra),
+        contraction_cost,
     )
 
 
@@ -406,14 +468,8 @@ def _local_cost(left, right, target, b_reduce) -> float:
     """Evaluate ``(target - L R)^H B_reduce (target - L R)``."""
     approximation = left @ right
     difference = target - approximation
-    value = np.einsum(
-        "ab,cd,abcd->",
-        difference,
-        difference.conj(),
-        b_reduce,
-        optimize=True,
-    )
-    return float(np.real(value))
+    value = _einsum("ab,cd,abcd->", difference, _conj(difference), b_reduce)
+    return _scalar_float(_real(value))
 
 
 def _fit_maps(
@@ -433,17 +489,20 @@ def _fit_maps(
     """Fit the two selected-bond maps with Quimb's public ALS API."""
     import quimb.tensor as qtn
 
-    dtype = b_reduce.dtype
     rng = np.random.default_rng(seed)
     if init == "b_reduce":
         try:
-            left, right = _b_reduce_initial_maps(b_reduce, max_bond)
+            left, right = _b_reduce_initial_maps(
+                b_reduce,
+                max_bond,
+                optimize=contract_optimize,
+            )
         except np.linalg.LinAlgError:
             left, right = _initial_maps(
                 dimension,
                 max_bond,
                 init="projector",
-                dtype=dtype,
+                like=b_reduce,
                 rng=rng,
             )
     else:
@@ -451,10 +510,10 @@ def _fit_maps(
             dimension,
             max_bond,
             init=init,
-            dtype=dtype,
+            like=b_reduce,
             rng=rng,
         )
-    target = np.eye(dimension, dtype=dtype)
+    target = _eye(dimension, like=b_reduce)
     initial_cost = _local_cost(left, right, target, b_reduce)
 
     left_ket_ind, right_ket_ind, left_bra_ind, right_bra_ind = (
@@ -466,12 +525,12 @@ def _fit_maps(
     map_ind = qtn.rand_uuid()
     map_bra_ind = qtn.rand_uuid()
     left_fit = qtn.Tensor(
-        left.copy(),
+        _copy_array(left),
         inds=(left_ket_ind, map_ind),
         tags=("__MAP__",),
     )
     right_fit = qtn.Tensor(
-        right.copy(),
+        _copy_array(right),
         inds=(map_ind, right_ket_ind),
         tags=("__MAP__",),
     )
@@ -480,12 +539,12 @@ def _fit_maps(
     tn_target = qtn.TensorNetwork([target_tensor], virtual=True)
 
     left_ket = qtn.Tensor(
-        left.copy(),
+        _copy_array(left),
         inds=(left_ket_ind, map_ind),
         tags=("__KET__", "__VAR0__"),
     )
     right_ket = qtn.Tensor(
-        right.copy(),
+        _copy_array(right),
         inds=(map_ind, right_ket_ind),
         tags=("__KET__", "__VAR1__"),
     )
@@ -538,7 +597,13 @@ def _fit_maps(
         names = ", ".join(sorted(forbidden))
         raise TypeError(f"ALS options cannot override: {names}")
 
-    target_norm = float(np.real(np.einsum("ab,cd,abcd->", target, target, b_reduce)))
+    target_norm = _local_cost(
+        _zeros((dimension, dimension), like=b_reduce),
+        _zeros((dimension, dimension), like=b_reduce),
+        target,
+        b_reduce,
+    )
+    target_norm = float(target_norm)
     if target_norm < 0.0:
         target_norm = 0.0
     qtn.tensor_network_fit_als(
@@ -556,8 +621,8 @@ def _fit_maps(
 
     left_tensor = tn_aa["__KET__", "__VAR0__"]
     right_tensor = tn_aa["__KET__", "__VAR1__"]
-    left = _as_numpy(left_tensor.transpose(left_ket_ind, map_ind).data).copy()
-    right = _as_numpy(right_tensor.transpose(map_ind, right_ket_ind).data).copy()
+    left = _copy_array(left_tensor.transpose(left_ket_ind, map_ind).data)
+    right = _copy_array(right_tensor.transpose(map_ind, right_ket_ind).data)
     final_cost = _local_cost(left, right, target, b_reduce)
     return left, right, (initial_cost, final_cost)
 
@@ -601,18 +666,20 @@ class BondClusterCompressionResult:
     """
 
     compressed: Any
-    bond_maps: dict[str, tuple[np.ndarray, np.ndarray]]
+    bond_maps: dict[str, tuple[Any, Any]]
     errors: tuple[float, float]
     relative_error: float
     where: tuple[Any, Any]
     bond_ind: str
     cluster_tids: tuple[Any, ...]
     boundary_inds: tuple[str, ...]
-    B_reduce: np.ndarray
+    B_reduce: Any
     raw_min_eigenvalue: float
     clipped_eigenvalues: int
     steps: int
     max_bond: int
+    bp_info: dict[str, Any] | None = None
+    contraction_cost: dict[str, float] | None = None
 
 
 def compress_bond_cluster(
@@ -622,6 +689,10 @@ def compress_bond_cluster(
     max_bond: int,
     gauges=None,
     boundary_messages=None,
+    input_mode: str = "auto",
+    run_bp: bool = True,
+    bp_runner: str = "plain",
+    bp_opts: dict[str, Any] | None = None,
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
     max_distance: int = 0,
@@ -631,6 +702,10 @@ def compress_bond_cluster(
     steps: int = 20,
     tol: float = 1e-9,
     contract_optimize="greedy",
+    cost_check: bool = False,
+    max_flops_log10: float | None = None,
+    max_peak_memory_log2: float | None = None,
+    on_budget: str = "raise",
     als_opts: dict[str, Any] | None = None,
     seed=None,
     inplace: bool = False,
@@ -653,19 +728,34 @@ def compress_bond_cluster(
     Parameters
     ----------
     tn
-        Dense NumPy Quimb ``PEPS`` or ``PEPO`` target network.
+        Quimb ``PEPS`` or ``PEPO`` whose ordinary tensor data may live in any
+        backend supported by Quimb/Autoray, such as NumPy, Torch, JAX, or
+        CuPy. Tensor-shaped intermediates remain in that backend.
     where
         Ordered pair of neighboring sites identifying exactly one virtual
         bond.
     max_bond
         Retained dimension ``chi`` on the selected bond.
     gauges
-        Optional SU/simple-update bond vectors used only as diagonal boundary
-        closures. The input network itself is not gauge-mutated.
+        Optional SU/simple-update bond vectors. With ``input_mode="su_core"``
+        they are inserted into a copied core before contraction. With
+        ``input_mode="physical"`` they are used only as diagonal boundary
+        closures.
     boundary_messages
         Optional directed D2BP messages keyed by
         ``(bond_index, destination_tid)``. These take precedence over
         ``gauges`` when supplied.
+    input_mode
+        ``"physical"`` means ``tn`` already includes all SU factors;
+        ``"su_core"`` means ``tn`` is a core and ``gauges`` are inserted;
+        ``"auto"`` selects ``"su_core"`` when gauges are supplied and
+        otherwise ``"physical"``.
+    run_bp
+        If no messages or gauges are supplied, run a fresh D2BP solve to
+        obtain boundary messages. Set false to require a closed cluster.
+    bp_runner, bp_opts
+        Fresh-BP runner and options. ``bp_runner`` is ``"plain"`` or
+        ``"relay"``; options are forwarded to the corresponding Pepsy BP API.
     message_psd_project
         Hermitian/PSD-project each supplied boundary message before the
         cluster contraction.
@@ -683,6 +773,16 @@ def compress_bond_cluster(
         positive local normal equations.
     b_reduce_floor
         Relative eigenvalue floor used by the ``b_reduce`` projection.
+    cost_check
+        Build a Cotengra contraction tree before the environment contraction
+        and expose its FLOP/peak-memory estimate in the result.
+    max_flops_log10, max_peak_memory_log2
+        Optional Cotengra cost limits. Supplying either one enables
+        ``cost_check`` automatically.
+    on_budget
+        ``"raise"`` rejects an over-budget contraction before tensor data is
+        contracted. ``"warn"`` emits a warning and then raises the same
+        budget exception; ``"ignore"`` reports but proceeds.
     als_opts
         Additional options for Quimb's public ``tensor_network_fit_als``.
         Problem-defining arguments are protected from override.
@@ -729,8 +829,30 @@ def compress_bond_cluster(
         raise TypeError("boundary_messages must be a mapping")
     if gauges is not None and not hasattr(gauges, "__getitem__"):
         raise TypeError("gauges must be a mapping")
+    if not isinstance(run_bp, bool):
+        raise TypeError("run_bp must be a bool")
+    if not isinstance(bp_opts, (dict, type(None))):
+        raise TypeError("bp_opts must be a mapping or None")
+    (
+        max_flops_log10,
+        max_peak_memory_log2,
+        on_budget,
+    ) = validate_cost_options(
+        max_flops_log10,
+        max_peak_memory_log2,
+        on_budget,
+    )
+    cost_check = cost_check_requested(
+        cost_check,
+        max_flops_log10,
+        max_peak_memory_log2,
+    )
 
-    work = tn.copy()
+    work, gauge_inputs, _ = prepare_working_network(
+        tn,
+        gauges,
+        input_mode=input_mode,
+    )
     left_tid = _single_tid(work, left_site)
     right_tid = _single_tid(work, right_site)
     left_tensor = work.tensor_map[left_tid]
@@ -753,14 +875,17 @@ def compress_bond_cluster(
     dimension = work.ind_size(bond_ind)
     rank = min(int(max_bond), dimension)
     if rank == dimension:
-        identity = np.eye(dimension, dtype=left_tensor.data.dtype)
+        identity = _eye(dimension, like=left_tensor.data)
         compressed = work
         if inplace:
             compressed = _replace_network(tn, work)
-        zero_environment = np.zeros((dimension, dimension, dimension, dimension))
+        zero_environment = _zeros(
+            (dimension, dimension, dimension, dimension),
+            like=left_tensor.data,
+        )
         return BondClusterCompressionResult(
             compressed=compressed,
-            bond_maps={bond_ind: (identity.copy(), identity.copy())},
+            bond_maps={bond_ind: (_copy_array(identity), _copy_array(identity))},
             errors=(0.0, 0.0),
             relative_error=0.0,
             where=(left_site, right_site),
@@ -774,6 +899,14 @@ def compress_bond_cluster(
             max_bond=rank,
         )
 
+    resolved_messages, bp_info = resolve_d2bp_boundaries(
+        work,
+        boundary_messages,
+        gauge_inputs,
+        run_bp=run_bp,
+        bp_runner=bp_runner,
+        bp_opts=bp_opts,
+    )
     cluster_tids = _cluster_tids(work, (left_tid, right_tid), int(max_distance))
     (
         b_data,
@@ -781,18 +914,23 @@ def compress_bond_cluster(
         raw_min,
         clipped,
         _,
+        contraction_cost,
     ) = _build_b_reduce(
         work,
         cluster_tids=cluster_tids,
         active_tids=(left_tid, right_tid),
         bond_ind=bond_ind,
-        boundary_messages=boundary_messages,
-        gauges=gauges,
+        boundary_messages=resolved_messages,
+        gauges=gauge_inputs,
         message_psd_project=message_psd_project,
         message_psd_floor=float(message_psd_floor),
         b_reduce=b_reduce,
         b_reduce_floor=float(b_reduce_floor),
         optimize=contract_optimize,
+        cost_check=cost_check,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+        on_budget=on_budget,
     )
     left, right, costs = _fit_maps(
         b_data,
@@ -824,9 +962,9 @@ def compress_bond_cluster(
             max(
                 0.0,
                 _local_cost(
-                    np.eye(dimension, dtype=b_data.dtype),
-                    np.zeros((dimension, dimension), dtype=b_data.dtype),
-                    np.eye(dimension, dtype=b_data.dtype),
+                    _eye(dimension, like=b_data),
+                    _zeros((dimension, dimension), like=b_data),
+                    _eye(dimension, like=b_data),
                     b_data,
                 ),
             )
@@ -838,16 +976,18 @@ def compress_bond_cluster(
 
     return BondClusterCompressionResult(
         compressed=compressed,
-        bond_maps={bond_ind: (left.copy(), right.copy())},
+        bond_maps={bond_ind: (_copy_array(left), _copy_array(right))},
         errors=(initial_error, final_error),
         relative_error=relative_error,
         where=(left_site, right_site),
         bond_ind=bond_ind,
         cluster_tids=tuple(cluster_tids),
         boundary_inds=tuple(boundary_inds),
-        B_reduce=np.array(b_data, copy=True),
+        B_reduce=_copy_array(b_data),
         raw_min_eigenvalue=raw_min,
         clipped_eigenvalues=clipped,
         steps=int(steps),
         max_bond=rank,
+        bp_info=bp_info,
+        contraction_cost=contraction_cost,
     )

@@ -9,9 +9,11 @@ import quimb.tensor as qtn
 
 import pepsy as py
 from pepsy.bp import (
+    CompressionBudgetError,
     apply_reduced_loop_cluster_gate,
     compress_reduced_loop_cluster,
     exact_reduced_update_problem,
+    loop_cluster_reduced_update_problem,
     prepare_reduced_bond_pair,
     solve_reduced_als,
     su_cluster_reduced_update_problem,
@@ -42,6 +44,179 @@ def test_reduced_loop_cluster_accepts_directed_d2bp_messages():
         problem.linear_term,
         problem.metric @ problem.target.reshape(-1),
     )
+
+
+def test_reduced_prepare_runs_fresh_bp_when_no_boundary_data_is_supplied():
+    peps = _random_peps()
+    pair = prepare_reduced_bond_pair(
+        peps,
+        where=((0, 0), (1, 0)),
+        bp_opts={"max_iterations": 1, "tol": 0.0, "diis": False},
+    )
+    assert pair.bp_info["source"] == "fresh_bp"
+    assert pair.boundary_messages
+
+
+def test_reduced_exact_environment_is_psd_and_exposes_cost_preflight():
+    peps = _random_peps()
+    pair = prepare_reduced_bond_pair(
+        peps,
+        where=((0, 0), (1, 0)),
+        bp_opts={"max_iterations": 1, "tol": 0.0, "diis": False},
+    )
+    gate = np.eye(pair.theta_shape[1] * pair.theta_shape[2])
+    problem = exact_reduced_update_problem(
+        pair,
+        gate,
+        materialize_metric=True,
+        cost_check=True,
+    )
+    assert problem.psd_projected
+    assert problem.contraction_cost["flops_log10"] >= 0.0
+    assert np.min(np.linalg.eigvalsh(problem.metric)) >= -1e-10
+    with pytest.raises(CompressionBudgetError):
+        exact_reduced_update_problem(
+            pair,
+            gate,
+            max_flops_log10=-1.0,
+        )
+
+
+def test_reduced_update_preserves_torch_backend_for_all_als_paths():
+    torch = pytest.importorskip("torch")
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=67,
+    )
+    for tensor in peps.tensor_map.values():
+        tensor.modify(data=torch.as_tensor(tensor.data))
+
+    bp = two_norm_bp(peps, max_iterations=1, tol=0.0, diis=False)
+    pair = prepare_reduced_bond_pair(
+        peps,
+        where=((0, 0), (1, 0)),
+        boundary_messages=bp.messages,
+    )
+    gate = torch.eye(4, dtype=torch.float64)
+    for solver in ("quimb", "qr", "normal"):
+        problem = exact_reduced_update_problem(
+            pair,
+            gate,
+            materialize_metric=solver != "quimb",
+        )
+        solution = solve_reduced_als(
+            problem,
+            max_bond=1,
+            max_iterations=2,
+            solver=solver,
+        )
+        assert isinstance(problem.target, torch.Tensor)
+        assert isinstance(solution.left, torch.Tensor)
+        assert isinstance(solution.right, torch.Tensor)
+
+
+def test_reduced_update_exposes_native_quimb_autodiff_solver():
+    peps = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, dtype="float64", seed=73)
+    pair = prepare_reduced_bond_pair(
+        peps,
+        where=((0, 0), (1, 0)),
+        bp_opts={"max_iterations": 1, "tol": 0.0, "diis": False},
+    )
+    problem = exact_reduced_update_problem(
+        pair,
+        np.eye(pair.theta_shape[1] * pair.theta_shape[2]),
+    )
+    solution = solve_reduced_als(
+        problem,
+        max_bond=1,
+        max_iterations=4,
+        solver="autodiff",
+        autodiff_opts={
+            "autodiff_backend": "autograd",
+            "optimizer": "L-BFGS-B",
+            "progbar": False,
+        },
+    )
+    assert solution.left.shape[-1] == 1
+    assert solution.right.shape[0] == 1
+    assert np.isfinite(solution.costs[-1])
+
+
+def test_reduced_update_autodiff_keeps_torch_tensors_native():
+    torch = pytest.importorskip("torch")
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=74,
+    )
+    for tensor in peps.tensor_map.values():
+        tensor.modify(data=torch.as_tensor(tensor.data))
+    pair = prepare_reduced_bond_pair(
+        peps,
+        where=((0, 0), (1, 0)),
+        bp_opts={"max_iterations": 1, "tol": 0.0, "diis": False},
+    )
+    problem = exact_reduced_update_problem(
+        pair,
+        torch.eye(4, dtype=torch.float64),
+    )
+    solution = solve_reduced_als(
+        problem,
+        max_bond=1,
+        max_iterations=2,
+        solver="autodiff",
+        autodiff_opts={"autodiff_backend": "torch", "optimizer": "Adam"},
+    )
+    assert isinstance(solution.left, torch.Tensor)
+    assert isinstance(solution.right, torch.Tensor)
+
+
+def test_loop_cluster_normalizes_rescaled_directed_message_pairs():
+    peps = qtn.PEPS.rand(
+        3,
+        3,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="complex128",
+        seed=71,
+    )
+    bp = two_norm_bp(peps, max_iterations=2, tol=0.0, diis=False)
+    scaled_messages = {
+        key: 100.0 * message for key, message in bp.messages.items()
+    }
+    where = ((0, 0), (1, 0))
+    pair = prepare_reduced_bond_pair(
+        peps,
+        where=where,
+        boundary_messages=bp.messages,
+    )
+    scaled_pair = prepare_reduced_bond_pair(
+        peps,
+        where=where,
+        boundary_messages=scaled_messages,
+    )
+    gate = np.eye(pair.theta_shape[1] * pair.theta_shape[2])
+    problem = loop_cluster_reduced_update_problem(
+        pair,
+        gate,
+        max_loop_size=4,
+        psd_project=False,
+    )
+    scaled_problem = loop_cluster_reduced_update_problem(
+        scaled_pair,
+        gate,
+        max_loop_size=4,
+        psd_project=False,
+    )
+
+    assert np.allclose(problem.environment.data, scaled_problem.environment.data)
 
 
 def test_reduced_loop_cluster_gate_can_start_from_d2bp_messages():

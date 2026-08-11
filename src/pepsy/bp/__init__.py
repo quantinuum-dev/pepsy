@@ -124,6 +124,7 @@ from .observables import (
     compute_path_cluster_expectation,
 )
 from .compression import BondClusterCompressionResult, compress_bond_cluster
+from ._compression_utils import CompressionBudgetError, ContractionCost
 from .reduced_update import (
     ExactReducedUpdateProblem,
     LoopClusterReducedUpdateProblem,
@@ -146,6 +147,8 @@ from .reduced_update import (
 __all__ = [
     "GaugeResult",
     "BondClusterCompressionResult",
+    "CompressionBudgetError",
+    "ContractionCost",
     "ExactReducedUpdateProblem",
     "BPCandidateScore",
     "BPCandidateSelection",
