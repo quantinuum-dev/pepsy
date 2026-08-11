@@ -4,8 +4,9 @@
 guess to a target tensor network. There are three sweep entry points:
 
 - `run()` is the simple full-contraction reference.
-- `run_eff()` is the cached one-site full-chain solver used by the default
-  boundary/sampling path.
+- `run_eff()` is the cached full-chain solver used by the default
+  boundary/sampling path; it defaults to one-site updates and also supports
+  opt-in native two- and three-site updates.
 - `run_gate()` is the cached active-window solver used by MPS/MPO circuit FIT
   and by `fit_mode="two-site"` boundary contraction over the full interval.
 
@@ -14,7 +15,7 @@ Choose the entry point by the scope of the fit:
 | Entry point | Scope | Typical consumer |
 | --- | --- | --- |
 | `run()` | Full chain, simple reference contractions | Debugging and compatibility checks |
-| `run_eff()` | Full chain, cached one-site environments | Boundary and sampling workflows |
+| `run_eff()` | Full chain, cached one-, two-, or three-site environments | Boundary and sampling workflows |
 | `run_gate()` | `range_int` only, one-, two-, or three-site updates | MPS/MPO circuit compression |
 
 The distinction is deliberate: `run_eff()` must not replace `run_gate()` for a
@@ -60,6 +61,24 @@ wavefunction and performs two direction-aware native SVD splits, while
 useful when a larger local window is worth the extra SVD cost; it is not a
 dense `from_dense` conversion.
 
+The same native block updates are available for the full-chain path:
+
+```python
+fit.run_eff(
+    n_iter=4,
+    block_size=3,
+    sweep_sequence="RL",
+    max_bond=chi,
+    cutoff=1e-12,
+)
+```
+
+`run_eff(block_size=1)` remains the default compatibility path. The block-2
+and block-3 variants visit the complete chain, reuse cached environments, and
+grow only bonds reached by their native SVD splits. They always perform the
+requested fixed sweep sequence; adaptive `rtol` stopping and detailed timing
+remain controls of `run_gate()`.
+
 For an interval containing exactly one neighboring pair,
 `single_pair_fast_path=True` marks structural convergence after one update:
 the effective tensor and its SVD solve the entire active problem, so another
@@ -96,7 +115,7 @@ normal runs never pay for these synchronization barriers. FIT also exposes
 `convergence_reason`, allowing an optimizer to reuse the known canonical
 center without a redundant sweep.
 
-Those adaptive and detailed timing fields belong to `run_gate()`. The legacy
+Those adaptive stopping and detailed timing fields belong to `run_gate()`. The
 `run()` and `run_eff()` solvers remain fixed-sweep numerical paths and are not
 silently changed by the gate-window controls. PEPS boundary results describe
 them as `convergence_reason="fixed_sweeps"` and can collect one coarse elapsed

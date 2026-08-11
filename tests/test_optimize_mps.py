@@ -895,6 +895,65 @@ def test_fit_gate_two_site_grows_only_active_bonds():
     assert [record["direction"] for record in fit.get_timing()] == []
 
 
+@pytest.mark.parametrize("block_size", (2, 3))
+def test_fit_run_eff_native_blocks_grow_full_chain(block_size):
+    """Full-chain block FIT should grow only bonds supported by the target."""
+    initial = qtn.MPS_computational_state("00000", dtype="complex128")
+    target = initial.copy()
+    target.gate_(qu.hadamard(), 2, contract=True)
+    target.gate_(
+        qu.CNOT(),
+        (2, 3),
+        contract="split",
+        max_bond=2,
+        cutoff=0.0,
+    )
+    fit = py.FIT(
+        target,
+        p=initial,
+        cutoffs=1.0e-12,
+        contraction_opt="greedy",
+    )
+
+    fit.run_eff(
+        n_iter=2,
+        verbose=True,
+        block_size=block_size,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=1.0e-12,
+    )
+
+    assert float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+    assert [fit.p.bond_size(site, site + 1) for site in range(4)] == [1, 1, 2, 1]
+    assert len(fit.fidelity_trace) == 2
+    split_key = "two_site_splits" if block_size == 2 else "three_site_splits"
+    assert fit.info[split_key]
+
+
+def test_fit_run_eff_default_keeps_fixed_rank_one_site_compatibility():
+    """The default full-chain path must remain the legacy one-site solver."""
+    initial, target = _three_site_ghz_target()
+    fit = py.FIT(target, p=initial, cutoffs=0.0)
+
+    fit.run_eff(n_iter=2)
+
+    assert fit.p.max_bond() == 1
+    assert "two_site_splits" not in fit.info
+    assert "three_site_splits" not in fit.info
+
+
+def test_fit_run_eff_three_site_requires_three_sites():
+    """A three-site full-chain update needs a sufficiently long chain."""
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    fit = py.FIT(state.copy(), p=state)
+
+    with pytest.raises(ValueError, match="at least three sites"):
+        fit.run_eff(block_size=3)
+
+
 def test_fit_gate_three_site_native_splits_and_keeps_outside_bonds():
     """Three-site FIT should use two native splits within the active window."""
     initial, target = _three_site_ghz_target()

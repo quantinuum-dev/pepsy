@@ -96,8 +96,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Small, full-contraction reference solver.  It is useful for simple
         compatibility paths and debugging, but it does not reuse environments.
     ``run_eff``
-        Cached one-site solver for a complete MPS/MPO.  It is the historical
-        full-chain boundary/sampling path and keeps fixed-sweep semantics.
+        Cached full-chain solver for an MPS/MPO.  It defaults to the
+        historical one-site boundary/sampling path and optionally supports
+        native two- and three-site block updates with fixed-sweep semantics.
     ``run_gate``
         Cached active-window solver for circuit compression.  It only updates
         ``range_int`` and optionally performs one-, two-, or three-site updates;
@@ -475,7 +476,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             # Compute fidelity if verbose mode is enabled
             if verbose:
-                fidelity = tn_fidelity(self.tn, psi)
+                fidelity = tn_fidelity(
+                    self.tn,
+                    psi,
+                    contraction_opt=contraction_opt,
+                )
                 self.fidelity_trace.append(ar.do("real", fidelity))
 
     # ------------------------------------------------------------------
@@ -532,21 +537,76 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self,
         n_iter=6,
         verbose=False,
+        *,
+        block_size=1,
+        sweep_sequence="R",
+        max_bond=None,
+        cutoff=None,
+        cutoff_mode="rsum2",
+        collect_split_diagnostics=True,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
-        """Run environment-based fitting sweeps with cached left/right blocks.
+        """Run full-chain fitting sweeps with cached left/right environments.
 
         This method avoids rebuilding full contractions at each site by
         incrementally reusing left and right environments. It is the
         full-chain counterpart of :meth:`run_gate`: ``run_eff`` deliberately
         visits every site and does not use ``range_int`` to restrict the fit.
 
+        ``block_size=1`` retains the legacy fixed-rank one-site update. The
+        opt-in ``block_size=2`` and ``block_size=3`` paths use the same cached
+        full-chain environments and native Quimb/Symmray SVD splits as
+        :meth:`run_gate`; only bonds reached by those splits can grow, up to
+        ``max_bond``. These block updates keep fixed-sweep semantics: every
+        requested sweep in ``sweep_sequence`` is performed and no adaptive
+        tolerance stopping is applied.
+
         The DMRG circuit path uses ``run_gate`` instead. A gate target differs
         from the current MPS only on its active interval, so fitting the whole
         chain here would do unnecessary work and would change the algorithm
         from local gate compression into a global variational refit.
+
+        Parameters
+        ----------
+        n_iter : int
+            Number of complete full-chain sweeps.
+        verbose : bool
+            If ``True``, append one full-chain fidelity value per sweep.
+        block_size : {1, 2, 3}, default=1
+            Number of neighboring tensors optimized by the cached update.
+            The default one-site path is retained for boundary and sampling
+            compatibility. Two- and three-site paths use native SVD splits.
+        sweep_sequence : str, default="R"
+            Fixed sequence of sweep directions for block sizes 2 and 3.
+            ``"R"`` is left-to-right, ``"L"`` is right-to-left, and
+            sequences such as ``"RL"`` alternate directions.
+        max_bond : int | None, default=None
+            Maximum bond dimension passed to native block SVD splits. This
+            applies only to block sizes 2 and 3.
+        cutoff : float | None, default=None
+            Output SVD cutoff for block sizes 2 and 3. ``None`` uses
+            ``self.cutoffs``.
+        cutoff_mode : str, default="rsum2"
+            Quimb SVD cutoff mode for block sizes 2 and 3.
+        collect_split_diagnostics : bool, default=True
+            Store native SVD metadata in ``self.info`` for block sizes 2 and 3.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
+
+        if not isinstance(block_size, Integral) or int(block_size) not in {1, 2, 3}:
+            raise ValueError("block_size must be 1, 2, or 3.")
+        block_size = int(block_size)
+        sweep_sequence = self._validate_sweep_sequence(sweep_sequence)
+        if max_bond is not None:
+            if not isinstance(max_bond, Integral) or int(max_bond) < 1:
+                raise ValueError("max_bond must be a positive integer or None.")
+            max_bond = int(max_bond)
+        if cutoff is None:
+            cutoff = self.cutoffs
+        cutoff = float(cutoff)
+        if not math.isfinite(cutoff) or cutoff < 0.0:
+            raise ValueError("cutoff must be a finite non-negative number.")
+        collect_split_diagnostics = bool(collect_split_diagnostics)
 
         site_tag_id = self.site_tag_id
         psi = self.p
@@ -557,6 +617,53 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if self.warning:
                 logger.warning("run_eff called for L=1; falling back to run().")
             self.run(n_iter=n_iter, verbose=verbose)
+            return
+
+        if block_size == 3 and L < 3:
+            raise ValueError("block_size=3 requires a full chain of at least three sites.")
+
+        if block_size in {2, 3}:
+            previous_direction = None
+            for sweep in range(n_iter):
+                direction = sweep_sequence[sweep % len(sweep_sequence)]
+                reuse_canonical_form = (
+                    previous_direction is not None
+                    and previous_direction != direction
+                )
+                if block_size == 2:
+                    self._run_gate_two_site_sweep(
+                        psi,
+                        0,
+                        L - 1,
+                        direction=direction,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        timing_record=None,
+                        collect_split_diagnostics=collect_split_diagnostics,
+                        reuse_canonical_form=reuse_canonical_form,
+                    )
+                else:
+                    self._run_gate_three_site_sweep(
+                        psi,
+                        0,
+                        L - 1,
+                        direction=direction,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        timing_record=None,
+                        collect_split_diagnostics=collect_split_diagnostics,
+                        reuse_canonical_form=reuse_canonical_form,
+                    )
+                if verbose:
+                    fidelity = tn_fidelity(
+                        self.tn,
+                        psi,
+                        contraction_opt=contraction_opt,
+                    )
+                    self.fidelity_trace.append(ar.do("real", fidelity))
+                previous_direction = direction
             return
 
         env_left = {site_tag_id.format(i): None for i in range(psi.L)}
@@ -626,7 +733,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             # Compute fidelity if verbose mode is enabled
             if verbose:
-                fidelity = tn_fidelity(self.tn, psi)
+                fidelity = tn_fidelity(
+                    self.tn,
+                    psi,
+                    contraction_opt=contraction_opt,
+                )
                 self.fidelity_trace.append(ar.do("real", fidelity))
 
     # ------------------------------------------------------------------
@@ -1535,7 +1646,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.final_norm = self.local_norm_trace[-1]
 
                 if verbose:
-                    fidelity = tn_fidelity(self.tn, psi)
+                    fidelity = tn_fidelity(
+                        self.tn,
+                        psi,
+                        contraction_opt=self.contraction_opt,
+                    )
                     self.fidelity_trace.append(ar.do("real", fidelity))
 
                 if callable(finite_check) and not bool(finite_check(psi)):
