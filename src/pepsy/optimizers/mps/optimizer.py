@@ -1682,6 +1682,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             self._init_canonicalization()
 
+    def _prepare_fit_window(self, where, *, block_size):
+        """Prepare a FIT window without pre-expanding adaptive updates.
+
+        Native two- and three-site FIT updates receive the current MPS bond
+        dimensions unchanged. Their direction-aware SVD splits grow only the
+        visited bonds, up to ``chi``. The one-site compatibility path is the
+        sole FIT path that may pre-size active bonds before fitting.
+        """
+        if int(block_size) == 1:
+            self._prepare_mix_dmrg_state(where)
+
     def set_p(self, p):
         """Assign a new state and reset canonicalization metadata."""
         new_p = self._install_represented_norm(p if self.inplace else p.copy())
@@ -2606,6 +2617,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             FIT forms a three-site wavefunction and performs two native,
             direction-aware SVD splits. If the active gate span contains only
             two sites, it automatically falls back to the two-site update.
+            Two- and three-site FIT never pre-expand the MPS; only bonds
+            visited by their native splits can grow.
         fit_sweep_sequence : str, default="RL"
             Cyclic FIT sweep directions. ``"R"`` is left-to-right, ``"L"``
             is right-to-left, and ``"RL"`` alternates. Alternating sweeps avoid
@@ -5254,8 +5267,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         xmin = min(min(where_i) for where_i in batch_where)
                         xmax = max(max(where_i) for where_i in batch_where)
                         active_where = (xmin, xmax)
-                    if fit_block_size == 1:
-                        self._prepare_mix_dmrg_state(active_where)
+                    self._prepare_fit_window(
+                        active_where,
+                        block_size=fit_block_size,
+                    )
                     self._run_mix_dmrg_batch(
                         batch_G,
                         batch_where,
@@ -5532,8 +5547,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_block_size,
                         xmax - xmin + 1,
                     )
-                    if fit_block_size == 1:
-                        self._prepare_mix_dmrg_state((xmin, xmax))
+                    self._prepare_fit_window(
+                        (xmin, xmax),
+                        block_size=fit_block_size,
+                    )
                     self.canonize_mps(p, (xmin, xmax))
                     target_norm = None
                     unitary_target_norm = self._unitary_previous_norm
@@ -5645,8 +5662,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_block_size,
                         xmax - xmin + 1,
                     )
-                    if fit_block_size == 1:
-                        self._prepare_mix_dmrg_state((xmin, xmax))
+                    self._prepare_fit_window(
+                        (xmin, xmax),
+                        block_size=fit_block_size,
+                    )
                     self.canonize_mps(p, (xmin, xmax))
                     target_norm = None
                     unitary_target_norm = self._unitary_previous_norm

@@ -1637,6 +1637,51 @@ def test_mps_optimizer_fit_block_sizes_report_warm_start_infidelity():
         } == {block_size}
 
 
+@pytest.mark.parametrize("mode", ("dmrg", "mix"))
+@pytest.mark.parametrize("block_size", (2, 3))
+def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
+    mode,
+    block_size,
+    monkeypatch,
+):
+    """Adaptive FIT must grow only bonds reached by its native SVD splits."""
+    length = 8
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * length, dtype="complex128"),
+        gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 4))],
+        chi=2,
+        mode=mode,
+    )
+
+    def fail_rank_warmup(*args, **kwargs):
+        raise AssertionError(
+            "adaptive FIT must not pre-expand MPS bonds before fitting"
+        )
+
+    monkeypatch.setattr(
+        optimizer,
+        "_prepare_mix_dmrg_state",
+        fail_rank_warmup,
+    )
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        fit_block_size=block_size,
+        cutoff=0.0,
+        target_cutoff=0.0,
+        fit_single_pair_fast_path=False,
+        timing=True,
+    )
+
+    assert [
+        optimizer.p.bond_size(site, site + 1) for site in range(length - 1)
+    ] == [2, 2, 2, 2, 1, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["block_size"] == block_size
+    if mode == "mix":
+        assert optimizer.mix_history[-1]["backend"] == "dmrg"
+
+
 def test_unitary_fit_stabilization_preserves_recorded_compression_loss():
     """Renormalizing the live MPS must not erase the discarded fidelity."""
     optimizer = py.MpsOptimizer(

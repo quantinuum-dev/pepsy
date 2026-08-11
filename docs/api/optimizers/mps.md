@@ -110,7 +110,9 @@ not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
 wavefunction and two direction-aware native SVD splits, and is useful when a
 larger local window is worth the extra decomposition cost. An adjacent
 two-site gate span automatically falls back to `fit_block_size=2`. Both block
-sizes preserve native dense and Symmray backends. `fit_block_size=1` retains
+sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
+optimizer passes the current MPS directly to FIT without pre-padding bonds;
+only bonds visited by the native splits can grow. `fit_block_size=1` retains
 the fixed-rank compatibility algorithm, for which mixed mode still warms short
 active bonds through MPO. Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
