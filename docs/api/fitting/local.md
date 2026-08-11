@@ -61,6 +61,12 @@ wavefunction and performs two direction-aware native SVD splits, while
 useful when a larger local window is worth the extra SVD cost; it is not a
 dense `from_dense` conversion.
 
+For gate-window fits, `three_site_sweeps=1` (the default) uses one larger
+three-site warm-up sweep and then switches to one-site refinement for any
+remaining requested sweeps. Set `three_site_sweeps=2` for two directional
+warm-up passes. One-site refinement preserves the bond dimensions opened by
+the three-site update and is cheaper than repeating the larger SVD block.
+
 The same native block updates are available for the full-chain path:
 
 ```python
@@ -89,10 +95,16 @@ dictionaries when only the fitted state and retained norm are needed.
 
 `sweep_sequence` uses Quimb direction names: `"R"` is left-to-right, `"L"` is
 right-to-left, and `"RL"` alternates. `environment_strategy="auto"` selects
-`"mps-direct"` for an ordinary dense one-tensor-per-site target and otherwise
-uses the general native-safe `"generic"` route. The two strategies implement
-the same objective for targets supported by both; the explicit setting is
+`"mps-direct"` for an ordinary dense one-tensor-per-site target,
+`"symmray-native"` when all target and fitted tensors are Symmray-backed, and
+otherwise uses the general `"generic"` route. The native route contracts each
+chain environment with Symmray's blockwise tensor product, preserving charge
+sectors and fermionic metadata without densifying. The explicit settings are
 mainly useful for profiling and regression comparison.
+
+`cutoff="auto"` chooses `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
+data, and `1e-12` for 64-bit data. Numeric cutoffs retain their explicit
+behavior.
 
 When consecutive sweeps reverse direction, `run_gate()` reuses the canonical
 form produced by the preceding block update instead of repeating the boundary

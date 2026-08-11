@@ -137,7 +137,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Enable warning logs for fallback and retagging edge-cases.
     inplace : bool, default=False
         If ``True``, optimize ``p`` in place; otherwise operate on ``p.copy()``.
-    environment_strategy : {"auto", "mps-direct", "generic"}, default="auto"
+    environment_strategy : {"auto", "mps-direct", "symmray-native", "generic"}, default="auto"
         Local environment contraction route. ``"mps-direct"`` avoids
         temporary TensorNetwork construction when both the target and fitted
         state are ordinary dense MPS/MPO networks. ``"generic"`` is the
@@ -157,9 +157,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     range_int : list[int]
         Inclusive active interval represented as ``[start, stop]`` for
         :meth:`run_gate`; an empty list means no gate window was requested.
-    environment_strategy : {"mps-direct", "generic"}
+    environment_strategy : {"mps-direct", "symmray-native", "generic"}
         Resolved effective-environment implementation selected during
-        construction.
+        construction. Symmray inputs use the native blockwise route by
+        default.
     timing_records : list[dict]
         Copy-safe per-sweep timing records collected by ``run_gate(timing=True)``.
     info : dict
@@ -239,9 +240,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.backend = backend
 
         environment_strategy = str(environment_strategy).strip().lower()
-        if environment_strategy not in {"auto", "mps-direct", "generic"}:
+        if environment_strategy not in {
+            "auto",
+            "mps-direct",
+            "symmray-native",
+            "generic",
+        }:
             raise ValueError(
-                "environment_strategy must be 'auto', 'mps-direct', or 'generic'."
+                "environment_strategy must be 'auto', 'mps-direct', "
+                "'symmray-native', or 'generic'."
             )
 
         # Initialize user-facing diagnostics. These values describe the most
@@ -298,17 +305,32 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 for tensor in (*self.tn.tensors, *self.p.tensors)
             )
         )
+        symmray_tensors = (*self.tn.tensors, *self.p.tensors)
+        symmray_native_available = bool(symmray_tensors) and all(
+            type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+            for tensor in symmray_tensors
+        )
         if environment_strategy == "mps-direct" and not direct_available:
             raise ValueError(
                 "environment_strategy='mps-direct' requires an ordinary dense "
                 "MPS/MPO target and fitted state with exactly one target tensor "
                 "per site."
             )
+        if environment_strategy == "symmray-native" and not symmray_native_available:
+            raise ValueError(
+                "environment_strategy='symmray-native' requires Symmray-backed "
+                "target and fitted tensors."
+            )
         self.environment_strategy = (
             "mps-direct"
             if environment_strategy == "mps-direct"
             or (environment_strategy == "auto" and direct_available)
-            else "generic"
+            else (
+                "symmray-native"
+                if environment_strategy == "symmray-native"
+                or (environment_strategy == "auto" and symmray_native_available)
+                else "generic"
+            )
         )
 
     # ------------------------------------------------------------------
@@ -339,6 +361,27 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if len(self.tn.tensor_map) != self.L:
             return None
         return tuple(tensors)
+
+    def _resolve_cutoff(self, cutoff):
+        """Resolve an optional dtype-aware truncation cutoff."""
+        if cutoff != "auto":
+            return float(cutoff)
+
+        dtype_names = []
+        for network in (self.p, self.tn):
+            for tensor in network.tensors:
+                dtype = getattr(tensor.data, "dtype", None)
+                if dtype is not None:
+                    dtype_names.append(str(dtype).lower())
+        if any("16" in dtype for dtype in dtype_names):
+            resolved = 1.0e-3
+        elif any("32" in dtype or "complex64" in dtype for dtype in dtype_names):
+            resolved = 1.0e-6
+        else:
+            resolved = 1.0e-12
+        self.info["cutoff_requested"] = "auto"
+        self.info["cutoff_resolved"] = resolved
+        return resolved
 
     def visual(
         self,
@@ -603,7 +646,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             max_bond = int(max_bond)
         if cutoff is None:
             cutoff = self.cutoffs
-        cutoff = float(cutoff)
+        cutoff = self._resolve_cutoff(cutoff)
         if not math.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("cutoff must be a finite non-negative number.")
         collect_split_diagnostics = bool(collect_split_diagnostics)
@@ -827,6 +870,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if not components:
             raise ValueError("Cannot contract an empty FIT environment.")
 
+        if self.environment_strategy == "symmray-native" and all(
+            type(component.data).__module__.split(".", 1)[0] == "symmray"
+            for component in components
+        ):
+            return self._contract_symmray_components(
+                components,
+                output_inds=output_inds,
+            )
+
         if self.environment_strategy == "mps-direct" and all(
             isinstance(component, qtn.Tensor) for component in components
         ):
@@ -852,6 +904,42 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if output_inds is not None:
             return network.transpose(*output_inds)
         return network
+
+    @staticmethod
+    def _contract_symmray_components(components, *, output_inds=None):
+        """Contract Symmray components through native blockwise products.
+
+        FIT environments are chain-shaped: a site overlap is appended to one
+        already-contracted boundary environment at a time.  Quimb's generic
+        network contraction is robust, but rebuilding a contraction tree for
+        every such step adds avoidable Python overhead and can obscure
+        Symmray's native block contraction.  This route mirrors SymDMRG2's
+        pair contraction while retaining the exact Quimb index ordering and
+        tensor tags expected by the active-window solver.
+        """
+        result = components[0]
+        for right in components[1:]:
+            shared = tuple(ind for ind in result.inds if ind in right.inds)
+            left_axes = tuple(result.inds.index(ind) for ind in shared)
+            right_axes = tuple(right.inds.index(ind) for ind in shared)
+            data = result.data.tensordot(
+                right.data,
+                axes=(left_axes, right_axes),
+                mode="blockwise",
+                preserve_array=True,
+            )
+            inds = (
+                tuple(ind for ind in result.inds if ind not in shared)
+                + tuple(ind for ind in right.inds if ind not in shared)
+            )
+            result = qtn.Tensor(
+                data=data,
+                inds=inds,
+                tags=result.tags | right.tags,
+            )
+        if output_inds is not None:
+            result = result.transpose(*output_inds)
+        return result
 
     def _overlap_environment_site(self, psi, site, start, stop, prior=None):
         """Contract one ``<psi|target>`` site into a cached environment."""
@@ -1483,6 +1571,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing=None,
         timing_sync_device=False,
         single_pair_fast_path=False,
+        three_site_sweeps=1,
         collect_split_diagnostics=True,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
@@ -1511,7 +1600,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         the general state-check callback behavior. ``timing=True`` records one
         wall-clock entry per sweep and per active-site update. Accelerator
         timings become kernel-complete when ``timing_sync_device=True``.
-        ``single_pair_fast_path=True`` stops a two-site interval after its one
+        ``three_site_sweeps`` controls how many initial sweeps use the
+        three-site update. Remaining sweeps use one-site refinement, which
+        preserves the bond space opened by the larger block. ``single_pair_fast_path=True`` stops a two-site interval after its one
         exact variational update; additional sweeps cannot change that local
         optimum. ``collect_split_diagnostics=False`` avoids allocating SVD
         metadata when the caller only needs the fitted state.
@@ -1528,12 +1619,19 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             max_bond = int(max_bond)
         if cutoff is None:
             cutoff = self.cutoffs
-        cutoff = float(cutoff)
+        cutoff = self._resolve_cutoff(cutoff)
         if not math.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("cutoff must be a finite non-negative number.")
         if not isinstance(n_iter, Integral) or int(n_iter) < 1:
             raise ValueError("n_iter must be a positive integer.")
         n_iter = int(n_iter)
+        if not isinstance(three_site_sweeps, Integral) or int(three_site_sweeps) < 1:
+            raise ValueError("three_site_sweeps must be a positive integer.")
+        three_site_sweeps = min(int(three_site_sweeps), n_iter)
+        if block_size != 3 and three_site_sweeps != 1:
+            raise ValueError(
+                "three_site_sweeps is only configurable when block_size=3."
+            )
         if min_iter is None:
             min_iter = n_iter if rtol is None else 1
         if not isinstance(min_iter, Integral) or int(min_iter) < 1:
@@ -1591,6 +1689,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         previous_direction = None
         for sweep in range(1, n_iter + 1):
             direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
+            active_block_size = (
+                3
+                if block_size == 3 and sweep <= three_site_sweeps
+                else (1 if block_size == 3 else block_size)
+            )
             reuse_canonical_form = (
                 previous_direction is not None
                 and previous_direction != direction
@@ -1599,12 +1702,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 sweep,
                 timing,
                 direction=direction,
-                block_size=block_size,
+                block_size=active_block_size,
             )
             self.iterations_run = sweep
             sweep_norm_start = len(self.local_norm_trace)
             try:
-                if block_size == 1:
+                if active_block_size == 1:
                     self._run_gate_one_site_sweep(
                         psi,
                         start,
@@ -1614,7 +1717,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         reuse_canonical_form=reuse_canonical_form,
                     )
                 else:
-                    if block_size == 2:
+                    if active_block_size == 2:
                         self._run_gate_two_site_sweep(
                             psi,
                             start,
@@ -1685,7 +1788,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 should_stop = False
                 if (
                     single_pair_fast_path
-                    and block_size == 2
+                    and active_block_size == 2
                     and stop == start + 1
                 ):
                     # There is only one variational pair. Its effective tensor

@@ -965,6 +965,7 @@ def test_fit_gate_three_site_native_splits_and_keeps_outside_bonds():
         sweep_sequence="RL",
         max_bond=2,
         cutoff=0.0,
+        three_site_sweeps=2,
         timing=True,
     )
 
@@ -985,6 +986,25 @@ def test_fit_gate_three_site_native_splits_and_keeps_outside_bonds():
         for record in timing
         for site_timing in record["site_timings"]
     )
+
+
+def test_fit_gate_three_site_warmup_then_one_site_refinement():
+    """Three-site warm-up should switch to one-site polishing sweeps."""
+    initial, target = _three_site_ghz_target()
+    fit = py.FIT(target, p=initial, range_int=[0, 3])
+
+    fit.run_gate(
+        n_iter=3,
+        block_size=3,
+        three_site_sweeps=1,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+        timing=True,
+    )
+
+    assert [record["block_size"] for record in fit.get_timing()] == [3, 1, 1]
+    assert len(fit.info["three_site_splits"]) == 2
 
 
 @pytest.mark.parametrize("block_size", [1, 2, 3])
@@ -1024,10 +1044,14 @@ def test_fit_gate_large_window_block_sizes_compare_with_timing(block_size):
     assert [record["direction"] for record in records] == ["R", "L"]
     assert all(record["timing_schema"] == 2 for record in records)
     assert all(record["active_site_count"] == length for record in records)
-    assert all(record["block_size"] == block_size for record in records)
-    assert all(
-        record["update_count"] == length - block_size + 1 for record in records
-    )
+    expected_blocks = [block_size, block_size]
+    if block_size == 3:
+        expected_blocks = [3, 1]
+    assert [record["block_size"] for record in records] == expected_blocks
+    assert [record["update_count"] for record in records] == [
+        length - active_block_size + 1
+        for active_block_size in expected_blocks
+    ]
     assert all(
         all(
             site_timing[stage] >= 0.0
@@ -1056,8 +1080,11 @@ def test_fit_gate_large_window_block_sizes_compare_with_timing(block_size):
         assert 1 < fit.p.max_bond() < max_bond
         assert 0.4 < fidelity < 0.9
     else:
-        assert fit.p.max_bond() == max_bond
-        assert fidelity > 0.99
+        # The default three-site schedule uses one warm-up sweep followed by
+        # one-site refinement, so the refinement sweep cannot open additional
+        # bonds to reach the old two-three-site-sweep rank.
+        assert 1 < fit.p.max_bond() < max_bond
+        assert fidelity > 0.5
 
 
 def test_fit_gate_three_site_direct_and_generic_routes_match():
@@ -1134,6 +1161,21 @@ def test_fit_dense_direct_environment_matches_generic_route():
     assert np.allclose(direct.p.to_dense(), generic.p.to_dense(), atol=1.0e-11)
 
 
+def test_fit_auto_cutoff_is_dtype_aware():
+    """FIT's automatic cutoff follows the fitted tensor precision."""
+    initial = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex64", seed=209
+    )
+    target = initial.copy(deep=True)
+    target.gate_nonlocal_(qu.CNOT(), (0, 2), max_bond=None, cutoff=0.0)
+    fit = py.FIT(target, p=initial, range_int=[0, 2])
+
+    fit.run_gate(n_iter=1, block_size=2, cutoff="auto")
+
+    assert fit.info["cutoff_requested"] == "auto"
+    assert fit.info["cutoff_resolved"] == pytest.approx(1.0e-6)
+
+
 def test_fit_retag_resolves_environment_and_preserves_info_object():
     """Retagging precedes route selection and caller diagnostics stay live."""
     state = qtn.MPS_rand_state(
@@ -1194,6 +1236,8 @@ def test_new_fit_configuration_is_keyword_only():
         "fit_block_size",
         "fit_sweep_sequence",
         "fit_layer_size",
+        "fit_max_span",
+        "fit_three_site_sweeps",
         "target_cutoff",
         "fit_target_strategy",
         "fit_single_pair_fast_path",
@@ -1201,6 +1245,8 @@ def test_new_fit_configuration_is_keyword_only():
         "fit_stabilize_unitary",
         "timing",
         "timing_sync_device",
+        "quality_check_every",
+        "quality_check_repair",
     ):
         assert run_parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -1595,6 +1641,59 @@ def test_fit_gate_three_site_symmray_uses_native_block_splits():
     )
 
 
+def test_fit_symmray_native_environment_matches_generic_route():
+    """Native Symmray environments preserve the generic FIT result."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        3,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0)),
+        seed=2,
+        dtype="complex128",
+    )
+    target = state.copy(deep=True)
+    target[1].modify(data=target[1].data * 0.75)
+
+    native = py.FIT(
+        target,
+        p=state.copy(deep=True),
+        range_int=[0, 2],
+        environment_strategy="symmray-native",
+    )
+    generic = py.FIT(
+        target.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[0, 2],
+        environment_strategy="generic",
+    )
+    native.run_gate(n_iter=2, block_size=2, sweep_sequence="RL", cutoff=0.0)
+    generic.run_gate(n_iter=2, block_size=2, sweep_sequence="RL", cutoff=0.0)
+
+    assert native.environment_strategy == "symmray-native"
+    assert native.p.to_dense().allclose(generic.p.to_dense(), atol=1.0e-10)
+
+
+def test_fit_auto_selects_native_symmray_environment():
+    """Automatic FIT routing uses the native Symmray environment path."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(spinful=False, symmetry="U1", dtype="complex128")
+    state = py.ps_to_mps(
+        3,
+        fermion=fermion,
+        occupations=(1, 0, 1),
+        seed=3,
+        dtype="complex128",
+    )
+    fit = py.FIT(state.copy(deep=True), p=state, range_int=[0, 2])
+
+    assert fit.environment_strategy == "symmray-native"
+
+
 def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
     """MpsOptimizer should use three-site FIT and shorten adjacent windows."""
     optimizer = py.MpsOptimizer(
@@ -1691,9 +1790,12 @@ def test_mps_optimizer_fit_block_sizes_report_warm_start_infidelity():
             step["local_infidelity"] >= 0.0 for step in result["samples"]
         )
         assert result["timing"]["fit_steps"]
+        expected_blocks = {block_size}
+        if block_size == 3:
+            expected_blocks = {3, 1}
         assert {
             step["block_size"] for step in result["timing"]["fit_steps"]
-        } == {block_size}
+        } == expected_blocks
 
 
 @pytest.mark.parametrize("mode", ("dmrg", "mix"))
@@ -2172,6 +2274,22 @@ def test_mps_optimizer_mix_inplace_short_active_bond_uses_mpo():
     assert p0.bond_size(2, 3) == 2
 
 
+def test_mps_optimizer_mix_trial_copies_only_active_canonical_path():
+    """Mixed transactions isolate the active window without copying the chain."""
+    p0 = qtn.MPS_rand_state(5, bond_dim=2, phys_dim=2, dtype="complex128", seed=28)
+    opt = py.MpsOptimizer(p0, gates=[], chi=2, mode="mix", inplace=True)
+
+    trial, sites = opt._copy_mix_trial(opt.p, (0, 2), {"cur_orthog": (0, 0)})
+
+    assert sites == (0, 1, 2)
+    assert trial[0].data is not opt.p[0].data
+    assert trial[2].data is not opt.p[2].data
+    assert trial[3].data is opt.p[3].data
+    before = np.array(opt.p[0].data, copy=True)
+    trial[0].modify(data=np.zeros_like(trial[0].data))
+    assert np.allclose(opt.p[0].data, before)
+
+
 def test_mps_optimizer_mix_fallback_restores_unitary_norm_tracking(monkeypatch):
     """A failed DMRG trial must not change the MPO fallback error bar."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=29)
@@ -2278,6 +2396,41 @@ def test_mps_optimizer_mix_batches_two_site_transactions():
     assert opt.mix_history[0]["reason"] == "bond_at_target"
     assert opt.mix_history[1]["reason"] == "dmrg_batch"
     assert [sample["step"] for sample in opt.infidelity_samples] == [2]
+
+
+def test_mps_optimizer_batch_collection_respects_spatial_span():
+    """Span-aware batching splits disjoint gates before a wide FIT window."""
+    gates = [qu.CNOT(), qu.CNOT(), qu.CNOT()]
+    where = [(0, 1), (2, 3), (10, 11)]
+
+    batch_G, batch_where, count, next_idx = py.MpsOptimizer._collect_dmrg_batch(
+        gates,
+        where,
+        0,
+        3,
+        max_span=5,
+    )
+
+    assert batch_G == gates[:2]
+    assert batch_where == where[:2]
+    assert count == 2
+    assert next_idx == 2
+
+
+def test_mps_optimizer_quality_checks_report_finite_canonical_state():
+    """Periodic quality checks expose finite data and gauge coverage."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 2)), (qu.CNOT(), (1, 3))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    opt.run(progbar=False, n_iter=1, quality_check_every=True)
+
+    assert len(opt.get_quality_checks()) == 2
+    assert all(record["finite"] for record in opt.get_quality_checks())
+    assert all(record["canonical_ok"] for record in opt.get_quality_checks())
 
 
 def test_mps_optimizer_mix_rejects_initial_bond_above_chi():

@@ -131,6 +131,42 @@ class MpoOptimizer:
             for tensor in getattr(tn, "tensors", ())
         )
 
+    @staticmethod
+    def _resolve_cutoff(value, p):
+        """Resolve a numeric or dtype-aware truncation cutoff."""
+        if value == "auto":
+            dtype_names = [
+                str(getattr(tensor.data, "dtype", "")).lower()
+                for tensor in p.tensors
+            ]
+            if any("16" in dtype for dtype in dtype_names):
+                return 1.0e-3
+            if any("32" in dtype or "complex64" in dtype for dtype in dtype_names):
+                return 1.0e-6
+            return 1.0e-12
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cutoff must be 'auto' or a non-negative number."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        return value
+
+    @staticmethod
+    def _resolve_fit_max_span(value, k_2q_batch):
+        """Resolve the maximum inclusive spatial span of a DMRG batch."""
+        if value is None:
+            return None
+        if value == "auto":
+            return max(3, 2 * int(k_2q_batch) + 1)
+        if not isinstance(value, Integral) or int(value) < 2:
+            raise ValueError(
+                "fit_max_span must be 'auto', None, or an integer >= 2."
+            )
+        return int(value)
+
     @classmethod
     def _normalize_mode(cls, mode):
         """Lower-case and validate ``mode`` against :attr:`_ALLOWED_MODES`."""
@@ -211,12 +247,17 @@ class MpoOptimizer:
         self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
         self._current_orthog(self.p)
 
-    def _prepare_dmrg_state(self):
-        """Pad to at least ``chi`` bond dimension before DMRG fits.
+    def _prepare_dmrg_state(self, fit_block_size=1):
+        """Prepare the MPO for the selected local FIT update.
 
-        Local FIT updates cannot grow the bond dimension on their own, so we
-        expand the working MPO once up front and re-canonicalize.
+        The historical dense one-site FIT path has fixed bond dimensions and
+        still needs the old eager expansion. Native Symmray paths cannot use
+        that dense padding, and native two- and three-site FIT splits discover
+        the required bond sectors themselves, so native paths never pre-expand
+        their multi-sector bonds.
         """
+        if int(fit_block_size) != 1 or self._has_symmray_data(self.p):
+            return
         if self.p.max_bond() < self.chi:
             self.p.expand_bond_dimension(self.chi, inplace=True)
             self._init_canonicalization()
@@ -580,19 +621,31 @@ class MpoOptimizer:
         if contract == "split-gate":
             self._materialize_split_gate(p, where)
 
-    def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff, cutoff_mode="rsum2"):
+    def _build_dmrg_target(
+        self,
+        p,
+        gate,
+        where,
+        bra_gate,
+        cutoff,
+        cutoff_mode="rsum2",
+        *,
+        target_cutoff=None,
+    ):
         """Return ``p`` with one two-site gate pair applied via ``split-gate``.
 
         The result is the *target* MPO that the local FIT update will fit
         back to bond dimension ``chi`` inside the gate window.
         """
+        if target_cutoff is None:
+            target_cutoff = cutoff
         p_g = p.copy()
         self._apply_gate_pair(
             p_g,
             gate,
             where,
             bra_gate=bra_gate,
-            cutoff=cutoff,
+            cutoff=target_cutoff,
             cutoff_mode=cutoff_mode,
             contract="split-gate",
             inplace=True,
@@ -600,7 +653,14 @@ class MpoOptimizer:
         return p_g
 
     @staticmethod
-    def _collect_dmrg_batch(G_seq, where_seq, start_idx, k_2q_batch):
+    def _collect_dmrg_batch(
+        G_seq,
+        where_seq,
+        start_idx,
+        k_2q_batch,
+        *,
+        max_span=None,
+    ):
         """Greedily collect up to ``k_2q_batch`` consecutive two-site gates.
 
         Any one-site gates encountered along the way are folded into the
@@ -615,6 +675,12 @@ class MpoOptimizer:
         while idx < len(G_seq) and two_qubit_in_batch < k_2q_batch:
             where = tuple(where_seq[idx])
             gate = G_seq[idx]
+            if max_span is not None and batch_where:
+                sites = [site for previous in batch_where for site in previous]
+                sites.extend(where)
+                proposed_span = max(sites) - min(sites) + 1
+                if proposed_span > int(max_span):
+                    break
             if len(where) == 1:
                 batch_where.append(where)
                 batch_G.append(gate)
@@ -628,13 +694,24 @@ class MpoOptimizer:
 
         return batch_G, batch_where, two_qubit_in_batch, idx
 
-    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rsum2"):
+    def _build_dmrg_batch_target(
+        self,
+        p,
+        batch_G,
+        batch_where,
+        cutoff,
+        cutoff_mode="rsum2",
+        *,
+        target_cutoff=None,
+    ):
         """Apply a collected DMRG batch onto a copy of ``p``.
 
         Used to materialise the local target MPO for a batched FIT update.
         Two-site gates are split (``split-gate``) and one-site gates are
         contracted directly.
         """
+        if target_cutoff is None:
+            target_cutoff = cutoff
         p_g = p.copy()
         for G_i, where_i in zip(batch_G, batch_where):
             gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
@@ -644,22 +721,47 @@ class MpoOptimizer:
                 gate,
                 where,
                 bra_gate=bra_gate,
-                cutoff=cutoff,
+                cutoff=target_cutoff,
                 cutoff_mode=cutoff_mode,
                 contract=contract,
                 inplace=True,
             )
         return p_g
 
-    def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", k_2q_batch=1, fidelity_samples=10):
+    def _run_dmrg(
+        self,
+        G_seq,
+        where_seq,
+        n_iter,
+        progbar=False,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        k_2q_batch=1,
+        fidelity_samples=10,
+        fit_block_size=2,
+        fit_sweep_sequence="RL",
+        fit_max_span=None,
+        fit_three_site_sweeps=1,
+        target_cutoff=0.0,
+    ):
         """Sweep the gate stream with local DMRG-style FIT compression.
 
         One-site gates are applied exactly; each two-site gate (or batch of
         ``k_2q_batch`` consecutive ones) is fitted by :class:`FIT` back to
-        bond ``chi`` inside the gate window ``[xmin, xmax]``.
+        bond ``chi`` inside the gate window ``[xmin, xmax]``. ``fit_block_size``
+        selects the one-, two-, or three-site native SVD update, and its
+        cutoff policy is forwarded explicitly to both SVD splits and the
+        requested sweep sequence.
         """
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
+        if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
+            1,
+            2,
+            3,
+        }:
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        fit_block_size = int(fit_block_size)
 
         p = self.p
         two_qubit_count = 0
@@ -700,7 +802,15 @@ class MpoOptimizer:
                     two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._build_dmrg_target(p, gate, where, bra_gate, cutoff, cutoff_mode)
+                    p_g = self._build_dmrg_target(
+                        p,
+                        gate,
+                        where,
+                        bra_gate,
+                        cutoff,
+                        cutoff_mode,
+                        target_cutoff=target_cutoff,
+                    )
 
                     fit = FIT(
                         p_g,
@@ -710,15 +820,34 @@ class MpoOptimizer:
                         retag=False,
                         range_int=[xmin, xmax],
                     )
-                    fit.run_gate(n_iter=n_iter, verbose=False)
+                    active_fit_block_size = min(
+                        fit_block_size,
+                        xmax - xmin + 1,
+                    )
+                    fit.run_gate(
+                        n_iter=n_iter,
+                        verbose=False,
+                        block_size=active_fit_block_size,
+                        sweep_sequence=fit_sweep_sequence,
+                        max_bond=self.chi,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        three_site_sweeps=fit_three_site_sweeps,
+                    )
                     p = fit.p
 
                     self.info_c["cur_orthog"] = (xmin, xmax)
                     idx += 1
                     advanced = 1
                 else:
-                    batch_G, batch_where, two_qubit_in_batch, next_idx = self._collect_dmrg_batch(
-                        G_seq, where_seq, idx, k_2q_batch
+                    batch_G, batch_where, two_qubit_in_batch, next_idx = (
+                        self._collect_dmrg_batch(
+                            G_seq,
+                            where_seq,
+                            idx,
+                            k_2q_batch,
+                            max_span=fit_max_span,
+                        )
                     )
                     if two_qubit_in_batch < 1:
                         raise RuntimeError("DMRG batch unexpectedly contains no two-qubit gates.")
@@ -727,7 +856,14 @@ class MpoOptimizer:
                     batch_span_sites = [site for where_i in batch_where for site in where_i]
                     xmin, xmax = min(batch_span_sites), max(batch_span_sites)
                     self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
+                    p_g = self._build_dmrg_batch_target(
+                        p,
+                        batch_G,
+                        batch_where,
+                        cutoff,
+                        cutoff_mode,
+                        target_cutoff=target_cutoff,
+                    )
 
                     fit = FIT(
                         p_g,
@@ -737,7 +873,20 @@ class MpoOptimizer:
                         retag=False,
                         range_int=[xmin, xmax],
                     )
-                    fit.run_gate(n_iter=n_iter, verbose=False)
+                    active_fit_block_size = min(
+                        fit_block_size,
+                        xmax - xmin + 1,
+                    )
+                    fit.run_gate(
+                        n_iter=n_iter,
+                        verbose=False,
+                        block_size=active_fit_block_size,
+                        sweep_sequence=fit_sweep_sequence,
+                        max_bond=self.chi,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        three_site_sweeps=fit_three_site_sweeps,
+                    )
                     p = fit.p
 
                     self.info_c["cur_orthog"] = (xmin, xmax)
@@ -830,6 +979,7 @@ class MpoOptimizer:
                     stop=xmax,
                     max_bond=self.chi,
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                 )
             else:
                 raise ValueError("Each gate location must have one or two sites.")
@@ -954,6 +1104,11 @@ class MpoOptimizer:
         cutoff_mode="rsum2",
         fidelity_samples=10,
         k_2q_batch=1,
+        fit_block_size=2,
+        fit_sweep_sequence="RL",
+        fit_max_span="auto",
+        fit_three_site_sweeps=1,
+        target_cutoff=0.0,
     ):
         """Run queued gates on both MPO index families.
 
@@ -966,7 +1121,7 @@ class MpoOptimizer:
             Optional mode override for this run.
         progbar : bool, default=False
             Show tqdm progress bar.
-        cutoff : float, default=1e-12
+        cutoff : float | {"auto"}, default=1e-12
             Truncation cutoff used in gate application and compression.
         cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
@@ -978,6 +1133,23 @@ class MpoOptimizer:
             ``dmrg`` mode only: number of sequential two-qubit gates to batch
             into one local FIT update. The FIT window uses the batch-wide
             ``[xmin, xmax]`` from all gate locations in the batch.
+        fit_block_size : {1, 2, 3}, default=2
+            ``dmrg`` mode only: number of neighboring MPO tensors optimized
+            by each native FIT update. Two- and three-site updates grow only
+            bonds reached by their SVD splits; one-site FIT retains the legacy
+            fixed-rank compatibility path.
+        fit_sweep_sequence : str, default="RL"
+            ``dmrg`` mode only: cyclic FIT sweep directions. ``"R"`` and
+            ``"L"`` select one direction, while ``"RL"`` alternates them.
+        fit_max_span : int | {"auto"} | None, default="auto"
+            ``dmrg`` mode only: maximum inclusive spatial span of a batched
+            FIT target. The first long-range gate is always retained.
+        fit_three_site_sweeps : int, default=1
+            ``dmrg`` mode only: initial three-site warm-up sweeps before
+            one-site refinement when ``fit_block_size=3``.
+        target_cutoff : float, default=0.0
+            ``dmrg`` mode only: cutoff used while constructing the target
+            MPO. The output FIT SVD remains controlled by ``cutoff``.
 
         Returns
         -------
@@ -993,27 +1165,44 @@ class MpoOptimizer:
         if mode is not None:
             self.set_mode(mode)
 
+        cutoff = self._resolve_cutoff(cutoff, self.p)
+
         G_seq = list(self.G)
         where_seq = list(self.where)
         if not G_seq:
             return self.p
 
         if self.mode == "dmrg":
-            # Quimb's FIT preparation expands bonds with dense-style padding,
-            # which is not valid for multi-sector Symmray indices. The
-            # symmetry-aware local SVD path applies the same gate/compression
-            # contract without destroying charge blocks.
-            if self._has_symmray_data(self.p):
-                self._run_svd(
-                    G_seq,
-                    where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
+            if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
+                1,
+                2,
+                3,
+            }:
+                raise ValueError("fit_block_size must be 1, 2, or 3.")
+            if (
+                not isinstance(fit_three_site_sweeps, Integral)
+                or int(fit_three_site_sweeps) < 1
+            ):
+                raise ValueError("fit_three_site_sweeps must be a positive integer.")
+            if int(fit_block_size) != 3 and int(fit_three_site_sweeps) != 1:
+                raise ValueError(
+                    "fit_three_site_sweeps is only configurable when "
+                    "fit_block_size=3."
                 )
-                return self.p
-            self._prepare_dmrg_state()
+            fit_max_span = self._resolve_fit_max_span(
+                fit_max_span,
+                k_2q_batch,
+            )
+            target_cutoff = float(target_cutoff)
+            if not np.isfinite(target_cutoff) or target_cutoff < 0.0:
+                raise ValueError(
+                    "target_cutoff must be a finite non-negative number."
+                )
+            # Native Symmray FIT uses block-aware target construction and
+            # native SVD splits. It must not take Quimb's eager bond-padding
+            # route, but it otherwise follows the same variational DMRG path
+            # as dense MPOs. ``mode='mpo'`` remains the direct SVD path.
+            self._prepare_dmrg_state(fit_block_size=fit_block_size)
             self._run_dmrg(
                 G_seq,
                 where_seq,
@@ -1023,6 +1212,11 @@ class MpoOptimizer:
                 cutoff_mode=cutoff_mode,
                 k_2q_batch=k_2q_batch,
                 fidelity_samples=fidelity_samples,
+                fit_block_size=fit_block_size,
+                fit_sweep_sequence=fit_sweep_sequence,
+                fit_max_span=fit_max_span,
+                fit_three_site_sweeps=int(fit_three_site_sweeps),
+                target_cutoff=target_cutoff,
             )
             return self.p
 

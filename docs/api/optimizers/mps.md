@@ -118,7 +118,12 @@ active bonds through MPO. Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
 the block's shared compression. `fit_layer_size` is the clear name for
 `k_2q_batch`; it counts two-site gates in a contiguous paper-style target
-block. If a DMRG/FIT batch
+block. With `fit_block_size=3`, one initial three-site sweep is followed by
+one-site refinement by default; set `fit_three_site_sweeps=2` for two warm-up
+passes. `fit_max_span="auto"` also limits the spatial width of a batched
+target, splitting disjoint gates before they create an unnecessarily wide FIT
+window. Set `fit_max_span=None` to restore unrestricted gate-count batching.
+If a DMRG/FIT batch
 raises, produces non-finite data, or exceeds `chi`, the optimizer restores the
 complete pre-batch state (including canonical and infidelity metadata) and
 replays the batch through MPO. Interrupts restore the trial state and are
@@ -193,7 +198,17 @@ underflowing while keeping cumulative infidelity meaningful. Set the option to
 `False` only to reproduce historical norm-decay behavior. The old
 `fit_stabilize_unitary` spelling remains as a deprecated alias.
 
-After a non-finite DMRG result, `mix_sticky_nonfinite=True` keeps the remainder
+`cutoff="auto"` selects `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
+data, and `1e-12` for 64-bit data. Explicit numeric cutoffs are unchanged.
+Set `quality_check_every=N` to record finite-data and canonical-gauge health in
+`opt.get_quality_checks()`. Checks are disabled by default; when enabled,
+`quality_check_repair=True` re-canonicalizes if canonical coverage is lost.
+
+Mixed-mode DMRG trials isolate only the active FIT window and the canonicalization
+path leading to it. Untouched MPS tensors are shared until a successful trial is
+committed, avoiding a full deep copy for every transaction while preserving
+rollback safety for the active update. After a non-finite DMRG result,
+`mix_sticky_nonfinite=True` keeps the remainder
 of the current `run()` call on MPO rather than retrying an unhealthy FIT for
 every gate. An ordinary exception still falls back only for its transaction.
 The initial MPS must satisfy `p.max_bond() <= chi`. The mixed replay history is

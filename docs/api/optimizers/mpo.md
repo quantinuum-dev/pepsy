@@ -56,15 +56,34 @@ mpo = opt.run(progbar=False)
 Symmray gates keep their charge and dual metadata and are not coerced to dense
 arrays. Native graded gates from `Fermion.strang_gate_stream(...)` are accepted
 as well; even gates are adapted explicitly to the MPO's Jordan-Wigner
-convention. `mode="svd"` is the symmetry-aware compression path. For a
-Symmray MPO, `mode="mpo"` and `mode="dmrg"` use that same block-aware path
-because generic dense auxiliary MPO compression and bond padding do not support
+convention. `mode="svd"` and native `mode="mpo"` use symmetry-aware direct
+compression, while native `mode="dmrg"` uses block-aware FIT. All three avoid
+generic dense auxiliary MPO compression and bond padding, which do not support
 multi-sector Symmray bonds reliably.
 
 Native MPO tensors retain their Symmray graded metadata throughout replay and
-compression. `mode="svd"`, `mode="mpo"`, and `mode="dmrg"` use the same
-block-aware path for native Symmray MPOs; the optimizer does not require a
-dense conversion of the input MPO.
+compression. `mode="svd"` and `mode="mpo"` use the block-aware direct SVD path
+for native Symmray MPOs, while `mode="dmrg"` uses native block-aware FIT; the
+optimizer does not require a dense conversion of the input MPO.
+
+For MPO DMRG, `fit_block_size=2` is the default native two-site FIT update.
+`fit_block_size=3` enables the corresponding three-site effective tensor and
+two direction-aware SVD splits; an interval containing only two sites
+automatically uses the two-site update. The optimizer forwards `cutoff`,
+`cutoff_mode`, `chi`, and `fit_sweep_sequence` to every output FIT split.
+The first one or two sweeps can use the three-site block through
+`fit_three_site_sweeps`; remaining sweeps use one-site refinement. Batched
+targets accept `fit_max_span="auto"` to split disjoint gates before a wide
+active window is formed. `cutoff="auto"` selects a dtype-aware cutoff.
+`target_cutoff` controls only construction of the disposable target MPO, so
+target construction and output compression remain separate choices. Use
+`fit_block_size=1` to retain the legacy fixed-rank one-site path.
+
+As with MPS DMRG, `n_iter` counts FIT sweeps. `mode="mpo"` applies each gate
+with one direct MPO compression step and does not perform variational sweeps;
+the two modes therefore have different one-iteration behavior for a
+non-local gate even when they use the same `chi` and SVD cutoff.
+
 `ham_tn.build_mpo(..., fermionic=True)` is also routed to the native
 `Fermion.build_mpo(...)` entry point. `Fermion.to_mpo(...)` remains a
 compatibility alias. Use `to_backend=...` on the model-facing builder when
