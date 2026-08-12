@@ -4227,6 +4227,79 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
         ).run(progbar=False, fit_block_size=1)
 
 
+@pytest.mark.parametrize(
+    ("model", "symmetry", "site_charge", "hamiltonian_kwargs"),
+    [
+        (
+            "heisenberg",
+            "U1",
+            site_charge_from_occupations([1, 0, 1]),
+            {"j": 1.0},
+        ),
+        (
+            "fermi_hubbard_u1u1",
+            "U1U1",
+            site_charge_from_occupations([(1, 0), (0, 1), (1, 0)]),
+            {"t": 1.0, "U": 2.0, "mu": 0.0},
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("mode", "expected_blocks"),
+    [
+        ("dmrg1", [2, 2, 1]),
+        ("dmrg2", [2, 2, 1]),
+        ("dmrg3", [3, 3, 1]),
+    ],
+)
+def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
+    model,
+    symmetry,
+    site_charge,
+    hamiltonian_kwargs,
+    mode,
+    expected_blocks,
+):
+    """Native U1/U1U1 aliases grow then refine without densifying."""
+    state = SymMPS.random_unitary_for_model(
+        model,
+        3,
+        bond_dim=4,
+        site_charge=site_charge,
+        seed=123,
+        dtype="complex128",
+        rounds=8,
+    )
+    hamiltonian = SymHamiltonian.from_edges(
+        model,
+        symmetry,
+        [(0, 2)],
+        **hamiltonian_kwargs,
+    )
+    optimizer = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        hamiltonian.gate_stream(0.001),
+        chi=4,
+        mode=mode,
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    actual_blocks = [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ]
+    assert actual_blocks == expected_blocks
+    assert out.max_bond() <= 4
+    assert _all_tensor_data_symmray(out)
+    assert _finite_double_layer_norm(out)
+
+
 @pytest.mark.parametrize("mode", ["mpo", "svd"])
 def test_symmps_mps_optimizer_symmray_auto_swap_reports_infidelity(mode):
     """Symmray auto-swap fallbacks should report canonical infidelity samples."""

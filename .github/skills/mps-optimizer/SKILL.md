@@ -12,7 +12,13 @@ tests before editing.
 
 ## Execution modes
 
-- `fit` / `dmrg`: local variational compression. Compose with
+- `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
+  `dmrg1` uses adaptive two-site growth followed by one-site refinement,
+  `dmrg2` uses its required two-site warm-up (two sweeps by default) followed
+  by one-site refinement, and `dmrg3` uses adaptive three-site growth followed
+  by one-site refinement. Adaptive rank-growth phases end only when all
+  attainable active-bond ceilings are reached; rank stagnation is not an early
+  exit. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
 - `mpo`: direct non-local gate/MPO replay with bond truncation.
@@ -93,6 +99,20 @@ Use Quimb and Autoray APIs. Preserve Symmray arrays and route symmetric target
 gates through backend-compatible split/auto-swap paths; never force a dense
 NumPy identity into a Symmray contraction. Keep optional Symmray coverage
 guarded with `pytest.importorskip("symmray")`.
+
+Native fermionic FIT environments must use graph-planned contraction directly
+on the Symmray arrays so dummy-mode conjugate pairs and graded phases determine
+the contraction order; do not replace this with an arbitrary pairwise loop or
+a temporary `TensorNetwork`. Gate-window FIT keeps a conjugated native working
+MPS, contracts real outside overlap environments, applies dual-leg corrections
+before local writeback, and resolves odd dummy-mode global phases afterward.
+This convention must honor `R`, `L`, and `RL` directly and may reuse compatible
+environments across a direction reversal. A non-adjacent fermionic DMRG target
+is warm-started by the same chi-capped native auto-swap replay, analogous to
+deterministic sector enrichment, then follows the selected block-to-one-site
+schedule normally.
+`target_cutoff=0.0` may prune only structural zeros using the smallest positive
+absolute cutoff; every representable nonzero singular value must remain.
 
 ## Validation
 

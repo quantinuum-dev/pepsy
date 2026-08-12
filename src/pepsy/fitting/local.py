@@ -5,11 +5,12 @@ boundary contraction code. The focus is to keep tensor-index handling explicit
 and fail early when input structure is inconsistent.
 """
 
+import functools
 import logging
 import math
+import time
 from copy import deepcopy
 from numbers import Integral
-import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import autoray as ar
@@ -85,6 +86,56 @@ def _synchronize_tensor_network(tn):
             return
 
 
+def _native_fermionic_bra_fit(method):
+    """Run a FIT method with a native fermionic conjugated working MPS.
+
+    Symmray's graded variational derivative naturally updates the conjugated
+    fitting network. Keeping that representation for the complete sweep
+    sequence lets left- and right-moving environments share one consistent
+    dual-leg convention. The physical ket is restored even when a sweep
+    raises, and no array is converted or flattened.
+    """
+
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        psi = self.p
+        if (
+            psi is None
+            or int(psi.L) <= 1
+            or not psi.isfermionic()
+            or self._fermionic_bra_working
+        ):
+            return method(self, *args, **kwargs)
+
+        psi.conj_()
+        self._fermionic_bra_working = True
+        self._fermionic_physical_outer_inds = frozenset(psi.outer_inds())
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            psi.conj_()
+            self._fermionic_bra_working = False
+            self._fermionic_physical_outer_inds = frozenset()
+            self._fermionic_left_exterior_environment = None
+            self._fermionic_right_exterior_environment = None
+
+    return wrapped
+
+
+def _native_fermionic_bra_block_fit(method):
+    """Apply the native bra gauge only to opt-in block ``run_eff`` fits."""
+
+    wrapped = _native_fermionic_bra_fit(method)
+
+    @functools.wraps(method)
+    def block_wrapped(self, *args, **kwargs):
+        if int(kwargs.get("block_size", 1)) not in {2, 3}:
+            return method(self, *args, **kwargs)
+        return wrapped(self, *args, **kwargs)
+
+    return block_wrapped
+
+
 class FIT:  # pylint: disable=too-many-instance-attributes
     """Variationally fit an open-boundary MPS or MPO to a target network.
 
@@ -141,7 +192,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Local environment contraction route. ``"mps-direct"`` avoids
         temporary TensorNetwork construction when both the target and fitted
         state are ordinary dense MPS/MPO networks. ``"generic"`` is the
-        native-safe general/Symmray route.
+        native-safe general/Symmray route. Fermionic Symmray inputs use
+        Quimb's graph-planned native tensor contraction within the resolved
+        ``symmray-native`` strategy so contraction order, dummy modes, and
+        graded phases remain authoritative without building a temporary
+        TensorNetwork.
     copy_target : bool, default=True
         Copy ``tn`` before its internal indices are randomized. Optimizer
         integrations that construct a disposable target can pass ``False``
@@ -159,8 +214,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         :meth:`run_gate`; an empty list means no gate window was requested.
     environment_strategy : {"mps-direct", "symmray-native", "generic"}
         Resolved effective-environment implementation selected during
-        construction. Symmray inputs use the native blockwise route by
-        default.
+        construction. Non-fermionic Symmray inputs use the native blockwise
+        chain route; fermionic inputs retain the resolved native strategy but
+        use graph-planned Symmray contraction for dummy-mode safety.
     timing_records : list[dict]
         Copy-safe per-sweep timing records collected by ``run_gate(timing=True)``.
     info : dict
@@ -265,6 +321,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.final_center_site: Optional[int] = None
         self.final_direction: Optional[str] = None
         self.final_norm = None
+        self.adaptive_sweeps_run = 0
+        self.one_site_sweeps_run = 0
+        self._fermionic_bra_working = False
+        self._fermionic_physical_outer_inds = frozenset()
+        self._fermionic_left_exterior_environment = None
+        self._fermionic_right_exterior_environment = None
         self._timing_sync_device = False
         # Preserve an explicitly supplied empty dictionary: callers may use
         # ``info`` as a live diagnostics channel during and after a run.
@@ -296,6 +358,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # retagging. In particular, ``retag=True`` can turn an initially
         # untagged dense target into a valid one-tensor-per-site cache.
         self._target_site_tensors = self._build_target_site_cache()
+        self._target_tensor_ids = tuple(self.tn.tensor_map)
+        self._target_tensor_order = {
+            tensor_id: order
+            for order, tensor_id in enumerate(self._target_tensor_ids)
+        }
+        self._target_tag_tensor_ids = {
+            tag: tuple(
+                sorted(tensor_ids, key=self._target_tensor_order.__getitem__)
+            )
+            for tag, tensor_ids in self.tn.tag_map.items()
+        }
         direct_available = (
             self._target_site_tensors is not None
             and not self.tn.isfermionic()
@@ -333,6 +406,22 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
         )
 
+        # Dense arrays and the audited conjugated native-fermion gauge can
+        # reuse partial environments across an immediate direction reversal.
+        # Bosonic Symmray remains conservative until its ownership and fusion
+        # metadata have an equivalent audit.
+        native_fermionic_pair = (
+            self.tn.isfermionic() and self.p.isfermionic()
+        )
+        self._allow_sweep_environment_reuse = (
+            native_fermionic_pair
+            or not any(
+                type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+                for tensor in (*self.tn.tensors, *self.p.tensors)
+            )
+        )
+        self._sweep_environment_reuse_count = 0
+
     # ------------------------------------------------------------------
     # Target cache, public inspection, and visualization
     # ------------------------------------------------------------------
@@ -347,11 +436,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         tensors = []
         for site in range(self.L):
             tag = self.site_tag_id.format(site)
-            selected = self.tn.select(tag, which="all")
-            site_tensors = tuple(selected.tensors)
-            if len(site_tensors) != 1:
+            tensor_ids = self.tn.tag_map.get(tag, ())
+            if len(tensor_ids) != 1:
                 return None
-            tensors.append(site_tensors[0])
+            (tensor_id,) = tuple(tensor_ids)
+            tensors.append(self.tn.tensor_map[tensor_id])
         # A single tensor carrying several site tags is not an MPS site cache:
         # storing it once per tag would contract the same tensor repeatedly.
         # Likewise, extra untagged/layer tensors make the direct site-by-site
@@ -576,6 +665,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             t |= env_left[site_tag_id.format(site - 1)]
             env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
 
+    @_native_fermionic_bra_block_fit
     def run_eff(
         self,
         n_iter=6,
@@ -666,15 +756,36 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError("block_size=3 requires a full chain of at least three sites.")
 
         if block_size in {2, 3}:
+            if self._fermionic_bra_working:
+                self._prepare_fermionic_active_fit(
+                    psi,
+                    0,
+                    L - 1,
+                    sweep_sequence[0],
+                )
             previous_direction = None
+            environment_cache = None
+            environment_cache_direction = None
+            self._sweep_environment_reuse_count = 0
             for sweep in range(n_iter):
                 direction = sweep_sequence[sweep % len(sweep_sequence)]
                 reuse_canonical_form = (
+                    self._fermionic_bra_working
+                    and previous_direction is None
+                ) or (
                     previous_direction is not None
                     and previous_direction != direction
                 )
+                fixed_environments = None
+                if (
+                    self._allow_sweep_environment_reuse
+                    and environment_cache is not None
+                    and environment_cache_direction != direction
+                ):
+                    fixed_environments = environment_cache
+                    self._sweep_environment_reuse_count += 1
                 if block_size == 2:
-                    self._run_gate_two_site_sweep(
+                    environment_cache = self._run_gate_two_site_sweep(
                         psi,
                         0,
                         L - 1,
@@ -685,9 +796,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         timing_record=None,
                         collect_split_diagnostics=collect_split_diagnostics,
                         reuse_canonical_form=reuse_canonical_form,
+                        fixed_environments=fixed_environments,
                     )
                 else:
-                    self._run_gate_three_site_sweep(
+                    environment_cache = self._run_gate_three_site_sweep(
                         psi,
                         0,
                         L - 1,
@@ -698,11 +810,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         timing_record=None,
                         collect_split_diagnostics=collect_split_diagnostics,
                         reuse_canonical_form=reuse_canonical_form,
+                        fixed_environments=fixed_environments,
                     )
+                environment_cache_direction = direction
                 if verbose:
                     fidelity = tn_fidelity(
                         self.tn,
-                        psi,
+                        self._physical_working_state(psi),
                         contraction_opt=contraction_opt,
                     )
                     self.fidelity_trace.append(ar.do("real", fidelity))
@@ -791,16 +905,27 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """Return target tensors for ``sites`` without changing the target.
 
         Dense MPS/MPO targets use the per-site cache. General layered targets
-        retain the older tag-selection behavior. A boundary reindex is always
+        use pre-indexed tag-to-tensor maps. A boundary reindex is always
         applied to a copy because cached tensors are shared across sweeps.
         """
         sites = tuple(int(site) for site in sites)
         if self._target_site_tensors is not None:
             components = [self._target_site_tensors[site] for site in sites]
         else:
-            tags = tuple(self.site_tag_id.format(site) for site in sites)
-            selected = self.tn.select(tags, which="any")
-            components = list(selected.tensors)
+            tensor_ids = set()
+            for site in sites:
+                tensor_ids.update(
+                    self._target_tag_tensor_ids.get(
+                        self.site_tag_id.format(site), ()
+                    )
+                )
+            components = [
+                self.tn.tensor_map[tensor_id]
+                for tensor_id in sorted(
+                    tensor_ids,
+                    key=self._target_tensor_order.__getitem__,
+                )
+            ]
 
         if reindex:
             components = [
@@ -819,6 +944,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         fitted-state bond is therefore the exact identity environment supplied
         by those untouched sites.
         """
+        if self._fermionic_bra_working:
+            # Native fermions retain the actual outside overlap environments.
+            # Replacing those graded contractions by identity reindexing loses
+            # the bond-space Koszul gauge on a right-moving sweep.
+            return {}
+
         first, last = min(sites), max(sites)
         mapping = {}
         if first == start and start > 0:
@@ -862,8 +993,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """Contract local components through a safe or specialized route.
 
         The direct route avoids constructing a temporary TensorNetwork for an
-        ordinary dense MPS target. Symmray and fermionic tensors intentionally
-        stay on Quimb's TensorNetwork route so native block contraction,
+        ordinary dense MPS target. Fermionic Symmray tensors intentionally use
+        Quimb's graph-planned tensor contraction so native block contraction,
         dual-leg handling, dummy modes, and graded phases remain authoritative.
         """
         components = tuple(components)
@@ -874,10 +1005,36 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             type(component.data).__module__.split(".", 1)[0] == "symmray"
             for component in components
         ):
-            return self._contract_symmray_components(
-                components,
-                output_inds=output_inds,
-            )
+            # Fermionic Symmray arrays carry dummy-mode and graded-phase
+            # metadata that cannot be safely propagated by the small
+            # left-to-right product below. Keep those contractions on
+            # Quimb's graph-planned Symmray route, even though the selected
+            # strategy remains ``symmray-native`` (the tensors are never
+            # densified and no temporary TensorNetwork is constructed).
+            if self.tn.isfermionic() or self.p.isfermionic():
+                return self._contract_generic_components(
+                    components,
+                    output_inds=output_inds,
+                )
+            try:
+                return self._contract_symmray_components(
+                    components,
+                    output_inds=output_inds,
+                )
+            except ValueError as exc:
+                # Symmray's fermionic dummy-mode validation is stricter than
+                # the ordinary blockwise product used by this chain-special
+                # case.  A moving environment can temporarily carry repeated
+                # dummy-mode metadata after a native split.  Retry that one
+                # contraction through Quimb's graph-planned fermionic route,
+                # which owns the dummy-mode and graded-phase bookkeeping. Do
+                # not hide unrelated native contraction errors.
+                if "dummy_modes" not in str(exc):
+                    raise
+                return self._contract_generic_components(
+                    components,
+                    output_inds=output_inds,
+                )
 
         if self.environment_strategy == "mps-direct" and all(
             isinstance(component, qtn.Tensor) for component in components
@@ -887,23 +1044,116 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if output_inds is not None:
                     result = result.transpose(*output_inds)
                 return result
+            return self._contract_dense_chain_components(
+                components,
+                output_inds=output_inds,
+            )
+
+        # Layered dense targets contain several ordinary tensors per site, so
+        # they cannot use the one-tensor-per-site ``mps-direct`` cache above.
+        # They can nevertheless use Quimb's direct tensor contraction without
+        # first allocating a temporary TensorNetwork. Keep fermionic and
+        # Symmray data on the graph-planned native route below, where their
+        # metadata is part of the contraction semantics.
+        if (
+            all(isinstance(component, qtn.Tensor) for component in components)
+            and not self.tn.isfermionic()
+            and not self.p.isfermionic()
+            and not any(
+                type(component.data).__module__.split(".", 1)[0] == "symmray"
+                for component in components
+            )
+        ):
             return qtn.tensor_contract(
                 *components,
                 optimize=self.contraction_opt,
                 output_inds=output_inds,
             )
 
-        network = components[0]
-        for component in components[1:]:
-            network = network | component
-        if isinstance(network, qtn.TensorNetwork):
-            kwargs = {"optimize": self.contraction_opt}
-            if output_inds is not None:
-                kwargs["output_inds"] = output_inds
-            return network.contract(all, **kwargs)
+        return self._contract_generic_components(
+            components,
+            output_inds=output_inds,
+        )
+
+    @staticmethod
+    def _contract_dense_chain_components(components, *, output_inds=None):
+        """Contract ordinary MPS components without rebuilding a TN graph.
+
+        The direct MPS path presents components in chain order: neighboring
+        site tensors share one virtual index, while overlap environments attach
+        at the two ends. A left-to-right backend ``tensordot`` therefore avoids
+        Quimb's contraction-planner and temporary ``TensorNetwork`` overhead
+        while retaining one final ``qtn.Tensor`` for FIT's split API.
+        """
+        result = components[0]
+        result_data = result.data
+        result_inds = list(result.inds)
+        result_tags = result.tags
+
+        for right in components[1:]:
+            right_inds = list(right.inds)
+            shared = tuple(index for index in result_inds if index in right_inds)
+            if not shared:
+                raise ValueError(
+                    "Dense FIT chain components must share at least one "
+                    "index at each contraction step."
+                )
+            left_axes = tuple(result_inds.index(index) for index in shared)
+            right_axes = tuple(right_inds.index(index) for index in shared)
+            result_data = ar.do(
+                "tensordot",
+                result_data,
+                right.data,
+                axes=(left_axes, right_axes),
+            )
+            result_inds = [
+                index for index in result_inds if index not in shared
+            ] + [index for index in right_inds if index not in shared]
+            result_tags = result_tags | right.tags
+
+        result_inds = tuple(result_inds)
         if output_inds is not None:
-            return network.transpose(*output_inds)
-        return network
+            output_inds = tuple(output_inds)
+            if len(result_inds) != len(output_inds) or set(result_inds) != set(
+                output_inds
+            ):
+                raise ValueError(
+                    "'output_inds' must be a permutation of the current "
+                    f"tensor indices, but {set(result_inds)} != {set(output_inds)}"
+                )
+            axes = tuple(result_inds.index(index) for index in output_inds)
+            if axes != tuple(range(len(axes))):
+                result_data = ar.do("transpose", result_data, axes=axes)
+            result_inds = output_inds
+
+        return qtn.Tensor(
+            data=result_data,
+            inds=result_inds,
+            tags=result_tags,
+        )
+
+    def _contract_generic_components(self, components, *, output_inds=None):
+        """Contract components through Quimb's graph-planned native route.
+
+        This remains the fallback for fermionic, Symmray, and otherwise
+        general tensor data. In particular, it is the safety route for a
+        native Symmray environment whose blockwise metadata needs a contraction
+        order that annihilates conjugate dummy modes before like-dual copies
+        meet. ``qtn.tensor_contract`` plans directly from the component index
+        graph and dispatches on their native arrays; it neither constructs an
+        intermediate TensorNetwork nor converts block-sparse data to dense.
+        """
+        if len(components) == 1:
+            result = components[0]
+            if output_inds is not None:
+                result = result.transpose(*output_inds)
+            return result
+
+        return qtn.tensor_contract(
+            *components,
+            optimize=self.contraction_opt,
+            output_inds=output_inds,
+        )
 
     @staticmethod
     def _contract_symmray_components(components, *, output_inds=None):
@@ -949,7 +1199,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             start,
             stop,
         )
-        components = [psi[site].H]
+        components = [
+            psi[site] if self._fermionic_bra_working else psi[site].H
+        ]
         components.extend(
             self._target_components((site,), reindex=mapping)
         )
@@ -961,7 +1213,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """Build inclusive active-interval overlap environments."""
         environments = {}
         if direction == "R":
-            prior = None
+            prior = self._fermionic_right_exterior_environment
+            if prior is not None:
+                environments[stop + 1] = prior
             for site in range(stop, start - 1, -1):
                 prior = self._overlap_environment_site(
                     psi,
@@ -972,7 +1226,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
                 environments[site] = prior
         else:
-            prior = None
+            prior = self._fermionic_left_exterior_environment
+            if prior is not None:
+                environments[start - 1] = prior
             for site in range(start, stop + 1):
                 prior = self._overlap_environment_site(
                     psi,
@@ -983,6 +1239,155 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
                 environments[site] = prior
         return environments
+
+    def _prepare_fermionic_active_fit(self, psi, start, stop, direction):
+        """Canonicalize and cache exact outside graded environments once.
+
+        ``psi`` is the conjugated fitting MPS while this helper runs. A full
+        canonicalization around the first sweep center makes the outside
+        norm metric an identity in the ordinary sense, while explicitly
+        contracting those outside tensors retains the fermionic bond gauge
+        and dummy-mode ordering that an index-only identity would discard.
+        """
+        center = start if direction == "R" else stop
+        psi.canonize_around_(self.site_tag_id.format(center))
+
+        prior = None
+        for site in range(start):
+            prior = self._overlap_environment_site(
+                psi,
+                site,
+                start,
+                stop,
+                prior=prior,
+            )
+        self._fermionic_left_exterior_environment = prior
+
+        prior = None
+        for site in range(self.L - 1, stop, -1):
+            prior = self._overlap_environment_site(
+                psi,
+                site,
+                start,
+                stop,
+                prior=prior,
+            )
+        self._fermionic_right_exterior_environment = prior
+
+    def _prepare_fermionic_effective_tensor(
+        self,
+        tensor,
+        left_tensor,
+        right_tensor,
+        left_environment,
+        right_environment,
+    ):
+        """Convert a native effective ket derivative into the working bra.
+
+        This is the local graded derivative convention used by Quimb's native
+        two-site FIT: synchronize the dual environment legs, phase true
+        physical outer legs, then conjugate before decomposition/writeback.
+        Active-window virtual boundaries are represented by the cached real
+        outside environments and therefore never masquerade as physical legs.
+        """
+        if not self._fermionic_bra_working:
+            return tensor
+
+        left_environment_ind = None
+        if left_environment is not None:
+            (left_environment_ind,) = left_tensor.bonds(left_environment)
+        right_environment_ind = None
+        if right_environment is not None:
+            (right_environment_ind,) = right_tensor.bonds(right_environment)
+
+        data = tensor.data
+        left_axis = (
+            tensor.inds.index(left_environment_ind)
+            if left_environment_ind is not None
+            else None
+        )
+        right_axis = (
+            tensor.inds.index(right_environment_ind)
+            if right_environment_ind is not None
+            else None
+        )
+        if left_axis is not None and right_axis is not None:
+            data.phase_flip(
+                left_axis if data.duals[left_axis] else right_axis,
+                inplace=True,
+            )
+        elif left_axis is not None and data.duals[left_axis]:
+            data.phase_flip(left_axis, inplace=True)
+        elif right_axis is not None and data.duals[right_axis]:
+            data.phase_flip(right_axis, inplace=True)
+
+        dual_physical_axes = tuple(
+            axis
+            for axis, index in enumerate(tensor.inds)
+            if index in self._fermionic_physical_outer_inds
+            and data.indices[axis].dual
+        )
+        if dual_physical_axes:
+            data.phase_flip(*dual_physical_axes, inplace=True)
+
+        tensor.conj_()
+        return tensor
+
+    def _resolve_fermionic_writeback_phase(self, *tensors):
+        """Resolve odd dummy-mode global signs after native writeback."""
+        if not self._fermionic_bra_working:
+            return
+        for tensor in tensors:
+            if sum(mode.parity for mode in tensor.data.dummy_modes) % 2:
+                tensor.data.phase_global(inplace=True)
+
+    def _physical_working_state(self, psi):
+        """Return a physical-ket view for optional user diagnostics."""
+        return psi.H if self._fermionic_bra_working else psi
+
+    @staticmethod
+    def _active_bond_rank_targets(psi, start, stop, max_bond):
+        """Return physical-rank ceilings for bonds inside an active window.
+
+        The ceiling includes the current virtual dimensions at the window
+        boundaries. This gives the largest rank the local two-/three-site
+        updates can reach without padding or changing the outside MPS. For a
+        full dense chain this produces the usual ``2, 4, 8, ...`` profile,
+        capped by ``max_bond``. The adaptive block phase does not use a
+        rank-stability shortcut: if a target cannot reach this ceiling, it
+        remains in the adaptive phase until ``n_iter`` is exhausted.
+        """
+        if max_bond is None or stop <= start:
+            return None
+        try:
+            physical_dims = [int(psi.phys_dim(site)) for site in range(start, stop + 1)]
+            left_rank = (
+                int(psi.bond_size(start - 1, start)) if start > 0 else 1
+            )
+            right_rank = (
+                int(psi.bond_size(stop, stop + 1))
+                if stop + 1 < int(psi.L)
+                else 1
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        left_caps = []
+        rank = left_rank
+        for dim in physical_dims[:-1]:
+            rank = min(int(max_bond), rank * dim)
+            left_caps.append(rank)
+
+        right_caps = [right_rank] * (len(physical_dims) - 1)
+        rank = right_rank
+        for index in range(len(physical_dims) - 1, 0, -1):
+            rank = min(int(max_bond), rank * physical_dims[index])
+            right_caps[index - 1] = rank
+
+        return tuple(
+            min(int(max_bond), left, right)
+            for left, right in zip(left_caps, right_caps)
+        )
 
     def _effective_tensor(
         self,
@@ -1025,6 +1430,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         direction,
         timing_record,
         reuse_canonical_form=False,
+        fixed_environments=None,
     ):
         """Perform one cached one-site FIT sweep in ``direction``."""
         # An R sweep leaves every site strictly to the left of ``stop``
@@ -1036,19 +1442,29 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if not reuse_canonical_form:
                 for site in range(stop, start, -1):
                     psi.right_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "R"
-            )
+            if fixed_environments is None:
+                fixed_environments = self._build_active_environments(
+                    psi, start, stop, "R"
+                )
             moving_environments = {}
+            if self._fermionic_left_exterior_environment is not None:
+                moving_environments[start - 1] = (
+                    self._fermionic_left_exterior_environment
+                )
             sites = range(start, stop + 1)
         else:
             if not reuse_canonical_form:
                 for site in range(start, stop):
                     psi.left_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "L"
-            )
+            if fixed_environments is None:
+                fixed_environments = self._build_active_environments(
+                    psi, start, stop, "L"
+                )
             moving_environments = {}
+            if self._fermionic_right_exterior_environment is not None:
+                moving_environments[stop + 1] = (
+                    self._fermionic_right_exterior_environment
+                )
             sites = range(stop, start - 1, -1)
 
         for site in sites:
@@ -1072,14 +1488,25 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 right_environment=right_environment,
                 output_inds=psi[site].inds,
             )
-            norm_f = (f.H & f).contract(
-                all, optimize=self.contraction_opt
-            ) ** 0.5
+            f = self._prepare_fermionic_effective_tensor(
+                f,
+                psi[site],
+                psi[site],
+                left_environment,
+                right_environment,
+            )
+            # ``f`` is already a single effective tensor. Its direct
+            # Frobenius norm is exactly sqrt(<f|f>), but avoids constructing a
+            # temporary doubled tensor network and replanning a contraction
+            # for every one-site update. This matters once one-site FIT has
+            # removed the SVD from the hot path, particularly on accelerators.
+            norm_f = f.norm()
             effective_finished = (
                 self._timing_mark() if timing_record is not None else None
             )
             self.local_norm_trace.append(ar.do("real", norm_f))
             psi[site].modify(data=f.data)
+            self._resolve_fermionic_writeback_phase(psi[site])
             writeback_finished = (
                 self._timing_mark() if timing_record is not None else None
             )
@@ -1126,6 +1553,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
 
+        return moving_environments
+
     def _run_gate_two_site_sweep(
         self,
         psi,
@@ -1139,6 +1568,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing_record,
         collect_split_diagnostics,
         reuse_canonical_form=False,
+        fixed_environments=None,
     ):
         """Optimize dense two-site wavefunctions and split their middle bond.
 
@@ -1154,19 +1584,29 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if not reuse_canonical_form:
                 for site in range(stop, start, -1):
                     psi.right_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "R"
-            )
+            if fixed_environments is None:
+                fixed_environments = self._build_active_environments(
+                    psi, start, stop, "R"
+                )
             moving_environments = {}
+            if self._fermionic_left_exterior_environment is not None:
+                moving_environments[start - 1] = (
+                    self._fermionic_left_exterior_environment
+                )
             pairs = ((site, site + 1) for site in range(start, stop))
         else:
             if not reuse_canonical_form:
                 for site in range(start, stop):
                     psi.left_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "L"
-            )
+            if fixed_environments is None:
+                fixed_environments = self._build_active_environments(
+                    psi, start, stop, "L"
+                )
             moving_environments = {}
+            if self._fermionic_right_exterior_environment is not None:
+                moving_environments[stop + 1] = (
+                    self._fermionic_right_exterior_environment
+                )
             pairs = ((site, site + 1) for site in range(stop - 1, start - 1, -1))
 
         for left_site, right_site in pairs:
@@ -1194,6 +1634,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 left_environment=left_environment,
                 right_environment=right_environment,
                 output_inds=left_inds + right_inds,
+            )
+            theta = self._prepare_fermionic_effective_tensor(
+                theta,
+                left_tensor,
+                right_tensor,
+                left_environment,
+                right_environment,
             )
             effective_finished = (
                 self._timing_mark() if timing_record is not None else None
@@ -1226,6 +1673,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             right_tensor.modify(
                 data=new_right.data,
                 left_inds=new_right.left_inds,
+            )
+            self._resolve_fermionic_writeback_phase(
+                left_tensor,
+                right_tensor,
             )
 
             # The SVD absorbs singular values into the sweep-facing center.
@@ -1292,6 +1743,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
 
+        return moving_environments
+
     def _run_gate_three_site_sweep(
         self,
         psi,
@@ -1305,6 +1758,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing_record,
         collect_split_diagnostics,
         reuse_canonical_form=False,
+        fixed_environments=None,
     ):
         """Optimize three-site wavefunctions using two native SVD splits.
 
@@ -1323,10 +1777,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if not reuse_canonical_form:
                 for site in range(stop, start, -1):
                     psi.right_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "R"
-            )
+            if fixed_environments is None:
+                fixed_environments = self._build_active_environments(
+                    psi, start, stop, "R"
+                )
             moving_environments = {}
+            if self._fermionic_left_exterior_environment is not None:
+                moving_environments[start - 1] = (
+                    self._fermionic_left_exterior_environment
+                )
             blocks = (
                 (site, site + 1, site + 2)
                 for site in range(start, stop - 1)
@@ -1335,10 +1794,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if not reuse_canonical_form:
                 for site in range(start, stop):
                     psi.left_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "L"
-            )
+            if fixed_environments is None:
+                fixed_environments = self._build_active_environments(
+                    psi, start, stop, "L"
+                )
             moving_environments = {}
+            if self._fermionic_right_exterior_environment is not None:
+                moving_environments[stop + 1] = (
+                    self._fermionic_right_exterior_environment
+                )
             blocks = (
                 (site, site + 1, site + 2)
                 for site in range(stop - 2, start - 1, -1)
@@ -1380,6 +1844,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 left_environment=left_environment,
                 right_environment=right_environment,
                 output_inds=left_inds + middle_inds + right_inds,
+            )
+            theta = self._prepare_fermionic_effective_tensor(
+                theta,
+                left_tensor,
+                right_tensor,
+                left_environment,
+                right_environment,
             )
             effective_finished = (
                 self._timing_mark() if timing_record is not None else None
@@ -1474,6 +1945,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 data=new_right.data,
                 left_inds=new_right.left_inds,
             )
+            self._resolve_fermionic_writeback_phase(
+                left_tensor,
+                middle_tensor,
+                right_tensor,
+            )
 
             # The final sweep-facing tensor carries the retained center norm
             # after both truncations, just as in the two-site path.
@@ -1554,6 +2030,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
 
+        return moving_environments
+
+    @_native_fermionic_bra_fit
     def run_gate(
         self,
         n_iter=6,
@@ -1572,6 +2051,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing_sync_device=False,
         single_pair_fast_path=False,
         three_site_sweeps=1,
+        adaptive_block_sweeps=None,
+        adaptive_until_rank=False,
         final_one_site_sweeps=0,
         collect_split_diagnostics=True,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
@@ -1602,8 +2083,20 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         wall-clock entry per sweep and per active-site update. Accelerator
         timings become kernel-complete when ``timing_sync_device=True``.
         ``three_site_sweeps`` controls how many initial sweeps use the
-        three-site update. Remaining sweeps use one-site refinement, which
-        preserves the bond space opened by the larger block. ``single_pair_fast_path=True`` stops a two-site interval after its one
+        three-site update when ``adaptive_block_sweeps`` is not supplied.
+        ``adaptive_block_sweeps`` requests a common adaptive warm-up for
+        two- or three-site updates; remaining sweeps use one-site refinement,
+        which preserves the bond space opened by the larger block.
+        ``adaptive_until_rank=True`` interprets that value as the minimum
+        number of adaptive sweeps and keeps the larger block until every
+        active bond reaches its physical ``max_bond`` ceiling. There is no
+        rank-stability early exit: if a target remains rank-deficient, the
+        larger block is retained until ``n_iter`` is exhausted. This is the
+        schedule used by the named MPS DMRG modes.
+        For ordinary dense arrays, an opposite-direction sweep reuses the
+        compatible partial environments produced by the preceding sweep;
+        block-size transitions rebuild them once before reuse resumes.
+        ``single_pair_fast_path=True`` stops a two-site interval after its one
         exact variational update; additional sweeps cannot change that local
         optimum. ``final_one_site_sweeps`` optionally adds fixed-rank one-site
         polish sweeps after two- or three-site FIT on windows spanning at least
@@ -1636,6 +2129,21 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "three_site_sweeps is only configurable when block_size=3."
             )
+        adaptive_schedule = adaptive_block_sweeps is not None
+        if adaptive_schedule:
+            if (
+                not isinstance(adaptive_block_sweeps, Integral)
+                or int(adaptive_block_sweeps) < 1
+            ):
+                raise ValueError(
+                    "adaptive_block_sweeps must be a positive integer or None."
+                )
+            adaptive_block_sweeps = min(int(adaptive_block_sweeps), n_iter)
+        else:
+            adaptive_block_sweeps = (
+                three_site_sweeps if block_size == 3 else n_iter
+            )
+        adaptive_until_rank = bool(adaptive_until_rank)
         if (
             not isinstance(final_one_site_sweeps, Integral)
             or int(final_one_site_sweeps) < 0
@@ -1672,6 +2180,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.final_center_site = None
         self.final_direction = None
         self.final_norm = None
+        self.adaptive_sweeps_run = 0
+        self.one_site_sweeps_run = 0
 
         psi = self.p
         L = self.L
@@ -1693,18 +2203,81 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "block_size=3 requires range_int to span at least three sites."
             )
+        if (
+            adaptive_schedule
+            and block_size in {2, 3}
+            and stop - start >= 2
+            and n_iter < 2
+        ):
+            raise ValueError(
+                "adaptive two-/three-site FIT requires n_iter >= 2 for an "
+                "active window spanning at least three sites."
+            )
+
+        if self._fermionic_bra_working:
+            self._prepare_fermionic_active_fit(
+                psi,
+                start,
+                stop,
+                sweep_sequence[0],
+            )
+            self.info["fermionic_sweep_sequence"] = {
+                "requested": sweep_sequence,
+                "used": sweep_sequence,
+                "reason": "native_conjugated_fit_gauge",
+            }
 
         previous_sweep_norm = None
         stable_sweeps = 0
         previous_direction = None
+        previous_block_size = None
+        environment_cache = None
+        environment_cache_direction = None
+        self._sweep_environment_reuse_count = 0
+        adaptive_phase_done = not (
+            adaptive_schedule
+            and adaptive_until_rank
+            and block_size in {2, 3}
+            and stop - start >= 2
+        )
+        rank_targets = (
+            self._active_bond_rank_targets(psi, start, stop, max_bond)
+            if not adaptive_phase_done
+            else None
+        )
         for sweep in range(1, n_iter + 1):
             direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
             active_block_size = (
-                3
-                if block_size == 3 and sweep <= three_site_sweeps
-                else (1 if block_size == 3 else block_size)
+                block_size
+                if (
+                    block_size in {2, 3}
+                    and (
+                        (
+                            adaptive_until_rank
+                            and (
+                                not adaptive_phase_done
+                                or (stop == start + 1 and block_size == 2)
+                            )
+                        )
+                        or (
+                            not adaptive_until_rank
+                            and sweep <= adaptive_block_sweeps
+                        )
+                    )
+                )
+                else 1
             )
+            if previous_block_size is not None and active_block_size != previous_block_size:
+                # A block-to-one-site transition changes the optimization
+                # regime. Do not compare the first fixed-rank refinement
+                # sweep against the last adaptive split when applying rtol.
+                previous_sweep_norm = None
+                stable_sweeps = 0
+                self.last_relative_change = None
             reuse_canonical_form = (
+                self._fermionic_bra_working
+                and previous_direction is None
+            ) or (
                 previous_direction is not None
                 and previous_direction != direction
             )
@@ -1715,20 +2288,34 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 block_size=active_block_size,
             )
             self.iterations_run = sweep
+            if active_block_size == 1:
+                self.one_site_sweeps_run += 1
+            else:
+                self.adaptive_sweeps_run += 1
             sweep_norm_start = len(self.local_norm_trace)
+            fixed_environments = None
+            if (
+                self._allow_sweep_environment_reuse
+                and environment_cache is not None
+                and environment_cache_direction != direction
+                and previous_block_size == active_block_size
+            ):
+                fixed_environments = environment_cache
+                self._sweep_environment_reuse_count += 1
             try:
                 if active_block_size == 1:
-                    self._run_gate_one_site_sweep(
+                    environment_cache = self._run_gate_one_site_sweep(
                         psi,
                         start,
                         stop,
                         direction=direction,
                         timing_record=sweep_timing,
                         reuse_canonical_form=reuse_canonical_form,
+                        fixed_environments=fixed_environments,
                     )
                 else:
                     if active_block_size == 2:
-                        self._run_gate_two_site_sweep(
+                        environment_cache = self._run_gate_two_site_sweep(
                             psi,
                             start,
                             stop,
@@ -1739,9 +2326,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                             timing_record=sweep_timing,
                             collect_split_diagnostics=collect_split_diagnostics,
                             reuse_canonical_form=reuse_canonical_form,
+                            fixed_environments=fixed_environments,
                         )
                     else:
-                        self._run_gate_three_site_sweep(
+                        environment_cache = self._run_gate_three_site_sweep(
                             psi,
                             start,
                             stop,
@@ -1752,7 +2340,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                             timing_record=sweep_timing,
                             collect_split_diagnostics=collect_split_diagnostics,
                             reuse_canonical_form=reuse_canonical_form,
+                            fixed_environments=fixed_environments,
                         )
+                environment_cache_direction = direction
 
                 self.final_direction = direction
                 self.final_center_site = stop if direction == "R" else start
@@ -1761,12 +2351,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if verbose:
                     fidelity = tn_fidelity(
                         self.tn,
-                        psi,
+                        self._physical_working_state(psi),
                         contraction_opt=self.contraction_opt,
                     )
                     self.fidelity_trace.append(ar.do("real", fidelity))
 
-                if callable(finite_check) and not bool(finite_check(psi)):
+                if callable(finite_check) and not bool(
+                    finite_check(self._physical_working_state(psi))
+                ):
                     error = FloatingPointError(
                         f"FIT gate sweep {sweep} produced non-finite tensor data."
                     )
@@ -1817,6 +2409,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         )
                         error.fit_iteration = sweep
                         raise error
+                    reset_tolerance = False
                     if previous_sweep_norm is not None:
                         scale = max(
                             abs(sweep_norm),
@@ -1832,10 +2425,65 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         else:
                             stable_sweeps = 0
                         if sweep >= min_iter and stable_sweeps >= patience:
-                            self.converged = True
-                            self.convergence_reason = "relative_tolerance"
-                            should_stop = True
-                    previous_sweep_norm = sweep_norm
+                            # An explicitly requested adaptive schedule must
+                            # complete its block warm-up before convergence can
+                            # stop it. If refinement remains, transition to
+                            # one-site sweeps and start a fresh tolerance run.
+                            warmup_incomplete = (
+                                adaptive_schedule
+                                and sweep < adaptive_block_sweeps
+                            )
+                            warmup_finished_with_refinement = (
+                                adaptive_schedule
+                                and sweep == adaptive_block_sweeps
+                                and sweep < n_iter
+                            )
+                            adaptive_rank_incomplete = (
+                                adaptive_until_rank
+                                and not adaptive_phase_done
+                                and active_block_size in {2, 3}
+                            )
+                            if not (
+                                warmup_incomplete
+                                or warmup_finished_with_refinement
+                                or adaptive_rank_incomplete
+                            ):
+                                self.converged = True
+                                self.convergence_reason = "relative_tolerance"
+                                should_stop = True
+                            elif (
+                                warmup_finished_with_refinement
+                                or adaptive_rank_incomplete
+                            ):
+                                reset_tolerance = True
+                                stable_sweeps = 0
+                                self.last_relative_change = None
+                    previous_sweep_norm = None if reset_tolerance else sweep_norm
+
+                if (
+                    adaptive_until_rank
+                    and not adaptive_phase_done
+                    and active_block_size in {2, 3}
+                ):
+                    current_ranks = tuple(
+                        int(psi.bond_size(site, site + 1))
+                        for site in range(start, stop)
+                    )
+                    rank_ready = (
+                        sweep >= adaptive_block_sweeps
+                        and rank_targets is not None
+                        and all(
+                            current >= target
+                            for current, target in zip(current_ranks, rank_targets)
+                        )
+                    )
+                    if sweep >= adaptive_block_sweeps and rank_ready:
+                        adaptive_phase_done = True
+                        # The first one-site sweep is a new numerical phase;
+                        # do not compare its norm with the last SVD sweep.
+                        previous_sweep_norm = None
+                        stable_sweeps = 0
+                        self.last_relative_change = None
             except BaseException as error:
                 self.convergence_reason = "failed"
                 if sweep_timing is not None:
@@ -1844,6 +2492,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 raise
             else:
                 previous_direction = direction
+                previous_block_size = active_block_size
                 if sweep_timing is not None:
                     self._finish_timing_record(sweep_timing, status="complete")
                 if should_stop:
@@ -1868,16 +2517,29 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     direction=direction,
                     block_size=1,
                 )
+                self.iterations_run = sweep
+                self.one_site_sweeps_run += 1
                 sweep_norm_start = len(self.local_norm_trace)
+                fixed_environments = None
+                if (
+                    self._allow_sweep_environment_reuse
+                    and environment_cache is not None
+                    and environment_cache_direction != direction
+                    and previous_block_size == 1
+                ):
+                    fixed_environments = environment_cache
+                    self._sweep_environment_reuse_count += 1
                 try:
-                    self._run_gate_one_site_sweep(
+                    environment_cache = self._run_gate_one_site_sweep(
                         psi,
                         start,
                         stop,
                         direction=direction,
                         timing_record=sweep_timing,
                         reuse_canonical_form=reuse_canonical_form,
+                        fixed_environments=fixed_environments,
                     )
+                    environment_cache_direction = direction
                     self.final_direction = direction
                     self.final_center_site = stop if direction == "R" else start
                     self.final_norm = self.local_norm_trace[-1]
@@ -1885,12 +2547,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     if verbose:
                         fidelity = tn_fidelity(
                             self.tn,
-                            psi,
+                            self._physical_working_state(psi),
                             contraction_opt=self.contraction_opt,
                         )
                         self.fidelity_trace.append(ar.do("real", fidelity))
 
-                    if callable(finite_check) and not bool(finite_check(psi)):
+                    if callable(finite_check) and not bool(
+                        finite_check(self._physical_working_state(psi))
+                    ):
                         error = FloatingPointError(
                             f"FIT gate sweep {sweep} produced non-finite tensor data."
                         )
@@ -1921,6 +2585,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     raise
                 else:
                     previous_direction = direction
+                    previous_block_size = 1
                     if sweep_timing is not None:
                         self._finish_timing_record(sweep_timing, status="complete")
 
