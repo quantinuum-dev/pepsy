@@ -1572,6 +1572,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing_sync_device=False,
         single_pair_fast_path=False,
         three_site_sweeps=1,
+        final_one_site_sweeps=0,
         collect_split_diagnostics=True,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
@@ -1604,8 +1605,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         three-site update. Remaining sweeps use one-site refinement, which
         preserves the bond space opened by the larger block. ``single_pair_fast_path=True`` stops a two-site interval after its one
         exact variational update; additional sweeps cannot change that local
-        optimum. ``collect_split_diagnostics=False`` avoids allocating SVD
-        metadata when the caller only needs the fitted state.
+        optimum. ``final_one_site_sweeps`` optionally adds fixed-rank one-site
+        polish sweeps after two- or three-site FIT on windows spanning at least
+        three sites; it is ignored for a two-site window.
+        ``collect_split_diagnostics=False`` avoids allocating SVD metadata when
+        the caller only needs the fitted state.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -1632,6 +1636,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "three_site_sweeps is only configurable when block_size=3."
             )
+        if (
+            not isinstance(final_one_site_sweeps, Integral)
+            or int(final_one_site_sweeps) < 0
+        ):
+            raise ValueError("final_one_site_sweeps must be a non-negative integer.")
+        final_one_site_sweeps = int(final_one_site_sweeps)
         if min_iter is None:
             min_iter = n_iter if rtol is None else 1
         if not isinstance(min_iter, Integral) or int(min_iter) < 1:
@@ -1838,6 +1848,81 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     self._finish_timing_record(sweep_timing, status="complete")
                 if should_stop:
                     break
+
+        if (
+            block_size in {2, 3}
+            and stop - start + 1 >= 3
+            and final_one_site_sweeps > 0
+        ):
+            polish_start = self.iterations_run + 1
+            for polish_index in range(final_one_site_sweeps):
+                sweep = polish_start + polish_index
+                direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
+                reuse_canonical_form = (
+                    previous_direction is not None
+                    and previous_direction != direction
+                )
+                sweep_timing = self._start_timing_record(
+                    sweep,
+                    timing,
+                    direction=direction,
+                    block_size=1,
+                )
+                sweep_norm_start = len(self.local_norm_trace)
+                try:
+                    self._run_gate_one_site_sweep(
+                        psi,
+                        start,
+                        stop,
+                        direction=direction,
+                        timing_record=sweep_timing,
+                        reuse_canonical_form=reuse_canonical_form,
+                    )
+                    self.final_direction = direction
+                    self.final_center_site = stop if direction == "R" else start
+                    self.final_norm = self.local_norm_trace[-1]
+
+                    if verbose:
+                        fidelity = tn_fidelity(
+                            self.tn,
+                            psi,
+                            contraction_opt=self.contraction_opt,
+                        )
+                        self.fidelity_trace.append(ar.do("real", fidelity))
+
+                    if callable(finite_check) and not bool(finite_check(psi)):
+                        error = FloatingPointError(
+                            f"FIT gate sweep {sweep} produced non-finite tensor data."
+                        )
+                        error.fit_iteration = sweep
+                        raise error
+
+                    if finite_check is True:
+                        sweep_scalars = self.local_norm_trace[sweep_norm_start:]
+                        try:
+                            sweep_norms = np.asarray(
+                                ar.to_numpy(ar.do("stack", sweep_scalars))
+                            ).reshape(-1)
+                        except Exception:
+                            sweep_norms = np.asarray(
+                                [float(ar.to_numpy(value)) for value in sweep_scalars]
+                            )
+                        if not bool(np.all(np.isfinite(sweep_norms))):
+                            error = FloatingPointError(
+                                f"FIT gate sweep {sweep} produced a non-finite local norm."
+                            )
+                            error.fit_iteration = sweep
+                            raise error
+                except BaseException as error:
+                    self.convergence_reason = "failed"
+                    if sweep_timing is not None:
+                        sweep_timing["error"] = f"{type(error).__name__}: {error}"
+                        self._finish_timing_record(sweep_timing, status="failed")
+                    raise
+                else:
+                    previous_direction = direction
+                    if sweep_timing is not None:
+                        self._finish_timing_record(sweep_timing, status="complete")
 
     # ------------------------------------------------------------------
     # Timing and diagnostics

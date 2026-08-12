@@ -118,9 +118,12 @@ active bonds through MPO. Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
 the block's shared compression. `fit_layer_size` is the clear name for
 `k_2q_batch`; it counts two-site gates in a contiguous paper-style target
-block. With `fit_block_size=3`, one initial three-site sweep is followed by
-one-site refinement by default; set `fit_three_site_sweeps=2` for two warm-up
-passes. `fit_max_span="auto"` also limits the spatial width of a batched
+block. For `fit_block_size=2`, an active window spanning at least three sites
+gets one final one-site canonical-window refinement; an ordinary two-site
+gate window skips it because its two-site update already solves the complete
+local problem. With `fit_block_size=3`, the requested main sweeps all use
+three-site updates, followed by one final one-site canonical-window polish.
+`fit_max_span="auto"` also limits the spatial width of a batched
 target, splitting disjoint gates before they create an unnecessarily wide FIT
 window. Set `fit_max_span=None` to restore unrestricted gate-count batching.
 If a DMRG/FIT batch

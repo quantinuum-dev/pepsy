@@ -2644,9 +2644,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             gates before they create an unnecessarily wide active window.
             ``None`` restores unrestricted gate-count batching.
         fit_three_site_sweeps : int, default=1
-            For ``fit_block_size=3``, number of initial three-site sweeps.
-            Remaining sweeps use one-site refinement. Values of one or two
-            are recommended.
+            Retained for compatibility with the lower-level FIT controls.
+            MpsOptimizer's ``fit_block_size=3`` path uses all requested main
+            sweeps as three-site updates, followed by one final one-site
+            refinement.
         target_cutoff : float, default=0.0
             Cutoff used only while constructing the pre-FIT gate target.
             Keeping this at zero separates exact target construction from the
@@ -5840,6 +5841,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_block_size,
                         xmax - xmin + 1,
                     )
+                    final_one_site_sweeps = int(
+                        active_fit_block_size in {2, 3}
+                        and xmax - xmin + 1 >= 3
+                    )
+                    active_three_site_sweeps = (
+                        n_iter
+                        if active_fit_block_size == 3
+                        else fit_three_site_sweeps
+                    )
                     self._prepare_fit_window(
                         (xmin, xmax),
                         block_size=fit_block_size,
@@ -5888,7 +5898,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             single_pair_fast_path=fit_single_pair_fast_path,
-                            three_site_sweeps=fit_three_site_sweeps,
+                            three_site_sweeps=active_three_site_sweeps,
+                            final_one_site_sweeps=final_one_site_sweeps,
                             collect_split_diagnostics=False,
                         )
                     finally:
@@ -5899,6 +5910,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "relative_change": fit.last_relative_change,
                             "center_site": fit.final_center_site,
                             "block_size": int(active_fit_block_size),
+                            "final_one_site_sweeps": int(final_one_site_sweeps),
                             "target_strategy": fit_target_strategy,
                         }
 
@@ -5962,6 +5974,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_block_size,
                         xmax - xmin + 1,
                     )
+                    final_one_site_sweeps = int(
+                        active_fit_block_size in {2, 3}
+                        and xmax - xmin + 1 >= 3
+                    )
+                    active_three_site_sweeps = (
+                        n_iter
+                        if active_fit_block_size == 3
+                        else fit_three_site_sweeps
+                    )
                     self._prepare_fit_window(
                         (xmin, xmax),
                         block_size=fit_block_size,
@@ -6006,7 +6027,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             single_pair_fast_path=fit_single_pair_fast_path,
-                            three_site_sweeps=fit_three_site_sweeps,
+                            three_site_sweeps=active_three_site_sweeps,
+                            final_one_site_sweeps=final_one_site_sweeps,
                             collect_split_diagnostics=False,
                         )
                     finally:
@@ -6017,6 +6039,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "relative_change": fit.last_relative_change,
                             "center_site": fit.final_center_site,
                             "block_size": int(active_fit_block_size),
+                            "final_one_site_sweeps": int(final_one_site_sweeps),
                             "target_strategy": fit_target_strategy,
                         }
 

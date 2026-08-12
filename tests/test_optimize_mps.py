@@ -535,18 +535,18 @@ def test_mps_optimizer_timing_reports_fit_sweeps_and_sites():
 
     fit_steps = opt.get_run_timing()["fit_steps"]
     assert opt.get_run_timing()["stages"]["dmrg.target"]["calls"] == 1
-    assert len(fit_steps) == 2
-    assert [record["sweep"] for record in fit_steps] == [1, 2]
+    assert len(fit_steps) == 3
+    assert [record["sweep"] for record in fit_steps] == [1, 2, 3]
     assert all(record["status"] == "complete" for record in fit_steps)
     assert all(record["range_int"] == (0, 2) for record in fit_steps)
-    assert all(record["site_count"] == 2 for record in fit_steps)
-    assert [record["direction"] for record in fit_steps] == ["R", "L"]
-    assert all(record["block_size"] == 2 for record in fit_steps)
-    assert [record["fit_index"] for record in fit_steps] == [0, 0]
-    assert [record["record_index"] for record in fit_steps] == [0, 1]
+    assert [record["site_count"] for record in fit_steps] == [2, 2, 3]
+    assert [record["direction"] for record in fit_steps] == ["R", "L", "R"]
+    assert [record["block_size"] for record in fit_steps] == [2, 2, 1]
+    assert [record["fit_index"] for record in fit_steps] == [0, 0, 0]
+    assert [record["record_index"] for record in fit_steps] == [0, 1, 2]
+    assert [len(record["site_timings"]) for record in fit_steps] == [2, 2, 3]
     assert all(
         record["elapsed_seconds"] >= 0.0
-        and len(record["site_timings"]) == 2
         and all(site["elapsed_seconds"] >= 0.0 for site in record["site_timings"])
         for record in fit_steps
     )
@@ -566,9 +566,9 @@ def test_mps_optimizer_timing_distinguishes_fit_calls_from_sweeps():
     optimizer.run(progbar=False, n_iter=2, timing=True)
 
     records = optimizer.get_run_timing()["fit_steps"]
-    assert [record["fit_index"] for record in records] == [0, 0, 1, 1]
-    assert [record["record_index"] for record in records] == [0, 1, 2, 3]
-    assert [record["sweep"] for record in records] == [1, 2, 1, 2]
+    assert [record["fit_index"] for record in records] == [0, 0, 0, 1, 1, 1]
+    assert [record["record_index"] for record in records] == [0, 1, 2, 3, 4, 5]
+    assert [record["sweep"] for record in records] == [1, 2, 3, 1, 2, 3]
 
 
 def test_mps_optimizer_dmrg_uses_gate_window_fit(monkeypatch):
@@ -1409,6 +1409,36 @@ def test_fit_gate_two_site_timing_reports_pairs_and_directions():
     )
 
 
+def test_fit_gate_two_site_final_polish_only_spans_large_windows():
+    """Two-site FIT can polish a large window without touching a pair window."""
+    state = qtn.MPS_rand_state(
+        4, bond_dim=2, phys_dim=2, dtype="complex128", seed=205
+    )
+    fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
+    fit.run_gate(
+        n_iter=1,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        final_one_site_sweeps=1,
+        timing=True,
+    )
+
+    records = fit.get_timing()
+    assert [record["block_size"] for record in records] == [2, 1]
+    assert [record["direction"] for record in records] == ["R", "L"]
+    assert [record["site_count"] for record in records] == [2, 3]
+
+    pair = py.FIT(state.copy(), p=state, range_int=[1, 2])
+    pair.run_gate(
+        n_iter=1,
+        block_size=2,
+        final_one_site_sweeps=1,
+        timing=True,
+    )
+    assert [record["block_size"] for record in pair.get_timing()] == [2]
+
+
 def test_fit_alternating_sweeps_reuse_opposite_canonical_form(monkeypatch):
     """An R/L pair should not repeat the canonicalization boundary pass."""
     initial = qtn.MPS_rand_state(
@@ -1704,13 +1734,21 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
     )
     optimizer.run(
         progbar=False,
-        n_iter=1,
+        n_iter=2,
         fit_rtol=None,
         fit_block_size=3,
         timing=True,
     )
     assert optimizer._last_dmrg_fit_diagnostics["block_size"] == 3
-    assert optimizer.get_run_timing()["fit_steps"][0]["block_size"] == 3
+    assert optimizer._last_dmrg_fit_diagnostics["final_one_site_sweeps"] == 1
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [3, 3, 1]
+    assert [
+        record["site_count"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 4]
 
     adjacent = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
@@ -1726,6 +1764,11 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         timing=True,
     )
     assert adjacent._last_dmrg_fit_diagnostics["block_size"] == 2
+    assert adjacent._last_dmrg_fit_diagnostics["final_one_site_sweeps"] == 0
+    assert [
+        record["block_size"]
+        for record in adjacent.get_run_timing()["fit_steps"]
+    ] == [2]
 
 
 def test_mps_optimizer_fit_block_sizes_report_warm_start_infidelity():

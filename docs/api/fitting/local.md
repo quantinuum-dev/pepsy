@@ -61,6 +61,12 @@ wavefunction and performs two direction-aware native SVD splits, while
 useful when a larger local window is worth the extra SVD cost; it is not a
 dense `from_dense` conversion.
 
+For two- or three-site FIT on an active window spanning at least three sites,
+`final_one_site_sweeps=1` adds a fixed-rank one-site polish pass after the
+block sweeps. The pass reuses the canonical window and never touches sites
+outside `range_int`; it is skipped for a two-site window. `MpsOptimizer`
+enables this one-pass refinement automatically for its DMRG/FIT paths.
+
 For gate-window fits, `three_site_sweeps=1` (the default) uses one larger
 three-site warm-up sweep and then switches to one-site refinement for any
 remaining requested sweeps. Set `three_site_sweeps=2` for two directional
