@@ -131,9 +131,11 @@ re-raised.
 
 For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
-control adaptive stopping from FIT's final local-norm change;
-`fit_rtol="auto"` selects `1e-3`, `1e-5`, or `1e-8` for 16-, 32-/complex64-,
-or higher-precision data. Pass `fit_rtol=None` for fixed iterations. The old
+control adaptive stopping from FIT's final local-norm change. The public
+`MpsOptimizer.run` default is `fit_rtol=1e-8`; `fit_rtol="auto"` remains an
+explicit dtype-aware option selecting `1e-3`, `1e-5`, or `1e-8` for 16-,
+32-/complex64-, or higher-precision data. Pass `fit_rtol=None` for fixed
+iterations. The old
 `mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` spellings remain as
 deprecated aliases. A legacy value replaces the canonical default for old
 call sites; a conflicting non-default canonical value fails instead of
@@ -235,11 +237,20 @@ overlap with the mode replay total; use them to identify the dominant work,
 not to add into a second total. DMRG and mixed-mode timing also exposes
 `fit_steps`: one record per completed or failed FIT sweep, including its FIT
 call index, global record index, direction, block size, active interval, sweep
-time, per-site/block update times, and non-site sweep overhead. Every block
-size reports effective-environment contraction, native SVD, writeback/norm, and
-moving-environment time; one-site records use `svd_seconds=0.0`. Ordinary runs
-retain no per-gate timer overhead. These are host wall-clock measurements by
-default. Use
+time, per-site/block update times, and phase-level sweep overhead. Timing
+schema 3 reports `canonicalization_seconds` (including sweep gauge/QR
+preparation), `fixed_environment_seconds`, `effective_seconds`,
+`svd_seconds`, `writeback_seconds`, `moving_environment_seconds`, and
+`sweep_overhead_seconds`. Per-site records additionally expose
+`canonicalization_seconds` and `moving_environment_seconds`; the legacy
+`environment_seconds` field remains the complete post-writeback environment
+phase. `sweep_preparation_canonicalization_seconds` separates the preparation
+part of the canonicalization total, while
+`moving_canonicalization_seconds` identifies one-site gauge moves inside a
+sweep. `MpsOptimizer.get_run_timing()["fit_totals"]` provides the same phase
+totals across all FIT calls in the replay, while `fit_steps` retains the
+per-sweep and per-site records. Ordinary runs retain no per-gate timer
+overhead. These are host wall-clock measurements by default. Use
 `run(timing=True, timing_sync_device=True)` for kernel-complete Torch CUDA,
 CuPy, or JAX timings; the added barriers intentionally make profiling slower
 and are recorded as `timing_sync_device=True` in both replay and FIT records.

@@ -100,6 +100,44 @@ __all__ = [
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
+_FIT_TIMING_PHASES = (
+    "canonicalization_seconds",
+    "sweep_preparation_canonicalization_seconds",
+    "moving_canonicalization_seconds",
+    "fixed_environment_seconds",
+    "effective_seconds",
+    "svd_seconds",
+    "writeback_seconds",
+    "environment_seconds",
+    "moving_environment_seconds",
+    "non_site_elapsed_seconds",
+    "sweep_overhead_seconds",
+)
+
+
+def _summarize_fit_timing(records):
+    """Summarize detailed FIT sweep timing without discarding raw records."""
+    records = tuple(records)
+    fit_indices = {
+        int(record["fit_index"])
+        for record in records
+        if "fit_index" in record
+    }
+    return {
+        "calls": len(fit_indices),
+        "sweeps": len(records),
+        "site_updates": sum(
+            int(record.get("site_count", len(record.get("site_timings", ()))))
+            for record in records
+        ),
+        "elapsed_seconds": sum(
+            float(record.get("elapsed_seconds", 0.0)) for record in records
+        ),
+        **{
+            phase: sum(float(record.get(phase, 0.0)) for record in records)
+            for phase in _FIT_TIMING_PHASES
+        },
+    }
 
 
 class _DeprecatedOptionDefault:
@@ -2499,7 +2537,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_sticky_nonfinite=True,
         *,
         fit_min_iter=2,
-        fit_rtol="auto",
+        fit_rtol=1.0e-8,
         fit_patience=2,
         fit_block_size=2,
         fit_sweep_sequence="RL",
@@ -2611,10 +2649,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Minimum FIT sweeps before adaptive convergence can stop in
             ``dmrg`` or ``mix`` mode. Values above ``n_iter`` are clamped to
             ``n_iter``.
-        fit_rtol : {"auto"} | float | None, default="auto"
-            Relative tolerance for DMRG FIT early stopping. ``"auto"``
-            selects a dtype-aware tolerance; ``None`` disables early stopping
-            and restores fixed ``n_iter`` behavior.
+        fit_rtol : {"auto"} | float | None, default=1e-8
+            Relative tolerance for DMRG FIT early stopping. The default
+            ``1e-8`` is suitable for the ordinary high-precision MPS path.
+            ``"auto"`` selects a dtype-aware tolerance explicitly; ``None``
+            disables early stopping and restores fixed ``n_iter`` behavior.
         fit_patience : int, default=2
             Consecutive converged FIT sweeps required before stopping early in
             ``dmrg`` or ``mix`` mode.
@@ -2840,7 +2879,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_rtol = self._resolve_legacy_fit_option(
             canonical_name="fit_rtol",
             canonical_value=fit_rtol,
-            canonical_default="auto",
+            canonical_default=1.0e-8,
             legacy_name="mix_fit_rtol",
             legacy_value=mix_fit_rtol,
         )
@@ -3066,6 +3105,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "timing_sync_device": bool(sync_device),
                 "stages": deepcopy(self._timing_state["stages"]),
                 "fit_steps": deepcopy(self._timing_state["fit_steps"]),
+                "fit_totals": _summarize_fit_timing(
+                    self._timing_state["fit_steps"]
+                ),
                 "mix_summary": (
                     deepcopy(self.last_mix_summary)
                     if self.mode == "mix"

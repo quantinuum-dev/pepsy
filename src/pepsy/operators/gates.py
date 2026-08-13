@@ -2110,16 +2110,21 @@ def gate_loop_cluster(
     bp_opts=None,
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
+    bp_convergence: str = "ignore",
     which=None,
     ind_id=None,
     max_bond=None,
     max_loop_size: int = 0,
+    max_cluster_size: int | None = None,
     base_radius: int = 0,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
+    tree_reduction: bool = True,
     psd_project: bool = True,
     psd_floor: float = 0.0,
     optimize="auto-hq",
+    loop_cache=None,
+    plan_cache=None,
     cost_check: bool = False,
     max_flops_log10: float | None = None,
     max_peak_memory_log2: float | None = None,
@@ -2146,8 +2151,13 @@ def gate_loop_cluster(
     a mutable ``gauges={}``
     if the returned SU gauges are needed for subsequent updates. One-site
     gates require SU gauges. Long-range routing is not part of this first
-    nearest-neighbour TEBD path. The current reduced solver is dense and
-    rejects symmray block-sparse tensor arrays.
+    nearest-neighbour TEBD path. Native Symmray two-site updates use the
+    graded reduced-compression adapter; dense QR/autodiff refinement is not
+    selected for that route.
+
+    ``loop_cache`` optionally reuses generalized-loop geometry for repeated
+    updates of the same active bond. A cache is topology-only: contractions,
+    tensor values, and boundary messages are always rebuilt.
     """
     if gauges is None and isinstance(where, dict):
         gauges = where
@@ -2162,11 +2172,20 @@ def gate_loop_cluster(
     results = []
     regauge_opts_use = {} if regauge_opts is None else dict(regauge_opts)
 
-    if any(hasattr(tensor.data, "blocks") for tensor in tn_work.tensor_map.values()):
+    native_symmray = any(
+        _is_symmray_array(tensor.data)
+        for tensor in tn_work.tensor_map.values()
+    )
+    native_fermionic = any(
+        hasattr(tensor.data, "dummy_modes")
+        for tensor in tn_work.tensor_map.values()
+        if _is_symmray_array(tensor.data)
+    )
+    if native_symmray and not native_fermionic:
         raise NotImplementedError(
-            "gate_loop_cluster currently requires dense PEPS tensor arrays; "
-            "symmetry-block-aware reduced loop-cluster updates are not "
-            "implemented yet."
+            "gate_loop_cluster currently requires dense PEPS tensor arrays or "
+            "native fermionic Symmray tensors; generic block-sparse reduced "
+            "updates are not implemented."
         )
 
     # A supplied message tree belongs to the current tensor network. Running
@@ -2174,7 +2193,8 @@ def gate_loop_cluster(
     # attached to the old representation, so only initialize gauges on the
     # pure-SU route.
     if (
-        boundary_messages is None
+        not native_symmray
+        and boundary_messages is None
         and entries
         and any(index not in gauges for index in tn_work.inner_inds())
     ):
@@ -2190,7 +2210,9 @@ def gate_loop_cluster(
             **initial_gauge_opts,
         )
 
-    if any(hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()):
+    if not native_symmray and any(
+        hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()
+    ):
         for tensor in tn_work.tensor_map.values():
             if hasattr(tensor.data, "to_dense"):
                 tensor.modify(data=np.asarray(ar.to_numpy(tensor.data.to_dense())))
@@ -2199,7 +2221,7 @@ def gate_loop_cluster(
                 gauges[index] = np.asarray(ar.to_numpy(gauge.to_dense()))
 
     for gate_payload, where_payload, which_payload in entries:
-        if hasattr(gate_payload, "to_dense"):
+        if not native_symmray and hasattr(gate_payload, "to_dense"):
             gate_payload = np.asarray(ar.to_numpy(gate_payload.to_dense()))
 
         if _is_explicit_index_where(where_payload):
@@ -2292,14 +2314,19 @@ def gate_loop_cluster(
                     bp_opts=bp_opts,
                     message_psd_project=message_psd_project,
                     message_psd_floor=message_psd_floor,
+                    bp_convergence=bp_convergence,
                     max_bond=max_bond,
                     max_loop_size=max_loop_size,
+                    max_cluster_size=max_cluster_size,
                     base_radius=base_radius,
                     include_full_system=include_full_system,
                     autocomplete=autocomplete,
+                    tree_reduction=tree_reduction,
                     psd_project=psd_project,
                     psd_floor=psd_floor,
                     optimize=optimize,
+                    loop_cache=loop_cache,
+                    plan_cache=plan_cache,
                     cost_check=cost_check,
                     max_flops_log10=max_flops_log10,
                     max_peak_memory_log2=max_peak_memory_log2,

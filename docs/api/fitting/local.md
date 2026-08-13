@@ -114,13 +114,17 @@ still prepare their required gauge explicitly.
 With `timing=True`, `get_timing()` returns completed and failed partial sweep
 records, including a `timing_schema` version, direction, block size, active
 window size, update count, environment strategy, block/site times, and
-convergence status. Every update has the same four stage fields:
-`effective_seconds`, `svd_seconds`, `writeback_seconds`, and
-`environment_seconds`; one-site updates report `svd_seconds=0.0`. The sweep
-record aggregates each stage as well as `elapsed_seconds`, making one-, two-,
-and three-site runs directly comparable in benchmark output. Block records
-break out effective contraction, SVD, writeback/norm, and moving-environment
-time. Add
+convergence status. Timing schema 3 adds sweep-level
+`canonicalization_seconds`, `sweep_preparation_canonicalization_seconds`,
+`fixed_environment_seconds`, `moving_canonicalization_seconds`,
+`moving_environment_seconds`, and `sweep_overhead_seconds`. Every update also
+reports `effective_seconds`, `svd_seconds`, `writeback_seconds`,
+`canonicalization_seconds`, and `moving_environment_seconds`; the legacy
+`environment_seconds` remains the complete post-writeback phase, and one-site
+updates report `svd_seconds=0.0`. The sweep record aggregates each stage as
+well as `elapsed_seconds`, making one-, two-, and three-site runs directly
+comparable in benchmark output. Block records break out effective contraction,
+SVD, writeback/norm, canonicalization, and moving-environment time. Add
 `timing_sync_device=True` for device-complete Torch CUDA, CuPy, or JAX timing;
 normal runs never pay for these synchronization barriers. FIT also exposes
 `final_center_site`, `final_norm`, `final_direction`, and

@@ -533,8 +533,9 @@ def test_mps_optimizer_timing_reports_fit_sweeps_and_sites():
 
     opt.run(progbar=False, n_iter=2, timing=True)
 
-    fit_steps = opt.get_run_timing()["fit_steps"]
-    assert opt.get_run_timing()["stages"]["dmrg.target"]["calls"] == 1
+    timing = opt.get_run_timing()
+    fit_steps = timing["fit_steps"]
+    assert timing["stages"]["dmrg.target"]["calls"] == 1
     assert len(fit_steps) == 2
     assert [record["sweep"] for record in fit_steps] == [1, 2]
     assert all(record["status"] == "complete" for record in fit_steps)
@@ -544,6 +545,10 @@ def test_mps_optimizer_timing_reports_fit_sweeps_and_sites():
     assert all(record["block_size"] == 2 for record in fit_steps)
     assert [record["fit_index"] for record in fit_steps] == [0, 0]
     assert [record["record_index"] for record in fit_steps] == [0, 1]
+    assert timing["fit_totals"]["calls"] == 1
+    assert timing["fit_totals"]["sweeps"] == 2
+    assert timing["fit_totals"]["site_updates"] == 4
+    assert timing["fit_totals"]["svd_seconds"] >= 0.0
     assert all(
         record["elapsed_seconds"] >= 0.0
         and len(record["site_timings"]) == 2
@@ -845,7 +850,7 @@ def test_fit_gate_timing_records_sweep_and_site_steps():
     assert all(record["status"] == "complete" for record in records)
     assert all(record["range_int"] == (0, 2) for record in records)
     assert all(record["site_count"] == 3 for record in records)
-    assert all(record["timing_schema"] == 2 for record in records)
+    assert all(record["timing_schema"] == 3 for record in records)
     assert all(record["active_site_count"] == 3 for record in records)
     assert all(record["update_count"] == 3 for record in records)
     assert all(record["svd_seconds"] == 0.0 for record in records)
@@ -855,10 +860,50 @@ def test_fit_gate_timing_records_sweep_and_site_steps():
             "svd_seconds",
             "writeback_seconds",
             "environment_seconds",
+            "canonicalization_seconds",
+            "moving_environment_seconds",
         }.issubset(site_timing)
         for record in records
         for site_timing in record["site_timings"]
     )
+    assert all(
+        {
+            "canonicalization_seconds",
+            "sweep_preparation_canonicalization_seconds",
+            "fixed_environment_seconds",
+            "moving_environment_seconds",
+            "moving_canonicalization_seconds",
+            "sweep_overhead_seconds",
+        }.issubset(record)
+        for record in records
+    )
+
+
+def test_fit_gate_timing_separates_fixed_and_moving_environments():
+    """Two-site FIT timing exposes environment and decomposition phases."""
+    state = qtn.MPS_rand_state(
+        4, bond_dim=2, phys_dim=2, dtype="complex128", seed=203
+    )
+    fit = py.FIT(state.copy(), p=state, range_int=[0, 3])
+
+    fit.run_gate(n_iter=2, block_size=2, timing=True)
+
+    records = fit.get_timing()
+    assert all(record["block_size"] == 2 for record in records)
+    assert all(record["fixed_environment_seconds"] >= 0.0 for record in records)
+    assert all(record["canonicalization_seconds"] >= 0.0 for record in records)
+    assert all(record["moving_environment_seconds"] >= 0.0 for record in records)
+    assert all(record["sweep_overhead_seconds"] >= 0.0 for record in records)
+    for record in records:
+        assert record["moving_environment_seconds"] == pytest.approx(
+            sum(
+                site["moving_environment_seconds"]
+                for site in record["site_timings"]
+            )
+        )
+        assert record["canonicalization_seconds"] >= (
+            record["sweep_preparation_canonicalization_seconds"]
+        )
 
 
 def test_fit_gate_two_site_grows_only_active_bonds():
@@ -1042,7 +1087,7 @@ def test_fit_gate_large_window_block_sizes_compare_with_timing(block_size):
     )
     records = fit.get_timing()
     assert [record["direction"] for record in records] == ["R", "L"]
-    assert all(record["timing_schema"] == 2 for record in records)
+    assert all(record["timing_schema"] == 3 for record in records)
     assert all(record["active_site_count"] == length for record in records)
     expected_blocks = [block_size, block_size]
     if block_size == 3:
@@ -1249,6 +1294,17 @@ def test_new_fit_configuration_is_keyword_only():
         "quality_check_repair",
     ):
         assert run_parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_mps_optimizer_fit_defaults_are_adaptive_and_single_pair_fast():
+    """The public DMRG defaults use the safe local fast paths."""
+    fit_rtol = inspect.signature(py.MpsOptimizer.run).parameters["fit_rtol"]
+    fast_path = inspect.signature(py.MpsOptimizer.run).parameters[
+        "fit_single_pair_fast_path"
+    ]
+
+    assert fit_rtol.default == pytest.approx(1.0e-8)
+    assert fast_path.default is True
 
 
 def test_fit_two_site_single_pair_fast_path_is_structurally_converged():
@@ -2118,7 +2174,7 @@ def test_mps_optimizer_rejects_conflicting_legacy_fit_controls():
         with pytest.raises(ValueError, match="different values"):
             opt.run(
                 progbar=False,
-                fit_rtol=1.0e-8,
+                fit_rtol=1.0e-7,
                 mix_fit_rtol=None,
             )
 
@@ -4278,6 +4334,7 @@ def test_mps_optimizer_dmrg_non_unitary_matches_mpo_accuracy():
             n_iter=20,
             non_unitary=True,
             normalize_every=1,
+            fit_rtol=None,
         )
 
         fidelity = float(np.real(py.tn_fidelity(opt.p, target, contraction_opt="auto-hq")))

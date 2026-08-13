@@ -1012,6 +1012,69 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError("sweep_sequence must contain only 'R' and 'L'.")
         return sequence
 
+    def _prepare_gate_sweep_environments(
+        self,
+        psi,
+        start,
+        stop,
+        direction,
+        *,
+        timing_record=None,
+        reuse_canonical_form=False,
+    ):
+        """Prepare the gauge and fixed environments for one gate sweep.
+
+        The preparation work is deliberately timed separately from the
+        per-site records. In particular, fixed-environment construction takes
+        place before the first active update and was previously hidden inside
+        ``non_site_elapsed_seconds``. The canonicalization calls are Quimb's
+        QR/gauge preparation route for dense MPS data (or the corresponding
+        native route for other tensor types).
+        """
+        canonicalization_started = (
+            self._timing_mark() if timing_record is not None else None
+        )
+        if direction == "R":
+            if not reuse_canonical_form:
+                for site in range(stop, start, -1):
+                    psi.right_canonize_site(site, bra=None)
+        else:
+            if not reuse_canonical_form:
+                for site in range(start, stop):
+                    psi.left_canonize_site(site, bra=None)
+        canonicalization_finished = (
+            self._timing_mark() if timing_record is not None else None
+        )
+
+        fixed_environment_started = (
+            self._timing_mark() if timing_record is not None else None
+        )
+        fixed_environments = self._build_active_environments(
+            psi,
+            start,
+            stop,
+            direction,
+        )
+        fixed_environment_finished = (
+            self._timing_mark() if timing_record is not None else None
+        )
+
+        if timing_record is not None:
+            preparation_canonicalization_seconds = float(
+                canonicalization_finished - canonicalization_started
+            )
+            timing_record["canonicalization_seconds"] += (
+                preparation_canonicalization_seconds
+            )
+            timing_record["sweep_preparation_canonicalization_seconds"] += (
+                preparation_canonicalization_seconds
+            )
+            timing_record["fixed_environment_seconds"] += float(
+                fixed_environment_finished - fixed_environment_started
+            )
+
+        return fixed_environments
+
     # ------------------------------------------------------------------
     # Active gate-window solver
     # ------------------------------------------------------------------
@@ -1033,20 +1096,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # direction, that is exactly the gauge preparation it needs. Reusing
         # it avoids repeating a full boundary canonicalization pass.
         if direction == "R":
-            if not reuse_canonical_form:
-                for site in range(stop, start, -1):
-                    psi.right_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "R"
+            fixed_environments = self._prepare_gate_sweep_environments(
+                psi,
+                start,
+                stop,
+                "R",
+                timing_record=timing_record,
+                reuse_canonical_form=reuse_canonical_form,
             )
             moving_environments = {}
             sites = range(start, stop + 1)
         else:
-            if not reuse_canonical_form:
-                for site in range(start, stop):
-                    psi.left_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "L"
+            fixed_environments = self._prepare_gate_sweep_environments(
+                psi,
+                start,
+                stop,
+                "L",
+                timing_record=timing_record,
+                reuse_canonical_form=reuse_canonical_form,
             )
             moving_environments = {}
             sites = range(stop, start - 1, -1)
@@ -1084,8 +1151,26 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self._timing_mark() if timing_record is not None else None
             )
 
+            moving_environment_started = writeback_finished
+            moving_environment_updated = False
+            moving_canonicalization_seconds = 0.0
             if direction == "R" and site < stop:
+                moving_canonicalization_started = (
+                    self._timing_mark() if timing_record is not None else None
+                )
                 psi.left_canonize_site(site, bra=None)
+                moving_canonicalization_finished = (
+                    self._timing_mark() if timing_record is not None else None
+                )
+                if timing_record is not None:
+                    moving_canonicalization_seconds = float(
+                        moving_canonicalization_finished
+                        - moving_canonicalization_started
+                    )
+                    timing_record["canonicalization_seconds"] += (
+                        moving_canonicalization_seconds
+                    )
+                    moving_environment_started = moving_canonicalization_finished
                 moving_environments[site] = self._overlap_environment_site(
                     psi,
                     site,
@@ -1093,8 +1178,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     stop,
                     prior=moving_environments.get(site - 1),
                 )
+                moving_environment_updated = True
             elif direction == "L" and site > start:
+                moving_canonicalization_started = (
+                    self._timing_mark() if timing_record is not None else None
+                )
                 psi.right_canonize_site(site, bra=None)
+                moving_canonicalization_finished = (
+                    self._timing_mark() if timing_record is not None else None
+                )
+                if timing_record is not None:
+                    moving_canonicalization_seconds = float(
+                        moving_canonicalization_finished
+                        - moving_canonicalization_started
+                    )
+                    timing_record["canonicalization_seconds"] += (
+                        moving_canonicalization_seconds
+                    )
+                    moving_environment_started = moving_canonicalization_finished
                 moving_environments[site] = self._overlap_environment_site(
                     psi,
                     site,
@@ -1102,9 +1203,18 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     stop,
                     prior=moving_environments.get(site + 1),
                 )
+                moving_environment_updated = True
 
             if timing_record is not None:
                 environment_finished = self._timing_mark()
+                moving_environment_seconds = (
+                    float(environment_finished - moving_environment_started)
+                    if moving_environment_updated
+                    else 0.0
+                )
+                environment_seconds = float(
+                    environment_finished - writeback_finished
+                )
                 timing_record["site_timings"].append(
                     {
                         "site": int(site),
@@ -1117,9 +1227,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         "writeback_seconds": float(
                             writeback_finished - effective_finished
                         ),
-                        "environment_seconds": float(
-                            environment_finished - writeback_finished
-                        ),
+                        "canonicalization_seconds": moving_canonicalization_seconds,
+                        "environment_seconds": environment_seconds,
+                        "moving_environment_seconds": moving_environment_seconds,
                         "elapsed_seconds": float(
                             environment_finished - site_started
                         ),
@@ -1151,20 +1261,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # canonical gauge required here. Same-direction sweeps, and the first
         # sweep of a run, still perform the explicit preparation pass.
         if direction == "R":
-            if not reuse_canonical_form:
-                for site in range(stop, start, -1):
-                    psi.right_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "R"
+            fixed_environments = self._prepare_gate_sweep_environments(
+                psi,
+                start,
+                stop,
+                "R",
+                timing_record=timing_record,
+                reuse_canonical_form=reuse_canonical_form,
             )
             moving_environments = {}
             pairs = ((site, site + 1) for site in range(start, stop))
         else:
-            if not reuse_canonical_form:
-                for site in range(start, stop):
-                    psi.left_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "L"
+            fixed_environments = self._prepare_gate_sweep_environments(
+                psi,
+                start,
+                stop,
+                "L",
+                timing_record=timing_record,
+                reuse_canonical_form=reuse_canonical_form,
             )
             moving_environments = {}
             pairs = ((site, site + 1) for site in range(stop - 1, start - 1, -1))
@@ -1269,6 +1383,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             if timing_record is not None:
                 environment_finished = self._timing_mark()
+                moving_environment_seconds = float(
+                    environment_finished - writeback_finished
+                )
                 timing_record["site_timings"].append(
                     {
                         "site": int(left_site),
@@ -1283,9 +1400,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         "writeback_seconds": float(
                             writeback_finished - split_finished
                         ),
-                        "environment_seconds": float(
-                            environment_finished - writeback_finished
-                        ),
+                        "canonicalization_seconds": 0.0,
+                        "environment_seconds": moving_environment_seconds,
+                        "moving_environment_seconds": moving_environment_seconds,
                         "elapsed_seconds": float(
                             environment_finished - site_started
                         ),
@@ -1320,11 +1437,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # As with the one- and two-site paths, an opposite-direction sweep
         # can consume the canonical form produced by the previous sweep.
         if direction == "R":
-            if not reuse_canonical_form:
-                for site in range(stop, start, -1):
-                    psi.right_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "R"
+            fixed_environments = self._prepare_gate_sweep_environments(
+                psi,
+                start,
+                stop,
+                "R",
+                timing_record=timing_record,
+                reuse_canonical_form=reuse_canonical_form,
             )
             moving_environments = {}
             blocks = (
@@ -1332,11 +1451,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 for site in range(start, stop - 1)
             )
         else:
-            if not reuse_canonical_form:
-                for site in range(start, stop):
-                    psi.left_canonize_site(site, bra=None)
-            fixed_environments = self._build_active_environments(
-                psi, start, stop, "L"
+            fixed_environments = self._prepare_gate_sweep_environments(
+                psi,
+                start,
+                stop,
+                "L",
+                timing_record=timing_record,
+                reuse_canonical_form=reuse_canonical_form,
             )
             moving_environments = {}
             blocks = (
@@ -1527,6 +1648,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             if timing_record is not None:
                 environment_finished = self._timing_mark()
+                moving_environment_seconds = float(
+                    environment_finished - writeback_finished
+                )
                 timing_record["site_timings"].append(
                     {
                         "site": int(left_site),
@@ -1545,9 +1669,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         "writeback_seconds": float(
                             writeback_finished - split_finished
                         ),
-                        "environment_seconds": float(
-                            environment_finished - writeback_finished
-                        ),
+                        "canonicalization_seconds": 0.0,
+                        "environment_seconds": moving_environment_seconds,
+                        "moving_environment_seconds": moving_environment_seconds,
                         "elapsed_seconds": float(
                             environment_finished - site_started
                         ),
@@ -1856,7 +1980,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             return None
         started = self._timing_mark()
         return {
-            "timing_schema": 2,
+            "timing_schema": 3,
             "sweep": int(sweep),
             "range_int": tuple(self.range_int),
             "active_site_count": int(self.range_int[1] - self.range_int[0] + 1),
@@ -1864,6 +1988,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             "block_size": int(block_size),
             "environment_strategy": self.environment_strategy,
             "timing_sync_device": bool(self._timing_sync_device),
+            "canonicalization_seconds": 0.0,
+            "sweep_preparation_canonicalization_seconds": 0.0,
+            "fixed_environment_seconds": 0.0,
             "site_timings": [],
             "_started": started,
         }
@@ -1878,6 +2005,21 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             sum(site["elapsed_seconds"] for site in record["site_timings"])
         )
         record["update_count"] = record["site_count"]
+        record["moving_environment_seconds"] = float(
+            sum(
+                site.get(
+                    "moving_environment_seconds",
+                    site.get("environment_seconds", 0.0),
+                )
+                for site in record["site_timings"]
+            )
+        )
+        record["moving_canonicalization_seconds"] = float(
+            sum(
+                site.get("canonicalization_seconds", 0.0)
+                for site in record["site_timings"]
+            )
+        )
         for stage in (
             "effective_seconds",
             "svd_seconds",
@@ -1890,6 +2032,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         record["non_site_elapsed_seconds"] = max(
             0.0,
             record["elapsed_seconds"] - record["site_elapsed_seconds"],
+        )
+        record["sweep_overhead_seconds"] = max(
+            0.0,
+            record["non_site_elapsed_seconds"]
+            - record["sweep_preparation_canonicalization_seconds"]
+            - record["fixed_environment_seconds"],
         )
         record["converged"] = bool(self.converged)
         record["convergence_reason"] = self.convergence_reason
