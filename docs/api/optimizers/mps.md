@@ -102,8 +102,14 @@ measures each target in `basis`, records the result, then resets it to the
 physical leg with `vec`, absorbs it into the selected neighbour, and shortens
 the MPS by one site.
 
-`mode="fit"` is a clear alias for the historical `mode="dmrg"`. Both default
-to native two-site FIT. `mode="mix"` is the transactional unitary variant.
+`mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
+convenience modes share the DMRG backend but have distinct schedules:
+`"dmrg1"` uses adaptive two-site growth until active bonds reach their
+attainable ceilings and then fixed-rank one-site FIT; `"dmrg2"` uses two-site
+FIT for the required warm-up (two sweeps by default) and then one-site FIT;
+and `"dmrg3"` uses adaptive three-site growth and then one-site FIT.
+`mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
+schedule. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
 to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
 not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
@@ -116,11 +122,28 @@ only bonds visited by the native splits can grow. `fit_block_size=1` retains
 the fixed-rank compatibility algorithm, for which mixed mode still warms short
 active bonds through MPO. Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
-the block's shared compression. `fit_layer_size` is the clear name for
+the block's shared compression. By default, `fit_adaptive_sweeps=2` requires
+two-site or three-site FIT for at least two adaptive sweeps, then continues
+the block updates until every active bond reaches its physical rank ceiling.
+Rank stagnation is not a stopping condition: if a target remains below its
+ceiling, the block phase continues until `n_iter` is exhausted. Only after all
+ceilings are reached does it use one-site FIT for the remaining requested
+sweeps. This keeps the bond spaces opened by the SVD warm-up while
+avoiding repeated GPU SVD truncations. The dense open-chain ceilings are
+`2, 4, 8, ..., chi, ..., 8, 4, 2` (also limited by the current outside-window
+bonds); FIT never pads a bond merely to make it equal to `chi`. Set
+`fit_adaptive_sweeps` higher when the active bond spaces need a longer minimum
+warm-up. A generic `mode="dmrg"` with `fit_block_size=1` remains the fixed-rank
+one-site compatibility path; the named `"dmrg1"` mode deliberately continues
+two-site growth until its ceilings, while `"dmrg2"` uses the fixed two-sweep
+two-site warm-up. `fit_layer_size` is the clear name for
 `k_2q_batch`; it counts two-site gates in a contiguous paper-style target
-block. With `fit_block_size=3`, one initial three-site sweep is followed by
-one-site refinement by default; set `fit_three_site_sweeps=2` for two warm-up
-passes. `fit_max_span="auto"` also limits the spatial width of a batched
+block. For `fit_block_size=2`, an active window spanning at least three sites
+uses the same adaptive-to-one-site schedule; an ordinary two-site gate window
+skips one-site refinement because its two-site update already solves the
+complete local problem. `fit_three_site_sweeps` remains a deprecated alias for
+`fit_adaptive_sweeps`.
+`fit_max_span="auto"` also limits the spatial width of a batched
 target, splitting disjoint gates before they create an unnecessarily wide FIT
 window. Set `fit_max_span=None` to restore unrestricted gate-count batching.
 If a DMRG/FIT batch
@@ -132,8 +155,10 @@ re-raised.
 For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
 control adaptive stopping from FIT's final local-norm change. The public
-`MpsOptimizer.run` default is `fit_rtol=1e-8`; `fit_rtol="auto"` remains an
-explicit dtype-aware option selecting `1e-3`, `1e-5`, or `1e-8` for 16-,
+`MpsOptimizer.run` default is `fit_rtol=1e-8`, which compares the retained
+local Frobenius norm between sweeps. It is a cheap convergence proxy, not a
+direct overlap or literal infidelity. `fit_rtol="auto"` remains an explicit
+dtype-aware option selecting `1e-3`, `1e-5`, or `1e-8` for 16-,
 32-/complex64-, or higher-precision data. Pass `fit_rtol=None` for fixed
 iterations. The old
 `mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` spellings remain as
@@ -141,8 +166,12 @@ deprecated aliases. A legacy value replaces the canonical default for old
 call sites; a conflicting non-default canonical value fails instead of
 silently choosing a policy. FIT checks the small per-site norm scalars it
 already computes after every sweep, transferring only one active-span-sized
-vector to the host.
-An adjacent two-site interval is a structural special case: its only pair is
+vector to the host. Adaptive rank-growing windows require `n_iter >= 2`; a
+shorter request raises before fitting, except for the adjacent two-site exact
+fast path.
+At least two adaptive block sweeps are required whenever the active window
+needs rank growth, regardless of `fit_rtol`; an adjacent two-site interval is
+a structural special case whose only pair is
 the complete variational problem, so the default
 `fit_single_pair_fast_path=True` stops after one effective-tensor SVD even when
 `fit_rtol=None`. Set it to `False` only when intentionally benchmarking
@@ -167,7 +196,12 @@ forms the analogous three-site tensor and splits it twice, absorbing singular
 values toward the sweep direction. Both dispatch to configured dense SVD
 drivers and, crucially, Symmray's native block SVD for U1, U1xU1, and fermionic
 tensors. `fit_sweep_sequence="RL"` alternates canonical directions; `"R"`
-preserves a one-way sweep when required.
+preserves a one-way sweep for dense and native fermionic arrays. Fermionic FIT
+keeps a conjugated native working MPS across the sweep sequence, includes the
+actual outside graded overlap environments, applies dual-leg phase corrections
+before each split, and restores the physical ket afterward. Thus `R`, `L`, and
+`RL` are honored exactly without dense conversion or Jordan-Wigner
+bosonization.
 
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
@@ -187,6 +221,19 @@ has only the operator-Schmidt rank and does not apply the output `chi` limit.
 and fermionic data. `target_cutoff=0.0` keeps either representation exact while
 ordinary `cutoff` controls only the two-site output split, so target-
 construction loss is not reported as FIT loss.
+
+For a non-adjacent native fermionic gate, MPS DMRG first replays the target
+gate through Quimb's chi-capped graded auto-swap path and uses that native MPS
+as the FIT starting point. This is the deterministic counterpart of
+SymDMRG2's sector enrichment: it opens the gate-generated virtual charge
+sectors before alternating least squares can project them out. After that
+warm start, fermionic FIT follows the selected DMRG schedule normally:
+`dmrg2`, for example, can switch from its two block warm-up sweeps to native
+one-site refinement. The uncapped target remains separate. At
+`target_cutoff=0.0`, routed target splits use the smallest
+representable positive absolute cutoff, which removes structural zero singular
+directions while retaining every representable nonzero value. This prevents
+invalid duplicate dummy modes without introducing target truncation.
 
 Unitary DMRG and mixed streams default to `stabilize_unitary=True`. After each
 FIT compression—and after an MPO rank warm-up or fallback inside mixed

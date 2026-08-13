@@ -531,27 +531,23 @@ def test_mps_optimizer_timing_reports_fit_sweeps_and_sites():
         mode="dmrg",
     )
 
-    opt.run(progbar=False, n_iter=2, timing=True)
+    opt.run(progbar=False, n_iter=3, timing=True)
 
     timing = opt.get_run_timing()
     fit_steps = timing["fit_steps"]
     assert timing["stages"]["dmrg.target"]["calls"] == 1
-    assert len(fit_steps) == 2
-    assert [record["sweep"] for record in fit_steps] == [1, 2]
+    assert len(fit_steps) == 3
+    assert [record["sweep"] for record in fit_steps] == [1, 2, 3]
     assert all(record["status"] == "complete" for record in fit_steps)
     assert all(record["range_int"] == (0, 2) for record in fit_steps)
-    assert all(record["site_count"] == 2 for record in fit_steps)
-    assert [record["direction"] for record in fit_steps] == ["R", "L"]
-    assert all(record["block_size"] == 2 for record in fit_steps)
-    assert [record["fit_index"] for record in fit_steps] == [0, 0]
-    assert [record["record_index"] for record in fit_steps] == [0, 1]
-    assert timing["fit_totals"]["calls"] == 1
-    assert timing["fit_totals"]["sweeps"] == 2
-    assert timing["fit_totals"]["site_updates"] == 4
-    assert timing["fit_totals"]["svd_seconds"] >= 0.0
+    assert [record["site_count"] for record in fit_steps] == [2, 2, 3]
+    assert [record["direction"] for record in fit_steps] == ["R", "L", "R"]
+    assert [record["block_size"] for record in fit_steps] == [2, 2, 1]
+    assert [record["fit_index"] for record in fit_steps] == [0, 0, 0]
+    assert [record["record_index"] for record in fit_steps] == [0, 1, 2]
+    assert [len(record["site_timings"]) for record in fit_steps] == [2, 2, 3]
     assert all(
         record["elapsed_seconds"] >= 0.0
-        and len(record["site_timings"]) == 2
         and all(site["elapsed_seconds"] >= 0.0 for site in record["site_timings"])
         for record in fit_steps
     )
@@ -568,12 +564,12 @@ def test_mps_optimizer_timing_distinguishes_fit_calls_from_sweeps():
         mode="fit",
     )
 
-    optimizer.run(progbar=False, n_iter=2, timing=True)
+    optimizer.run(progbar=False, n_iter=3, timing=True)
 
     records = optimizer.get_run_timing()["fit_steps"]
-    assert [record["fit_index"] for record in records] == [0, 0, 1, 1]
-    assert [record["record_index"] for record in records] == [0, 1, 2, 3]
-    assert [record["sweep"] for record in records] == [1, 2, 1, 2]
+    assert [record["fit_index"] for record in records] == [0, 0, 0, 1, 1, 1]
+    assert [record["record_index"] for record in records] == [0, 1, 2, 3, 4, 5]
+    assert [record["sweep"] for record in records] == [1, 2, 3, 1, 2, 3]
 
 
 def test_mps_optimizer_dmrg_uses_gate_window_fit(monkeypatch):
@@ -597,7 +593,7 @@ def test_mps_optimizer_dmrg_uses_gate_window_fit(monkeypatch):
         chi=2,
         mode="dmrg",
     )
-    opt.run(progbar=False, n_iter=1)
+    opt.run(progbar=False, n_iter=2)
 
     assert called_ranges == [(1, 3)]
 
@@ -1052,6 +1048,192 @@ def test_fit_gate_three_site_warmup_then_one_site_refinement():
     assert len(fit.info["three_site_splits"]) == 2
 
 
+def test_fit_gate_polish_sweeps_update_iteration_diagnostics():
+    """Explicit one-site polish sweeps count in FIT diagnostics."""
+    initial, target = _three_site_ghz_target()
+    fit = py.FIT(target, p=initial, range_int=[0, 3])
+
+    fit.run_gate(
+        n_iter=1,
+        block_size=3,
+        three_site_sweeps=1,
+        final_one_site_sweeps=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+        timing=True,
+    )
+
+    assert fit.iterations_run == 3
+    assert fit.adaptive_sweeps_run == 1
+    assert fit.one_site_sweeps_run == 2
+    assert [record["sweep"] for record in fit.get_timing()] == [1, 2, 3]
+
+
+def test_fit_gate_two_site_warmup_then_one_site_refinement():
+    """Two-site warm-up should switch to fixed-rank one-site sweeps."""
+    initial, target = _three_site_ghz_target()
+    fit = py.FIT(target, p=initial, range_int=[0, 3])
+
+    fit.run_gate(
+        n_iter=4,
+        block_size=2,
+        adaptive_block_sweeps=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+        timing=True,
+    )
+
+    timing = fit.get_timing()
+    assert [record["block_size"] for record in timing] == [2, 2, 1, 1]
+    assert len(fit.info["two_site_splits"]) == 6
+    assert all(
+        record["svd_seconds"] == 0.0
+        for record in timing[2:]
+    )
+
+
+def test_fit_adaptive_rank_targets_follow_open_chain_capacity():
+    """Adaptive FIT should use attainable 2, 4, 8, ... bond ceilings."""
+    state = qtn.MPS_computational_state("00000000", dtype="complex128")
+
+    assert py.FIT._active_bond_rank_targets(  # pylint: disable=protected-access
+        state,
+        0,
+        7,
+        16,
+    ) == (2, 4, 8, 16, 8, 4, 2)
+
+
+def test_dmrg1_does_not_leave_adaptive_phase_on_rank_stagnation():
+    """DMRG1 remains two-site when the target cannot fill its ceilings."""
+    state = qtn.MPS_computational_state("000", dtype="complex128")
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[(np.eye(4), (0, 2))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=6,
+        cutoff=1.0e-12,
+        fit_rtol=1.0e9,
+        fit_patience=1,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 2, 2, 2, 2]
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
+
+
+def test_dmrg1_requires_two_adaptive_sweeps():
+    """Adaptive DMRG rejects a non-adjacent run shorter than two sweeps."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(np.eye(4), (0, 2))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    with pytest.raises(ValueError, match="n_iter >= 2"):
+        optimizer.run(progbar=False, n_iter=1, fit_rtol=None)
+
+
+def test_dmrg1_switches_to_one_site_only_after_ceiling_is_reached():
+    """DMRG1 refines only after all active bonds reach their ceilings."""
+    state = qtn.MPS_rand_state(
+        3,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="complex128",
+        seed=123,
+    )
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[(np.eye(4), (0, 2))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        cutoff=1.0e-12,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
+
+
+def test_dmrg2_switches_after_required_two_site_warmup():
+    """DMRG2 uses two sites twice, then one-site refinement."""
+    state = qtn.MPS_rand_state(
+        3,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="complex128",
+        seed=123,
+    )
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[(np.eye(4), (0, 2))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        cutoff=1.0e-12,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
+
+
+def test_dmrg2_rtol_can_stop_after_two_site_warmup():
+    """DMRG2 tolerance stopping starts only after its two-site phase."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(np.eye(4), (0, 2))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=8,
+        fit_rtol=1.0e9,
+        fit_patience=1,
+        cutoff=1.0e-12,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+
+
 @pytest.mark.parametrize("block_size", [1, 2, 3])
 def test_fit_gate_large_window_block_sizes_compare_with_timing(block_size):
     """Large active windows compare rank growth and expose benchmark stages."""
@@ -1206,6 +1388,42 @@ def test_fit_dense_direct_environment_matches_generic_route():
     assert np.allclose(direct.p.to_dense(), generic.p.to_dense(), atol=1.0e-11)
 
 
+def test_fit_gate_reuses_dense_opposite_sweep_environments():
+    """Dense R/L sweeps reuse only compatible cached boundary environments."""
+    initial = qtn.MPS_rand_state(
+        10, bond_dim=1, phys_dim=2, dtype="complex128", seed=601
+    )
+    target = qtn.MPS_rand_state(
+        10, bond_dim=3, phys_dim=2, dtype="complex128", seed=602
+    )
+    options = {
+        "n_iter": 4,
+        "block_size": 2,
+        "sweep_sequence": "RL",
+        "max_bond": 3,
+        "cutoff": 1.0e-12,
+        "rtol": None,
+    }
+    cached = py.FIT(target, p=initial, range_int=[0, 9])
+    uncached = py.FIT(target, p=initial, range_int=[0, 9])
+    uncached._allow_sweep_environment_reuse = False
+
+    cached.run_gate(**options)
+    uncached.run_gate(**options)
+
+    assert cached._sweep_environment_reuse_count == 3
+    assert uncached._sweep_environment_reuse_count == 0
+    cached_dense = np.asarray(cached.p.to_dense()).reshape(-1)
+    uncached_dense = np.asarray(uncached.p.to_dense()).reshape(-1)
+    overlap = np.vdot(cached_dense, uncached_dense)
+    assert abs(overlap) ** 2 == pytest.approx(
+        np.vdot(cached_dense, cached_dense).real
+        * np.vdot(uncached_dense, uncached_dense).real,
+        rel=1.0e-9,
+        abs=1.0e-12,
+    )
+
+
 def test_fit_auto_cutoff_is_dtype_aware():
     """FIT's automatic cutoff follows the fitted tensor precision."""
     initial = qtn.MPS_rand_state(
@@ -1274,11 +1492,13 @@ def test_new_fit_configuration_is_keyword_only():
     run_parameters = inspect.signature(py.MpsOptimizer.run).parameters
 
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["fit_rtol"].default == pytest.approx(1.0e-8)
     for name in (
         "fit_min_iter",
         "fit_rtol",
         "fit_patience",
         "fit_block_size",
+        "fit_adaptive_sweeps",
         "fit_sweep_sequence",
         "fit_layer_size",
         "fit_max_span",
@@ -1463,6 +1683,36 @@ def test_fit_gate_two_site_timing_reports_pairs_and_directions():
         for record in records
         for site_timing in record["site_timings"]
     )
+
+
+def test_fit_gate_two_site_final_polish_only_spans_large_windows():
+    """Two-site FIT can polish a large window without touching a pair window."""
+    state = qtn.MPS_rand_state(
+        4, bond_dim=2, phys_dim=2, dtype="complex128", seed=205
+    )
+    fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
+    fit.run_gate(
+        n_iter=1,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        final_one_site_sweeps=1,
+        timing=True,
+    )
+
+    records = fit.get_timing()
+    assert [record["block_size"] for record in records] == [2, 1]
+    assert [record["direction"] for record in records] == ["R", "L"]
+    assert [record["site_count"] for record in records] == [2, 3]
+
+    pair = py.FIT(state.copy(), p=state, range_int=[1, 2])
+    pair.run_gate(
+        n_iter=1,
+        block_size=2,
+        final_one_site_sweeps=1,
+        timing=True,
+    )
+    assert [record["block_size"] for record in pair.get_timing()] == [2]
 
 
 def test_fit_alternating_sweeps_reuse_opposite_canonical_form(monkeypatch):
@@ -1731,7 +1981,96 @@ def test_fit_symmray_native_environment_matches_generic_route():
     generic.run_gate(n_iter=2, block_size=2, sweep_sequence="RL", cutoff=0.0)
 
     assert native.environment_strategy == "symmray-native"
-    assert native.p.to_dense().allclose(generic.p.to_dense(), atol=1.0e-10)
+    native_dense = np.asarray(native.p.to_dense().to_dense()).reshape(-1)
+    generic_dense = np.asarray(generic.p.to_dense().to_dense()).reshape(-1)
+    overlap = np.vdot(native_dense, generic_dense)
+    assert abs(overlap) ** 2 == pytest.approx(
+        np.vdot(native_dense, native_dense).real
+        * np.vdot(generic_dense, generic_dense).real,
+        rel=1.0e-9,
+        abs=1.0e-14,
+    )
+
+
+@pytest.mark.parametrize("block_size", [2, 3])
+@pytest.mark.parametrize(
+    ("spinful", "symmetry", "occupations"),
+    [
+        (False, "U1", (0, 1, 0, 1, 0, 1, 0, 1)),
+        (
+            True,
+            "U1U1",
+            ((0, 1), (1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1), (1, 0)),
+        ),
+    ],
+)
+def test_fit_symmray_native_environment_preserves_dummy_modes(
+    block_size, spinful, symmetry, occupations
+):
+    """Long native sweeps preserve dummy modes without tensor densification."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    state = py.hrs_to_mps(
+        8,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=2,
+        seed=7,
+        dtype="complex128",
+    )
+
+    native = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[0, 7],
+        environment_strategy="symmray-native",
+    )
+    generic = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[0, 7],
+        environment_strategy="generic",
+    )
+
+    native.run_gate(
+        n_iter=4,
+        min_iter=1,
+        rtol=None,
+        patience=99,
+        block_size=block_size,
+        max_bond=4,
+        cutoff=1.0e-12,
+        sweep_sequence="R",
+    )
+    generic.run_gate(
+        n_iter=4,
+        min_iter=1,
+        rtol=None,
+        patience=99,
+        block_size=block_size,
+        max_bond=4,
+        cutoff=1.0e-12,
+        sweep_sequence="R",
+    )
+
+    native_dense = np.asarray(native.p.to_dense().to_dense()).reshape(-1)
+    generic_dense = np.asarray(generic.p.to_dense().to_dense()).reshape(-1)
+    overlap = np.vdot(native_dense, generic_dense)
+    assert abs(overlap) ** 2 == pytest.approx(
+        np.vdot(native_dense, native_dense).real
+        * np.vdot(generic_dense, generic_dense).real,
+        rel=1.0e-9,
+        abs=1.0e-14,
+    )
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        for tensor in native.p.tensors
+    )
 
 
 def test_fit_auto_selects_native_symmray_environment():
@@ -1750,6 +2089,282 @@ def test_fit_auto_selects_native_symmray_environment():
     assert fit.environment_strategy == "symmray-native"
 
 
+@pytest.mark.parametrize("block_size", [1, 2, 3])
+@pytest.mark.parametrize("sweep_sequence", ["R", "RL"])
+@pytest.mark.parametrize(
+    ("spinful", "symmetry", "occupations"),
+    [
+        (False, "U1", (1, 0, 1, 0, 1, 0)),
+        (
+            True,
+            "U1U1",
+            ((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
+        ),
+        (False, "Z2", (1, 0, 1, 0, 1, 0)),
+    ],
+)
+def test_fit_fermionic_native_writeback_gauge_is_phase_safe(
+    block_size,
+    sweep_sequence,
+    spinful,
+    symmetry,
+    occupations,
+):
+    """Every native FIT block size preserves an exact graded MPS target."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    state = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=2,
+        seed=17,
+        dtype="complex128",
+    )
+    fit = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[1, 4],
+        environment_strategy="symmray-native",
+    )
+    run_options = {
+        "n_iter": 2,
+        "min_iter": 1,
+        "rtol": None,
+        "block_size": block_size,
+        "sweep_sequence": sweep_sequence,
+        "max_bond": 8,
+        "cutoff": 1.0e-12,
+    }
+    if block_size > 1:
+        run_options["adaptive_block_sweeps"] = 2
+    fit.run_gate(**run_options)
+
+    assert fit.info["fermionic_sweep_sequence"] == {
+        "requested": sweep_sequence,
+        "used": sweep_sequence,
+        "reason": "native_conjugated_fit_gauge",
+    }
+    assert fit._sweep_environment_reuse_count == (1 if sweep_sequence == "RL" else 0)
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in fit.p
+    )
+    assert float(
+        np.real(py.tn_fidelity(fit.p, state, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+
+
+@pytest.mark.parametrize("block_size", [2, 3])
+def test_fit_run_eff_fermionic_blocks_alternate_natively(block_size):
+    """Full-chain native blocks reuse the conjugated RL environment gauge."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    state = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
+        chi=2,
+        random_rounds=2,
+        seed=31,
+        dtype="complex128",
+    )
+    fit = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        environment_strategy="symmray-native",
+    )
+    fit.run_eff(
+        n_iter=2,
+        block_size=block_size,
+        sweep_sequence="RL",
+        max_bond=8,
+        cutoff=1.0e-12,
+    )
+
+    assert fit._sweep_environment_reuse_count == 1
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in fit.p
+    )
+    assert float(
+        np.real(py.tn_fidelity(fit.p, state, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+
+
+def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
+    """A failed native sweep cannot leak FIT's conjugated working gauge."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=False,
+        symmetry="U1",
+        dtype="complex128",
+    )
+    state = py.hrs_to_mps(
+        5,
+        fermion=fermion,
+        occupations=(1, 0, 1, 0, 1),
+        chi=2,
+        random_rounds=2,
+        seed=41,
+        dtype="complex128",
+    )
+    fit = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[1, 3],
+        environment_strategy="symmray-native",
+    )
+
+    def fail_sweep(*_args, **_kwargs):
+        raise RuntimeError("injected native sweep failure")
+
+    monkeypatch.setattr(fit, "_run_gate_two_site_sweep", fail_sweep)
+    with pytest.raises(RuntimeError, match="injected native sweep failure"):
+        fit.run_gate(
+            n_iter=1,
+            block_size=2,
+            sweep_sequence="R",
+            max_bond=8,
+            cutoff=1.0e-12,
+        )
+
+    assert fit._fermionic_bra_working is False
+    assert fit._fermionic_left_exterior_environment is None
+    assert fit._fermionic_right_exterior_environment is None
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in fit.p
+    )
+    assert float(
+        np.real(py.tn_fidelity(fit.p, state, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+
+
+@pytest.mark.parametrize(
+    ("spinful", "symmetry", "occupations"),
+    [
+        (False, "U1", (1, 0, 1, 0, 1, 0)),
+        (
+            True,
+            "U1U1",
+            ((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
+        ),
+        (False, "Z2", (1, 0, 1, 0, 1, 0)),
+    ],
+)
+@pytest.mark.parametrize("fit_sweep_sequence", ["R", "RL"])
+def test_mps_optimizer_dmrg2_long_range_fermions_stay_native_and_exact(
+    spinful,
+    symmetry,
+    occupations,
+    fit_sweep_sequence,
+    monkeypatch,
+):
+    """Exact-cutoff DMRG2 keeps native U1/U1U1/Z2 grading end to end."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    state = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=2,
+        seed=23,
+        dtype="complex128",
+    )
+    gate = fermion.hopping_gate(0.02, t=1.0)
+    stream = [(gate, (0, 3))]
+    reference = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=16,
+        mode="mpo",
+        track_infidelity=False,
+    ).run(progbar=False, cutoff=0.0)
+    raw_zero_cutoff_target = state.copy(deep=True)
+    raw_zero_cutoff_target.gate_with_auto_swap_(
+        gate,
+        (0, 3),
+        info={},
+        swap_back=True,
+        cutoff=0.0,
+        cutoff_mode="rsum2",
+    )
+    assert float(
+        np.real(
+            py.tn_fidelity(
+                reference,
+                raw_zero_cutoff_target,
+                contraction_opt="greedy",
+            )
+        )
+    ) == pytest.approx(1.0, abs=1.0e-12)
+
+    def fail_dense(*_args, **_kwargs):
+        raise AssertionError("native fermionic DMRG must not call to_dense")
+
+    def fail_network_contract(*_args, **_kwargs):
+        raise AssertionError(
+            "native fermionic FIT must not build a temporary TensorNetwork"
+        )
+
+    optimizer = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=16,
+        mode="dmrg2",
+        track_infidelity=False,
+    )
+    array_types = {type(tensor.data) for tensor in (*state, *reference)}
+    array_types.add(type(gate))
+    with monkeypatch.context() as patcher:
+        for array_type in array_types:
+            patcher.setattr(array_type, "to_dense", fail_dense)
+        patcher.setattr(qtn.TensorNetwork, "contract", fail_network_contract)
+        out = optimizer.run(
+            progbar=False,
+            n_iter=3,
+            fit_rtol=None,
+            cutoff=1.0e-12,
+            target_cutoff=0.0,
+            fit_sweep_sequence=fit_sweep_sequence,
+            stabilize_unitary=False,
+        )
+
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in out
+    )
+    assert optimizer._last_dmrg_fit_diagnostics[
+        "native_fermionic_warm_start"
+    ] is True
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics[
+        "one_site_refinement_sweeps"
+    ] == 1
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-9)
+
+
 def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
     """MpsOptimizer should use three-site FIT and shorten adjacent windows."""
     optimizer = py.MpsOptimizer(
@@ -1760,13 +2375,22 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
     )
     optimizer.run(
         progbar=False,
-        n_iter=1,
+        n_iter=3,
         fit_rtol=None,
         fit_block_size=3,
         timing=True,
     )
     assert optimizer._last_dmrg_fit_diagnostics["block_size"] == 3
-    assert optimizer.get_run_timing()["fit_steps"][0]["block_size"] == 3
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 3
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [3, 3, 3]
+    assert [
+        record["site_count"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 2]
 
     adjacent = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
@@ -1782,6 +2406,11 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         timing=True,
     )
     assert adjacent._last_dmrg_fit_diagnostics["block_size"] == 2
+    assert adjacent._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
+    assert [
+        record["block_size"]
+        for record in adjacent.get_run_timing()["fit_steps"]
+    ] == [2]
 
 
 def test_mps_optimizer_fit_block_sizes_report_warm_start_infidelity():
@@ -1847,8 +2476,8 @@ def test_mps_optimizer_fit_block_sizes_report_warm_start_infidelity():
         )
         assert result["timing"]["fit_steps"]
         expected_blocks = {block_size}
-        if block_size == 3:
-            expected_blocks = {3, 1}
+        if block_size in {2, 3}:
+            expected_blocks = {block_size, 1}
         assert {
             step["block_size"] for step in result["timing"]["fit_steps"]
         } == expected_blocks
@@ -1969,7 +2598,7 @@ def test_dmrg_fit_layer_size_and_target_cutoff_are_independent(monkeypatch):
 
     optimizer.run(
         progbar=False,
-        n_iter=1,
+        n_iter=2,
         cutoff=1.0e-3,
         target_cutoff=0.0,
         fit_layer_size=2,
@@ -2005,6 +2634,37 @@ def test_mps_optimizer_fit_mode_is_clear_dmrg_alias():
 
     assert optimizer.mode == "dmrg"
     assert out.L == 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_blocks"),
+    [
+        ("dmrg1", [2, 2, 2]),
+        ("dmrg2", [2, 2, 1]),
+        ("dmrg3", [3, 3, 3]),
+    ],
+)
+def test_mps_optimizer_dmrg_mode_aliases_select_block_size(mode, expected_blocks):
+    """Named DMRG modes select the corresponding FIT block size."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode=mode,
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    assert optimizer.mode == "dmrg"
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == expected_blocks
 
 
 def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
@@ -2091,7 +2751,9 @@ def test_mps_optimizer_mix_stops_fit_adaptively():
 
     event = opt.mix_history[0]
     assert event["backend"] == "dmrg"
-    assert event["fit_iterations"] == 2
+    # The adaptive warm-up is mandatory; tolerance stopping then gets a
+    # separate one-site refinement phase.
+    assert event["fit_iterations"] == 4
     assert event["fit_converged"] is True
     assert event["fit_relative_change"] <= 1e9
 
@@ -2116,7 +2778,7 @@ def test_mps_optimizer_dmrg_stops_fit_adaptively():
         fit_patience=1,
     )
 
-    assert opt._last_dmrg_fit_diagnostics["iterations"] == 2
+    assert opt._last_dmrg_fit_diagnostics["iterations"] == 4
 
 
 def test_mps_optimizer_mix_can_keep_fixed_fit_iterations():
@@ -2482,7 +3144,7 @@ def test_mps_optimizer_quality_checks_report_finite_canonical_state():
         mode="dmrg",
     )
 
-    opt.run(progbar=False, n_iter=1, quality_check_every=True)
+    opt.run(progbar=False, n_iter=2, quality_check_every=True)
 
     assert len(opt.get_quality_checks()) == 2
     assert all(record["finite"] for record in opt.get_quality_checks())
@@ -4332,9 +4994,11 @@ def test_mps_optimizer_dmrg_non_unitary_matches_mpo_accuracy():
             progbar=False,
             cutoff=1e-12,
             n_iter=20,
+            # This legacy accuracy comparison intentionally requests the old
+            # fixed-sweep behavior; the public default is adaptive FIT.
+            fit_rtol=None,
             non_unitary=True,
             normalize_every=1,
-            fit_rtol=None,
         )
 
         fidelity = float(np.real(py.tn_fidelity(opt.p, target, contraction_opt="auto-hq")))

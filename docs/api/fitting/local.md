@@ -61,11 +61,39 @@ wavefunction and performs two direction-aware native SVD splits, while
 useful when a larger local window is worth the extra SVD cost; it is not a
 dense `from_dense` conversion.
 
-For gate-window fits, `three_site_sweeps=1` (the default) uses one larger
-three-site warm-up sweep and then switches to one-site refinement for any
-remaining requested sweeps. Set `three_site_sweeps=2` for two directional
-warm-up passes. One-site refinement preserves the bond dimensions opened by
-the three-site update and is cheaper than repeating the larger SVD block.
+For two- or three-site FIT on an active window spanning at least three sites,
+`final_one_site_sweeps=1` adds a fixed-rank one-site polish pass after the
+block sweeps. The pass reuses the canonical window and never touches sites
+outside `range_int`; it is skipped for a two-site window. This is an explicit
+direct-`FIT.run_gate` control. `MpsOptimizer` uses its separate adaptive
+`fit_adaptive_sweeps`/rank-ceiling schedule and does not add this legacy polish
+pass automatically.
+
+For direct gate-window fits, `three_site_sweeps=1` (the default) uses one
+larger three-site warm-up sweep and then switches to one-site refinement for
+any remaining requested sweeps. Set `three_site_sweeps=2` for two directional
+warm-up passes. Supplying `adaptive_block_sweeps=N` instead applies the same
+minimum block warm-up to two- or three-site FIT. With
+`adaptive_until_rank=True`, the block phase continues until all active bonds
+reach their physical ceilings; rank stagnation is deliberately not an early
+exit. Remaining requested sweeps use one-site FIT. One-site refinement
+preserves the bond dimensions opened by the larger block and is cheaper than
+repeating the larger SVD block.
+
+The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and
+`adaptive_until_rank=True` for its rank-growing `dmrg`, `dmrg1`, and `dmrg3`
+paths. `dmrg2` uses the configured minimum block warm-up and then refines with
+one-site FIT. The direct FIT diagnostics
+`adaptive_sweeps_run` and `one_site_sweeps_run` count both scheduled block
+sweeps and any explicit `final_one_site_sweeps` polish passes.
+
+Ordinary dense arrays and native fermionic Symmray arrays reuse the compatible
+partial overlap environments produced by the preceding opposite-direction
+sweep. Fermionic FIT keeps the working state conjugated across the complete
+sweep sequence, so the reused environments retain one dual-leg convention.
+A change from two-/three-site updates to one-site refinement rebuilds the
+boundary environments once before reuse resumes. Bosonic Symmray arrays retain
+their conservative environment rebuild policy.
 
 The same native block updates are available for the full-chain path:
 
@@ -94,13 +122,24 @@ in by default. `collect_split_diagnostics=False` omits per-SVD truncation
 dictionaries when only the fitted state and retained norm are needed.
 
 `sweep_sequence` uses Quimb direction names: `"R"` is left-to-right, `"L"` is
-right-to-left, and `"RL"` alternates. `environment_strategy="auto"` selects
+right-to-left, and `"RL"` alternates. Native fermionic `run_gate` executes the
+requested sequence exactly and records the conjugated fitting convention in
+`info["fermionic_sweep_sequence"]`. It canonicalizes once around the first
+sweep center, contracts the real outside overlap environments rather than
+substituting graded boundary identities, applies Symmray's dual-leg phase
+correction before each local writeback, and resolves odd dummy-mode global
+phases afterward. The physical ket is restored on both success and failure.
+The same convention supports block-2/3 native `run_eff` sweeps.
+`environment_strategy="auto"` selects
 `"mps-direct"` for an ordinary dense one-tensor-per-site target,
 `"symmray-native"` when all target and fitted tensors are Symmray-backed, and
-otherwise uses the general `"generic"` route. The native route contracts each
-chain environment with Symmray's blockwise tensor product, preserving charge
-sectors and fermionic metadata without densifying. The explicit settings are
-mainly useful for profiling and regression comparison.
+otherwise uses the general `"generic"` route. Non-fermionic Symmray inputs
+use the native blockwise chain product; fermionic Symmray inputs stay on the
+resolved native strategy but use Quimb's graph-planned direct tensor
+contraction so contraction order, dummy modes, and graded phases remain
+authoritative. It dispatches directly on the Symmray arrays and does not build
+a temporary TensorNetwork. Neither route densifies the tensor arrays. The
+explicit settings are mainly useful for profiling and regression comparison.
 
 `cutoff="auto"` chooses `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
 data, and `1e-12` for 64-bit data. Numeric cutoffs retain their explicit

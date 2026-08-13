@@ -769,9 +769,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
         committed DMRG/MPO results at or below this limit.
-    mode : {"fit", "dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
+    mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
         Optimization backend. ``"fit"`` is the clear alias of the historical
-        ``"dmrg"`` spelling.
+        ``"dmrg"`` spelling. ``"dmrg1"`` uses two-site adaptive growth until
+        the active bonds reach their attainable ceilings, then one-site
+        refinement. ``"dmrg2"`` uses two-site updates for the required warm-up
+        (two sweeps by default), then one-site refinement. ``"dmrg3"`` uses
+        three-site adaptive updates before one-site refinement.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -831,8 +835,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         The list is identity until :meth:`apply_layout` is called.
     """
 
+    _DMRG_MODE_ALIASES = {"dmrg1": 1, "dmrg2": 2, "dmrg3": 3}
     _ALLOWED_MODES = frozenset(
-        {"dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}
+        {
+            "dmrg",
+            "dmrg1",
+            "dmrg2",
+            "dmrg3",
+            "mpo",
+            "mix",
+            "swap",
+            "perm",
+            "svd",
+            "su",
+            "exact",
+        }
     )
     LayoutFinder = MpsGateStreamLayoutFinder
     _ALLOWED_SUBMPO_METHODS = frozenset(
@@ -876,12 +893,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Validate and normalize execution mode."""
         mode_norm = str(mode).strip().lower()
         # ``fit`` names the algorithm while ``dmrg`` preserves the historical
-        # mode spelling. They intentionally share one implementation.
-        if mode_norm == "fit":
+        # mode spelling. DMRG1/2/3 are readable block-size aliases that share
+        # the same implementation and are normalized to ``dmrg``.
+        if mode_norm == "fit" or mode_norm in cls._DMRG_MODE_ALIASES:
             mode_norm = "dmrg"
         if mode_norm not in cls._ALLOWED_MODES:
             raise ValueError(f"Unknown mode: {mode}")
         return mode_norm
+
+    @classmethod
+    def _dmrg_alias_block_size(cls, mode):
+        """Return the fixed block size requested by a DMRG mode alias."""
+        return cls._DMRG_MODE_ALIASES.get(str(mode).strip().lower())
 
     @classmethod
     def _normalize_submpo_method(cls, method):
@@ -1298,6 +1321,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
         self.G, self.where, self.event_types = _normalize_gate_queue(gates)
         self.chi = int(chi)
+        mode_name = str(mode).strip().lower()
+        self._dmrg_mode_alias = (
+            mode_name if mode_name in self._DMRG_MODE_ALIASES else None
+        )
+        self._dmrg_mode_block_size = self._dmrg_alias_block_size(mode)
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.ind_id = str(ind_id)
@@ -1460,9 +1488,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 except Exception:
                     pass
 
-                dense = getattr(data, "to_dense", None)
-                if callable(dense):
-                    data = dense()
                 try:
                     if not bool(np.all(np.isfinite(np.asarray(data)))):
                         return False
@@ -1506,6 +1531,49 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # through block-aware gate and split implementations.
         return
 
+    @staticmethod
+    def _symmray_structural_zero_cutoff(p, cutoff, cutoff_mode):
+        """Turn an exact native split into exact-zero pruning.
+
+        Symmray deliberately keeps every singular direction when
+        ``cutoff == 0``. Routed fermionic swaps can consequently retain
+        structural zero sectors whose duplicate like-dual dummy modes are not
+        valid inputs to a later partial environment contraction. The smallest
+        positive value representable by the block's real dtype, interpreted
+        as an absolute cutoff, removes only exact zeros: Symmray keeps values
+        greater than or equal to the cutoff, so every representable nonzero
+        singular value is retained. No tensor is flattened or converted.
+        """
+        cutoff = float(cutoff)
+        if cutoff != 0.0 or not p.isfermionic():
+            return cutoff, cutoff_mode
+
+        dtype_name = str(getattr(p, "dtype", "float64")).lower()
+        if "bfloat16" in dtype_name:
+            # NumPy has no portable bfloat16 scalar. bfloat16 has no
+            # subnormal range, so its smallest positive normal is exact here.
+            structural_cutoff = 1.1754943508222875e-38
+        elif "16" in dtype_name:
+            structural_cutoff = np.nextafter(
+                np.float16(0.0), np.float16(1.0)
+            ).item()
+        elif "32" in dtype_name or "complex64" in dtype_name:
+            structural_cutoff = np.nextafter(
+                np.float32(0.0), np.float32(1.0)
+            ).item()
+        elif "longdouble" in dtype_name or "float128" in dtype_name:
+            structural_cutoff = np.nextafter(
+                np.longdouble(0.0), np.longdouble(1.0)
+            ).item()
+        else:
+            structural_cutoff = np.nextafter(
+                np.float64(0.0), np.float64(1.0)
+            ).item()
+        # Preserve extended-precision scalars: coercing the smallest positive
+        # ``longdouble`` to Python's binary64 ``float`` can turn it back into
+        # zero and silently disable structural-zero pruning.
+        return structural_cutoff, "abs"
+
     def _apply_symmray_auto_swap_gate(
         self,
         p,
@@ -1518,6 +1586,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         info=None,
     ):
         """Apply a Symmray two-site gate through quimb's block-aware swaps."""
+        cutoff, cutoff_mode = self._symmray_structural_zero_cutoff(
+            p,
+            cutoff,
+            cutoff_mode,
+        )
         compress_opts = {
             "cutoff": cutoff,
             "cutoff_mode": cutoff_mode,
@@ -1532,6 +1605,61 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             **compress_opts,
         )
         return p
+
+    def _warm_start_native_fermionic_fit(
+        self,
+        p,
+        gates,
+        wheres,
+        *,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Seed a non-local fermionic FIT with a compressed native replay.
+
+        A charge-preserving long-range gate can introduce virtual charge
+        sectors on several bonds at once. Starting alternating least squares
+        from the pre-gate state can then lock a two-site sweep into its old
+        sector subspace: each overlap environment projects out the missing
+        branch before a local SVD can grow it. SymDMRG2 addresses the analogous
+        issue with sector enrichment. Here the exact target is already known,
+        so replaying the same gates through Quimb's native graded auto-swap
+        path is a deterministic, physically informed enrichment. FIT then
+        variationally refines that chi-capped trial against the uncapped
+        target. No Jordan-Wigner conversion, bosonization, or dense array is
+        involved.
+        """
+        if not (self._has_symmray_data(p) and p.isfermionic()):
+            return False
+
+        sites = tuple(site for where in wheres for site in where)
+        if max(sites) - min(sites) <= 1:
+            # The adjacent two-site effective tensor is already the complete
+            # variational problem and cannot suffer multi-bond sector locking.
+            return False
+
+        for gate, where in zip(gates, wheres):
+            if len(where) == 1:
+                self._apply_gate(
+                    p,
+                    gate,
+                    where,
+                    contract=True,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    inplace=True,
+                )
+            else:
+                self._apply_symmray_auto_swap_gate(
+                    p,
+                    gate,
+                    where,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    max_bond=self.chi,
+                    info=self.info_c,
+                )
+        return True
 
     def _build_symmray_auto_swap_target(
         self,
@@ -1800,6 +1928,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             gauges=deepcopy(self.gauges),
             track_infidelity=self.track_infidelity,
         )
+        copied._dmrg_mode_block_size = self._dmrg_mode_block_size
+        copied._dmrg_mode_alias = self._dmrg_mode_alias
         # Restore the source's tracked centre afterwards. It describes the
         # same represented state and must remain optimizer-local.
         copied.info_c = deepcopy(self.info_c)
@@ -1845,6 +1975,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def set_mode(self, mode):
         """Switch optimization mode while preserving the represented state."""
         old_mode = self.mode
+        mode_name = str(mode).strip().lower()
+        new_dmrg_alias = (
+            mode_name if mode_name in self._DMRG_MODE_ALIASES else None
+        )
+        new_dmrg_block_size = self._dmrg_alias_block_size(mode)
         new_mode = self._normalize_mode(mode)
         if new_mode == "exact" and self._persistent_layout_plan is not None:
             raise ValueError(
@@ -1877,6 +2012,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # TensorNetwork's state.
             self.info_c = {}
         self.mode = new_mode
+        self._dmrg_mode_alias = new_dmrg_alias
+        self._dmrg_mode_block_size = new_dmrg_block_size
         if self.mode == "su":
             self.info_c = {}
             self.p_ungauged = None
@@ -2540,10 +2677,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_rtol=1.0e-8,
         fit_patience=2,
         fit_block_size=2,
+        fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         fit_layer_size=None,
         fit_max_span="auto",
-        fit_three_site_sweeps=1,
+        fit_three_site_sweeps=_DEPRECATED_OPTION,
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
@@ -2562,7 +2700,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Inner iterations for DMRG local fits. In ``dmrg`` and ``mix``
             modes this is the maximum number of sweeps when adaptive FIT
             stopping is enabled; pass ``fit_rtol=None`` for fixed
-            iterations. Ignored by ``mpo``/``swap``/``svd``/``exact``.
+            iterations. Adaptive rank-growing windows require at least two
+            sweeps (except the adjacent two-site exact fast path). Ignored by
+            ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
             Show per-mode progress bars.
         cutoff : float | {"auto"}, default=1e-12
@@ -2571,7 +2711,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``.
-        mode : {"fit", "dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         k_2q_batch : int, default=1
@@ -2651,12 +2791,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``n_iter``.
         fit_rtol : {"auto"} | float | None, default=1e-8
             Relative tolerance for DMRG FIT early stopping. The default
-            ``1e-8`` is suitable for the ordinary high-precision MPS path.
-            ``"auto"`` selects a dtype-aware tolerance explicitly; ``None``
-            disables early stopping and restores fixed ``n_iter`` behavior.
+            ``1e-8`` uses relative change in the retained local Frobenius norm
+            as a cheap convergence proxy, not a direct overlap or literal
+            infidelity. ``"auto"`` selects a dtype-aware tolerance explicitly;
+            ``None`` disables early stopping and restores fixed ``n_iter``
+            behavior.
         fit_patience : int, default=2
             Consecutive converged FIT sweeps required before stopping early in
-            ``dmrg`` or ``mix`` mode.
+            ``dmrg`` or ``mix`` mode. Rank-adaptive DMRG still performs its
+            minimum adaptive warm-up before this criterion can stop a run.
         fit_block_size : {1, 2, 3}, default=2
             Number of neighboring MPS tensors optimized by each FIT update.
             Two-site FIT is recommended: it forms both physical legs and the
@@ -2668,6 +2811,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             two sites, it automatically falls back to the two-site update.
             Two- and three-site FIT never pre-expand the MPS; only bonds
             visited by their native splits can grow.
+        fit_adaptive_sweeps : int, default=2
+            Minimum number of initial two- or three-site sweeps used to adapt
+            the active bond spaces. Rank-adaptive DMRG continues block sweeps
+            until every active bond reaches its physical ceiling; rank
+            stagnation never triggers the transition. If a ceiling is not
+            reached, the block phase uses all requested sweeps. Remaining
+            sweeps use fixed-rank one-site FIT. The value is clipped to
+            ``n_iter`` and ignored for ``fit_block_size=1``. For
+            ``mode="dmrg2"`` it sets the required two-site warm-up length;
+            the default is two sweeps.
         fit_sweep_sequence : str, default="RL"
             Cyclic FIT sweep directions. ``"R"`` is left-to-right, ``"L"``
             is right-to-left, and ``"RL"`` alternates. Alternating sweeps avoid
@@ -2682,10 +2835,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             keeps ordinary local layers together while splitting disjoint
             gates before they create an unnecessarily wide active window.
             ``None`` restores unrestricted gate-count batching.
-        fit_three_site_sweeps : int, default=1
-            For ``fit_block_size=3``, number of initial three-site sweeps.
-            Remaining sweeps use one-site refinement. Values of one or two
-            are recommended.
+        fit_three_site_sweeps : int, deprecated
+            Compatibility alias for ``fit_adaptive_sweeps``. New code should
+            use the common adaptive-sweep control.
         target_cutoff : float, default=0.0
             Cutoff used only while constructing the pre-FIT gate target.
             Keeping this at zero separates exact target construction from the
@@ -2898,6 +3050,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             legacy_value=fit_stabilize_unitary,
         )
         if self.mode in {"dmrg", "mix"}:
+            if self._dmrg_mode_block_size is not None:
+                # A named DMRG mode is an explicit block-size choice. Use the
+                # generic ``mode='dmrg'`` spelling when custom per-run block
+                # sizes are needed.
+                alias_block_size = (
+                    2 if self._dmrg_mode_block_size == 1
+                    else self._dmrg_mode_block_size
+                )
+                if (
+                    isinstance(fit_block_size, Integral)
+                    and int(fit_block_size)
+                    not in {1, 2, alias_block_size}
+                ):
+                    raise ValueError(
+                        f"mode='dmrg{self._dmrg_mode_block_size}' fixes "
+                        "fit_block_size; use mode='dmrg' for a custom value."
+                    )
+                fit_block_size = alias_block_size
             if self.mode == "mix" and non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
             if not isinstance(n_iter, Integral) or int(n_iter) < 1:
@@ -2926,16 +3096,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ):
                 raise ValueError("fit_block_size must be 1, 2, or 3.")
             fit_block_size = int(fit_block_size)
+            fit_adaptive_sweeps = self._resolve_legacy_fit_option(
+                canonical_name="fit_adaptive_sweeps",
+                canonical_value=fit_adaptive_sweeps,
+                canonical_default=2,
+                legacy_name="fit_three_site_sweeps",
+                legacy_value=fit_three_site_sweeps,
+            )
             if (
-                not isinstance(fit_three_site_sweeps, Integral)
-                or int(fit_three_site_sweeps) < 1
+                not isinstance(fit_adaptive_sweeps, Integral)
+                or int(fit_adaptive_sweeps) < 1
             ):
-                raise ValueError("fit_three_site_sweeps must be a positive integer.")
-            if fit_block_size != 3 and int(fit_three_site_sweeps) != 1:
-                raise ValueError(
-                    "fit_three_site_sweeps is only configurable when "
-                    "fit_block_size=3."
-                )
+                raise ValueError("fit_adaptive_sweeps must be a positive integer.")
+            fit_adaptive_sweeps = min(int(fit_adaptive_sweeps), int(n_iter))
             fit_sweep_sequence = FIT._validate_sweep_sequence(
                 fit_sweep_sequence
             )
@@ -2999,9 +3172,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_patience=int(fit_patience),
             mix_sticky_nonfinite=bool(mix_sticky_nonfinite),
             fit_block_size=fit_block_size,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_sweep_sequence=fit_sweep_sequence,
             fit_max_span=fit_max_span,
-            fit_three_site_sweeps=int(fit_three_site_sweeps),
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
@@ -3177,9 +3350,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_patience=2,
         mix_sticky_nonfinite=True,
         fit_block_size=2,
+        fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         fit_max_span="auto",
-        fit_three_site_sweeps=1,
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
@@ -3226,9 +3399,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_patience=fit_patience,
                 fit_finite_check=True,
                 fit_block_size=fit_block_size,
+                fit_adaptive_sweeps=fit_adaptive_sweeps,
                 fit_sweep_sequence=fit_sweep_sequence,
                 fit_max_span=fit_max_span,
-                fit_three_site_sweeps=fit_three_site_sweeps,
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
@@ -3258,9 +3431,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_patience=fit_patience,
                 sticky_nonfinite=mix_sticky_nonfinite,
                 fit_block_size=fit_block_size,
+                fit_adaptive_sweeps=fit_adaptive_sweeps,
                 fit_sweep_sequence=fit_sweep_sequence,
                 fit_max_span=fit_max_span,
-                fit_three_site_sweeps=fit_three_site_sweeps,
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
@@ -4409,10 +4582,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return None
         try:
             if self._has_symmray_data(p):
-                to_dense = getattr(gate, "to_dense", None)
-                if not callable(to_dense):
-                    return None
-                gate = np.asarray(ar.to_numpy(to_dense()))
+                # Keep the complete Symmray path native, including optional
+                # non-unitary infidelity diagnostics. The caller will build a
+                # block-sparse target and measure its norm instead of
+                # flattening even this comparatively small gate.
+                return None
             shape = tuple(int(dim) for dim in gate.shape)
             if len(shape) != 2:
                 dims = self._infer_gate_dims(gate, where)
@@ -4905,6 +5079,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         fit_block_size=2,
+        fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
@@ -4928,6 +5103,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_patience=fit_patience,
             fit_finite_check=True,
             fit_block_size=fit_block_size,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_sweep_sequence=fit_sweep_sequence,
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
@@ -4951,8 +5127,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         fit_block_size=2,
+        fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
-        fit_three_site_sweeps=1,
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
@@ -4975,8 +5151,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_patience=fit_patience,
             fit_finite_check=True,
             fit_block_size=fit_block_size,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_sweep_sequence=fit_sweep_sequence,
-            fit_three_site_sweeps=fit_three_site_sweeps,
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
@@ -5388,8 +5564,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode="rsum2",
         submpo_method="direct",
         fit_block_size=2,
+        fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
-        fit_three_site_sweeps=1,
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
@@ -5589,8 +5765,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                         fit_block_size=fit_block_size,
+                        fit_adaptive_sweeps=fit_adaptive_sweeps,
                         fit_sweep_sequence=fit_sweep_sequence,
-                        fit_three_site_sweeps=fit_three_site_sweeps,
                         target_cutoff=target_cutoff,
                         fit_target_strategy=fit_target_strategy,
                         fit_single_pair_fast_path=fit_single_pair_fast_path,
@@ -5800,9 +5976,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_patience=1,
         fit_finite_check=None,
         fit_block_size=2,
+        fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         fit_max_span=None,
-        fit_three_site_sweeps=1,
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
@@ -5822,6 +5998,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 if self._has_symmray_data(self.p) or self.p.isfermionic()
                 else "layered"
             )
+
+        # ``dmrg1`` is the adaptive two-site-to-one-site schedule. ``dmrg2``
+        # performs its required two-site warm-up for exactly the configured
+        # minimum (two by default), then uses one-site refinement. The generic
+        # ``dmrg`` mode and ``dmrg3`` retain their rank-adaptive schedules.
+        adaptive_rank_schedule = self._dmrg_mode_alias != "dmrg2"
+        adaptive_sweeps = int(fit_adaptive_sweeps)
 
         self._last_dmrg_fit_diagnostics = None
         p = self.p
@@ -5900,6 +6083,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode,
                         target_strategy=fit_target_strategy,
                     )
+                    native_fermionic_warm_start = self._timed_call(
+                        "dmrg.native_warm_start",
+                        self._warm_start_native_fermionic_fit,
+                        p,
+                        (gate,),
+                        (where,),
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
+                    active_adaptive_sweeps = adaptive_sweeps
+                    active_adaptive_rank_schedule = adaptive_rank_schedule
                     if self.track_infidelity and not track_unitary_norm:
                         target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
@@ -5930,7 +6124,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             single_pair_fast_path=fit_single_pair_fast_path,
-                            three_site_sweeps=fit_three_site_sweeps,
+                            adaptive_block_sweeps=active_adaptive_sweeps,
+                            adaptive_until_rank=active_adaptive_rank_schedule,
+                            final_one_site_sweeps=0,
                             collect_split_diagnostics=False,
                         )
                     finally:
@@ -5941,6 +6137,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "relative_change": fit.last_relative_change,
                             "center_site": fit.final_center_site,
                             "block_size": int(active_fit_block_size),
+                            "adaptive_sweeps": int(fit.adaptive_sweeps_run),
+                            "one_site_refinement_sweeps": int(
+                                fit.one_site_sweeps_run
+                            ),
+                            "native_fermionic_warm_start": bool(
+                                native_fermionic_warm_start
+                            ),
                             "target_strategy": fit_target_strategy,
                         }
 
@@ -6021,6 +6224,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode,
                         target_strategy=fit_target_strategy,
                     )
+                    native_fermionic_warm_start = self._timed_call(
+                        "dmrg.native_warm_start",
+                        self._warm_start_native_fermionic_fit,
+                        p,
+                        batch_G,
+                        batch_where,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
+                    active_adaptive_sweeps = adaptive_sweeps
+                    active_adaptive_rank_schedule = adaptive_rank_schedule
                     if self.track_infidelity and not track_unitary_norm:
                         target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
@@ -6048,7 +6262,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             single_pair_fast_path=fit_single_pair_fast_path,
-                            three_site_sweeps=fit_three_site_sweeps,
+                            adaptive_block_sweeps=active_adaptive_sweeps,
+                            adaptive_until_rank=active_adaptive_rank_schedule,
+                            final_one_site_sweeps=0,
                             collect_split_diagnostics=False,
                         )
                     finally:
@@ -6059,6 +6275,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "relative_change": fit.last_relative_change,
                             "center_site": fit.final_center_site,
                             "block_size": int(active_fit_block_size),
+                            "adaptive_sweeps": int(fit.adaptive_sweeps_run),
+                            "one_site_refinement_sweeps": int(
+                                fit.one_site_sweeps_run
+                            ),
+                            "native_fermionic_warm_start": bool(
+                                native_fermionic_warm_start
+                            ),
                             "target_strategy": fit_target_strategy,
                         }
 
