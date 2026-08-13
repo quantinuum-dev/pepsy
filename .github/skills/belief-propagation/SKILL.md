@@ -182,13 +182,17 @@ backends use Quimb's public autodiff fitter. Choose `solver="qr"` for an
 explicit PSD weighted least-squares solve, or `solver="normal"` only when a
 materially indefinite diagnostic metric requires the normal-equation fallback.
 A positive `regularization` selects the QR path automatically because native
-Quimb ALS does not apply Pepsy's relative Tikhonov term.
+Quimb ALS does not apply Pepsy's relative Tikhonov term. Native Symmray
+reduced compression uses a separate graded, charge-preserving SVD adapter
+through `solver="auto"` or `solver="quimb"`; do not request dense QR or
+autodiff refinement for that route, since flattening charge sectors can corrupt
+fermionic signs.
 
 The tensor-shaped path stays in the input Quimb/Autoray backend (NumPy,
-Torch, JAX, or CuPy when the requested Quimb operation supports it); only
-scalar diagnostics are converted to Python values. Native block-sparse
-Symmray tensors are rejected by this dense reduced-compression path until a
-graded adapter is available. The shared policy implementation is in
+Torch, JAX, CuPy, or native Symmray when the requested Quimb operation
+supports it); only scalar diagnostics are converted to Python values. Native
+block-sparse Symmray compression stays native through the graded SVD adapter
+described above. The shared policy implementation is in
 [`bp/_compression_utils.py`](../../../src/pepsy/bp/_compression_utils.py) and
 the backend helpers are in
 [`bp/_backend.py`](../../../src/pepsy/bp/_backend.py). Regression coverage is

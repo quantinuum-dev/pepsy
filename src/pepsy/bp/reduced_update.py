@@ -11,7 +11,7 @@ solve before constructing the local environment.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -45,10 +45,14 @@ from ._compression_utils import (
     contract_many_with_preflight,
     contract_with_preflight,
     cost_check_requested,
+    ContractionPlanCache,
     prepare_working_network,
     resolve_d2bp_boundaries,
     validate_cost_options,
 )
+from ._symmray import align_message_to_bond as _align_message_to_bond
+from ._symmray import from_blocks_compatible as _from_blocks_compatible
+from ._symmray import is_symmray_array
 
 __all__ = [
     "ExactReducedUpdateProblem",
@@ -57,6 +61,7 @@ __all__ = [
     "LoopClusterTerm",
     "ReducedALSSolution",
     "ReducedBondPair",
+    "ReducedLoopClusterCache",
     "ReducedLoopClusterCompressionResult",
     "ReducedUpdateProblem",
     "SUClusterReducedUpdateProblem",
@@ -123,6 +128,37 @@ def _replace_tensor(tn, tid, tensor) -> None:
 def _project_boundary_message(message, *, psd_floor: float = 0.0):
     """Hermitian/PSD-project one dense D2 boundary message."""
     message = 0.5 * (message + _dag(message))
+    if is_symmray_array(message):
+        blocks = {}
+        for sector, block in message.blocks.items():
+            if len(sector) != 2 or sector[0] != sector[1]:
+                raise ValueError(
+                    "native D2BP boundary messages must be charge-preserving"
+                )
+            block = 0.5 * (block + _dag(block))
+            eigenvalues, eigenvectors = ar.do("linalg.eigh", block)
+            scale = (
+                max(
+                    1.0,
+                    _scalar_float(ar.do("max", _backend_abs(eigenvalues))),
+                )
+                if eigenvalues.shape[0]
+                else 1.0
+            )
+            floor = float(psd_floor) * scale
+            projected = ar.do(
+                "maximum",
+                eigenvalues,
+                _backend_array(floor, like=eigenvalues),
+            )
+            blocks[sector] = (eigenvectors * projected) @ _dag(eigenvectors)
+        return _from_blocks_compatible(
+            type(message),
+            blocks,
+            duals=message.indices,
+            charge=getattr(message, "charge", None),
+            symmetry=getattr(message, "symmetry", None),
+        )
     eigenvalues, eigenvectors = ar.do("linalg.eigh", message)
     scale = (
         max(1.0, _scalar_float(ar.do("max", _backend_abs(eigenvalues))))
@@ -195,6 +231,12 @@ def _open_environment_tensor(pair: "ReducedBondPair", data):
 def _hermitian_open_environment(pair: "ReducedBondPair", environment):
     """Hermitian-symmetrize an open environment without adding physical legs."""
     data = _open_environment_data(environment)
+    if is_symmray_array(data):
+        data = 0.5 * (
+            data
+            + _transpose(_conj(data), (2, 3, 0, 1))
+        )
+        return _open_environment_tensor(pair, data)
     left_dim, _, _, right_dim = pair.theta_shape
     matrix = _reshape(
         _transpose(data, (2, 3, 0, 1)),
@@ -356,13 +398,319 @@ class _ReducedUpdateProblemMixin:
     def cost(self, theta) -> float:
         """Return the environment-weighted squared target error."""
         if self.metric is None or isinstance(self.metric, _LazyReducedMetric):
-            delta = _native(theta) - self.target
+            theta = _native(theta)
+            if is_symmray_array(theta):
+                theta = theta.copy_with(indices=self.target.indices)
+                theta.fill_missing_blocks()
+            delta = theta - self.target
             return _open_environment_quadratic(self.pair, self.environment, delta)
         delta = _native(theta).reshape(-1) - self.target.reshape(-1)
         metric = _native(self.metric)
         return _scalar_float(
             _real(_einsum("i,ij,j->", _conj(delta), metric, delta))
         )
+
+
+@dataclass
+class ReducedLoopClusterCache:
+    """Cache Quimb loop geometry for one reduced active bond.
+
+    The generalized-loop search depends only on the tensor topology and the
+    selected active bond, not on tensor values, BP messages, or the gate. A
+    cutoff sweep such as ``0, 4, 6, 8, 10`` would otherwise rerun Quimb's
+    breadth-first region search from the active pair for every cutoff. This
+    cache keeps the transformed loop network, reuses a previously generated
+    larger cutoff for smaller cutoffs, and caches the associated
+    inclusion-exclusion region counts.
+
+    For an increasing cutoff sweep, call :meth:`precompute` once at the
+    largest desired cutoff before building the individual environments. The
+    geometry still comes from Quimb's public ``gen_gloops`` and
+    ``gen_region_counts`` APIs; this class only reuses their topology-only
+    results.
+    """
+
+    loops_by_max_size: dict[int, tuple[frozenset[Any], ...]] = field(
+        default_factory=dict
+    )
+    counted_regions: dict[
+        tuple[frozenset[frozenset[Any]], bool],
+        tuple[tuple[frozenset[Any], int], ...],
+    ] = field(default_factory=dict)
+    _topology_signature: Any = field(default=None, init=False, repr=False)
+    _loop_tn: Any = field(default=None, init=False, repr=False)
+    _all_loops: tuple[frozenset[Any], ...] = field(
+        default_factory=tuple,
+        init=False,
+        repr=False,
+    )
+    _generated_max_size: int = field(default=-1, init=False, repr=False)
+
+    @staticmethod
+    def _signature(pair: "ReducedBondPair"):
+        """Return the topology and active-bond identity for ``pair``."""
+        return (
+            frozenset(pair.tn.tensor_map),
+            frozenset(
+                (index, frozenset(tids))
+                for index, tids in pair.tn.ind_map.items()
+                if len(tids) > 1
+            ),
+            pair.left_tid,
+            pair.right_tid,
+            pair.bond_ind,
+        )
+
+    def _check_pair(self, pair: "ReducedBondPair") -> None:
+        """Prepare the active-bond loop network and reject mismatched pairs."""
+        signature = self._signature(pair)
+        if self._topology_signature is None:
+            import quimb.tensor as qtn
+
+            loop_tn = pair.tn.copy()
+            loop_tn.tensor_map[pair.right_tid].reindex_({
+                pair.bond_ind: qtn.rand_uuid(),
+            })
+            self._topology_signature = signature
+            self._loop_tn = loop_tn
+        elif signature != self._topology_signature:
+            raise ValueError(
+                "ReducedLoopClusterCache belongs to a different tensor-network "
+                "topology or active bond; create a fresh cache"
+            )
+
+    @property
+    def generated_max_size(self) -> int:
+        """Largest generalized-loop cutoff generated so far."""
+        return self._generated_max_size
+
+    @property
+    def raw_loop_count(self) -> int:
+        """Number of unique raw Quimb loop regions currently cached."""
+        return len(self._all_loops)
+
+    def clear(self) -> None:
+        """Clear cached topology, loop regions, and counting numbers."""
+        self.loops_by_max_size.clear()
+        self.counted_regions.clear()
+        self._topology_signature = None
+        self._loop_tn = None
+        self._all_loops = ()
+        self._generated_max_size = -1
+
+    def loops_for(
+        self,
+        pair: "ReducedBondPair",
+        max_loop_size: int,
+    ) -> tuple[frozenset[Any], ...]:
+        """Return all cached Quimb loop regions up to ``max_loop_size``."""
+        if not isinstance(max_loop_size, (int, np.integer)) or max_loop_size < 0:
+            raise ValueError("max_loop_size must be a nonnegative integer")
+        max_loop_size = int(max_loop_size)
+        self._check_pair(pair)
+        if max_loop_size == 0:
+            return ()
+
+        if max_loop_size > self._generated_max_size:
+            loops = tuple(
+                frozenset(loop)
+                for loop in self._loop_tn.gen_gloops(
+                    max_size=max_loop_size,
+                    tids=(pair.left_tid, pair.right_tid),
+                    grow_from="alldangle",
+                )
+            )
+            self._all_loops = tuple(
+                sorted(set(loops), key=_region_sort_key)
+            )
+            self._generated_max_size = max_loop_size
+
+        try:
+            return self.loops_by_max_size[max_loop_size]
+        except KeyError:
+            loops = tuple(
+                loop
+                for loop in self._all_loops
+                if len(loop) <= max_loop_size
+            )
+            self.loops_by_max_size[max_loop_size] = loops
+            return loops
+
+    def precompute(
+        self,
+        pair: "ReducedBondPair",
+        max_loop_size: int,
+    ) -> tuple[frozenset[Any], ...]:
+        """Generate and retain geometry through one largest desired cutoff."""
+        return self.loops_for(pair, max_loop_size)
+
+    def regions_for(
+        self,
+        pair: "ReducedBondPair",
+        *,
+        max_loop_size: int,
+        base_radius: int,
+        include_full_system: bool | None,
+        autocomplete: bool,
+        max_cluster_size: int | None = None,
+        tree_reduction: bool = True,
+    ):
+        """Return counted active-anchored regions and raw loop regions."""
+        from quimb.tensor.belief_propagation.regions import gen_region_counts
+
+        anchor = frozenset(
+            {pair.left_tid, pair.right_tid, *pair._cluster_tids(base_radius)}
+        )
+        if max_cluster_size is not None:
+            if not isinstance(max_cluster_size, (int, np.integer)):
+                raise ValueError("max_cluster_size must be a nonnegative integer")
+            max_cluster_size = int(max_cluster_size)
+            if max_cluster_size < len(anchor):
+                raise ValueError(
+                    "max_cluster_size cannot be smaller than the base cluster "
+                    f"size {len(anchor)}"
+                )
+        known_tids = frozenset(pair.tn.tensor_map)
+        regions = {anchor}
+
+        if include_full_system is None:
+            include_full_system = (
+                max_loop_size >= len(known_tids)
+                if max_cluster_size is None
+                else max_cluster_size >= len(known_tids)
+            )
+
+        # Once the paper-facing cutoff covers every tensor, the inclusion-
+        # exclusion sum contains the full-system region with unit weight and
+        # all nested regions cancel. Contracting that one open full-system
+        # region directly is algebraically identical, and avoids asking
+        # ``gen_gloops`` to enumerate every possible loop on larger lattices.
+        # Keep this shortcut restricted to the non-reduced path: tree
+        # reduction is an approximation for intermediate regions and should
+        # not silently change the full-system endpoint.
+        if (
+            include_full_system
+            and not tree_reduction
+            and max_cluster_size is not None
+            and max_cluster_size >= len(known_tids)
+        ):
+            return ((known_tids, 1),), ()
+
+        loop_cutoff = (
+            max_loop_size if max_cluster_size is None else max_cluster_size
+        )
+        loop_regions = self.loops_for(pair, loop_cutoff)
+        if max_cluster_size is not None:
+            loop_regions = tuple(
+                loop
+                for loop in loop_regions
+                if len(anchor | loop) <= max_cluster_size
+            )
+        for loop in loop_regions:
+            unknown_tids = loop.difference(known_tids)
+            if unknown_tids:
+                raise RuntimeError(
+                    "quimb generated a loop region with unknown tensor ids: "
+                    f"{unknown_tids!r}"
+                )
+            region = frozenset(anchor | loop)
+            if region != anchor:
+                regions.add(region)
+
+        if include_full_system:
+            regions.add(known_tids)
+
+        region_key = (frozenset(regions), bool(autocomplete))
+        try:
+            region_counts = self.counted_regions[region_key]
+        except KeyError:
+            region_counts = tuple(
+                sorted(
+                    gen_region_counts(
+                        sorted(regions, key=_region_sort_key),
+                        autocomplete=autocomplete,
+                    ),
+                    key=lambda item: _region_sort_key(item[0]),
+                )
+            )
+            self.counted_regions[region_key] = region_counts
+
+        if tree_reduction:
+            reduced_counts: dict[frozenset[Any], int] = {}
+            for region, count in region_counts:
+                reduced = _reduce_tree_like_region(
+                    pair,
+                    region,
+                    protected_tids=anchor,
+                )
+                reduced_counts[reduced] = reduced_counts.get(reduced, 0) + int(
+                    count
+                )
+            region_counts = tuple(
+                sorted(
+                    (
+                        (region, count)
+                        for region, count in reduced_counts.items()
+                        if count
+                    ),
+                    key=lambda item: _region_sort_key(item[0]),
+                )
+            )
+
+        return region_counts, tuple(
+            sorted(
+                {
+                    loop
+                    for loop in loop_regions
+                    if frozenset(anchor | loop) != anchor
+                },
+                key=_region_sort_key,
+            )
+        )
+
+
+def _reduce_tree_like_region(
+    pair: "ReducedBondPair",
+    region,
+    *,
+    protected_tids: frozenset[Any],
+) -> frozenset[Any]:
+    """Prune non-target dangling tensors from a counted region.
+
+    ``gen_gloops`` already generates 2-core generalized loops. Intersection
+    closure can still create tree-like appendages, which reduce to BP boundary
+    messages at a fixed point. The active/base support remains protected.
+    """
+    remaining = set(region)
+    protected_tids = set(protected_tids)
+    degree = {tid: 0 for tid in remaining}
+    neighbors = {tid: set() for tid in remaining}
+    for index, tids in pair.tn.ind_map.items():
+        if index == pair.bond_ind or len(tids) != 2:
+            continue
+        left, right = tuple(tids)
+        if left in remaining and right in remaining:
+            neighbors[left].add(right)
+            neighbors[right].add(left)
+            degree[left] += 1
+            degree[right] += 1
+
+    queue = deque(
+        tid
+        for tid in remaining
+        if tid not in protected_tids and degree[tid] < 2
+    )
+    while queue:
+        tid = queue.popleft()
+        if tid not in remaining or tid in protected_tids:
+            continue
+        remaining.remove(tid)
+        for neighbor in neighbors[tid]:
+            if neighbor in remaining:
+                degree[neighbor] -= 1
+                if neighbor not in protected_tids and degree[neighbor] < 2:
+                    queue.append(neighbor)
+    return frozenset(remaining)
 
 
 @dataclass
@@ -403,6 +751,10 @@ class ReducedBondPair:
     su_gauges: dict[str, Any]
     boundary_messages: dict[tuple[str, Any], Any] | None
     bp_info: dict[str, Any] | None = None
+    loop_cache: ReducedLoopClusterCache = field(
+        default_factory=ReducedLoopClusterCache,
+        repr=False,
+    )
 
     @property
     def bond_dimension(self) -> int:
@@ -573,7 +925,7 @@ class ReducedBondPair:
             )
         )
 
-    def _su_boundary_message(self, index: str):
+    def _su_boundary_message(self, index: str, inside_tid):
         """Return the unnormalized two-norm SU closure on one cut bond."""
         try:
             gauge = self.su_gauges[index]
@@ -582,6 +934,16 @@ class ReducedBondPair:
                 "SU-boundary cluster needs a stored gauge for each cut "
                 f"virtual bond; missing gauge for {index!r}"
             ) from exc
+
+        if is_symmray_array(gauge) and hasattr(gauge, "blocks"):
+            from .gauges import _d2bp_diagonal_message
+
+            return _d2bp_diagonal_message(
+                self.tn,
+                index,
+                inside_tid,
+                gauge,
+            )
 
         gauge = _native(gauge)
         if gauge.ndim != 1 or gauge.shape != (self.tn.ind_size(index),):
@@ -622,7 +984,7 @@ class ReducedBondPair:
         that tensor.
         """
         if self.boundary_messages is None:
-            return self._su_boundary_message(index)
+            return self._su_boundary_message(index, inside_tid)
 
         key = (index, inside_tid)
         try:
@@ -676,7 +1038,7 @@ class ReducedBondPair:
             )
 
         inner_inds = set(self.tn.inner_inds())
-        dual_inds = {ix: qtn.rand_uuid() for ix in inner_inds}
+        dual_inds = _stable_dual_index_map(self.tn, inner_inds)
         tensors = [self.q_left.copy(), self.q_right.copy()]
         tensors.extend(self.tn.tensor_map[tid].copy() for tid in cluster_tids)
 
@@ -786,7 +1148,7 @@ class ReducedBondPair:
         import quimb.tensor as qtn
 
         inner_inds = set(self.tn.inner_inds())
-        dual_inds = {ix: qtn.rand_uuid() for ix in inner_inds}
+        dual_inds = _stable_dual_index_map(self.tn, inner_inds)
         tensors = [
             self.tn.tensor_map[tid].copy()
             for tid in self.tn.tensor_map
@@ -906,7 +1268,11 @@ class LoopClusterReducedUpdateProblem(_ReducedUpdateProblemMixin):
     Every counted region includes the active QR/LQ outer factors, so each
     contraction returns the same open-leg operator ``N_C``. These operators are
     combined with inclusion-exclusion counting numbers,
-    ``N_red ~= sum_C c_C N_C``. Boundaries are closed with stored two-norm SU
+    ``N_red ~= sum_C c_C N_C``. This is an operator-valued approximation
+    implemented by Pepsy; it is not implied by the scalar product formula for
+    cluster observables. A Hessian derived from that scalar formula would also
+    contain derivatives of cluster weights and cross-gradient terms. Boundaries
+    are closed with stored two-norm SU
     messages ``diag(lambda)`` or supplied directed D2BP matrices; no D2BP
     solve is run. The counted open environments are combined before the
     physical identity factors are introduced, and the dense ``N_red`` view is
@@ -928,6 +1294,9 @@ class LoopClusterReducedUpdateProblem(_ReducedUpdateProblemMixin):
     psd_projected: bool
     raw_min_eigenvalue: float
     clipped_eigenvalues: int
+    max_cluster_size: int | None = None
+    tree_reduction: bool = True
+    combination: str = "additive"
     contraction_costs: tuple[dict[str, float], ...] = ()
     contraction_cost: dict[str, float] | None = None
 
@@ -1012,6 +1381,7 @@ def prepare_reduced_bond_pair(
     bp_opts: dict[str, Any] | None = None,
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
+    bp_convergence: str = "ignore",
     smudge: float = 0.0,
 ) -> ReducedBondPair:
     """Prepare an adjacent physical PEPS or PEPO bond for a reduced update.
@@ -1041,6 +1411,9 @@ def prepare_reduced_bond_pair(
         to leave boundary data unresolved for a system-covering cluster.
     bp_runner, bp_opts
         Fresh-BP runner and options, forwarded to Pepsy's plain or relay D2BP.
+    bp_convergence
+        Policy for an unfinished fresh BP solve: ``"ignore"``, ``"warn"``,
+        or ``"raise"``.
     message_psd_project
         Whether to Hermitian/PSD-project supplied D2BP boundary messages.
     message_psd_floor
@@ -1089,6 +1462,7 @@ def prepare_reduced_bond_pair(
         run_bp=run_bp,
         bp_runner=bp_runner,
         bp_opts=bp_opts,
+        bp_convergence=bp_convergence,
     )
 
     left_tid = _single_tid(work, site_left)
@@ -1124,7 +1498,11 @@ def prepare_reduced_bond_pair(
     if len(physical_left_original_inds) == 1:
         physical_left_ind = physical_left_original_inds[0]
     else:
-        physical_left_ind = qtn.rand_uuid()
+        physical_left_ind = _stable_private_index(
+            work,
+            "fused_physical_left",
+            bond_ind,
+        )
         left_tensor = left_tensor.fuse(
             {physical_left_ind: physical_left_original_inds}
         )
@@ -1133,7 +1511,11 @@ def prepare_reduced_bond_pair(
     if len(physical_right_original_inds) == 1:
         physical_right_ind = physical_right_original_inds[0]
     else:
-        physical_right_ind = qtn.rand_uuid()
+        physical_right_ind = _stable_private_index(
+            work,
+            "fused_physical_right",
+            bond_ind,
+        )
         right_tensor = right_tensor.fuse(
             {physical_right_ind: physical_right_original_inds}
         )
@@ -1155,8 +1537,29 @@ def prepare_reduced_bond_pair(
             "each site"
         )
 
-    reduced_left_ind = qtn.rand_uuid()
-    reduced_right_ind = qtn.rand_uuid()
+    reduced_left_ind = _stable_private_index(work, "reduced_left", bond_ind)
+    reduced_right_ind = _stable_private_index(
+        work,
+        "reduced_right",
+        bond_ind,
+        reserved=(reduced_left_ind,),
+    )
+    reduced_left_bra_ind = _stable_private_index(
+        work,
+        "reduced_left_bra",
+        bond_ind,
+        reserved=(reduced_left_ind, reduced_right_ind),
+    )
+    reduced_right_bra_ind = _stable_private_index(
+        work,
+        "reduced_right_bra",
+        bond_ind,
+        reserved=(
+            reduced_left_ind,
+            reduced_right_ind,
+            reduced_left_bra_ind,
+        ),
+    )
     q_left, r_left = left_tensor.split(
         left_inds=left_outer,
         method="qr",
@@ -1194,6 +1597,8 @@ def prepare_reduced_bond_pair(
                 raise ValueError(
                     f"D2BP boundary message refers to unknown bond {index!r}"
                 )
+            message = _align_message_to_bond(work, index, message)
+            copied_boundary_messages[index, destination_tid] = message
             if destination_tid not in work.ind_map[index]:
                 raise ValueError(
                     "D2BP boundary message destination "
@@ -1232,8 +1637,8 @@ def prepare_reduced_bond_pair(
         physical_right_ind=physical_right_ind,
         reduced_left_ind=reduced_left_ind,
         reduced_right_ind=reduced_right_ind,
-        reduced_left_bra_ind=qtn.rand_uuid(),
-        reduced_right_bra_ind=qtn.rand_uuid(),
+        reduced_left_bra_ind=reduced_left_bra_ind,
+        reduced_right_bra_ind=reduced_right_bra_ind,
         q_left=q_left,
         r_left=r_left,
         l_right=l_right,
@@ -1263,6 +1668,14 @@ def prepare_reduced_bond_pair(
 
 def _apply_two_site_gate(theta, gate):
     """Apply a physical two-site gate to a joint reduced tensor."""
+    if gate is None:
+        return theta
+    if is_symmray_array(theta) or is_symmray_array(gate):
+        if getattr(gate, "ndim", None) != 4:
+            raise ValueError(
+                "native Symmray two-site gates must be rank-four tensors"
+            )
+        return _einsum("xyuv,auvb->axyb", gate, theta)
     d_left = theta.shape[1]
     d_right = theta.shape[2]
     gate = _native(gate)
@@ -1509,6 +1922,40 @@ def _region_sort_key(region) -> tuple[int, tuple[str, ...]]:
     return (len(region), tuple(sorted(map(repr, region))))
 
 
+def _stable_dual_index_map(tn, inner_inds):
+    """Return collision-free, topology-stable names for bra indices."""
+    used = set(tn.ind_map)
+    used.update(tn.outer_inds())
+    dual_inds = {}
+    for index in sorted(inner_inds, key=repr):
+        candidate = f"{index}__bra"
+        while candidate in used or candidate in dual_inds.values():
+            candidate = f"{candidate}_"
+        dual_inds[index] = candidate
+    return dual_inds
+
+
+def _stable_private_index(tn, stem: str, *parts, reserved=()):
+    """Return a deterministic private index name absent from ``tn``.
+
+    Reduced-pair environments are rebuilt for every gate or compression call.
+    Stable private names let :class:`ContractionPlanCache` reuse a contraction
+    tree across those fresh pair objects while the collision suffix keeps the
+    helper safe for networks that already use the private prefix.
+    """
+    used = set(tn.ind_map)
+    used.update(tn.outer_inds())
+    used.update(reserved)
+    suffix = "_".join(str(part) for part in parts)
+    base = f"__pepsy_{stem}_{suffix}" if suffix else f"__pepsy_{stem}"
+    candidate = base
+    serial = 1
+    while candidate in used:
+        candidate = f"{base}_{serial}"
+        serial += 1
+    return candidate
+
+
 def _loop_cluster_region_counts(
     pair: ReducedBondPair,
     *,
@@ -1516,6 +1963,9 @@ def _loop_cluster_region_counts(
     base_radius: int,
     include_full_system: bool | None,
     autocomplete: bool,
+    max_cluster_size: int | None = None,
+    tree_reduction: bool = True,
+    cache: ReducedLoopClusterCache | None = None,
 ):
     """Return active-anchored open-leg loop regions and counting numbers.
 
@@ -1526,66 +1976,21 @@ def _loop_cluster_region_counts(
     observable loop construction, but every target site is included in each
     generated loop cluster.
     """
-    from quimb.tensor.belief_propagation.regions import gen_region_counts
-    import quimb.tensor as qtn
-
     if not isinstance(max_loop_size, (int, np.integer)) or max_loop_size < 0:
         raise ValueError("max_loop_size must be a nonnegative integer")
     max_loop_size = int(max_loop_size)
-
-    anchor = frozenset(
-        {pair.left_tid, pair.right_tid, *pair._cluster_tids(base_radius)}
+    cache = pair.loop_cache if cache is None else cache
+    if not isinstance(cache, ReducedLoopClusterCache):
+        raise TypeError("cache must be a ReducedLoopClusterCache or None")
+    return cache.regions_for(
+        pair,
+        max_loop_size=max_loop_size,
+        base_radius=base_radius,
+        include_full_system=include_full_system,
+        autocomplete=autocomplete,
+        max_cluster_size=max_cluster_size,
+        tree_reduction=tree_reduction,
     )
-    known_tids = frozenset(pair.tn.tensor_map)
-    regions = {anchor}
-    loop_regions = []
-
-    if max_loop_size:
-        # The active virtual bond is carried by R_L and L_R, which are removed
-        # when forming the open-leg environment. Break it before finding
-        # loops, otherwise a path through the spectator tensors can be
-        # incorrectly closed by that bond and classified as an ordinary
-        # generalized loop.
-        loop_tn = pair.tn.copy()
-        loop_tn.tensor_map[pair.right_tid].reindex_({
-            pair.bond_ind: qtn.rand_uuid(),
-        })
-
-        for loop in loop_tn.gen_gloops(
-            max_size=max_loop_size,
-            tids=(pair.left_tid, pair.right_tid),
-            grow_from="alldangle",
-        ):
-            loop = frozenset(loop)
-            unknown_tids = loop.difference(known_tids)
-            if unknown_tids:
-                raise RuntimeError(
-                    "quimb generated a loop region with unknown tensor ids: "
-                    f"{unknown_tids!r}"
-                )
-
-            region = frozenset(anchor | loop)
-            if region == anchor:
-                continue
-            regions.add(region)
-            loop_regions.append(loop)
-
-    if include_full_system is None:
-        include_full_system = max_loop_size >= len(pair.tn.tensor_map)
-    if include_full_system:
-        regions.add(known_tids)
-
-    region_counts = tuple(
-        sorted(
-            gen_region_counts(
-                sorted(regions, key=_region_sort_key),
-                autocomplete=autocomplete,
-            ),
-            key=lambda item: _region_sort_key(item[0]),
-        )
-    )
-    loop_regions = tuple(sorted(set(loop_regions), key=_region_sort_key))
-    return region_counts, loop_regions
 
 
 def _psd_project_metric(metric, psd_floor: float):
@@ -1617,6 +2022,28 @@ def _psd_project_open_environment(pair, environment, psd_floor: float):
     data = _open_environment_data(environment)
     left_dim, _, _, right_dim = pair.theta_shape
     open_size = left_dim * right_dim
+    if is_symmray_array(data):
+        matrix = _reshape(
+            _transpose(data, (2, 3, 0, 1)),
+            (open_size, open_size),
+        )
+        eigenvalues, _ = ar.do("linalg.eigh", matrix)
+        eigenvalues_dense = np.asarray(
+            eigenvalues.to_dense()
+            if hasattr(eigenvalues, "to_dense")
+            else ar.to_numpy(eigenvalues)
+        )
+        raw_min = float(eigenvalues_dense.min()) if eigenvalues_dense.size else 0.0
+        scale = max(1.0, float(np.max(np.abs(eigenvalues_dense))))
+        floor = float(psd_floor) * scale
+        tolerance = 128.0 * np.finfo(float).eps * scale
+        if np.any(eigenvalues_dense < floor - tolerance):
+            raise np.linalg.LinAlgError(
+                "native Symmray reduced environment has eigenvalues below "
+                "the requested PSD floor; graded spectral clipping would "
+                "change charge sectors and is not implicit"
+            )
+        return environment, raw_min, 0
     open_metric = _reshape(
         _transpose(data, (2, 3, 0, 1)),
         (open_size, open_size),
@@ -1657,12 +2084,16 @@ def loop_cluster_reduced_update_problem(
     gate,
     *,
     max_loop_size: int = 0,
+    max_cluster_size: int | None = None,
     base_radius: int = 0,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
+    tree_reduction: bool = True,
     psd_project: bool = True,
     psd_floor: float = 0.0,
     optimize="auto-hq",
+    loop_cache: ReducedLoopClusterCache | None = None,
+    plan_cache: ContractionPlanCache | None = None,
     materialize_metric: bool = False,
     cost_check: bool = False,
     max_flops_log10: float | None = None,
@@ -1693,10 +2124,39 @@ def loop_cluster_reduced_update_problem(
     contraction trees before any regional tensor data is contracted. An
     over-budget contraction raises before measurement; ``on_budget="warn"``
     additionally emits a warning.
+
+    ``loop_cache`` optionally supplies reusable Quimb loop geometry and
+    inclusion-exclusion counts. If omitted, the cache attached to ``pair`` is
+    used automatically.
+
+    ``max_cluster_size`` is the paper-facing cutoff: it limits the total
+    augmented region size, including the base cluster. It is mutually
+    exclusive with a nonzero ``max_loop_size``. ``max_loop_size`` remains the
+    compatibility cutoff for the raw generalized-loop decoration.
+
+    ``tree_reduction`` applies the paper's BP fixed-point reduction to
+    tree-like intersection regions before contraction. The compression
+    combination is intentionally additive: a product formula is defined for
+    scalar cluster observables, not operator-valued reduced environments.
     """
     _require_bool("materialize_metric", materialize_metric)
     _require_bool("autocomplete", autocomplete)
     _require_bool("psd_project", psd_project)
+    _require_bool("tree_reduction", tree_reduction)
+    if plan_cache is not None and not isinstance(plan_cache, ContractionPlanCache):
+        raise TypeError("plan_cache must be a ContractionPlanCache or None")
+    if max_cluster_size is not None and max_loop_size:
+        raise ValueError(
+            "specify either max_loop_size or max_cluster_size, not both"
+        )
+    if max_cluster_size is not None and (
+        not isinstance(max_cluster_size, (int, np.integer))
+        or max_cluster_size < 0
+    ):
+        raise ValueError("max_cluster_size must be a nonnegative integer")
+    max_cluster_size = (
+        None if max_cluster_size is None else int(max_cluster_size)
+    )
     if include_full_system is not None:
         _require_bool("include_full_system", include_full_system)
     if not np.isfinite(psd_floor) or psd_floor < 0.0:
@@ -1721,6 +2181,9 @@ def loop_cluster_reduced_update_problem(
         base_radius=base_radius,
         include_full_system=include_full_system,
         autocomplete=autocomplete,
+        max_cluster_size=max_cluster_size,
+        tree_reduction=tree_reduction,
+        cache=loop_cache,
     )
 
     active_tids = {pair.left_tid, pair.right_tid}
@@ -1730,7 +2193,7 @@ def loop_cluster_reduced_update_problem(
         pair.theta_shape[0],
         pair.theta_shape[3],
     )
-    raw_environment_data = _zeros(open_shape, like=pair.q_left.data)
+    raw_environment_data = None
     terms = []
     networks = []
     network_meta = []
@@ -1761,14 +2224,17 @@ def loop_cluster_reduced_update_problem(
         max_peak_memory_log2=max_peak_memory_log2,
         on_budget=on_budget,
         label="loop-cluster region",
+        plan_cache=plan_cache,
     )
     for (region, count, cluster_tids, boundary_inds), environment in zip(
         network_meta,
         environments,
     ):
-        raw_environment_data = raw_environment_data + count * _open_environment_data(
-            environment
-        )
+        environment_data = _open_environment_data(environment)
+        if raw_environment_data is None:
+            raw_environment_data = count * environment_data
+        else:
+            raw_environment_data = raw_environment_data + count * environment_data
         terms.append(
             LoopClusterTerm(
                 region_tids=frozenset(region),
@@ -1778,6 +2244,8 @@ def loop_cluster_reduced_update_problem(
             )
         )
 
+    if raw_environment_data is None:
+        raw_environment_data = _zeros(open_shape, like=pair.q_left.data)
     raw_environment = _hermitian_open_environment(
         pair,
         _open_environment_tensor(pair, raw_environment_data),
@@ -1797,8 +2265,17 @@ def loop_cluster_reduced_update_problem(
                 pair.theta_shape[0] * pair.theta_shape[3],
             ),
         )
-        eigenvalues = ar.do("linalg.eigvalsh", raw_matrix)
-        raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
+        if is_symmray_array(raw_matrix):
+            eigenvalues, _ = raw_matrix.eigh()
+            eigenvalues = (
+                eigenvalues.to_dense()
+                if hasattr(eigenvalues, "to_dense")
+                else ar.to_numpy(eigenvalues)
+            )
+            raw_min = float(np.min(eigenvalues)) if eigenvalues.size else 0.0
+        else:
+            eigenvalues = ar.do("linalg.eigvalsh", raw_matrix)
+            raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
         environment = raw_environment
         clipped = 0
 
@@ -1829,6 +2306,9 @@ def loop_cluster_reduced_update_problem(
         psd_projected=bool(psd_project),
         raw_min_eigenvalue=raw_min,
         clipped_eigenvalues=clipped,
+        max_cluster_size=max_cluster_size,
+        tree_reduction=tree_reduction,
+        combination="additive",
         contraction_costs=tuple(contraction_costs),
         contraction_cost=aggregate_costs(contraction_costs),
     )
@@ -1837,6 +2317,27 @@ def loop_cluster_reduced_update_problem(
 def _svd_initial_factors(target, max_bond: int):
     """Return a rank-``max_bond`` two-factor split of a joint reduced tensor."""
     left_dim, physical_left, physical_right, right_dim = target.shape
+    if is_symmray_array(target):
+        matrix = target.reshape(
+            (left_dim * physical_left, physical_right * right_dim)
+        )
+        left, singular_values, right = matrix.svd(
+            max_bond=max_bond,
+            cutoff=0.0,
+            absorb=None,
+        )
+        roots = singular_values.sqrt()
+        left = left.multiply_diagonal(roots, axis=1).unfuse(0)
+        right = right.multiply_diagonal(roots, axis=0).unfuse(1)
+        left = left.copy_with(
+            indices=(target.indices[0], target.indices[1], left.indices[2])
+        )
+        right = right.copy_with(
+            indices=(right.indices[0], target.indices[2], target.indices[3])
+        )
+        left.fill_missing_blocks()
+        right.fill_missing_blocks()
+        return left, right
     matrix = _reshape(
         target,
         (left_dim * physical_left, physical_right * right_dim),
@@ -1857,6 +2358,32 @@ def _svd_initial_factors(target, max_bond: int):
         (rank, physical_right, right_dim),
     )
     return left, right
+
+
+def _solve_reduced_als_symmray(
+    problem,
+    *,
+    max_bond: int,
+    solver: str,
+):
+    """Run the native graded SVD compression adapter.
+
+    Quimb's dense ALS driver currently assumes NumPy-like singular-value
+    vectors and cannot update Symmray block arrays without flattening charge
+    sectors. The safe native fallback is the graded, charge-preserving SVD
+    of the reduced target. It never densifies the PEPS, retains fermionic
+    phase metadata, and reports identical initial/final objectives because no
+    dense ALS refinement was applied.
+    """
+    if solver not in {"auto", "quimb"}:
+        raise NotImplementedError(
+            "native Symmray reduced compression currently supports the "
+            "graded SVD adapter through solver='auto' or solver='quimb'; "
+            f"solver={solver!r} would require a blockwise autodiff/ALS driver"
+        )
+    left, right = _svd_initial_factors(problem.target, max_bond)
+    cost = problem.cost(_einsum("aps,sqb->apqb", left, right))
+    return ReducedALSSolution(left=left, right=right, costs=(cost, cost))
 
 
 def _metric_scale(metric) -> float:
@@ -2163,6 +2690,9 @@ def _solve_reduced_als_quimb(
 def _native_reduced_cost(environment, left, right, target):
     """Return the weighted reduced objective without extracting a scalar."""
     theta = _einsum("aps,sqb->apqb", left, right)
+    if is_symmray_array(theta):
+        theta = theta.copy_with(indices=target.indices)
+        theta.fill_missing_blocks()
     delta = theta - target
     return _real(
         _einsum(
@@ -2541,6 +3071,18 @@ def solve_reduced_als(
         raise ValueError("max_bond must be a positive integer")
     max_bond = min(max_bond, left_dim * physical_left, physical_right * right_dim)
 
+    if is_symmray_array(problem.target):
+        if regularization:
+            raise NotImplementedError(
+                "regularization is not yet available for native Symmray "
+                "reduced compression"
+            )
+        return _solve_reduced_als_symmray(
+            problem,
+            max_bond=max_bond,
+            solver=solver,
+        )
+
     # Native Quimb ALS is the stable default because it contracts the open
     # environment directly. Regularization, explicit autodiff, and indefinite
     # diagnostic metrics are the deliberate reasons to select the alternatives
@@ -2673,6 +3215,20 @@ def _valid_warm_start_gauge(tn, index: str, gauge):
     if gauge is None:
         return None
 
+    if is_symmray_array(gauge) and hasattr(gauge, "blocks"):
+        if not getattr(gauge, "ndim", 1) == 1:
+            return None
+        values = tuple(
+            np.asarray(ar.to_numpy(block)).reshape(-1)
+            for block in gauge.blocks.values()
+        )
+        if not values:
+            return None
+        values = np.concatenate(values)
+        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            return None
+        return _copy_array(gauge)
+
     gauge = _native(gauge)
     if gauge.ndim != 1 or gauge.shape != (tn.ind_size(index),):
         return None
@@ -2695,7 +3251,19 @@ def _warm_start_core_from_physical_tn(physical_tn, gauges):
         gauge = _valid_warm_start_gauge(physical_tn, index, gauges.get(index))
         if gauge is None:
             sample = next(iter(physical_tn.tensor_map.values())).data
-            gauge = _ones(physical_tn.ind_size(index), like=sample)
+            if is_symmray_array(sample):
+                # Autoray has no generic ``ones`` rule for Symmray.  Build a
+                # charge-preserving block vector in the bond's native charge
+                # layout instead of densifying the warm-start gauge.
+                from .gauges import _symmray_block_vector
+
+                gauge = _symmray_block_vector(
+                    physical_tn,
+                    index,
+                    np.ones(physical_tn.ind_size(index)),
+                )
+            else:
+                gauge = _ones(physical_tn.ind_size(index), like=sample)
         else:
             reused += 1
         initial_gauges[index] = gauge
@@ -2812,14 +3380,19 @@ def compress_reduced_loop_cluster(
     bp_opts: dict[str, Any] | None = None,
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
+    bp_convergence: str = "ignore",
     max_bond: int | None = None,
     max_distance: int = 0,
     max_loop_size: int = 0,
+    max_cluster_size: int | None = None,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
+    tree_reduction: bool = True,
     psd_project: bool = True,
     psd_floor: float = 0.0,
     optimize="auto-hq",
+    loop_cache: ReducedLoopClusterCache | None = None,
+    plan_cache: ContractionPlanCache | None = None,
     cost_check: bool = False,
     max_flops_log10: float | None = None,
     max_peak_memory_log2: float | None = None,
@@ -2851,8 +3424,9 @@ def compress_reduced_loop_cluster(
     Parameters
     ----------
     tn
-        Dense PEPS/PEPO core or physical network. ``input_mode`` makes the
-        representation explicit; native Symmray compression remains separate.
+        Dense or native Symmray PEPS/PEPO core or physical network.
+        ``input_mode`` makes the representation explicit; native Symmray uses
+        the graded SVD adapter in ``solve_reduced_als``.
     where
         Ordered neighboring site coordinates identifying the active bond.
     gauges
@@ -2866,6 +3440,9 @@ def compress_reduced_loop_cluster(
         Shared physical/SU-core and fresh-D2BP controls. With ``"auto"``,
         supplied gauges mean ``tn`` is an SU core; with no closures, fresh BP
         runs unless ``run_bp=False``.
+    bp_convergence
+        Policy for an unfinished fresh BP solve: ``"ignore"``, ``"warn"``,
+        or ``"raise"``.
     message_psd_project
         Whether to Hermitian/PSD-project supplied D2BP boundary messages.
     message_psd_floor
@@ -2875,6 +3452,19 @@ def compress_reduced_loop_cluster(
         dimension.
     max_distance
         Tensor-graph fill-in radius around the active pair.
+    max_loop_size, max_cluster_size
+        Raw generalized-loop cutoff or paper-facing total-region cutoff.
+        Specify at most one nonzero cutoff. ``max_cluster_size`` includes the
+        active/base support.
+    tree_reduction
+        Apply the fixed-point tree-like region reduction before contraction.
+    loop_cache
+        Optional reusable loop-geometry cache. When omitted, a cache is
+        created on the prepared pair; pass a cache explicitly when repeating
+        this helper for several cutoff values.
+    plan_cache
+        Optional topology-keyed Cotengra plan cache for repeated regional
+        contractions.
     cost_check, max_flops_log10, max_peak_memory_log2, on_budget
         Optional Cotengra preflight and budget controls. All loop-region trees
         are built before any region contraction.
@@ -2911,26 +3501,28 @@ def compress_reduced_loop_cluster(
         run_bp=run_bp,
         bp_runner=bp_runner,
         bp_opts=bp_opts,
+        bp_convergence=bp_convergence,
         message_psd_project=message_psd_project,
         message_psd_floor=message_psd_floor,
         smudge=smudge,
     )
-    theta = pair.theta_array()
-    identity = _eye(theta.shape[1] * theta.shape[2], like=theta)
-
     # Route even the zero-loop buffered cluster through the open-leg cluster
     # builder. This keeps the first pass inexpensive (one counted region) but
     # applies the paper's Hermitian/PSD environment safeguard consistently.
     problem = loop_cluster_reduced_update_problem(
         pair,
-        identity,
+        None,
         max_loop_size=max_loop_size,
+        max_cluster_size=max_cluster_size,
         base_radius=max_distance,
         include_full_system=include_full_system,
         autocomplete=autocomplete,
+        tree_reduction=tree_reduction,
         psd_project=psd_project,
         psd_floor=psd_floor,
         optimize=optimize,
+        loop_cache=loop_cache,
+        plan_cache=plan_cache,
         cost_check=cost_check,
         max_flops_log10=max_flops_log10,
         max_peak_memory_log2=max_peak_memory_log2,
@@ -2990,14 +3582,19 @@ def apply_reduced_loop_cluster_gate(
     bp_opts: dict[str, Any] | None = None,
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
+    bp_convergence: str = "ignore",
     max_bond: int | None = None,
     max_loop_size: int = 0,
+    max_cluster_size: int | None = None,
     base_radius: int = 0,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
+    tree_reduction: bool = True,
     psd_project: bool = True,
     psd_floor: float = 0.0,
     optimize="auto-hq",
+    loop_cache: ReducedLoopClusterCache | None = None,
+    plan_cache: ContractionPlanCache | None = None,
     cost_check: bool = False,
     max_flops_log10: float | None = None,
     max_peak_memory_log2: float | None = None,
@@ -3019,6 +3616,10 @@ def apply_reduced_loop_cluster_gate(
     into a fresh SU core/gauge representation. The re-gauging is warm-started
     without double-counting old gauges: matching positive old gauges are first
     compensated out of the reconstructed physical state.
+
+    ``loop_cache`` optionally reuses topology-only generalized-loop geometry
+    when the same active bond is updated repeatedly with different loop
+    cutoffs. It does not cache tensor contractions or boundary messages.
     """
     # Preserve the historical ``(tn, gauges, gate)`` positional form while
     # allowing the natural message-only ``(tn, gate, ...)`` form.
@@ -3046,6 +3647,7 @@ def apply_reduced_loop_cluster_gate(
         run_bp=run_bp,
         bp_runner=bp_runner,
         bp_opts=bp_opts,
+        bp_convergence=bp_convergence,
         message_psd_project=message_psd_project,
         message_psd_floor=message_psd_floor,
         smudge=smudge,
@@ -3054,12 +3656,16 @@ def apply_reduced_loop_cluster_gate(
         pair,
         gate,
         max_loop_size=max_loop_size,
+        max_cluster_size=max_cluster_size,
         base_radius=base_radius,
         include_full_system=include_full_system,
         autocomplete=autocomplete,
+        tree_reduction=tree_reduction,
         psd_project=psd_project,
         psd_floor=psd_floor,
         optimize=optimize,
+        loop_cache=loop_cache,
+        plan_cache=plan_cache,
         cost_check=cost_check,
         max_flops_log10=max_flops_log10,
         max_peak_memory_log2=max_peak_memory_log2,

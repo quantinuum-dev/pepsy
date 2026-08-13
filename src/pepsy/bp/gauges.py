@@ -13,6 +13,7 @@ import numpy as np
 from ._symmray import (
     dense_bp_tn as _dense_bp_tn,
     dense_message_tree as _dense_message_tree,
+    from_blocks_compatible as _from_blocks_compatible,
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
@@ -225,7 +226,8 @@ def _symmray_block_matrix(tn, ix, tid, matrix, *, full=False):
         blocks[(charge, charge)] = matrix[
             offset : offset + size, offset : offset + size
         ].copy()
-    return type(data).from_blocks(
+    return _from_blocks_compatible(
+        type(data),
         blocks,
         duals=(bond_index.dual, not bond_index.dual),
         phases={},
@@ -504,7 +506,8 @@ def _d2bp_diagonal_message(tn, ix, tid, gauge, *, smudge=0.0):
     # Do not copy the PEPS tensor's dummy modes: these auxiliary density
     # messages are not physical fermion legs and must have no dummy mode.
     message_cls = type(data)
-    return message_cls.from_blocks(
+    return _from_blocks_compatible(
+        message_cls,
         blocks,
         duals=(bond_index.dual, not bond_index.dual),
         phases={},

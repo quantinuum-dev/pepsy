@@ -26,9 +26,15 @@ from typing import Any
 
 from .cluster import loop_cluster_expand
 from .pne import partitioned_expand, recursive_partitioned_expand
-from .series import loop_series_expand
+from .series import (
+    loop_series_expand,
+    partial_trace_edge_loop_series_expand,
+    partial_trace_loop_cluster_expand,
+    partial_trace_loop_series_expand,
+    partial_trace_open_loop_series_expand,
+)
 
-__all__ = ["loop_expand"]
+__all__ = ["loop_expand", "rho_expand"]
 
 _EXPANSION_ALIASES = {
     "series": "series",
@@ -144,3 +150,80 @@ def loop_expand(
     if key == "pne_recursive":
         return recursive_partitioned_expand(tn, norm=norm, **options)
     return partitioned_expand(tn, norm=norm, **options)
+
+
+_RHO_EXPANSION_ALIASES = {
+    "local": "local",
+    "region": "local",
+    "series": "local",
+    "loop_series": "local",
+    "edge": "edge",
+    "edge_series": "edge",
+    "open": "open",
+    "open_edge": "open",
+    "corridor": "open",
+    "cluster": "cluster",
+    "loop_cluster": "cluster",
+}
+
+
+def rho_expand(
+    tn,
+    where,
+    cutoff=None,
+    *,
+    expansion: str = "open",
+    **options: Any,
+):
+    """Choose one of Pepsy's explicit rho loop-series constructions.
+
+    This is the common rho-facing API. ``cutoff`` has one unambiguous meaning
+    for each route:
+
+    ``expansion="local"``
+        Quimb tensor-region loop-series cutoff, delegated to
+        :func:`partial_trace_loop_series_expand`.
+    ``expansion="edge"``
+        Explicit excited-edge degree cutoff, delegated to
+        :func:`partial_trace_edge_loop_series_expand`.
+    ``expansion="open"``
+        Open paths, closed loops, and path-plus-loop terms, with ``cutoff``
+        passed as ``edge_cutoff`` to
+        :func:`partial_trace_open_loop_series_expand`.
+    ``expansion="cluster"``
+        Generalized-loop region clusters, delegated to
+        :func:`partial_trace_loop_cluster_expand`.
+
+    The dispatcher does not reinterpret one cutoff as another. Use the
+    direct functions when route-specific diagnostics, caches, or corridor
+    controls are needed.
+    """
+    try:
+        key = _RHO_EXPANSION_ALIASES[str(expansion).lower()]
+    except KeyError as exc:
+        choices = "'local', 'edge', 'open', or 'cluster'"
+        raise ValueError(
+            f"expansion must be {choices}; got {expansion!r}."
+        ) from exc
+
+    if "gloops" in options:
+        raise TypeError(
+            "pass cutoff to rho_expand; do not also pass route-specific "
+            "gloops"
+        )
+    if key == "local":
+        return partial_trace_loop_series_expand(tn, where, cutoff, **options)
+    if key == "edge":
+        return partial_trace_edge_loop_series_expand(tn, where, cutoff, **options)
+    if key == "cluster":
+        return partial_trace_loop_cluster_expand(tn, where, cutoff, **options)
+    if "edge_cutoff" in options:
+        raise TypeError(
+            "pass cutoff to rho_expand; do not also pass edge_cutoff"
+        )
+    return partial_trace_open_loop_series_expand(
+        tn,
+        where,
+        edge_cutoff=cutoff,
+        **options,
+    )

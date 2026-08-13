@@ -1,8 +1,8 @@
 """Small Autoray helpers for backend-native BP compression.
 
-The BP compression code operates on ordinary Quimb tensor data.  These
-helpers deliberately keep tensor-shaped values in their originating backend
-and only convert scalar diagnostics to Python values.
+Tensor-shaped values stay in their originating backend, including native
+Symmray block-sparse arrays. Scalar diagnostics alone are converted to Python
+values. Dense materialization remains an explicit caller choice.
 """
 
 from __future__ import annotations
@@ -18,17 +18,15 @@ def native(value):
     """Return an array-like value without converting its backend."""
     if hasattr(value, "data") and not hasattr(value, "shape"):
         value = value.data
-    if is_symmray_array(value):
-        raise TypeError(
-            "BP compression requires ordinary Quimb backend arrays; "
-            "native block-sparse tensors need a graded compression adapter"
-        )
     return value
 
 
 def copy(value):
     """Copy an array through its native Autoray backend."""
-    return ar.do("copy", native(value))
+    value = native(value)
+    if is_symmray_array(value):
+        return value.copy()
+    return ar.do("copy", value)
 
 
 def backend(value) -> str:
@@ -70,6 +68,20 @@ def cast_like(value, like):
     """Cast an existing value to the backend and dtype of ``like``."""
     value = native(value)
     like = native(like)
+    if is_symmray_array(like):
+        if not is_symmray_array(value):
+            raise TypeError(
+                "native Symmray compression requires native boundary data; "
+                "dense closures cannot be implicitly charge-lifted"
+            )
+        result = value.copy()
+        if dtype_name(value) != dtype_name(like) and hasattr(
+            result, "apply_to_arrays"
+        ):
+            result.apply_to_arrays(
+                lambda block: ar.astype(block, dtype_name(like))
+            )
+        return result
     if ar.infer_backend(value) == ar.infer_backend(like):
         return ar.astype(value, dtype_name(like))
     result = ar.do("array", value, like=like)

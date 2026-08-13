@@ -81,9 +81,59 @@ vectors should be used only as diagonal closures.
 Set `regauge=True` to refresh SU gauges after truncation; the default returns
 the compressed physical network without refreshing them. Set
 `max_loop_size>0` to add the open-leg loop-cluster correction on top of the
-finite base cluster. Supplied D2BP boundary messages are Hermitian/PSD
-projected by default (`message_psd_project=True`); set
-`message_psd_project=False` only for diagnostic raw-message experiments.
+finite base cluster. For the paper's total-region convention, use
+`max_cluster_size=...`; it includes the active/base support and is mutually
+exclusive with a nonzero `max_loop_size`. `tree_reduction=True` (the default)
+prunes tree-like intersection appendages to the protected active/base support,
+matching the fixed-point tree reduction in Algorithm 1. Set it to `False` only
+when auditing the un-reduced inclusion-exclusion regions. Supplied D2BP
+boundary messages are Hermitian/PSD projected by default
+(`message_psd_project=True`); set `message_psd_project=False` only for
+diagnostic raw-message experiments.
+
+When a fresh D2BP solve is requested, `bp_convergence` controls an unfinished
+solve: `"ignore"` keeps the historical behavior, `"warn"` emits a
+`RuntimeWarning`, and `"raise"` stops before the reduced pair is built. The
+selected policy and BP diagnostics are available as `pair.bp_info`.
+
+For a cutoff sweep, reuse the topology-only loop geometry. A prepared
+`ReducedBondPair` owns a cache automatically, or an explicit
+`ReducedLoopClusterCache` can be precomputed at the largest desired cutoff:
+
+```python
+from pepsy.bp import ContractionPlanCache, ReducedLoopClusterCache
+
+cache = ReducedLoopClusterCache()
+plans = ContractionPlanCache()
+cache.precompute(pair, max_loop_size=10)
+for gloops in (0, 4, 6, 8, 10):
+    problem = loop_cluster_reduced_update_problem(
+        pair,
+        identity,
+        max_loop_size=gloops,
+        loop_cache=cache,
+        plan_cache=plans,
+    )
+```
+
+This reuses Quimb's `gen_gloops` results for all lower cutoffs and caches the
+`gen_region_counts` inclusion-exclusion regions. For repeated contractions of
+the same topology, pass a `ContractionPlanCache` as `plan_cache` to
+`loop_cluster_reduced_update_problem`, `compress_reduced_loop_cluster`,
+`apply_reduced_loop_cluster_gate`, or `gate_loop_cluster`; it reuses the
+topology-only Cotengra trees while still contracting current tensor values and
+boundary messages. Inspect `cache.snapshot()` for `plans`, `hits`, and
+`misses`. Large cutoffs can still have combinatorially many regions.
+
+The current reduced open metric uses the additive operator-valued ansatz
+`N_red ~= sum_C c_C N_C`. The paper's product combination is reserved for
+scalar cluster observables; it is not silently applied to a matrix-valued
+reduced update. This additive choice is an implementation approximation, not
+a theorem obtained by differentiating the paper's scalar product formula.
+The returned loop problem records the choice as
+`problem.combination == "additive"`; derive and validate a parameter-dependent
+objective separately if a Hessian-level justification is required.
+
 The solver options accept `solver="auto"` (the default), `solver="quimb"`,
 `solver="autodiff"`, `solver="qr"`, or `solver="normal"`, plus a relative
 `regularization` value. The autodiff route uses Quimb's public autodiff
@@ -98,8 +148,10 @@ rather than rebuilding the environment. Reduced problem builders retain the
 open Quimb environment directly, so native ALS does not first form the full
 `N_red` matrix. The `.metric` and `.linear_term` attributes are lazy dense
 compatibility views; accessing them, or selecting a dense solver, materializes
-the physical-identity-expanded metric. Native Symmray compression remains
-separate work.
+the physical-identity-expanded metric. Native Symmray compression stays
+block-sparse through the graded SVD adapter; use `solver="auto"` or
+`solver="quimb"` there. Dense QR/autodiff refinement is intentionally not
+available for native arrays because it would flatten charge sectors.
 
 For explicit dense diagnostics, use `problem.dense_metric()` and
 `problem.dense_linear_term()`. Direct problem builders also accept
@@ -108,7 +160,11 @@ All reduced problem builders Hermitianize and PSD-project the smaller open
 environment by default. `problem.raw_min_eigenvalue` and
 `problem.clipped_eigenvalues` expose the projection diagnostics.
 The three builder return types share the `ReducedUpdateProblem` type alias for
-annotations.
+annotations. The full-system `max_cluster_size` cutoff is an exact small-system
+oracle (up to the requested Hermitian/PSD projection), so a practical
+convergence study compares a ladder of total cutoffs against
+`exact_reduced_update_problem(..., psd_project=False)` and reports the open
+environment norm error before solving ALS.
 
 The reduced-update message keys are `(bond_index, destination_tid)`, matching
 Quimb's D2BP layout. Messages are copied at preparation time and each directed
@@ -120,6 +176,11 @@ For compatibility with gate streams, `apply_reduced_loop_cluster_gate` and
 `gate_loop_cluster` accept the same closure semantics for adjacent two-site
 updates: `input_mode`, fresh-BP controls, PSD message handling, and contraction
 cost budgets are forwarded through the wrapper.
+
+Pass the same `ReducedLoopClusterCache` through repeated updates of one
+active bond with `loop_cache=cache` to reuse generalized-loop geometry. The
+cache is topology-only; each update still rebuilds contractions and uses the
+current tensor values and boundary messages.
 
 Pass `cost_check=True` to expose Cotengra's `flops_log10` and
 `peak_memory_log2` estimates. Supplying either `max_flops_log10` or
@@ -193,6 +254,76 @@ legs remain separate. The cluster contraction can still be expensive as
 `max_flops_log10` / `max_peak_memory_log2` to preflight it. The estimate is
 returned in `result.contraction_cost`.
 
+## Cut-edge loop-series compression
+
+`compress_bond_loop_series` implements the cut-edge construction from
+Evenbly et al., arXiv:2409.03108. It cuts the selected virtual bond, leaves
+its four norm legs open, and resolves every other internal edge as
+`I = P + Q` in the D2BP basis. `edge_cutoff` counts excited Q edges:
+
+```python
+from pepsy.bp import compress_bond_loop_series
+
+result = compress_bond_loop_series(
+    peps,
+    where=((0, 0), (1, 0)),
+    max_bond=chi,
+    edge_cutoff=6,
+    bp_opts={"max_iterations": 1000, "tol": 1e-10},
+)
+```
+
+Use `cut_edge_loop_series_expand` when only the environment is needed. The
+returned `terms` and `term_count_by_degree` make the convergence ladder
+explicit. `edge_cutoff=0` is the BP vacuum; when the cutoff reaches all
+non-cut internal edges, `complete=True` and the finite-network sum is an
+exact `P + Q` identity expansion at a converged BP fixed point, up to
+numerical contraction error. Partial sums need not be monotone or PSD, so
+`b_reduce=True` projects the environment before ALS. This finite route
+retains disconnected Q configurations explicitly; it does not apply the
+paper's infinite-lattice free-energy suppression factor.
+
+This is separate from `compress_reduced_loop_cluster`. The latter combines
+operator-valued regional environments additively for the reduced ALS metric.
+The scalar loop-cluster product formula cannot be promoted to
+`N_red ~= sum_C c_C N_C` without deriving the parameter-dependent scalar
+objective and its Hessian. For example, if
+`F(theta) = sum_C c_C log Z_C(theta)`, then
+
+```text
+H_C = c_C * (Z_C**-1 * d2Z_C
+             - Z_C**-2 * outer(dZ_C, dZ_C))
+```
+
+so the Hessian contains derivative and cross-gradient terms. The explicit
+cut-edge series avoids that assumption by approximating the matrix
+environment itself term by term.
+
+The two cutoff names are intentionally different. In
+`compress_bond_loop_series`, `edge_cutoff` is the maximum number of *other*
+virtual bonds carrying `Q` in one admissible configuration. The selected
+`A--B` bond is excluded from this count and is returned as the four open
+environment legs. A term may be an `A--B` excitation path, a closed loop, or
+an admissible path together with disconnected closed loops. `term_count`
+counts these configurations plus the degree-zero BP vacuum; it is not the
+number of geometric loops. For a 4x4 PEPS with one bond cut there are 23
+non-cut virtual bonds, so `edge_cutoff=16` is not the complete expansion;
+`edge_cutoff=None` (or a value at least 23) requests the finite complete sum.
+
+By contrast, `max_cluster_size` in
+`loop_cluster_reduced_update_problem` counts PEPS site tensors in the
+augmented inclusion-exclusion region. On a 4x4 lattice, the `16` row in a
+total-region benchmark means that the full 16-site region is included. The
+single surviving `term` there is the full-system contraction after counting
+number cancellations, not one physical loop and not an edge cutoff of 16.
+
+When comparing a partial loop-cluster metric with an exact finite-network
+metric, compare a common normalization (for example, Frobenius-normalized
+matrices or trace-normalized scalar diagnostics). Partial cluster closures
+use normalized BP/SU boundary objects, so their raw global scale is not
+necessarily the same as the raw finite-network contraction even when the
+matrix shape is converging.
+
 ## Long-range PEPS expectations
 
 Use `compute_boundary_expectation` for batched one- and two-site operators,
@@ -239,6 +370,29 @@ contraction. Pass `optimize="auto-hq"`, another Quimb optimizer string, or a
 standard Cotengra path optimizer through either path-cluster helper.
 
 ## Local reduced density matrices
+
+For a single route-independent entry point, use `rho_expand`. Its
+`expansion` value makes the cutoff semantics explicit: `"local"` means
+tensor-region loop series, `"edge"` means explicit Q-edge degree,
+`"open"` means paths plus closed loops, and `"cluster"` means generalized
+loop-cluster regions:
+
+```python
+from pepsy.bp import rho_expand
+
+rho = rho_expand(
+    peps.tn,
+    where=((0, 0), (0, 3)),
+    cutoff=6,
+    expansion="open",
+    normalized=True,
+)
+```
+
+The dispatcher delegates to the existing tested implementations and never
+converts one route's cutoff into another route's convention. Use the direct
+functions below when you need their route-specific caches, diagnostics, or
+corridor controls.
 
 For a D2BP loop-series estimate of a local reduced density matrix, keep the
 requested physical sites open with `partial_trace_loop_series_expand`:

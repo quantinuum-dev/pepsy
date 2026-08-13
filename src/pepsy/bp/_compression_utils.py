@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import warnings
 from typing import Any
@@ -31,6 +31,62 @@ class ContractionCost:
         }
 
 
+@dataclass
+class ContractionPlanCache:
+    """Reuse Cotengra trees for topology-identical local contractions."""
+
+    plans: dict[Any, Any] = field(default_factory=dict)
+    costs: dict[Any, dict[str, float]] = field(default_factory=dict)
+    hits: int = 0
+    misses: int = 0
+
+    @staticmethod
+    def _topology_key(network, output_inds, optimize):
+        tensors = tuple(
+            sorted(
+                (
+                    tuple(tensor.inds),
+                    tuple(tensor.shape),
+                    tuple(sorted(map(repr, tensor.tags))),
+                )
+                for tensor in network.tensors
+            )
+        )
+        return (tensors, tuple(output_inds), repr(optimize))
+
+    def clear(self) -> None:
+        """Discard plans and reset statistics."""
+        self.plans.clear()
+        self.costs.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def snapshot(self) -> dict[str, int]:
+        """Return stable cache statistics."""
+        return {
+            "plans": len(self.plans),
+            "hits": int(self.hits),
+            "misses": int(self.misses),
+        }
+
+    def plan_for(self, network, *, output_inds, optimize):
+        """Return ``(tree, cost, cache_hit)`` for one network."""
+        key = self._topology_key(network, output_inds, optimize)
+        if key in self.plans:
+            self.hits += 1
+            return self.plans[key], self.costs[key], True
+        self.misses += 1
+        tree = network.contract(
+            get="tree",
+            output_inds=output_inds,
+            optimize=optimize,
+        )
+        cost = estimate_cost(tree).as_dict()
+        self.plans[key] = tree
+        self.costs[key] = cost
+        return tree, cost, False
+
+
 def validate_input_mode(input_mode: str, gauges) -> str:
     """Resolve the common physical-versus-SU-core input convention."""
     if input_mode not in {"auto", "physical", "su_core"}:
@@ -45,6 +101,29 @@ def validate_input_mode(input_mode: str, gauges) -> str:
             "input_mode='su_core' requires a non-empty gauges mapping"
         )
     return input_mode
+
+
+def validate_bp_convergence_policy(policy: str) -> str:
+    """Validate the policy for an unfinished fresh BP solve."""
+    if policy not in {"ignore", "warn", "raise"}:
+        raise ValueError("bp_convergence must be 'ignore', 'warn', or 'raise'")
+    return policy
+
+
+def enforce_bp_convergence_policy(info: dict[str, Any], policy: str) -> None:
+    """Warn or raise when an internally run BP solve did not converge."""
+    policy = validate_bp_convergence_policy(policy)
+    if info.get("source") != "fresh_bp" or info.get("converged", True):
+        return
+    message = (
+        "fresh D2BP did not converge before reduced loop-cluster construction: "
+        f"iterations={info.get('iterations')!r}, "
+        f"max_mdiff={info.get('max_mdiff')!r}"
+    )
+    if policy == "warn":
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+    elif policy == "raise":
+        raise RuntimeError(message)
 
 
 def prepare_working_network(tn, gauges, *, input_mode: str, smudge: float = 0.0):
@@ -83,14 +162,17 @@ def resolve_d2bp_boundaries(
     run_bp: bool,
     bp_runner: str,
     bp_opts: dict[str, Any] | None,
+    bp_convergence: str = "ignore",
 ):
     """Use explicit closures, SU closures, or run a fresh D2BP solve."""
+    bp_convergence = validate_bp_convergence_policy(bp_convergence)
     # Preserve the caller's strongest information first: directed messages
     # describe the actual working network and can contain non-diagonal
     # correlations that diagonal SU vectors cannot represent.
     if boundary_messages is not None:
         return boundary_messages, {
             "source": "boundary_messages",
+            "bp_convergence": bp_convergence,
             "converged": None,
             "iterations": None,
             "max_mdiff": None,
@@ -98,6 +180,7 @@ def resolve_d2bp_boundaries(
     if gauges:
         return None, {
             "source": "su_gauges",
+            "bp_convergence": bp_convergence,
             "converged": None,
             "iterations": None,
             "max_mdiff": None,
@@ -105,6 +188,7 @@ def resolve_d2bp_boundaries(
     if not run_bp:
         return None, {
             "source": "none",
+            "bp_convergence": bp_convergence,
             "converged": None,
             "iterations": None,
             "max_mdiff": None,
@@ -125,12 +209,15 @@ def resolve_d2bp_boundaries(
     else:
         raise ValueError("bp_runner must be 'plain' or 'relay'")
 
-    return result.messages, {
+    info = {
         "source": "fresh_bp",
+        "bp_convergence": bp_convergence,
         "converged": bool(result.converged),
         "iterations": int(result.iterations),
         "max_mdiff": float(result.max_mdiff),
     }
+    enforce_bp_convergence_policy(info, bp_convergence)
+    return result.messages, info
 
 
 def validate_cost_options(
@@ -266,9 +353,10 @@ def contract_many_with_preflight(
     max_peak_memory_log2: float | None,
     on_budget: str,
     label: str,
+    plan_cache: ContractionPlanCache | None = None,
 ):
     """Preflight every network before contracting any of them."""
-    if not cost_check:
+    if not cost_check and plan_cache is None:
         return [
             network.contract(output_inds=output_inds, optimize=optimize)
             for network in networks
@@ -277,16 +365,23 @@ def contract_many_with_preflight(
     plans = []
     costs = []
     for network in networks:
-        tree = network.contract(
-            get="tree",
-            output_inds=output_inds,
-            optimize=optimize,
-        )
-        cost = estimate_cost(tree)
+        if plan_cache is None:
+            tree = network.contract(
+                get="tree",
+                output_inds=output_inds,
+                optimize=optimize,
+            )
+            cost = estimate_cost(tree).as_dict()
+        else:
+            tree, cost, _ = plan_cache.plan_for(
+                network,
+                output_inds=output_inds,
+                optimize=optimize,
+            )
         plans.append(tree)
         costs.append(cost)
         enforce_cost_budget(
-            cost,
+            ContractionCost(**cost),
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
             on_budget=on_budget,
@@ -297,7 +392,7 @@ def contract_many_with_preflight(
         network.contract(output_inds=output_inds, optimize=tree)
         for network, tree in zip(networks, plans)
     ]
-    return values, [cost.as_dict() for cost in costs]
+    return values, costs
 
 
 def aggregate_costs(costs) -> dict[str, float] | None:
@@ -318,13 +413,16 @@ def aggregate_costs(costs) -> dict[str, float] | None:
 __all__ = [
     "CompressionBudgetError",
     "ContractionCost",
+    "ContractionPlanCache",
     "aggregate_costs",
     "contract_many_with_preflight",
     "contract_with_preflight",
     "cost_check_requested",
+    "enforce_bp_convergence_policy",
     "estimate_cost",
     "prepare_working_network",
     "resolve_d2bp_boundaries",
     "validate_cost_options",
+    "validate_bp_convergence_policy",
     "validate_input_mode",
 ]

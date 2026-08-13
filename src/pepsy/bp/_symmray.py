@@ -10,9 +10,28 @@ only where the quimb API requires a common layout.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import inspect
 
 import autoray as ar
 import numpy as np
+
+
+def from_blocks_compatible(array_cls, blocks, *, duals, **kwargs):
+    """Construct a Symmray array across constructor-version differences.
+
+    Some Symmray releases expose ``phases`` only on fermionic array
+    constructors, while ``from_blocks`` forwards arbitrary keyword arguments
+    to ordinary Abelian constructors that reject it. BP's auxiliary density
+    messages are phase-free, but the helper also preserves phases when the
+    target class supports that metadata.
+    """
+    try:
+        parameters = inspect.signature(array_cls).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "phases" not in parameters:
+        kwargs.pop("phases", None)
+    return array_cls.from_blocks(blocks, duals=duals, **kwargs)
 
 
 def is_symmray_array(value) -> bool:
@@ -62,7 +81,8 @@ def restore_fermionic_dummy_modes(tn):
             continue
 
         tensor.modify(
-            data=type(data).from_blocks(
+            data=from_blocks_compatible(
+                type(data),
                 data.blocks,
                 duals=data.indices,
                 charge=getattr(data, "charge", None),
@@ -210,6 +230,34 @@ def align_message_pair(left, right):
     left.fill_missing_blocks()
     right.fill_missing_blocks()
     return left, right
+
+
+def align_message_to_bond(tn, index, message):
+    """Pad one native message to the union charge support of a bond."""
+    if not (
+        is_symmray_array(message)
+        and hasattr(message, "indices")
+        and index in tn.ind_map
+    ):
+        return message
+
+    charge_map = {}
+    for tid in tn.ind_map[index]:
+        tensor = tn.tensor_map[tid]
+        axis = tensor.inds.index(index)
+        for charge, size in tensor.data.indices[axis].chargemap.items():
+            previous = charge_map.setdefault(charge, int(size))
+            if previous != int(size):
+                raise ValueError(
+                    f"incompatible endpoint charge dimensions on bond {index!r}"
+                )
+    indices = tuple(
+        message_index.copy_with(chargemap=charge_map)
+        for message_index in message.indices
+    )
+    aligned = message.copy_with(indices=indices)
+    aligned.fill_missing_blocks()
+    return aligned
 
 
 def message_distance(left, right) -> float:

@@ -6,8 +6,11 @@ import quimb.tensor as qtn
 
 from pepsy.bp import (
     BondClusterCompressionResult,
+    BondLoopSeriesCompressionResult,
     CompressionBudgetError,
+    compress_bond_loop_series,
     compress_bond_cluster,
+    cut_edge_loop_series_expand,
     gauge_all_simple,
     two_norm_bp,
 )
@@ -67,6 +70,83 @@ def test_selected_peps_bond_uses_bp_cluster_and_reduces_only_that_bond():
     assert left.shape == (2, 1)
     assert right.shape == (1, 2)
     assert result.boundary_inds
+
+
+def test_cut_edge_loop_series_reaches_full_finite_environment():
+    """Adding all admissible Q terms reproduces the finite cut environment."""
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=42,
+    )
+    where = ((0, 0), (1, 0))
+    bp = two_norm_bp(peps, max_iterations=100, tol=1e-12, diis=False)
+
+    vacuum = cut_edge_loop_series_expand(
+        peps,
+        where=where,
+        edge_cutoff=0,
+        boundary_messages=bp.messages,
+        run_bp=False,
+        optimize="greedy",
+    )
+    complete = cut_edge_loop_series_expand(
+        peps,
+        where=where,
+        edge_cutoff=None,
+        boundary_messages=bp.messages,
+        run_bp=False,
+        optimize="greedy",
+    )
+    reference = compress_bond_cluster(
+        peps,
+        where=where,
+        boundary_messages=bp.messages,
+        max_distance=2,
+        max_bond=1,
+        b_reduce=False,
+        steps=1,
+        contract_optimize="greedy",
+    )
+
+    assert vacuum.term_count_by_degree == {0: 1}
+    assert complete.complete
+    assert len(complete.terms) > len(vacuum.terms)
+    np.testing.assert_allclose(complete.environment, reference.B_reduce, atol=1e-10)
+
+
+def test_cut_edge_loop_series_compression_uses_explicit_degree_cutoff():
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=44,
+    )
+    result = compress_bond_loop_series(
+        peps,
+        where=((0, 0), (1, 0)),
+        max_bond=1,
+        edge_cutoff=None,
+        bp_opts={"max_iterations": 100, "tol": 1e-12, "diis": False},
+        steps=2,
+        tol=0.0,
+        als_opts={"solver_maxiter": 8},
+    )
+
+    assert isinstance(result, BondLoopSeriesCompressionResult)
+    assert result.complete
+    assert result.term_count >= 2
+    assert result.B_reduce.shape == (2, 2, 2, 2)
+    assert result.errors[1] <= result.errors[0] + 1e-10
+    assert any(
+        result.compressed.ind_size(index) == 1
+        for index in result.compressed.inner_inds()
+    )
 
 
 def test_selected_pepo_bond_preserves_separate_operator_legs():

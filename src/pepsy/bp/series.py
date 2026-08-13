@@ -70,6 +70,8 @@ __all__ = [
     "LoopSeriesCache",
     "LoopSeriesResult",
     "LoopSeriesTerm",
+    "CutEdgeLoopSeriesResult",
+    "cut_edge_loop_series_expand",
     "compute_local_expectation_edge_loop_series",
     "compute_local_expectation_open_loop_series",
     "diagnose_open_loop_series",
@@ -380,6 +382,36 @@ class LoopSeriesTerm:
     def weight(self) -> int:
         """Alias for :attr:`degree`, useful when comparing loop families."""
         return self.degree
+
+
+@dataclass
+class CutEdgeLoopSeriesResult:
+    """Finite-network loop-series approximation to a cut-edge environment.
+
+    ``environment`` has leg order ``(left_ket, right_ket, left_bra,
+    right_bra)``.  The selected virtual edge is left open, while every other
+    internal edge is resolved into the exact identity ``P + Q``.  Thus
+    ``edge_cutoff`` is an explicit excitation-degree cutoff, rather than a
+    tensor-region or counting-number cutoff.
+
+    For a finite tensor network, ``complete`` is true when all admissible
+    configurations have been included.  At a converged BP fixed point, the
+    dangling-Q configurations omitted by the admissibility rule vanish, so
+    the result then reproduces the exact cut-edge environment up to numerical
+    contraction error.  Partial sums are not guaranteed to be monotone for
+    arbitrary networks; the paper's rapid-convergence argument additionally
+    assumes a good BP fixed point and suppressed high-degree excitations.
+    """
+
+    environment: Any
+    bond_ind: Any
+    where: tuple[Any, Any]
+    edge_cutoff: int
+    terms: tuple[LoopSeriesTerm, ...]
+    complete: bool
+    bp_info: dict[str, Any]
+    term_count_by_degree: dict[int, int]
+    bp: Any = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -2278,6 +2310,362 @@ def _get_edge_excited(bp, term):
     if bp.__class__.__name__ == "D1BP":
         return _get_d1_edge_excited(bp, term)
     return _get_d2_edge_excited(bp, term)
+
+
+def _get_d2_cut_edge_excited(bp, bond_ind, term):
+    """Build one full finite-network D2BP term with ``bond_ind`` open.
+
+    This is the transfer-matrix counterpart of
+    :func:`_get_d2_edge_excited`.  Unlike a message-closed local cluster, the
+    complete tensor network is retained, so one-ended virtual indices (if a
+    caller supplies any) are closed directly between ket and bra rather than
+    replaced by BP boundary messages.  The selected bond receives no
+    projector and is returned as four open legs.
+    """
+    import quimb.tensor as qtn
+
+    if bp.__class__.__name__ != "D2BP":
+        raise ValueError("cut-edge loop series currently requires norm='2norm'")
+    if bond_ind not in bp.tn.ind_map:
+        raise ValueError(f"unknown cut bond {bond_ind!r}")
+    endpoints = tuple(bp.tn.ind_map[bond_ind])
+    if len(endpoints) != 2:
+        raise ValueError(
+            f"cut bond {bond_ind!r} must have two endpoints, got {endpoints!r}"
+        )
+    left_tid, right_tid = endpoints
+    if left_tid == right_tid:
+        raise ValueError(f"cut bond {bond_ind!r} must join distinct tensors")
+
+    open_ket = (qtn.rand_uuid(), qtn.rand_uuid())
+    open_bra = (qtn.rand_uuid(), qtn.rand_uuid())
+    output_inds = (*open_ket, *open_bra)
+    excited_edges = set(term.edges)
+    kixmaps = {tid: {} for tid in bp.tn.tensor_map}
+    bixmaps = {tid: {} for tid in bp.tn.tensor_map}
+    projector_inds = {}
+
+    for index, tids0 in bp.tn.ind_map.items():
+        tids = tuple(tids0)
+        if index == bond_ind:
+            if tids != endpoints:
+                raise RuntimeError(
+                    f"cut bond {bond_ind!r} endpoint layout changed: {tids!r}"
+                )
+            kixmaps[left_tid][index] = open_ket[0]
+            kixmaps[right_tid][index] = open_ket[1]
+            bixmaps[left_tid][index] = open_bra[0]
+            bixmaps[right_tid][index] = open_bra[1]
+        elif index in bp.output_inds:
+            # Physical ket/bra legs retain their ordinary norm contraction.
+            continue
+        elif index in bp.tn._inner_inds:
+            if len(tids) != 2:
+                raise RuntimeError(
+                    f"internal bond {index!r} has endpoint layout {tids!r}"
+                )
+            for tid in tids:
+                kix = qtn.rand_uuid()
+                bix = qtn.rand_uuid()
+                kixmaps[tid][index] = kix
+                bixmaps[tid][index] = bix
+                projector_inds.setdefault(index, {})[tid] = (bix, kix)
+        else:
+            # A finite PEPS normally has no open virtual boundary legs. If it
+            # does, close that leg by the exact ket-bra identity in the full
+            # network, not by a BP message.
+            (tid,) = tids
+            bixmaps[tid][index] = index
+
+    local = qtn.TensorNetwork(virtual=True)
+    for tid, tensor in bp.tn.tensor_map.items():
+        local |= tensor.reindex(kixmaps[tid])
+    for tid in bp.tn.tensor_map:
+        bra_reindex = {
+            bp.index_dual_map.get(index, index): new_index
+            for index, new_index in bixmaps[tid].items()
+        }
+        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+
+    for index, projector_tids in projector_inds.items():
+        tid_left, tid_right = tuple(projector_tids)
+        left = projector_inds[index][tid_left]
+        right = projector_inds[index][tid_right]
+        ml = bp.messages[index, tid_left]
+        mr = bp.messages[index, tid_right]
+        if _uses_symmray(bp.tn):
+            p0 = _symmray_rank_one_d2_projector(
+                bp.tn, index, ml, mr, layout="series"
+            )
+            projector = _symmray_d2_operator(
+                bp.tn,
+                index,
+                p0,
+                complement=index in excited_edges,
+                layout="open",
+                fermionic=True,
+            )
+        else:
+            p0 = ar.do(
+                "einsum",
+                "i,j->ij",
+                ml.reshape(-1),
+                mr.reshape(-1),
+            )
+            projector = (
+                ar.do("eye", ar.do("shape", p0)[0]) - p0
+                if index in excited_edges
+                else p0
+            )
+            projector = ar.do(
+                "reshape",
+                projector,
+                ar.do("shape", ml) + ar.do("shape", mr),
+            )
+        local |= qtn.Tensor(projector, inds=(*left, *right))
+
+    return local, output_inds
+
+
+def _resolve_cut_edge(tn, *, where=None, bond_ind=None):
+    """Resolve one selected PEPS virtual bond and its endpoint sites."""
+    import quimb.tensor as qtn
+
+    if bond_ind is not None and where is not None:
+        raise ValueError("specify either where or bond_ind, not both")
+    if bond_ind is not None:
+        if bond_ind not in tn.ind_map:
+            raise ValueError(f"unknown bond_ind {bond_ind!r}")
+        endpoints = tuple(tn.ind_map[bond_ind])
+        if len(endpoints) != 2:
+            raise ValueError(
+                f"bond_ind {bond_ind!r} must have two endpoints, got {endpoints!r}"
+            )
+        return bond_ind, endpoints
+    if not isinstance(where, (tuple, list)) or len(where) != 2:
+        raise ValueError("where must be an ordered pair of neighboring sites")
+    left_site, right_site = tuple(where)
+    if left_site == right_site:
+        raise ValueError("selected bond sites must be distinct")
+    left_tids = tuple(
+        tn._get_tids_from_tags((tn.site_tag(left_site),), "any")
+    )
+    right_tids = tuple(
+        tn._get_tids_from_tags((tn.site_tag(right_site),), "any")
+    )
+    if len(left_tids) != 1 or len(right_tids) != 1:
+        raise ValueError("where must identify exactly one tensor at each site")
+    bonds = tuple(qtn.bonds(tn.tensor_map[left_tids[0]], tn.tensor_map[right_tids[0]]))
+    if len(bonds) != 1:
+        raise ValueError(
+            "where must identify neighboring sites sharing exactly one bond"
+        )
+    return bonds[0], (left_tids[0], right_tids[0])
+
+
+def cut_edge_loop_series_expand(
+    tn,
+    *,
+    where=None,
+    bond_ind=None,
+    edge_cutoff: int | None = None,
+    messages=None,
+    boundary_messages=None,
+    gauges=None,
+    run_bp: bool = True,
+    bp_runner: str = "plain",
+    relay_opts: dict[str, Any] | None = None,
+    max_iterations: int = 1000,
+    tol: float = 5e-6,
+    tol_abs: float | None = None,
+    tol_rolling_diff: float | None = 0.0,
+    diis: bool | dict[str, Any] = False,
+    damping: float = 0.0,
+    update: str = "sequential",
+    require_fixed_point: bool = True,
+    max_terms: int | None = None,
+    max_enumeration_time: float | None = None,
+    max_enumeration_memory: int | None = None,
+    optimize: Any = "auto-hq",
+    contract_opts: dict[str, Any] | None = None,
+    progbar: bool = False,
+    bp_opts: dict[str, Any] | None = None,
+    **extra_bp_opts,
+) -> CutEdgeLoopSeriesResult:
+    """Expand a selected cut edge into a systematic finite-network series.
+
+    The selected virtual bond is left open, giving a four-leg transfer
+    environment. Every other internal bond is resolved into ``P + Q`` using
+    the D2BP messages. Terms are enumerated with the same open-edge rule as
+    :func:`partial_trace_open_loop_series_expand`: degree-one Q vertices are
+    allowed only at the two tensors adjacent to the cut. All disconnected
+    terms are retained, so the full finite cutoff is an exact identity
+    expansion rather than an assumed sum of region Hessians.
+
+    ``edge_cutoff=0`` returns the BP vacuum environment. Increasing the
+    cutoff adds Q excitations. When the cutoff reaches the number of
+    non-cut internal edges, ``complete`` is true and the finite expansion
+    contains every admissible configuration. At a converged BP fixed point,
+    this is the finite-network analogue of the paper's cut-edge
+    transfer-matrix construction; the paper's infinite-lattice free-energy
+    suppression factors are deliberately not applied here.
+    """
+    if messages is not None and boundary_messages is not None:
+        raise ValueError("pass either messages or boundary_messages, not both")
+    if boundary_messages is not None:
+        messages = boundary_messages
+    if gauges is not None and messages is not None:
+        raise ValueError("pass either messages or gauges, not both")
+    if not isinstance(run_bp, bool):
+        raise TypeError("run_bp must be a bool")
+    if not isinstance(require_fixed_point, bool):
+        raise TypeError("require_fixed_point must be a bool")
+    if contract_opts is None:
+        contract_opts = {}
+    else:
+        contract_opts = dict(contract_opts)
+    if bp_opts is not None and not isinstance(bp_opts, dict):
+        raise TypeError("bp_opts must be a mapping or None")
+    bp_opts = {} if bp_opts is None else dict(bp_opts)
+    bp_opts.update(extra_bp_opts)
+    # ``compress_bond_loop_series`` follows the compression APIs and passes
+    # runner controls in one ``bp_opts`` mapping. Pull those controls out
+    # before handing the remaining constructor options to D2BP.
+    for name in (
+        "max_iterations",
+        "tol",
+        "tol_abs",
+        "tol_rolling_diff",
+        "diis",
+        "damping",
+        "update",
+    ):
+        if name in bp_opts:
+            value = bp_opts.pop(name)
+            if name == "max_iterations":
+                max_iterations = value
+            elif name == "tol":
+                tol = value
+            elif name == "tol_abs":
+                tol_abs = value
+            elif name == "tol_rolling_diff":
+                tol_rolling_diff = value
+            elif name == "diis":
+                diis = value
+            elif name == "damping":
+                damping = value
+            elif name == "update":
+                update = value
+    if edge_cutoff is not None:
+        if not isinstance(edge_cutoff, (int, np.integer)) or edge_cutoff < 0:
+            raise ValueError("edge_cutoff must be a nonnegative integer or None")
+        edge_cutoff = int(edge_cutoff)
+    limits = _OpenEnumerationLimits.validate(
+        max_terms=max_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+    )
+    bond_ind, endpoints = _resolve_cut_edge(
+        tn,
+        where=where,
+        bond_ind=bond_ind,
+    )
+    bp, bp_info = _build_bp(
+        tn,
+        norm="2norm",
+        messages=messages,
+        gauges=gauges,
+        run_bp=run_bp,
+        bp_runner=bp_runner,
+        relay_opts=relay_opts,
+        max_iterations=max_iterations,
+        tol=tol,
+        tol_abs=tol_abs,
+        tol_rolling_diff=tol_rolling_diff,
+        diis=diis,
+        damping=damping,
+        update=update,
+        optimize=optimize,
+        bp_opts=bp_opts,
+        progbar=progbar,
+    )
+    if require_fixed_point and run_bp and not bp_info.get("converged", False):
+        raise RuntimeError(
+            "cut-edge loop-series expansion requires converged BP messages; "
+            "pass require_fixed_point=False for an exploratory estimate"
+        )
+
+    # The dangling-excitation cancellation is expressed in the normalized BP
+    # basis. ``normalize_tensors`` stores the removed global scale on the BP
+    # object, which is restored after summing the open transfer terms below.
+    if _uses_symmray(bp.tn):
+        _align_symmray_d2bp_messages(bp)
+    bp.normalize_message_pairs()
+    bp.normalize_tensors()
+
+    pairwise_edges = tuple(
+        edge
+        for edge, _, _ in _pairwise_edges(bp.tn, norm="2norm")
+        if edge != bond_ind
+    )
+    if edge_cutoff is None:
+        edge_cutoff = len(pairwise_edges)
+    else:
+        edge_cutoff = min(edge_cutoff, len(pairwise_edges))
+
+    base_term = LoopSeriesTerm((), frozenset())
+    terms = [base_term]
+    terms.extend(
+        _iter_open_edge_loops(
+            bp.tn,
+            edge_cutoff,
+            allowed_tids=endpoints,
+            excluded_edges=(bond_ind,),
+            limits=limits,
+        )
+    )
+    terms = tuple(
+        sorted(
+            terms,
+            key=lambda term: (term.degree, tuple(map(repr, term.edges))),
+        )
+    )
+
+    data = None
+    for term in terms:
+        network, output_inds = _get_d2_cut_edge_excited(bp, bond_ind, term)
+        contracted = network.contract(
+            output_inds=output_inds,
+            optimize=optimize,
+            **contract_opts,
+        )
+        contribution = contracted.data if hasattr(contracted, "data") else contracted
+        data = contribution if data is None else data + contribution
+    data = data * bp.sign * 10**bp.exponent
+
+    term_count_by_degree = dict(Counter(term.degree for term in terms))
+    info = dict(bp_info)
+    info.update(
+        {
+            "bond_ind": bond_ind,
+            "edge_cutoff": edge_cutoff,
+            "term_count": len(terms),
+            "term_count_by_degree": term_count_by_degree,
+            "complete": edge_cutoff >= len(pairwise_edges),
+            "finite_exact_identity_at_bp_fixed_point": True,
+        }
+    )
+    return CutEdgeLoopSeriesResult(
+        environment=data,
+        bond_ind=bond_ind,
+        where=endpoints,
+        edge_cutoff=edge_cutoff,
+        terms=terms,
+        complete=bool(info["complete"]),
+        bp_info=info,
+        term_count_by_degree=term_count_by_degree,
+        bp=bp,
+    )
 
 
 def _get_d2_partial_trace_excited(

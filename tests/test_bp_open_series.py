@@ -21,6 +21,7 @@ from pepsy.bp import (
     diagnose_open_loop_series,
     partial_trace_open_loop_series_expand,
     partial_trace_open_loop_series_sweep,
+    rho_expand,
     two_norm_bp,
 )
 from pepsy.bp.series import (
@@ -91,6 +92,43 @@ def test_open_rho_series_keeps_the_long_range_path_and_is_exact_on_a_tree():
     assert terms[0].degree == 3
     assert np.max(np.abs(rho - exact)) < 1e-10
     np.testing.assert_allclose(np.trace(rho), 1.0, atol=1e-12)
+
+
+def test_rho_expand_dispatches_route_specific_cutoffs():
+    state = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=1909,
+        dtype="float64",
+    )
+    where = ((0, 0), (1, 1))
+    bp = two_norm_bp(state, max_iterations=100, tol=1e-10, diis=False)
+    expected = partial_trace_open_loop_series_expand(
+        state,
+        where,
+        edge_cutoff=2,
+        messages=bp.messages,
+        run_bp=False,
+    )
+    actual = rho_expand(
+        state,
+        where,
+        cutoff=2,
+        expansion="open",
+        messages=bp.messages,
+        run_bp=False,
+    )
+    np.testing.assert_allclose(actual, expected)
+    with pytest.raises(TypeError, match="edge_cutoff"):
+        rho_expand(
+            state,
+            where,
+            cutoff=2,
+            expansion="open",
+            edge_cutoff=2,
+        )
 
 
 def test_open_terms_stream_shortest_support_path_first():

@@ -19,6 +19,7 @@ from pepsy.bp import (  # noqa: E402
     compute_local_expectation_loop_cluster,
     compute_local_expectation_loop_series,
     compute_path_cluster_expectation,
+    compress_reduced_loop_cluster,
     gauge_all,
     loop_cluster_expand,
     loop_series_expand,
@@ -33,7 +34,7 @@ from pepsy.bp import (  # noqa: E402
     two_norm_bp,
     weight_pass,
 )
-from pepsy.operators.gates import gate_simple  # noqa: E402
+from pepsy.operators.gates import gate_loop_cluster, gate_simple  # noqa: E402
 from pepsy.tensors import (  # noqa: E402
     Fermion,
     OneDMap,
@@ -173,6 +174,53 @@ def _spinless_sign_sensitive_peps():
         _unitary_from_hermitian(-hop_02, dt) @ initial
     )
     return state, fermion, dense_state
+
+
+def test_native_reduced_loop_compression_uses_graded_svd_adapter():
+    """Native U1 tensors stay block-sparse through reduced compression."""
+    state, fermion, _ = _spinless_sign_sensitive_peps()
+    result = compress_reduced_loop_cluster(
+        state.tn,
+        where=((0, 0), (1, 0)),
+        run_bp=False,
+        max_distance=1,
+        max_bond=1,
+        als_opts={"solver": "quimb"},
+    )
+
+    assert result.solution.costs[0] == pytest.approx(result.solution.costs[-1])
+    assert result.physical_tn.ind_size(result.pair.bond_ind) == 1
+    assert all(
+        type(tensor.data).__module__.startswith("symmray")
+        for tensor in result.physical_tn.tensors
+    )
+    with pytest.raises(NotImplementedError, match="blockwise autodiff/ALS"):
+        compress_reduced_loop_cluster(
+            state.tn,
+            where=((0, 0), (1, 0)),
+            run_bp=False,
+            max_distance=1,
+            max_bond=1,
+            als_opts={"solver": "qr"},
+        )
+
+    updated, results = gate_loop_cluster(
+        state.tn,
+        ((fermion.hopping_gate(0.01, t=1.0), ((0, 0), (1, 0))),),
+        gauges={},
+        run_bp=False,
+        base_radius=1,
+        max_bond=1,
+        als_opts={"solver": "quimb"},
+        regauge_opts={"max_iterations": 1},
+        inplace=False,
+        return_results=True,
+    )
+    assert len(results) == 1
+    assert all(
+        type(tensor.data).__module__.startswith("symmray")
+        for tensor in updated.tensors
+    )
 
 
 def test_fermionic_long_range_hopping_sign_survives_su_and_bp_gauges():

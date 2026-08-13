@@ -10,6 +10,8 @@ contractions and corrections used by Pepsy:
 * :func:`loop_cluster_expand` -- the loop cluster expansion (arXiv:2510.05647),
 * :func:`loop_series_expand` -- the edge-resolved ``P + Q`` loop series
   (arXiv:2409.03108),
+* :func:`cut_edge_loop_series_expand` -- a finite cut-edge transfer
+  environment built by adding explicit Q excitations,
 * :func:`partial_trace_loop_cluster_expand` -- a D2BP loop-cluster reduced
   density matrix and its scalar expectation companion,
 * :func:`partial_trace_loop_series_expand` -- a D2BP reduced-density-matrix
@@ -18,6 +20,8 @@ contractions and corrections used by Pepsy:
   rho series retaining long-range excitation paths and closed loops,
 * :func:`partial_trace_open_loop_series_sweep` -- one-BP multi-support,
   multi-cutoff open-rho diagnostics,
+* :func:`rho_expand` -- one explicit selector for local, edge, open, or
+  region-cluster rho expansions,
 * :func:`compute_local_expectation_open_loop_series` -- direct gate-inserted
   scalar expectations from the same open paths and loops,
 * :func:`loop_expand` -- an explicit selector between the correction families.
@@ -61,6 +65,8 @@ from .series import (
     LoopSeriesCache,
     LoopSeriesResult,
     LoopSeriesTerm,
+    CutEdgeLoopSeriesResult,
+    cut_edge_loop_series_expand,
     compute_local_expectation_edge_loop_series,
     compute_local_expectation_open_loop_series,
     compute_local_expectation_loop_cluster,
@@ -75,7 +81,7 @@ from .series import (
     partial_trace_loop_series_expand,
     loop_series_expand,
 )
-from .expansion import loop_expand
+from .expansion import loop_expand, rho_expand
 from .pne import (
     PNEExpansionResult,
     PNEExpansionTerm,
@@ -123,14 +129,24 @@ from .observables import (
     compute_bp_path_expectation,
     compute_path_cluster_expectation,
 )
-from .compression import BondClusterCompressionResult, compress_bond_cluster
-from ._compression_utils import CompressionBudgetError, ContractionCost
+from .compression import (
+    BondClusterCompressionResult,
+    BondLoopSeriesCompressionResult,
+    compress_bond_cluster,
+    compress_bond_loop_series,
+)
+from ._compression_utils import (
+    CompressionBudgetError,
+    ContractionCost,
+    ContractionPlanCache,
+)
 from .reduced_update import (
     ExactReducedUpdateProblem,
     LoopClusterReducedUpdateProblem,
     LoopClusterTerm,
     ReducedALSSolution,
     ReducedBondPair,
+    ReducedLoopClusterCache,
     ReducedLoopClusterCompressionResult,
     ReducedLoopClusterGateResult,
     ReducedUpdateProblem,
@@ -147,8 +163,10 @@ from .reduced_update import (
 __all__ = [
     "GaugeResult",
     "BondClusterCompressionResult",
+    "BondLoopSeriesCompressionResult",
     "CompressionBudgetError",
     "ContractionCost",
+    "ContractionPlanCache",
     "ExactReducedUpdateProblem",
     "BPCandidateScore",
     "BPCandidateSelection",
@@ -173,6 +191,8 @@ __all__ = [
     "OpenLoopSeriesSweepResult",
     "LoopSeriesResult",
     "LoopSeriesTerm",
+    "CutEdgeLoopSeriesResult",
+    "cut_edge_loop_series_expand",
     "compute_local_expectation_edge_loop_series",
     "compute_local_expectation_open_loop_series",
     "diagnose_open_loop_series",
@@ -188,6 +208,7 @@ __all__ = [
     "RelayGaugeOptions",
     "ReducedALSSolution",
     "ReducedBondPair",
+    "ReducedLoopClusterCache",
     "ReducedLoopClusterCompressionResult",
     "ReducedLoopClusterGateResult",
     "ReducedUpdateProblem",
@@ -195,6 +216,7 @@ __all__ = [
     "ScalarClusterCache",
     "apply_reduced_loop_cluster_gate",
     "compress_bond_cluster",
+    "compress_bond_loop_series",
     "compress_reduced_loop_cluster",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
@@ -212,6 +234,7 @@ __all__ = [
     "linked_cluster_expand",
     "norm1_gloop_expand",
     "loop_series_expand",
+    "rho_expand",
     "loop_expand",
     "PNEExpansionResult",
     "PNEExpansionTerm",

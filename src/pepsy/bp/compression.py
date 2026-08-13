@@ -52,10 +52,13 @@ from ._compression_utils import (
     resolve_d2bp_boundaries,
     validate_cost_options,
 )
+from .series import cut_edge_loop_series_expand
 
 __all__ = [
     "BondClusterCompressionResult",
     "compress_bond_cluster",
+    "BondLoopSeriesCompressionResult",
+    "compress_bond_loop_series",
 ]
 
 
@@ -680,6 +683,228 @@ class BondClusterCompressionResult:
     max_bond: int
     bp_info: dict[str, Any] | None = None
     contraction_cost: dict[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class BondLoopSeriesCompressionResult:
+    """Result of compression using an explicit cut-edge loop series."""
+
+    compressed: Any
+    bond_maps: dict[str, tuple[Any, Any]]
+    errors: tuple[float, float]
+    relative_error: float
+    where: tuple[Any, Any]
+    bond_ind: str
+    B_reduce: Any
+    raw_min_eigenvalue: float
+    clipped_eigenvalues: int
+    steps: int
+    max_bond: int
+    edge_cutoff: int
+    complete: bool
+    term_count: int
+    bp_info: dict[str, Any] | None = None
+    series: Any = None
+
+
+def compress_bond_loop_series(
+    tn,
+    *,
+    where,
+    max_bond: int,
+    edge_cutoff: int | None = None,
+    gauges=None,
+    boundary_messages=None,
+    input_mode: str = "auto",
+    run_bp: bool = True,
+    bp_runner: str = "plain",
+    bp_opts: dict[str, Any] | None = None,
+    require_fixed_point: bool = True,
+    max_terms: int | None = None,
+    max_enumeration_time: float | None = None,
+    max_enumeration_memory: int | None = None,
+    b_reduce: bool = True,
+    b_reduce_floor: float = 0.0,
+    init: str = "b_reduce",
+    steps: int = 20,
+    tol: float = 1e-9,
+    contract_optimize="auto-hq",
+    contract_opts: dict[str, Any] | None = None,
+    als_opts: dict[str, Any] | None = None,
+    seed=None,
+    inplace: bool = False,
+    progbar: bool = False,
+) -> BondLoopSeriesCompressionResult:
+    """Compress one bond with the finite cut-edge ``P + Q`` expansion.
+
+    The selected bond is cut open and the loop-series environment is built by
+    summing explicit Q-edge configurations through ``edge_cutoff``. The
+    environment has the same four-leg layout as ``B_reduce`` in
+    :func:`compress_bond_cluster`, so the existing unconstrained rectangular
+    map fit is reused after the series contraction.
+
+    ``edge_cutoff=0`` is the BP-vacuum compression. Increasing the cutoff
+    adds admissible excitations, including disconnected terms. If the cutoff
+    reaches all non-cut internal edges, ``series.complete`` is true and, at a
+    converged BP fixed point, the finite-network environment is exact up to
+    contraction precision. Partial sums need not be PSD, so
+    ``b_reduce=True`` projects the metric before ALS.
+    """
+    _validate_dense_peps_like(tn)
+    if not isinstance(where, (tuple, list)) or len(where) != 2:
+        raise ValueError("where must be an ordered pair of adjacent sites")
+    if not isinstance(max_bond, (int, np.integer)) or max_bond < 1:
+        raise ValueError("max_bond must be a positive integer")
+    if not isinstance(require_fixed_point, bool):
+        raise TypeError("require_fixed_point must be a bool")
+    if not isinstance(inplace, bool):
+        raise TypeError("inplace must be a bool")
+    if not isinstance(b_reduce, bool):
+        raise TypeError("b_reduce must be a bool")
+    if not np.isfinite(tol) or tol < 0.0:
+        raise ValueError("tol must be finite and nonnegative")
+    if not np.isfinite(b_reduce_floor) or b_reduce_floor < 0.0:
+        raise ValueError("b_reduce_floor must be finite and nonnegative")
+
+    als_opts = {} if als_opts is None else dict(als_opts)
+    bp_opts = {} if bp_opts is None else dict(bp_opts)
+    contract_opts = {} if contract_opts is None else dict(contract_opts)
+    work, gauge_inputs, _ = prepare_working_network(
+        tn,
+        gauges,
+        input_mode=input_mode,
+    )
+    series = cut_edge_loop_series_expand(
+        work,
+        where=where,
+        edge_cutoff=edge_cutoff,
+        messages=boundary_messages,
+        gauges=None if boundary_messages is not None else gauge_inputs or None,
+        run_bp=run_bp,
+        bp_runner=bp_runner,
+        bp_opts=bp_opts,
+        require_fixed_point=require_fixed_point,
+        max_terms=max_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+        optimize=contract_optimize,
+        contract_opts=contract_opts,
+        progbar=progbar,
+    )
+
+    b_data = _native(series.environment)
+    if b_data.ndim != 4 or len(set(b_data.shape)) != 1:
+        raise RuntimeError(
+            "cut-edge loop-series environment must have shape (D, D, D, D), "
+            f"got {b_data.shape}"
+        )
+    dimension = int(b_data.shape[0])
+    rank = min(int(max_bond), dimension)
+    if rank == dimension:
+        identity = _eye(dimension, like=b_data)
+        compressed = work
+        if inplace:
+            compressed = _replace_network(tn, work)
+        return BondLoopSeriesCompressionResult(
+            compressed=compressed,
+            bond_maps={series.bond_ind: (_copy_array(identity), _copy_array(identity))},
+            errors=(0.0, 0.0),
+            relative_error=0.0,
+            where=tuple(where),
+            bond_ind=series.bond_ind,
+            B_reduce=_copy_array(b_data),
+            raw_min_eigenvalue=0.0,
+            clipped_eigenvalues=0,
+            steps=0,
+            max_bond=rank,
+            edge_cutoff=series.edge_cutoff,
+            complete=series.complete,
+            term_count=len(series.terms),
+            bp_info=series.bp_info,
+            series=series,
+        )
+
+    matrix = _reshape(
+        _transpose(b_data, (2, 3, 0, 1)),
+        (dimension * dimension, dimension * dimension),
+    )
+    hermitian = 0.5 * (matrix + _dag(matrix))
+    eigenvalues = ar.do("linalg.eigvalsh", hermitian)
+    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
+    clipped = 0
+    if b_reduce:
+        matrix, raw_min, clipped = _project_psd(
+            matrix,
+            psd_floor=float(b_reduce_floor),
+        )
+    else:
+        matrix = hermitian
+    b_data = _transpose(
+        _reshape(matrix, (dimension, dimension, dimension, dimension)),
+        (2, 3, 0, 1),
+    )
+
+    left, right, costs = _fit_maps(
+        b_data,
+        dimension=dimension,
+        max_bond=rank,
+        init=init,
+        steps=int(steps),
+        tol=float(tol),
+        contract_optimize=contract_optimize,
+        als_opts=als_opts,
+        seed=seed,
+        positive_environment=b_reduce,
+        progbar=progbar,
+    )
+    left_tid, right_tid = series.where
+    compressed, _ = _reconstruct_selected_bond(
+        work,
+        series.bond_ind,
+        left_tid,
+        right_tid,
+        left,
+        right,
+    )
+    initial_cost = max(0.0, costs[0])
+    final_cost = max(0.0, costs[-1])
+    initial_error = float(np.sqrt(initial_cost))
+    final_error = float(np.sqrt(final_cost))
+    target_norm = float(
+        np.sqrt(
+            max(
+                0.0,
+                _local_cost(
+                    _eye(dimension, like=b_data),
+                    _zeros((dimension, dimension), like=b_data),
+                    _eye(dimension, like=b_data),
+                    b_data,
+                ),
+            )
+        )
+    )
+    relative_error = 0.0 if target_norm == 0.0 else final_error / target_norm
+    if inplace:
+        compressed = _replace_network(tn, compressed)
+
+    return BondLoopSeriesCompressionResult(
+        compressed=compressed,
+        bond_maps={series.bond_ind: (_copy_array(left), _copy_array(right))},
+        errors=(initial_error, final_error),
+        relative_error=relative_error,
+        where=tuple(where),
+        bond_ind=series.bond_ind,
+        B_reduce=_copy_array(b_data),
+        raw_min_eigenvalue=raw_min,
+        clipped_eigenvalues=clipped,
+        steps=int(steps),
+        max_bond=rank,
+        edge_cutoff=series.edge_cutoff,
+        complete=series.complete,
+        term_count=len(series.terms),
+        bp_info=series.bp_info,
+        series=series,
+    )
 
 
 def compress_bond_cluster(
