@@ -45,6 +45,12 @@ from .cluster import (
     _filter_gauge_init_only_bp_opts,
     _run_plain_bp,
 )
+from ._compression_utils import (
+    aggregate_costs as _aggregate_contraction_costs,
+    contract_with_preflight as _contract_with_preflight,
+    cost_check_requested as _cost_check_requested,
+    validate_cost_options as _validate_cost_options,
+)
 from ._symmray import (
     align_d2bp_messages as _align_symmray_d2bp_messages,
     dense_bp_tn as _dense_bp_tn,
@@ -412,6 +418,11 @@ class CutEdgeLoopSeriesResult:
     bp_info: dict[str, Any]
     term_count_by_degree: dict[int, int]
     bp: Any = field(default=None, repr=False)
+    contraction_costs: dict[tuple[Any, ...], dict[str, float]] = field(
+        default_factory=dict
+    )
+    contraction_cost: dict[str, float] | None = None
+    cost_limits: dict[str, float | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -1824,21 +1835,24 @@ def _iter_open_edge_loops(
 
     degrees: Counter[Any] = Counter()
     selected = []
-    def has_closed_dangling_vertex():
-        return any(
-            remaining[tid] == 0
-            and degree == 1
-            and tid not in allowed_tids
-            for tid, degree in degrees.items()
-        )
 
-    def visit(edge_pos, selected_count):
+    def is_invalid_closed_vertex(tid):
+        """Whether a now-closed spectator has one selected Q edge."""
+        return tid not in allowed_tids and degrees[tid] == 1
+
+    def visit(edge_pos, selected_count, closed_dangling_count):
         guard.check()
         if edge_pos == len(edges):
-            if selected and not has_closed_dangling_vertex():
+            if selected and not closed_dangling_count:
                 term = LoopSeriesTerm(
                     tuple(sorted(selected, key=repr)),
-                    frozenset(degrees),
+                    # ``Counter`` retains zero-count keys while this DFS
+                    # backtracks. Keep only the tensors actually incident on
+                    # the selected Q edges: consumers use ``term.tids`` as
+                    # geometry, so stale zero-degree vertices are incorrect.
+                    frozenset(
+                        tid for tid, degree in degrees.items() if degree
+                    ),
                 )
                 if term.edges not in path_terms:
                     guard.accept(term, loop=True)
@@ -1848,16 +1862,36 @@ def _iter_open_edge_loops(
         _, left, right = edges[edge_pos]
         remaining[left] -= 1
         remaining[right] -= 1
+        just_closed = tuple(
+            tid for tid in (left, right) if remaining[tid] == 0
+        )
 
-        if not has_closed_dangling_vertex():
-            yield from visit(edge_pos + 1, selected_count)
+        # Once all candidate edges incident on a spectator have been decided,
+        # a degree-one Q excitation can never be repaired. Track this count
+        # incrementally instead of re-scanning every touched tensor at every
+        # DFS node. This keeps the exact admissibility rule while making the
+        # exponential search substantially cheaper at high cutoffs.
+        excluded_bad_count = closed_dangling_count + sum(
+            is_invalid_closed_vertex(tid) for tid in just_closed
+        )
+        if not excluded_bad_count:
+            yield from visit(edge_pos + 1, selected_count, excluded_bad_count)
 
         if selected_count < max_degree:
+            included_bad_count = excluded_bad_count
+            for tid in just_closed:
+                included_bad_count -= is_invalid_closed_vertex(tid)
             selected.append(edges[edge_pos][0])
             degrees[left] += 1
             degrees[right] += 1
-            if not has_closed_dangling_vertex():
-                yield from visit(edge_pos + 1, selected_count + 1)
+            for tid in just_closed:
+                included_bad_count += is_invalid_closed_vertex(tid)
+            if not included_bad_count:
+                yield from visit(
+                    edge_pos + 1,
+                    selected_count + 1,
+                    included_bad_count,
+                )
             degrees[left] -= 1
             degrees[right] -= 1
             selected.pop()
@@ -1865,7 +1899,7 @@ def _iter_open_edge_loops(
         remaining[left] += 1
         remaining[right] += 1
 
-    yield from visit(0, 0)
+    yield from visit(0, 0, 0)
 
 
 def _enumerate_open_edge_loops(
@@ -2483,11 +2517,16 @@ def cut_edge_loop_series_expand(
     damping: float = 0.0,
     update: str = "sequential",
     require_fixed_point: bool = True,
+    cache: OpenLoopSeriesCache | None = None,
     max_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
     optimize: Any = "auto-hq",
     contract_opts: dict[str, Any] | None = None,
+    cost_check: bool = False,
+    max_flops_log10: float | None = None,
+    max_peak_memory_log2: float | None = None,
+    on_budget: str = "raise",
     progbar: bool = False,
     bp_opts: dict[str, Any] | None = None,
     **extra_bp_opts,
@@ -2524,6 +2563,16 @@ def cut_edge_loop_series_expand(
         contract_opts = {}
     else:
         contract_opts = dict(contract_opts)
+    max_flops_log10, max_peak_memory_log2, on_budget = _validate_cost_options(
+        max_flops_log10,
+        max_peak_memory_log2,
+        on_budget,
+    )
+    cost_check = _cost_check_requested(
+        cost_check,
+        max_flops_log10,
+        max_peak_memory_log2,
+    )
     if bp_opts is not None and not isinstance(bp_opts, dict):
         raise TypeError("bp_opts must be a mapping or None")
     bp_opts = {} if bp_opts is None else dict(bp_opts)
@@ -2615,15 +2664,31 @@ def cut_edge_loop_series_expand(
 
     base_term = LoopSeriesTerm((), frozenset())
     terms = [base_term]
-    terms.extend(
-        _iter_open_edge_loops(
+    if cache is None:
+        nonvacuum_terms = _iter_open_edge_loops(
             bp.tn,
             edge_cutoff,
             allowed_tids=endpoints,
             excluded_edges=(bond_ind,),
             limits=limits,
         )
-    )
+    elif isinstance(cache, OpenLoopSeriesCache):
+        # The admissibility rule is identical to the open-rho series: only
+        # the cut endpoints may carry a degree-one Q excitation. The cache is
+        # topology-only, so it can safely be reused while tensor values and
+        # BP messages change, provided the index/tensor layout is unchanged.
+        nonvacuum_terms = cache.iter_terms_for(
+            bp.tn,
+            edge_cutoff,
+            endpoints,
+            excluded_edges=(bond_ind,),
+            max_terms=limits.max_terms,
+            max_enumeration_time=limits.max_enumeration_time,
+            max_enumeration_memory=limits.max_enumeration_memory,
+        )
+    else:
+        raise TypeError("cache must be an OpenLoopSeriesCache or None")
+    terms.extend(nonvacuum_terms)
     terms = tuple(
         sorted(
             terms,
@@ -2632,13 +2697,22 @@ def cut_edge_loop_series_expand(
     )
 
     data = None
+    contraction_costs = {}
     for term in terms:
         network, output_inds = _get_d2_cut_edge_excited(bp, bond_ind, term)
-        contracted = network.contract(
+        contracted, cost = _contract_with_preflight(
+            network,
             output_inds=output_inds,
             optimize=optimize,
-            **contract_opts,
+            contract_opts=contract_opts,
+            cost_check=cost_check,
+            max_flops_log10=max_flops_log10,
+            max_peak_memory_log2=max_peak_memory_log2,
+            on_budget=on_budget,
+            label=f"cut-edge loop-series term {term.edges!r}",
         )
+        if cost is not None:
+            contraction_costs[term.edges] = cost
         contribution = contracted.data if hasattr(contracted, "data") else contracted
         data = contribution if data is None else data + contribution
     data = data * bp.sign * 10**bp.exponent
@@ -2653,6 +2727,14 @@ def cut_edge_loop_series_expand(
             "term_count_by_degree": term_count_by_degree,
             "complete": edge_cutoff >= len(pairwise_edges),
             "finite_exact_identity_at_bp_fixed_point": True,
+            "cost_check": cost_check,
+            "contraction_cost": _aggregate_contraction_costs(
+                contraction_costs.values()
+            ),
+            "cost_limits": {
+                "max_flops_log10": max_flops_log10,
+                "max_peak_memory_log2": max_peak_memory_log2,
+            },
         }
     )
     return CutEdgeLoopSeriesResult(
@@ -2665,6 +2747,12 @@ def cut_edge_loop_series_expand(
         bp_info=info,
         term_count_by_degree=term_count_by_degree,
         bp=bp,
+        contraction_costs=contraction_costs,
+        contraction_cost=_aggregate_contraction_costs(contraction_costs.values()),
+        cost_limits={
+            "max_flops_log10": max_flops_log10,
+            "max_peak_memory_log2": max_peak_memory_log2,
+        },
     )
 
 

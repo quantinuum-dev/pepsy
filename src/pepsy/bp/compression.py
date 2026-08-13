@@ -9,9 +9,9 @@ update; it is not a simultaneous whole-network bond fit.
 The cluster contraction is reduced to a four-leg bond environment
 ``B_reduce``.  Its legs are ordered as
 ``(left_ket, right_ket, left_bra, right_bra)``.  By default that environment
-is Hermitian/PSD projected before Quimb's ALS solver sees it.  This keeps the
-local normal equations in the positive cone without forming a fused PEPO
-physical space such as ``d**4`` or ``d**8``.
+is Hermitianized before Quimb's ALS solver sees it. Optional PSD projection
+is available for stabilization without forming a fused PEPO physical space
+such as ``d**4`` or ``d**8``.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from ._compression_utils import (
     resolve_d2bp_boundaries,
     validate_cost_options,
 )
-from .series import cut_edge_loop_series_expand
+from .series import OpenLoopSeriesCache, cut_edge_loop_series_expand
 
 __all__ = [
     "BondClusterCompressionResult",
@@ -133,6 +133,83 @@ def _project_psd(matrix, *, psd_floor: float = 0.0):
     clipped = _scalar_int(ar.do("sum", eigenvalues < floor))
     raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
     return projected, raw_min, clipped
+
+
+def _resolve_environment_projection_options(
+    *,
+    b_reduce: bool | None,
+    hermitian_project: bool,
+    psd_project: bool,
+) -> tuple[bool, bool]:
+    """Validate the explicit environment-projection policy.
+
+    ``b_reduce`` predates the explicit controls and historically meant
+    "Hermitianize and PSD-project" when true, and "Hermitianize only" when
+    false. Keep it as a compatibility alias for ``psd_project`` while making
+    the two mathematically distinct operations visible in the public API.
+    """
+    if b_reduce is not None and not isinstance(b_reduce, bool):
+        raise TypeError("b_reduce must be a bool or None")
+    if not isinstance(hermitian_project, bool):
+        raise TypeError("hermitian_project must be a bool")
+    if not isinstance(psd_project, bool):
+        raise TypeError("psd_project must be a bool")
+    if b_reduce is not None:
+        psd_project = b_reduce
+    if psd_project and not hermitian_project:
+        raise ValueError(
+            "psd_project=True requires hermitian_project=True; a PSD "
+            "projection is necessarily Hermitian"
+        )
+    return hermitian_project, psd_project
+
+
+def _process_bond_environment(
+    data,
+    dimension: int,
+    *,
+    hermitian_project: bool,
+    psd_project: bool,
+    psd_floor: float,
+):
+    """Optionally Hermitian/PSD-project a four-leg bond environment.
+
+    The matrix view groups ``(left_bra, right_bra)`` against
+    ``(left_ket, right_ket)``. The defaults make that metric Hermitian and
+    PSD before ALS. A caller can retain the raw four-leg contraction for
+    diagnostics only by disabling both operations explicitly.
+    """
+    matrix = _reshape(
+        _transpose(data, (2, 3, 0, 1)),
+        (dimension * dimension, dimension * dimension),
+    )
+    hermitian = 0.5 * (matrix + _dag(matrix))
+    eigenvalues = ar.do("linalg.eigvalsh", hermitian)
+    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
+    clipped = 0
+    if psd_project:
+        matrix, raw_min, clipped = _project_psd(matrix, psd_floor=psd_floor)
+    elif hermitian_project:
+        matrix = hermitian
+    return (
+        _transpose(
+            _reshape(matrix, (dimension, dimension, dimension, dimension)),
+            (2, 3, 0, 1),
+        ),
+        raw_min,
+        clipped,
+    )
+
+
+def _environment_projection_diagnostics(
+    *, hermitian_project: bool, psd_project: bool, psd_floor: float
+) -> dict[str, bool | float]:
+    """Return the effective environment-processing policy for results."""
+    return {
+        "hermitian_project": hermitian_project,
+        "psd_project": psd_project,
+        "psd_floor": float(psd_floor),
+    }
 
 
 def _random_rectangular_map(dim: int, rank: int, *, like, rng):
@@ -321,7 +398,8 @@ def _build_b_reduce(
     gauges,
     message_psd_project: bool,
     message_psd_floor: float,
-    b_reduce: bool,
+    hermitian_project: bool,
+    psd_project: bool,
     b_reduce_floor: float,
     optimize,
     cost_check: bool,
@@ -435,27 +513,13 @@ def _build_b_reduce(
             "the selected cluster has an uncontracted non-physical leg"
         )
 
-    matrix = _reshape(_transpose(data, (2, 3, 0, 1)), (dimension**2, dimension**2))
-    hermitian = 0.5 * (matrix + _dag(matrix))
-    eigenvalues = ar.do("linalg.eigvalsh", hermitian)
-    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
-    clipped = 0
-    if b_reduce:
-        matrix, raw_min, clipped = _project_psd(
-            matrix,
-            psd_floor=b_reduce_floor,
-        )
-        data = _transpose(
-            _reshape(matrix, (dimension, dimension, dimension, dimension)),
-            (2, 3, 0, 1),
-        )
-    else:
-        # Keep the raw contraction available for diagnostics, but remove the
-        # roundoff-level anti-Hermitian component before the non-PSD route.
-        data = _transpose(
-            _reshape(hermitian, (dimension, dimension, dimension, dimension)),
-            (2, 3, 0, 1),
-        )
+    data, raw_min, clipped = _process_bond_environment(
+        data,
+        dimension,
+        hermitian_project=hermitian_project,
+        psd_project=psd_project,
+        psd_floor=b_reduce_floor,
+    )
 
     return (
         data,
@@ -473,6 +537,189 @@ def _local_cost(left, right, target, b_reduce) -> float:
     difference = target - approximation
     value = _einsum("ab,cd,abcd->", difference, _conj(difference), b_reduce)
     return _scalar_float(_real(value))
+
+
+def _gram_message_diagnostics(left, right):
+    """Report the balanced Gram gauges of a fitted map pair.
+
+    ``L.conj().T @ L`` and ``R @ R.conj().T`` have the same ``chi x chi``
+    shape. They are useful diagnostics for the map gauge, but normalizing them
+    independently would change the physical map ``L @ R``. Quimb's
+    ``absorb='both'`` factorization makes these gauges balanced without
+    forcing either map to be isometric.
+    """
+    left_gram = _dag(left) @ left
+    right_gram = right @ _dag(right)
+
+    def _message_inner(first, second):
+        first = _reshape(first, (-1,))
+        second = _reshape(second, (-1,))
+        return _scalar_float(_real(ar.do("sum", _conj(first) * second)))
+
+    left_self = _message_inner(left_gram, left_gram)
+    right_self = _message_inner(right_gram, right_gram)
+    cross = _message_inner(left_gram, right_gram)
+    return {
+        "left_gram_self": left_self,
+        "right_gram_self": right_self,
+        "gram_cross": cross,
+        "gram_self_relative_difference": abs(left_self - right_self)
+        / max(abs(left_self), abs(right_self), 1e-300),
+    }
+
+
+def _normalize_map_pair_with_quimb(
+    left,
+    right,
+):
+    """Put an ALS map pair into Quimb's balanced ``absorb='both'`` gauge.
+
+    The ALS objective depends on the product ``L @ R``, so its factorization
+    has an arbitrary internal gauge: ``L @ G`` and ``G^-1 @ R`` represent the
+    same map.  We remove that arbitrary gauge after ALS by refactoring the
+    product with Quimb's public ``array_split`` convention used by
+    ``D2BP.compress``: an SVD with ``absorb='both'`` and ``renorm=0``.  The
+    singular values are therefore split between both factors, rather than
+    forcing either factor to be isometric or introducing a separate scalar
+    normalization.
+
+    The BP message matrices are deliberately not applied here. They already
+    enter ``B_reduce`` (and are pair-normalized with Quimb's
+    ``normalize_message_pair`` convention before that contraction). Applying
+    them again to ``L`` or ``R`` would count the environment twice. This
+    helper only fixes the internal factor gauge. The overall PEPS/PEPO
+    norm correction is deliberately performed after insertion, using the
+    actual network norm rather than ``B_reduce``. A local environment can be
+    approximate (for example for a finite cluster), so using it as a proxy for
+    the global norm would not satisfy the compression contract.
+    """
+    import quimb.tensor as qtn
+
+    product = left @ right
+    left_normalized, _, right_normalized = qtn.decomp.array_split(
+        product,
+        method="svd",
+        absorb="both",
+        max_bond=left.shape[1],
+        cutoff=0.0,
+        renorm=0,
+    )
+    if left_normalized.shape != left.shape or right_normalized.shape != right.shape:
+        raise RuntimeError(
+            "Quimb map normalization changed the fitted map shapes from "
+            f"{left.shape}, {right.shape} to "
+            f"{left_normalized.shape}, {right_normalized.shape}"
+        )
+
+    product_normalized = left_normalized @ right_normalized
+    product_norm = _scalar_float(ar.do("linalg.norm", product))
+    product_error = _scalar_float(
+        ar.do("linalg.norm", product - product_normalized)
+    )
+    relative_product_error = product_error / max(product_norm, 1e-300)
+    normalization = {
+        "method": "quimb.decomp.array_split",
+        "absorb": "both",
+        "renorm": 0,
+        "scalar_factor": 1.0,
+        "message_normalization": "quimb.normalize_message_pair",
+        "messages_applied_to_maps": False,
+        "product_relative_error": relative_product_error,
+    }
+    normalization.update(_gram_message_diagnostics(left_normalized, right_normalized))
+    return left_normalized, right_normalized, normalization
+
+
+def _network_norm(tn, *, optimize, contract_opts):
+    """Compute the actual Frobenius norm used for normalization diagnostics."""
+    return _scalar_float(
+        tn.norm(
+            squared=False,
+            optimize=optimize,
+            **dict(contract_opts),
+        )
+    )
+
+
+def _normalize_inserted_map_pair(
+    tn,
+    bond_ind,
+    left_tid,
+    right_tid,
+    left,
+    right,
+    *,
+    optimize,
+    contract_opts,
+    preserve_norm: bool,
+    normalization: dict[str, Any],
+):
+    """Normalize maps against the full network norm after their insertion.
+
+    ``alpha`` rescales the product ``L @ R``. Splitting it as
+    ``sqrt(alpha)`` on each map keeps the Quimb balanced SVD gauge while
+    changing neither map into an isometry. The correction is on the maps
+    themselves, not on ``TensorNetwork.exponent``, so ``result.bond_maps`` and
+    the returned network describe the same normalized tensors.
+    """
+    raw_compressed, _ = _reconstruct_selected_bond(
+        tn,
+        bond_ind,
+        left_tid,
+        right_tid,
+        left,
+        right,
+    )
+    normalization = dict(normalization)
+    normalization["preserve_norm"] = preserve_norm
+    if not preserve_norm:
+        normalization["norm_before"] = None
+        normalization["norm_after_raw_maps"] = None
+        normalization["norm_after_maps"] = None
+        return raw_compressed, left, right, normalization
+
+    norm_before = _network_norm(
+        tn,
+        optimize=optimize,
+        contract_opts=contract_opts,
+    )
+    norm_after_raw = _network_norm(
+        raw_compressed,
+        optimize=optimize,
+        contract_opts=contract_opts,
+    )
+    if not np.isfinite(norm_before) or not np.isfinite(norm_after_raw):
+        raise ValueError("cannot preserve the PEPS/PEPO norm: non-finite norm")
+    if norm_before <= 0.0 or norm_after_raw <= 0.0:
+        raise ValueError(
+            "cannot preserve the PEPS/PEPO norm: expected positive norms, "
+            f"got {norm_before!r} and {norm_after_raw!r}"
+        )
+
+    scalar_factor = norm_before / norm_after_raw
+    map_scale = float(np.sqrt(scalar_factor))
+    left = left * map_scale
+    right = right * map_scale
+    compressed, _ = _reconstruct_selected_bond(
+        tn,
+        bond_ind,
+        left_tid,
+        right_tid,
+        left,
+        right,
+    )
+    normalization.update(
+        {
+            "scalar_factor": float(scalar_factor),
+            "norm_scope": "full_network",
+            "norm_before": norm_before,
+            "norm_after_raw_maps": norm_after_raw,
+            "norm_after_maps": norm_after_raw * scalar_factor,
+            "map_scale_left": map_scale,
+            "map_scale_right": map_scale,
+        }
+    )
+    return compressed, left, right, normalization
 
 
 def _fit_maps(
@@ -683,6 +930,8 @@ class BondClusterCompressionResult:
     max_bond: int
     bp_info: dict[str, Any] | None = None
     contraction_cost: dict[str, float] | None = None
+    environment_projection: dict[str, bool | float] | None = None
+    normalization: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -705,6 +954,10 @@ class BondLoopSeriesCompressionResult:
     term_count: int
     bp_info: dict[str, Any] | None = None
     series: Any = None
+    contraction_cost: dict[str, float] | None = None
+    cost_limits: dict[str, float | None] | None = None
+    environment_projection: dict[str, bool | float] | None = None
+    normalization: dict[str, Any] | None = None
 
 
 def compress_bond_loop_series(
@@ -720,19 +973,27 @@ def compress_bond_loop_series(
     bp_runner: str = "plain",
     bp_opts: dict[str, Any] | None = None,
     require_fixed_point: bool = True,
+    loop_cache: OpenLoopSeriesCache | None = None,
     max_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
-    b_reduce: bool = True,
+    b_reduce: bool | None = None,
+    hermitian_project: bool = True,
+    psd_project: bool = False,
     b_reduce_floor: float = 0.0,
     init: str = "b_reduce",
     steps: int = 20,
     tol: float = 1e-9,
     contract_optimize="auto-hq",
     contract_opts: dict[str, Any] | None = None,
+    cost_check: bool = False,
+    max_flops_log10: float | None = None,
+    max_peak_memory_log2: float | None = None,
+    on_budget: str = "raise",
     als_opts: dict[str, Any] | None = None,
     seed=None,
     inplace: bool = False,
+    preserve_norm: bool = True,
     progbar: bool = False,
 ) -> BondLoopSeriesCompressionResult:
     """Compress one bond with the finite cut-edge ``P + Q`` expansion.
@@ -747,8 +1008,14 @@ def compress_bond_loop_series(
     adds admissible excitations, including disconnected terms. If the cutoff
     reaches all non-cut internal edges, ``series.complete`` is true and, at a
     converged BP fixed point, the finite-network environment is exact up to
-    contraction precision. Partial sums need not be PSD, so
-    ``b_reduce=True`` projects the metric before ALS.
+    contraction precision. Partial sums need not be PSD, so the default
+    Hermitian projection is applied by default; PSD projection is opt-in.
+
+    ``preserve_norm=True`` (the default) applies a reported global amplitude
+    correction after inserting the maps. The correction matches the norm
+    before and after compression in the full PEPS/PEPO network; it is split
+    between the non-isometric maps, so the returned network exponent is not
+    changed.
     """
     _validate_dense_peps_like(tn)
     if not isinstance(where, (tuple, list)) or len(where) != 2:
@@ -759,8 +1026,13 @@ def compress_bond_loop_series(
         raise TypeError("require_fixed_point must be a bool")
     if not isinstance(inplace, bool):
         raise TypeError("inplace must be a bool")
-    if not isinstance(b_reduce, bool):
-        raise TypeError("b_reduce must be a bool")
+    if not isinstance(preserve_norm, bool):
+        raise TypeError("preserve_norm must be a bool")
+    hermitian_project, psd_project = _resolve_environment_projection_options(
+        b_reduce=b_reduce,
+        hermitian_project=hermitian_project,
+        psd_project=psd_project,
+    )
     if not np.isfinite(tol) or tol < 0.0:
         raise ValueError("tol must be finite and nonnegative")
     if not np.isfinite(b_reduce_floor) or b_reduce_floor < 0.0:
@@ -784,11 +1056,16 @@ def compress_bond_loop_series(
         bp_runner=bp_runner,
         bp_opts=bp_opts,
         require_fixed_point=require_fixed_point,
+        cache=loop_cache,
         max_terms=max_terms,
         max_enumeration_time=max_enumeration_time,
         max_enumeration_memory=max_enumeration_memory,
         optimize=contract_optimize,
         contract_opts=contract_opts,
+        cost_check=cost_check,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+        on_budget=on_budget,
         progbar=progbar,
     )
 
@@ -822,26 +1099,30 @@ def compress_bond_loop_series(
             term_count=len(series.terms),
             bp_info=series.bp_info,
             series=series,
+            contraction_cost=series.contraction_cost,
+            cost_limits=series.cost_limits,
+            environment_projection=_environment_projection_diagnostics(
+                hermitian_project=hermitian_project,
+                psd_project=psd_project,
+                psd_floor=b_reduce_floor,
+            ),
+            normalization={
+                "method": "identity",
+                "absorb": "none",
+                "renorm": 0,
+                "scalar_factor": 1.0,
+                "message_normalization": "not_needed",
+                "messages_applied_to_maps": False,
+                "product_relative_error": 0.0,
+            },
         )
 
-    matrix = _reshape(
-        _transpose(b_data, (2, 3, 0, 1)),
-        (dimension * dimension, dimension * dimension),
-    )
-    hermitian = 0.5 * (matrix + _dag(matrix))
-    eigenvalues = ar.do("linalg.eigvalsh", hermitian)
-    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
-    clipped = 0
-    if b_reduce:
-        matrix, raw_min, clipped = _project_psd(
-            matrix,
-            psd_floor=float(b_reduce_floor),
-        )
-    else:
-        matrix = hermitian
-    b_data = _transpose(
-        _reshape(matrix, (dimension, dimension, dimension, dimension)),
-        (2, 3, 0, 1),
+    b_data, raw_min, clipped = _process_bond_environment(
+        b_data,
+        dimension,
+        hermitian_project=hermitian_project,
+        psd_project=psd_project,
+        psd_floor=float(b_reduce_floor),
     )
 
     left, right, costs = _fit_maps(
@@ -854,20 +1135,37 @@ def compress_bond_loop_series(
         contract_optimize=contract_optimize,
         als_opts=als_opts,
         seed=seed,
-        positive_environment=b_reduce,
+        positive_environment=psd_project,
         progbar=progbar,
     )
+    left, right, normalization = _normalize_map_pair_with_quimb(
+        left,
+        right,
+    )
+    # Report the error of the factors that are actually inserted.  The
+    # Quimb refactor preserves ``L @ R`` up to decomposition precision, but
+    # using the post-normalization product keeps the result self-consistent.
+    final_cost = _local_cost(
+        left,
+        right,
+        _eye(dimension, like=b_data),
+        b_data,
+    )
     left_tid, right_tid = series.where
-    compressed, _ = _reconstruct_selected_bond(
+    compressed, left, right, normalization = _normalize_inserted_map_pair(
         work,
         series.bond_ind,
         left_tid,
         right_tid,
         left,
         right,
+        optimize=contract_optimize,
+        contract_opts=contract_opts,
+        preserve_norm=preserve_norm,
+        normalization=normalization,
     )
     initial_cost = max(0.0, costs[0])
-    final_cost = max(0.0, costs[-1])
+    final_cost = max(0.0, final_cost)
     initial_error = float(np.sqrt(initial_cost))
     final_error = float(np.sqrt(final_cost))
     target_norm = float(
@@ -904,6 +1202,14 @@ def compress_bond_loop_series(
         term_count=len(series.terms),
         bp_info=series.bp_info,
         series=series,
+        contraction_cost=series.contraction_cost,
+        cost_limits=series.cost_limits,
+        environment_projection=_environment_projection_diagnostics(
+            hermitian_project=hermitian_project,
+            psd_project=psd_project,
+            psd_floor=b_reduce_floor,
+        ),
+        normalization=normalization,
     )
 
 
@@ -921,7 +1227,9 @@ def compress_bond_cluster(
     message_psd_project: bool = True,
     message_psd_floor: float = 0.0,
     max_distance: int = 0,
-    b_reduce: bool = True,
+    b_reduce: bool | None = None,
+    hermitian_project: bool = True,
+    psd_project: bool = False,
     b_reduce_floor: float = 0.0,
     init: str = "b_reduce",
     steps: int = 20,
@@ -934,6 +1242,7 @@ def compress_bond_cluster(
     als_opts: dict[str, Any] | None = None,
     seed=None,
     inplace: bool = False,
+    preserve_norm: bool = True,
     progbar: bool = False,
 ) -> BondClusterCompressionResult:
     """Compress one selected virtual bond with a BP/SU-closed cluster.
@@ -992,10 +1301,15 @@ def compress_bond_cluster(
         subspaces of the two Quimb-contracted bond marginals and is the
         default. ``"projector"`` and ``"random"`` are deterministic and
         stochastic alternatives, respectively.
+    hermitian_project, psd_project
+        Hermitianize and PSD-project the contracted four-leg ``B_reduce``
+        environment before ALS. Hermitian projection defaults to true and PSD
+        projection defaults to false; PSD projection requires Hermitian
+        projection. Set both false only for raw-environment diagnostics.
     b_reduce
-        Hermitian/PSD-project the contracted four-leg ``B_reduce`` environment
-        before ALS. This is enabled by default and is recommended for stable
-        positive local normal equations.
+        Backwards-compatible alias for ``psd_project``. If supplied, it takes
+        precedence over ``psd_project`` while Hermitian projection remains
+        controlled by ``hermitian_project``.
     b_reduce_floor
         Relative eigenvalue floor used by the ``b_reduce`` projection.
     cost_check
@@ -1013,6 +1327,10 @@ def compress_bond_cluster(
         Problem-defining arguments are protected from override.
     inplace
         Replace the input network's tensors with the locally compressed result.
+    preserve_norm
+        Match the pre- and post-compression full PEPS/PEPO norm by splitting
+        a positive amplitude correction across the returned maps. Set false
+        to leave the raw compressed amplitude unchanged.
 
     Returns
     -------
@@ -1038,12 +1356,17 @@ def compress_bond_cluster(
         raise ValueError("tol must be finite and nonnegative")
     for name, value in (
         ("message_psd_project", message_psd_project),
-        ("b_reduce", b_reduce),
         ("inplace", inplace),
+        ("preserve_norm", preserve_norm),
         ("progbar", progbar),
     ):
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a bool")
+    hermitian_project, psd_project = _resolve_environment_projection_options(
+        b_reduce=b_reduce,
+        hermitian_project=hermitian_project,
+        psd_project=psd_project,
+    )
     for name, value in (
         ("message_psd_floor", message_psd_floor),
         ("b_reduce_floor", b_reduce_floor),
@@ -1126,6 +1449,20 @@ def compress_bond_cluster(
             clipped_eigenvalues=0,
             steps=0,
             max_bond=rank,
+            environment_projection=_environment_projection_diagnostics(
+                hermitian_project=hermitian_project,
+                psd_project=psd_project,
+                psd_floor=b_reduce_floor,
+            ),
+            normalization={
+                "method": "identity",
+                "absorb": "none",
+                "renorm": 0,
+                "scalar_factor": 1.0,
+                "message_normalization": "not_needed",
+                "messages_applied_to_maps": False,
+                "product_relative_error": 0.0,
+            },
         )
 
     # Closure precedence is explicit D2BP messages, then SU diagonal vectors,
@@ -1156,7 +1493,8 @@ def compress_bond_cluster(
         gauges=gauge_inputs,
         message_psd_project=message_psd_project,
         message_psd_floor=float(message_psd_floor),
-        b_reduce=b_reduce,
+        hermitian_project=hermitian_project,
+        psd_project=psd_project,
         b_reduce_floor=float(b_reduce_floor),
         optimize=contract_optimize,
         cost_check=cost_check,
@@ -1174,18 +1512,34 @@ def compress_bond_cluster(
         contract_optimize=contract_optimize,
         als_opts=als_opts,
         seed=seed,
-        positive_environment=b_reduce,
+        positive_environment=psd_project,
         progbar=progbar,
     )
-    compressed, _ = _reconstruct_selected_bond(
+    left, right, normalization = _normalize_map_pair_with_quimb(
+        left,
+        right,
+    )
+    # Use the refactored pair for the reported objective as well as for the
+    # tensor insertion, rather than reporting the pre-normalization ALS pair.
+    final_cost = _local_cost(
+        left,
+        right,
+        _eye(dimension, like=b_data),
+        b_data,
+    )
+    compressed, left, right, normalization = _normalize_inserted_map_pair(
         work,
         bond_ind,
         left_tid,
         right_tid,
         left,
         right,
+        optimize=contract_optimize,
+        contract_opts={},
+        preserve_norm=preserve_norm,
+        normalization=normalization,
     )
-    final_cost = max(0.0, costs[-1])
+    final_cost = max(0.0, final_cost)
     initial_cost = max(0.0, costs[0])
     initial_error = float(np.sqrt(initial_cost))
     final_error = float(np.sqrt(final_cost))
@@ -1222,4 +1576,10 @@ def compress_bond_cluster(
         max_bond=rank,
         bp_info=bp_info,
         contraction_cost=contraction_cost,
+        environment_projection=_environment_projection_diagnostics(
+            hermitian_project=hermitian_project,
+            psd_project=psd_project,
+            psd_floor=b_reduce_floor,
+        ),
+        normalization=normalization,
     )

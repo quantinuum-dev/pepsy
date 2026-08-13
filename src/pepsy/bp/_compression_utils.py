@@ -312,6 +312,7 @@ def contract_with_preflight(
     *,
     output_inds,
     optimize,
+    contract_opts: dict[str, Any] | None = None,
     cost_check: bool,
     max_flops_log10: float | None,
     max_peak_memory_log2: float | None,
@@ -319,11 +320,18 @@ def contract_with_preflight(
     label: str,
 ):
     """Estimate then contract one network, reusing the estimated tree."""
+    contract_opts = {} if contract_opts is None else dict(contract_opts)
     if cost_check:
+        if "get" in contract_opts:
+            raise TypeError(
+                "contract_opts['get'] cannot be combined with contraction cost "
+                "limits; use the returned contraction diagnostics instead"
+            )
         tree = network.contract(
             get="tree",
             output_inds=output_inds,
             optimize=optimize,
+            **contract_opts,
         )
         cost = estimate_cost(tree)
         enforce_cost_budget(
@@ -334,11 +342,19 @@ def contract_with_preflight(
             label=label,
         )
         return (
-            network.contract(output_inds=output_inds, optimize=tree),
+            network.contract(
+                output_inds=output_inds,
+                optimize=tree,
+                **contract_opts,
+            ),
             cost.as_dict(),
         )
     return (
-        network.contract(output_inds=output_inds, optimize=optimize),
+        network.contract(
+            output_inds=output_inds,
+            optimize=optimize,
+            **contract_opts,
+        ),
         None,
     )
 

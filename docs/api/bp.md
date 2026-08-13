@@ -230,6 +230,20 @@ tensors; no isometry, orthogonality, or adjoint constraint is imposed. The
 endpoint and spectator site tensors are fixed, and no QR/LQ split or gate is
 used. All other virtual bonds are unchanged.
 
+After ALS, Pepsy refactors `L @ R` with Quimb's public
+`qtn.decomp.array_split(..., absorb="both", renorm=0)` convention, matching
+the factor-balancing used by `D2BP.compress`. This removes the arbitrary ALS
+internal gauge while preserving the fitted product; it does not force either
+map to be isometric and it does not apply the BP message matrices a second
+time. Those messages already define `B_reduce`. The diagnostic
+`result.normalization` reports the method, the Quimb message-pair convention,
+and the relative product reconstruction error. With `preserve_norm=True`, the
+product-amplitude correction `scalar_factor` is split symmetrically between
+the maps (`L <- sqrt(alpha) L`, `R <- sqrt(alpha) R`) using the selected-bond
+full-network norm. No tensor-network exponent or separate global scalar is
+changed. `messages_applied_to_maps=False` is intentional: the messages
+already weight `B_reduce`; they are not applied to `L, R` a second time.
+
 The default `init="b_reduce"` uses Quimb tensor contractions to form the two
 bond marginals of `B_reduce` and takes their dominant `chi` subspaces as the
 ALS starting maps. Use `init="projector"` or `init="random"` for simpler
@@ -243,13 +257,17 @@ adapter.
 
 For a radius-zero cluster, every cut bond is closed by fresh D2BP messages,
 explicit directed D2BP messages, or SU vectors. SU vectors are interpreted as
-`diag(lambda)` boundary closures. Set `b_reduce=True` (the default) to
-Hermitian/PSD-project the
-contracted `B_reduce` before ALS; `result.B_reduce` exposes the retained
-four-leg environment in `(left_ket, right_ket, left_bra, right_bra)` order.
-This makes the local normal equations positive while avoiding the physical-leg
-fusion that produces `d^4` PEPS or `d^8` PEPO dense spaces. PEPO lower and upper
-legs remain separate. The cluster contraction can still be expensive as
+`diag(lambda)` boundary closures. By default, `hermitian_project=True` makes
+the contracted `B_reduce` Hermitian while `psd_project=False` retains its
+eigenvalues. Set `psd_project=True` to clip negative eigenvalues for a
+positive ALS metric. `result.environment_projection` records the effective
+policy and the number of clipped eigenvalues is reported separately. Set both
+options false only for raw-environment diagnostics. `b_reduce=...` remains a
+backwards-compatible alias for `psd_project`. `result.B_reduce` exposes the
+retained four-leg environment in `(left_ket, right_ket, left_bra, right_bra)`
+order. This makes the local normal equations positive while avoiding the
+physical-leg fusion that produces `d^4` PEPS or `d^8` PEPO dense spaces. PEPO
+lower and upper legs remain separate. The cluster contraction can still be expensive as
 `max_distance` grows, so pass an appropriate Cotengra optimizer and use
 `max_flops_log10` / `max_peak_memory_log2` to preflight it. The estimate is
 returned in `result.contraction_cost`.
@@ -273,15 +291,54 @@ result = compress_bond_loop_series(
 )
 ```
 
+For a cutoff ladder, or repeated compression attempts on an unchanged PEPS
+topology, reuse an `OpenLoopSeriesCache`. It caches only the admissible
+Q-edge geometry for each cut bond and cutoff; every call still contracts the
+current tensors and BP messages:
+
+```python
+from pepsy.bp import OpenLoopSeriesCache, compress_bond_loop_series
+
+cache = OpenLoopSeriesCache()
+for cutoff in (2, 4, 6):
+    result = compress_bond_loop_series(
+        peps,
+        where=((0, 0), (1, 0)),
+        max_bond=chi,
+        edge_cutoff=cutoff,
+        loop_cache=cache,
+    )
+```
+
+The same cache can be passed directly as `cache=...` to
+`cut_edge_loop_series_expand`. Changing the PEPS index layout or bond
+dimensions intentionally invalidates it and requires a fresh cache.
+
+The cut-edge route accepts the same local contraction-budget policy as the
+cluster compressor. Set `cost_check=True`, or provide
+`max_flops_log10` / `max_peak_memory_log2`, to estimate every retained term
+with Cotengra before contracting it. The default `on_budget="raise"` stops on
+an over-budget term; `"warn"` reports the violation and raises as well, while
+`"ignore"` records the estimate and continues. The expansion result exposes
+per-term `contraction_costs`, aggregate `contraction_cost`, and the requested
+`cost_limits`; `BondLoopSeriesCompressionResult` forwards the aggregate cost
+and limits.
+
 Use `cut_edge_loop_series_expand` when only the environment is needed. The
 returned `terms` and `term_count_by_degree` make the convergence ladder
 explicit. `edge_cutoff=0` is the BP vacuum; when the cutoff reaches all
 non-cut internal edges, `complete=True` and the finite-network sum is an
 exact `P + Q` identity expansion at a converged BP fixed point, up to
 numerical contraction error. Partial sums need not be monotone or PSD, so
-`b_reduce=True` projects the environment before ALS. This finite route
+the default `hermitian_project=True, psd_project=False` Hermitianizes the
+environment before ALS. Set `psd_project=True` for an explicitly positive
+metric. This finite route
 retains disconnected Q configurations explicitly; it does not apply the
 paper's infinite-lattice free-energy suppression factor.
+
+The fitted loop-series maps use the same post-ALS Quimb balanced
+factorization as `compress_bond_cluster`. Inspect `result.normalization` to
+verify the symmetric map normalization and the pre/post full-network norms.
 
 This is separate from `compress_reduced_loop_cluster`. The latter combines
 operator-valued regional environments additively for the reduced ALS metric.
