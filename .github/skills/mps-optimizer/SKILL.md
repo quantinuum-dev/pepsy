@@ -68,25 +68,43 @@ deprecated compatibility path that temporarily reorders, runs, and swaps back.
 
 `optimizer.info_c["cur_orthog"]` is algorithm state, not cosmetic metadata.
 
+Canonical MPS modes require an open-boundary MPS. Reject cyclic states before
+constructor, `set_p()`, or mode-switch mutations because a periodic loop has no
+exact one-tensor mixed-canonical norm. Exact mode may contract a cyclic input
+before rebuilding an open MPS.
+
 - `_current_orthog` may scan only when the state metadata is unknown.
 - Pass the tracked range through Quimb `info` arguments and canonicalization.
 - Local Pauli expectations should use `local_expectation_canonical` when
   available and move the center from the tracked range to the support.
 - Norm diagnostics should canonicalize to one center and use its tensor norm;
   do not replace this with a global doubled-network contraction.
-- Local non-unitary scale control normalizes active canonical tensors and adds
+- Local non-unitary scale control reuses an authoritative singleton center
+  inside the active span, collapsing only a genuinely broad center, and adds
   the removed base-10 scale to `p.exponent`.
 - Every rebuilt/replaced live MPS needs its known canonical span recorded.
+- `set_p()` starts a new fidelity interval. Manual normalization and layout
+  changes preserve cumulative fidelity but must invalidate/rebase raw unitary
+  norm scalars; normalization must also restore a valid one-site center at its
+  insertion site.
 - Temporary target copies (`p.copy()`) must use isolated metadata and must not
   overwrite the live `info_c` dictionary.
 - FIT may consume an optimizer-owned guess/target to remove redundant copies,
   but mixed mode must still isolate the complete trial before mutation.
+- Mixed in-place trial copies and commits must preserve each tensor's
+  `left_inds` isometry metadata as well as its native array data.
 - After FIT, reuse its final center and norm for stabilization and canonical
   metadata instead of scanning or canonicalizing the active interval again.
 - Unitary one-site gates preserve the existing center. Do not replace the
   cache with the gate site. MPO/SVD/swap compression should reuse the
   one-site center left by the backend and read that tensor norm directly;
   collapse a span only when the backend genuinely leaves a broad center.
+- Single-gate DMRG target norms should use the canonical dense/native local
+  expectation before contracting the already-materialized FIT target. Batch
+  fallback work belongs in the `infidelity.target_norm` timing stage.
+- Preserve unclipped norm-ratio diagnostics. A significant retained-norm
+  overshoot is a broken orthogonal-projection invariant and must raise rather
+  than being silently clipped to fidelity one.
 
 After a mutation that invalidates canonicality, either canonicalize explicitly
 or invalidate the cache before any canonical-only operation. Unitary one-site

@@ -16,7 +16,8 @@ Changes for the next release should be added here before the version is bumped.
 
 - MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
   `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
-  and `stabilize_unitary` now covers mixed MPO warm-up/fallback compression.
+  and `stabilize_unitary` now covers DMRG, mixed MPO warm-up/fallback, and the
+  standalone MPO/swap/permutation/SVD compression modes.
 - PEPS boundary contractions expose typed per-fit convergence diagnostics,
   opt-in detailed timing, `return_info=True` on scalar norm helpers, and an
   information-preserving `peps_fidelity(..., return_info=True)` path.
@@ -33,6 +34,18 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Native Symmray MPS compression now measures non-unitary target norms from a
+  sector-preserving canonical active-span overlap instead of constructing a
+  routed target copy, and native bosonic FIT reuses audited reversed-sweep
+  environments. Infidelity samples identify the target-norm source route.
+- MPS/FIT diagnostics now rebase unitary norm tracking after state replacement,
+  manual normalization, and layout changes; profile DMRG target-norm work; keep
+  unclipped norm-ratio diagnostics with an overshoot guard; and compute one
+  terminal canonical-center norm per FIT sweep. Reused FIT objects reset
+  per-run traces and split metadata, and full-chain entry points reject invalid
+  sweep counts consistently. Canonical modes reject cyclic MPS inputs, local
+  normalization reuses FIT's singleton center without an extra QR sweep, and
+  mixed in-place commits preserve Quimb isometry metadata.
 - Two-site PEPS boundary warm starts retain their requested future bond caps
   instead of treating the current rank as the cap; target replacement,
   per-call FIT overrides, and lowering `chi` now preserve explicit policy.

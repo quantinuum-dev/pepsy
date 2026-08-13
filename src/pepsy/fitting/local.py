@@ -407,7 +407,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.warning = warning
         self.timing_records: List[Dict[str, Any]] = []
         self.fidelity_trace: List[float] = []
-        self.local_norm_trace: List[float] = []
+        self.local_norm_trace: List[Any] = []
         self.sweep_norm_trace: List[float] = []
         self.iterations_run = 0
         self.converged = False
@@ -507,15 +507,22 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
         )
 
-        # Dense arrays and the audited conjugated native-fermion gauge can
-        # reuse partial environments across an immediate direction reversal.
-        # Bosonic Symmray remains conservative until its ownership and fusion
-        # metadata have an equivalent audit.
+        # Dense arrays, the audited conjugated native-fermion gauge, and the
+        # native bosonic Symmray route can reuse partial environments across
+        # an immediate direction reversal. Keep mixed-backend or explicitly
+        # generic bosonic Symmray fits conservative: only the native route has
+        # the zero-copy ownership/fusion-metadata contract exercised here.
         native_fermionic_pair = (
             self.tn.isfermionic() and self.p.isfermionic()
         )
+        native_bosonic_symmray_pair = (
+            symmray_native_available
+            and not native_fermionic_pair
+            and self.environment_strategy == "symmray-native"
+        )
         self._allow_sweep_environment_reuse = (
             native_fermionic_pair
+            or native_bosonic_symmray_pair
             or not any(
                 type(tensor.data).__module__.split(".", 1)[0] == "symmray"
                 for tensor in (*self.tn.tensors, *self.p.tensors)
@@ -679,6 +686,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
+        if not isinstance(n_iter, Integral) or int(n_iter) < 1:
+            raise ValueError("n_iter must be a positive integer.")
+        n_iter = int(n_iter)
+        self._reset_run_traces()
 
         psi = self.p
         L = self.L
@@ -826,6 +837,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
+        if not isinstance(n_iter, Integral) or int(n_iter) < 1:
+            raise ValueError("n_iter must be a positive integer.")
+        n_iter = int(n_iter)
+        self._reset_run_traces()
 
         if not isinstance(block_size, Integral) or int(block_size) not in {1, 2, 3}:
             raise ValueError("block_size must be 1, 2, or 3.")
@@ -1718,6 +1733,59 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """Return a physical-ket view for optional user diagnostics."""
         return psi.H if self._fermionic_bra_working else psi
 
+    def _reset_run_traces(self):
+        """Clear diagnostics that describe one invocation rather than lifetime."""
+        self.fidelity_trace = []
+        self.local_norm_trace = []
+        self.sweep_norm_trace = []
+        self.info.pop("two_site_splits", None)
+        self.info.pop("three_site_splits", None)
+
+    @staticmethod
+    def _sweep_diagnostics_to_host(
+        psi,
+        start,
+        stop,
+        final_norm,
+        *,
+        check_finite,
+        read_norm,
+    ):
+        """Transfer one compact backend-native diagnostic vector per sweep.
+
+        ``finite_check=True`` reduces every active tensor (including native
+        Symmray blocks) to backend boolean scalars before the transfer. If rtol
+        also needs the retained norm, that scalar shares the same transfer.
+        """
+        scalars = []
+        finite_count = 0
+        if check_finite:
+            for site in range(start, stop + 1):
+                for array in _iter_backend_arrays(psi[site]):
+                    scalars.append(ar.do("all", ar.do("isfinite", array)))
+                    finite_count += 1
+            scalars.append(ar.do("isfinite", final_norm))
+            finite_count += 1
+        if read_norm:
+            scalars.append(ar.do("real", final_norm))
+
+        if not scalars:
+            return True, None
+        try:
+            host_values = np.asarray(
+                ar.to_numpy(ar.do("stack", scalars))
+            ).reshape(-1)
+        except Exception:
+            # Supported dense and Symmray backends take the single-transfer
+            # route. Retain a conservative fallback for custom autoray leaves.
+            host_values = np.asarray(
+                [np.asarray(ar.to_numpy(value)).item() for value in scalars]
+            ).reshape(-1)
+
+        finite = bool(np.all(host_values[:finite_count])) if check_finite else True
+        norm = float(host_values[-1]) if read_norm else None
+        return finite, norm
+
     @staticmethod
     def _active_bond_rank_targets(psi, start, stop, max_bond):
         """Return physical-rank ceilings for bonds inside an active window.
@@ -1967,24 +2035,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 f,
                 (site,),
             )
-            # ``f`` is already a single effective tensor. Canonicalization
-            # makes the center-to-MPS map isometric, and this local update is
-            # an orthogonal projection, so for A = ||f|| and target norm T,
-            # the true normalized fidelity is (A / T)**2. In particular, for
-            # a normalized ``p_target`` the true infidelity is 1 - A**2.
-            # Computing A directly also avoids constructing a doubled tensor
-            # network and replanning a contraction for every one-site update.
-            norm_f = f.norm()
+            # Only the final update's sweep-facing tensor is the retained
+            # canonical center returned to the caller. Its norm A determines
+            # fidelity through (A / T)**2, or true infidelity 1 - A**2 for a
+            # normalized target. Earlier local norms are neither used nor
+            # authoritative after subsequent updates, so do not reduce them.
+            terminal_update = site == (stop if direction == "R" else start)
+            norm_f = f.norm() if terminal_update else None
             effective_finished = (
                 self._timing_mark(f, norm_f)
+                if terminal_update and timing_record is not None
+                else self._timing_mark(f)
                 if timing_record is not None
                 else None
             )
-            self.local_norm_trace.append(ar.do("real", norm_f))
+            if terminal_update:
+                self.local_norm_trace.append(ar.do("real", norm_f))
             psi[site].modify(data=f.data)
             self._resolve_fermionic_writeback_phase(psi[site])
             writeback_finished = (
-                self._timing_mark(psi[site], self.local_norm_trace[-1])
+                self._timing_mark(psi[site], norm_f)
+                if terminal_update and timing_record is not None
+                else self._timing_mark(psi[site])
                 if timing_record is not None
                 else None
             )
@@ -2218,14 +2290,18 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 right_tensor,
             )
 
-            # The SVD absorbs the retained singular values into the
-            # sweep-facing center. Orthogonal SVD truncation preserves the
-            # FIT projection identity, so if its norm is A and the target
-            # norm is T, fidelity = (A / T)**2; for normalized ``p_target``,
-            # true infidelity = 1 - A**2. Measuring ``theta`` before
-            # truncation would therefore overstate the retained fidelity.
+            # The terminal SVD absorbs the retained singular values into the
+            # final canonical center. Its norm A obeys the FIT projection
+            # identity fidelity = (A / T)**2; for normalized ``p_target``, true
+            # infidelity = 1 - A**2. Intermediate center norms are superseded
+            # by later updates and would add a redundant backend reduction.
             center = right_tensor if direction == "R" else left_tensor
-            self.local_norm_trace.append(ar.do("real", center.norm()))
+            terminal_update = (
+                right_site == stop if direction == "R" else left_site == start
+            )
+            retained_norm = center.norm() if terminal_update else None
+            if terminal_update:
+                self.local_norm_trace.append(ar.do("real", retained_norm))
             if collect_split_diagnostics:
                 self.info.setdefault("two_site_splits", []).append(
                     {
@@ -2240,7 +2316,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
             writeback_finished = (
-                self._timing_mark(center, self.local_norm_trace[-1])
+                self._timing_mark(center, retained_norm)
+                if terminal_update and timing_record is not None
+                else self._timing_mark(center)
                 if timing_record is not None
                 else None
             )
@@ -2521,12 +2599,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 right_tensor,
             )
 
-            # The final sweep-facing tensor carries the retained center norm
+            # The terminal sweep-facing tensor carries the retained center norm
             # A after both orthogonal truncations. As in the two-site path,
-            # fidelity = (A / ||p_target||)**2, and a normalized target has
-            # true infidelity 1 - A**2.
+            # fidelity = (A / ||p_target||)**2, and a normalized target has true
+            # infidelity 1 - A**2. Earlier centers do not survive the sweep.
             center = right_tensor if direction == "R" else left_tensor
-            self.local_norm_trace.append(ar.do("real", center.norm()))
+            terminal_update = (
+                right_site == stop if direction == "R" else left_site == start
+            )
+            retained_norm = center.norm() if terminal_update else None
+            if terminal_update:
+                self.local_norm_trace.append(ar.do("real", retained_norm))
             if collect_split_diagnostics:
                 self.info.setdefault("three_site_splits", []).append(
                     {
@@ -2553,7 +2636,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
             writeback_finished = (
-                self._timing_mark(center, self.local_norm_trace[-1])
+                self._timing_mark(center, retained_norm)
+                if terminal_update and timing_record is not None
+                else self._timing_mark(center)
                 if timing_record is not None
                 else None
             )
@@ -2665,11 +2750,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         norm changes by at most ``rtol`` across a ``patience``-sample window.
         Thus ``patience=2`` means one stable comparison between two same-phase
         sweep norms; ``patience=1`` retains the same minimum comparable pair.
-        ``finite_check=True`` checks only the already-computed per-site norm
-        scalars, transferring one tiny vector per sweep. A callable retains
-        the general state-check callback behavior. ``timing=True`` records one
-        wall-clock entry per sweep and per active-site update. Accelerator
-        timings become kernel-complete when ``timing_sync_device=True``.
+        ``finite_check=True`` reduces all active tensor blocks to native
+        finite-status scalars and transfers one tiny vector per sweep. The
+        terminal retained norm used by ``rtol`` shares that transfer. A callable
+        retains the general state-check callback behavior. ``timing=True``
+        records one wall-clock entry per sweep and per active-site update.
+        Accelerator timings become kernel-complete when
+        ``timing_sync_device=True``.
         ``three_site_sweeps`` controls how many initial sweeps use the
         three-site update when ``adaptive_block_sweeps`` is not supplied.
         ``adaptive_block_sweeps`` requests a common adaptive warm-up for
@@ -2766,7 +2853,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if timing:
             self.timing_records = []
 
-        self.sweep_norm_trace = []
+        self._reset_run_traces()
         self.iterations_run = 0
         self.converged = False
         self.convergence_reason = "max_sweeps"
@@ -2943,6 +3030,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
                 self.final_direction = direction
                 self.final_center_site = stop if direction == "R" else start
+                if len(self.local_norm_trace) != sweep_norm_start + 1:
+                    raise RuntimeError(
+                        "FIT sweep did not produce exactly one terminal center norm."
+                    )
                 self.final_norm = self.local_norm_trace[-1]
 
                 if verbose:
@@ -2962,24 +3053,19 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     error.fit_iteration = sweep
                     raise error
 
+                sweep_norm = None
                 if finite_check is True or rtol is not None:
-                    sweep_scalars = self.local_norm_trace[sweep_norm_start:]
-                    try:
-                        sweep_norms = np.asarray(
-                            ar.to_numpy(ar.do("stack", sweep_scalars))
-                        ).reshape(-1)
-                    except Exception:
-                        # Unknown backends can omit scalar stack. NumPy,
-                        # Torch, CuPy, and supported Symmray leaves use the
-                        # one-transfer path above.
-                        sweep_norms = np.asarray(
-                            [float(ar.to_numpy(value)) for value in sweep_scalars]
-                        )
-                    if finite_check is True and not bool(
-                        np.all(np.isfinite(sweep_norms))
-                    ):
+                    finite, sweep_norm = self._sweep_diagnostics_to_host(
+                        psi,
+                        start,
+                        stop,
+                        self.final_norm,
+                        check_finite=finite_check is True,
+                        read_norm=rtol is not None,
+                    )
+                    if not finite:
                         error = FloatingPointError(
-                            f"FIT gate sweep {sweep} produced a non-finite local norm."
+                            f"FIT gate sweep {sweep} produced non-finite tensor data."
                         )
                         error.fit_iteration = sweep
                         raise error
@@ -2998,7 +3084,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     self.last_relative_change = 0.0
                     should_stop = True
                 if rtol is not None:
-                    sweep_norm = float(sweep_norms[-1])
                     self.sweep_norm_trace.append(sweep_norm)
                     if not math.isfinite(sweep_norm):
                         error = FloatingPointError(
@@ -3191,6 +3276,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     )
                     self.final_direction = direction
                     self.final_center_site = stop if direction == "R" else start
+                    if len(self.local_norm_trace) != sweep_norm_start + 1:
+                        raise RuntimeError(
+                            "FIT polish sweep did not produce exactly one terminal "
+                            "center norm."
+                        )
                     self.final_norm = self.local_norm_trace[-1]
 
                     if verbose:
@@ -3211,18 +3301,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         raise error
 
                     if finite_check is True:
-                        sweep_scalars = self.local_norm_trace[sweep_norm_start:]
-                        try:
-                            sweep_norms = np.asarray(
-                                ar.to_numpy(ar.do("stack", sweep_scalars))
-                            ).reshape(-1)
-                        except Exception:
-                            sweep_norms = np.asarray(
-                                [float(ar.to_numpy(value)) for value in sweep_scalars]
-                            )
-                        if not bool(np.all(np.isfinite(sweep_norms))):
+                        finite, _ = self._sweep_diagnostics_to_host(
+                            psi,
+                            start,
+                            stop,
+                            self.final_norm,
+                            check_finite=True,
+                            read_norm=False,
+                        )
+                        if not finite:
                             error = FloatingPointError(
-                                f"FIT gate sweep {sweep} produced a non-finite local norm."
+                                f"FIT gate sweep {sweep} produced non-finite tensor data."
                             )
                             error.fit_iteration = sweep
                             raise error

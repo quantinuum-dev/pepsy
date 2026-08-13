@@ -95,20 +95,33 @@ For tolerance-controlled `run_gate`, `patience` counts same-phase retained-norm
 samples, not norm differences. Thus `patience=2` needs two comparable
 one-site samples and stops after their first stable relative change, subject
 to `min_iter`. A phase change from block growth to one-site refinement resets
-the convergence window.
+the convergence window. Each completed sweep reduces only its terminal
+canonical-center norm; intermediate update norms are superseded by later
+updates and are not computed. Consequently `local_norm_trace` contains exactly
+one backend scalar per completed sweep, and `sweep_norm_trace` contains the
+host values actually used by tolerance stopping.
 
-Ordinary dense arrays and native fermionic Symmray arrays reuse the compatible
-partial overlap environments produced by the preceding opposite-direction
-sweep. Fermionic FIT keeps the working state conjugated across the complete
-sweep sequence, so the reused environments retain one dual-leg convention.
+`finite_check=True` reduces every dense tensor or native Symmray block in the
+active interval to backend finite-status scalars. Those flags and the optional
+rtol norm are transferred as one compact vector per sweep. A callable keeps the
+general user-defined state-check behavior. Reusing one `FIT` instance clears
+per-run norm/fidelity traces and split diagnostics before the next invocation;
+`run`, `run_eff`, and `run_gate` all require a positive integer `n_iter`.
+
+Ordinary dense arrays and native bosonic or fermionic Symmray arrays reuse the
+compatible partial overlap environments produced by the preceding
+opposite-direction sweep. Fermionic FIT keeps the working state conjugated
+across the complete sweep sequence, so the reused environments retain one
+dual-leg convention.
 A block sweep retains only the boundaries needed by another reversed sweep of
 the same size. If the next reversed sweep changes to one-site refinement, FIT
 extends that cache through exactly one terminal tensor after a two-site sweep,
 or two terminal tensors after a three-site sweep. Both 2-to-1 and 3-to-1
 transitions therefore avoid a complete fixed-side rebuild without constructing
 unused terminal environments during block warm-up. Fresh sweeps construct only
-the fixed boundaries that their active block can query. Bosonic Symmray arrays
-retain their conservative environment rebuild policy.
+the fixed boundaries that their active block can query. Explicitly generic or
+mixed-backend bosonic Symmray fits retain the conservative rebuild policy;
+automatic/native Symmray fits use the audited zero-copy cache.
 
 The same native block updates are available for the full-chain path:
 
@@ -202,7 +215,7 @@ reports `effective_seconds`, `svd_seconds`, `writeback_seconds`,
 updates report `svd_seconds=0.0`. The sweep record aggregates each stage as
 well as `elapsed_seconds`, making one-, two-, and three-site runs directly
 comparable in benchmark output. Block records break out effective contraction,
-SVD, writeback/norm, canonicalization, and moving-environment time. These
+SVD, writeback/terminal-norm, canonicalization, and moving-environment time. These
 fields intentionally include named subtotals and compatibility overlaps:
 `canonicalization_seconds` equals preparation plus moving canonicalization,
 and `environment_seconds` includes moving canonicalization as well as the

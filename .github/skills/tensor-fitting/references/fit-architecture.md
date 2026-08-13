@@ -29,15 +29,20 @@
   for ordinary arrays versus a materialized/native-routed target MPS.
 - `fit_single_pair_fast_path=True`: one update for an adjacent active pair.
 - `cutoff`, `cutoff_mode`, `chi`: output split/truncation controls.
-- `stabilize_unitary=True`: restore raw norm after recording compression
-  loss for FIT and mixed-mode MPO compression, preventing deep complex64
-  underflow. `fit_stabilize_unitary` remains a deprecated compatibility alias.
-- `environment_strategy={"auto", "mps-direct", "generic"}` on `FIT`: dense
-  MPS specialization versus general/native-safe contraction.
+- `stabilize_unitary=True`: restore raw norm after recording compression loss
+  for DMRG/FIT, mixed MPO compression, and standalone MPO/swap/perm/SVD modes,
+  preventing deep complex64 underflow. Sampling and stabilization are
+  independent controls. `fit_stabilize_unitary` remains a deprecated alias.
+- `environment_strategy={"auto", "mps-direct", "symmray-native", "generic"}`
+  on `FIT`: dense MPS specialization, native Symmray chain contraction, or the
+  general conservative route.
 - `timing_sync_device=True`: opt-in accelerator barriers for kernel-complete
   profiling; two-site timings include effective/SVD/writeback/environment.
   Resolve the accelerator once, wait on actual JAX stage results, and keep
   timing independent of `collect_split_diagnostics`.
+- `local_norm_trace` stores one terminal retained-center scalar per completed
+  sweep. With `finite_check=True`, active backend leaves are reduced natively
+  and transferred with the optional rtol norm in one compact vector.
 
 ## Algorithm map
 
@@ -75,7 +80,9 @@ perform one two-site update for a two-site window, skip one-site refinement,
 and advance to the next gate regardless of the remaining `n_iter` budget.
 After any final sweep, FIT's retained norm and center tensor are authoritative
 for infidelity and unitary stabilization; recanonicalizing the interval is
-redundant.
+redundant. Non-unitary scale control likewise normalizes that singleton center
+in place when it remains inside the active interval; it must not move a valid
+left endpoint to the right endpoint merely to extract the same norm.
 
 For `dmrg1`, inspect the active attainable rank targets before starting FIT.
 An already-capped window starts with one-site updates. An under-capacity

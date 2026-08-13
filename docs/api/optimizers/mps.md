@@ -80,6 +80,13 @@ helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. These
 events are applied with `gate_with_submpo_` and compressed to `chi`; they are
 only accepted in `mode="mpo"`.
 
+Modes that use canonical MPS metadata require an open-boundary MPS. A cyclic
+MPS has a nontrivial loop environment, so no single tensor norm can equal its
+global norm under the open-chain mixed-canonical identity. Such inputs are
+rejected before optimizer state is mutated. `mode="exact"` does not consume
+canonical metadata and can first contract a cyclic input; switching its
+contracted result back to an MPS mode rebuilds an open MPS.
+
 `MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
 from every live MPS tensor; the same values are also available as the
 state-derived `backend`, `backend_dtype`, and `backend_device` attributes.
@@ -176,9 +183,10 @@ minimum completed-sweep count. The old
 `mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` spellings remain as
 deprecated aliases. A legacy value replaces the canonical default for old
 call sites; a conflicting non-default canonical value fails instead of
-silently choosing a policy. FIT checks the small per-site norm scalars it
-already computes after every sweep, transferring only one active-span-sized
-vector to the host. Adaptive rank-growing windows require `n_iter >= 2`; a
+silently choosing a policy. FIT computes only the terminal canonical-center
+norm once per sweep. Its native finite checks reduce active tensor blocks and
+transfer those flags together with the optional tolerance norm as one compact
+vector. Adaptive rank-growing windows require `n_iter >= 2`; a
 shorter request raises before fitting, except for the adjacent two-site exact
 fast path. An under-capacity, non-adjacent `mode="dmrg1"` window requires
 `n_iter >= 3`, reserving its first two sweeps for two-site rank growth and at
@@ -262,17 +270,20 @@ representable positive absolute cutoff, which removes structural zero singular
 directions while retaining every representable nonzero value. This prevents
 invalid duplicate dummy modes without introducing target truncation.
 
-Unitary DMRG and mixed streams default to `stabilize_unitary=True`. After each
-FIT compression—and after an MPO rank warm-up or fallback inside mixed
-mode—Pepsy first records retained norm loss in log-fidelity space when
-infidelity tracking is enabled, then restores the raw working MPS to its
-pre-compression norm without accumulating that approximation loss in
-`p.exponent`. FIT reuses its final canonical center and retained norm; mixed
-MPO compression measures the already-canonicalized center before rescaling.
-This prevents deep complex64 streams and one-site mixed warm-up from
-underflowing while keeping cumulative infidelity meaningful. Set the option to
-`False` only to reproduce historical norm-decay behavior. The old
-`fit_stabilize_unitary` spelling remains as a deprecated alias.
+All unitary compressed modes (`dmrg*`, `mix`, `mpo`, `swap`, `perm`, and
+`svd`) default to `stabilize_unitary=True`. After each compression Pepsy first
+records retained norm loss in log-fidelity space when infidelity tracking is
+enabled, then restores the raw working MPS to its pre-compression norm without
+accumulating that approximation loss in `p.exponent`. FIT and the direct
+compression modes reuse the final canonical center and retained norm rather
+than sweeping or contracting the state again. Stabilization is independent of
+`track_infidelity`: disabling samples removes diagnostic work, but an enabled
+stabilizer still reads the one center norm it needs. This prevents deep
+complex64 streams from underflowing while keeping cumulative infidelity
+meaningful. Pass `non_unitary=True` for filters/Kraus/sub-MPO streams so this
+unitary rescaling is disabled. Set `stabilize_unitary=False` only to reproduce
+historical norm-decay behavior. The old `fit_stabilize_unitary` spelling
+remains as a deprecated alias.
 
 `cutoff="auto"` selects `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
 data, and `1e-12` for 64-bit data. Explicit numeric cutoffs are unchanged.
@@ -407,10 +418,12 @@ use a compatibility overlap contraction instead.
 
 Normalization and infidelity use the same canonical-center contract. For a
 non-unitary run with `normalize_every` enabled, after every replay step the
-optimizer moves the tracked range to a one-site center, normalizes that center
-tensor, and stores the removed scale in `p.exponent`. Thus `p.norm()` restores
-the represented norm, while a copy with `exponent=0` exposes the normalized
-working data. For DMRG, a multi-gate batch is one replay step for this purpose.
+optimizer reuses an authoritative one-site center already inside the active
+span, normalizes that tensor, and stores the removed scale in `p.exponent`.
+Only a genuinely broad tracked center is collapsed to one site. Thus
+`p.norm()` restores the represented norm, while a copy with `exponent=0`
+exposes the normalized working data. For DMRG, a multi-gate batch is one replay
+step for this purpose.
 For unitary streams, `get_infidelities()` uses the running product of local
 retained fidelities. The cumulative state is preserved across repeated
 `run()` calls, so it can be used directly as the simulation-fidelity trace;
@@ -418,16 +431,28 @@ call `reset_infidelity_tracking()` when starting an independent accounting
 interval. Local products and norm-ratio evaluations are accumulated in the log
 domain and exponentiated only for readout, so long streams and very small
 retained norms do not lose fidelity to underflow. Local ratios remain available
-in detailed samples for diagnostics. The trace is populated by default. Set
+in detailed samples for diagnostics. Replacing the state with `set_p()` starts
+a new accounting interval. Manual `normalize()` preserves represented scale in
+`p.exponent`, reuses the tracked singleton center when no insertion site is
+requested, and otherwise canonicalizes directly to that site. It rebases the
+raw unitary stabilization norm without erasing prior cumulative fidelity. Layout
+changes likewise rebase the representation-dependent raw baseline. The trace
+is populated by default. Set
 ``track_infidelity=False`` in the constructor, or pass
 ``track_infidelity=False`` to ``run()``, to skip target-norm construction,
-retained-norm calculations, samples, and progress-bar infidelity fields. For
-dense two-site non-unitary gates, the target
-norm is obtained from the local expectation of `G†G`, so no copied target MPS
-is needed. Symmray and general sub-MPO backends use a raw target-norm fallback
-where that local expectation is not available. DMRG still materializes its
-target because FIT needs it, but the diagnostic uses FIT's final local norm
-trace as the current retained norm.
+samples, and progress-bar infidelity fields. When unitary stabilization remains
+enabled, its single retained-center norm read is still required. For
+dense two-site non-unitary gates, the target norm is obtained from the local
+expectation of `G†G`, so no copied target MPS is needed. Symmray uses an
+equivalent native contraction containing only the canonical active span, the
+gate, and its conjugate; it preserves sectors and graded phases without a
+dense reduced density matrix or routed target copy. Unsupported gates and
+general sub-MPO backends retain the materialized target-norm fallback. DMRG
+still materializes its target because FIT needs it, but a single-gate DMRG
+diagnostic first uses the same dense/native local expectation and contracts the
+existing FIT target only as a fallback. Batch DMRG contracts its already-owned
+multi-gate target once. Target-norm work is reported under
+`infidelity.target_norm`; FIT's terminal center norm supplies the retained norm.
 For `mpo`, `swap`, `perm`, and `svd`, Quimb's post-compression one-site center
 is reused directly, wherever it lies, so infidelity reads one tensor norm and
 does not sweep the center across the gate interval merely for diagnostics.
@@ -458,7 +483,13 @@ When enabled, infidelity is recorded automatically whenever a compressed gate
 update occurs. `get_infidelities()` is the cheap cumulative trace for
 progress and stopping criteria. Use
 `get_infidelity_samples()` when the target norm, retained norm, local ratio, or
-step metadata is needed.
+step metadata is needed. Each sample's `target_norm_source` identifies whether
+the norm came from previous unitary retention, a dense or native local
+contraction, a FIT/sub-MPO target, or the conservative materialized fallback.
+Samples expose both the clipped reporting values and the unclipped
+`raw_norm_ratio`/`raw_local_fidelity`. A retained norm significantly above its
+target raises `FloatingPointError` with a dtype-aware rounding allowance,
+rather than being silently clipped to perfect fidelity.
 
 For a logical gate stream whose site order has not been chosen yet,
 `MpsOptimizer.LayoutFinder(gates, L=...)` or

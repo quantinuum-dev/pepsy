@@ -4339,6 +4339,140 @@ def test_symmps_mps_optimizer_symmray_auto_swap_reports_infidelity(mode):
     assert 0.0 <= opt.get_infidelities()[-1] <= 1.0
 
 
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        "bosonic_u1",
+        "bosonic_z2",
+        "fermionic_u1",
+        "fermionic_u1u1",
+        "fermionic_z2",
+    ],
+)
+def test_symmray_non_unitary_target_norm_uses_native_local_overlap(
+    monkeypatch,
+    case_name,
+):
+    """Native target norms avoid routed MPS copies and dense reductions."""
+    if case_name == "bosonic_u1":
+        state = SymMPS.random(
+            5,
+            symmetry="U1",
+            phys_dim={0: 1, 1: 1},
+            site_charge=site_charge_from_occupations([1, 0, 1, 0, 1]),
+            bond_dim=3,
+            seed=81,
+            dtype="float64",
+        ).tn
+        gate_data = SymHamiltonian.from_edges(
+            "heisenberg",
+            "U1",
+            [(0, 4)],
+            j=1.0,
+        ).gate_stream(0.01, imaginary=True)[0][0]
+    elif case_name == "bosonic_z2":
+        state = SymMPS.random(
+            5,
+            symmetry="Z2",
+            phys_dim={0: 1, 1: 1},
+            site_charge=site_charge_from_occupations([0] * 5),
+            bond_dim=3,
+            seed=82,
+            dtype="float64",
+        ).tn
+        gate_data = SymHamiltonian.from_edges(
+            "itf",
+            "Z2",
+            [(0, 4)],
+            jx=-1.0,
+            hz=-0.5,
+        ).gate_stream(0.01, imaginary=True)[0][0]
+    else:
+        spinful = case_name == "fermionic_u1u1"
+        symmetry = {
+            "fermionic_u1": "U1",
+            "fermionic_u1u1": "U1U1",
+            "fermionic_z2": "Z2",
+        }[case_name]
+        occupations = (
+            ((1, 0), (0, 1), (1, 0), (0, 1), (1, 0))
+            if spinful
+            else (1, 0, 1, 0, 1)
+        )
+        fermion = Fermion(
+            spinful=spinful,
+            symmetry=symmetry,
+            dtype="complex128",
+        )
+        state = pepsy.hrs_to_mps(
+            5,
+            fermion=fermion,
+            occupations=occupations,
+            chi=2,
+            random_rounds=2,
+            seed=83,
+            dtype="complex128",
+        )
+        gate_data = fermion.hopping_gate(
+            0.01,
+            t=1.0,
+            imaginary=True,
+        )
+
+    where = (4, 0) if case_name == "bosonic_z2" else (0, 4)
+    optimizer = pepsy.MpsOptimizer(
+        state.copy(deep=True),
+        gates=[(gate_data, where)],
+        chi=8,
+        mode="mpo",
+    )
+    reference_info = {}
+    reference_target = optimizer._build_norm_target(
+        optimizer.p,
+        gate_data,
+        where,
+        0.0,
+        "rsum2",
+        info=reference_info,
+    )
+    expected_norm = optimizer._isolated_center_norm(
+        reference_target,
+        reference_info,
+        where,
+    )
+
+    def fail_materialized_target(*_args, **_kwargs):
+        raise AssertionError("native target norm must not build a routed MPS")
+
+    def fail_dense(*_args, **_kwargs):
+        raise AssertionError("native target norm must not call to_dense")
+
+    def fail_backend_scan(*_args, **_kwargs):
+        raise AssertionError("native gate replay must reuse the cached backend")
+
+    monkeypatch.setattr(optimizer, "_build_norm_target", fail_materialized_target)
+    monkeypatch.setattr(optimizer, "_has_symmray_data", fail_backend_scan)
+    array_types = {type(gate_data), *(type(tensor.data) for tensor in state)}
+    with monkeypatch.context() as patcher:
+        for array_type in array_types:
+            patcher.setattr(array_type, "to_dense", fail_dense)
+        out = optimizer.run(
+            progbar=False,
+            cutoff=0.0,
+            non_unitary=True,
+            normalize_final=False,
+        )
+
+    sample = optimizer.get_infidelity_samples()[-1]
+    assert sample["target_norm_source"] == "native_local_overlap"
+    assert sample["target_norm"] == pytest.approx(
+        pepsy.to_float(expected_norm),
+        rel=1.0e-11,
+        abs=1.0e-12,
+    )
+    assert _all_tensor_data_symmray(out)
+
+
 def test_sympeps_tfim_builds_z2_terms_and_step():
     """SymPEPS should build Z2 TFIM terms on a square grid."""
     state = SymPEPS.for_model(
