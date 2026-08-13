@@ -9,6 +9,7 @@ import functools
 import logging
 import math
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from numbers import Integral
 from typing import Any, Dict, List, Optional, Sequence
@@ -87,48 +88,97 @@ def internal_inds(psi):
     return inner
 
 
-def _synchronize_array(data):
-    """Synchronize a supported accelerator array without moving its data.
+def _iter_backend_arrays(value):
+    """Yield dense backend leaves from tensors, networks, or containers."""
+    if value is None:
+        return
 
-    Accelerator kernels are asynchronous, so an unsynchronized wall-clock
-    timer mostly measures dispatch latency. This helper is intentionally
-    opt-in and backend-local: normal FIT execution never pays for a device
-    barrier, and symmetric arrays are inspected through their native blocks.
-    """
-    blocks = getattr(data, "blocks", None)
+    if isinstance(value, qtn.Tensor):
+        yield from _iter_backend_arrays(value.data)
+        return
+
+    if isinstance(value, qtn.TensorNetwork):
+        for tensor in value.tensors:
+            yield from _iter_backend_arrays(tensor.data)
+        return
+
+    blocks = getattr(value, "blocks", None)
     if blocks is not None:
         values = blocks.values() if hasattr(blocks, "values") else blocks
         for block in values:
-            if _synchronize_array(block):
-                return True
-        return False
+            yield from _iter_backend_arrays(block)
+        return
 
-    module = type(data).__module__.split(".", 1)[0]
-    if module == "torch":
-        device = getattr(data, "device", None)
-        if getattr(device, "type", None) == "cuda":
+    if isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_backend_arrays(item)
+        return
+
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_backend_arrays(item)
+        return
+
+    yield value
+
+
+class _BackendSynchronizer:
+    """A cached accelerator barrier selected once for a timing session."""
+
+    __slots__ = ("backend", "device")
+
+    def __init__(self, backend, device=None):
+        self.backend = backend
+        self.device = device
+
+    @classmethod
+    def from_value(cls, value):
+        """Return a synchronizer for the first supported accelerator leaf."""
+        for data in _iter_backend_arrays(value):
+            module = type(data).__module__.split(".", 1)[0]
+            if module == "torch":
+                device = getattr(data, "device", None)
+                if getattr(device, "type", None) == "cuda":
+                    return cls("torch", device=device)
+            elif module == "cupy":
+                return cls("cupy")
+            elif module in {"jax", "jaxlib"}:
+                return cls("jax")
+        return None
+
+    def synchronize(self, value, *, fallback=None):
+        """Wait for work represented by ``value`` without host conversion."""
+        if self.backend == "torch":
             import torch  # pylint: disable=import-outside-toplevel
 
-            torch.cuda.synchronize(device)
-            return True
-    elif module == "cupy":
-        import cupy  # pylint: disable=import-outside-toplevel
+            torch.cuda.synchronize(self.device)
+            return
 
-        cupy.cuda.get_current_stream().synchronize()
-        return True
-    elif module in {"jax", "jaxlib"}:
-        block_until_ready = getattr(data, "block_until_ready", None)
-        if block_until_ready is not None:
-            block_until_ready()
-            return True
-    return False
+        if self.backend == "cupy":
+            import cupy  # pylint: disable=import-outside-toplevel
+
+            cupy.cuda.get_current_stream().synchronize()
+            return
+
+        synchronized = False
+        for data in _iter_backend_arrays(value):
+            module = type(data).__module__.split(".", 1)[0]
+            if module not in {"jax", "jaxlib"}:
+                continue
+            block_until_ready = getattr(data, "block_until_ready", None)
+            if block_until_ready is not None:
+                block_until_ready()
+                synchronized = True
+
+        if not synchronized and fallback is not None and fallback is not value:
+            self.synchronize(fallback)
 
 
 def _synchronize_tensor_network(tn):
-    """Synchronize the first accelerator-backed leaf in ``tn`` if present."""
-    for tensor in tn.tensors:
-        if _synchronize_array(tensor.data):
-            return
+    """Synchronize supported accelerator work represented by ``tn`` once."""
+    synchronizer = _BackendSynchronizer.from_value(tn)
+    if synchronizer is not None:
+        synchronizer.synchronize(tn)
 
 
 def _native_fermionic_bra_fit(method):
@@ -373,6 +423,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self._fermionic_left_exterior_environment = None
         self._fermionic_right_exterior_environment = None
         self._timing_sync_device = False
+        self._timing_synchronizer = None
         # Preserve an explicitly supplied empty dictionary: callers may use
         # ``info`` as a live diagnostics channel during and after a run.
         self.info: Dict[str, Any] = info if info is not None else {}
@@ -1380,7 +1431,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
 
         if timing_record is not None:
-            elapsed = float(self._timing_mark() - started)
+            elapsed = float(self._timing_mark(boundaries) - started)
             # The extension is terminal moving-environment work associated
             # with the final block update, not an additional update/site.
             final_update = timing_record["site_timings"][-1]
@@ -1792,7 +1843,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 for site in range(start, stop):
                     psi.left_canonize_site(site, bra=None)
         canonicalization_finished = (
-            self._timing_mark() if timing_record is not None else None
+            self._timing_mark(psi) if timing_record is not None else None
         )
 
         fixed_environment_started = (
@@ -1807,7 +1858,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 block_size=block_size,
             )
         fixed_environment_finished = (
-            self._timing_mark() if timing_record is not None else None
+            self._timing_mark(fixed_environments)
+            if timing_record is not None
+            else None
         )
 
         if timing_record is not None:
@@ -1923,13 +1976,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             # network and replanning a contraction for every one-site update.
             norm_f = f.norm()
             effective_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(f, norm_f)
+                if timing_record is not None
+                else None
             )
             self.local_norm_trace.append(ar.do("real", norm_f))
             psi[site].modify(data=f.data)
             self._resolve_fermionic_writeback_phase(psi[site])
             writeback_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(psi[site], self.local_norm_trace[-1])
+                if timing_record is not None
+                else None
             )
 
             moving_environment_started = writeback_finished
@@ -1941,7 +1998,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
                 psi.left_canonize_site(site, bra=None)
                 moving_canonicalization_finished = (
-                    self._timing_mark() if timing_record is not None else None
+                    self._timing_mark(psi[site])
+                    if timing_record is not None
+                    else None
                 )
                 if timing_record is not None:
                     moving_canonicalization_seconds = float(
@@ -1966,7 +2025,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
                 psi.right_canonize_site(site, bra=None)
                 moving_canonicalization_finished = (
-                    self._timing_mark() if timing_record is not None else None
+                    self._timing_mark(psi[site])
+                    if timing_record is not None
+                    else None
                 )
                 if timing_record is not None:
                     moving_canonicalization_seconds = float(
@@ -1987,7 +2048,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 moving_environment_updated = True
 
             if timing_record is not None:
-                environment_finished = self._timing_mark()
+                environment_finished = self._timing_mark(moving_environments)
                 moving_environment_seconds = (
                     float(environment_finished - moving_environment_started)
                     if moving_environment_updated
@@ -2117,7 +2178,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 (left_site, right_site),
             )
             effective_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(theta)
+                if timing_record is not None
+                else None
             )
 
             split_info = {} if collect_split_diagnostics else None
@@ -2136,7 +2199,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 info=split_info,
             )
             split_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(new_left, new_right)
+                if timing_record is not None
+                else None
             )
             new_left.transpose_like_(left_tensor)
             new_right.transpose_like_(right_tensor)
@@ -2175,7 +2240,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
             writeback_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(center, self.local_norm_trace[-1])
+                if timing_record is not None
+                else None
             )
 
             needs_next_update = (
@@ -2203,7 +2270,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 moving_environment_updated = True
 
             if timing_record is not None:
-                environment_finished = self._timing_mark()
+                environment_finished = self._timing_mark(moving_environments)
                 moving_environment_seconds = (
                     float(environment_finished - writeback_finished)
                     if moving_environment_updated
@@ -2352,7 +2419,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 (left_site, middle_site, right_site),
             )
             effective_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(theta)
+                if timing_record is not None
+                else None
             )
 
             split_info_left = {} if collect_split_diagnostics else None
@@ -2426,7 +2495,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     info=split_info_left,
                 )
             split_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(new_left, new_middle, new_right)
+                if timing_record is not None
+                else None
             )
 
             new_left.transpose_like_(left_tensor)
@@ -2482,7 +2553,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     }
                 )
             writeback_finished = (
-                self._timing_mark() if timing_record is not None else None
+                self._timing_mark(center, self.local_norm_trace[-1])
+                if timing_record is not None
+                else None
             )
 
             needs_next_update = (
@@ -2510,7 +2583,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 moving_environment_updated = True
 
             if timing_record is not None:
-                environment_finished = self._timing_mark()
+                environment_finished = self._timing_mark(moving_environments)
                 moving_environment_seconds = (
                     float(environment_finished - writeback_finished)
                     if moving_environment_updated
@@ -2685,6 +2758,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         single_pair_fast_path = bool(single_pair_fast_path)
         collect_split_diagnostics = bool(collect_split_diagnostics)
         self._timing_sync_device = timing and timing_sync_device
+        self._timing_synchronizer = (
+            self._make_backend_synchronizer(self.p)
+            if self._timing_sync_device
+            else None
+        )
         if timing:
             self.timing_records = []
 
@@ -3244,16 +3322,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         record["relative_change"] = self.last_relative_change
         self.timing_records.append(record)
 
-    def _timing_mark(self):
+    def _timing_mark(self, *values):
         """Return a wall-clock mark after an optional device barrier."""
-        if self._timing_sync_device:
-            _synchronize_tensor_network(self.p)
+        if self._timing_synchronizer is not None:
+            value = self.p if not values else values[0] if len(values) == 1 else values
+            self._timing_synchronizer.synchronize(value, fallback=self.p)
         return time.perf_counter()
+
+    @staticmethod
+    def _make_backend_synchronizer(value):
+        """Resolve one reusable accelerator barrier for ``value``."""
+        return _BackendSynchronizer.from_value(value)
 
     @staticmethod
     def synchronize_backend(tn):
         """Synchronize accelerator work for explicit external profiling."""
         _synchronize_tensor_network(tn)
+
+    def _take_timing_records(self):
+        """Transfer ownership of timing records to an internal consumer."""
+        records = self.timing_records
+        self.timing_records = []
+        return records
 
     def get_timing(self):
         """Return a copy of the most recent opt-in per-sweep timing records."""

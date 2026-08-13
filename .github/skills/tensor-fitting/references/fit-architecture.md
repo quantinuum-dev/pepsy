@@ -36,6 +36,8 @@
   MPS specialization versus general/native-safe contraction.
 - `timing_sync_device=True`: opt-in accelerator barriers for kernel-complete
   profiling; two-site timings include effective/SVD/writeback/environment.
+  Resolve the accelerator once, wait on actual JAX stage results, and keep
+  timing independent of `collect_split_diagnostics`.
 
 ## Algorithm map
 
@@ -68,11 +70,12 @@ continue to use direct dictionary lookups with no wrapper in their hot loops.
 
 An active interval containing one adjacent pair reaches its complete local
 optimum after that split. MpsOptimizer enables the single-pair fast path even
-when tolerance stopping is disabled. Thus `dmrg1` and `dmrg2` each perform one
-two-site update for a two-site window, skip one-site refinement, and advance
-to the next gate regardless of the remaining `n_iter` budget. After any final
-sweep, FIT's retained norm and center tensor are authoritative for infidelity
-and unitary stabilization; recanonicalizing the interval is redundant.
+when tolerance stopping is disabled. Thus `dmrg1`, `dmrg2`, and `dmrg3` each
+perform one two-site update for a two-site window, skip one-site refinement,
+and advance to the next gate regardless of the remaining `n_iter` budget.
+After any final sweep, FIT's retained norm and center tensor are authoritative
+for infidelity and unitary stabilization; recanonicalizing the interval is
+redundant.
 
 For `dmrg1`, inspect the active attainable rank targets before starting FIT.
 An already-capped window starts with one-site updates. An under-capacity
@@ -80,11 +83,22 @@ non-adjacent window requires at least three requested sweeps: two two-site
 growth sweeps followed by at least one one-site refinement sweep. Reaching all
 targets during growth switches the remaining budget to one-site updates;
 rank stagnation below a target does not impersonate reaching the target.
+Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform exactly
+`fit_adaptive_sweeps` two- or three-site sweeps (two by default), then spend
+the remaining `n_iter` budget on one-site refinement subject to `fit_rtol`.
+Generic `dmrg` remains available for rank-adaptive block scheduling.
 
 `run_eff` is a separate global full-chain fit used by boundary/sampling code.
 Do not substitute it for the gate-window solver.
 `run` and `run_eff` retain fixed-sweep behavior; PEPS boundary diagnostics
 describe them as `fixed_sweeps` and use only coarse opt-in elapsed timing.
+
+FIT timing records contain both compatibility totals and their named subsets.
+`canonicalization_seconds` includes preparation and moving canonicalization;
+legacy `environment_seconds` includes the complete post-writeback phase. Do
+not sum every timing field. MpsOptimizer owns its temporary FIT instances, so
+it moves their records into the replay collector and copies only at the public
+getter boundary.
 
 ## Native tensor rule
 

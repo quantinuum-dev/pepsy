@@ -108,8 +108,8 @@ convenience modes share the DMRG backend but have distinct schedules:
 attainable ceilings and then fixed-rank one-site FIT. If every active bond is
 already at its attainable ceiling before the fit, `"dmrg1"` starts directly
 with one-site FIT. `"dmrg2"` uses two-site FIT for the required warm-up (two
-sweeps by default) and then one-site FIT; `"dmrg3"` uses adaptive three-site
-growth and then one-site FIT.
+sweeps by default) and then one-site FIT; `"dmrg3"` follows the same fixed
+warm-up schedule with three-site FIT and then one-site FIT.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
 schedule. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
@@ -143,9 +143,10 @@ two-site warm-up. `fit_layer_size` is the clear name for
 block. For `fit_block_size=2`, an active window spanning at least three sites
 uses the same adaptive-to-one-site schedule; an ordinary two-site gate window
 uses exactly one two-site update because that effective tensor already solves
-the complete local problem. In particular, `dmrg1` and `dmrg2` immediately
-advance to the next gate after that update: they do not repeat their warm-up
-or enter one-site refinement, regardless of `n_iter` or `fit_rtol`.
+the complete local problem. In particular, `dmrg1`, `dmrg2`, and `dmrg3`
+immediately advance to the next gate after that update: they do not repeat
+their warm-up or enter one-site refinement, regardless of `n_iter` or
+`fit_rtol`.
 `fit_three_site_sweeps` remains a deprecated alias for
 `fit_adaptive_sweeps`.
 `fit_max_span="auto"` also limits the spatial width of a batched
@@ -219,8 +220,9 @@ before each split, and restores the physical ket afterward. Thus `R`, `L`, and
 bosonization.
 
 The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
-native U1, U1xU1, and Z2 fermionic states use the same adaptive block-growth
-and one-site-refinement policies as ordinary arrays. A native nonlocal gate
+native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
+arrays. `dmrg1` remains rank-adaptive, while `dmrg2` and `dmrg3` perform their
+fixed block warm-up before one-site refinement. A native nonlocal gate
 still receives its chi-capped graded auto-swap warm start before FIT. For a
 direct full-chain FIT whose arbitrary MPS guess lacks target virtual charge
 sectors, FIT instead uses a target-informed native compressed initialization;
@@ -302,11 +304,20 @@ print(opt.get_run_timing())
 The copy-safe record contains replay wall time, event count, final bond,
 backend signature, and—when using `mode="mix"`—a copy of
 `last_mix_summary`, including its elapsed time and backend decision counts.
+Mixed runs leave `last_mix_summary["elapsed_seconds"]` as `None` when replay
+timing is disabled, so the normal mixed path performs no profiling clock
+reads. The measured replay interval begins after argument validation and any
+temporary layout setup; it ends before temporary layout restoration and
+before `get_run_timing()` makes its defensive result copy.
 It also contains inclusive `stages` totals for `gate_stream.prepare`, the
 active mode replay, `canonicalize`, `gate.apply`, `dmrg.target`, `dmrg.fit`,
-`normalization`, `control.<event>`, and `infidelity.compute`. Stage totals can
-overlap with the mode replay total; use them to identify the dominant work,
-not to add into a second total. DMRG and mixed-mode timing also exposes
+`normalization`, `control.<event>`, `infidelity.target_norm`,
+`infidelity.retained_norm`, and `infidelity.compute`. The three infidelity
+stages distinguish construction or contraction of a non-unitary target norm,
+the retained one-center tensor norm, and the final scalar log-fidelity update.
+Stage totals can overlap with the mode replay total; use them to identify the
+dominant work, not to add into a second total. DMRG and mixed-mode timing also
+expose
 `fit_steps`: one record per completed or failed FIT sweep, including its FIT
 call index, global record index, direction, block size, active interval, sweep
 time, per-site/block update times, and phase-level sweep overhead. Timing
@@ -321,11 +332,25 @@ part of the canonicalization total, while
 `moving_canonicalization_seconds` identifies one-site gauge moves inside a
 sweep. `MpsOptimizer.get_run_timing()["fit_totals"]` provides the same phase
 totals across all FIT calls in the replay, while `fit_steps` retains the
-per-sweep and per-site records. Ordinary runs retain no per-gate timer
-overhead. These are host wall-clock measurements by default. Use
+per-sweep and per-site records. FIT phase fields are not one flat additive
+list: `canonicalization_seconds` contains both sweep preparation and moving
+canonicalization, while legacy `environment_seconds` contains the complete
+post-writeback phase. An additive decomposition uses preparation
+canonicalization, fixed environments, effective contraction, SVD, writeback,
+moving canonicalization, moving environments, and sweep overhead exactly
+once. Timing also remains independent of `collect_split_diagnostics`;
+profiling an MPS run does not allocate per-SVD truncation dictionaries.
+
+Ordinary runs retain no per-gate timer or timing-record overhead. Enabled
+profiling moves its internally owned FIT records into the replay result and
+copies them only when `get_run_timing()` is called. These are host wall-clock
+measurements by default. Use
 `run(timing=True, timing_sync_device=True)` for kernel-complete Torch CUDA,
 CuPy, or JAX timings; the added barriers intentionally make profiling slower
 and are recorded as `timing_sync_device=True` in both replay and FIT records.
+The accelerator backend is detected once per timing session, so CPU timing
+does not repeatedly scan the MPS. JAX barriers wait on each newly returned
+stage result rather than an unrelated previously ready MPS leaf.
 
 Parallel pTEBD/IPMC and local-TDVP circuit compression are intentionally not
 aliases of this sequential solver. Their status is exposed through
@@ -403,6 +428,14 @@ is needed. Symmray and general sub-MPO backends use a raw target-norm fallback
 where that local expectation is not available. DMRG still materializes its
 target because FIT needs it, but the diagnostic uses FIT's final local norm
 trace as the current retained norm.
+For `mpo`, `swap`, `perm`, and `svd`, Quimb's post-compression one-site center
+is reused directly, wherever it lies, so infidelity reads one tensor norm and
+does not sweep the center across the gate interval merely for diagnostics.
+Unitary one-site gates preserve the previous center and do not overwrite the
+cache with their support site. In `svd` mode the non-unitary target norm is
+measured before both the routed gate split and the final chi compression, so
+loss from either truncating stage is included rather than silently becoming
+the diagnostic baseline.
 Temporary fallback targets never modify the live `info_c` cache.
 When tracking is enabled, the `mpo`, `swap`, and `svd` progress bars show the
 same cumulative `infidelity` field, starting at zero before the first

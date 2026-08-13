@@ -81,15 +81,15 @@ preserves the bond dimensions opened by the larger block and is cheaper than
 repeating the larger SVD block.
 
 The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and
-`adaptive_until_rank=True` for its rank-growing `dmrg`, `dmrg1`, and `dmrg3`
+`adaptive_until_rank=True` for its rank-growing generic `dmrg` and `dmrg1`
 paths. Before constructing a `dmrg1` fit, the optimizer checks the active
 attainable bond ceilings: an already-capped window starts with one-site FIT,
 while an under-capacity non-adjacent window requires `n_iter >= 3` for two
 two-site growth sweeps and at least one one-site refinement sweep. `dmrg2`
-uses the configured minimum block warm-up and then refines with one-site FIT.
-The direct FIT diagnostics
-`adaptive_sweeps_run` and `one_site_sweeps_run` count both scheduled block
-sweeps and any explicit `final_one_site_sweeps` polish passes.
+and `dmrg3` use exactly the configured two- or three-site block warm-up (two
+sweeps by default) and then refine with one-site FIT. The direct FIT
+diagnostics `adaptive_sweeps_run` and `one_site_sweeps_run` count both
+scheduled block sweeps and any explicit `final_one_site_sweeps` polish passes.
 
 For tolerance-controlled `run_gate`, `patience` counts same-phase retained-norm
 samples, not norm differences. Thus `patience=2` needs two comparable
@@ -135,10 +135,10 @@ sweep only rebuilds the same environments. That terminal update constructs no
 active-window environments; native fermionic outside-window environments stay
 intact. The default is `False` on direct
 `FIT.run_gate` calls to preserve fixed-sweep compatibility; MpsOptimizer opts
-in by default. Consequently, named `dmrg1` and `dmrg2` windows of two sites
-perform one two-site update and advance to the next gate without one-site
-refinement; `n_iter` and tolerance controls cannot add a second sweep while
-the fast path is enabled. `collect_split_diagnostics=False` omits per-SVD
+in by default. Consequently, named `dmrg1`, `dmrg2`, and `dmrg3` windows of
+two sites perform one two-site update and advance to the next gate without
+one-site refinement; `n_iter` and tolerance controls cannot add a second sweep
+while the fast path is enabled. `collect_split_diagnostics=False` omits per-SVD
 truncation dictionaries when only the fitted state and retained norm are
 needed.
 
@@ -202,9 +202,22 @@ reports `effective_seconds`, `svd_seconds`, `writeback_seconds`,
 updates report `svd_seconds=0.0`. The sweep record aggregates each stage as
 well as `elapsed_seconds`, making one-, two-, and three-site runs directly
 comparable in benchmark output. Block records break out effective contraction,
-SVD, writeback/norm, canonicalization, and moving-environment time. Add
+SVD, writeback/norm, canonicalization, and moving-environment time. These
+fields intentionally include named subtotals and compatibility overlaps:
+`canonicalization_seconds` equals preparation plus moving canonicalization,
+and `environment_seconds` includes moving canonicalization as well as the
+moving environment. Do not sum every reported field. The non-overlapping
+partition uses preparation canonicalization, fixed environments, effective
+contraction, SVD, writeback, moving canonicalization, moving environments,
+and sweep overhead once each.
+
+Timing is independent of `collect_split_diagnostics`: clock recording does not
+turn on native SVD truncation metadata. Add
 `timing_sync_device=True` for device-complete Torch CUDA, CuPy, or JAX timing;
-normal runs never pay for these synchronization barriers. FIT also exposes
+the backend is detected once, CPU data becomes a no-op, and JAX waits on the
+new effective/split/writeback results associated with each timing boundary.
+Normal runs never pay for clocks, timing records, or synchronization barriers.
+FIT also exposes
 `final_center_site`, `final_norm`, `final_direction`, and
 `convergence_reason`, allowing an optimizer to reuse the known canonical
 center without a redundant sweep.

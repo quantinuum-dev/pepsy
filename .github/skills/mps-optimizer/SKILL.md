@@ -15,17 +15,17 @@ tests before editing.
 - `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
   `dmrg1` uses adaptive two-site growth followed by one-site refinement,
   `dmrg2` uses its required two-site warm-up (two sweeps by default) followed
-  by one-site refinement, and `dmrg3` uses adaptive three-site growth followed
-  by one-site refinement. Adaptive rank-growth phases end only when all
-  attainable active-bond ceilings are reached; rank stagnation is not an early
-  exit. A `dmrg1` window already at those ceilings starts directly with
-  one-site FIT. An under-capacity non-adjacent `dmrg1` window requires
+  by one-site refinement, and `dmrg3` uses the same fixed warm-up policy with
+  three-site updates. Generic `dmrg` and `dmrg1` rank-growth phases end only
+  when all attainable active-bond ceilings are reached; rank stagnation is not
+  an early exit. A `dmrg1` window already at those ceilings starts directly
+  with one-site FIT. An under-capacity non-adjacent `dmrg1` window requires
   `n_iter >= 3`: two block sweeps plus at least one refinement sweep. Its
   default `fit_patience=2` is a two-sample same-phase norm window, i.e. one
-  stable comparison. A two-site window is a structural special case for both
-  `dmrg1` and `dmrg2`: perform exactly one two-site update, no one-site
-  refinement, then advance to the next gate without consuming the remaining
-  `n_iter` budget. Compose with
+  stable comparison. A two-site window is a structural special case for
+  `dmrg1`, `dmrg2`, and `dmrg3`: perform exactly one two-site update, no
+  one-site refinement, then advance to the next gate without consuming the
+  remaining `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
 - `mpo`: direct non-local gate/MPO replay with bond truncation.
@@ -83,6 +83,10 @@ deprecated compatibility path that temporarily reorders, runs, and swaps back.
   but mixed mode must still isolate the complete trial before mutation.
 - After FIT, reuse its final center and norm for stabilization and canonical
   metadata instead of scanning or canonicalizing the active interval again.
+- Unitary one-site gates preserve the existing center. Do not replace the
+  cache with the gate site. MPO/SVD/swap compression should reuse the
+  one-site center left by the backend and read that tensor norm directly;
+  collapse a span only when the backend genuinely leaves a broad center.
 
 After a mutation that invalidates canonicality, either canonicalize explicitly
 or invalidate the cache before any canonical-only operation. Unitary one-site
@@ -128,6 +132,24 @@ same initialization on a partial window because replacing its outside tensors
 would violate the fixed-boundary contract; let native block updates grow local
 sectors there. Treat an empty native effective tensor as a clear
 disconnected-sector error, not as a backend decomposition failure.
+
+## Profiling contract
+
+`run(timing=False)` performs no replay profiling clock reads, accelerator
+barriers, or timing-record allocation; mixed summaries leave elapsed time
+unset on that path. Enabled timing must remain observational: do not turn on
+FIT split diagnostics or another numerical/metadata path merely because clocks
+are active. Move optimizer-owned FIT records into the run collector and keep
+the defensive deep copy at `get_run_timing()` rather than copying every nested
+site record during replay. Stage and FIT totals are hierarchical and contain
+documented compatibility overlaps, so never present every field as one
+additive total. Resolve synchronized accelerator timing once per session, and
+for JAX wait on each actual stage result rather than an older MPS leaf.
+For MPO/SVD/swap diagnostics, separate non-unitary target-norm work, the
+retained one-center norm read, and scalar log-fidelity bookkeeping in timing
+records. In SVD mode measure the non-unitary target before the routed gate
+split so both that cutoff and the final chi compression contribute to reported
+loss.
 
 ## Validation
 

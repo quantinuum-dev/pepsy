@@ -38,6 +38,8 @@ editing the solver or its MpsOptimizer integration.
    synchronizing full GPU states per local update.
    Use `timing_sync_device=True` only for profiling asynchronous accelerators,
    and separate effective contraction, SVD, writeback, and environment costs.
+   Timing must not enable split diagnostics or another heavier numerical path;
+   cache the accelerator route and wait on actual JAX stage outputs.
 7. Validate dense complex64/complex128, active bond growth, alternating
    sweeps, exact-target separation, and native symmetry/fermionic cases.
 8. Update API docs when defaults, controls, timing fields, or backend status
