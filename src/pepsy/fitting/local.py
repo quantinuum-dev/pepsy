@@ -757,6 +757,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         if block_size in {2, 3}:
             if self._fermionic_bra_working:
+                self._prepare_native_fermionic_target_support(
+                    method_name="run_eff",
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    sweep_sequence=sweep_sequence,
+                )
                 self._prepare_fermionic_active_fit(
                     psi,
                     0,
@@ -1274,6 +1281,162 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
         self._fermionic_right_exterior_environment = prior
 
+    @staticmethod
+    def _native_bond_chargemap(mps, site):
+        """Return the left tensor's native charge map for one MPS bond."""
+        bond = mps.bond(site, site + 1)
+        tensor = mps[site]
+        axis = tensor.inds.index(bond)
+        return dict(tensor.data.indices[axis].chargemap)
+
+    def _native_target_support_gaps(self):
+        """Return target virtual charges absent from the fitted native MPS."""
+        if not isinstance(self.tn, qtn.MatrixProductState):
+            return None
+        if self._target_site_tensors is None:
+            return None
+
+        gaps = []
+        try:
+            for site in range(self.L - 1):
+                target_map = self._native_bond_chargemap(self.tn, site)
+                guess_map = self._native_bond_chargemap(self.p, site)
+                missing = tuple(
+                    sorted(
+                        set(target_map).difference(guess_map),
+                        key=repr,
+                    )
+                )
+                if missing:
+                    gaps.append(
+                        {
+                            "bond": (int(site), int(site + 1)),
+                            "missing_charges": missing,
+                            "target_bond_dim": int(sum(target_map.values())),
+                            "guess_bond_dim": int(sum(guess_map.values())),
+                        }
+                    )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        return tuple(gaps)
+
+    def _prepare_native_fermionic_target_support(
+        self,
+        *,
+        method_name,
+        max_bond,
+        cutoff,
+        cutoff_mode,
+        sweep_sequence,
+    ):
+        """Seed a full-chain native FIT when the guess lacks target sectors.
+
+        A local variational contraction cannot create a target charge sector
+        when every surrounding overlap environment projects that sector to
+        zero. For a one-tensor-per-site full-chain MPS target, the target is
+        itself the deterministic native sector template: compressing a copy
+        to the requested output policy gives FIT a nonzero representative in
+        every retained sector without random noise, dense conversion, or a
+        Jordan-Wigner representation.
+
+        A partial active window cannot use this replacement safely because its
+        outside fitted tensors are part of the fixed variational boundary.
+        Such a mismatch therefore receives an explicit compatibility error.
+        """
+        diagnostic = {
+            "applied": False,
+            "strategy": "target_mps_compressed",
+            "reason": "not_native_fermionic_mps_target",
+            "bonds": (),
+        }
+        self.info["native_sector_initialization"] = diagnostic
+        if not (
+            isinstance(self.p, qtn.MatrixProductState)
+            and isinstance(self.tn, qtn.MatrixProductState)
+            and self.p.isfermionic()
+            and self.tn.isfermionic()
+        ):
+            return
+
+        gaps = self._native_target_support_gaps()
+        if gaps is None:
+            diagnostic["reason"] = "target_support_not_bond_resolved"
+            return
+        diagnostic["bonds"] = gaps
+        if not gaps:
+            diagnostic["reason"] = "compatible_virtual_charge_support"
+            return
+
+        if method_name == "run_gate":
+            full_chain = self.range_int == [0, self.L - 1]
+        else:
+            full_chain = method_name == "run_eff"
+        if not full_chain:
+            # Missing target charges inside a partial window are not by
+            # themselves an error: a two-/three-site split can introduce them
+            # while preserving the fixed outside state. Defer to that native
+            # local growth and only reject if the resulting effective tensor
+            # is structurally empty.
+            diagnostic["reason"] = "partial_window_local_sector_growth"
+            return
+
+        if max_bond is not None and (
+            not isinstance(max_bond, Integral) or int(max_bond) < 1
+        ):
+            # Preserve run_gate/run_eff's public validation and error text.
+            return
+        max_bond = None if max_bond is None else int(max_bond)
+        if cutoff is None:
+            cutoff = self.cutoffs
+        try:
+            cutoff = self._resolve_cutoff(cutoff)
+        except (TypeError, ValueError):
+            # Preserve run_gate/run_eff's public validation and error text.
+            return
+        if not math.isfinite(cutoff) or cutoff < 0.0:
+            return
+
+        sequence = self._validate_sweep_sequence(sweep_sequence)
+        center = 0 if sequence[0] == "R" else self.L - 1
+        seed = self.tn.copy(deep=True)
+        if max_bond is not None or cutoff > 0.0:
+            seed.compress(
+                form=center,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        # The target and fitted MPS must remain independent layers in every
+        # overlap contraction. Re-randomize only the seed's internal bonds
+        # before transferring its native arrays into the owned fitted MPS.
+        seed.reindex_(
+            {index: qtn.rand_uuid() for index in seed.inner_inds()}
+        )
+        for site in range(self.L):
+            seed_tensor = seed[site]
+            self.p[site].modify(
+                data=seed_tensor.data,
+                inds=seed_tensor.inds,
+                left_inds=seed_tensor.left_inds,
+            )
+        if hasattr(seed, "exponent"):
+            self.p.exponent = seed.exponent
+
+        if self._fermionic_bra_working:
+            # The wrapper restores the physical ket on exit, so retain its
+            # temporary conjugated representation for the upcoming sweep.
+            self.p.conj_()
+
+        diagnostic.update(
+            {
+                "applied": True,
+                "reason": "missing_virtual_charge_support",
+                "max_bond": max_bond,
+                "cutoff": float(cutoff),
+                "cutoff_mode": str(cutoff_mode),
+            }
+        )
+
     def _prepare_fermionic_effective_tensor(
         self,
         tensor,
@@ -1332,6 +1495,21 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         tensor.conj_()
         return tensor
+
+    def _require_nonempty_fermionic_effective_tensor(self, tensor, sites):
+        """Raise a direct sector-support error for an empty native update."""
+        if not self._fermionic_bra_working:
+            return
+        if getattr(tensor.data, "num_blocks", 1) != 0:
+            return
+        sites = tuple(int(site) for site in sites)
+        raise ValueError(
+            "Native fermionic FIT produced an empty effective tensor at "
+            f"sites {sites}; the target and initial MPS have disconnected "
+            "charge-sector support. Use a full-chain one-tensor-per-site MPS "
+            "target for automatic target-informed sector initialization, or "
+            "provide a sector-compatible initial MPS."
+        )
 
     def _resolve_fermionic_writeback_phase(self, *tensors):
         """Resolve odd dummy-mode global signs after native writeback."""
@@ -1564,6 +1742,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 left_environment,
                 right_environment,
             )
+            self._require_nonempty_fermionic_effective_tensor(
+                f,
+                (site,),
+            )
             # ``f`` is already a single effective tensor. Its direct
             # Frobenius norm is exactly sqrt(<f|f>), but avoids constructing a
             # temporary doubled tensor network and replanning a contraction
@@ -1757,6 +1939,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 right_tensor,
                 left_environment,
                 right_environment,
+            )
+            self._require_nonempty_fermionic_effective_tensor(
+                theta,
+                (left_site, right_site),
             )
             effective_finished = (
                 self._timing_mark() if timing_record is not None else None
@@ -1974,6 +2160,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 right_tensor,
                 left_environment,
                 right_environment,
+            )
+            self._require_nonempty_fermionic_effective_tensor(
+                theta,
+                (left_site, middle_site, right_site),
             )
             effective_finished = (
                 self._timing_mark() if timing_record is not None else None
@@ -2341,6 +2531,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
 
         if self._fermionic_bra_working:
+            self._prepare_native_fermionic_target_support(
+                method_name="run_gate",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                sweep_sequence=sweep_sequence,
+            )
             self._prepare_fermionic_active_fit(
                 psi,
                 start,

@@ -203,6 +203,16 @@ before each split, and restores the physical ket afterward. Thus `R`, `L`, and
 `RL` are honored exactly without dense conversion or Jordan-Wigner
 bosonization.
 
+The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
+native U1, U1xU1, and Z2 fermionic states use the same adaptive block-growth
+and one-site-refinement policies as ordinary arrays. A native nonlocal gate
+still receives its chi-capped graded auto-swap warm start before FIT. For a
+direct full-chain FIT whose arbitrary MPS guess lacks target virtual charge
+sectors, FIT instead uses a target-informed native compressed initialization;
+partial gate windows retain their fixed outside-state contract, grow sectors
+through native local blocks, and reject only a genuinely empty effective
+problem.
+
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
 or batch. This is implemented by `FIT.run_gate`, the gate-window version of

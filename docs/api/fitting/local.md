@@ -130,6 +130,20 @@ substituting graded boundary identities, applies Symmray's dual-leg phase
 correction before each local writeback, and resolves odd dummy-mode global
 phases afterward. The physical ket is restored on both success and failure.
 The same convention supports block-2/3 native `run_eff` sweeps.
+
+Before entering that conjugated gauge, a native full-chain MPS fit compares
+the target and guess virtual charge maps. If the target has sectors absent
+from the guess, FIT initializes from a target copy compressed natively with
+the requested `max_bond`, `cutoff`, and `cutoff_mode`. This deterministic
+target-informed initialization prevents an overlap environment from
+projecting every missing sector to zero; it uses neither random noise nor a
+dense representation. The decision is recorded under
+`info["native_sector_initialization"]`. A partial-window fit cannot replace
+its fixed outside boundary safely, so it leaves sector creation to its native
+two-/three-site block updates. If the actual effective tensor is nevertheless
+empty, FIT raises an explicit disconnected-sector error rather than an
+internal Symmray decomposition failure.
+
 `environment_strategy="auto"` selects
 `"mps-direct"` for an ordinary dense one-tensor-per-site target,
 `"symmray-native"` when all target and fitted tensors are Symmray-backed, and

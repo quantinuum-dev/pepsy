@@ -2253,6 +2253,213 @@ def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
     ) == pytest.approx(1.0, abs=1.0e-10)
 
 
+@pytest.mark.parametrize("block_size", [1, 2, 3])
+@pytest.mark.parametrize(
+    ("spinful", "symmetry", "occupations", "expect_initialization"),
+    [
+        (False, "U1", (1, 0, 1, 0, 1, 0), True),
+        (
+            True,
+            "U1U1",
+            ((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
+            True,
+        ),
+        (False, "Z2", (1, 0, 1, 0, 1, 0), False),
+    ],
+)
+def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
+    block_size,
+    spinful,
+    symmetry,
+    occupations,
+    expect_initialization,
+    monkeypatch,
+):
+    """Full-chain FIT seeds target sectors without dense conversion."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    guess = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=3,
+        seed=29,
+        dtype="complex128",
+    )
+    target = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=3,
+        seed=37,
+        dtype="complex128",
+    )
+    fit = py.FIT(
+        target.copy(deep=True),
+        p=guess.copy(deep=True),
+        range_int=[0, 5],
+        environment_strategy="symmray-native",
+    )
+
+    def fail_dense(*_args, **_kwargs):
+        raise AssertionError("native sector initialization must not call to_dense")
+
+    def fail_network_contract(*_args, **_kwargs):
+        raise AssertionError(
+            "native sector initialization must not build a temporary "
+            "TensorNetwork"
+        )
+
+    run_options = {
+        "n_iter": 2,
+        "min_iter": 1,
+        "rtol": None,
+        "block_size": block_size,
+        "sweep_sequence": "RL",
+        "max_bond": 2,
+        "cutoff": 1.0e-12,
+    }
+    if block_size > 1:
+        run_options["adaptive_block_sweeps"] = 2
+    array_types = {type(tensor.data) for tensor in (*guess, *target)}
+    with monkeypatch.context() as patcher:
+        for array_type in array_types:
+            patcher.setattr(array_type, "to_dense", fail_dense)
+        patcher.setattr(qtn.TensorNetwork, "contract", fail_network_contract)
+        fit.run_gate(**run_options)
+
+    initialization = fit.info["native_sector_initialization"]
+    assert initialization["applied"] is expect_initialization
+    if expect_initialization:
+        assert initialization["reason"] == "missing_virtual_charge_support"
+        assert initialization["bonds"]
+    else:
+        assert initialization["reason"] == "compatible_virtual_charge_support"
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in fit.p
+    )
+    assert float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+
+
+def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
+    """Native block run_eff shares full-chain target-informed initialization."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    occupations = (
+        (1, 0),
+        (0, 1),
+        (1, 0),
+        (0, 1),
+        (1, 0),
+        (0, 1),
+    )
+    guess = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=3,
+        seed=29,
+        dtype="complex128",
+    )
+    target = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=3,
+        seed=37,
+        dtype="complex128",
+    )
+    fit = py.FIT(
+        target,
+        p=guess,
+        environment_strategy="symmray-native",
+    )
+    fit.run_eff(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=1.0e-12,
+    )
+
+    initialization = fit.info["native_sector_initialization"]
+    assert initialization["applied"] is True
+    assert initialization["reason"] == "missing_virtual_charge_support"
+    assert float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-10)
+
+
+def test_fit_fermionic_partial_window_reports_disconnected_target_sectors():
+    """A disconnected partial FIT reports its fixed-boundary sector issue."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    occupations = (
+        (1, 0),
+        (0, 1),
+        (1, 0),
+        (0, 1),
+        (1, 0),
+        (0, 1),
+    )
+    guess = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=3,
+        seed=29,
+        dtype="complex128",
+    )
+    target = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=occupations,
+        chi=2,
+        random_rounds=3,
+        seed=37,
+        dtype="complex128",
+    )
+    fit = py.FIT(
+        target,
+        p=guess,
+        range_int=[1, 4],
+        environment_strategy="symmray-native",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="disconnected charge-sector support",
+    ):
+        fit.run_gate(
+            n_iter=2,
+            block_size=2,
+            sweep_sequence="RL",
+            max_bond=2,
+            cutoff=1.0e-12,
+        )
+
+
 @pytest.mark.parametrize(
     ("spinful", "symmetry", "occupations"),
     [
@@ -2266,14 +2473,16 @@ def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
     ],
 )
 @pytest.mark.parametrize("fit_sweep_sequence", ["R", "RL"])
-def test_mps_optimizer_dmrg2_long_range_fermions_stay_native_and_exact(
+@pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
+def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
     spinful,
     symmetry,
     occupations,
     fit_sweep_sequence,
+    mode,
     monkeypatch,
 ):
-    """Exact-cutoff DMRG2 keeps native U1/U1U1/Z2 grading end to end."""
+    """Every named DMRG mode keeps U1/U1U1/Z2 grading end to end."""
     pytest.importorskip("symmray")
     fermion = py.Fermion(
         spinful=spinful,
@@ -2329,7 +2538,7 @@ def test_mps_optimizer_dmrg2_long_range_fermions_stay_native_and_exact(
         state.copy(deep=True),
         stream,
         chi=16,
-        mode="dmrg2",
+        mode=mode,
         track_infidelity=False,
     )
     array_types = {type(tensor.data) for tensor in (*state, *reference)}
@@ -2356,10 +2565,17 @@ def test_mps_optimizer_dmrg2_long_range_fermions_stay_native_and_exact(
     assert optimizer._last_dmrg_fit_diagnostics[
         "native_fermionic_warm_start"
     ] is True
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
-    assert optimizer._last_dmrg_fit_diagnostics[
-        "one_site_refinement_sweeps"
-    ] == 1
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["block_size"] == (3 if mode == "dmrg3" else 2)
+    assert diagnostics["adaptive_sweeps"] >= 2
+    assert (
+        diagnostics["adaptive_sweeps"]
+        + diagnostics["one_site_refinement_sweeps"]
+        == 3
+    )
+    if mode == "dmrg2":
+        assert diagnostics["adaptive_sweeps"] == 2
+        assert diagnostics["one_site_refinement_sweeps"] == 1
     assert float(
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-9)
