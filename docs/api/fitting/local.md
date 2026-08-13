@@ -82,18 +82,33 @@ repeating the larger SVD block.
 
 The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and
 `adaptive_until_rank=True` for its rank-growing `dmrg`, `dmrg1`, and `dmrg3`
-paths. `dmrg2` uses the configured minimum block warm-up and then refines with
-one-site FIT. The direct FIT diagnostics
+paths. Before constructing a `dmrg1` fit, the optimizer checks the active
+attainable bond ceilings: an already-capped window starts with one-site FIT,
+while an under-capacity non-adjacent window requires `n_iter >= 3` for two
+two-site growth sweeps and at least one one-site refinement sweep. `dmrg2`
+uses the configured minimum block warm-up and then refines with one-site FIT.
+The direct FIT diagnostics
 `adaptive_sweeps_run` and `one_site_sweeps_run` count both scheduled block
 sweeps and any explicit `final_one_site_sweeps` polish passes.
+
+For tolerance-controlled `run_gate`, `patience` counts same-phase retained-norm
+samples, not norm differences. Thus `patience=2` needs two comparable
+one-site samples and stops after their first stable relative change, subject
+to `min_iter`. A phase change from block growth to one-site refinement resets
+the convergence window.
 
 Ordinary dense arrays and native fermionic Symmray arrays reuse the compatible
 partial overlap environments produced by the preceding opposite-direction
 sweep. Fermionic FIT keeps the working state conjugated across the complete
 sweep sequence, so the reused environments retain one dual-leg convention.
-A change from two-/three-site updates to one-site refinement rebuilds the
-boundary environments once before reuse resumes. Bosonic Symmray arrays retain
-their conservative environment rebuild policy.
+A block sweep retains only the boundaries needed by another reversed sweep of
+the same size. If the next reversed sweep changes to one-site refinement, FIT
+extends that cache through exactly one terminal tensor after a two-site sweep,
+or two terminal tensors after a three-site sweep. Both 2-to-1 and 3-to-1
+transitions therefore avoid a complete fixed-side rebuild without constructing
+unused terminal environments during block warm-up. Fresh sweeps construct only
+the fixed boundaries that their active block can query. Bosonic Symmray arrays
+retain their conservative environment rebuild policy.
 
 The same native block updates are available for the full-chain path:
 
@@ -116,10 +131,16 @@ remain controls of `run_gate()`.
 For an interval containing exactly one neighboring pair,
 `single_pair_fast_path=True` marks structural convergence after one update:
 the effective tensor and its SVD solve the entire active problem, so another
-sweep only rebuilds the same environments. The default is `False` on direct
+sweep only rebuilds the same environments. That terminal update constructs no
+active-window environments; native fermionic outside-window environments stay
+intact. The default is `False` on direct
 `FIT.run_gate` calls to preserve fixed-sweep compatibility; MpsOptimizer opts
-in by default. `collect_split_diagnostics=False` omits per-SVD truncation
-dictionaries when only the fitted state and retained norm are needed.
+in by default. Consequently, named `dmrg1` and `dmrg2` windows of two sites
+perform one two-site update and advance to the next gate without one-site
+refinement; `n_iter` and tolerance controls cannot add a second sweep while
+the fast path is enabled. `collect_split_diagnostics=False` omits per-SVD
+truncation dictionaries when only the fitted state and retained norm are
+needed.
 
 `sweep_sequence` uses Quimb direction names: `"R"` is left-to-right, `"L"` is
 right-to-left, and `"RL"` alternates. Native fermionic `run_gate` executes the
@@ -154,6 +175,10 @@ contraction so contraction order, dummy modes, and graded phases remain
 authoritative. It dispatches directly on the Symmray arrays and does not build
 a temporary TensorNetwork. Neither route densifies the tensor arrays. The
 explicit settings are mainly useful for profiling and regression comparison.
+For a layered target, FIT resolves each active-window boundary bond by
+inspecting tensors on the two neighboring site tags and caches the resulting
+index name. It does not rescan the complete target index map during local
+environment updates; no tensor data or backend array is copied by this cache.
 
 `cutoff="auto"` chooses `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
 data, and `1e-12` for 64-bit data. Numeric cutoffs retain their explicit

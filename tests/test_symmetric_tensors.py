@@ -4247,7 +4247,7 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
 @pytest.mark.parametrize(
     ("mode", "expected_blocks"),
     [
-        ("dmrg1", [2, 2, 1]),
+        ("dmrg1", [1, 1, 1]),
         ("dmrg2", [2, 2, 1]),
         ("dmrg3", [3, 3, 1]),
     ],
@@ -4260,7 +4260,7 @@ def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
     mode,
     expected_blocks,
 ):
-    """Native U1/U1U1 aliases grow then refine without densifying."""
+    """Native U1/U1U1 aliases follow their schedules without densifying."""
     state = SymMPS.random_unitary_for_model(
         model,
         3,

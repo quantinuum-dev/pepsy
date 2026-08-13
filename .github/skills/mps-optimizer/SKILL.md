@@ -18,7 +18,14 @@ tests before editing.
   by one-site refinement, and `dmrg3` uses adaptive three-site growth followed
   by one-site refinement. Adaptive rank-growth phases end only when all
   attainable active-bond ceilings are reached; rank stagnation is not an early
-  exit. Compose with
+  exit. A `dmrg1` window already at those ceilings starts directly with
+  one-site FIT. An under-capacity non-adjacent `dmrg1` window requires
+  `n_iter >= 3`: two block sweeps plus at least one refinement sweep. Its
+  default `fit_patience=2` is a two-sample same-phase norm window, i.e. one
+  stable comparison. A two-site window is a structural special case for both
+  `dmrg1` and `dmrg2`: perform exactly one two-site update, no one-site
+  refinement, then advance to the next gate without consuming the remaining
+  `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
 - `mpo`: direct non-local gate/MPO replay with bond truncation.

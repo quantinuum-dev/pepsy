@@ -105,9 +105,11 @@ the MPS by one site.
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
 `"dmrg1"` uses adaptive two-site growth until active bonds reach their
-attainable ceilings and then fixed-rank one-site FIT; `"dmrg2"` uses two-site
-FIT for the required warm-up (two sweeps by default) and then one-site FIT;
-and `"dmrg3"` uses adaptive three-site growth and then one-site FIT.
+attainable ceilings and then fixed-rank one-site FIT. If every active bond is
+already at its attainable ceiling before the fit, `"dmrg1"` starts directly
+with one-site FIT. `"dmrg2"` uses two-site FIT for the required warm-up (two
+sweeps by default) and then one-site FIT; `"dmrg3"` uses adaptive three-site
+growth and then one-site FIT.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
 schedule. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
@@ -140,8 +142,11 @@ two-site warm-up. `fit_layer_size` is the clear name for
 `k_2q_batch`; it counts two-site gates in a contiguous paper-style target
 block. For `fit_block_size=2`, an active window spanning at least three sites
 uses the same adaptive-to-one-site schedule; an ordinary two-site gate window
-skips one-site refinement because its two-site update already solves the
-complete local problem. `fit_three_site_sweeps` remains a deprecated alias for
+uses exactly one two-site update because that effective tensor already solves
+the complete local problem. In particular, `dmrg1` and `dmrg2` immediately
+advance to the next gate after that update: they do not repeat their warm-up
+or enter one-site refinement, regardless of `n_iter` or `fit_rtol`.
+`fit_three_site_sweeps` remains a deprecated alias for
 `fit_adaptive_sweeps`.
 `fit_max_span="auto"` also limits the spatial width of a batched
 target, splitting disjoint gates before they create an unnecessarily wide FIT
@@ -156,11 +161,17 @@ For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
 control adaptive stopping from FIT's final local-norm change. The public
 `MpsOptimizer.run` default is `fit_rtol=1e-8`, which compares the retained
-local Frobenius norm between sweeps. It is a cheap convergence proxy, not a
-direct overlap or literal infidelity. `fit_rtol="auto"` remains an explicit
+canonical-center norm (A) between sweeps. Canonical FIT is an orthogonal
+projection, so for target norm (T) the true normalized fidelity is
+\((A/T)^2\); when `p_target` is normalized, true infidelity is exactly
+\(1-A^2\). The stopping test compares changes in (A), rather than applying
+an absolute infidelity threshold. `fit_rtol="auto"` remains an explicit
 dtype-aware option selecting `1e-3`, `1e-5`, or `1e-8` for 16-,
 32-/complex64-, or higher-precision data. Pass `fit_rtol=None` for fixed
-iterations. The old
+iterations. `fit_patience` counts same-phase sweep-norm samples in the
+convergence window, so the default `fit_patience=2` stops after one stable
+comparison between two one-site samples; `fit_min_iter` still sets the
+minimum completed-sweep count. The old
 `mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` spellings remain as
 deprecated aliases. A legacy value replaces the canonical default for old
 call sites; a conflicting non-default canonical value fails instead of
@@ -168,7 +179,11 @@ silently choosing a policy. FIT checks the small per-site norm scalars it
 already computes after every sweep, transferring only one active-span-sized
 vector to the host. Adaptive rank-growing windows require `n_iter >= 2`; a
 shorter request raises before fitting, except for the adjacent two-site exact
-fast path.
+fast path. An under-capacity, non-adjacent `mode="dmrg1"` window requires
+`n_iter >= 3`, reserving its first two sweeps for two-site rank growth and at
+least one later sweep for one-site refinement. An already-capped `dmrg1`
+window has no growth reservation and uses all requested sweeps as one-site
+updates.
 At least two adaptive block sweeps are required whenever the active window
 needs rank growth, regardless of `fit_rtol`; an adjacent two-site interval is
 a structural special case whose only pair is

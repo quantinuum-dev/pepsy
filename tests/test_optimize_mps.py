@@ -1046,6 +1046,9 @@ def test_fit_gate_three_site_warmup_then_one_site_refinement():
 
     assert [record["block_size"] for record in fit.get_timing()] == [3, 1, 1]
     assert len(fit.info["three_site_splits"]) == 2
+    # The 3->1 transition extends two terminal boundaries instead of
+    # rebuilding the fixed side; the following 1->1 sweep reuses normally.
+    assert fit._sweep_environment_reuse_count == 2
 
 
 def test_fit_gate_polish_sweeps_update_iteration_diagnostics():
@@ -1088,6 +1091,7 @@ def test_fit_gate_two_site_warmup_then_one_site_refinement():
     timing = fit.get_timing()
     assert [record["block_size"] for record in timing] == [2, 2, 1, 1]
     assert len(fit.info["two_site_splits"]) == 6
+    assert fit._sweep_environment_reuse_count == 3
     assert all(
         record["svd_seconds"] == 0.0
         for record in timing[2:]
@@ -1132,8 +1136,9 @@ def test_dmrg1_does_not_leave_adaptive_phase_on_rank_stagnation():
     assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
 
 
-def test_dmrg1_requires_two_adaptive_sweeps():
-    """Adaptive DMRG rejects a non-adjacent run shorter than two sweeps."""
+@pytest.mark.parametrize("n_iter", [1, 2])
+def test_dmrg1_growth_requires_room_for_one_site_refinement(n_iter):
+    """DMRG1 growth needs two block sweeps plus one refinement sweep."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("000", dtype="complex128"),
         gates=[(np.eye(4), (0, 2))],
@@ -1141,12 +1146,47 @@ def test_dmrg1_requires_two_adaptive_sweeps():
         mode="dmrg1",
     )
 
-    with pytest.raises(ValueError, match="n_iter >= 2"):
-        optimizer.run(progbar=False, n_iter=1, fit_rtol=None)
+    with pytest.raises(ValueError, match="n_iter >= 3"):
+        optimizer.run(progbar=False, n_iter=n_iter, fit_rtol=None)
 
 
-def test_dmrg1_switches_to_one_site_only_after_ceiling_is_reached():
-    """DMRG1 refines only after all active bonds reach their ceilings."""
+def test_dmrg1_under_capacity_grows_twice_then_refines():
+    """DMRG1 grows an under-capacity window twice before refinement."""
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
+    cnot = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    bell_gate = cnot @ np.kron(hadamard, np.eye(2))
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(bell_gate, (0, 2))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        cutoff=0.0,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
+
+
+def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
+    """A full-rank DMRG1 window should not repeat two-site warm-up."""
     state = qtn.MPS_rand_state(
         3,
         bond_dim=2,
@@ -1156,7 +1196,7 @@ def test_dmrg1_switches_to_one_site_only_after_ceiling_is_reached():
     )
     optimizer = py.MpsOptimizer(
         state,
-        gates=[(np.eye(4), (0, 2))],
+        gates=[(np.eye(4, dtype=np.complex128), (0, 2))],
         chi=2,
         mode="dmrg1",
     )
@@ -1172,9 +1212,43 @@ def test_dmrg1_switches_to_one_site_only_after_ceiling_is_reached():
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 1]
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
+    ] == [1, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
+
+
+def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
+    """The default window of two stops after two stable one-site norms."""
+    state = qtn.MPS_rand_state(
+        3,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="complex128",
+        seed=124,
+    )
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[(np.eye(4, dtype=np.complex128), (0, 2))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=8,
+        fit_rtol=1.0e9,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["iterations"] == 2
+    assert (
+        optimizer._last_dmrg_fit_diagnostics["convergence_reason"]
+        == "relative_tolerance"
+    )
 
 
 def test_dmrg2_switches_after_required_two_site_warmup():
@@ -1424,6 +1498,181 @@ def test_fit_gate_reuses_dense_opposite_sweep_environments():
     )
 
 
+@pytest.mark.parametrize("direction", ["R", "L"])
+@pytest.mark.parametrize("block_size", [1, 2, 3])
+def test_fit_gate_builds_only_fixed_environments_reachable_by_block(
+    monkeypatch,
+    direction,
+    block_size,
+):
+    """Fresh sweeps contract only boundaries reachable by their blocks."""
+    initial = qtn.MPS_rand_state(
+        4, bond_dim=2, phys_dim=2, dtype="complex128", seed=603
+    )
+    target = qtn.MPS_rand_state(
+        4, bond_dim=3, phys_dim=2, dtype="complex128", seed=604
+    )
+    fit = py.FIT(target, p=initial, range_int=[0, 3])
+    overlap_calls = 0
+    original = fit._overlap_environment_site
+
+    def count_overlap(*args, **kwargs):
+        nonlocal overlap_calls
+        overlap_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fit, "_overlap_environment_site", count_overlap)
+    fit.run_gate(
+        n_iter=1,
+        block_size=block_size,
+        sweep_sequence=direction,
+        max_bond=3,
+        cutoff=1.0e-12,
+    )
+
+    window_size = 4
+    fixed_count = window_size - block_size
+    moving_count = (
+        window_size - 1
+        if block_size == 1
+        else window_size - block_size
+    )
+    assert overlap_calls == fixed_count + moving_count
+
+
+@pytest.mark.parametrize("direction", ["R", "L"])
+def test_fit_single_pair_fast_path_builds_no_active_environments(
+    monkeypatch,
+    direction,
+):
+    """A terminal update covering the full window needs no active cache."""
+    initial = qtn.MPS_rand_state(
+        4, bond_dim=2, phys_dim=2, dtype="complex128", seed=605
+    )
+    fit = py.FIT(initial.copy(), p=initial, range_int=[1, 2])
+    overlap_calls = 0
+    original = fit._overlap_environment_site
+
+    def count_overlap(*args, **kwargs):
+        nonlocal overlap_calls
+        overlap_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fit, "_overlap_environment_site", count_overlap)
+    fit.run_gate(
+        n_iter=7,
+        block_size=2,
+        sweep_sequence=direction,
+        max_bond=2,
+        rtol=None,
+        single_pair_fast_path=True,
+    )
+
+    assert overlap_calls == 0
+
+
+@pytest.mark.parametrize("sweep_sequence", ["RL", "LR"])
+def test_fit_reuses_reversed_two_site_cache_for_one_site_refinement(
+    sweep_sequence,
+):
+    """The final two-site boundaries exactly serve reversed one-site FIT."""
+    initial = qtn.MPS_rand_state(
+        5, bond_dim=1, phys_dim=2, dtype="complex128", seed=606
+    )
+    target = qtn.MPS_rand_state(
+        5, bond_dim=3, phys_dim=2, dtype="complex128", seed=607
+    )
+    options = {
+        "n_iter": 3,
+        "block_size": 2,
+        "adaptive_block_sweeps": 2,
+        "sweep_sequence": sweep_sequence,
+        "max_bond": 3,
+        "cutoff": 1.0e-12,
+        "rtol": None,
+    }
+    cached = py.FIT(target, p=initial, range_int=[0, 4])
+    conservative = py.FIT(target, p=initial, range_int=[0, 4])
+    overlap_calls = {"cached": 0, "conservative": 0}
+    cached_overlap = cached._overlap_environment_site
+    conservative_overlap = conservative._overlap_environment_site
+
+    def count_cached(*args, **kwargs):
+        overlap_calls["cached"] += 1
+        return cached_overlap(*args, **kwargs)
+
+    def count_conservative(*args, **kwargs):
+        overlap_calls["conservative"] += 1
+        return conservative_overlap(*args, **kwargs)
+
+    cached._overlap_environment_site = count_cached
+    conservative._overlap_environment_site = count_conservative
+    conservative._allow_sweep_environment_reuse = False
+
+    cached.run_gate(**options)
+    conservative.run_gate(**options)
+
+    assert cached._sweep_environment_reuse_count == 2
+    assert conservative._sweep_environment_reuse_count == 0
+    assert overlap_calls == {"cached": 14, "conservative": 20}
+    assert np.allclose(
+        cached.p.to_dense(),
+        conservative.p.to_dense(),
+        atol=1.0e-12,
+    )
+
+
+@pytest.mark.parametrize("sweep_sequence", ["RL", "LR"])
+def test_fit_reuses_reversed_three_site_cache_for_one_site_refinement(
+    sweep_sequence,
+):
+    """Three-site FIT extends only two terminal boundaries before 1-site."""
+    initial = qtn.MPS_rand_state(
+        5, bond_dim=1, phys_dim=2, dtype="complex128", seed=608
+    )
+    target = qtn.MPS_rand_state(
+        5, bond_dim=3, phys_dim=2, dtype="complex128", seed=609
+    )
+    options = {
+        "n_iter": 3,
+        "block_size": 3,
+        "adaptive_block_sweeps": 2,
+        "sweep_sequence": sweep_sequence,
+        "max_bond": 3,
+        "cutoff": 1.0e-12,
+        "rtol": None,
+    }
+    cached = py.FIT(target, p=initial, range_int=[0, 4])
+    conservative = py.FIT(target, p=initial, range_int=[0, 4])
+    overlap_calls = {"cached": 0, "conservative": 0}
+    cached_overlap = cached._overlap_environment_site
+    conservative_overlap = conservative._overlap_environment_site
+
+    def count_cached(*args, **kwargs):
+        overlap_calls["cached"] += 1
+        return cached_overlap(*args, **kwargs)
+
+    def count_conservative(*args, **kwargs):
+        overlap_calls["conservative"] += 1
+        return conservative_overlap(*args, **kwargs)
+
+    cached._overlap_environment_site = count_cached
+    conservative._overlap_environment_site = count_conservative
+    conservative._allow_sweep_environment_reuse = False
+
+    cached.run_gate(**options)
+    conservative.run_gate(**options)
+
+    assert cached._sweep_environment_reuse_count == 2
+    assert conservative._sweep_environment_reuse_count == 0
+    assert overlap_calls == {"cached": 12, "conservative": 16}
+    assert np.allclose(
+        cached.p.to_dense(),
+        conservative.p.to_dense(),
+        atol=1.0e-12,
+    )
+
+
 def test_fit_auto_cutoff_is_dtype_aware():
     """FIT's automatic cutoff follows the fitted tensor precision."""
     initial = qtn.MPS_rand_state(
@@ -1551,21 +1800,33 @@ def test_fit_two_site_single_pair_fast_path_is_structurally_converged():
     assert fit.final_direction == "R"
 
 
-def test_dmrg_uses_single_pair_fast_path_by_default():
-    """Adjacent optimizer gates should not rebuild the same FIT environments."""
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2"])
+def test_dmrg_modes_advance_after_one_update_per_two_site_window(mode):
+    """A two-site window gets one exact update, independent of n_iter."""
     optimizer = py.MpsOptimizer(
-        qtn.MPS_computational_state("00", dtype="complex128"),
-        gates=[(qu.CNOT(), (0, 1))],
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[
+            (qu.hadamard(), (0,)),
+            (qu.CNOT(), (0, 1)),
+            (qu.CNOT(), (1, 2)),
+        ],
         chi=2,
-        mode="dmrg",
+        mode=mode,
     )
 
-    optimizer.run(progbar=False, n_iter=8, fit_rtol=None)
+    optimizer.run(progbar=False, n_iter=8, fit_rtol=None, timing=True)
 
+    records = optimizer.get_run_timing()["fit_steps"]
+    assert [record["fit_index"] for record in records] == [0, 1]
+    assert [record["sweep"] for record in records] == [1, 1]
+    assert [record["block_size"] for record in records] == [2, 2]
     diagnostics = optimizer._last_dmrg_fit_diagnostics
     assert diagnostics["iterations"] == 1
+    assert diagnostics["block_size"] == 2
+    assert diagnostics["adaptive_sweeps"] == 1
+    assert diagnostics["one_site_refinement_sweeps"] == 0
     assert diagnostics["convergence_reason"] == "single_pair_exact"
-    assert diagnostics["center_site"] == 1
+    assert diagnostics["center_site"] == 2
 
 
 def test_dense_layered_fit_target_matches_materialized_mps_target():
@@ -1593,6 +1854,44 @@ def test_dense_layered_fit_target_matches_materialized_mps_target():
 
     assert layered.num_tensors == state.L + 2
     assert np.allclose(layered.to_dense(), materialized.to_dense(), atol=1.0e-12)
+
+
+def test_layered_fit_resolves_boundary_bonds_locally_and_caches_them():
+    """Layered boundary discovery must not scan the global target index map."""
+    state = qtn.MPS_rand_state(
+        6, bond_dim=2, phys_dim=2, dtype="complex128", seed=608
+    )
+    optimizer = py.MpsOptimizer(state.copy(), gates=[], chi=4, mode="dmrg")
+    target = optimizer._build_norm_target(
+        state,
+        qu.CNOT(),
+        (2, 3),
+        0.0,
+        target_strategy="layered",
+    )
+    fit = py.FIT(
+        target,
+        p=state,
+        range_int=[2, 3],
+        copy_target=False,
+    )
+
+    class LocalOnlyIndexMap(dict):
+        def items(self):
+            raise AssertionError("layered FIT scanned the global index map")
+
+    fit.tn.ind_map = LocalOnlyIndexMap(fit.tn.ind_map)
+    fit.run_gate(
+        n_iter=1,
+        block_size=2,
+        max_bond=4,
+        cutoff=0.0,
+        single_pair_fast_path=True,
+    )
+
+    assert set(fit._target_bond_cache) == {(1, 2), (3, 4)}
+    assert fit._target_bond(1, 2) == fit._target_bond_cache[(1, 2)]
+    assert fit._target_bond(3, 4) == fit._target_bond_cache[(3, 4)]
 
 
 def test_layered_dmrg_batch_target_avoids_intermediate_mps_rank_growth():
@@ -1704,6 +2003,7 @@ def test_fit_gate_two_site_final_polish_only_spans_large_windows():
     assert [record["block_size"] for record in records] == [2, 1]
     assert [record["direction"] for record in records] == ["R", "L"]
     assert [record["site_count"] for record in records] == [2, 3]
+    assert fit._sweep_environment_reuse_count == 1
 
     pair = py.FIT(state.copy(), p=state, range_int=[1, 2])
     pair.run_gate(
@@ -2203,6 +2503,80 @@ def test_fit_run_eff_fermionic_blocks_alternate_natively(block_size):
     ) == pytest.approx(1.0, abs=1.0e-10)
 
 
+@pytest.mark.parametrize("block_size", [2, 3])
+@pytest.mark.parametrize("sweep_sequence", ["RL", "LR"])
+def test_fit_fermionic_block_cache_feeds_one_site_refinement(
+    monkeypatch,
+    sweep_sequence,
+    block_size,
+):
+    """Native U1U1 fermions reuse reversed block-to-1 caches natively."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    state = py.hrs_to_mps(
+        6,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
+        chi=2,
+        random_rounds=2,
+        seed=61,
+        dtype="complex128",
+    )
+    cached = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[1, 4],
+        environment_strategy="symmray-native",
+    )
+    conservative = py.FIT(
+        state.copy(deep=True),
+        p=state.copy(deep=True),
+        range_int=[1, 4],
+        environment_strategy="symmray-native",
+    )
+    conservative._allow_sweep_environment_reuse = False
+    options = {
+        "n_iter": 3,
+        "block_size": block_size,
+        "adaptive_block_sweeps": 2,
+        "sweep_sequence": sweep_sequence,
+        "max_bond": 8,
+        "cutoff": 1.0e-12,
+        "rtol": None,
+    }
+
+    def fail_dense(*_args, **_kwargs):
+        raise AssertionError("native cache reuse must not call to_dense")
+
+    array_types = {type(tensor.data) for tensor in state}
+    with monkeypatch.context() as patcher:
+        for array_type in array_types:
+            patcher.setattr(array_type, "to_dense", fail_dense)
+        cached.run_gate(**options)
+        conservative.run_gate(**options)
+
+    assert cached._sweep_environment_reuse_count == 2
+    assert conservative._sweep_environment_reuse_count == 0
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in cached.p
+    )
+    assert float(
+        np.real(
+            py.tn_fidelity(
+                cached.p,
+                conservative.p,
+                contraction_opt="greedy",
+            )
+        )
+    ) == pytest.approx(1.0, abs=1.0e-10)
+
+
 def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
     """A failed native sweep cannot leak FIT's conjugated working gauge."""
     pytest.importorskip("symmray")
@@ -2566,8 +2940,14 @@ def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
         "native_fermionic_warm_start"
     ] is True
     diagnostics = optimizer._last_dmrg_fit_diagnostics
-    assert diagnostics["block_size"] == (3 if mode == "dmrg3" else 2)
-    assert diagnostics["adaptive_sweeps"] >= 2
+    if mode == "dmrg1" and diagnostics["block_size"] == 1:
+        # The native warm start can already fill every active rank ceiling.
+        # DMRG1 then correctly spends the complete budget on one-site FIT.
+        assert diagnostics["adaptive_sweeps"] == 0
+        assert diagnostics["one_site_refinement_sweeps"] == 3
+    else:
+        assert diagnostics["block_size"] == (3 if mode == "dmrg3" else 2)
+        assert diagnostics["adaptive_sweeps"] >= 2
     assert (
         diagnostics["adaptive_sweeps"]
         + diagnostics["one_site_refinement_sweeps"]

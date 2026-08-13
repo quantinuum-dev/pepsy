@@ -19,7 +19,9 @@
 - `fit_block_size=1`: fixed-rank compatibility update.
 - `fit_sweep_sequence="RL"`: alternating left-to-right/right-to-left sweeps.
 - `fit_min_iter`, `fit_rtol`, `fit_patience`: mode-neutral adaptive stopping
-  controls for DMRG and mixed DMRG; legacy `mix_fit_*` names are deprecated.
+  controls for DMRG and mixed DMRG. Patience counts same-phase norm samples,
+  so the default value 2 represents one stable comparison; legacy
+  `mix_fit_*` names are deprecated.
 - `fit_layer_size=N`: number of circuit gates in one target block; compatibility
   alias `k_2q_batch` remains.
 - `target_cutoff=0.0`: target construction cutoff.
@@ -50,11 +52,34 @@ environments, yielding the two physical groups and two outer virtual legs.
 `Tensor.split` truncates only the middle bond and absorbs singular values in
 the sweep direction.
 
+Fresh gate sweeps build fixed environments only beyond the first active
+block. Completed block sweeps retain the minimal cumulative boundaries needed
+by an equal-size reversed sweep. Immediately before a reversed one-site
+transition, FIT extends that cache through one terminal tensor for a two-site
+producer or two terminal tensors for a three-site producer; it never rebuilds
+the complete fixed side. A terminal single-pair fast path needs no
+active-window environment. Layered targets
+cache boundary index names discovered from neighboring site tensors rather
+than scanning the global target index map; this cache owns no tensor data.
+The private `_SweepEnvironmentCache` keeps each completed sweep's boundary
+mapping, direction, and block size together. It retains the mapping by
+reference and performs compatibility checks once per sweep; update kernels
+continue to use direct dictionary lookups with no wrapper in their hot loops.
+
 An active interval containing one adjacent pair reaches its complete local
 optimum after that split. MpsOptimizer enables the single-pair fast path even
-when tolerance stopping is disabled. After any final sweep, FIT's retained
-norm and center tensor are authoritative for infidelity and unitary
-stabilization; recanonicalizing the interval is redundant.
+when tolerance stopping is disabled. Thus `dmrg1` and `dmrg2` each perform one
+two-site update for a two-site window, skip one-site refinement, and advance
+to the next gate regardless of the remaining `n_iter` budget. After any final
+sweep, FIT's retained norm and center tensor are authoritative for infidelity
+and unitary stabilization; recanonicalizing the interval is redundant.
+
+For `dmrg1`, inspect the active attainable rank targets before starting FIT.
+An already-capped window starts with one-site updates. An under-capacity
+non-adjacent window requires at least three requested sweeps: two two-site
+growth sweeps followed by at least one one-site refinement sweep. Reaching all
+targets during growth switches the remaining budget to one-site updates;
+rank stagnation below a target does not impersonate reaching the target.
 
 `run_eff` is a separate global full-chain fit used by boundary/sampling code.
 Do not substitute it for the gate-window solver.

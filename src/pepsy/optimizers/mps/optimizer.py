@@ -773,8 +773,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Optimization backend. ``"fit"`` is the clear alias of the historical
         ``"dmrg"`` spelling. ``"dmrg1"`` uses two-site adaptive growth until
         the active bonds reach their attainable ceilings, then one-site
-        refinement. ``"dmrg2"`` uses two-site updates for the required warm-up
-        (two sweeps by default), then one-site refinement. ``"dmrg3"`` uses
+        refinement; an already-capped window starts directly with one-site
+        sweeps. ``"dmrg2"`` uses two-site updates for the required warm-up (two
+        sweeps by default), then one-site refinement. ``"dmrg3"`` uses
         three-site adaptive updates before one-site refinement.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
@@ -1863,6 +1864,54 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if int(block_size) == 1:
             self._prepare_mix_dmrg_state(where)
 
+    def _dmrg_fit_block_size(self, p, where, requested_block_size):
+        """Resolve the live DMRG block size for an active window.
+
+        DMRG1 uses two-site updates only to grow an under-capacity active
+        window. Once every active bond has reached its attainable ``chi``
+        ceiling, including at the start of a later gate fit, fixed-rank
+        one-site sweeps are the correct and cheaper update.
+        """
+        xmin, xmax = self._normalize_span(where)
+        active_block_size = min(
+            int(requested_block_size),
+            xmax - xmin + 1,
+        )
+        if (
+            self._dmrg_mode_alias == "dmrg1"
+            and active_block_size == 2
+            and xmax - xmin >= 2
+            and FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+                p,
+                xmin,
+                xmax,
+                self.chi,
+            )
+        ):
+            return 1
+        return active_block_size
+
+    def _validate_dmrg1_iteration_budget(self, p, where, *, n_iter, block_size):
+        """Require two growth sweeps plus refinement for uncapped DMRG1."""
+        if self._dmrg_mode_alias != "dmrg1" or int(block_size) != 2:
+            return
+        xmin, xmax = self._normalize_span(where)
+        if xmax - xmin < 2:
+            return
+        if FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+            p,
+            xmin,
+            xmax,
+            self.chi,
+        ):
+            return
+        if int(n_iter) < 3:
+            raise ValueError(
+                "mode='dmrg1' requires n_iter >= 3 for an under-capacity "
+                "window: two two-site growth sweeps and at least one "
+                "one-site refinement sweep."
+            )
+
     def set_p(self, p):
         """Assign a new state and reset canonicalization metadata."""
         new_p = self._install_represented_norm(p if self.inplace else p.copy())
@@ -2701,8 +2750,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             modes this is the maximum number of sweeps when adaptive FIT
             stopping is enabled; pass ``fit_rtol=None`` for fixed
             iterations. Adaptive rank-growing windows require at least two
-            sweeps (except the adjacent two-site exact fast path). Ignored by
-            ``mpo``/``swap``/``svd``/``exact``.
+            sweeps. An under-capacity non-adjacent ``dmrg1`` window requires
+            ``n_iter >= 3`` so two growth sweeps leave room for one-site
+            refinement. The adjacent two-site exact fast path is exempt.
+            Ignored by ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
             Show per-mode progress bars.
         cutoff : float | {"auto"}, default=1e-12
@@ -2791,15 +2842,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``n_iter``.
         fit_rtol : {"auto"} | float | None, default=1e-8
             Relative tolerance for DMRG FIT early stopping. The default
-            ``1e-8`` uses relative change in the retained local Frobenius norm
-            as a cheap convergence proxy, not a direct overlap or literal
-            infidelity. ``"auto"`` selects a dtype-aware tolerance explicitly;
-            ``None`` disables early stopping and restores fixed ``n_iter``
-            behavior.
+            ``1e-8`` uses relative change in the retained canonical-center
+            norm ``A``. The FIT projection identity gives true normalized
+            fidelity ``(A / T)**2`` for target norm ``T``; therefore, when
+            ``p_target`` is normalized, true infidelity is ``1 - A**2``.
+            Early stopping compares changes in ``A``, not an absolute
+            infidelity threshold. ``"auto"`` selects a dtype-aware tolerance
+            explicitly; ``None`` disables early stopping and restores fixed
+            ``n_iter`` behavior.
         fit_patience : int, default=2
-            Consecutive converged FIT sweeps required before stopping early in
-            ``dmrg`` or ``mix`` mode. Rank-adaptive DMRG still performs its
-            minimum adaptive warm-up before this criterion can stop a run.
+            Number of same-phase sweep-norm samples in the convergence window.
+            The default of two stops after one stable comparison between two
+            one-site sweeps. Rank-adaptive DMRG still performs its minimum
+            adaptive warm-up before this criterion can stop a run.
         fit_block_size : {1, 2, 3}, default=2
             Number of neighboring MPS tensors optimized by each FIT update.
             Two-site FIT is recommended: it forms both physical legs and the
@@ -6065,6 +6120,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_block_size,
                         xmax - xmin + 1,
                     )
+                    self._validate_dmrg1_iteration_budget(
+                        p,
+                        (xmin, xmax),
+                        n_iter=n_iter,
+                        block_size=active_fit_block_size,
+                    )
                     self._prepare_fit_window(
                         (xmin, xmax),
                         block_size=fit_block_size,
@@ -6091,6 +6152,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (where,),
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
+                    )
+                    active_fit_block_size = self._dmrg_fit_block_size(
+                        p,
+                        (xmin, xmax),
+                        fit_block_size,
                     )
                     active_adaptive_sweeps = adaptive_sweeps
                     active_adaptive_rank_schedule = adaptive_rank_schedule
@@ -6207,6 +6273,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_block_size,
                         xmax - xmin + 1,
                     )
+                    self._validate_dmrg1_iteration_budget(
+                        p,
+                        (xmin, xmax),
+                        n_iter=n_iter,
+                        block_size=active_fit_block_size,
+                    )
                     self._prepare_fit_window(
                         (xmin, xmax),
                         block_size=fit_block_size,
@@ -6232,6 +6304,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         batch_where,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
+                    )
+                    active_fit_block_size = self._dmrg_fit_block_size(
+                        p,
+                        (xmin, xmax),
+                        fit_block_size,
                     )
                     active_adaptive_sweeps = adaptive_sweeps
                     active_adaptive_rank_schedule = adaptive_rank_schedule

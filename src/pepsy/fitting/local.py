@@ -27,6 +27,51 @@ __all__ = [
 ]
 
 
+class _SweepEnvironmentCache:
+    """Boundary tensors and compatibility metadata from one completed sweep.
+
+    ``boundaries`` is retained by reference: constructing this object copies
+    neither its dictionary nor any backend tensor. Sweep kernels still receive
+    that plain dictionary and use direct ``dict.get`` calls in their hot loops.
+
+    A cache is directional. It can supply fixed environments only to an
+    opposite-direction sweep. Equal block sizes have matching minimal
+    boundary coverage. When the next reversed sweep is one-site, the producer
+    extends that minimal mapping by only the one or two terminal boundaries
+    needed after a two- or three-site sweep, respectively.
+    """
+
+    __slots__ = ("boundaries", "block_size", "direction", "one_site_ready")
+
+    def __init__(
+        self,
+        boundaries,
+        *,
+        direction,
+        block_size,
+        one_site_ready=None,
+    ):
+        self.boundaries = boundaries
+        self.direction = direction
+        self.block_size = int(block_size)
+        self.one_site_ready = (
+            self.block_size == 1
+            if one_site_ready is None
+            else bool(one_site_ready)
+        )
+
+    def fixed_for(self, *, direction, block_size):
+        """Return the zero-copy fixed-boundary mapping, or ``None``."""
+        if direction == self.direction:
+            return None
+        block_size = int(block_size)
+        if self.block_size == block_size or (
+            block_size == 1 and self.one_site_ready
+        ):
+            return self.boundaries
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Low-level backend and tensor-network helpers
 # ---------------------------------------------------------------------------
@@ -369,6 +414,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
             for tag, tensor_ids in self.tn.tag_map.items()
         }
+        # Layered targets can carry several tensors per site, so their chain
+        # bond is not available through ``TensorNetwork.bond``. The target
+        # graph is immutable during FIT: resolve each boundary locally once
+        # and retain only its index name, never tensor data.
+        self._target_bond_cache = {}
         direct_available = (
             self._target_site_tensors is not None
             and not self.tn.isfermionic()
@@ -770,12 +820,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     L - 1,
                     sweep_sequence[0],
                 )
-            previous_direction = None
-            environment_cache = None
-            environment_cache_direction = None
+            sweep_cache = None
             self._sweep_environment_reuse_count = 0
             for sweep in range(n_iter):
                 direction = sweep_sequence[sweep % len(sweep_sequence)]
+                previous_direction = (
+                    None if sweep_cache is None else sweep_cache.direction
+                )
                 reuse_canonical_form = (
                     self._fermionic_bra_working
                     and previous_direction is None
@@ -784,15 +835,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     and previous_direction != direction
                 )
                 fixed_environments = None
-                if (
-                    self._allow_sweep_environment_reuse
-                    and environment_cache is not None
-                    and environment_cache_direction != direction
-                ):
-                    fixed_environments = environment_cache
+                if self._allow_sweep_environment_reuse and sweep_cache is not None:
+                    fixed_environments = sweep_cache.fixed_for(
+                        direction=direction,
+                        block_size=block_size,
+                    )
+                if fixed_environments is not None:
                     self._sweep_environment_reuse_count += 1
                 if block_size == 2:
-                    environment_cache = self._run_gate_two_site_sweep(
+                    boundaries = self._run_gate_two_site_sweep(
                         psi,
                         0,
                         L - 1,
@@ -806,7 +857,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         fixed_environments=fixed_environments,
                     )
                 else:
-                    environment_cache = self._run_gate_three_site_sweep(
+                    boundaries = self._run_gate_three_site_sweep(
                         psi,
                         0,
                         L - 1,
@@ -819,7 +870,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         reuse_canonical_form=reuse_canonical_form,
                         fixed_environments=fixed_environments,
                     )
-                environment_cache_direction = direction
+                sweep_cache = _SweepEnvironmentCache(
+                    boundaries,
+                    direction=direction,
+                    block_size=block_size,
+                )
                 if verbose:
                     fidelity = tn_fidelity(
                         self.tn,
@@ -827,7 +882,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         contraction_opt=contraction_opt,
                     )
                     self.fidelity_trace.append(ar.do("real", fidelity))
-                previous_direction = direction
             return
 
         env_left = {site_tag_id.format(i): None for i in range(psi.L)}
@@ -978,23 +1032,41 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """
         if self._target_site_tensors is not None:
             return self.tn.bond(left_site, right_site)
+
+        key = (int(left_site), int(right_site))
+        try:
+            return self._target_bond_cache[key]
+        except KeyError:
+            pass
+
         left_tids = set(
             self.tn.tag_map[self.site_tag_id.format(left_site)]
         )
         right_tids = set(
             self.tn.tag_map[self.site_tag_id.format(right_site)]
         )
-        candidates = [
-            index
-            for index, tids in self.tn.ind_map.items()
-            if left_tids.intersection(tids) and right_tids.intersection(tids)
-        ]
+        # Search only indices attached to the left site's tensors. The old
+        # whole-network ``ind_map.items()`` scan made a local gate fit scale
+        # with the complete MPS length.
+        candidates = []
+        seen = set()
+        for tensor_id in sorted(
+            left_tids,
+            key=self._target_tensor_order.__getitem__,
+        ):
+            for index in self.tn.tensor_map[tensor_id].inds:
+                if index in seen:
+                    continue
+                seen.add(index)
+                if right_tids.intersection(self.tn.ind_map[index]):
+                    candidates.append(index)
         if len(candidates) != 1:
             raise ValueError(
                 "A gate-window FIT target must have one chain index across "
                 f"sites {left_site} and {right_site}; found {candidates}."
             )
-        return candidates[0]
+        self._target_bond_cache[key] = candidates[0]
+        return self._target_bond_cache[key]
 
     def _contract_components(self, components, *, output_inds=None):
         """Contract local components through a safe or specialized route.
@@ -1216,14 +1288,26 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             components.append(prior)
         return self._contract_components(components)
 
-    def _build_active_environments(self, psi, start, stop, direction):
-        """Build inclusive active-interval overlap environments."""
+    def _build_active_environments(
+        self,
+        psi,
+        start,
+        stop,
+        direction,
+        *,
+        block_size,
+    ):
+        """Build only fixed environments reachable by this block sweep."""
         environments = {}
         if direction == "R":
             prior = self._fermionic_right_exterior_environment
             if prior is not None:
                 environments[stop + 1] = prior
-            for site in range(stop, start - 1, -1):
+            # The first block spans ``start:start + block_size`` and therefore
+            # needs a fixed right environment beginning at ``start +
+            # block_size``. Environments closer to the left edge can never be
+            # queried by this sweep.
+            for site in range(stop, start + block_size - 1, -1):
                 prior = self._overlap_environment_site(
                     psi,
                     site,
@@ -1236,7 +1320,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             prior = self._fermionic_left_exterior_environment
             if prior is not None:
                 environments[start - 1] = prior
-            for site in range(start, stop + 1):
+            # Mirror the right-moving rule: the first block needs fixed data
+            # only through ``stop - block_size``.
+            for site in range(start, stop - block_size + 1):
                 prior = self._overlap_environment_site(
                     psi,
                     site,
@@ -1246,6 +1332,64 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
                 environments[site] = prior
         return environments
+
+    def _extend_block_cache_for_one_site(
+        self,
+        psi,
+        boundaries,
+        start,
+        stop,
+        direction,
+        *,
+        block_size,
+        timing_record=None,
+    ):
+        """Complete only the terminal boundaries needed by reversed 1-site FIT.
+
+        A minimal reversed block cache stops ``block_size - 1`` sites before
+        the terminal center. Those tensors are already canonical after the
+        final block split, so extending through them costs only one overlap
+        contraction for a two-site producer and two for a three-site producer.
+        This avoids rebuilding the complete fixed side at a 2/3-to-1
+        transition while retaining no unused terminal environments between
+        equal-size block sweeps.
+        """
+        if block_size not in {2, 3}:
+            return
+
+        started = self._timing_mark() if timing_record is not None else None
+        if direction == "R":
+            sites = range(stop - block_size + 1, stop)
+            for site in sites:
+                boundaries[site] = self._overlap_environment_site(
+                    psi,
+                    site,
+                    start,
+                    stop,
+                    prior=boundaries.get(site - 1),
+                )
+        else:
+            sites = range(start + block_size - 1, start, -1)
+            for site in sites:
+                boundaries[site] = self._overlap_environment_site(
+                    psi,
+                    site,
+                    start,
+                    stop,
+                    prior=boundaries.get(site + 1),
+                )
+
+        if timing_record is not None:
+            elapsed = float(self._timing_mark() - started)
+            # The extension is terminal moving-environment work associated
+            # with the final block update, not an additional update/site.
+            final_update = timing_record["site_timings"][-1]
+            for key in (
+                "environment_seconds",
+                "moving_environment_seconds",
+                "elapsed_seconds",
+            ):
+                final_update[key] += elapsed
 
     def _prepare_fermionic_active_fit(self, psi, start, stop, direction):
         """Canonicalize and cache exact outside graded environments once.
@@ -1567,6 +1711,26 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             for left, right in zip(left_caps, right_caps)
         )
 
+    @classmethod
+    def _active_bonds_at_rank_targets(cls, psi, start, stop, max_bond):
+        """Return whether every active bond is already at its rank ceiling."""
+        targets = cls._active_bond_rank_targets(
+            psi,
+            start,
+            stop,
+            max_bond,
+        )
+        if targets is None:
+            return False
+        try:
+            current = tuple(
+                int(psi.bond_size(site, site + 1))
+                for site in range(start, stop)
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return all(rank >= target for rank, target in zip(current, targets))
+
     def _effective_tensor(
         self,
         psi,
@@ -1602,6 +1766,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         stop,
         direction,
         *,
+        block_size,
         timing_record=None,
         reuse_canonical_form=False,
         fixed_environments=None,
@@ -1639,6 +1804,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 direction,
+                block_size=block_size,
             )
         fixed_environment_finished = (
             self._timing_mark() if timing_record is not None else None
@@ -1687,6 +1853,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 "R",
+                block_size=1,
                 timing_record=timing_record,
                 reuse_canonical_form=reuse_canonical_form,
                 fixed_environments=fixed_environments,
@@ -1703,6 +1870,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 "L",
+                block_size=1,
                 timing_record=timing_record,
                 reuse_canonical_form=reuse_canonical_form,
                 fixed_environments=fixed_environments,
@@ -1746,11 +1914,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 f,
                 (site,),
             )
-            # ``f`` is already a single effective tensor. Its direct
-            # Frobenius norm is exactly sqrt(<f|f>), but avoids constructing a
-            # temporary doubled tensor network and replanning a contraction
-            # for every one-site update. This matters once one-site FIT has
-            # removed the SVD from the hot path, particularly on accelerators.
+            # ``f`` is already a single effective tensor. Canonicalization
+            # makes the center-to-MPS map isometric, and this local update is
+            # an orthogonal projection, so for A = ||f|| and target norm T,
+            # the true normalized fidelity is (A / T)**2. In particular, for
+            # a normalized ``p_target`` the true infidelity is 1 - A**2.
+            # Computing A directly also avoids constructing a doubled tensor
+            # network and replanning a contraction for every one-site update.
             norm_f = f.norm()
             effective_finished = (
                 self._timing_mark() if timing_record is not None else None
@@ -1880,6 +2050,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 "R",
+                block_size=2,
                 timing_record=timing_record,
                 reuse_canonical_form=reuse_canonical_form,
                 fixed_environments=fixed_environments,
@@ -1896,6 +2067,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 "L",
+                block_size=2,
                 timing_record=timing_record,
                 reuse_canonical_form=reuse_canonical_form,
                 fixed_environments=fixed_environments,
@@ -1981,9 +2153,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 right_tensor,
             )
 
-            # The SVD absorbs singular values into the sweep-facing center.
-            # Its Frobenius norm is therefore the retained global FIT norm;
-            # measuring theta before truncation would overstate fidelity.
+            # The SVD absorbs the retained singular values into the
+            # sweep-facing center. Orthogonal SVD truncation preserves the
+            # FIT projection identity, so if its norm is A and the target
+            # norm is T, fidelity = (A / T)**2; for normalized ``p_target``,
+            # true infidelity = 1 - A**2. Measuring ``theta`` before
+            # truncation would therefore overstate the retained fidelity.
             center = right_tensor if direction == "R" else left_tensor
             self.local_norm_trace.append(ar.do("real", center.norm()))
             if collect_split_diagnostics:
@@ -2003,7 +2178,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self._timing_mark() if timing_record is not None else None
             )
 
-            if direction == "R":
+            needs_next_update = (
+                (direction == "R" and right_site < stop)
+                or (direction == "L" and left_site > start)
+            )
+            moving_environment_updated = False
+            if direction == "R" and needs_next_update:
                 moving_environments[left_site] = self._overlap_environment_site(
                     psi,
                     left_site,
@@ -2011,7 +2191,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     stop,
                     prior=moving_environments.get(left_site - 1),
                 )
-            else:
+                moving_environment_updated = True
+            elif direction == "L" and needs_next_update:
                 moving_environments[right_site] = self._overlap_environment_site(
                     psi,
                     right_site,
@@ -2019,11 +2200,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     stop,
                     prior=moving_environments.get(right_site + 1),
                 )
+                moving_environment_updated = True
 
             if timing_record is not None:
                 environment_finished = self._timing_mark()
-                moving_environment_seconds = float(
-                    environment_finished - writeback_finished
+                moving_environment_seconds = (
+                    float(environment_finished - writeback_finished)
+                    if moving_environment_updated
+                    else 0.0
                 )
                 timing_record["site_timings"].append(
                     {
@@ -2084,6 +2268,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 "R",
+                block_size=3,
                 timing_record=timing_record,
                 reuse_canonical_form=reuse_canonical_form,
                 fixed_environments=fixed_environments,
@@ -2103,6 +2288,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 start,
                 stop,
                 "L",
+                block_size=3,
                 timing_record=timing_record,
                 reuse_canonical_form=reuse_canonical_form,
                 fixed_environments=fixed_environments,
@@ -2265,7 +2451,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
 
             # The final sweep-facing tensor carries the retained center norm
-            # after both truncations, just as in the two-site path.
+            # A after both orthogonal truncations. As in the two-site path,
+            # fidelity = (A / ||p_target||)**2, and a normalized target has
+            # true infidelity 1 - A**2.
             center = right_tensor if direction == "R" else left_tensor
             self.local_norm_trace.append(ar.do("real", center.norm()))
             if collect_split_diagnostics:
@@ -2297,7 +2485,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self._timing_mark() if timing_record is not None else None
             )
 
-            if direction == "R":
+            needs_next_update = (
+                (direction == "R" and right_site < stop)
+                or (direction == "L" and left_site > start)
+            )
+            moving_environment_updated = False
+            if direction == "R" and needs_next_update:
                 moving_environments[left_site] = self._overlap_environment_site(
                     psi,
                     left_site,
@@ -2305,7 +2498,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     stop,
                     prior=moving_environments.get(left_site - 1),
                 )
-            else:
+                moving_environment_updated = True
+            elif direction == "L" and needs_next_update:
                 moving_environments[right_site] = self._overlap_environment_site(
                     psi,
                     right_site,
@@ -2313,11 +2507,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     stop,
                     prior=moving_environments.get(right_site + 1),
                 )
+                moving_environment_updated = True
 
             if timing_record is not None:
                 environment_finished = self._timing_mark()
-                moving_environment_seconds = float(
-                    environment_finished - writeback_finished
+                moving_environment_seconds = (
+                    float(environment_finished - writeback_finished)
+                    if moving_environment_updated
+                    else 0.0
                 )
                 timing_record["site_timings"].append(
                     {
@@ -2392,7 +2589,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         ``"RL"`` alternate directions. By default, exactly ``n_iter`` sweeps
         are performed. Supplying ``rtol``
         enables early stopping after ``min_iter`` sweeps once the final local
-        norm changes by at most ``rtol`` for ``patience`` consecutive sweeps.
+        norm changes by at most ``rtol`` across a ``patience``-sample window.
+        Thus ``patience=2`` means one stable comparison between two same-phase
+        sweep norms; ``patience=1`` retains the same minimum comparable pair.
         ``finite_check=True`` checks only the already-computed per-site norm
         scalars, transferring one tiny vector per sweep. A callable retains
         the general state-check callback behavior. ``timing=True`` records one
@@ -2410,8 +2609,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         larger block is retained until ``n_iter`` is exhausted. This is the
         schedule used by the named MPS DMRG modes.
         For ordinary dense arrays, an opposite-direction sweep reuses the
-        compatible partial environments produced by the preceding sweep;
-        block-size transitions rebuild them once before reuse resumes.
+        compatible partial environments produced by the preceding sweep. A
+        two-site cache also serves reversed one-site refinement; incompatible
+        transitions such as three-site to one-site rebuild once.
         ``single_pair_fast_path=True`` stops a two-site interval after its one
         exact variational update; additional sweeps cannot change that local
         optimum. ``final_one_site_sweeps`` optionally adds fixed-rank one-site
@@ -2552,10 +2752,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         previous_sweep_norm = None
         stable_sweeps = 0
-        previous_direction = None
-        previous_block_size = None
-        environment_cache = None
-        environment_cache_direction = None
+        sweep_cache = None
         self._sweep_environment_reuse_count = 0
         adaptive_phase_done = not (
             adaptive_schedule
@@ -2568,28 +2765,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if not adaptive_phase_done
             else None
         )
+
+        def block_size_for_sweep(sweep_number):
+            """Resolve the active block after any live rank-phase update."""
+            if block_size not in {2, 3}:
+                return 1
+            if adaptive_until_rank:
+                use_block = not adaptive_phase_done or (
+                    stop == start + 1 and block_size == 2
+                )
+            else:
+                use_block = sweep_number <= adaptive_block_sweeps
+            return block_size if use_block else 1
+
         for sweep in range(1, n_iter + 1):
             direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
-            active_block_size = (
-                block_size
-                if (
-                    block_size in {2, 3}
-                    and (
-                        (
-                            adaptive_until_rank
-                            and (
-                                not adaptive_phase_done
-                                or (stop == start + 1 and block_size == 2)
-                            )
-                        )
-                        or (
-                            not adaptive_until_rank
-                            and sweep <= adaptive_block_sweeps
-                        )
-                    )
-                )
-                else 1
+            previous_direction = (
+                None if sweep_cache is None else sweep_cache.direction
             )
+            previous_block_size = (
+                None if sweep_cache is None else sweep_cache.block_size
+            )
+            active_block_size = block_size_for_sweep(sweep)
             if previous_block_size is not None and active_block_size != previous_block_size:
                 # A block-to-one-site transition changes the optimization
                 # regime. Do not compare the first fixed-rank refinement
@@ -2617,17 +2814,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.adaptive_sweeps_run += 1
             sweep_norm_start = len(self.local_norm_trace)
             fixed_environments = None
-            if (
-                self._allow_sweep_environment_reuse
-                and environment_cache is not None
-                and environment_cache_direction != direction
-                and previous_block_size == active_block_size
-            ):
-                fixed_environments = environment_cache
+            if self._allow_sweep_environment_reuse and sweep_cache is not None:
+                fixed_environments = sweep_cache.fixed_for(
+                    direction=direction,
+                    block_size=active_block_size,
+                )
+            if fixed_environments is not None:
                 self._sweep_environment_reuse_count += 1
+            one_site_ready = active_block_size == 1
             try:
                 if active_block_size == 1:
-                    environment_cache = self._run_gate_one_site_sweep(
+                    boundaries = self._run_gate_one_site_sweep(
                         psi,
                         start,
                         stop,
@@ -2638,7 +2835,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     )
                 else:
                     if active_block_size == 2:
-                        environment_cache = self._run_gate_two_site_sweep(
+                        boundaries = self._run_gate_two_site_sweep(
                             psi,
                             start,
                             stop,
@@ -2652,7 +2849,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                             fixed_environments=fixed_environments,
                         )
                     else:
-                        environment_cache = self._run_gate_three_site_sweep(
+                        boundaries = self._run_gate_three_site_sweep(
                             psi,
                             start,
                             stop,
@@ -2665,7 +2862,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                             reuse_canonical_form=reuse_canonical_form,
                             fixed_environments=fixed_environments,
                         )
-                environment_cache_direction = direction
 
                 self.final_direction = direction
                 self.final_center_site = stop if direction == "R" else start
@@ -2734,6 +2930,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         raise error
                     reset_tolerance = False
                     if previous_sweep_norm is not None:
+                        # For a fixed target norm, A is proportional to the
+                        # square root of the true fidelity. Thus this tests
+                        # convergence of fidelity through changes in A; it is
+                        # not an absolute threshold on 1 - A**2.
                         scale = max(
                             abs(sweep_norm),
                             abs(previous_sweep_norm),
@@ -2747,17 +2947,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                             stable_sweeps += 1
                         else:
                             stable_sweeps = 0
-                        if sweep >= min_iter and stable_sweeps >= patience:
+                        # ``patience`` counts norm samples in the tolerance
+                        # window, not additional comparisons after its first
+                        # sample. Thus the public default of two stops after
+                        # one stable comparison between two same-phase sweeps.
+                        required_stable_changes = max(1, patience - 1)
+                        if (
+                            sweep >= min_iter
+                            and stable_sweeps >= required_stable_changes
+                        ):
                             # An explicitly requested adaptive schedule must
                             # complete its block warm-up before convergence can
                             # stop it. If refinement remains, transition to
                             # one-site sweeps and start a fresh tolerance run.
+                            has_block_warmup = (
+                                adaptive_schedule and block_size in {2, 3}
+                            )
                             warmup_incomplete = (
-                                adaptive_schedule
+                                has_block_warmup
                                 and sweep < adaptive_block_sweeps
                             )
                             warmup_finished_with_refinement = (
-                                adaptive_schedule
+                                has_block_warmup
                                 and sweep == adaptive_block_sweeps
                                 and sweep < n_iter
                             )
@@ -2807,6 +3018,38 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         previous_sweep_norm = None
                         stable_sweeps = 0
                         self.last_relative_change = None
+
+                next_sweep = None
+                next_block_size = None
+                if not should_stop and sweep < n_iter:
+                    next_sweep = sweep + 1
+                    next_block_size = block_size_for_sweep(next_sweep)
+                elif (
+                    block_size in {2, 3}
+                    and stop - start + 1 >= 3
+                    and final_one_site_sweeps > 0
+                ):
+                    next_sweep = sweep + 1
+                    next_block_size = 1
+
+                if (
+                    self._allow_sweep_environment_reuse
+                    and active_block_size in {2, 3}
+                    and next_block_size == 1
+                    and next_sweep is not None
+                    and sweep_sequence[(next_sweep - 1) % len(sweep_sequence)]
+                    != direction
+                ):
+                    self._extend_block_cache_for_one_site(
+                        psi,
+                        boundaries,
+                        start,
+                        stop,
+                        direction,
+                        block_size=active_block_size,
+                        timing_record=sweep_timing,
+                    )
+                    one_site_ready = True
             except BaseException as error:
                 self.convergence_reason = "failed"
                 if sweep_timing is not None:
@@ -2814,8 +3057,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     self._finish_timing_record(sweep_timing, status="failed")
                 raise
             else:
-                previous_direction = direction
-                previous_block_size = active_block_size
+                sweep_cache = _SweepEnvironmentCache(
+                    boundaries,
+                    direction=direction,
+                    block_size=active_block_size,
+                    one_site_ready=one_site_ready,
+                )
                 if sweep_timing is not None:
                     self._finish_timing_record(sweep_timing, status="complete")
                 if should_stop:
@@ -2830,6 +3077,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             for polish_index in range(final_one_site_sweeps):
                 sweep = polish_start + polish_index
                 direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
+                previous_direction = (
+                    None if sweep_cache is None else sweep_cache.direction
+                )
                 reuse_canonical_form = (
                     previous_direction is not None
                     and previous_direction != direction
@@ -2844,16 +3094,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.one_site_sweeps_run += 1
                 sweep_norm_start = len(self.local_norm_trace)
                 fixed_environments = None
-                if (
-                    self._allow_sweep_environment_reuse
-                    and environment_cache is not None
-                    and environment_cache_direction != direction
-                    and previous_block_size == 1
-                ):
-                    fixed_environments = environment_cache
+                if self._allow_sweep_environment_reuse and sweep_cache is not None:
+                    fixed_environments = sweep_cache.fixed_for(
+                        direction=direction,
+                        block_size=1,
+                    )
+                if fixed_environments is not None:
                     self._sweep_environment_reuse_count += 1
                 try:
-                    environment_cache = self._run_gate_one_site_sweep(
+                    boundaries = self._run_gate_one_site_sweep(
                         psi,
                         start,
                         stop,
@@ -2862,7 +3111,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         reuse_canonical_form=reuse_canonical_form,
                         fixed_environments=fixed_environments,
                     )
-                    environment_cache_direction = direction
                     self.final_direction = direction
                     self.final_center_site = stop if direction == "R" else start
                     self.final_norm = self.local_norm_trace[-1]
@@ -2907,8 +3155,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         self._finish_timing_record(sweep_timing, status="failed")
                     raise
                 else:
-                    previous_direction = direction
-                    previous_block_size = 1
+                    sweep_cache = _SweepEnvironmentCache(
+                        boundaries,
+                        direction=direction,
+                        block_size=1,
+                    )
                     if sweep_timing is not None:
                         self._finish_timing_record(sweep_timing, status="complete")
 
