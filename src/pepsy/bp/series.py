@@ -29,6 +29,7 @@ from itertools import combinations
 import operator
 import sys
 import time
+import threading
 from typing import Any, ClassVar
 import warnings
 
@@ -51,6 +52,7 @@ from ._compression_utils import (
     cost_check_requested as _cost_check_requested,
     validate_cost_options as _validate_cost_options,
 )
+from ._backend import copy as _copy_array
 from ._symmray import (
     align_d2bp_messages as _align_symmray_d2bp_messages,
     dense_bp_tn as _dense_bp_tn,
@@ -72,6 +74,7 @@ __all__ = [
     "OpenLoopSeriesDiagnostic",
     "OpenLoopSeriesDiagnosticCache",
     "OpenLoopSeriesCache",
+    "CutEdgeLoopProjectorCache",
     "OpenLoopSeriesSweepResult",
     "LoopSeriesCache",
     "LoopSeriesResult",
@@ -762,6 +765,45 @@ class OpenLoopSeriesCache:
             raise
         else:
             self.terms_by_key[key] = tuple(discovered)
+
+
+@dataclass
+class CutEdgeLoopProjectorCache:
+    """Cache dense/native ``P`` and ``Q`` projectors for a fixed BP snapshot.
+
+    The loop geometry cache deliberately stores only topology. This companion
+    cache stores the numerical edge projectors for one frozen BP message
+    snapshot, so a bond batch does not rebuild the same ``P + Q`` factors for
+    every cut and every term. It must be discarded after the tensor values or
+    BP messages change.
+    """
+
+    projectors: dict[tuple[Any, bool], Any] = field(default_factory=dict)
+    hits: int = 0
+    misses: int = 0
+    _lock: Any = field(default_factory=threading.RLock, repr=False)
+
+    def get_or_create(self, key, builder):
+        """Return one cached projector, building it once if needed."""
+        with self._lock:
+            try:
+                projector = self.projectors[key]
+            except KeyError:
+                self.misses += 1
+                projector = builder()
+                self.projectors[key] = projector
+            else:
+                self.hits += 1
+        return projector
+
+    def snapshot(self) -> dict[str, int]:
+        """Return cache statistics without exposing mutable internals."""
+        with self._lock:
+            return {
+                "projectors": len(self.projectors),
+                "hits": int(self.hits),
+                "misses": int(self.misses),
+            }
 
 
 @dataclass
@@ -2346,7 +2388,64 @@ def _get_edge_excited(bp, term):
     return _get_d2_edge_excited(bp, term)
 
 
-def _get_d2_cut_edge_excited(bp, bond_ind, term):
+def _build_d2_cut_projector(bp, index, *, complement):
+    """Build one numerical ``P`` or ``Q`` projector for a BP edge."""
+    left_tid, right_tid = tuple(bp.tn.ind_map[index])
+    ml = bp.messages[index, left_tid]
+    mr = bp.messages[index, right_tid]
+    if _uses_symmray(bp.tn):
+        p0 = _symmray_rank_one_d2_projector(
+            bp.tn,
+            index,
+            ml,
+            mr,
+            layout="series",
+        )
+        return _symmray_d2_operator(
+            bp.tn,
+            index,
+            p0,
+            complement=complement,
+            layout="open",
+            fermionic=True,
+        )
+
+    p0 = ar.do(
+        "einsum",
+        "i,j->ij",
+        ml.reshape(-1),
+        mr.reshape(-1),
+    )
+    projector = ar.do("eye", ar.do("shape", p0)[0]) - p0 if complement else p0
+    return ar.do(
+        "reshape",
+        projector,
+        ar.do("shape", ml) + ar.do("shape", mr),
+    )
+
+
+def _get_d2_cut_projector(bp, index, *, complement, projector_cache=None):
+    """Get one cut-edge projector, optionally from a frozen-batch cache."""
+    if projector_cache is None:
+        return _build_d2_cut_projector(bp, index, complement=complement)
+    key = (index, bool(complement))
+    return projector_cache.get_or_create(
+        key,
+        lambda: _build_d2_cut_projector(
+            bp,
+            index,
+            complement=complement,
+        ),
+    )
+
+
+def _get_d2_cut_edge_excited(
+    bp,
+    bond_ind,
+    term,
+    *,
+    projector_cache=None,
+):
     """Build one full finite-network D2BP term with ``bond_ind`` open.
 
     This is the transfer-matrix counterpart of
@@ -2425,37 +2524,12 @@ def _get_d2_cut_edge_excited(bp, bond_ind, term):
         tid_left, tid_right = tuple(projector_tids)
         left = projector_inds[index][tid_left]
         right = projector_inds[index][tid_right]
-        ml = bp.messages[index, tid_left]
-        mr = bp.messages[index, tid_right]
-        if _uses_symmray(bp.tn):
-            p0 = _symmray_rank_one_d2_projector(
-                bp.tn, index, ml, mr, layout="series"
-            )
-            projector = _symmray_d2_operator(
-                bp.tn,
-                index,
-                p0,
-                complement=index in excited_edges,
-                layout="open",
-                fermionic=True,
-            )
-        else:
-            p0 = ar.do(
-                "einsum",
-                "i,j->ij",
-                ml.reshape(-1),
-                mr.reshape(-1),
-            )
-            projector = (
-                ar.do("eye", ar.do("shape", p0)[0]) - p0
-                if index in excited_edges
-                else p0
-            )
-            projector = ar.do(
-                "reshape",
-                projector,
-                ar.do("shape", ml) + ar.do("shape", mr),
-            )
+        projector = _get_d2_cut_projector(
+            bp,
+            index,
+            complement=index in excited_edges,
+            projector_cache=projector_cache,
+        )
         local |= qtn.Tensor(projector, inds=(*left, *right))
 
     return local, output_inds
@@ -2518,6 +2592,7 @@ def cut_edge_loop_series_expand(
     update: str = "sequential",
     require_fixed_point: bool = True,
     cache: OpenLoopSeriesCache | None = None,
+    projector_cache: CutEdgeLoopProjectorCache | None = None,
     max_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
@@ -2699,7 +2774,12 @@ def cut_edge_loop_series_expand(
     data = None
     contraction_costs = {}
     for term in terms:
-        network, output_inds = _get_d2_cut_edge_excited(bp, bond_ind, term)
+        network, output_inds = _get_d2_cut_edge_excited(
+            bp,
+            bond_ind,
+            term,
+            projector_cache=projector_cache,
+        )
         contracted, cost = _contract_with_preflight(
             network,
             output_inds=output_inds,
@@ -6026,6 +6106,15 @@ def _build_bp(
     if gauges is not None and messages is not None:
         raise ValueError("pass either messages or gauges, not both")
 
+    # ``normalize_message_pairs`` below is intentionally allowed to mutate the
+    # BP object's message dictionary. Detach caller-supplied messages first so
+    # parallel cut-edge workers never race on a shared snapshot.
+    if messages is not None:
+        messages = {
+            key: _copy_array(value)
+            for key, value in messages.items()
+        }
+
     if key == "1norm" and validate_graph:
         from .gauges import _validate_d1_graph
 
@@ -6062,7 +6151,7 @@ def _build_bp(
 
             relay_kwargs = {} if relay_opts is None else dict(relay_opts)
             init_messages = {
-                key_: ar.do("copy", value)
+                key_: _copy_array(value)
                 for key_, value in bp.messages.items()
             }
             bp_result = relay_bp(

@@ -279,6 +279,7 @@ _SYMBOL_MODULES = {
     "validate_tensor_network_tags": ".tensors",
     "gauge_all": ".bp",
     "gauge_all_simple": ".bp",
+    "compress_all_gauge": ".bp",
     "one_norm_bp": ".bp",
 }
 
@@ -296,7 +297,7 @@ def __getattr__(name):
 
 
 if TYPE_CHECKING:
-    from .bp import gauge_all, gauge_all_simple, one_norm_bp  # noqa: F401
+    from .bp import compress_all_gauge, gauge_all, gauge_all_simple, one_norm_bp  # noqa: F401
     from . import backends, boundary, bp, experimental, fitting, interop, operators, optimizers, sampling, solvers, tensors, vmc  # noqa: F401
     from .interop import GuppyConversionError, GuppyGateStream, GuppyMeasurement, guppy_gate_stream  # noqa: F401
     from .backends import (  # noqa: F401

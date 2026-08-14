@@ -53,6 +53,7 @@ from .cluster import (
     select_bp_candidate,
 )
 from .series import (
+    CutEdgeLoopProjectorCache,
     OpenLoopBudgetError,
     OpenLoopAdaptiveResult,
     OpenLoopEnumerationLimitError,
@@ -132,6 +133,10 @@ from .observables import (
 from .compression import (
     BondClusterCompressionResult,
     BondLoopSeriesCompressionResult,
+    BondLoopSeriesCompressor,
+    BondLoopSeriesSweepResult,
+    BondLoopSeriesSweepStep,
+    compress_all_gauge,
     compress_bond_cluster,
     compress_bond_loop_series,
 )
@@ -164,6 +169,10 @@ __all__ = [
     "GaugeResult",
     "BondClusterCompressionResult",
     "BondLoopSeriesCompressionResult",
+    "BondLoopSeriesCompressor",
+    "BondLoopSeriesSweepResult",
+    "BondLoopSeriesSweepStep",
+    "compress_all_gauge",
     "CompressionBudgetError",
     "ContractionCost",
     "ContractionPlanCache",
@@ -181,6 +190,7 @@ __all__ = [
     "LoopClusterTerm",
     "LoopSeriesCache",
     "OpenLoopSeriesCache",
+    "CutEdgeLoopProjectorCache",
     "OpenLoopEnumerationLimitError",
     "OpenLoopObservableTerm",
     "OpenLoopSeriesDiagnostic",

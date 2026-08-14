@@ -235,19 +235,53 @@ After ALS, Pepsy refactors `L @ R` with Quimb's public
 the factor-balancing used by `D2BP.compress`. This removes the arbitrary ALS
 internal gauge while preserving the fitted product; it does not force either
 map to be isometric and it does not apply the BP message matrices a second
-time. Those messages already define `B_reduce`. The diagnostic
-`result.normalization` reports the method, the Quimb message-pair convention,
-and the relative product reconstruction error. With `preserve_norm=True`, the
-product-amplitude correction `scalar_factor` is split symmetrically between
-the maps (`L <- sqrt(alpha) L`, `R <- sqrt(alpha) R`) using the selected-bond
-full-network norm. No tensor-network exponent or separate global scalar is
-changed. `messages_applied_to_maps=False` is intentional: the messages
-already weight `B_reduce`; they are not applied to `L, R` a second time.
+time. Those messages already define `B_reduce`. It then applies a reciprocal
+scalar gauge to the two fitted maps using their ordinary Frobenius norms:
 
-The default `init="b_reduce"` uses Quimb tensor contractions to form the two
-bond marginals of `B_reduce` and takes their dominant `chi` subspaces as the
-ALS starting maps. Use `init="projector"` or `init="random"` for simpler
-initializations.
+```text
+a = Tr(L† L),           b = Tr(R R†)
+c = (b / a) ** 1/4
+L <- c L,               R <- R / c
+```
+
+Thus the two Frobenius map norms are equal while `L @ R` is unchanged. This
+is a gauge balance, not independent unit-trace normalization
+of `L` and `R`; independent normalization would change the inserted PEPS
+state by a scalar. The diagnostic `result.normalization` reports the gauge
+scales, the before/after Frobenius squared norms, the Quimb message-pair
+convention used by the environment, and the relative product reconstruction
+error. The ordinary path
+uses only this local normalization; it does not contract the full network. The
+legacy `preserve_norm=True` option explicitly requests expensive full-network
+norm matching. `preserve_norm=False` and `compute_fidelity=False` are the
+defaults. `messages_applied_to_maps=False` is intentional: the messages already
+weight `B_reduce`; they are not applied to `L, R` a second time.
+
+The default `init="bp_messages"` uses the two selected-bond D2BP message
+matrices when `boundary_messages` are supplied. With `gauges`, the selected
+SU vector is interpreted as the diagonal message `diag(lambda)` on both
+directions. Thus the same initializer supports either representation, with
+explicit BP messages taking precedence when both are supplied. Quimb factors
+those small message matrices and constructs the oblique projectors with
+`absorb="both"`, giving balanced `(L, R)` maps without contracting or
+diagonalizing `B_reduce`. If neither selected representation is available or
+usable, it falls back to `L = I[:, :chi], R = L.H`. Use `init="projector"`
+for that initialization explicitly, `init="random"` for a stochastic
+initialization, or the legacy `init="b_reduce"` only when the extra
+bond-marginal contractions and eigendecompositions are desired.
+
+These are the dense-2-norm/D2BP conventions. D1BP vector messages use a
+different `sqrt(lambda)` convention and should not be passed as D2BP matrix
+messages. If converting D2BP messages to SU form with
+`simple_update_core_and_gauges_from_d2bp`, pass the returned core and gauge
+mapping together so the gauge transformation and boundary messages describe
+the same network.
+
+By default, `B_reduce` is only Hermitianized; it is not eigendecomposed. Set
+`psd_project=True` when an explicit PSD projection is wanted, or set
+`diagnose_environment_spectrum=True` to request the raw minimum eigenvalue
+diagnostic without PSD clipping. In the default mode,
+`result.raw_min_eigenvalue` is `None`.
 
 The selected-bond path uses the same native Quimb/Autoray backend policy as the
 reduced path: NumPy, Torch, JAX, and CuPy tensor data remain in place when the
@@ -271,6 +305,10 @@ lower and upper legs remain separate. The cluster contraction can still be expen
 `max_distance` grows, so pass an appropriate Cotengra optimizer and use
 `max_flops_log10` / `max_peak_memory_log2` to preflight it. The estimate is
 returned in `result.contraction_cost`.
+
+`result.N_reduce` is a compatibility alias for `result.B_reduce`; both names
+refer to the same four-leg local norm environment. The alias is useful when
+describing a bond sweep in terms of one `N_reduce` per selected bond.
 
 ## Cut-edge loop-series compression
 
@@ -314,6 +352,13 @@ The same cache can be passed directly as `cache=...` to
 `cut_edge_loop_series_expand`. Changing the PEPS index layout or bond
 dimensions intentionally invalidates it and requires a fresh cache.
 
+For repeated terms at one fixed BP snapshot, pass a
+`CutEdgeLoopProjectorCache` as `projector_cache`. It reuses the numerical D2BP
+`P` and `Q` projectors while the topology and directed messages remain fixed;
+discard it after changing the network or rerunning BP. This complements the
+topology-only `OpenLoopSeriesCache`: the former avoids rebuilding projector
+values and the latter avoids rediscovering admissible Q-edge configurations.
+
 The cut-edge route accepts the same local contraction-budget policy as the
 cluster compressor. Set `cost_check=True`, or provide
 `max_flops_log10` / `max_peak_memory_log2`, to estimate every retained term
@@ -336,9 +381,155 @@ metric. This finite route
 retains disconnected Q configurations explicitly; it does not apply the
 paper's infinite-lattice free-energy suppression factor.
 
-The fitted loop-series maps use the same post-ALS Quimb balanced
-factorization as `compress_bond_cluster`. Inspect `result.normalization` to
-verify the symmetric map normalization and the pre/post full-network norms.
+The fitted loop-series maps use the same post-ALS Quimb factorization and
+reciprocal Frobenius gauge as `compress_bond_cluster`. Inspect
+`result.normalization` to verify `map_gauge ==
+"frobenius_reciprocal_scalar"`, equal map norms, and the reciprocal scales.
+Full-network norms are not computed by default.
+
+Inspect `result.als_info` for the ALS fit diagnostics. Quimb's
+`tensor_network_fit_als` returns a fitted `TensorNetwork` (reported as
+`quimb_return_type`), while the actual fitted maps are read from the updated
+precomputed environment variables (`solution_source`). It does not return a fidelity. The stored weighted error
+and `normalized_distance` compare the product `L @ R` with the untruncated
+identity in the local `B_reduce` metric. They do not measure the difference of
+`L` and `R` separately, since their internal gauge is arbitrary. A fidelity is
+not reported in `als_info`. The optional full-network pure-state/
+Hilbert-Schmidt overlap is stored as `result.network_fidelity` and
+`result.network_infidelity` only when `compute_fidelity=True`; it is not part
+of local map normalization. Set `compute_fidelity=False` to skip those global
+contractions.
+`relative_error` is the final weighted residual divided by the weighted
+identity norm, not a fidelity.
+
+## Loop-series bond sweeps
+
+For reducing several bonds one after another, use
+`BondLoopSeriesCompressor`. It reruns D2BP after every reduction and carries
+the previous directed messages forward instead of randomly initializing the
+new BP problem:
+
+```python
+from pepsy.bp import BondLoopSeriesCompressor
+
+sweep = BondLoopSeriesCompressor(
+    peps,
+    bonds=[((0, 0), (1, 0)), ((0, 0), (0, 1))],
+    max_bond=chi,
+    boundary_mode="bp",
+    bp_opts={"max_iterations": 1000, "tol": 1e-10},
+    compression_opts={"edge_cutoff": 4},
+)
+result = sweep.run()
+```
+
+Messages on unchanged bonds are copied directly. The message pair on a
+newly reduced bond is projected through the fitted maps using Quimb's
+reduced-factor convention, then the full message snapshot is used as
+`init_messages` for the next D2BP solve. If that projection is unavailable,
+only the new bond receives deterministic identity messages.
+
+An `OpenLoopSeriesCache` supplied through `compression_opts` is reused while
+the sweep topology is unchanged. After a reduction replaces a bond index,
+the sweep automatically starts a fresh topology cache for the next step;
+loop geometry must not be reused across those topology changes.
+
+Set `boundary_mode="su"` with `input_mode="su_core"` and `gauges=...` to keep
+an SU/simple-update core and gauge dictionary between steps. After each
+compression, the converged D2BP messages are converted back to an SU gauge;
+this is necessary because general matrix BP messages cannot be represented by
+a diagonal SU vector exactly.
+
+Each `result.steps[i]` contains the one-bond compression result, BP
+convergence before and after the reduction, the old/new bond indices, the
+message seed source, and `als_infidelity`. That infidelity is computed in the
+local `B_reduce` metric. It is not a global PEPS infidelity unless the
+environment is complete and exact; global overlap diagnostics remain an
+explicit expensive option.
+
+By default the sweep is sequential (`update_mode="sequential"`): the next
+bond is fitted using the BP fixed point after the previous reduction. Use
+`update_mode="simultaneous"` for a Jacobi-style batch when the selected bonds
+should all use one boundary snapshot:
+
+```python
+sweep = BondLoopSeriesCompressor(
+    peps,
+    bonds=[((0, 0), (1, 0)), ((0, 0), (0, 1))],
+    max_bond=chi,
+    update_mode="simultaneous",
+    boundary_mode="bp",
+)
+result = sweep.run()
+```
+
+The simultaneous mode runs BP once before the batch, fits every bond against
+that same physical network and message snapshot, inserts all map pairs into
+one copied network, and runs BP once afterward. The returned `steps` retain
+one local ALS diagnostic per bond, while `result.compressed` is the common
+batch network. With `boundary_mode="su"`, one supplied SU gauge snapshot is
+used for the batch and the post-batch BP fixed point is converted back to one
+refreshed core/gauge representation. This mode is not a jointly optimized
+global fit: if reductions substantially change one another's environments,
+run another batch or use the default sequential mode.
+
+To reduce every two-ended virtual bond in a PEPS/PEPO, use `bonds="all"`.
+Set `parallel=True` with `update_mode="simultaneous"` to fit the independent
+bond environments concurrently. The sweep runs BP once, warms the loop
+geometry cache, reuses one frozen message snapshot, tries the configured ALS
+starts, chooses the lowest final local objective for each bond, inserts all
+`L/R` pairs into one copied network, and runs BP once afterward:
+
+```python
+sweep = BondLoopSeriesCompressor(
+    peps,
+    bonds="all",
+    max_bond=chi,
+    update_mode="simultaneous",
+    parallel=True,
+    max_workers=4,
+    init_candidates=("bp_messages", "projector"),
+    compression_opts={"edge_cutoff": 4},
+)
+result = sweep.run()
+N_reduce_by_bond = result.N_reduce_by_bond
+```
+
+The compact top-level spelling for this standard workflow is
+`pepsy.compress_all_gauge`:
+
+```python
+import pepsy as py
+
+result = py.compress_all_gauge(
+    peps,
+    max_bond=chi,
+    bp_messages=bp,
+    mode="parallel",       # or "sequential"
+    compression_opts={"edge_cutoff": 4},
+)
+```
+
+It is a gate-free bond-compression helper despite the name: “gauge” refers to
+the BP/SU boundary and local map gauge handling. Use
+`BondLoopSeriesCompressor` directly when selecting a custom bond list or
+controlling sequential versus simultaneous scheduling in more detail.
+Pass `gauges=gauges, input_mode="su_core"` for an SU-core input; with
+`boundary_mode="auto"` that selects the SU path. `bp_messages` accepts a
+directed message mapping or the result returned by `two_norm_bp`/`relay_bp`.
+`boundary_messages` remains an alias for compatibility.
+
+`parallel=True` is deliberately restricted to simultaneous batches: each
+worker reads the same frozen physical network and BP/SU boundary snapshot, so
+workers must not target the same virtual bond. `result.B_reduce_by_bond` is a
+compatibility alias for `result.N_reduce_by_bond`. For a sequential sweep,
+the loop and projector caches are refreshed when a reduction changes the
+topology.
+
+Loop-series compression accepts both physical PEPS/PEPO tensors with BP
+messages and SU cores with `gauges`. SU factors are inserted exactly once;
+when the input is already physical, the gauges seed diagonal BP messages
+without being inserted again.
 
 This is separate from `compress_reduced_loop_cluster`. The latter combines
 operator-valued regional environments additively for the reduced ALS metric.

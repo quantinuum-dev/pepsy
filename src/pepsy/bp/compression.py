@@ -4,7 +4,7 @@ The compressor in this module deliberately has a narrow scope: it selects one
 existing virtual bond, contracts a finite surrounding cluster, and optimizes
 only the two rectangular maps on that bond.  The site tensors away from the
 selected bond are fixed.  This is the gate-free counterpart of a local full
-update; it is not a simultaneous whole-network bond fit.
+update; its batch mode is not a jointly optimized whole-network bond fit.
 
 The cluster contraction is reduced to a four-leg bond environment
 ``B_reduce``.  Its legs are ordered as
@@ -17,6 +17,7 @@ such as ``d**4`` or ``d**8``.
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,12 +53,20 @@ from ._compression_utils import (
     resolve_d2bp_boundaries,
     validate_cost_options,
 )
-from .series import OpenLoopSeriesCache, cut_edge_loop_series_expand
+from .series import (
+    CutEdgeLoopProjectorCache,
+    OpenLoopSeriesCache,
+    cut_edge_loop_series_expand,
+)
 
 __all__ = [
     "BondClusterCompressionResult",
     "compress_bond_cluster",
     "BondLoopSeriesCompressionResult",
+    "BondLoopSeriesSweepResult",
+    "BondLoopSeriesSweepStep",
+    "BondLoopSeriesCompressor",
+    "compress_all_gauge",
     "compress_bond_loop_series",
 ]
 
@@ -171,24 +180,31 @@ def _process_bond_environment(
     hermitian_project: bool,
     psd_project: bool,
     psd_floor: float,
+    diagnose_spectrum: bool = False,
 ):
     """Optionally Hermitian/PSD-project a four-leg bond environment.
 
     The matrix view groups ``(left_bra, right_bra)`` against
-    ``(left_ket, right_ket)``. The defaults make that metric Hermitian and
-    PSD before ALS. A caller can retain the raw four-leg contraction for
-    diagnostics only by disabling both operations explicitly.
+    ``(left_ket, right_ket)``. The default makes that metric Hermitian before
+    ALS; PSD projection is opt-in. Hermitianization is cheap and independent of spectral
+    decomposition. The default path deliberately does not diagonalize
+    ``B_reduce``; a spectral diagnostic is computed only when requested, and
+    PSD projection necessarily computes the spectrum.
     """
     matrix = _reshape(
         _transpose(data, (2, 3, 0, 1)),
         (dimension * dimension, dimension * dimension),
     )
     hermitian = 0.5 * (matrix + _dag(matrix))
-    eigenvalues = ar.do("linalg.eigvalsh", hermitian)
-    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
+    raw_min = None
     clipped = 0
     if psd_project:
         matrix, raw_min, clipped = _project_psd(matrix, psd_floor=psd_floor)
+    elif diagnose_spectrum:
+        eigenvalues = ar.do("linalg.eigvalsh", hermitian)
+        raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
+        if hermitian_project:
+            matrix = hermitian
     elif hermitian_project:
         matrix = hermitian
     return (
@@ -290,6 +306,100 @@ def _b_reduce_initial_maps(b_reduce, rank: int, *, optimize):
     left = left_vectors[:, -rank:]
     right = _dag(right_vectors[:, -rank:])
     return left, right
+
+
+def _bp_message_initial_maps(
+    tn,
+    bond_ind,
+    left_tid,
+    right_tid,
+    boundary_messages,
+    gauges,
+    rank: int,
+):
+    """Build cheap selected-bond maps from BP messages or an SU gauge.
+
+    Explicit D2BP messages take precedence. If they are absent, the selected
+    SU vector is interpreted as the diagonal D2BP message on both directions.
+    The message matrices are the squared reduced environments used by D2BP;
+    their reduced factors are combined with Quimb's public oblique-projector
+    construction. This only decomposes objects sized by the selected bond and
+    never contracts or diagonalizes ``B_reduce``.
+    """
+    import quimb.tensor as qtn
+    from .gauges import _d2bp_diagonal_message
+
+    if boundary_messages is None and (gauges is None or bond_ind not in gauges):
+        return None
+    endpoints = tuple(tn.ind_map[bond_ind])
+    if set(endpoints) != {left_tid, right_tid}:
+        return None
+
+    dimension = tn.ind_size(bond_ind)
+    if boundary_messages is not None:
+        messages = _normalize_message_pairs(boundary_messages, tn.ind_map)
+        left_message = _native(messages[bond_ind, right_tid])
+        right_message = _native(messages[bond_ind, left_tid]).T
+    else:
+        gauge = _native(gauges[bond_ind])
+        expected = (dimension,)
+        if gauge.shape != expected:
+            raise ValueError(
+                f"SU gauge for {bond_ind!r} has shape {gauge.shape}, expected "
+                f"{expected} and must be real"
+            )
+        if _is_complex(gauge):
+            if _scalar_float(
+                ar.do("max", _backend_abs(ar.do("imag", gauge)))
+            ) > 1e-12:
+                raise ValueError(
+                    f"SU gauge for {bond_ind!r} has shape {gauge.shape}, expected "
+                    f"{expected} and must be real"
+                )
+            gauge = _real(gauge)
+        if not _all_finite(gauge) or _scalar_bool(ar.do("any", gauge < 0.0)):
+            raise ValueError(
+                f"SU gauge for {bond_ind!r} must be finite and nonnegative"
+            )
+        # Reuse the package's D2BP/SU bridge so this stays aligned with the
+        # convention used by d2bp_from_simple_update_gauges: D2BP sees
+        # diag(lambda), whereas D1BP would use sqrt(lambda).
+        left_message = _d2bp_diagonal_message(
+            tn,
+            bond_ind,
+            right_tid,
+            gauge,
+        )
+        right_message = _d2bp_diagonal_message(
+            tn,
+            bond_ind,
+            left_tid,
+            gauge,
+        )
+
+    left_size = tn.tensor_map[left_tid].size // dimension
+    right_size = tn.tensor_map[right_tid].size // dimension
+
+    left_factor = qtn.decomp.squared_op_to_reduced_factor(
+        left_message,
+        left_size,
+        dimension,
+        right=True,
+    )
+    right_factor = qtn.decomp.squared_op_to_reduced_factor(
+        right_message,
+        dimension,
+        right_size,
+        right=False,
+    )
+    return qtn.decomp.compute_oblique_projectors(
+        left_factor,
+        right_factor,
+        max_bond=rank,
+        cutoff=0.0,
+        absorb="both",
+        method="svd",
+    )
 
 
 def _site_graph(tn):
@@ -401,6 +511,7 @@ def _build_b_reduce(
     hermitian_project: bool,
     psd_project: bool,
     b_reduce_floor: float,
+    diagnose_spectrum: bool = False,
     optimize,
     cost_check: bool,
     max_flops_log10: float | None,
@@ -519,6 +630,7 @@ def _build_b_reduce(
         hermitian_project=hermitian_project,
         psd_project=psd_project,
         psd_floor=b_reduce_floor,
+        diagnose_spectrum=diagnose_spectrum,
     )
 
     return (
@@ -531,12 +643,60 @@ def _build_b_reduce(
     )
 
 
+def _weighted_inner(first, second, b_reduce):
+    """Evaluate ``first^H B_reduce second`` in the local map metric."""
+    return _einsum("ab,cd,abcd->", first, _conj(second), b_reduce)
+
+
 def _local_cost(left, right, target, b_reduce) -> float:
     """Evaluate ``(target - L R)^H B_reduce (target - L R)``."""
     approximation = left @ right
     difference = target - approximation
-    value = _einsum("ab,cd,abcd->", difference, _conj(difference), b_reduce)
-    return _scalar_float(_real(value))
+    return _scalar_float(_real(_weighted_inner(difference, difference, b_reduce)))
+
+
+def _als_fit_metrics(left, right, target, b_reduce):
+    """Report ALS residual and normalized distance in the local objective."""
+    approximation = left @ right
+    approx_norm_sq = _scalar_float(
+        _real(_weighted_inner(approximation, approximation, b_reduce))
+    )
+    target_norm_sq = _scalar_float(
+        _real(_weighted_inner(target, target, b_reduce))
+    )
+    residual_sq = _local_cost(left, right, target, b_reduce)
+    residual_sq_nonnegative = max(0.0, residual_sq)
+    approx_norm = float(np.sqrt(max(0.0, approx_norm_sq)))
+    target_norm = float(np.sqrt(max(0.0, target_norm_sq)))
+    denominator = approx_norm + target_norm
+    normalized_distance = (
+        None
+        if denominator == 0.0
+        else float(2.0 * np.sqrt(residual_sq_nonnegative) / denominator)
+    )
+    overlap = _weighted_inner(target, approximation, b_reduce)
+    if target_norm_sq > 0.0 and approx_norm_sq > 0.0:
+        fidelity = _scalar_float(ar.do("abs", overlap)) ** 2 / (
+            target_norm_sq * approx_norm_sq
+        )
+        if np.isfinite(fidelity):
+            fidelity = min(1.0, max(0.0, float(fidelity)))
+            infidelity = 1.0 - fidelity
+        else:
+            fidelity = None
+            infidelity = None
+    else:
+        fidelity = None
+        infidelity = None
+    return {
+        "weighted_squared_error": float(residual_sq_nonnegative),
+        "weighted_error": float(np.sqrt(residual_sq_nonnegative)),
+        "approx_norm": approx_norm,
+        "target_norm": target_norm,
+        "normalized_distance": normalized_distance,
+        "local_fidelity": fidelity,
+        "local_infidelity": infidelity,
+    }
 
 
 def _gram_message_diagnostics(left, right):
@@ -583,15 +743,10 @@ def _normalize_map_pair_with_quimb(
     forcing either factor to be isometric or introducing a separate scalar
     normalization.
 
-    The BP message matrices are deliberately not applied here. They already
-    enter ``B_reduce`` (and are pair-normalized with Quimb's
-    ``normalize_message_pair`` convention before that contraction). Applying
-    them again to ``L`` or ``R`` would count the environment twice. This
-    helper only fixes the internal factor gauge. The overall PEPS/PEPO
-    norm correction is deliberately performed after insertion, using the
-    actual network norm rather than ``B_reduce``. A local environment can be
-    approximate (for example for a finite cluster), so using it as a proxy for
-    the global norm would not satisfy the compression contract.
+    This helper only fixes the factorization gauge. The BP messages are used
+    to build the local environment and, when requested, the Quimb message
+    projector initialization; they are not multiplied into the fitted maps.
+    Multiplying them into ``L`` or ``R`` would count the environment twice.
     """
     import quimb.tensor as qtn
 
@@ -630,6 +785,68 @@ def _normalize_map_pair_with_quimb(
     return left_normalized, right_normalized, normalization
 
 
+def _map_squared_frobenius_norm(map_, *, left: bool):
+    """Return a real squared Frobenius norm for one rectangular map."""
+    if left:
+        value = _einsum("ai,ai->", _conj(map_), map_)
+    else:
+        value = _einsum("ia,ia->", map_, _conj(map_))
+    return _scalar_float(_real(value))
+
+
+def _normalize_map_pair_with_frobenius(
+    left,
+    right,
+    *,
+    normalization,
+):
+    """Reciprocally balance the fitted maps without changing their product.
+
+    The transformation is ``L -> c L`` and ``R -> R / c``. With
+    ``a = ||L||_F^2`` and ``b = ||R||_F^2``, choosing
+    ``c = (b / a)**(1/4)`` makes the two Frobenius norms equal while keeping
+    ``L @ R`` exactly unchanged. This is an internal map gauge only; it does
+    not normalize the BP messages or change the PEPS network amplitude.
+    """
+    normalization = dict(normalization)
+    left_before = _map_squared_frobenius_norm(left, left=True)
+    right_before = _map_squared_frobenius_norm(right, left=False)
+
+    if (
+        not np.isfinite(left_before)
+        or not np.isfinite(right_before)
+        or left_before <= 0.0
+        or right_before <= 0.0
+    ):
+        raise ValueError(
+            "cannot normalize selected-bond maps: expected positive finite "
+            f"map norms, got {left_before!r} and {right_before!r}"
+        )
+
+    scale_left = float((right_before / left_before) ** 0.25)
+    scale_right = 1.0 / scale_left
+    left = left * scale_left
+    right = right * scale_right
+    left_after = _map_squared_frobenius_norm(left, left=True)
+    right_after = _map_squared_frobenius_norm(right, left=False)
+    normalization.update(
+        {
+            "map_gauge": "frobenius_reciprocal_scalar",
+            "map_gauge_reason": "post_als_product_gauge",
+            "norm_scope": "local_frobenius",
+            "messages_applied_to_maps": False,
+            "reciprocal_gauge_scale_left": scale_left,
+            "reciprocal_gauge_scale_right": scale_right,
+            "left_map_squared_norm_before": left_before,
+            "right_map_squared_norm_before": right_before,
+            "left_map_squared_norm_after": left_after,
+            "right_map_squared_norm_after": right_after,
+            "map_product_preserved_by_gauge": True,
+        }
+    )
+    return left, right, normalization
+
+
 def _network_norm(tn, *, optimize, contract_opts):
     """Compute the actual Frobenius norm used for normalization diagnostics."""
     return _scalar_float(
@@ -639,6 +856,64 @@ def _network_norm(tn, *, optimize, contract_opts):
             **dict(contract_opts),
         )
     )
+
+
+def _network_fidelity(
+    original,
+    compressed,
+    *,
+    norm_original: float,
+    norm_compressed: float,
+    optimize,
+    contract_opts,
+):
+    """Compute normalized full-network overlap and infidelity."""
+    if (
+        not np.isfinite(norm_original)
+        or not np.isfinite(norm_compressed)
+        or norm_original <= 0.0
+        or norm_compressed <= 0.0
+    ):
+        raise ValueError(
+            "cannot compute network fidelity: expected finite positive norms, got "
+            f"{norm_original!r} and {norm_compressed!r}"
+        )
+    overlap = original.overlap(
+        compressed,
+        optimize=optimize,
+        **dict(contract_opts),
+    )
+    overlap_abs = _scalar_float(ar.do("abs", overlap))
+    if not np.isfinite(overlap_abs):
+        raise ValueError("cannot compute network fidelity: non-finite overlap")
+    fidelity = overlap_abs**2 / (norm_original * norm_compressed) ** 2
+    fidelity = min(1.0, max(0.0, float(fidelity)))
+    return fidelity, 1.0 - fidelity
+
+
+def _environment_fidelity(target, approximation, b_reduce):
+    """Compute fidelity from an exact four-leg reduced norm environment."""
+    target_norm_sq = _scalar_float(
+        _real(_weighted_inner(target, target, b_reduce))
+    )
+    approximation_norm_sq = _scalar_float(
+        _real(_weighted_inner(approximation, approximation, b_reduce))
+    )
+    overlap = _weighted_inner(target, approximation, b_reduce)
+    if (
+        not np.isfinite(target_norm_sq)
+        or not np.isfinite(approximation_norm_sq)
+        or target_norm_sq <= 0.0
+        or approximation_norm_sq <= 0.0
+    ):
+        return None
+    fidelity = _scalar_float(ar.do("abs", overlap)) ** 2 / (
+        target_norm_sq * approximation_norm_sq
+    )
+    if not np.isfinite(fidelity) or fidelity < -1e-8 or fidelity > 1.0 + 1e-8:
+        return None
+    fidelity = min(1.0, max(0.0, float(fidelity)))
+    return fidelity, 1.0 - fidelity
 
 
 def _normalize_inserted_map_pair(
@@ -652,15 +927,22 @@ def _normalize_inserted_map_pair(
     optimize,
     contract_opts,
     preserve_norm: bool,
+    compute_fidelity: bool,
+    environment_fidelity: tuple[float, float] | None,
     normalization: dict[str, Any],
 ):
-    """Normalize maps against the full network norm after their insertion.
+    """Insert maps using local Quimb gauge normalization.
 
-    ``alpha`` rescales the product ``L @ R``. Splitting it as
-    ``sqrt(alpha)`` on each map keeps the Quimb balanced SVD gauge while
-    changing neither map into an isometry. The correction is on the maps
-    themselves, not on ``TensorNetwork.exponent``, so ``result.bond_maps`` and
-    the returned network describe the same normalized tensors.
+    The ordinary path does not contract the full network. The maps have
+    already been factorized with Quimb's L2BP/D2BP convention and balanced
+    with a reciprocal Frobenius gauge. Full-network norm matching and
+    overlap fidelity remain explicit opt-in diagnostics for callers that can
+    afford those global contractions.
+
+    ``scalar_factor`` is retained only for the legacy
+    ``preserve_norm=True`` path. Splitting it as
+    ``sqrt(scalar_factor)`` on each map keeps the Quimb balanced SVD
+    gauge while changing neither map into an isometry.
     """
     raw_compressed, _ = _reconstruct_selected_bond(
         tn,
@@ -672,10 +954,44 @@ def _normalize_inserted_map_pair(
     )
     normalization = dict(normalization)
     normalization["preserve_norm"] = preserve_norm
+    normalization["compute_fidelity"] = compute_fidelity
     if not preserve_norm:
+        normalization.setdefault("norm_scope", "local_frobenius")
+        normalization["scalar_factor"] = 1.0
         normalization["norm_before"] = None
         normalization["norm_after_raw_maps"] = None
         normalization["norm_after_maps"] = None
+        if not compute_fidelity:
+            normalization["network_fidelity"] = None
+            normalization["network_infidelity"] = None
+            normalization["network_fidelity_source"] = "disabled"
+            return raw_compressed, left, right, normalization
+        norm_before = _network_norm(
+            tn,
+            optimize=optimize,
+            contract_opts=contract_opts,
+        )
+        norm_after = _network_norm(
+            raw_compressed,
+            optimize=optimize,
+            contract_opts=contract_opts,
+        )
+        if environment_fidelity is None:
+            fidelity, infidelity = _network_fidelity(
+                tn,
+                raw_compressed,
+                norm_original=norm_before,
+                norm_compressed=norm_after,
+                optimize=optimize,
+                contract_opts=contract_opts,
+            )
+            fidelity_source = "full_network_overlap"
+        else:
+            fidelity, infidelity = environment_fidelity
+            fidelity_source = "complete_reduced_environment"
+        normalization["network_fidelity"] = fidelity
+        normalization["network_infidelity"] = infidelity
+        normalization["network_fidelity_source"] = fidelity_source
         return raw_compressed, left, right, normalization
 
     norm_before = _network_norm(
@@ -708,6 +1024,27 @@ def _normalize_inserted_map_pair(
         left,
         right,
     )
+    if compute_fidelity:
+        if environment_fidelity is None:
+            fidelity, infidelity = _network_fidelity(
+                tn,
+                compressed,
+                norm_original=norm_before,
+                norm_compressed=norm_after_raw * scalar_factor,
+                optimize=optimize,
+                contract_opts=contract_opts,
+            )
+            fidelity_source = "full_network_overlap"
+        else:
+            fidelity, infidelity = environment_fidelity
+            fidelity_source = "complete_reduced_environment"
+        normalization["network_fidelity"] = fidelity
+        normalization["network_infidelity"] = infidelity
+        normalization["network_fidelity_source"] = fidelity_source
+    else:
+        normalization["network_fidelity"] = None
+        normalization["network_infidelity"] = None
+        normalization["network_fidelity_source"] = "disabled"
     normalization.update(
         {
             "scalar_factor": float(scalar_factor),
@@ -719,12 +1056,24 @@ def _normalize_inserted_map_pair(
             "map_scale_right": map_scale,
         }
     )
+    if "left_map_squared_norm_after" in normalization:
+        # The optional global correction scales both maps by ``map_scale``;
+        # report the final map norms while retaining the reciprocal-gauge
+        # norms in the corresponding ``*_before`` fields.
+        normalization["left_map_squared_norm_after"] *= scalar_factor
+        normalization["right_map_squared_norm_after"] *= scalar_factor
     return compressed, left, right, normalization
 
 
 def _fit_maps(
     b_reduce,
     *,
+    tn,
+    bond_ind,
+    left_tid,
+    right_tid,
+    boundary_messages,
+    gauges,
     dimension: int,
     max_bond: int,
     init: str,
@@ -735,12 +1084,116 @@ def _fit_maps(
     seed,
     positive_environment: bool,
     progbar: bool,
+    init_candidates=None,
 ):
     """Fit the two selected-bond maps with Quimb's public ALS API."""
     import quimb.tensor as qtn
 
+    if init_candidates is not None:
+        candidates = tuple(dict.fromkeys(init_candidates))
+        if not candidates:
+            raise ValueError("init_candidates must contain at least one initializer")
+        allowed = {"bp_messages", "b_reduce", "projector", "random"}
+        invalid = set(candidates).difference(allowed)
+        if invalid:
+            raise ValueError(
+                "init_candidates contains unsupported initializers: "
+                f"{tuple(sorted(invalid))!r}"
+            )
+        candidate_results = []
+        candidate_errors = []
+        for candidate_index, candidate in enumerate(candidates):
+            candidate_seed = seed
+            if seed is not None:
+                candidate_seed = int(seed) + candidate_index
+            try:
+                candidate_result = _fit_maps(
+                    b_reduce,
+                    tn=tn,
+                    bond_ind=bond_ind,
+                    left_tid=left_tid,
+                    right_tid=right_tid,
+                    boundary_messages=boundary_messages,
+                    gauges=gauges,
+                    dimension=dimension,
+                    max_bond=max_bond,
+                    init=candidate,
+                    steps=steps,
+                    tol=tol,
+                    contract_optimize=contract_optimize,
+                    als_opts=als_opts,
+                    seed=candidate_seed,
+                    positive_environment=positive_environment,
+                    progbar=progbar,
+                    init_candidates=None,
+                )
+            except (
+                ArithmeticError,
+                KeyError,
+                np.linalg.LinAlgError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                candidate_errors.append(
+                    (candidate, type(exc).__name__, str(exc))
+                )
+                continue
+            candidate_results.append((candidate, candidate_result))
+
+        if not candidate_results:
+            details = "; ".join(
+                f"{name}: {kind}: {message}"
+                for name, kind, message in candidate_errors
+            )
+            raise RuntimeError(f"all ALS initializers failed: {details}")
+
+        selected_name, selected_result = min(
+            candidate_results,
+            key=lambda item: float(item[1][2][1]),
+        )
+        left, right, costs, selected_info = selected_result
+        selected_info = dict(selected_info)
+        selected_info["initialization_selection"] = {
+            "selected": selected_name,
+            "candidates": {
+                name: {
+                    "initial_cost": float(result[2][0]),
+                    "final_cost": float(result[2][1]),
+                    "normalized_distance": result[3]["final"].get(
+                        "normalized_distance"
+                    ),
+                }
+                for name, result in candidate_results
+            },
+            "failed": tuple(candidate_errors),
+        }
+        return left, right, costs, selected_info
+
     rng = np.random.default_rng(seed)
-    if init == "b_reduce":
+    if init == "bp_messages":
+        try:
+            maps = _bp_message_initial_maps(
+                tn,
+                bond_ind,
+                left_tid,
+                right_tid,
+                boundary_messages,
+                gauges,
+                max_bond,
+            )
+        except (KeyError, np.linalg.LinAlgError, RuntimeError, ValueError):
+            maps = None
+        if maps is None:
+            left, right = _initial_maps(
+                dimension,
+                max_bond,
+                init="projector",
+                like=b_reduce,
+                rng=rng,
+            )
+        else:
+            left, right = maps
+    elif init == "b_reduce":
         try:
             left, right = _b_reduce_initial_maps(
                 b_reduce,
@@ -765,6 +1218,12 @@ def _fit_maps(
         )
     target = _eye(dimension, like=b_reduce)
     initial_cost = _local_cost(left, right, target, b_reduce)
+    initial_als_metrics = _als_fit_metrics(
+        left,
+        right,
+        target,
+        b_reduce,
+    )
 
     left_ket_ind, right_ket_ind, left_bra_ind, right_bra_ind = (
         qtn.rand_uuid(),
@@ -856,7 +1315,7 @@ def _fit_maps(
     target_norm = float(target_norm)
     if target_norm < 0.0:
         target_norm = 0.0
-    qtn.tensor_network_fit_als(
+    als_fit = qtn.tensor_network_fit_als(
         tn_fit,
         tn_target,
         tags="__MAP__",
@@ -874,7 +1333,56 @@ def _fit_maps(
     left = _copy_array(left_tensor.transpose(left_ket_ind, map_ind).data)
     right = _copy_array(right_tensor.transpose(map_ind, right_ket_ind).data)
     final_cost = _local_cost(left, right, target, b_reduce)
-    return left, right, (initial_cost, final_cost)
+    als_info = {
+        "method": "quimb.tensor_network_fit_als",
+        "status": "completed",
+        "quimb_return_type": type(als_fit).__name__,
+        "solution_source": "precomputed_tnAA_variables",
+        "objective": "B_reduce_weighted_squared_error",
+        "steps_requested": int(steps),
+        "tol": float(tol),
+        "initialization": init,
+        "initial": initial_als_metrics,
+        "final": _als_fit_metrics(
+            left,
+            right,
+            target,
+            b_reduce,
+        ),
+    }
+    return left, right, (initial_cost, final_cost), als_info
+
+
+def _su_seed_messages(tn, gauges, *, optimize, bp_opts):
+    """Create diagonal D2BP seed messages without inserting SU gauges.
+
+    This is used when a loop-series call is given a network that already
+    contains its SU factors. The public gauge-to-D2BP bridge is reused, but
+    ``insert_gauges=False`` prevents the factors from being inserted twice.
+    """
+    from .gauges import d2bp_from_simple_update_gauges
+
+    init_names = {
+        "damping",
+        "update",
+        "smudge",
+        "missing",
+        "normalize_initial",
+        "output_inds",
+        "distance",
+        "local_convergence",
+        "contract_every",
+    }
+    init_opts = {
+        name: value for name, value in bp_opts.items() if name in init_names
+    }
+    init_opts.setdefault("optimize", optimize)
+    return d2bp_from_simple_update_gauges(
+        tn,
+        gauges,
+        insert_gauges=False,
+        **init_opts,
+    ).messages
 
 
 def _reconstruct_selected_bond(tn, bond_ind, left_tid, right_tid, left, right):
@@ -913,6 +1421,11 @@ class BondClusterCompressionResult:
     ``bond_maps[bond_ind]`` is ``(L, R)`` with shapes ``(D, chi)`` and
     ``(chi, D)``. The maps are ordinary rectangular variational tensors: no
     isometry, orthogonality, or adjoint constraint is imposed by this API.
+    ``als_info`` stores the Quimb ALS objective diagnostics; it compares the
+    product ``L @ R`` with the untruncated identity in the local ``B_reduce``
+    metric, not the two individual maps in isolation.
+    ``network_fidelity`` and ``network_infidelity`` are the global overlap
+    diagnostics between the input and returned networks.
     """
 
     compressed: Any
@@ -924,19 +1437,32 @@ class BondClusterCompressionResult:
     cluster_tids: tuple[Any, ...]
     boundary_inds: tuple[str, ...]
     B_reduce: Any
-    raw_min_eigenvalue: float
+    raw_min_eigenvalue: float | None
     clipped_eigenvalues: int
     steps: int
     max_bond: int
+    als_info: dict[str, Any] | None = None
+    network_fidelity: float | None = None
+    network_infidelity: float | None = None
     bp_info: dict[str, Any] | None = None
     contraction_cost: dict[str, float] | None = None
     environment_projection: dict[str, bool | float] | None = None
     normalization: dict[str, Any] | None = None
 
+    @property
+    def N_reduce(self):
+        """Alias for the selected-bond norm environment ``B_reduce``."""
+        return self.B_reduce
+
 
 @dataclass(frozen=True)
 class BondLoopSeriesCompressionResult:
-    """Result of compression using an explicit cut-edge loop series."""
+    """Result of compression using an explicit cut-edge loop series.
+
+    ``als_info`` has the same local map-fit diagnostics as the cluster result.
+    ``network_fidelity`` and ``network_infidelity`` use the full-network
+    overlap between the input and returned networks.
+    """
 
     compressed: Any
     bond_maps: dict[str, tuple[Any, Any]]
@@ -945,19 +1471,855 @@ class BondLoopSeriesCompressionResult:
     where: tuple[Any, Any]
     bond_ind: str
     B_reduce: Any
-    raw_min_eigenvalue: float
+    raw_min_eigenvalue: float | None
     clipped_eigenvalues: int
     steps: int
     max_bond: int
     edge_cutoff: int
     complete: bool
     term_count: int
+    als_info: dict[str, Any] | None = None
+    network_fidelity: float | None = None
+    network_infidelity: float | None = None
     bp_info: dict[str, Any] | None = None
     series: Any = None
     contraction_cost: dict[str, float] | None = None
     cost_limits: dict[str, float | None] | None = None
     environment_projection: dict[str, bool | float] | None = None
     normalization: dict[str, Any] | None = None
+
+    @property
+    def N_reduce(self):
+        """Alias for the selected-bond norm environment ``B_reduce``."""
+        return self.B_reduce
+
+
+@dataclass(frozen=True)
+class BondLoopSeriesSweepStep:
+    """One selected-bond record from a compression sweep or batch."""
+
+    step: int
+    where: tuple[Any, Any]
+    bond_ind_before: str
+    bond_ind_after: str
+    compression: BondLoopSeriesCompressionResult
+    als_infidelity: float | None
+    bp_before: dict[str, Any]
+    bp_after: dict[str, Any]
+    message_seed: str
+    messages_reused: bool
+
+
+@dataclass(frozen=True)
+class BondLoopSeriesSweepResult:
+    """Result of compressing a list of virtual bonds in one configured mode."""
+
+    compressed: Any
+    steps: tuple[BondLoopSeriesSweepStep, ...]
+    boundary_mode: str
+    messages: dict[Any, Any] | None = None
+    gauges: dict[Any, Any] | None = None
+    core: Any = None
+    update_mode: str = "sequential"
+
+    @property
+    def N_reduce_by_bond(self):
+        """Return one selected-bond norm environment per sweep step."""
+        return {
+            step.bond_ind_before: step.compression.N_reduce
+            for step in self.steps
+        }
+
+    @property
+    def B_reduce_by_bond(self):
+        """Compatibility spelling of :attr:`N_reduce_by_bond`."""
+        return self.N_reduce_by_bond
+
+
+def _sweep_bp_info(bp_result) -> dict[str, Any]:
+    """Extract scalar convergence diagnostics from a BP runner result."""
+    return {
+        "converged": bool(bp_result.converged),
+        "iterations": int(bp_result.iterations),
+        "max_mdiff": float(bp_result.max_mdiff),
+        "quimb_converged": bp_result.quimb_converged,
+    }
+
+
+def _sweep_bond_from_where(tn, where):
+    """Resolve a sweep site pair to its tensor ids and virtual bond."""
+    import quimb.tensor as qtn
+
+    if not isinstance(where, (tuple, list)) or len(where) != 2:
+        raise ValueError("each sweep bond must be an ordered site pair")
+    left_tid = _single_tid(tn, where[0])
+    right_tid = _single_tid(tn, where[1])
+    bonds = tuple(qtn.bonds(tn.tensor_map[left_tid], tn.tensor_map[right_tid]))
+    if len(bonds) != 1:
+        raise ValueError(
+            f"sweep bond {where!r} must identify exactly one virtual bond, "
+            f"found {bonds!r}"
+        )
+    return left_tid, right_tid, bonds[0]
+
+
+def _sweep_new_bond(tn, old_bond, left_tid, right_tid):
+    """Find the selected bond after map insertion, or retain an identity bond."""
+    candidates = [
+        index
+        for index, tids in tn.ind_map.items()
+        if len(tids) == 2
+        and set(tids) == {left_tid, right_tid}
+        and index != old_bond
+    ]
+    if old_bond in tn.ind_map:
+        return old_bond
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "could not identify the reduced sweep bond after compression; "
+            f"candidates={candidates!r}"
+        )
+    return candidates[0]
+
+
+def _sweep_project_messages_batch(
+    old_tn,
+    new_tn,
+    old_messages,
+    *,
+    changes,
+):
+    """Warm-start messages after replacing several bonds by ``L`` and ``R``.
+
+    Unchanged bonds retain their previous directed messages. The selected
+    pairs are updated with the same reduced-factor projection used by
+    Quimb's ``D2BP.compress``. ``changes`` is a sequence of
+    ``(old_bond, new_bond, left_tid, right_tid, left_map, right_map)``
+    tuples. If a projection is unavailable, deterministic identity messages
+    are used for only that new bond; no random state is introduced.
+    """
+    if old_messages is None:
+        return None, "fresh", False
+
+    changes = tuple(changes)
+    new_bonds = {change[1] for change in changes}
+    messages = {}
+    for index, tids in new_tn.ind_map.items():
+        if len(tids) != 2 or index in new_bonds:
+            continue
+        for destination in tids:
+            key = (index, destination)
+            if key in old_messages:
+                messages[key] = _copy_array(old_messages[key])
+
+    try:
+        import quimb.tensor as qtn
+
+        from_messages = _normalize_message_pairs(
+            old_messages,
+            old_tn.ind_map,
+        )
+    except (KeyError, TypeError, ValueError, np.linalg.LinAlgError, RuntimeError):
+        from_messages = None
+
+    used_fallback = False
+    for (
+        old_bond,
+        new_bond,
+        left_tid,
+        right_tid,
+        left_map,
+        right_map,
+    ) in changes:
+        projected = False
+        if from_messages is not None:
+            try:
+                old_dimension = int(old_tn.ind_size(old_bond))
+                left_size = old_tn.tensor_map[left_tid].size // old_dimension
+                right_size = old_tn.tensor_map[right_tid].size // old_dimension
+                left_message = _native(from_messages[old_bond, right_tid])
+                right_message = _transpose(
+                    _native(from_messages[old_bond, left_tid]),
+                    (1, 0),
+                )
+                left_factor = qtn.decomp.squared_op_to_reduced_factor(
+                    left_message,
+                    left_size,
+                    old_dimension,
+                    right=True,
+                )
+                right_factor = qtn.decomp.squared_op_to_reduced_factor(
+                    right_message,
+                    old_dimension,
+                    right_size,
+                    right=False,
+                )
+                new_left_factor = left_factor @ left_map
+                new_right_factor = right_map @ right_factor
+                messages[new_bond, right_tid] = (
+                    _dag(new_left_factor) @ new_left_factor
+                )
+                messages[new_bond, left_tid] = (
+                    new_right_factor @ _dag(new_right_factor)
+                )
+                projected = True
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                np.linalg.LinAlgError,
+                RuntimeError,
+            ):
+                projected = False
+
+        if not projected:
+            new_dimension = int(new_tn.ind_size(new_bond))
+            like = new_tn.tensor_map[left_tid].data
+            identity = _eye(new_dimension, like=like)
+            messages[new_bond, right_tid] = _copy_array(identity)
+            messages[new_bond, left_tid] = _copy_array(identity)
+            used_fallback = True
+
+    messages = _normalize_message_pairs(messages, new_tn.ind_map)
+    return (
+        messages,
+        "identity_new_bond" if used_fallback else "projected_old_messages",
+        True,
+    )
+
+
+def _sweep_project_messages(
+    old_tn,
+    new_tn,
+    old_messages,
+    *,
+    old_bond,
+    new_bond,
+    left_tid,
+    right_tid,
+    left_map,
+    right_map,
+):
+    """Warm-start messages after replacing one bond by ``L`` and ``R``."""
+    if new_bond == old_bond:
+        if old_messages is None:
+            return None, "fresh", False
+        messages = {
+            key: _copy_array(value)
+            for key, value in old_messages.items()
+            if key[0] in new_tn.ind_map
+        }
+        return _normalize_message_pairs(messages, new_tn.ind_map), "reused", True
+    return _sweep_project_messages_batch(
+        old_tn,
+        new_tn,
+        old_messages,
+        changes=((old_bond, new_bond, left_tid, right_tid, left_map, right_map),),
+    )
+
+
+class BondLoopSeriesCompressor:
+    """Compress selected bonds with BP or SU boundary snapshots.
+
+    The class keeps a directed D2BP message snapshot between reductions. The
+    old messages on unaffected bonds are reused, while the message pair on a
+    newly reduced bond is projected through the fitted maps before the next
+    BP solve. With ``update_mode="simultaneous"``, all maps are fitted from
+    one common boundary snapshot and inserted into one batch network before a
+    single post-batch BP solve. ``boundary_mode="su"`` additionally converts
+    the post-update BP fixed point back to a simple-update core and gauge
+    dictionary.
+    """
+
+    def __init__(
+        self,
+        tn,
+        *,
+        bonds="all",
+        max_bond: int,
+        boundary_mode: str = "bp",
+        update_mode: str = "sequential",
+        parallel: bool = False,
+        max_workers: int | None = None,
+        init_candidates=("bp_messages", "projector"),
+        boundary_messages=None,
+        gauges=None,
+        input_mode: str = "auto",
+        bp_runner: str = "plain",
+        bp_opts: dict[str, Any] | None = None,
+        compression_opts: dict[str, Any] | None = None,
+        require_fixed_point: bool = True,
+    ):
+        if boundary_mode not in {"bp", "su"}:
+            raise ValueError("boundary_mode must be 'bp' or 'su'")
+        if update_mode not in {"sequential", "simultaneous"}:
+            raise ValueError(
+                "update_mode must be 'sequential' or 'simultaneous'"
+            )
+        if input_mode not in {"auto", "physical", "su_core"}:
+            raise ValueError(
+                "input_mode must be 'auto', 'physical', or 'su_core'"
+            )
+        if bp_runner not in {"plain", "relay"}:
+            raise ValueError("bp_runner must be 'plain' or 'relay'")
+        if not isinstance(max_bond, (int, np.integer)) or max_bond < 1:
+            raise ValueError("max_bond must be a positive integer")
+        if not isinstance(require_fixed_point, bool):
+            raise TypeError("require_fixed_point must be a bool")
+        if not isinstance(parallel, bool):
+            raise TypeError("parallel must be a bool")
+        if parallel and update_mode != "simultaneous":
+            raise ValueError(
+                "parallel execution requires update_mode='simultaneous'"
+            )
+        if max_workers is not None:
+            if (
+                isinstance(max_workers, bool)
+                or not isinstance(max_workers, (int, np.integer))
+                or max_workers < 1
+            ):
+                raise ValueError("max_workers must be a positive integer or None")
+            max_workers = int(max_workers)
+        init_candidates = tuple(init_candidates)
+        if not init_candidates:
+            raise ValueError("init_candidates must contain at least one initializer")
+
+        self.tn = tn.copy()
+        if bonds == "all":
+            tid_to_site = self.tn._get_tid_to_site_map()
+            all_bonds = []
+            for bond_ind in self.tn.inner_inds():
+                tids = tuple(self.tn.ind_map[bond_ind])
+                if len(tids) != 2:
+                    continue
+                all_bonds.append((tid_to_site[tids[0]], tid_to_site[tids[1]]))
+            self.bonds = tuple(all_bonds)
+        else:
+            self.bonds = tuple(bonds)
+        if not self.bonds:
+            raise ValueError("bonds must contain at least one site pair")
+        self.max_bond = int(max_bond)
+        self.boundary_mode = boundary_mode
+        self.update_mode = update_mode
+        self.parallel = parallel
+        self.max_workers = max_workers
+        self.init_candidates = init_candidates
+        self.input_mode = input_mode
+        self.bp_runner = bp_runner
+        self.bp_opts = {} if bp_opts is None else dict(bp_opts)
+        self.compression_opts = (
+            {} if compression_opts is None else dict(compression_opts)
+        )
+        self.require_fixed_point = require_fixed_point
+        self._initial_messages = (
+            None
+            if boundary_messages is None
+            else {key: _copy_array(value) for key, value in boundary_messages.items()}
+        )
+        if gauges is None:
+            self._initial_gauges = None
+        else:
+            from .gauges import copy_gauges
+
+            self._initial_gauges = copy_gauges(gauges)
+        self._ran = False
+
+        protected = {
+            "where",
+            "max_bond",
+            "boundary_messages",
+            "gauges",
+            "input_mode",
+            "run_bp",
+            "inplace",
+            "projector_cache",
+            "init_candidates",
+        }
+        forbidden = protected.intersection(self.compression_opts)
+        if forbidden:
+            names = ", ".join(sorted(forbidden))
+            raise TypeError(
+                "compression_opts cannot override sweep-managed options: "
+                f"{names}"
+            )
+
+    def _initial_state(self):
+        """Return physical working data and optional SU representation."""
+        gauges = self._initial_gauges
+        if self.boundary_mode != "su" or self.input_mode == "physical":
+            return self.tn.copy(), None, gauges
+        if self.input_mode == "auto" and gauges is None:
+            return self.tn.copy(), None, None
+        if gauges is None:
+            raise ValueError("input_mode='su_core' requires gauges")
+        core = self.tn.copy()
+        physical = core.copy()
+        physical.gauge_simple_insert(gauges)
+        return physical, core, gauges
+
+    def _run_bp(self, tn, init_messages):
+        """Run plain or relay D2BP from a detached warm-start snapshot."""
+        options = dict(self.bp_opts)
+        if "init_messages" in options:
+            raise TypeError("put BP warm starts in boundary_messages, not bp_opts")
+        if self.bp_runner == "plain":
+            from .relay import two_norm_bp
+
+            return two_norm_bp(
+                tn,
+                init_messages=init_messages,
+                **options,
+            )
+        from .relay import relay_bp
+
+        return relay_bp(
+            tn,
+            method="d2bp",
+            init_messages=init_messages,
+            **options,
+        )
+
+    def _su_seed(self, tn, gauges):
+        """Build deterministic diagonal D2BP seeds from SU gauges."""
+        if gauges is None:
+            return None
+        from .gauges import d2bp_from_simple_update_gauges
+
+        optimize = self.bp_opts.get("optimize", "auto-hq")
+        return d2bp_from_simple_update_gauges(
+            tn,
+            gauges,
+            insert_gauges=False,
+            optimize=optimize,
+        ).messages
+
+    def _run_sequential(self) -> BondLoopSeriesSweepResult:
+        """Run the configured schedule with Gauss--Seidel updates."""
+        current_tn, current_core, current_gauges = self._initial_state()
+        messages = self._initial_messages
+        # Open-loop geometry caches are tied to the complete tensor-network
+        # topology. A sequential reduction normally replaces the selected
+        # bond with a fresh index, so the cache is valid for the next step
+        # only when that bond was left unchanged (the identity-rank path).
+        # Keep a caller-supplied cache for the first matching topology, then
+        # detach it and start a fresh cache after a topology change.
+        sequential_loop_cache = self.compression_opts.get("loop_cache")
+        steps = []
+
+        for step_index, where in enumerate(self.bonds):
+            if (
+                step_index > 0
+                and self.boundary_mode == "su"
+                and current_core is not None
+            ):
+                current_tn = current_core.copy()
+                current_tn.gauge_simple_insert(current_gauges)
+            if messages is None and self.boundary_mode == "su":
+                messages = self._su_seed(current_tn, current_gauges)
+
+            bp_before_result = self._run_bp(current_tn, messages)
+            bp_before = _sweep_bp_info(bp_before_result)
+            if self.require_fixed_point and not bp_before["converged"]:
+                raise RuntimeError(
+                    f"BP did not converge before sweep step {step_index}: "
+                    f"max_mdiff={bp_before['max_mdiff']!r}"
+                )
+            messages_before = bp_before_result.snapshot()
+            left_tid, right_tid, old_bond = _sweep_bond_from_where(
+                current_tn,
+                where,
+            )
+
+            options = dict(self.compression_opts)
+            if sequential_loop_cache is not None:
+                options["loop_cache"] = sequential_loop_cache
+            # Numerical projectors are valid only for this BP snapshot. Keep
+            # one cache for all terms of this bond, then discard it before the
+            # next BP update.
+            options["projector_cache"] = CutEdgeLoopProjectorCache()
+            options["init_candidates"] = self.init_candidates
+            options.setdefault("require_fixed_point", True)
+            compression = compress_bond_loop_series(
+                current_tn,
+                where=where,
+                max_bond=self.max_bond,
+                boundary_messages=messages_before,
+                input_mode="physical",
+                run_bp=False,
+                inplace=False,
+                **options,
+            )
+            new_bond = _sweep_new_bond(
+                compression.compressed,
+                old_bond,
+                left_tid,
+                right_tid,
+            )
+            if sequential_loop_cache is not None and new_bond != old_bond:
+                sequential_loop_cache = OpenLoopSeriesCache()
+            left_map, right_map = compression.bond_maps[old_bond]
+            messages, message_seed, messages_reused = (
+                _sweep_project_messages(
+                    current_tn,
+                    compression.compressed,
+                    messages_before,
+                    old_bond=old_bond,
+                    new_bond=new_bond,
+                    left_tid=left_tid,
+                    right_tid=right_tid,
+                    left_map=left_map,
+                    right_map=right_map,
+                )
+            )
+
+            bp_after_result = self._run_bp(compression.compressed, messages)
+            bp_after = _sweep_bp_info(bp_after_result)
+            if self.require_fixed_point and not bp_after["converged"]:
+                raise RuntimeError(
+                    f"BP did not converge after sweep step {step_index}: "
+                    f"max_mdiff={bp_after['max_mdiff']!r}"
+                )
+            messages = bp_after_result.snapshot()
+
+            if self.boundary_mode == "su":
+                from .gauges import simple_update_core_and_gauges_from_d2bp
+
+                current_core, current_gauges = (
+                    simple_update_core_and_gauges_from_d2bp(bp_after_result.bp)
+                )
+            else:
+                current_core = None
+                current_gauges = None
+            current_tn = compression.compressed
+
+            final_metrics = None
+            if compression.als_info is not None:
+                final_metrics = compression.als_info.get("final")
+            steps.append(
+                BondLoopSeriesSweepStep(
+                    step=step_index,
+                    where=tuple(where),
+                    bond_ind_before=old_bond,
+                    bond_ind_after=new_bond,
+                    compression=compression,
+                    als_infidelity=(
+                        None
+                        if final_metrics is None
+                        else final_metrics.get("local_infidelity")
+                    ),
+                    bp_before=bp_before,
+                    bp_after=bp_after,
+                    message_seed=message_seed,
+                    messages_reused=messages_reused,
+                )
+            )
+
+        return BondLoopSeriesSweepResult(
+            compressed=current_tn,
+            steps=tuple(steps),
+            boundary_mode=self.boundary_mode,
+            update_mode=self.update_mode,
+            messages=messages,
+            gauges=current_gauges,
+            core=current_core,
+        )
+
+    def _run_simultaneous(self) -> BondLoopSeriesSweepResult:
+        """Run a Jacobi-style batch from one common boundary snapshot."""
+        current_tn, current_core, current_gauges = self._initial_state()
+        messages = self._initial_messages
+        if messages is None and self.boundary_mode == "su":
+            messages = self._su_seed(current_tn, current_gauges)
+
+        bp_before_result = self._run_bp(current_tn, messages)
+        bp_before = _sweep_bp_info(bp_before_result)
+        if self.require_fixed_point and not bp_before["converged"]:
+            raise RuntimeError(
+                "BP did not converge before simultaneous sweep: "
+                f"max_mdiff={bp_before['max_mdiff']!r}"
+            )
+        messages_before = bp_before_result.snapshot()
+
+        compressions = []
+        changes = []
+        old_bonds = set()
+        options = dict(self.compression_opts)
+        options.setdefault("require_fixed_point", True)
+
+        if self.parallel:
+            seen_bonds = set()
+            for where in self.bonds:
+                _, _, old_bond = _sweep_bond_from_where(current_tn, where)
+                if old_bond in seen_bonds:
+                    raise ValueError(
+                        "parallel sweep bonds must identify distinct virtual "
+                        f"bonds, got {old_bond!r} more than once"
+                    )
+                seen_bonds.add(old_bond)
+
+        if self.parallel:
+            loop_cache = options.get("loop_cache")
+            if loop_cache is None:
+                loop_cache = OpenLoopSeriesCache()
+            projector_cache = options.get("projector_cache")
+            if projector_cache is None:
+                projector_cache = CutEdgeLoopProjectorCache()
+            options["loop_cache"] = loop_cache
+            options["projector_cache"] = projector_cache
+            options["init_candidates"] = self.init_candidates
+
+            # Geometry discovery mutates OpenLoopSeriesCache. Complete it
+            # before launching workers so the parallel phase is read-only.
+            edge_cutoff = options.get("edge_cutoff")
+            if edge_cutoff is None:
+                edge_cutoff = sum(
+                    len(tids) == 2
+                    for tids in current_tn.ind_map.values()
+                    if len(tids) == 2
+                ) - 1
+            for where in self.bonds:
+                left_tid, right_tid, old_bond = _sweep_bond_from_where(
+                    current_tn,
+                    where,
+                )
+                loop_cache.iter_terms_for(
+                    current_tn,
+                    int(edge_cutoff),
+                    (left_tid, right_tid),
+                    excluded_edges=(old_bond,),
+                    max_terms=options.get("max_terms"),
+                    max_enumeration_time=options.get("max_enumeration_time"),
+                    max_enumeration_memory=options.get("max_enumeration_memory"),
+                )
+
+        def compress_one(where):
+            left_tid, right_tid, old_bond = _sweep_bond_from_where(
+                current_tn,
+                where,
+            )
+            compression = compress_bond_loop_series(
+                current_tn,
+                where=where,
+                max_bond=self.max_bond,
+                boundary_messages=messages_before,
+                input_mode="physical",
+                run_bp=False,
+                inplace=False,
+                **options,
+            )
+            left_map, right_map = compression.bond_maps[old_bond]
+            return (
+                tuple(where),
+                left_tid,
+                right_tid,
+                old_bond,
+                compression,
+                left_map,
+                right_map,
+            )
+
+        if self.parallel:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                compressions = list(executor.map(compress_one, self.bonds))
+            old_bonds = {compression[3] for compression in compressions}
+        else:
+            for where in self.bonds:
+                compression = compress_one(where)
+                if compression[3] in old_bonds:
+                    raise ValueError(
+                        "simultaneous sweep bonds must identify distinct "
+                        f"virtual bonds, got {compression[3]!r} more than once"
+                    )
+                old_bonds.add(compression[3])
+                compressions.append(compression)
+
+        # Apply every map to one copy of the original network. Each map was
+        # fitted against ``current_tn`` above; this insertion order only
+        # changes distinct virtual indices and therefore does not turn the
+        # batch into a sequential re-fit.
+        batch_tn = current_tn
+        for (
+            where,
+            left_tid,
+            right_tid,
+            old_bond,
+            _compression,
+            left_map,
+            right_map,
+        ) in compressions:
+            batch_tn, new_bond = _reconstruct_selected_bond(
+                batch_tn,
+                old_bond,
+                left_tid,
+                right_tid,
+                left_map,
+                right_map,
+            )
+            changes.append(
+                (
+                    old_bond,
+                    new_bond,
+                    left_tid,
+                    right_tid,
+                    left_map,
+                    right_map,
+                )
+            )
+
+        messages, message_seed, messages_reused = _sweep_project_messages_batch(
+            current_tn,
+            batch_tn,
+            messages_before,
+            changes=changes,
+        )
+        bp_after_result = self._run_bp(batch_tn, messages)
+        bp_after = _sweep_bp_info(bp_after_result)
+        if self.require_fixed_point and not bp_after["converged"]:
+            raise RuntimeError(
+                "BP did not converge after simultaneous sweep: "
+                f"max_mdiff={bp_after['max_mdiff']!r}"
+            )
+        messages = bp_after_result.snapshot()
+
+        if self.boundary_mode == "su":
+            from .gauges import simple_update_core_and_gauges_from_d2bp
+
+            current_core, current_gauges = (
+                simple_update_core_and_gauges_from_d2bp(bp_after_result.bp)
+            )
+        else:
+            current_core = None
+            current_gauges = None
+
+        steps = []
+        for step_index, (
+            where,
+            _left_tid,
+            _right_tid,
+            old_bond,
+            compression,
+            _left_map,
+            _right_map,
+        ) in enumerate(compressions):
+            new_bond = changes[step_index][1]
+            final_metrics = None
+            if compression.als_info is not None:
+                final_metrics = compression.als_info.get("final")
+            steps.append(
+                BondLoopSeriesSweepStep(
+                    step=step_index,
+                    where=where,
+                    bond_ind_before=old_bond,
+                    bond_ind_after=new_bond,
+                    compression=compression,
+                    als_infidelity=(
+                        None
+                        if final_metrics is None
+                        else final_metrics.get("local_infidelity")
+                    ),
+                    bp_before=bp_before,
+                    bp_after=bp_after,
+                    message_seed=message_seed,
+                    messages_reused=messages_reused,
+                )
+            )
+
+        return BondLoopSeriesSweepResult(
+            compressed=batch_tn,
+            steps=tuple(steps),
+            boundary_mode=self.boundary_mode,
+            update_mode=self.update_mode,
+            messages=messages,
+            gauges=current_gauges,
+            core=current_core,
+        )
+
+    def run(self) -> BondLoopSeriesSweepResult:
+        """Run the configured bond schedule once and return its history."""
+        if self._ran:
+            raise RuntimeError("BondLoopSeriesCompressor.run() may only be called once")
+        self._ran = True
+        if self.update_mode == "simultaneous":
+            return self._run_simultaneous()
+        return self._run_sequential()
+
+
+def compress_all_gauge(
+    tn,
+    *,
+    max_bond: int,
+    gauges=None,
+    bp_messages=None,
+    boundary_messages=None,
+    mode: str = "parallel",
+    boundary_mode: str = "auto",
+    max_workers: int | None = None,
+    init_candidates=("bp_messages", "projector"),
+    input_mode: str = "auto",
+    bp_runner: str = "plain",
+    bp_opts: dict[str, Any] | None = None,
+    compression_opts: dict[str, Any] | None = None,
+    require_fixed_point: bool = True,
+) -> BondLoopSeriesSweepResult:
+    """Compress every virtual bond with one BP/SU boundary snapshot.
+
+    This convenience entry point is equivalent to constructing
+    :class:`BondLoopSeriesCompressor` with ``bonds="all"`` and calling
+    :meth:`BondLoopSeriesCompressor.run`. The returned sweep result retains
+    one ``N_reduce`` environment and one fitted ``(L, R)`` pair per bond.
+    No gate compression or global gauge normalization is performed.
+
+    ``mode`` is ``"parallel"`` by default and maps to one simultaneous batch;
+    ``"sequential"`` maps to a BP refresh after each bond. ``gauges`` accepts
+    SU gauge vectors. ``bp_messages`` accepts either a directed message
+    mapping, a BP result with ``.messages``, or a BP result with
+    ``.snapshot()``. ``boundary_messages`` is a compatibility alias for
+    ``bp_messages``. With ``boundary_mode="auto"``, supplied gauges select
+    SU mode and otherwise BP mode is used.
+    """
+    if mode not in {"parallel", "sequential"}:
+        raise ValueError("mode must be 'parallel' or 'sequential'")
+    if boundary_mode == "auto":
+        boundary_mode = "su" if gauges is not None else "bp"
+    elif boundary_mode not in {"bp", "su"}:
+        raise ValueError("boundary_mode must be 'auto', 'bp', or 'su'")
+    if bp_messages is not None and boundary_messages is not None:
+        raise ValueError(
+            "pass either bp_messages or boundary_messages, not both"
+        )
+    if bp_messages is None:
+        bp_messages = boundary_messages
+    if bp_messages is not None:
+        if callable(getattr(bp_messages, "snapshot", None)):
+            bp_messages = bp_messages.snapshot()
+        elif hasattr(bp_messages, "messages"):
+            bp_messages = bp_messages.messages
+        elif not hasattr(bp_messages, "items"):
+            raise TypeError(
+                "bp_messages must be a message mapping or a BP result with "
+                "messages/snapshot()"
+            )
+    if input_mode == "su_core" and boundary_mode != "su":
+        raise ValueError("input_mode='su_core' requires boundary_mode='su'")
+
+    compressor = BondLoopSeriesCompressor(
+        tn,
+        bonds="all",
+        max_bond=max_bond,
+        boundary_mode=boundary_mode,
+        update_mode=("simultaneous" if mode == "parallel" else "sequential"),
+        parallel=(mode == "parallel"),
+        max_workers=max_workers,
+        init_candidates=init_candidates,
+        boundary_messages=boundary_messages,
+        gauges=gauges,
+        input_mode=input_mode,
+        bp_runner=bp_runner,
+        bp_opts=bp_opts,
+        compression_opts=compression_opts,
+        require_fixed_point=require_fixed_point,
+    )
+    return compressor.run()
 
 
 def compress_bond_loop_series(
@@ -974,6 +2336,7 @@ def compress_bond_loop_series(
     bp_opts: dict[str, Any] | None = None,
     require_fixed_point: bool = True,
     loop_cache: OpenLoopSeriesCache | None = None,
+    projector_cache: CutEdgeLoopProjectorCache | None = None,
     max_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
@@ -981,7 +2344,9 @@ def compress_bond_loop_series(
     hermitian_project: bool = True,
     psd_project: bool = False,
     b_reduce_floor: float = 0.0,
-    init: str = "b_reduce",
+    init: str = "bp_messages",
+    init_candidates=None,
+    diagnose_environment_spectrum: bool = False,
     steps: int = 20,
     tol: float = 1e-9,
     contract_optimize="auto-hq",
@@ -993,7 +2358,8 @@ def compress_bond_loop_series(
     als_opts: dict[str, Any] | None = None,
     seed=None,
     inplace: bool = False,
-    preserve_norm: bool = True,
+    preserve_norm: bool = False,
+    compute_fidelity: bool = False,
     progbar: bool = False,
 ) -> BondLoopSeriesCompressionResult:
     """Compress one bond with the finite cut-edge ``P + Q`` expansion.
@@ -1011,11 +2377,18 @@ def compress_bond_loop_series(
     contraction precision. Partial sums need not be PSD, so the default
     Hermitian projection is applied by default; PSD projection is opt-in.
 
-    ``preserve_norm=True`` (the default) applies a reported global amplitude
-    correction after inserting the maps. The correction matches the norm
-    before and after compression in the full PEPS/PEPO network; it is split
-    between the non-isometric maps, so the returned network exponent is not
-    changed.
+    The returned maps use the local Quimb L2BP/D2BP compression convention:
+    their product is refactored with ``absorb="both"`` and ``renorm=0``.
+    A reciprocal scalar gauge then equalizes their Frobenius norms while
+    preserving ``L @ R``. This does not contract the full network or force
+    either map to be isometric.
+
+    ``preserve_norm=False`` is the default because full-network norm matching
+    requires expensive global contractions. Set it to ``True`` only when that
+    legacy global amplitude correction is explicitly wanted.
+
+    ``compute_fidelity=False`` is the default. Set it to ``True`` to request
+    the additional full-network overlap diagnostic.
     """
     _validate_dense_peps_like(tn)
     if not isinstance(where, (tuple, list)) or len(where) != 2:
@@ -1028,6 +2401,10 @@ def compress_bond_loop_series(
         raise TypeError("inplace must be a bool")
     if not isinstance(preserve_norm, bool):
         raise TypeError("preserve_norm must be a bool")
+    if not isinstance(compute_fidelity, bool):
+        raise TypeError("compute_fidelity must be a bool")
+    if not isinstance(diagnose_environment_spectrum, bool):
+        raise TypeError("diagnose_environment_spectrum must be a bool")
     hermitian_project, psd_project = _resolve_environment_projection_options(
         b_reduce=b_reduce,
         hermitian_project=hermitian_project,
@@ -1041,22 +2418,42 @@ def compress_bond_loop_series(
     als_opts = {} if als_opts is None else dict(als_opts)
     bp_opts = {} if bp_opts is None else dict(bp_opts)
     contract_opts = {} if contract_opts is None else dict(contract_opts)
-    work, gauge_inputs, _ = prepare_working_network(
+    work, gauge_inputs, input_mode_resolved = prepare_working_network(
         tn,
         gauges,
         input_mode=input_mode,
     )
+
+    # ``cut_edge_loop_series_expand`` inserts gauges when it receives an SU
+    # core. Pass the original core in that case so insertion happens exactly
+    # once. For an already physical network, seed the BP object with diagonal
+    # gauge messages instead of asking the series helper to insert the same
+    # gauges a second time.
+    series_tn = work
+    series_messages = boundary_messages
+    series_gauges = None
+    if input_mode_resolved == "su_core" and boundary_messages is None:
+        series_tn = tn
+        series_gauges = gauge_inputs or None
+    elif boundary_messages is None and gauge_inputs:
+        series_messages = _su_seed_messages(
+            work,
+            gauge_inputs,
+            optimize=contract_optimize,
+            bp_opts=bp_opts,
+        )
     series = cut_edge_loop_series_expand(
-        work,
+        series_tn,
         where=where,
         edge_cutoff=edge_cutoff,
-        messages=boundary_messages,
-        gauges=None if boundary_messages is not None else gauge_inputs or None,
+        messages=series_messages,
+        gauges=series_gauges,
         run_bp=run_bp,
         bp_runner=bp_runner,
         bp_opts=bp_opts,
         require_fixed_point=require_fixed_point,
         cache=loop_cache,
+        projector_cache=projector_cache,
         max_terms=max_terms,
         max_enumeration_time=max_enumeration_time,
         max_enumeration_memory=max_enumeration_memory,
@@ -1090,7 +2487,7 @@ def compress_bond_loop_series(
             where=tuple(where),
             bond_ind=series.bond_ind,
             B_reduce=_copy_array(b_data),
-            raw_min_eigenvalue=0.0,
+            raw_min_eigenvalue=None,
             clipped_eigenvalues=0,
             steps=0,
             max_bond=rank,
@@ -1114,7 +2511,12 @@ def compress_bond_loop_series(
                 "message_normalization": "not_needed",
                 "messages_applied_to_maps": False,
                 "product_relative_error": 0.0,
+                "network_fidelity": 1.0,
+                "network_infidelity": 0.0,
+                "network_fidelity_source": "identity",
             },
+            network_fidelity=1.0,
+            network_infidelity=0.0,
         )
 
     b_data, raw_min, clipped = _process_bond_environment(
@@ -1123,11 +2525,18 @@ def compress_bond_loop_series(
         hermitian_project=hermitian_project,
         psd_project=psd_project,
         psd_floor=float(b_reduce_floor),
+        diagnose_spectrum=diagnose_environment_spectrum,
     )
 
-    left, right, costs = _fit_maps(
+    left, right, costs, als_info = _fit_maps(
         b_data,
         dimension=dimension,
+        tn=series.bp.tn,
+        bond_ind=series.bond_ind,
+        left_tid=series.where[0],
+        right_tid=series.where[1],
+        boundary_messages=series.bp.messages,
+        gauges=gauge_inputs,
         max_bond=rank,
         init=init,
         steps=int(steps),
@@ -1137,11 +2546,24 @@ def compress_bond_loop_series(
         seed=seed,
         positive_environment=psd_project,
         progbar=progbar,
+        init_candidates=init_candidates,
     )
     left, right, normalization = _normalize_map_pair_with_quimb(
         left,
         right,
     )
+    left, right, normalization = _normalize_map_pair_with_frobenius(
+        left,
+        right,
+        normalization=normalization,
+    )
+    environment_fidelity = None
+    if compute_fidelity and series.complete and not psd_project:
+        environment_fidelity = _environment_fidelity(
+            _eye(dimension, like=b_data),
+            left @ right,
+            b_data,
+        )
     # Report the error of the factors that are actually inserted.  The
     # Quimb refactor preserves ``L @ R`` up to decomposition precision, but
     # using the post-normalization product keeps the result self-consistent.
@@ -1162,6 +2584,8 @@ def compress_bond_loop_series(
         optimize=contract_optimize,
         contract_opts=contract_opts,
         preserve_norm=preserve_norm,
+        compute_fidelity=compute_fidelity,
+        environment_fidelity=environment_fidelity,
         normalization=normalization,
     )
     initial_cost = max(0.0, costs[0])
@@ -1200,6 +2624,9 @@ def compress_bond_loop_series(
         edge_cutoff=series.edge_cutoff,
         complete=series.complete,
         term_count=len(series.terms),
+        als_info=als_info,
+        network_fidelity=normalization["network_fidelity"],
+        network_infidelity=normalization["network_infidelity"],
         bp_info=series.bp_info,
         series=series,
         contraction_cost=series.contraction_cost,
@@ -1231,7 +2658,8 @@ def compress_bond_cluster(
     hermitian_project: bool = True,
     psd_project: bool = False,
     b_reduce_floor: float = 0.0,
-    init: str = "b_reduce",
+    init: str = "bp_messages",
+    diagnose_environment_spectrum: bool = False,
     steps: int = 20,
     tol: float = 1e-9,
     contract_optimize="greedy",
@@ -1242,7 +2670,8 @@ def compress_bond_cluster(
     als_opts: dict[str, Any] | None = None,
     seed=None,
     inplace: bool = False,
-    preserve_norm: bool = True,
+    preserve_norm: bool = False,
+    compute_fidelity: bool = False,
     progbar: bool = False,
 ) -> BondClusterCompressionResult:
     """Compress one selected virtual bond with a BP/SU-closed cluster.
@@ -1297,10 +2726,12 @@ def compress_bond_cluster(
         Tensor-graph radius around the selected pair. ``0`` retains only the
         two endpoint tensors; larger values fill in spectator tensors.
     init
-        Rectangular-map initialization. ``"b_reduce"`` selects dominant
-        subspaces of the two Quimb-contracted bond marginals and is the
-        default. ``"projector"`` and ``"random"`` are deterministic and
-        stochastic alternatives, respectively.
+        Rectangular-map initialization. ``"bp_messages"`` uses the selected
+        bond's D2BP message matrices and is the default. If those messages
+        are unavailable, it falls back to ``"projector"``. ``"b_reduce"``
+        explicitly selects the more expensive dominant-subspace
+        initialization from ``B_reduce``. ``"projector"`` and ``"random"``
+        are deterministic and stochastic alternatives, respectively.
     hermitian_project, psd_project
         Hermitianize and PSD-project the contracted four-leg ``B_reduce``
         environment before ALS. Hermitian projection defaults to true and PSD
@@ -1312,6 +2743,11 @@ def compress_bond_cluster(
         controlled by ``hermitian_project``.
     b_reduce_floor
         Relative eigenvalue floor used by the ``b_reduce`` projection.
+    diagnose_environment_spectrum
+        If true, compute and report the minimum eigenvalue of the Hermitian
+        ``B_reduce`` view. The default false avoids any ``B_reduce`` spectral
+        decomposition; ``raw_min_eigenvalue`` is then ``None`` unless
+        ``psd_project=True``.
     cost_check
         Build a Cotengra contraction tree before the environment contraction
         and expose its FLOP/peak-memory estimate in the result.
@@ -1328,9 +2764,12 @@ def compress_bond_cluster(
     inplace
         Replace the input network's tensors with the locally compressed result.
     preserve_norm
-        Match the pre- and post-compression full PEPS/PEPO norm by splitting
-        a positive amplitude correction across the returned maps. Set false
-        to leave the raw compressed amplitude unchanged.
+        Legacy opt-in full-network norm matching. The default is false;
+        ordinary compression uses only local BP/message normalization and
+        does not contract ``tn.norm()``.
+    compute_fidelity
+        Compute the normalized full-network overlap fidelity and infidelity.
+        This adds global norm and overlap contractions; the default is false.
 
     Returns
     -------
@@ -1358,7 +2797,9 @@ def compress_bond_cluster(
         ("message_psd_project", message_psd_project),
         ("inplace", inplace),
         ("preserve_norm", preserve_norm),
+        ("compute_fidelity", compute_fidelity),
         ("progbar", progbar),
+        ("diagnose_environment_spectrum", diagnose_environment_spectrum),
     ):
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a bool")
@@ -1445,7 +2886,7 @@ def compress_bond_cluster(
             cluster_tids=(left_tid, right_tid),
             boundary_inds=(),
             B_reduce=zero_environment,
-            raw_min_eigenvalue=0.0,
+            raw_min_eigenvalue=None,
             clipped_eigenvalues=0,
             steps=0,
             max_bond=rank,
@@ -1462,7 +2903,12 @@ def compress_bond_cluster(
                 "message_normalization": "not_needed",
                 "messages_applied_to_maps": False,
                 "product_relative_error": 0.0,
+                "network_fidelity": 1.0,
+                "network_infidelity": 0.0,
+                "network_fidelity_source": "identity",
             },
+            network_fidelity=1.0,
+            network_infidelity=0.0,
         )
 
     # Closure precedence is explicit D2BP messages, then SU diagonal vectors,
@@ -1496,15 +2942,22 @@ def compress_bond_cluster(
         hermitian_project=hermitian_project,
         psd_project=psd_project,
         b_reduce_floor=float(b_reduce_floor),
+        diagnose_spectrum=diagnose_environment_spectrum,
         optimize=contract_optimize,
         cost_check=cost_check,
         max_flops_log10=max_flops_log10,
         max_peak_memory_log2=max_peak_memory_log2,
         on_budget=on_budget,
     )
-    left, right, costs = _fit_maps(
+    left, right, costs, als_info = _fit_maps(
         b_data,
         dimension=dimension,
+        tn=work,
+        bond_ind=bond_ind,
+        left_tid=left_tid,
+        right_tid=right_tid,
+        boundary_messages=resolved_messages,
+        gauges=gauge_inputs,
         max_bond=rank,
         init=init,
         steps=int(steps),
@@ -1519,6 +2972,23 @@ def compress_bond_cluster(
         left,
         right,
     )
+    left, right, normalization = _normalize_map_pair_with_frobenius(
+        left,
+        right,
+        normalization=normalization,
+    )
+    environment_fidelity = None
+    if (
+        compute_fidelity
+        and not psd_project
+        and not boundary_inds
+        and set(cluster_tids) == set(work.tensor_map)
+    ):
+        environment_fidelity = _environment_fidelity(
+            _eye(dimension, like=b_data),
+            left @ right,
+            b_data,
+        )
     # Use the refactored pair for the reported objective as well as for the
     # tensor insertion, rather than reporting the pre-normalization ALS pair.
     final_cost = _local_cost(
@@ -1537,6 +3007,8 @@ def compress_bond_cluster(
         optimize=contract_optimize,
         contract_opts={},
         preserve_norm=preserve_norm,
+        compute_fidelity=compute_fidelity,
+        environment_fidelity=environment_fidelity,
         normalization=normalization,
     )
     final_cost = max(0.0, final_cost)
@@ -1574,6 +3046,9 @@ def compress_bond_cluster(
         clipped_eigenvalues=clipped,
         steps=int(steps),
         max_bond=rank,
+        als_info=als_info,
+        network_fidelity=normalization["network_fidelity"],
+        network_infidelity=normalization["network_infidelity"],
         bp_info=bp_info,
         contraction_cost=contraction_cost,
         environment_projection=_environment_projection_diagnostics(
