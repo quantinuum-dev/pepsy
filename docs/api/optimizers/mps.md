@@ -111,12 +111,13 @@ the MPS by one site.
 
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
-`"dmrg1"` uses adaptive two-site growth until active bonds reach their
-attainable ceilings and then fixed-rank one-site FIT. If every active bond is
-already at its attainable ceiling before the fit, `"dmrg1"` starts directly
-with one-site FIT. `"dmrg2"` uses two-site FIT for the required warm-up (two
-sweeps by default) and then one-site FIT; `"dmrg3"` follows the same fixed
-warm-up schedule with three-site FIT and then one-site FIT.
+`"dmrg1"` uses at most two two-site growth sweeps and then fixed-rank one-site
+FIT. If every active bond is already at its attainable ceiling before the fit,
+`"dmrg1"` starts directly with one-site FIT. Once every full-chain bond
+reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
+later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
+warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
+same fixed warm-up schedule with three-site FIT and then one-site FIT.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
 schedule. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
@@ -131,21 +132,19 @@ only bonds visited by the native splits can grow. `fit_block_size=1` retains
 the fixed-rank compatibility algorithm, for which mixed mode still warms short
 active bonds through MPO. Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
-the block's shared compression. By default, `fit_adaptive_sweeps=2` requires
-two-site or three-site FIT for at least two adaptive sweeps, then continues
-the block updates until every active bond reaches its physical rank ceiling.
-Rank stagnation is not a stopping condition: if a target remains below its
-ceiling, the block phase continues until `n_iter` is exhausted. Only after all
-ceilings are reached does it use one-site FIT for the remaining requested
-sweeps. This keeps the bond spaces opened by the SVD warm-up while
-avoiding repeated GPU SVD truncations. The dense open-chain ceilings are
+the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive,
+but named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
+one-site FIT for the remaining requested sweeps. The named mode does not
+extend the two-site phase because of rank stagnation. Once all full-chain
+ceilings are reached, it latches one-site updates for later gate windows.
+This keeps the bond spaces opened by the SVD warm-up while avoiding repeated
+GPU SVD truncations. The dense open-chain ceilings are
 `2, 4, 8, ..., chi, ..., 8, 4, 2` (also limited by the current outside-window
 bonds); FIT never pads a bond merely to make it equal to `chi`. Set
-`fit_adaptive_sweeps` higher when the active bond spaces need a longer minimum
-warm-up. A generic `mode="dmrg"` with `fit_block_size=1` remains the fixed-rank
-one-site compatibility path; the named `"dmrg1"` mode deliberately continues
-two-site growth until its ceilings, while `"dmrg2"` uses the fixed two-sweep
-two-site warm-up. `fit_layer_size` is the clear name for
+`fit_adaptive_sweeps` to configure the named `dmrg2`/`dmrg3` warm-up; `dmrg1`
+keeps its two-sweep policy. A generic `mode="dmrg"` with `fit_block_size=1`
+remains the fixed-rank one-site compatibility path. `fit_layer_size` is the
+clear name for
 `k_2q_batch`; it counts two-site gates in a contiguous paper-style target
 block. For `fit_block_size=2`, an active window spanning at least three sites
 uses the same adaptive-to-one-site schedule; an ordinary two-site gate window
@@ -229,8 +228,9 @@ bosonization.
 
 The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
 native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
-arrays. `dmrg1` remains rank-adaptive, while `dmrg2` and `dmrg3` perform their
-fixed block warm-up before one-site refinement. A native nonlocal gate
+arrays. `dmrg1` uses its bounded two-sweep warm-up and sticky one-site phase,
+while `dmrg2` and `dmrg3` perform their fixed block warm-up before one-site
+refinement. A native nonlocal gate
 still receives its chi-capped graded auto-swap warm start before FIT. For a
 direct full-chain FIT whose arbitrary MPS guess lacks target virtual charge
 sectors, FIT instead uses a target-informed native compressed initialization;
@@ -362,14 +362,6 @@ and are recorded as `timing_sync_device=True` in both replay and FIT records.
 The accelerator backend is detected once per timing session, so CPU timing
 does not repeatedly scan the MPS. JAX barriers wait on each newly returned
 stage result rather than an unrelated previously ready MPS leaf.
-
-Parallel pTEBD/IPMC and local-TDVP circuit compression are intentionally not
-aliases of this sequential solver. Their status is exposed through
-`pepsy.experimental.mps_fit.experimental_mps_fit_backends()`. pTEBD/IPMC needs
-faithful parallel independent-compression scheduling (Phys. Rev. B 110,
-085149), while the local-TDVP circuit route remains based on a 2025 preprint.
-Selecting either currently raises a clear `NotImplementedError` instead of
-silently running a different algorithm.
 
 `mode="su"` uses simple-update evolution for imaginary-time or other
 non-unitary gate streams. It keeps `opt.p` as the simple-update core and

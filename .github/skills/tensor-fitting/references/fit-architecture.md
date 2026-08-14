@@ -84,16 +84,18 @@ redundant. Non-unitary scale control likewise normalizes that singleton center
 in place when it remains inside the active interval; it must not move a valid
 left endpoint to the right endpoint merely to extract the same norm.
 
-For `dmrg1`, inspect the active attainable rank targets before starting FIT.
-An already-capped window starts with one-site updates. An under-capacity
-non-adjacent window requires at least three requested sweeps: two two-site
-growth sweeps followed by at least one one-site refinement sweep. Reaching all
-targets during growth switches the remaining budget to one-site updates;
-rank stagnation below a target does not impersonate reaching the target.
-Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform exactly
-`fit_adaptive_sweeps` two- or three-site sweeps (two by default), then spend
-the remaining `n_iter` budget on one-site refinement subject to `fit_rtol`.
-Generic `dmrg` remains available for rank-adaptive block scheduling.
+For `dmrg1`, inspect the active and full-chain attainable rank targets before
+starting FIT. An already-capped window starts with one-site updates. An
+under-capacity non-adjacent window requires at least three requested sweeps:
+two two-site growth sweeps followed by at least one one-site refinement sweep.
+The two-site phase is bounded at two sweeps; it does not extend because of
+rank stagnation. Once every full-chain bond reaches its physical/``chi``
+ceiling, the optimizer latches one-site updates for later windows in the same
+replay. Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform
+exactly `fit_adaptive_sweeps` two- or three-site sweeps (two by default), then
+spend the remaining `n_iter` budget on one-site refinement subject to
+`fit_rtol`. Generic `dmrg` remains available for rank-adaptive block
+scheduling.
 
 `run_eff` is a separate global full-chain fit used by boundary/sampling code.
 Do not substitute it for the gate-window solver.
@@ -121,12 +123,6 @@ reference, not merely for finite values.
 
 - Stable FIT basis: Ayral et al., PRX Quantum 4, 020304 (2023),
   <https://doi.org/10.1103/PRXQuantum.4.020304>.
-- pTEBD/IPMC parallel compression: Phys. Rev. B 110, 085149 (2024),
-  <https://doi.org/10.1103/PhysRevB.110.085149>. Do not label sequential FIT as
-  this method.
-- Local-TDVP circuit compression: 2025 preprint,
-  <https://arxiv.org/abs/2508.10096>. Keep experimental until independently
-  implemented and validated.
 
 ## Focused validation commands
 

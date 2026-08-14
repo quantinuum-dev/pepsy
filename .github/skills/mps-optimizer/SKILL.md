@@ -13,16 +13,17 @@ tests before editing.
 ## Execution modes
 
 - `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
-  `dmrg1` uses adaptive two-site growth followed by one-site refinement,
-  `dmrg2` uses its required two-site warm-up (two sweeps by default) followed
-  by one-site refinement, and `dmrg3` uses the same fixed warm-up policy with
-  three-site updates. Generic `dmrg` and `dmrg1` rank-growth phases end only
-  when all attainable active-bond ceilings are reached; rank stagnation is not
-  an early exit. A `dmrg1` window already at those ceilings starts directly
-  with one-site FIT. An under-capacity non-adjacent `dmrg1` window requires
-  `n_iter >= 3`: two block sweeps plus at least one refinement sweep. Its
-  default `fit_patience=2` is a two-sample same-phase norm window, i.e. one
-  stable comparison. A two-site window is a structural special case for
+  `dmrg1` uses at most two two-site growth sweeps followed by one-site
+  refinement, then latches one-site updates after all full-chain attainable
+  bond ceilings are reached. `dmrg2` uses its required two-site warm-up (two
+  sweeps by default) followed by one-site refinement, and `dmrg3` uses the
+  same fixed warm-up policy with three-site updates. Generic `dmrg` remains
+  rank-adaptive until its active-bond ceilings are reached; rank stagnation is
+  not an early exit there. A `dmrg1` window already at its attainable ceilings
+  starts directly with one-site FIT. An under-capacity non-adjacent `dmrg1`
+  window requires `n_iter >= 3`: two block sweeps plus at least one refinement
+  sweep. Its default `fit_patience=2` is a two-sample same-phase norm window,
+  i.e. one stable comparison. A two-site window is a structural special case for
   `dmrg1`, `dmrg2`, and `dmrg3`: perform exactly one two-site update, no
   one-site refinement, then advance to the next gate without consuming the
   remaining `n_iter` budget. Compose with

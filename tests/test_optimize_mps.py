@@ -1283,9 +1283,12 @@ def test_fit_adaptive_rank_targets_follow_open_chain_capacity():
         16,
     ) == (2, 4, 8, 16, 8, 4, 2)
 
+    optimizer = py.MpsOptimizer(state, gates=[], chi=16, mode="dmrg1")
+    assert optimizer._mix_target_bond_dimensions() == [2, 4, 8, 16, 8, 4, 2]
 
-def test_dmrg1_does_not_leave_adaptive_phase_on_rank_stagnation():
-    """DMRG1 remains two-site when the target cannot fill its ceilings."""
+
+def test_dmrg1_leaves_adaptive_phase_after_two_sweeps_on_rank_stagnation():
+    """DMRG1 does not extend its two-site phase when rank growth stalls."""
     state = qtn.MPS_computational_state("000", dtype="complex128")
     optimizer = py.MpsOptimizer(
         state,
@@ -1298,16 +1301,18 @@ def test_dmrg1_does_not_leave_adaptive_phase_on_rank_stagnation():
         progbar=False,
         n_iter=6,
         cutoff=1.0e-12,
-        fit_rtol=1.0e9,
-        fit_patience=1,
+        fit_adaptive_sweeps=6,
+        fit_rtol=None,
         timing=True,
     )
 
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 2, 2, 2, 2]
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
+    ] == [2, 2, 1, 1, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 4
+    assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is False
 
 
 @pytest.mark.parametrize("n_iter", [1, 2])
@@ -1359,6 +1364,42 @@ def test_dmrg1_under_capacity_grows_twice_then_refines():
     assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
 
 
+def test_dmrg1_latches_one_site_phase_after_full_chain_saturation():
+    """After filling all bonds, later DMRG1 windows stay one-site."""
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
+    cnot = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    bell_gate = cnot @ np.kron(hadamard, np.eye(2))
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[
+            (bell_gate, (0, 2)),
+            (np.eye(4), (0, 2)),
+        ],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        cutoff=0.0,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    records = optimizer.get_run_timing()["fit_steps"]
+    assert [record["block_size"] for record in records] == [2, 2, 1, 1, 1, 1]
+    assert [record["fit_index"] for record in records] == [0, 0, 0, 1, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
+
+
 def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
     """A full-rank DMRG1 window should not repeat two-site warm-up."""
     state = qtn.MPS_rand_state(
@@ -1389,6 +1430,7 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
     ] == [1, 1, 1]
     assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
     assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
+    assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
 
 
 def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
@@ -3533,17 +3575,6 @@ def test_dmrg_fit_layer_size_and_target_cutoff_are_independent(monkeypatch):
     ]
 
 
-def test_research_fit_backends_are_explicitly_unavailable():
-    """Research labels must never silently dispatch to sequential FIT."""
-    from pepsy.experimental import mps_fit
-
-    status = mps_fit.experimental_mps_fit_backends()
-    assert set(status) == {"ptebd-ipmc", "local-tdvp-circuit"}
-    assert not any(record["available"] for record in status.values())
-    with pytest.raises(NotImplementedError, match="parallel independent"):
-        mps_fit.require_experimental_mps_fit_backend("ptebd-ipmc")
-
-
 def test_mps_optimizer_fit_mode_is_clear_dmrg_alias():
     """The public FIT spelling should select the maintained DMRG kernel."""
     optimizer = py.MpsOptimizer(
@@ -3562,7 +3593,7 @@ def test_mps_optimizer_fit_mode_is_clear_dmrg_alias():
 @pytest.mark.parametrize(
     ("mode", "expected_blocks"),
     [
-        ("dmrg1", [2, 2, 2]),
+        ("dmrg1", [2, 2, 1]),
         ("dmrg2", [2, 2, 1]),
         ("dmrg3", [3, 3, 1]),
     ],
