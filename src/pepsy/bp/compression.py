@@ -89,7 +89,10 @@ def _normalize_max_edge_excitations(
         )
     option_value = nested if nested is not _MISSING else legacy
     if option_value is not _MISSING:
-        if max_edge_excitations not in (0, option_value):
+        if (
+            max_edge_excitations is not None
+            and max_edge_excitations not in (0, option_value)
+        ):
             raise TypeError(
                 "pass max_edge_excitations either directly or through "
                 "compression_opts"
@@ -1185,20 +1188,42 @@ def _fit_maps(
             )
             raise RuntimeError(f"all ALS initializers failed: {details}")
 
-        selected_name, selected_result = min(
-            candidate_results,
-            key=lambda item: float(item[1][2][1]),
-        )
+        fidelity_candidates = [
+            item
+            for item in candidate_results
+            if item[1][3].get("final", {}).get("local_fidelity") is not None
+            and np.isfinite(item[1][3]["final"]["local_fidelity"])
+        ]
+        if fidelity_candidates:
+            selected_name, selected_result = max(
+                fidelity_candidates,
+                key=lambda item: (
+                    float(item[1][3]["final"]["local_fidelity"]),
+                    -float(item[1][2][1]),
+                ),
+            )
+            selection_metric = "local_fidelity"
+        else:
+            selected_name, selected_result = min(
+                candidate_results,
+                key=lambda item: float(item[1][2][1]),
+            )
+            selection_metric = "final_cost"
         left, right, costs, selected_info = selected_result
         selected_info = dict(selected_info)
         selected_info["initialization_selection"] = {
             "selected": selected_name,
+            "selection_metric": selection_metric,
             "candidates": {
                 name: {
                     "initial_cost": float(result[2][0]),
                     "final_cost": float(result[2][1]),
                     "normalized_distance": result[3]["final"].get(
                         "normalized_distance"
+                    ),
+                    "local_fidelity": result[3]["final"].get("local_fidelity"),
+                    "local_infidelity": result[3]["final"].get(
+                        "local_infidelity"
                     ),
                 }
                 for name, result in candidate_results
@@ -1592,6 +1617,18 @@ def _sweep_bp_info(bp_result) -> dict[str, Any]:
     }
 
 
+def _sweep_supplied_bp_info() -> dict[str, Any]:
+    """Describe a supplied BP snapshot without claiming a fresh solve."""
+    return {
+        "source": "supplied_messages",
+        "converged": None,
+        "iterations": 0,
+        "max_mdiff": None,
+        "quimb_converged": None,
+        "fixed_point_checked": False,
+    }
+
+
 def _sweep_bond_from_where(tn, where):
     """Resolve a sweep site pair to its tensor ids and virtual bond."""
     import quimb.tensor as qtn
@@ -1785,9 +1822,9 @@ class BondLoopSeriesCompressor:
         boundary_mode: str = "bp",
         update_mode: str = "sequential",
         parallel: bool = False,
-        max_workers: int | None = None,
+        max_workers: int | bool | None = False,
         max_edge_excitations: int | None = 0,
-        init_candidates=("bp_messages", "projector"),
+        init_candidates=("bp_messages", "b_reduce", "projector"),
         boundary_messages=None,
         gauges=None,
         input_mode: str = "auto",
@@ -1819,13 +1856,20 @@ class BondLoopSeriesCompressor:
             raise ValueError(
                 "parallel execution requires update_mode='simultaneous'"
             )
-        if max_workers is not None:
+        if max_workers is True:
+            raise ValueError(
+                "max_workers=True is ambiguous; pass a positive integer, "
+                "None for automatic threads, or False to disable worker threads"
+            )
+        if max_workers is not False and max_workers is not None:
             if (
                 isinstance(max_workers, bool)
                 or not isinstance(max_workers, (int, np.integer))
                 or max_workers < 1
             ):
-                raise ValueError("max_workers must be a positive integer or None")
+                raise ValueError(
+                    "max_workers must be a positive integer, None, or False"
+                )
             max_workers = int(max_workers)
         init_candidates = tuple(init_candidates)
         if not init_candidates:
@@ -1908,6 +1952,24 @@ class BondLoopSeriesCompressor:
         # messages for the sweep boundary.
         from .gauges import gauge_all_simple
 
+        if self.input_mode != "physical" and gauges is not None:
+            # A supplied SU core/gauge pair is already the requested boundary
+            # snapshot. Do not run another simple-update solve before the
+            # simultaneous batch.
+            from .gauges import copy_gauges
+
+            core = self.tn.copy()
+            gauges = copy_gauges(gauges)
+            self._initial_su_info = {
+                "source": "supplied_gauges",
+                "converged": True,
+                "iterations": 0,
+                "max_sdiff": 0.0,
+            }
+            physical = core.copy()
+            physical.gauge_simple_insert(gauges)
+            return physical, core, gauges
+
         if self.input_mode == "physical":
             core_input = self.tn.copy()
             gauges = {}
@@ -1950,7 +2012,7 @@ class BondLoopSeriesCompressor:
         """Adapt direct SU diagnostics to the legacy sweep record shape."""
         info = {} if info is None else info
         return {
-            "source": source,
+            "source": info.get("source", source),
             "converged": bool(info.get("converged", False)),
             "iterations": int(info.get("iterations", 0)),
             "max_mdiff": None,
@@ -2048,6 +2110,8 @@ class BondLoopSeriesCompressor:
         old_bonds = set()
         options = dict(self.compression_opts)
         options.setdefault("require_fixed_point", False)
+        options.setdefault("hermitian_project", True)
+        options.setdefault("psd_project", False)
         options["init_candidates"] = self.init_candidates
 
         if self.parallel:
@@ -2114,7 +2178,7 @@ class BondLoopSeriesCompressor:
                 right_map,
             )
 
-        if self.parallel:
+        if self.parallel and self.max_workers is not False:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 compressions = list(executor.map(compress_one, self.bonds))
             old_bonds = {compression[3] for compression in compressions}
@@ -2349,20 +2413,29 @@ class BondLoopSeriesCompressor:
         """Run a Jacobi-style batch from one common boundary snapshot."""
         current_tn, current_core, current_gauges = self._initial_state()
         messages = self._initial_messages
-        bp_before_result = self._run_bp(current_tn, messages)
-        bp_before = _sweep_bp_info(bp_before_result)
-        if self.require_fixed_point and not bp_before["converged"]:
-            raise RuntimeError(
-                "BP did not converge before simultaneous sweep: "
-                f"max_mdiff={bp_before['max_mdiff']!r}"
+        if messages is None:
+            bp_before_result = self._run_bp(current_tn, None)
+            bp_before = _sweep_bp_info(bp_before_result)
+            if self.require_fixed_point and not bp_before["converged"]:
+                raise RuntimeError(
+                    "BP did not converge before simultaneous sweep: "
+                    f"max_mdiff={bp_before['max_mdiff']!r}"
+                )
+            messages_before = bp_before_result.snapshot()
+        else:
+            messages_before = _normalize_message_pairs(
+                messages,
+                current_tn.ind_map,
             )
-        messages_before = bp_before_result.snapshot()
+            bp_before = _sweep_supplied_bp_info()
 
         compressions = []
         changes = []
         old_bonds = set()
         options = dict(self.compression_opts)
         options.setdefault("require_fixed_point", True)
+        options.setdefault("hermitian_project", True)
+        options.setdefault("psd_project", False)
         # The initializer policy belongs to the sweep, independently of
         # whether the simultaneous batch is evaluated in worker threads.
         options["init_candidates"] = self.init_candidates
@@ -2438,7 +2511,7 @@ class BondLoopSeriesCompressor:
                 right_map,
             )
 
-        if self.parallel:
+        if self.parallel and self.max_workers is not False:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 compressions = list(executor.map(compress_one, self.bonds))
             old_bonds = {compression[3] for compression in compressions}
@@ -2566,9 +2639,9 @@ def compress_all_gauge(
     boundary_messages=None,
     mode: str = "sequential",
     boundary_mode: str = "auto",
-    max_workers: int | None = None,
+    max_workers: int | bool | None = False,
     max_edge_excitations: int | None = 0,
-    init_candidates=("bp_messages", "projector"),
+    init_candidates=("bp_messages", "b_reduce", "projector"),
     input_mode: str = "auto",
     bp_runner: str = "plain",
     bp_opts: dict[str, Any] | None = None,
@@ -2585,11 +2658,14 @@ def compress_all_gauge(
     No gate compression or global gauge normalization is performed.
 
     ``mode`` is ``"sequential"`` by default and maps to a boundary refresh
-    after each bond. ``"parallel"`` is an explicit opt-in simultaneous batch;
-    ``max_workers`` is only used in that mode. ``max_edge_excitations`` is
-    the maximum number of non-cut virtual edges carrying a ``Q`` excitation
-    in the cut-edge environment used for ``B_reduce``; its default ``0`` is
-    the BP/SU vacuum. ``gauges`` accepts SU gauge vectors.
+    after each bond. ``"parallel"`` is an explicit opt-in simultaneous batch.
+    ``max_workers=False`` is the default and keeps the simultaneous batch
+    deterministic without worker threads; pass a positive integer to enable
+    worker threads or ``None`` to use the executor default. All-bond modes
+    default to ``max_edge_excitations=0``, the BP/SU vacuum. Pass
+    ``max_edge_excitations=None`` explicitly to sum the complete finite
+    cut-edge loop series for every ``B_reduce``. ``gauges`` accepts SU gauge
+    vectors.
     ``bp_messages`` accepts either a directed message
     mapping, a BP result with ``.messages``, or a BP result with
     ``.snapshot()``. ``boundary_messages`` is a compatibility alias for
@@ -2610,6 +2686,8 @@ def compress_all_gauge(
         )
     if bp_messages is None:
         bp_messages = boundary_messages
+    if gauges is not None and bp_messages is not None:
+        raise ValueError("pass either gauges or BP messages, not both")
     if bp_messages is not None:
         if callable(getattr(bp_messages, "snapshot", None)):
             bp_messages = bp_messages.snapshot()

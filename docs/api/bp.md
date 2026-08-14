@@ -487,11 +487,20 @@ environments, run another batch or use the default sequential mode.
 
 To reduce every two-ended virtual bond in a PEPS/PEPO, use `bonds="all"`.
 Set `parallel=True` with `update_mode="simultaneous"` to fit the independent
-bond environments concurrently. The sweep runs BP once, warms the loop
-geometry cache, reuses one frozen message snapshot, tries the configured ALS
-starts, chooses the lowest final local objective for each bond, inserts all
-`L/R` pairs into one copied network, and runs BP once afterward in BP mode.
-In SU mode, the same batch is refreshed directly with `gauge_all_simple`:
+bond environments from one common boundary snapshot. `max_workers=False` is
+the default: the batch remains simultaneous, but local fits are evaluated
+without creating a thread pool. Pass a positive integer to enable worker
+threads or `None` to use the executor default. The default cutoff is
+`max_edge_excitations=0`, the BP/SU vacuum. Pass `None` explicitly when the
+parallel path should sum the complete finite cut-edge loop series for every bond,
+Hermitianizes each `B_reduce` while leaving PSD projection disabled by default,
+runs ALS from three starts
+(`bp_messages`, `b_reduce`, and `projector`), selects the highest local
+`B_reduce` fidelity, normalizes the selected `L/R` pair, and inserts all maps
+into one copied network. In BP mode, a supplied message snapshot is used
+directly for the batch; otherwise BP is solved once before it. In SU mode, a
+supplied core/gauge snapshot is used directly; otherwise `gauge_all_simple`
+constructs one. The final boundary is refreshed after the maps are inserted.
 
 ```python
 sweep = BondLoopSeriesCompressor(
@@ -500,9 +509,8 @@ sweep = BondLoopSeriesCompressor(
     max_bond=chi,
     update_mode="simultaneous",
     parallel=True,
-    max_workers=4,
-    init_candidates=("bp_messages", "projector"),
-    max_edge_excitations=4,
+    max_workers=False,  # simultaneous batch without worker threads
+    init_candidates=("bp_messages", "b_reduce", "projector"),
 )
 result = sweep.run()
 N_reduce_by_bond = result.N_reduce_by_bond
@@ -534,8 +542,8 @@ directed message mapping or the result returned by `two_norm_bp`/`relay_bp`.
 
 `parallel=True` is deliberately restricted to simultaneous batches: each
 worker reads the same frozen physical network and BP/SU boundary snapshot, so
-workers must not target the same virtual bond. `max_workers` is only used for
-that explicit parallel mode. `result.B_reduce_by_bond` is a
+workers must not target the same virtual bond. `max_workers` only controls the
+local fit workers and is false by default. `result.B_reduce_by_bond` is a
 compatibility alias for `result.N_reduce_by_bond`. For a sequential sweep,
 the loop and projector caches are refreshed when a reduction changes the
 topology.

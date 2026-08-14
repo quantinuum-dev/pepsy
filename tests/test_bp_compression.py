@@ -615,8 +615,12 @@ def test_sequential_loop_series_compression_reuses_projected_messages():
             "frobenius_reciprocal_scalar"
         )
         selection = step.compression.als_info["initialization_selection"]
-        assert selection["selected"] in {"bp_messages", "projector"}
-        assert set(selection["candidates"]) == {"bp_messages", "projector"}
+        assert selection["selected"] in {"bp_messages", "b_reduce", "projector"}
+        assert set(selection["candidates"]) == {
+            "bp_messages",
+            "b_reduce",
+            "projector",
+        }
     assert all(
         result.compressed.ind_size(index) == 1
         for index in result.compressed.inner_inds()
@@ -857,10 +861,145 @@ def test_parallel_simultaneous_sweep_compresses_all_bonds_and_selects_als_start(
     assert set(result.B_reduce_by_bond) == original_bonds
     for step in result.steps:
         selection = step.compression.als_info["initialization_selection"]
-        assert selection["selected"] in {"bp_messages", "projector"}
-        assert set(selection["candidates"]) == {"bp_messages", "projector"}
+        assert selection["selected"] in {"bp_messages", "b_reduce", "projector"}
+        assert set(selection["candidates"]) == {
+            "bp_messages",
+            "b_reduce",
+            "projector",
+        }
         assert step.compression.N_reduce is step.compression.B_reduce
         assert result.compressed.ind_size(step.bond_ind_after) == 1
+
+
+def test_parallel_can_use_complete_hermitian_fidelity_selected_batch(monkeypatch):
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=4571,
+    )
+
+    def fail_if_thread_pool_used(*args, **kwargs):
+        raise AssertionError("max_workers=False must not create a thread pool")
+
+    monkeypatch.setattr(compression, "ThreadPoolExecutor", fail_if_thread_pool_used)
+    result = compress_all_gauge(
+        peps,
+        max_bond=1,
+        mode="parallel",
+        max_edge_excitations=None,
+        bp_opts={"max_iterations": 100, "tol": 1e-10, "diis": False},
+        compression_opts={
+            "steps": 1,
+            "tol": 0.0,
+            "contract_optimize": "greedy",
+        },
+    )
+
+    assert result.update_mode == "simultaneous"
+    for step in result.steps:
+        compression_result = step.compression
+        selection = compression_result.als_info["initialization_selection"]
+        assert compression_result.complete
+        assert compression_result.environment_projection == {
+            "hermitian_project": True,
+            "psd_project": False,
+            "psd_floor": 0.0,
+        }
+        assert selection["selection_metric"] == "local_fidelity"
+        assert set(selection["candidates"]) == {
+            "bp_messages",
+            "b_reduce",
+            "projector",
+        }
+        fidelities = [
+            candidate["local_fidelity"]
+            for candidate in selection["candidates"].values()
+            if candidate["local_fidelity"] is not None
+        ]
+        assert selection["candidates"][selection["selected"]]["local_fidelity"] == pytest.approx(
+            max(fidelities)
+        )
+
+
+def test_parallel_uses_supplied_bp_snapshot_before_batch(monkeypatch):
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=4572,
+    )
+    bp = two_norm_bp(peps, max_iterations=20, tol=0.0, diis=False)
+    calls = []
+    original_run_bp = BondLoopSeriesCompressor._run_bp
+
+    def record_run_bp(self, tn, init_messages):
+        calls.append(init_messages is not None)
+        return original_run_bp(self, tn, init_messages)
+
+    monkeypatch.setattr(BondLoopSeriesCompressor, "_run_bp", record_run_bp)
+    result = compress_all_gauge(
+        peps,
+        max_bond=1,
+        mode="parallel",
+        bp_messages=bp,
+        compression_opts={
+            "edge_cutoff": 0,
+            "steps": 1,
+            "tol": 0.0,
+            "contract_optimize": "greedy",
+        },
+    )
+
+    assert calls == [True]
+    assert all(
+        step.bp_before["source"] == "supplied_messages"
+        for step in result.steps
+    )
+
+
+def test_parallel_uses_supplied_su_snapshot_before_batch(monkeypatch):
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=4573,
+    )
+    core, gauges, _ = gauge_all_simple(peps, progbar=False)
+    gauges_module = pytest.importorskip("pepsy.bp.gauges")
+    calls = []
+    original_gauge_all_simple = gauges_module.gauge_all_simple
+
+    def record_gauge_all_simple(*args, **kwargs):
+        calls.append(True)
+        return original_gauge_all_simple(*args, **kwargs)
+
+    monkeypatch.setattr(gauges_module, "gauge_all_simple", record_gauge_all_simple)
+    result = compress_all_gauge(
+        core,
+        max_bond=1,
+        mode="parallel",
+        gauges=gauges,
+        input_mode="su_core",
+        compression_opts={
+            "edge_cutoff": 0,
+            "steps": 1,
+            "tol": 0.0,
+            "contract_optimize": "greedy",
+        },
+    )
+
+    assert len(calls) == 1
+    assert all(
+        step.bp_before["source"] == "supplied_gauges"
+        for step in result.steps
+    )
 
 
 def test_compress_all_gauge_is_the_public_all_bond_convenience_wrapper():
@@ -891,7 +1030,8 @@ def test_compress_all_gauge_is_the_public_all_bond_convenience_wrapper():
     assert set(result.N_reduce_by_bond) == set(peps.inner_inds())
 
 
-def test_compress_all_gauge_defaults_to_sequential_zero_edge_excitations():
+@pytest.mark.parametrize("mode", ["sequential", "parallel"])
+def test_compress_all_gauge_defaults_to_zero_edge_excitations(mode):
     peps = qtn.PEPS.rand(
         2,
         2,
@@ -903,6 +1043,8 @@ def test_compress_all_gauge_defaults_to_sequential_zero_edge_excitations():
     result = compress_all_gauge(
         peps,
         max_bond=1,
+        mode=mode,
+        max_workers=False,
         bp_opts={"max_iterations": 100, "tol": 1e-10, "diis": False},
         compression_opts={
             "steps": 1,
@@ -911,7 +1053,9 @@ def test_compress_all_gauge_defaults_to_sequential_zero_edge_excitations():
         },
     )
 
-    assert result.update_mode == "sequential"
+    assert result.update_mode == (
+        "sequential" if mode == "sequential" else "simultaneous"
+    )
     assert all(
         step.compression.max_edge_excitations == 0 for step in result.steps
     )
