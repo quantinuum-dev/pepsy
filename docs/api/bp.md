@@ -315,7 +315,7 @@ describing a bond sweep in terms of one `N_reduce` per selected bond.
 `compress_bond_loop_series` implements the cut-edge construction from
 Evenbly et al., arXiv:2409.03108. It cuts the selected virtual bond, leaves
 its four norm legs open, and resolves every other internal edge as
-`I = P + Q` in the D2BP basis. `edge_cutoff` counts excited Q edges:
+`I = P + Q` in the D2BP basis. `max_edge_excitations` counts excited Q edges:
 
 ```python
 from pepsy.bp import compress_bond_loop_series
@@ -324,7 +324,7 @@ result = compress_bond_loop_series(
     peps,
     where=((0, 0), (1, 0)),
     max_bond=chi,
-    edge_cutoff=6,
+    max_edge_excitations=6,
     bp_opts={"max_iterations": 1000, "tol": 1e-10},
 )
 ```
@@ -343,7 +343,7 @@ for cutoff in (2, 4, 6):
         peps,
         where=((0, 0), (1, 0)),
         max_bond=chi,
-        edge_cutoff=cutoff,
+        max_edge_excitations=cutoff,
         loop_cache=cache,
     )
 ```
@@ -371,7 +371,7 @@ and limits.
 
 Use `cut_edge_loop_series_expand` when only the environment is needed. The
 returned `terms` and `term_count_by_degree` make the convergence ladder
-explicit. `edge_cutoff=0` is the BP vacuum; when the cutoff reaches all
+explicit. `max_edge_excitations=0` is the BP vacuum; when the cutoff reaches all
 non-cut internal edges, `complete=True` and the finite-network sum is an
 exact `P + Q` identity expansion at a converged BP fixed point, up to
 numerical contraction error. Partial sums need not be monotone or PSD, so
@@ -402,12 +402,18 @@ contractions.
 `relative_error` is the final weighted residual divided by the weighted
 identity norm, not a fidelity.
 
+The compression ALS uses Quimb's direct dense local solve for small map
+environments. Larger local environments use the iterative solve with a
+default `solver_maxiter=16`; override this through
+`compression_opts={"als_opts": {"solver_maxiter": ...}}` when trading
+accuracy for runtime.
+
 ## Loop-series bond sweeps
 
 For reducing several bonds one after another, use
-`BondLoopSeriesCompressor`. It reruns D2BP after every reduction and carries
-the previous directed messages forward instead of randomly initializing the
-new BP problem:
+`BondLoopSeriesCompressor`. In BP mode it reruns D2BP after every reduction
+and carries the previous directed messages forward instead of randomly
+initializing the new BP problem:
 
 ```python
 from pepsy.bp import BondLoopSeriesCompressor
@@ -418,7 +424,7 @@ sweep = BondLoopSeriesCompressor(
     max_bond=chi,
     boundary_mode="bp",
     bp_opts={"max_iterations": 1000, "tol": 1e-10},
-    compression_opts={"edge_cutoff": 4},
+    max_edge_excitations=4,
 )
 result = sweep.run()
 ```
@@ -435,14 +441,19 @@ the sweep automatically starts a fresh topology cache for the next step;
 loop geometry must not be reused across those topology changes.
 
 Set `boundary_mode="su"` with `input_mode="su_core"` and `gauges=...` to keep
-an SU/simple-update core and gauge dictionary between steps. After each
-compression, the converged D2BP messages are converted back to an SU gauge;
-this is necessary because general matrix BP messages cannot be represented by
-a diagonal SU vector exactly.
+an SU/simple-update core and gauge dictionary between steps. SU mode is a
+separate direct `gauge_all_simple` path: it initializes and refreshes the
+external gauge dictionary directly, without keeping a D2BP message snapshot as
+the sweep boundary or converting D2BP messages back to SU gauges. Pass
+`su_opts={...}` to control the simple-update iterations. In SU mode,
+`result.messages` is `None` and the updated representation is in
+`result.core` and `result.gauges`.
 
-Each `result.steps[i]` contains the one-bond compression result, BP
-convergence before and after the reduction, the old/new bond indices, the
-message seed source, and `als_infidelity`. That infidelity is computed in the
+Each `result.steps[i]` contains the one-bond compression result, boundary
+diagnostics before and after the reduction, the old/new bond indices, the
+boundary seed source, and `als_infidelity`. In BP mode the diagnostics report
+BP convergence; in SU mode they report direct simple-update diagnostics. That
+infidelity is computed in the
 local `B_reduce` metric. It is not a global PEPS infidelity unless the
 environment is complete and exact; global overlap diagnostics remain an
 explicit expensive option.
@@ -463,22 +474,24 @@ sweep = BondLoopSeriesCompressor(
 result = sweep.run()
 ```
 
-The simultaneous mode runs BP once before the batch, fits every bond against
-that same physical network and message snapshot, inserts all map pairs into
-one copied network, and runs BP once afterward. The returned `steps` retain
-one local ALS diagnostic per bond, while `result.compressed` is the common
-batch network. With `boundary_mode="su"`, one supplied SU gauge snapshot is
-used for the batch and the post-batch BP fixed point is converted back to one
-refreshed core/gauge representation. This mode is not a jointly optimized
-global fit: if reductions substantially change one another's environments,
-run another batch or use the default sequential mode.
+In BP mode, the simultaneous schedule runs BP once before the batch, fits
+every bond against that same physical network and message snapshot, inserts
+all map pairs into one copied network, and runs BP once afterward. In SU mode,
+it instead starts from one direct simple-update gauge snapshot, fits every
+bond against that snapshot, inserts all map pairs into one copied network, and
+refreshes the core and external gauges directly with `gauge_all_simple`.
+The returned `steps` retain one local ALS diagnostic per bond, while
+`result.compressed` is the common batch network. This mode is not a jointly
+optimized global fit: if reductions substantially change one another's
+environments, run another batch or use the default sequential mode.
 
 To reduce every two-ended virtual bond in a PEPS/PEPO, use `bonds="all"`.
 Set `parallel=True` with `update_mode="simultaneous"` to fit the independent
 bond environments concurrently. The sweep runs BP once, warms the loop
 geometry cache, reuses one frozen message snapshot, tries the configured ALS
 starts, chooses the lowest final local objective for each bond, inserts all
-`L/R` pairs into one copied network, and runs BP once afterward:
+`L/R` pairs into one copied network, and runs BP once afterward in BP mode.
+In SU mode, the same batch is refreshed directly with `gauge_all_simple`:
 
 ```python
 sweep = BondLoopSeriesCompressor(
@@ -489,7 +502,7 @@ sweep = BondLoopSeriesCompressor(
     parallel=True,
     max_workers=4,
     init_candidates=("bp_messages", "projector"),
-    compression_opts={"edge_cutoff": 4},
+    max_edge_excitations=4,
 )
 result = sweep.run()
 N_reduce_by_bond = result.N_reduce_by_bond
@@ -505,8 +518,8 @@ result = py.compress_all_gauge(
     peps,
     max_bond=chi,
     bp_messages=bp,
-    mode="parallel",       # or "sequential"
-    compression_opts={"edge_cutoff": 4},
+    mode="sequential",     # default; "parallel" is opt-in
+    max_edge_excitations=0, # BP/SU vacuum default
 )
 ```
 
@@ -521,15 +534,16 @@ directed message mapping or the result returned by `two_norm_bp`/`relay_bp`.
 
 `parallel=True` is deliberately restricted to simultaneous batches: each
 worker reads the same frozen physical network and BP/SU boundary snapshot, so
-workers must not target the same virtual bond. `result.B_reduce_by_bond` is a
+workers must not target the same virtual bond. `max_workers` is only used for
+that explicit parallel mode. `result.B_reduce_by_bond` is a
 compatibility alias for `result.N_reduce_by_bond`. For a sequential sweep,
 the loop and projector caches are refreshed when a reduction changes the
 topology.
 
 Loop-series compression accepts both physical PEPS/PEPO tensors with BP
 messages and SU cores with `gauges`. SU factors are inserted exactly once;
-when the input is already physical, the gauges seed diagonal BP messages
-without being inserted again.
+when the input is already physical, the gauges seed the local D2BP contraction
+basis without being inserted again.
 
 This is separate from `compress_reduced_loop_cluster`. The latter combines
 operator-valued regional environments additively for the reduced ALS metric.
@@ -548,15 +562,17 @@ cut-edge series avoids that assumption by approximating the matrix
 environment itself term by term.
 
 The two cutoff names are intentionally different. In
-`compress_bond_loop_series`, `edge_cutoff` is the maximum number of *other*
+`compress_bond_loop_series`, `max_edge_excitations` is the maximum number of *other*
 virtual bonds carrying `Q` in one admissible configuration. The selected
 `A--B` bond is excluded from this count and is returned as the four open
 environment legs. A term may be an `A--B` excitation path, a closed loop, or
 an admissible path together with disconnected closed loops. `term_count`
 counts these configurations plus the degree-zero BP vacuum; it is not the
 number of geometric loops. For a 4x4 PEPS with one bond cut there are 23
-non-cut virtual bonds, so `edge_cutoff=16` is not the complete expansion;
-`edge_cutoff=None` (or a value at least 23) requests the finite complete sum.
+non-cut virtual bonds, so `max_edge_excitations=16` is not the complete
+expansion; `max_edge_excitations=None` (or a value at least 23) requests the
+finite complete sum. The older `edge_cutoff` spelling remains accepted as a
+compatibility alias.
 
 By contrast, `max_cluster_size` in
 `loop_cluster_reduced_update_problem` counts PEPS site tensors in the

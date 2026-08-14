@@ -71,6 +71,44 @@ __all__ = [
 ]
 
 
+_MISSING = object()
+
+
+def _normalize_max_edge_excitations(
+    max_edge_excitations: int | None,
+    compression_opts: dict[str, Any] | None,
+) -> tuple[int | None, dict[str, Any]]:
+    """Normalize the public cut-edge excitation name and old option alias."""
+    options = {} if compression_opts is None else dict(compression_opts)
+    nested = options.pop("max_edge_excitations", _MISSING)
+    legacy = options.pop("edge_cutoff", _MISSING)
+    if nested is not _MISSING and legacy is not _MISSING and nested != legacy:
+        raise TypeError(
+            "compression_opts cannot contain conflicting max_edge_excitations "
+            "and edge_cutoff values"
+        )
+    option_value = nested if nested is not _MISSING else legacy
+    if option_value is not _MISSING:
+        if max_edge_excitations not in (0, option_value):
+            raise TypeError(
+                "pass max_edge_excitations either directly or through "
+                "compression_opts"
+            )
+        max_edge_excitations = option_value
+    if max_edge_excitations is not None:
+        if (
+            isinstance(max_edge_excitations, bool)
+            or not isinstance(max_edge_excitations, (int, np.integer))
+            or max_edge_excitations < 0
+        ):
+            raise ValueError(
+                "max_edge_excitations must be a nonnegative integer or None"
+            )
+        max_edge_excitations = int(max_edge_excitations)
+    options["max_edge_excitations"] = max_edge_excitations
+    return max_edge_excitations, options
+
+
 def _validate_dense_peps_like(tn) -> None:
     """Validate the ordinary backend-array PEPS/PEPO subset used here."""
     required = ("inner_inds", "ind_map", "ind_size", "tensor_map", "copy")
@@ -1279,7 +1317,10 @@ def _fit_maps(
     fit_opts = {
         "dense_solve": "auto",
         "solver": None,
-        "solver_maxiter": 4,
+        # Small local map problems use the direct dense solver selected by
+        # ``dense_solve="auto"``. For larger maps, give the iterative local
+        # solve enough CG iterations to reach the requested ALS tolerance.
+        "solver_maxiter": 16,
         "solver_dense": "eigh" if positive_environment else "solve",
         "enforce_pos": positive_environment,
         "pos_smudge": max(tol, 1e-15),
@@ -1492,6 +1533,11 @@ class BondLoopSeriesCompressionResult:
     def N_reduce(self):
         """Alias for the selected-bond norm environment ``B_reduce``."""
         return self.B_reduce
+
+    @property
+    def max_edge_excitations(self) -> int:
+        """Preferred name for the cut-edge excitation degree."""
+        return self.edge_cutoff
 
 
 @dataclass(frozen=True)
@@ -1721,14 +1767,13 @@ def _sweep_project_messages(
 class BondLoopSeriesCompressor:
     """Compress selected bonds with BP or SU boundary snapshots.
 
-    The class keeps a directed D2BP message snapshot between reductions. The
-    old messages on unaffected bonds are reused, while the message pair on a
-    newly reduced bond is projected through the fitted maps before the next
-    BP solve. With ``update_mode="simultaneous"``, all maps are fitted from
-    one common boundary snapshot and inserted into one batch network before a
-    single post-batch BP solve. ``boundary_mode="su"`` additionally converts
-    the post-update BP fixed point back to a simple-update core and gauge
-    dictionary.
+    ``boundary_mode="bp"`` keeps a directed D2BP message snapshot between
+    reductions. ``boundary_mode="su"`` is separate: it initializes and
+    refreshes external gauges with :func:`gauge_all_simple` and does not keep
+    a D2BP message snapshot as the sweep boundary or convert BP messages back
+    to SU gauges.
+    With ``update_mode="simultaneous"``, all maps are fitted from one common
+    boundary snapshot and inserted into one batch network.
     """
 
     def __init__(
@@ -1741,12 +1786,14 @@ class BondLoopSeriesCompressor:
         update_mode: str = "sequential",
         parallel: bool = False,
         max_workers: int | None = None,
+        max_edge_excitations: int | None = 0,
         init_candidates=("bp_messages", "projector"),
         boundary_messages=None,
         gauges=None,
         input_mode: str = "auto",
         bp_runner: str = "plain",
         bp_opts: dict[str, Any] | None = None,
+        su_opts: dict[str, Any] | None = None,
         compression_opts: dict[str, Any] | None = None,
         require_fixed_point: bool = True,
     ):
@@ -1803,13 +1850,19 @@ class BondLoopSeriesCompressor:
         self.update_mode = update_mode
         self.parallel = parallel
         self.max_workers = max_workers
+        self.max_edge_excitations, self.compression_opts = (
+            _normalize_max_edge_excitations(
+                max_edge_excitations,
+                compression_opts,
+            )
+        )
         self.init_candidates = init_candidates
         self.input_mode = input_mode
         self.bp_runner = bp_runner
         self.bp_opts = {} if bp_opts is None else dict(bp_opts)
-        self.compression_opts = (
-            {} if compression_opts is None else dict(compression_opts)
-        )
+        if su_opts is not None and not isinstance(su_opts, dict):
+            raise TypeError("su_opts must be a mapping or None")
+        self.su_opts = {} if su_opts is None else dict(su_opts)
         self.require_fixed_point = require_fixed_point
         self._initial_messages = (
             None
@@ -1823,6 +1876,7 @@ class BondLoopSeriesCompressor:
 
             self._initial_gauges = copy_gauges(gauges)
         self._ran = False
+        self._initial_su_info = None
 
         protected = {
             "where",
@@ -1846,16 +1900,304 @@ class BondLoopSeriesCompressor:
     def _initial_state(self):
         """Return physical working data and optional SU representation."""
         gauges = self._initial_gauges
-        if self.boundary_mode != "su" or self.input_mode == "physical":
+        if self.boundary_mode != "su":
             return self.tn.copy(), None, gauges
-        if self.input_mode == "auto" and gauges is None:
-            return self.tn.copy(), None, None
-        if gauges is None:
-            raise ValueError("input_mode='su_core' requires gauges")
-        core = self.tn.copy()
+
+        # SU mode is deliberately self-contained: simple-update gauges are
+        # initialized or refreshed directly and never promoted to D2BP
+        # messages for the sweep boundary.
+        from .gauges import gauge_all_simple
+
+        if self.input_mode == "physical":
+            core_input = self.tn.copy()
+            gauges = {}
+        else:
+            core_input = self.tn.copy()
+            gauges = {} if gauges is None else gauges
+        options = dict(self.su_opts)
+        for name in ("gauges", "info", "inplace"):
+            if name in options:
+                raise TypeError(f"su_opts cannot override {name}")
+        options.setdefault("schedule", "sequential")
+        core, gauges, self._initial_su_info = gauge_all_simple(
+            core_input,
+            gauges=gauges,
+            inplace=False,
+            **options,
+        )
         physical = core.copy()
         physical.gauge_simple_insert(gauges)
         return physical, core, gauges
+
+    def _run_gauge_all_simple(self, tn):
+        """Refactor a physical network with direct simple-update gauges."""
+        from .gauges import gauge_all_simple
+
+        options = dict(self.su_opts)
+        for name in ("gauges", "info", "inplace"):
+            if name in options:
+                raise TypeError(f"su_opts cannot override {name}")
+        options.setdefault("schedule", "sequential")
+        return gauge_all_simple(
+            tn,
+            gauges={},
+            inplace=False,
+            **options,
+        )
+
+    @staticmethod
+    def _su_info(info, *, source="simple_update"):
+        """Adapt direct SU diagnostics to the legacy sweep record shape."""
+        info = {} if info is None else info
+        return {
+            "source": source,
+            "converged": bool(info.get("converged", False)),
+            "iterations": int(info.get("iterations", 0)),
+            "max_mdiff": None,
+            "su_converged": bool(info.get("converged", False)),
+            "max_sdiff": info.get("max_sdiff"),
+        }
+
+    def _run_sequential_su(self) -> BondLoopSeriesSweepResult:
+        """Run sequential compression with direct simple-update gauges."""
+        current_tn, current_core, current_gauges = self._initial_state()
+        su_before = self._su_info(self._initial_su_info)
+        sequential_loop_cache = self.compression_opts.get("loop_cache")
+        steps = []
+
+        for step_index, where in enumerate(self.bonds):
+            if step_index > 0:
+                current_tn = current_core.copy()
+                current_tn.gauge_simple_insert(current_gauges)
+            left_tid, right_tid, old_bond = _sweep_bond_from_where(
+                current_tn,
+                where,
+            )
+
+            options = dict(self.compression_opts)
+            if sequential_loop_cache is not None:
+                options["loop_cache"] = sequential_loop_cache
+            options["projector_cache"] = CutEdgeLoopProjectorCache()
+            options["init_candidates"] = self.init_candidates
+            options.setdefault("require_fixed_point", False)
+            compression = compress_bond_loop_series(
+                current_core,
+                where=where,
+                max_bond=self.max_bond,
+                gauges=current_gauges,
+                input_mode="su_core",
+                run_bp=False,
+                inplace=False,
+                **options,
+            )
+            new_bond = _sweep_new_bond(
+                compression.compressed,
+                old_bond,
+                left_tid,
+                right_tid,
+            )
+            if sequential_loop_cache is not None and new_bond != old_bond:
+                sequential_loop_cache = OpenLoopSeriesCache()
+
+            current_core, current_gauges, su_after_info = (
+                self._run_gauge_all_simple(compression.compressed)
+            )
+            current_tn = current_core.copy()
+            current_tn.gauge_simple_insert(current_gauges)
+            su_after = self._su_info(su_after_info)
+
+            final_metrics = None
+            if compression.als_info is not None:
+                final_metrics = compression.als_info.get("final")
+            steps.append(
+                BondLoopSeriesSweepStep(
+                    step=step_index,
+                    where=tuple(where),
+                    bond_ind_before=old_bond,
+                    bond_ind_after=new_bond,
+                    compression=compression,
+                    als_infidelity=(
+                        None
+                        if final_metrics is None
+                        else final_metrics.get("local_infidelity")
+                    ),
+                    bp_before=su_before,
+                    bp_after=su_after,
+                    message_seed="simple_update_gauges",
+                    messages_reused=False,
+                )
+            )
+            su_before = su_after
+
+        return BondLoopSeriesSweepResult(
+            compressed=current_tn,
+            steps=tuple(steps),
+            boundary_mode=self.boundary_mode,
+            update_mode=self.update_mode,
+            messages=None,
+            gauges=current_gauges,
+            core=current_core,
+        )
+
+    def _run_simultaneous_su(self) -> BondLoopSeriesSweepResult:
+        """Run a simultaneous batch with one direct SU gauge snapshot."""
+        current_tn, current_core, current_gauges = self._initial_state()
+        su_before = self._su_info(self._initial_su_info)
+        compressions = []
+        changes = []
+        old_bonds = set()
+        options = dict(self.compression_opts)
+        options.setdefault("require_fixed_point", False)
+        options["init_candidates"] = self.init_candidates
+
+        if self.parallel:
+            seen_bonds = set()
+            for where in self.bonds:
+                _, _, old_bond = _sweep_bond_from_where(current_tn, where)
+                if old_bond in seen_bonds:
+                    raise ValueError(
+                        "parallel sweep bonds must identify distinct virtual "
+                        f"bonds, got {old_bond!r} more than once"
+                    )
+                seen_bonds.add(old_bond)
+            loop_cache = options.get("loop_cache") or OpenLoopSeriesCache()
+            projector_cache = (
+                options.get("projector_cache") or CutEdgeLoopProjectorCache()
+            )
+            options["loop_cache"] = loop_cache
+            options["projector_cache"] = projector_cache
+            max_edge_excitations = options.get("max_edge_excitations")
+            if max_edge_excitations is None:
+                max_edge_excitations = sum(
+                    len(tids) == 2
+                    for tids in current_tn.ind_map.values()
+                    if len(tids) == 2
+                ) - 1
+            for where in self.bonds:
+                left_tid, right_tid, old_bond = _sweep_bond_from_where(
+                    current_tn,
+                    where,
+                )
+                loop_cache.iter_terms_for(
+                    current_tn,
+                    int(max_edge_excitations),
+                    (left_tid, right_tid),
+                    excluded_edges=(old_bond,),
+                    max_terms=options.get("max_terms"),
+                    max_enumeration_time=options.get("max_enumeration_time"),
+                    max_enumeration_memory=options.get("max_enumeration_memory"),
+                )
+
+        def compress_one(where):
+            left_tid, right_tid, old_bond = _sweep_bond_from_where(
+                current_tn,
+                where,
+            )
+            compression = compress_bond_loop_series(
+                current_core,
+                where=where,
+                max_bond=self.max_bond,
+                gauges=current_gauges,
+                input_mode="su_core",
+                run_bp=False,
+                inplace=False,
+                **options,
+            )
+            left_map, right_map = compression.bond_maps[old_bond]
+            return (
+                tuple(where),
+                left_tid,
+                right_tid,
+                old_bond,
+                compression,
+                left_map,
+                right_map,
+            )
+
+        if self.parallel:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                compressions = list(executor.map(compress_one, self.bonds))
+            old_bonds = {compression[3] for compression in compressions}
+        else:
+            for where in self.bonds:
+                compression = compress_one(where)
+                if compression[3] in old_bonds:
+                    raise ValueError(
+                        "simultaneous sweep bonds must identify distinct "
+                        f"virtual bonds, got {compression[3]!r} more than once"
+                    )
+                old_bonds.add(compression[3])
+                compressions.append(compression)
+
+        batch_tn = current_tn
+        for (
+            where,
+            left_tid,
+            right_tid,
+            old_bond,
+            _compression,
+            left_map,
+            right_map,
+        ) in compressions:
+            batch_tn, new_bond = _reconstruct_selected_bond(
+                batch_tn,
+                old_bond,
+                left_tid,
+                right_tid,
+                left_map,
+                right_map,
+            )
+            changes.append((old_bond, new_bond, left_tid, right_tid))
+
+        current_core, current_gauges, su_after_info = (
+            self._run_gauge_all_simple(batch_tn)
+        )
+        current_tn = current_core.copy()
+        current_tn.gauge_simple_insert(current_gauges)
+        su_after = self._su_info(su_after_info)
+
+        steps = []
+        for step_index, (
+            where,
+            _left_tid,
+            _right_tid,
+            old_bond,
+            compression,
+            _left_map,
+            _right_map,
+        ) in enumerate(compressions):
+            new_bond = changes[step_index][1]
+            final_metrics = None
+            if compression.als_info is not None:
+                final_metrics = compression.als_info.get("final")
+            steps.append(
+                BondLoopSeriesSweepStep(
+                    step=step_index,
+                    where=where,
+                    bond_ind_before=old_bond,
+                    bond_ind_after=new_bond,
+                    compression=compression,
+                    als_infidelity=(
+                        None
+                        if final_metrics is None
+                        else final_metrics.get("local_infidelity")
+                    ),
+                    bp_before=su_before,
+                    bp_after=su_after,
+                    message_seed="simple_update_gauges",
+                    messages_reused=False,
+                )
+            )
+
+        return BondLoopSeriesSweepResult(
+            compressed=current_tn,
+            steps=tuple(steps),
+            boundary_mode=self.boundary_mode,
+            update_mode=self.update_mode,
+            messages=None,
+            gauges=current_gauges,
+            core=current_core,
+        )
 
     def _run_bp(self, tn, init_messages):
         """Run plain or relay D2BP from a detached warm-start snapshot."""
@@ -1879,21 +2221,12 @@ class BondLoopSeriesCompressor:
             **options,
         )
 
-    def _su_seed(self, tn, gauges):
-        """Build deterministic diagonal D2BP seeds from SU gauges."""
-        if gauges is None:
-            return None
-        from .gauges import d2bp_from_simple_update_gauges
-
-        optimize = self.bp_opts.get("optimize", "auto-hq")
-        return d2bp_from_simple_update_gauges(
-            tn,
-            gauges,
-            insert_gauges=False,
-            optimize=optimize,
-        ).messages
-
     def _run_sequential(self) -> BondLoopSeriesSweepResult:
+        if self.boundary_mode == "su":
+            return self._run_sequential_su()
+        return self._run_sequential_bp()
+
+    def _run_sequential_bp(self) -> BondLoopSeriesSweepResult:
         """Run the configured schedule with Gauss--Seidel updates."""
         current_tn, current_core, current_gauges = self._initial_state()
         messages = self._initial_messages
@@ -1907,16 +2240,6 @@ class BondLoopSeriesCompressor:
         steps = []
 
         for step_index, where in enumerate(self.bonds):
-            if (
-                step_index > 0
-                and self.boundary_mode == "su"
-                and current_core is not None
-            ):
-                current_tn = current_core.copy()
-                current_tn.gauge_simple_insert(current_gauges)
-            if messages is None and self.boundary_mode == "su":
-                messages = self._su_seed(current_tn, current_gauges)
-
             bp_before_result = self._run_bp(current_tn, messages)
             bp_before = _sweep_bp_info(bp_before_result)
             if self.require_fixed_point and not bp_before["converged"]:
@@ -1981,15 +2304,8 @@ class BondLoopSeriesCompressor:
                 )
             messages = bp_after_result.snapshot()
 
-            if self.boundary_mode == "su":
-                from .gauges import simple_update_core_and_gauges_from_d2bp
-
-                current_core, current_gauges = (
-                    simple_update_core_and_gauges_from_d2bp(bp_after_result.bp)
-                )
-            else:
-                current_core = None
-                current_gauges = None
+            current_core = None
+            current_gauges = None
             current_tn = compression.compressed
 
             final_metrics = None
@@ -2025,12 +2341,14 @@ class BondLoopSeriesCompressor:
         )
 
     def _run_simultaneous(self) -> BondLoopSeriesSweepResult:
+        if self.boundary_mode == "su":
+            return self._run_simultaneous_su()
+        return self._run_simultaneous_bp()
+
+    def _run_simultaneous_bp(self) -> BondLoopSeriesSweepResult:
         """Run a Jacobi-style batch from one common boundary snapshot."""
         current_tn, current_core, current_gauges = self._initial_state()
         messages = self._initial_messages
-        if messages is None and self.boundary_mode == "su":
-            messages = self._su_seed(current_tn, current_gauges)
-
         bp_before_result = self._run_bp(current_tn, messages)
         bp_before = _sweep_bp_info(bp_before_result)
         if self.require_fixed_point and not bp_before["converged"]:
@@ -2045,6 +2363,9 @@ class BondLoopSeriesCompressor:
         old_bonds = set()
         options = dict(self.compression_opts)
         options.setdefault("require_fixed_point", True)
+        # The initializer policy belongs to the sweep, independently of
+        # whether the simultaneous batch is evaluated in worker threads.
+        options["init_candidates"] = self.init_candidates
 
         if self.parallel:
             seen_bonds = set()
@@ -2066,13 +2387,12 @@ class BondLoopSeriesCompressor:
                 projector_cache = CutEdgeLoopProjectorCache()
             options["loop_cache"] = loop_cache
             options["projector_cache"] = projector_cache
-            options["init_candidates"] = self.init_candidates
 
             # Geometry discovery mutates OpenLoopSeriesCache. Complete it
             # before launching workers so the parallel phase is read-only.
-            edge_cutoff = options.get("edge_cutoff")
-            if edge_cutoff is None:
-                edge_cutoff = sum(
+            max_edge_excitations = options.get("max_edge_excitations")
+            if max_edge_excitations is None:
+                max_edge_excitations = sum(
                     len(tids) == 2
                     for tids in current_tn.ind_map.values()
                     if len(tids) == 2
@@ -2084,7 +2404,7 @@ class BondLoopSeriesCompressor:
                 )
                 loop_cache.iter_terms_for(
                     current_tn,
-                    int(edge_cutoff),
+                    int(max_edge_excitations),
                     (left_tid, right_tid),
                     excluded_edges=(old_bond,),
                     max_terms=options.get("max_terms"),
@@ -2181,15 +2501,8 @@ class BondLoopSeriesCompressor:
             )
         messages = bp_after_result.snapshot()
 
-        if self.boundary_mode == "su":
-            from .gauges import simple_update_core_and_gauges_from_d2bp
-
-            current_core, current_gauges = (
-                simple_update_core_and_gauges_from_d2bp(bp_after_result.bp)
-            )
-        else:
-            current_core = None
-            current_gauges = None
+        current_core = None
+        current_gauges = None
 
         steps = []
         for step_index, (
@@ -2251,13 +2564,15 @@ def compress_all_gauge(
     gauges=None,
     bp_messages=None,
     boundary_messages=None,
-    mode: str = "parallel",
+    mode: str = "sequential",
     boundary_mode: str = "auto",
     max_workers: int | None = None,
+    max_edge_excitations: int | None = 0,
     init_candidates=("bp_messages", "projector"),
     input_mode: str = "auto",
     bp_runner: str = "plain",
     bp_opts: dict[str, Any] | None = None,
+    su_opts: dict[str, Any] | None = None,
     compression_opts: dict[str, Any] | None = None,
     require_fixed_point: bool = True,
 ) -> BondLoopSeriesSweepResult:
@@ -2269,13 +2584,19 @@ def compress_all_gauge(
     one ``N_reduce`` environment and one fitted ``(L, R)`` pair per bond.
     No gate compression or global gauge normalization is performed.
 
-    ``mode`` is ``"parallel"`` by default and maps to one simultaneous batch;
-    ``"sequential"`` maps to a BP refresh after each bond. ``gauges`` accepts
-    SU gauge vectors. ``bp_messages`` accepts either a directed message
+    ``mode`` is ``"sequential"`` by default and maps to a boundary refresh
+    after each bond. ``"parallel"`` is an explicit opt-in simultaneous batch;
+    ``max_workers`` is only used in that mode. ``max_edge_excitations`` is
+    the maximum number of non-cut virtual edges carrying a ``Q`` excitation
+    in the cut-edge environment used for ``B_reduce``; its default ``0`` is
+    the BP/SU vacuum. ``gauges`` accepts SU gauge vectors.
+    ``bp_messages`` accepts either a directed message
     mapping, a BP result with ``.messages``, or a BP result with
     ``.snapshot()``. ``boundary_messages`` is a compatibility alias for
     ``bp_messages``. With ``boundary_mode="auto"``, supplied gauges select
-    SU mode and otherwise BP mode is used.
+    SU mode and otherwise BP mode is used. ``su_opts`` is forwarded to the
+    direct :func:`gauge_all_simple` SU path; ``bp_opts`` is used only by the
+    BP path.
     """
     if mode not in {"parallel", "sequential"}:
         raise ValueError("mode must be 'parallel' or 'sequential'")
@@ -2310,12 +2631,14 @@ def compress_all_gauge(
         update_mode=("simultaneous" if mode == "parallel" else "sequential"),
         parallel=(mode == "parallel"),
         max_workers=max_workers,
+        max_edge_excitations=max_edge_excitations,
         init_candidates=init_candidates,
         boundary_messages=bp_messages,
         gauges=gauges,
         input_mode=input_mode,
         bp_runner=bp_runner,
         bp_opts=bp_opts,
+        su_opts=su_opts,
         compression_opts=compression_opts,
         require_fixed_point=require_fixed_point,
     )
@@ -2327,6 +2650,7 @@ def compress_bond_loop_series(
     *,
     where,
     max_bond: int,
+    max_edge_excitations: int | None = None,
     edge_cutoff: int | None = None,
     gauges=None,
     boundary_messages=None,
@@ -2365,12 +2689,13 @@ def compress_bond_loop_series(
     """Compress one bond with the finite cut-edge ``P + Q`` expansion.
 
     The selected bond is cut open and the loop-series environment is built by
-    summing explicit Q-edge configurations through ``edge_cutoff``. The
+    summing explicit Q-edge configurations through ``max_edge_excitations``.
+    ``edge_cutoff`` remains a compatibility alias. The
     environment has the same four-leg layout as ``B_reduce`` in
     :func:`compress_bond_cluster`, so the existing unconstrained rectangular
     map fit is reused after the series contraction.
 
-    ``edge_cutoff=0`` is the BP-vacuum compression. Increasing the cutoff
+    ``max_edge_excitations=0`` is the BP-vacuum compression. Increasing the cutoff
     adds admissible excitations, including disconnected terms. If the cutoff
     reaches all non-cut internal edges, ``series.complete`` is true and, at a
     converged BP fixed point, the finite-network environment is exact up to
@@ -2414,6 +2739,22 @@ def compress_bond_loop_series(
         raise ValueError("tol must be finite and nonnegative")
     if not np.isfinite(b_reduce_floor) or b_reduce_floor < 0.0:
         raise ValueError("b_reduce_floor must be finite and nonnegative")
+    if edge_cutoff is not None:
+        if max_edge_excitations not in (None, 0, edge_cutoff):
+            raise TypeError(
+                "pass only one of max_edge_excitations and edge_cutoff"
+            )
+        max_edge_excitations = edge_cutoff
+    if max_edge_excitations is not None:
+        if (
+            isinstance(max_edge_excitations, bool)
+            or not isinstance(max_edge_excitations, (int, np.integer))
+            or max_edge_excitations < 0
+        ):
+            raise ValueError(
+                "max_edge_excitations must be a nonnegative integer or None"
+            )
+        max_edge_excitations = int(max_edge_excitations)
 
     als_opts = {} if als_opts is None else dict(als_opts)
     bp_opts = {} if bp_opts is None else dict(bp_opts)
@@ -2445,7 +2786,7 @@ def compress_bond_loop_series(
     series = cut_edge_loop_series_expand(
         series_tn,
         where=where,
-        edge_cutoff=edge_cutoff,
+        edge_cutoff=max_edge_excitations,
         messages=series_messages,
         gauges=series_gauges,
         run_bp=run_bp,

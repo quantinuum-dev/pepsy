@@ -1812,3 +1812,105 @@ def test_vec_sampler_samples_valid_dense_state():
     assert result.configs_1d == [[1, 0], [1, 0]]
     assert all(np.array_equal(grid, np.array([[1, 0]])) for grid in result.configs_2d)
     assert result.probs == [1.0, 1.0]
+
+
+def test_vec_sampler_supports_fixed_pauli_bases():
+    """X and Y sampling rotate eigenstates to deterministic Z outcomes."""
+    plus_x = np.array([1.0, 1.0], dtype=complex) / np.sqrt(2.0)
+    plus_y = np.array([1.0, 1.0j], dtype=complex) / np.sqrt(2.0)
+    site_map = {0: (0, 0)}
+
+    x_result = sampler_mod.VecSampler(plus_x, site_map).sample(
+        8,
+        seed=4,
+        basis="X",
+    )
+    y_result = sampler_mod.VecSampler(plus_y, site_map).sample(
+        8,
+        seed=4,
+        basis="Y",
+    )
+
+    assert x_result.configs_1d == [[0]] * 8
+    assert y_result.configs_1d == [[0]] * 8
+    assert x_result.basis == ("X",)
+    assert y_result.basis == ("Y",)
+
+
+def test_vec_sampler_random_basis_is_per_site_and_seeded():
+    """Random basis mode chooses one reproducible label at every site."""
+    sampler = sampler_mod.VecSampler(np.ones(16), {i: (i, 0) for i in range(4)})
+    first = sampler.sample(5, seed=19, basis="random")
+    second = sampler.sample(5, seed=19, basis="random")
+
+    assert first.basis == second.basis
+    assert len(first.basis) == 4
+    assert set(first.basis) <= {"X", "Y", "Z"}
+    np.testing.assert_array_equal(first.configs_1d, second.configs_1d)
+    np.testing.assert_allclose(
+        sampler.probability_vector(basis=first.basis),
+        sampler.probability_vector(basis=second.basis),
+    )
+
+
+def test_vec_sampler_batch_tracks_basis_and_joint_sample_weights():
+    """The efficient batch API returns conditional and joint probabilities."""
+    sampler = sampler_mod.VecSampler(
+        np.ones(16, dtype=complex),
+        {i: (i, 0) for i in range(4)},
+    )
+    batch = sampler.sample_batch(32, seed=7, basis="random")
+
+    assert batch.configs.shape == (32, 4)
+    assert batch.probs.shape == (32,)
+    assert batch.weights.shape == (32,)
+    assert len(batch.basis) == 4
+    assert batch.basis_probability == pytest.approx(3.0 ** -4)
+    np.testing.assert_allclose(
+        batch.weights,
+        batch.probs * batch.basis_probability,
+    )
+    legacy = batch.to_sample_result()
+    assert legacy.basis == batch.basis
+    np.testing.assert_allclose(legacy.weights, batch.weights)
+
+
+def test_vec_sampler_caches_transformed_basis_distributions():
+    """Repeated sampling in one basis reuses its exact transformed distribution."""
+    sampler = sampler_mod.VecSampler(np.ones(16, dtype=complex), {i: (i, 0) for i in range(4)})
+    first = sampler.probability_vector("XYZZ")
+    second = sampler.probability_vector("XYZZ")
+
+    np.testing.assert_allclose(first, second)
+    assert len(sampler._basis_probability_cache) == 2
+    assert sampler._basis_probability_cache[tuple("XYZZ")] is not None
+
+
+def test_vec_sampler_chunked_batch_and_streaming_api():
+    """Chunking bounds temporary draws while preserving batch metadata."""
+    sampler = sampler_mod.VecSampler(np.ones(64, dtype=complex), {i: (i, 0) for i in range(6)})
+
+    batch = sampler.sample_batch(23, seed=11, basis="random", chunk_size=5)
+    assert batch.configs.shape == (23, 6)
+    assert batch.probs.shape == (23,)
+    assert batch.weights.shape == (23,)
+    np.testing.assert_allclose(batch.weights, batch.probs * batch.basis_probability)
+
+    chunks = list(sampler.iter_samples(23, seed=11, basis="random", chunk_size=5))
+    assert [len(chunk) for chunk in chunks] == [5, 5, 5, 5, 3]
+    assert all(chunk.basis == chunks[0].basis for chunk in chunks)
+    assert all(
+        chunk.basis_probability == pytest.approx(3.0 ** -6)
+        for chunk in chunks
+    )
+    np.testing.assert_allclose(
+        np.concatenate([chunk.weights for chunk in chunks]),
+        np.concatenate([chunk.probs for chunk in chunks]) * chunks[0].basis_probability,
+    )
+
+
+@pytest.mark.parametrize("argument", [0, -1, 1.5, True])
+def test_vec_sampler_rejects_invalid_chunk_size(argument):
+    sampler = sampler_mod.VecSampler(np.ones(4), {0: (0, 0), 1: (1, 0)})
+    with pytest.raises((TypeError, ValueError), match="chunk_size"):
+        sampler.sample_batch(4, chunk_size=argument)

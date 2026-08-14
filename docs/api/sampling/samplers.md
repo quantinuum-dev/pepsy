@@ -81,6 +81,40 @@ require quimb to canonicalize Torch or CuPy tensors before sampling.
 It caches those environments for the current MPS tensors: after modifying the
 MPS, call `sampler.refresh()` before sampling again.
 
+### Dense exact-vector sampler
+
+`VecSampler` supports computational-basis and Pauli-basis sampling from a
+dense state vector:
+
+```python
+sampler = pepsy.VecSampler(state, one_d_to_two_d)
+batch = sampler.sample_batch(4096, seed=0, basis="random", chunk_size=1024)
+
+batch.configs       # shape (4096, n_sites)
+batch.basis         # one resolved X/Y/Z label per site
+batch.probs         # p(outcome | resolved basis)
+batch.weights       # p(basis, outcome)
+batch.basis_probability
+```
+
+Use `basis="X"`, `basis="Y"`, `basis="Z"`, a per-site string such as
+`"XYZZ"`, or `basis="random"`. Random mode chooses each site's basis
+uniformly and independently once per batch, so all shots in that batch share
+the resolved pattern. `sample(...)` retains the legacy list/grid result. The
+batch method avoids constructing a Python grid for every shot, and transformed
+basis distributions are cached with a bounded cache. `probability_vector(...)`
+returns the full conditional distribution for a requested resolved basis.
+For true bounded-memory processing, consume `iter_samples(...)` instead:
+
+```python
+for batch in sampler.iter_samples(100_000, seed=0, chunk_size=4096):
+    train_or_process(batch)
+```
+
+`sample_batch(...)` preallocates the final arrays and uses chunks only for
+temporary draw memory; `iter_samples(...)` does not retain the complete shot
+set.
+
 For a Symmray MPS, `MpsSampler` detects the block-sparse tensor data and
 selects its native symmetry-aware route automatically. It caches a
 right-canonical copy, preserves the source physical-code/charge map, then

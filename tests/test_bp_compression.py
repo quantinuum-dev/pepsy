@@ -517,6 +517,31 @@ def test_cut_edge_loop_series_compression_uses_explicit_degree_cutoff():
     )
 
 
+def test_max_edge_excitations_is_the_preferred_cut_edge_api_name():
+    peps = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, dtype="float64", seed=441)
+    bp = two_norm_bp(peps, max_iterations=2, tol=0.0, diis=False)
+
+    result = cut_edge_loop_series_expand(
+        peps,
+        where=((0, 0), (1, 0)),
+        max_edge_excitations=0,
+        messages=bp.messages,
+        run_bp=False,
+    )
+
+    assert result.max_edge_excitations == 0
+    assert result.bp_info["max_edge_excitations"] == 0
+    with pytest.raises(TypeError, match="only one"):
+        cut_edge_loop_series_expand(
+            peps,
+            where=((0, 0), (1, 0)),
+            edge_cutoff=0,
+            max_edge_excitations=0,
+            messages=bp.messages,
+            run_bp=False,
+        )
+
+
 def test_cut_edge_loop_series_default_does_not_contract_full_network_norm(
     monkeypatch,
 ):
@@ -660,8 +685,9 @@ def test_sequential_loop_series_compression_refreshes_su_gauges():
     assert result.boundary_mode == "su"
     assert result.core is not None
     assert result.gauges
-    assert result.steps[0].bp_after["converged"]
-    assert result.steps[0].message_seed == "projected_old_messages"
+    assert result.messages is None
+    assert result.steps[0].bp_after["source"] == "simple_update"
+    assert result.steps[0].message_seed == "simple_update_gauges"
     assert isinstance(result.compressed, qtn.PEPS)
 
 
@@ -716,6 +742,40 @@ def test_simultaneous_loop_series_compression_uses_one_boundary_snapshot():
     )
 
 
+def test_simultaneous_serial_sweep_honors_initializer_candidates():
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=4541,
+    )
+    sweep = BondLoopSeriesCompressor(
+        peps,
+        bonds=(((0, 0), (1, 0)), ((0, 0), (0, 1))),
+        max_bond=1,
+        update_mode="simultaneous",
+        parallel=False,
+        init_candidates=("projector",),
+        bp_opts={"max_iterations": 100, "tol": 1e-10, "diis": False},
+        compression_opts={
+            "edge_cutoff": 0,
+            "steps": 1,
+            "tol": 0.0,
+            "contract_optimize": "greedy",
+        },
+    )
+
+    result = sweep.run()
+
+    assert len(result.steps) == 2
+    for step in result.steps:
+        selection = step.compression.als_info["initialization_selection"]
+        assert selection["selected"] == "projector"
+        assert tuple(selection["candidates"]) == ("projector",)
+
+
 def test_simultaneous_loop_series_compression_refreshes_su_snapshot():
     peps = qtn.PEPS.rand(
         2,
@@ -749,7 +809,10 @@ def test_simultaneous_loop_series_compression_refreshes_su_snapshot():
     assert result.update_mode == "simultaneous"
     assert result.core is not None
     assert result.gauges
-    assert all(step.bp_after["converged"] for step in result.steps)
+    assert result.messages is None
+    assert all(
+        step.bp_after["source"] == "simple_update" for step in result.steps
+    )
     assert isinstance(result.compressed, qtn.PEPS)
 
 
@@ -812,6 +875,7 @@ def test_compress_all_gauge_is_the_public_all_bond_convenience_wrapper():
     result = compress_all_gauge(
         peps,
         max_bond=1,
+        mode="parallel",
         max_workers=2,
         bp_opts={"max_iterations": 100, "tol": 1e-10, "diis": False},
         compression_opts={
@@ -825,6 +889,32 @@ def test_compress_all_gauge_is_the_public_all_bond_convenience_wrapper():
     assert result.update_mode == "simultaneous"
     assert len(result.steps) == len(tuple(peps.inner_inds()))
     assert set(result.N_reduce_by_bond) == set(peps.inner_inds())
+
+
+def test_compress_all_gauge_defaults_to_sequential_zero_edge_excitations():
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="float64",
+        seed=4581,
+    )
+    result = compress_all_gauge(
+        peps,
+        max_bond=1,
+        bp_opts={"max_iterations": 100, "tol": 1e-10, "diis": False},
+        compression_opts={
+            "steps": 1,
+            "tol": 0.0,
+            "contract_optimize": "greedy",
+        },
+    )
+
+    assert result.update_mode == "sequential"
+    assert all(
+        step.compression.max_edge_excitations == 0 for step in result.steps
+    )
 
 
 def test_compress_all_gauge_accepts_bp_results_and_su_gauges(monkeypatch):
@@ -864,6 +954,7 @@ def test_compress_all_gauge_accepts_bp_results_and_su_gauges(monkeypatch):
     assert sequential.update_mode == "sequential"
     assert sequential.boundary_mode == "bp"
     assert seen_initial_messages[0]
+    bp_call_count = len(seen_initial_messages)
 
     core, gauges, _ = gauge_all_simple(peps, progbar=False)
     su = compress_all_gauge(
@@ -883,6 +974,7 @@ def test_compress_all_gauge_accepts_bp_results_and_su_gauges(monkeypatch):
     assert su.boundary_mode == "su"
     assert su.update_mode == "simultaneous"
     assert su.gauges
+    assert len(seen_initial_messages) == bp_call_count
 
 
 def test_compression_environment_projection_controls_and_legacy_alias():

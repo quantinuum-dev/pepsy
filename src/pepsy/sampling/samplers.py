@@ -91,6 +91,92 @@ def _normalize_mps_sampler_backend(backend):
         ) from exc
 
 
+_MEASUREMENT_BASIS_LABELS = frozenset(("X", "Y", "Z"))
+_DEFAULT_VEC_SAMPLE_CHUNK_SIZE = 4096
+
+
+def _validate_sample_count(n_samples):
+    """Normalize a non-negative integer shot count."""
+    if isinstance(n_samples, bool) or not isinstance(n_samples, Integral):
+        raise TypeError(f"n_samples must be an integer, got {n_samples!r}")
+    n_samples = int(n_samples)
+    if n_samples < 0:
+        raise ValueError(f"n_samples must be non-negative, got {n_samples}")
+    return n_samples
+
+
+def _validate_sample_chunk_size(chunk_size):
+    """Normalize an optional positive integer shot chunk size."""
+    if chunk_size is None:
+        return None
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, Integral):
+        raise TypeError(f"chunk_size must be a positive integer, got {chunk_size!r}")
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    return chunk_size
+
+
+def _resolve_measurement_basis(basis, L, *, rng=None):
+    """Normalize a global, per-site, or random Pauli basis specification."""
+    if basis is None:
+        basis = "Z"
+
+    if isinstance(basis, str):
+        text = basis.strip().upper().replace(" ", "")
+        if text == "RANDOM":
+            if rng is None:
+                rng = np.random.default_rng()
+            return tuple(rng.choice(("X", "Y", "Z"), size=L).tolist())
+        if "," in text:
+            values = tuple(part for part in text.split(",") if part)
+        elif len(text) == 1:
+            values = (text,) * L
+        else:
+            values = tuple(text)
+    else:
+        try:
+            values = tuple(str(value).strip().upper() for value in basis)
+        except TypeError as exc:
+            raise TypeError(
+                "basis must be 'X', 'Y', 'Z', 'random', or a length-L sequence"
+            ) from exc
+
+    if len(values) != L or any(value not in _MEASUREMENT_BASIS_LABELS for value in values):
+        raise ValueError(
+            "basis must be one of 'X', 'Y', 'Z', 'random', or a per-site "
+            f"sequence of exactly L={L} entries from X/Y/Z; got {basis!r}."
+        )
+    return values
+
+
+def _measurement_rotation(label):
+    """Return the unitary that maps a Pauli measurement to computational Z."""
+    if label == "Z":
+        return np.eye(2, dtype=complex)
+    hadamard = np.asarray(((1.0, 1.0), (1.0, -1.0)), dtype=complex) / np.sqrt(2.0)
+    if label == "X":
+        return hadamard
+    # For Y, apply S^dagger followed by H: H S^dagger maps Y eigenstates
+    # to computational Z eigenstates.
+    phase_dagger = np.diag((1.0, -1.0j))
+    return hadamard @ phase_dagger
+
+
+def _basis_selection_probability(basis, L):
+    """Return the proposal probability of a resolved basis pattern.
+
+    Explicit basis specifications are treated as deterministic choices. The
+    special ``"random"`` policy chooses each site's X/Y/Z label uniformly and
+    independently, so one resolved pattern has probability ``3**(-L)``.
+    """
+    if isinstance(basis, str):
+        text = basis.strip().upper().replace(" ", "")
+        if text == "RANDOM":
+            return float(3.0 ** (-int(L)))
+    return 1.0
+
+
 def _normalize_symmray_prefix_strategy(strategy):
     if strategy is None:
         return "auto"
@@ -390,7 +476,17 @@ def _prepare_bp_binary_network(tn, *, site_order=None, encoding=None):
     return work, split_inds, sites, code_order
 
 
-def _configs_to_sample_result(configs, probs, *, Lx, Ly, one_d_to_two_d):
+def _configs_to_sample_result(
+    configs,
+    probs,
+    *,
+    Lx,
+    Ly,
+    one_d_to_two_d,
+    basis=None,
+    basis_probability=1.0,
+    weights=None,
+):
     configs_1d = []
     configs_2d = []
     probs_out = []
@@ -409,6 +505,9 @@ def _configs_to_sample_result(configs, probs, *, Lx, Ly, one_d_to_two_d):
         probs=probs_out,
         Lx=Lx,
         Ly=Ly,
+        basis=basis,
+        basis_probability=basis_probability,
+        weights=probs_out if weights is None else weights,
     )
 
 
@@ -452,6 +551,16 @@ class MpsSampleResult:
         Lattice width.
     Ly : int
         Lattice height.
+    basis : tuple[str, ...] | None
+        Pauli basis used at each site. ``None`` means the legacy sampler did
+        not attach basis metadata; ``VecSampler`` always records it.
+    basis_probability : float
+        Probability of selecting the resolved basis pattern under the basis
+        proposal. Fixed bases have probability one; ``VecSampler``'s
+        ``basis="random"`` has probability ``3**(-L)``.
+    weights : list[float]
+        Joint proposal probability of each returned basis/outcome pair. This
+        equals ``probs`` for fixed-basis sampling.
     """
 
     configs_1d: list[list[int]]
@@ -459,6 +568,18 @@ class MpsSampleResult:
     probs: list[float]
     Lx: int
     Ly: int
+    basis: tuple[str, ...] | None = None
+    basis_probability: float = 1.0
+    weights: list[float] | None = None
+
+    def __post_init__(self):
+        self.basis_probability = float(self.basis_probability)
+        if not np.isfinite(self.basis_probability) or self.basis_probability <= 0:
+            raise ValueError("basis_probability must be finite and positive")
+        if self.weights is None:
+            self.weights = self.probs
+        if len(self.weights) != len(self.probs):
+            raise ValueError("weights and probs must have the same length")
 
     def __len__(self):
         return len(self.configs_1d)
@@ -701,6 +822,12 @@ class MpsBatchSampleResult:
     backend
         Backend of ``configs`` and ``probs``: ``"numpy"``, ``"torch"``, or
         ``"cupy"``.
+    basis
+        Pauli basis used at each site, when the sampler supplies it.
+    basis_probability
+        Probability of selecting the resolved basis pattern.
+    weights
+        Joint proposal probability of each returned basis/outcome pair.
     """
 
     configs: Any
@@ -710,6 +837,18 @@ class MpsBatchSampleResult:
     one_d_to_two_d: dict[int, tuple[int, int]]
     backend: str = "numpy"
     configuration_encoding: FermionConfigurationEncoding | None = None
+    basis: tuple[str, ...] | None = None
+    basis_probability: float = 1.0
+    weights: Any | None = None
+
+    def __post_init__(self):
+        self.basis_probability = float(self.basis_probability)
+        if not np.isfinite(self.basis_probability) or self.basis_probability <= 0:
+            raise ValueError("basis_probability must be finite and positive")
+        if self.weights is None:
+            self.weights = self.probs
+        if getattr(self.weights, "shape", None) != getattr(self.probs, "shape", None):
+            raise ValueError("weights and probs must have the same shape")
 
     def __len__(self):
         return int(self.configs.shape[0])
@@ -734,6 +873,9 @@ class MpsBatchSampleResult:
             one_d_to_two_d=dict(self.one_d_to_two_d),
             backend="numpy",
             configuration_encoding=self.configuration_encoding,
+            basis=self.basis,
+            basis_probability=self.basis_probability,
+            weights=_backend_array_to_numpy(self.weights),
         )
 
     def configs_1d(self) -> list[list[int]]:
@@ -777,6 +919,9 @@ class MpsBatchSampleResult:
             Lx=batch.Lx,
             Ly=batch.Ly,
             one_d_to_two_d=batch.one_d_to_two_d,
+            basis=batch.basis,
+            basis_probability=batch.basis_probability,
+            weights=batch.weights,
         )
 
 
@@ -3468,6 +3613,11 @@ class VecSampler:
         Mapping from 1D site index to (x, y) lattice coordinate.
     ind_id : str
         Format string for physical index names (default ``'k{}'``).
+    basis : str or sequence[str], optional
+        Sampling basis is supplied to :meth:`sample`, rather than fixed at
+        construction. It can be global ``"X"``, ``"Y"``, or ``"Z"``, the
+        string ``"random"`` for an independent random choice at each site,
+        or a length-``L`` sequence such as ``"XYZZZ"``.
     """
 
     def __init__(
@@ -3498,8 +3648,11 @@ class VecSampler:
         if not np.isfinite(total) or total <= 0:
             raise ValueError("state vector must have a finite non-zero norm.")
         probs /= total
+        self._vector = vec / np.sqrt(total)
         self._probs = probs
         self._L = L
+        self._basis_probability_cache = {("Z",) * L: self._probs}
+        self._basis_probability_cache_limit = 16
 
     @staticmethod
     def _to_vector(state, L, ind_id):
@@ -3517,39 +3670,206 @@ class VecSampler:
         # Raw array
         return np.asarray(state).reshape(-1)
 
-    def sample(self, n_samples: int = 1, seed: int | None = None) -> MpsSampleResult:
+    def _probabilities_for_basis(self, basis):
+        """Return the normalized distribution in a resolved local basis."""
+        basis = tuple(basis)
+        cached = self._basis_probability_cache.get(basis)
+        if cached is not None:
+            return cached
+
+        vector = self._vector.reshape((2,) * self._L)
+        for site, label in enumerate(basis):
+            vector = np.tensordot(
+                _measurement_rotation(label),
+                vector,
+                axes=(1, site),
+            )
+            vector = np.moveaxis(vector, 0, site)
+        probabilities = np.abs(vector.reshape(-1)) ** 2
+        probabilities /= probabilities.sum()
+        if len(self._basis_probability_cache) >= self._basis_probability_cache_limit:
+            z_basis = ("Z",) * self._L
+            oldest = next(
+                key for key in self._basis_probability_cache if key != z_basis
+            )
+            del self._basis_probability_cache[oldest]
+        self._basis_probability_cache[basis] = probabilities
+        return probabilities
+
+    def probability_vector(
+        self,
+        basis="Z",
+        *,
+        seed: int | None = None,
+    ) -> np.ndarray:
+        """Return the exact normalized distribution in a measurement basis.
+
+        ``basis="random"`` chooses one independent X/Y/Z label per site and
+        uses ``seed`` to make that pattern reproducible. The returned vector
+        uses the same big-endian bit ordering as computational-basis sampling.
+        """
+        rng = np.random.default_rng(seed)
+        resolved_basis = _resolve_measurement_basis(basis, self._L, rng=rng)
+        return np.asarray(self._probabilities_for_basis(resolved_basis)).copy()
+
+    def sample(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        basis="Z",
+        chunk_size: int | None = _DEFAULT_VEC_SAMPLE_CHUNK_SIZE,
+    ) -> MpsSampleResult:
         """Draw ``n_samples`` configurations from the state vector.
+
+        Parameters
+        ----------
+        basis : {"X", "Y", "Z", "random"} or sequence[str]
+            Measurement basis. A sequence supplies one Pauli basis per site.
+            For ``"random"``, one basis pattern is drawn per call and shared
+            by all samples in that call. This is the efficient setting for
+            randomized-basis batches; it is not a different basis per shot.
+        chunk_size : int or None
+            Number of shots generated at a time. The default uses bounded
+            internal draw memory. This does not reduce the memory of the
+            returned legacy lists/grids; use :meth:`iter_samples` for true
+            streaming.
 
         Returns
         -------
         MpsSampleResult
             Contains 1D configs, 2D grids, and Born probabilities.
         """
+        return self.sample_batch(
+            n_samples=n_samples,
+            seed=seed,
+            basis=basis,
+            chunk_size=chunk_size,
+        ).to_sample_result()
+
+    def _draw_samples(
+        self,
+        n_samples=1,
+        *,
+        seed=None,
+        rng=None,
+        basis="Z",
+        resolved_basis=None,
+        probabilities=None,
+    ):
+        """Draw a NumPy batch without constructing legacy 2D grids."""
+        n_samples = _validate_sample_count(n_samples)
+        if rng is None:
+            rng = np.random.default_rng(seed)
+        if resolved_basis is None:
+            resolved_basis = _resolve_measurement_basis(basis, self._L, rng=rng)
+        if probabilities is None:
+            probabilities = self._probabilities_for_basis(resolved_basis)
+        indices = rng.choice(len(probabilities), size=n_samples, p=probabilities)
+        bit_positions = np.arange(self._L - 1, -1, -1, dtype=np.int64)
+        configs = ((np.asarray(indices, dtype=np.int64)[:, None] >> bit_positions) & 1).astype(
+            np.int8,
+            copy=False,
+        )
+        probs = np.asarray(probabilities[indices], dtype=float)
+        basis_probability = _basis_selection_probability(basis, self._L)
+        weights = probs * basis_probability
+        return configs, probs, weights, resolved_basis, basis_probability
+
+    def iter_samples(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        basis="Z",
+        chunk_size: int = _DEFAULT_VEC_SAMPLE_CHUNK_SIZE,
+    ):
+        """Stream sampled batches with bounded shot-memory.
+
+        The state vector and one resolved-basis probability vector remain
+        resident, but only ``chunk_size`` configurations, probabilities, and
+        weights are materialized at once. In ``basis="random"`` mode, one
+        independent X/Y/Z basis label is chosen per site and shared by all
+        yielded chunks from this call.
+        """
+        n_samples = _validate_sample_count(n_samples)
+        chunk_size = _validate_sample_chunk_size(chunk_size)
+        if chunk_size is None:
+            chunk_size = max(1, n_samples)
         rng = np.random.default_rng(seed)
-        indices = rng.choice(len(self._probs), size=n_samples, p=self._probs)
+        resolved_basis = _resolve_measurement_basis(basis, self._L, rng=rng)
+        probabilities = self._probabilities_for_basis(resolved_basis)
+        basis_probability = _basis_selection_probability(basis, self._L)
+        for start in range(0, n_samples, chunk_size):
+            count = min(chunk_size, n_samples - start)
+            configs, probs, weights, _, _ = self._draw_samples(
+                count,
+                rng=rng,
+                basis=basis,
+                resolved_basis=resolved_basis,
+                probabilities=probabilities,
+            )
+            yield MpsBatchSampleResult(
+                configs=configs,
+                probs=probs,
+                Lx=self.Lx,
+                Ly=self.Ly,
+                one_d_to_two_d=dict(self.one_d_to_two_d),
+                backend="numpy",
+                basis=resolved_basis,
+                basis_probability=basis_probability,
+                weights=weights,
+            )
 
-        configs_1d = []
-        configs_2d = []
-        probs = []
+    def sample_batch(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        basis="Z",
+        chunk_size: int | None = _DEFAULT_VEC_SAMPLE_CHUNK_SIZE,
+    ) -> MpsBatchSampleResult:
+        """Draw a backend-neutral NumPy batch without Python per-shot loops.
 
-        for idx in indices:
-            # Convert flat index to binary configuration (big-endian: site 0 is MSB)
-            config = [(idx >> (self._L - 1 - site)) & 1 for site in range(self._L)]
-            configs_1d.append(config)
+        ``sample`` remains the compatibility API that also builds one 2D grid
+        per shot. ``chunk_size`` bounds temporary draw allocations; the final
+        returned arrays still contain all requested shots. Use
+        :meth:`iter_samples` when the consumer can process streaming chunks.
+        """
+        n_samples = _validate_sample_count(n_samples)
+        chunk_size = _validate_sample_chunk_size(chunk_size)
+        if chunk_size is None:
+            chunk_size = max(1, n_samples)
 
-            grid = np.zeros((self.Ly, self.Lx), dtype=int)
-            for site_1d, spin in enumerate(config):
-                x, y = self.one_d_to_two_d[site_1d]
-                grid[y, x] = spin
-            configs_2d.append(grid)
-            probs.append(float(self._probs[idx]))
-
-        return MpsSampleResult(
-            configs_1d=configs_1d,
-            configs_2d=configs_2d,
+        rng = np.random.default_rng(seed)
+        resolved_basis = _resolve_measurement_basis(basis, self._L, rng=rng)
+        probabilities = self._probabilities_for_basis(resolved_basis)
+        basis_probability = _basis_selection_probability(basis, self._L)
+        configs = np.empty((n_samples, self._L), dtype=np.int8)
+        probs = np.empty(n_samples, dtype=float)
+        weights = np.empty(n_samples, dtype=float)
+        for start in range(0, n_samples, chunk_size):
+            stop = min(n_samples, start + chunk_size)
+            chunk_configs, chunk_probs, chunk_weights, _, _ = self._draw_samples(
+                stop - start,
+                rng=rng,
+                basis=basis,
+                resolved_basis=resolved_basis,
+                probabilities=probabilities,
+            )
+            configs[start:stop] = chunk_configs
+            probs[start:stop] = chunk_probs
+            weights[start:stop] = chunk_weights
+        return MpsBatchSampleResult(
+            configs=configs,
             probs=probs,
             Lx=self.Lx,
             Ly=self.Ly,
+            one_d_to_two_d=dict(self.one_d_to_two_d),
+            backend="numpy",
+            basis=resolved_basis,
+            basis_probability=basis_probability,
+            weights=weights,
         )
 
 

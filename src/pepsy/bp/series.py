@@ -427,6 +427,11 @@ class CutEdgeLoopSeriesResult:
     contraction_cost: dict[str, float] | None = None
     cost_limits: dict[str, float | None] | None = None
 
+    @property
+    def max_edge_excitations(self) -> int:
+        """Preferred name for the cut-edge excitation degree."""
+        return self.edge_cutoff
+
 
 @dataclass(frozen=True)
 class _OpenEnumerationLimits:
@@ -2577,6 +2582,7 @@ def cut_edge_loop_series_expand(
     where=None,
     bond_ind=None,
     edge_cutoff: int | None = None,
+    max_edge_excitations: int | None = None,
     messages=None,
     boundary_messages=None,
     gauges=None,
@@ -2616,7 +2622,7 @@ def cut_edge_loop_series_expand(
     terms are retained, so the full finite cutoff is an exact identity
     expansion rather than an assumed sum of region Hessians.
 
-    ``edge_cutoff=0`` returns the BP vacuum environment. Increasing the
+    ``max_edge_excitations=0`` returns the BP vacuum environment. Increasing the
     cutoff adds Q excitations. When the cutoff reaches the number of
     non-cut internal edges, ``complete`` is true and the finite expansion
     contains every admissible configuration. At a converged BP fixed point,
@@ -2626,6 +2632,12 @@ def cut_edge_loop_series_expand(
     """
     if messages is not None and boundary_messages is not None:
         raise ValueError("pass either messages or boundary_messages, not both")
+    if edge_cutoff is not None and max_edge_excitations is not None:
+        raise TypeError(
+            "pass only one of max_edge_excitations and edge_cutoff"
+        )
+    if max_edge_excitations is not None:
+        edge_cutoff = max_edge_excitations
     if boundary_messages is not None:
         messages = boundary_messages
     if gauges is not None and messages is not None:
@@ -2803,6 +2815,7 @@ def cut_edge_loop_series_expand(
         {
             "bond_ind": bond_ind,
             "edge_cutoff": edge_cutoff,
+            "max_edge_excitations": edge_cutoff,
             "term_count": len(terms),
             "term_count_by_degree": term_count_by_degree,
             "complete": edge_cutoff >= len(pairwise_edges),
