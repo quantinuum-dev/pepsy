@@ -2311,7 +2311,7 @@ def compress_all_gauge(
         parallel=(mode == "parallel"),
         max_workers=max_workers,
         init_candidates=init_candidates,
-        boundary_messages=boundary_messages,
+        boundary_messages=bp_messages,
         gauges=gauges,
         input_mode=input_mode,
         bp_runner=bp_runner,

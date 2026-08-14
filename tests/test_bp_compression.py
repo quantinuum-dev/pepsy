@@ -827,7 +827,7 @@ def test_compress_all_gauge_is_the_public_all_bond_convenience_wrapper():
     assert set(result.N_reduce_by_bond) == set(peps.inner_inds())
 
 
-def test_compress_all_gauge_accepts_bp_results_and_su_gauges():
+def test_compress_all_gauge_accepts_bp_results_and_su_gauges(monkeypatch):
     peps = qtn.PEPS.rand(
         2,
         2,
@@ -837,6 +837,18 @@ def test_compress_all_gauge_accepts_bp_results_and_su_gauges():
         seed=459,
     )
     bp = two_norm_bp(peps, max_iterations=20, tol=0.0, diis=False)
+    seen_initial_messages = []
+    original_run_bp = BondLoopSeriesCompressor._run_bp
+
+    def record_initial_messages(self, tn, init_messages):
+        seen_initial_messages.append(init_messages is not None)
+        return original_run_bp(self, tn, init_messages)
+
+    monkeypatch.setattr(
+        BondLoopSeriesCompressor,
+        "_run_bp",
+        record_initial_messages,
+    )
     sequential = compress_all_gauge(
         peps,
         max_bond=1,
@@ -851,6 +863,7 @@ def test_compress_all_gauge_accepts_bp_results_and_su_gauges():
     )
     assert sequential.update_mode == "sequential"
     assert sequential.boundary_mode == "bp"
+    assert seen_initial_messages[0]
 
     core, gauges, _ = gauge_all_simple(peps, progbar=False)
     su = compress_all_gauge(
