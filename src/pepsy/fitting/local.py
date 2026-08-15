@@ -777,6 +777,55 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             t |= env_left[site_tag_id.format(site - 1)]
             env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
 
+    def _build_env_left(self, psi, env_left):
+        """Build inclusive left environments for all sites."""
+        contraction_opt = self.contraction_opt
+        site_tag_id = self.site_tag_id
+
+        for i in range(self.L):
+            psi_block = psi.H.select([site_tag_id.format(i)], "all")
+            if site_tag_id.format(i) in self.tn.tags:
+                tn_block = self.tn.select([site_tag_id.format(i)], "all")
+                t = psi_block | tn_block
+            else:
+                t = psi_block
+
+            if i == 0:
+                env_left[site_tag_id.format(i)] = t.contract(
+                    all,
+                    optimize=contraction_opt,
+                )
+            else:
+                t |= env_left[site_tag_id.format(i - 1)]
+                env_left[site_tag_id.format(i)] = t.contract(
+                    all,
+                    optimize=contraction_opt,
+                )
+
+    def _update_env_right(self, psi, site: int, env_right):
+        """Update right environment incrementally for current site."""
+        psi_block = psi.H.select([self.site_tag_id.format(site)], "all")
+        contraction_opt = self.contraction_opt
+        site_tag_id = self.site_tag_id
+
+        if site_tag_id.format(site) in self.tn.tags:
+            tn_block = self.tn.select([site_tag_id.format(site)], "all")
+            t = psi_block | tn_block
+        else:
+            t = psi_block
+
+        if site == self.L - 1:
+            env_right[site_tag_id.format(site)] = t.contract(
+                all,
+                optimize=contraction_opt,
+            )
+        else:
+            t |= env_right[site_tag_id.format(site + 1)]
+            env_right[site_tag_id.format(site)] = t.contract(
+                all,
+                optimize=contraction_opt,
+            )
+
     @_native_fermionic_bra_block_fit
     def run_eff(
         self,
@@ -784,11 +833,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         verbose=False,
         *,
         block_size=1,
-        sweep_sequence="R",
+        sweep_sequence="RL",
         max_bond=None,
         cutoff=None,
         cutoff_mode="rsum2",
         collect_split_diagnostics=True,
+        adaptive_block_sweeps=None,
+        min_iter=None,
+        rtol=None,
+        patience=1,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run full-chain fitting sweeps with cached left/right environments.
 
@@ -797,13 +850,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         full-chain counterpart of :meth:`run_gate`: ``run_eff`` deliberately
         visits every site and does not use ``range_int`` to restrict the fit.
 
-        ``block_size=1`` retains the legacy fixed-rank one-site update. The
+        ``block_size=1`` retains the fixed-rank one-site compatibility update. The
         opt-in ``block_size=2`` and ``block_size=3`` paths use the same cached
         full-chain environments and native Quimb/Symmray SVD splits as
         :meth:`run_gate`; only bonds reached by those splits can grow, up to
-        ``max_bond``. These block updates keep fixed-sweep semantics: every
-        requested sweep in ``sweep_sequence`` is performed and no adaptive
-        tolerance stopping is applied.
+        ``max_bond``. These block updates keep fixed-sweep semantics unless
+        ``rtol`` is enabled: every requested sweep in ``sweep_sequence`` is
+        performed when tolerance stopping is disabled.
 
         The DMRG circuit path uses ``run_gate`` instead. A gate target differs
         from the current MPS only on its active interval, so fitting the whole
@@ -820,8 +873,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             Number of neighboring tensors optimized by the cached update.
             The default one-site path is retained for boundary and sampling
             compatibility. Two- and three-site paths use native SVD splits.
-        sweep_sequence : str, default="R"
-            Fixed sequence of sweep directions for block sizes 2 and 3.
+        sweep_sequence : str, default="RL"
+            Fixed sequence of sweep directions for all block sizes.
             ``"R"`` is left-to-right, ``"L"`` is right-to-left, and
             sequences such as ``"RL"`` alternate directions.
         max_bond : int | None, default=None
@@ -834,6 +887,25 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             Quimb SVD cutoff mode for block sizes 2 and 3.
         collect_split_diagnostics : bool, default=True
             Store native SVD metadata in ``self.info`` for block sizes 2 and 3.
+        adaptive_block_sweeps : int | None, default=None
+            If set for ``block_size=2`` or ``block_size=3``, use the selected
+            block update for this many initial sweeps and then use one-site
+            refinement for the remaining sweeps. ``None`` preserves the
+            historical fixed-block behavior.
+        min_iter : int | None, default=None
+            Minimum number of completed sweeps before ``rtol`` can stop the
+            run. Defaults to ``2`` when ``rtol`` is enabled and to ``n_iter``
+            otherwise. Adaptive stopping always requires two completed sweeps
+            so it has a comparable pair of retained norms. A block-to-one-site
+            transition always completes its requested block warm-up before
+            convergence can stop the run.
+        rtol : float | None, default=None
+            Relative change tolerance for the terminal retained center norm.
+            ``None`` performs exactly ``n_iter`` sweeps and does not add a
+            backend-to-host diagnostic transfer.
+        patience : int, default=1
+            Number of stable retained-norm samples required when ``rtol`` is
+            enabled. A phase transition resets this window.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -856,6 +928,39 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if not math.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("cutoff must be a finite non-negative number.")
         collect_split_diagnostics = bool(collect_split_diagnostics)
+        if adaptive_block_sweeps is not None:
+            if block_size not in {2, 3}:
+                raise ValueError(
+                    "adaptive_block_sweeps is only configurable for block_size=2 or 3."
+                )
+            if (
+                not isinstance(adaptive_block_sweeps, Integral)
+                or int(adaptive_block_sweeps) < 1
+            ):
+                raise ValueError(
+                    "adaptive_block_sweeps must be a positive integer or None."
+                )
+            adaptive_block_sweeps = min(int(adaptive_block_sweeps), n_iter)
+        adaptive_schedule = adaptive_block_sweeps is not None
+        if min_iter is None:
+            min_iter = 2 if rtol is not None else n_iter
+        if not isinstance(min_iter, Integral) or int(min_iter) < 1:
+            raise ValueError("min_iter must be a positive integer or None.")
+        min_iter = min(int(min_iter), n_iter)
+        if rtol is not None:
+            if n_iter < 2:
+                raise ValueError(
+                    "run_eff with rtol requires n_iter >= 2 for a comparable "
+                    "pair of sweep norms."
+                )
+            if min_iter < 2:
+                raise ValueError("run_eff with rtol requires min_iter >= 2.")
+            rtol = float(rtol)
+            if not math.isfinite(rtol) or rtol < 0.0:
+                raise ValueError("rtol must be a finite non-negative number or None.")
+        if not isinstance(patience, Integral) or int(patience) < 1:
+            raise ValueError("patience must be a positive integer.")
+        patience = int(patience)
 
         site_tag_id = self.site_tag_id
         psi = self.p
@@ -888,11 +993,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
             sweep_cache = None
             self._sweep_environment_reuse_count = 0
+            previous_sweep_norm = None
+            stable_sweeps = 0
             for sweep in range(n_iter):
                 direction = sweep_sequence[sweep % len(sweep_sequence)]
                 previous_direction = (
                     None if sweep_cache is None else sweep_cache.direction
                 )
+                previous_block_size = (
+                    None if sweep_cache is None else sweep_cache.block_size
+                )
+                active_block_size = (
+                    block_size
+                    if not adaptive_schedule or sweep < adaptive_block_sweeps
+                    else 1
+                )
+                if (
+                    previous_block_size is not None
+                    and active_block_size != previous_block_size
+                ):
+                    previous_sweep_norm = None
+                    stable_sweeps = 0
+                    self.last_relative_change = None
                 reuse_canonical_form = (
                     self._fermionic_bra_working
                     and previous_direction is None
@@ -904,11 +1026,24 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if self._allow_sweep_environment_reuse and sweep_cache is not None:
                     fixed_environments = sweep_cache.fixed_for(
                         direction=direction,
-                        block_size=block_size,
+                        block_size=active_block_size,
                     )
                 if fixed_environments is not None:
                     self._sweep_environment_reuse_count += 1
-                if block_size == 2:
+                self.iterations_run = sweep + 1
+                if active_block_size == 1:
+                    self.one_site_sweeps_run += 1
+                    boundaries = self._run_gate_one_site_sweep(
+                        psi,
+                        0,
+                        L - 1,
+                        direction=direction,
+                        timing_record=None,
+                        reuse_canonical_form=reuse_canonical_form,
+                        fixed_environments=fixed_environments,
+                    )
+                elif active_block_size == 2:
+                    self.adaptive_sweeps_run += 1
                     boundaries = self._run_gate_two_site_sweep(
                         psi,
                         0,
@@ -923,6 +1058,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         fixed_environments=fixed_environments,
                     )
                 else:
+                    self.adaptive_sweeps_run += 1
                     boundaries = self._run_gate_three_site_sweep(
                         psi,
                         0,
@@ -936,10 +1072,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         reuse_canonical_form=reuse_canonical_form,
                         fixed_environments=fixed_environments,
                     )
+                self.final_direction = direction
+                self.final_center_site = L - 1 if direction == "R" else 0
+                self.final_norm = self.local_norm_trace[-1]
                 sweep_cache = _SweepEnvironmentCache(
                     boundaries,
                     direction=direction,
-                    block_size=block_size,
+                    block_size=active_block_size,
                 )
                 if verbose:
                     fidelity = tn_fidelity(
@@ -948,22 +1087,212 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         contraction_opt=contraction_opt,
                     )
                     self.fidelity_trace.append(ar.do("real", fidelity))
+
+                should_stop = False
+                reset_tolerance = False
+                if rtol is not None:
+                    _, sweep_norm = self._sweep_diagnostics_to_host(
+                        psi,
+                        0,
+                        L - 1,
+                        self.final_norm,
+                        check_finite=False,
+                        read_norm=True,
+                    )
+                    self.sweep_norm_trace.append(sweep_norm)
+                    if previous_sweep_norm is not None:
+                        scale = max(
+                            abs(sweep_norm),
+                            abs(previous_sweep_norm),
+                            float.fromhex("0x1.0p-1022"),
+                        )
+                        relative_change = abs(
+                            sweep_norm - previous_sweep_norm
+                        ) / scale
+                        self.last_relative_change = relative_change
+                        if relative_change <= rtol:
+                            stable_sweeps += 1
+                        else:
+                            stable_sweeps = 0
+                        required_stable_changes = max(1, patience - 1)
+                        if (
+                            sweep + 1 >= min_iter
+                            and stable_sweeps >= required_stable_changes
+                        ):
+                            warmup_incomplete = (
+                                adaptive_schedule
+                                and sweep + 1 < adaptive_block_sweeps
+                            )
+                            warmup_finished_with_refinement = (
+                                adaptive_schedule
+                                and sweep + 1 == adaptive_block_sweeps
+                                and sweep + 1 < n_iter
+                            )
+                            if not (
+                                warmup_incomplete
+                                or warmup_finished_with_refinement
+                            ):
+                                self.converged = True
+                                self.convergence_reason = "relative_tolerance"
+                                should_stop = True
+                            elif warmup_finished_with_refinement:
+                                reset_tolerance = True
+                                stable_sweeps = 0
+                                self.last_relative_change = None
+                    previous_sweep_norm = None if reset_tolerance else sweep_norm
+
+                next_sweep = sweep + 1
+                next_block_size = (
+                    block_size
+                    if not adaptive_schedule or next_sweep < adaptive_block_sweeps
+                    else 1
+                )
+                if (
+                    self._allow_sweep_environment_reuse
+                    and not should_stop
+                    and adaptive_schedule
+                    and active_block_size in {2, 3}
+                    and next_sweep <= n_iter - 1
+                    and next_block_size == 1
+                    and sweep_sequence[next_sweep % len(sweep_sequence)] != direction
+                ):
+                    self._extend_block_cache_for_one_site(
+                        psi,
+                        boundaries,
+                        0,
+                        L - 1,
+                        direction,
+                        block_size=active_block_size,
+                    )
+                    sweep_cache = _SweepEnvironmentCache(
+                        boundaries,
+                        direction=direction,
+                        block_size=active_block_size,
+                        one_site_ready=True,
+                    )
+                if should_stop:
+                    break
+            return
+
+        if rtol is not None or not (self.p.isfermionic() or self.tn.isfermionic()):
+            # Dense and non-fermionic native fits use the same cached one-site
+            # kernel as run_gate. Fixed-sweep run_eff keeps the compatibility
+            # update and sweep order, while reusing the completed opposite-side
+            # environment instead of rebuilding it at every direction change.
+            # Fermionic fixed-sweep compatibility remains on the legacy route;
+            # the native bra wrapper is intentionally limited to block fits.
+            sweep_cache = None
+            self._sweep_environment_reuse_count = 0
+            previous_sweep_norm = None
+            stable_sweeps = 0
+            for sweep in range(n_iter):
+                direction = sweep_sequence[sweep % len(sweep_sequence)]
+                previous_direction = (
+                    None if sweep_cache is None else sweep_cache.direction
+                )
+                fixed_environments = None
+                if self._allow_sweep_environment_reuse and sweep_cache is not None:
+                    fixed_environments = sweep_cache.fixed_for(
+                        direction=direction,
+                        block_size=1,
+                    )
+                if fixed_environments is not None:
+                    self._sweep_environment_reuse_count += 1
+                boundaries = self._run_gate_one_site_sweep(
+                    psi,
+                    0,
+                    L - 1,
+                    direction=direction,
+                    timing_record=None,
+                    reuse_canonical_form=(
+                        previous_direction is not None
+                        and previous_direction != direction
+                    ),
+                    fixed_environments=fixed_environments,
+                )
+                self.iterations_run = sweep + 1
+                self.one_site_sweeps_run += 1
+                self.final_direction = direction
+                self.final_center_site = L - 1 if direction == "R" else 0
+                self.final_norm = self.local_norm_trace[-1]
+                sweep_cache = _SweepEnvironmentCache(
+                    boundaries,
+                    direction=direction,
+                    block_size=1,
+                )
+                if verbose:
+                    fidelity = tn_fidelity(
+                        self.tn,
+                        self._physical_working_state(psi),
+                        contraction_opt=contraction_opt,
+                    )
+                    self.fidelity_trace.append(ar.do("real", fidelity))
+                if rtol is not None:
+                    _, sweep_norm = self._sweep_diagnostics_to_host(
+                        psi,
+                        0,
+                        L - 1,
+                        self.final_norm,
+                        check_finite=False,
+                        read_norm=True,
+                    )
+                    self.sweep_norm_trace.append(sweep_norm)
+                    if previous_sweep_norm is not None:
+                        scale = max(
+                            abs(sweep_norm),
+                            abs(previous_sweep_norm),
+                            float.fromhex("0x1.0p-1022"),
+                        )
+                        relative_change = abs(
+                            sweep_norm - previous_sweep_norm
+                        ) / scale
+                        self.last_relative_change = relative_change
+                        if relative_change <= rtol:
+                            stable_sweeps += 1
+                        else:
+                            stable_sweeps = 0
+                        if (
+                            sweep + 1 >= min_iter
+                            and stable_sweeps >= max(1, patience - 1)
+                        ):
+                            self.converged = True
+                            self.convergence_reason = "relative_tolerance"
+                            break
+                    previous_sweep_norm = sweep_norm
             return
 
         env_left = {site_tag_id.format(i): None for i in range(psi.L)}
         env_right = {site_tag_id.format(i): None for i in range(psi.L)}
 
-        for _ in range(n_iter):
-            for site in range(L):
+        for sweep in range(n_iter):
+            direction = sweep_sequence[sweep % len(sweep_sequence)]
+            self.iterations_run = sweep + 1
+            self.one_site_sweeps_run += 1
+            self.final_direction = direction
+            self.final_center_site = L - 1 if direction == "R" else 0
+
+            if direction == "R":
+                sites = range(L)
+            else:
+                sites = range(L - 1, -1, -1)
+
+            for site in sites:
                 # Determine orthogonalization reference
-                ortho_arg = "calc" if site == 0 else site - 1
+                if direction == "R":
+                    ortho_arg = "calc" if site == 0 else site - 1
+                else:
+                    ortho_arg = "calc" if site == L - 1 else site + 1
                 # Canonicalize psi at the current site
                 psi.canonize(site, cur_orthog=ortho_arg, bra=None)
 
-                if site == 0:
+                if direction == "R" and site == 0:
                     self._build_env_right(psi, env_right)
-                else:
+                elif direction == "R":
                     self._update_env_left(psi, site - 1, env_left)
+                elif site == L - 1:
+                    self._build_env_left(psi, env_left)
+                else:
+                    self._update_env_right(psi, site + 1, env_right)
 
                 if self.site_tag_id.format(site) in self.tn.tags:
                     tn_site = self.tn.select([site_tag_id.format(site)], "any")

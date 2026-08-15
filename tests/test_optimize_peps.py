@@ -164,6 +164,43 @@ def test_peps_optimizer_routes_two_site_boundary_policy(monkeypatch):
         assert init_kwargs[key] == value
 
 
+def test_peps_optimizer_routes_adaptive_eff_boundary_policy(monkeypatch):
+    """Adaptive full-chain FIT controls reach PEPS normalization and sweeps."""
+    calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def _fake_infidelity(_state, _target, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+    policy = {
+        "fit_mode": "eff",
+        "fit_block_size": 2,
+        "fit_adaptive_sweeps": 2,
+        "fit_sweep_sequence": "RL",
+        "fit_min_iter": 2,
+        "fit_rtol": 1.0e-8,
+        "fit_patience": 2,
+    }
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs=policy,
+        normalize_initial=False,
+    )
+
+    opt.normalize()
+    opt.estimate_infidelity(DummyState(), DummyState())
+    init_kwargs, _, _ = opt._sweep_boundary_kwargs(progress=False)
+
+    for key, value in policy.items():
+        assert calls[-1][1][key] == value
+        assert infidelity_calls[-1][key] == value
+        assert init_kwargs[key] == value
+
+
 def test_sweep_optimizer_builds_two_site_cached_boundary_pair():
     """PEPS sweep cleanup should construct both CompBdy objects consistently."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=5)

@@ -7,6 +7,7 @@ import warnings
 import math
 import inspect
 from collections.abc import Mapping
+from numbers import Integral
 from typing import Any
 
 import autoray as ar
@@ -84,6 +85,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Contraction optimizer.
     fit_mode : {"eff", "two-site", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary.sweeps.CompBdy`.
+    fit_block_size : {1, 2, 3}, default=1
+        Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
+    fit_adaptive_sweeps : int | None, default=None
+        For block size 2 or 3, number of initial block-SVD sweeps before
+        one-site refinement. ``None`` keeps fixed block-size sweeps.
     fit_max_bond : int | None, default=None
         Two-site boundary SVD cap. Defaults to each boundary's requested
         ``chi``.
@@ -120,6 +126,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "fit_block_size",
+        "fit_adaptive_sweeps",
         "fit_max_bond",
         "fit_sweep_sequence",
         "fit_cutoff_mode",
@@ -145,6 +153,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "fit_block_size",
+        "fit_adaptive_sweeps",
         "fit_max_bond",
         "fit_sweep_sequence",
         "fit_cutoff_mode",
@@ -421,6 +431,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         bdy_overlap=None,
         contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_block_size=1,
+        fit_adaptive_sweeps=None,
         fit_max_bond=None,
         fit_sweep_sequence="RL",
         fit_cutoff_mode="rsum2",
@@ -447,6 +459,33 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         # Canonicalize before boundary construction because the mode decides
         # whether a new dense DMRG boundary should start at rank one.
         fit_mode = _canonical_fit_mode_selector(fit_mode)
+        if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
+            1,
+            2,
+            3,
+        }:
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        fit_block_size = int(fit_block_size)
+        if fit_mode != "eff" and fit_block_size != 1:
+            raise ValueError(
+                "fit_block_size is only configurable with fit_mode='eff'."
+            )
+        if fit_adaptive_sweeps is not None:
+            if fit_block_size not in {2, 3}:
+                raise ValueError(
+                    "fit_adaptive_sweeps requires fit_block_size=2 or 3."
+                )
+            if (
+                not isinstance(fit_adaptive_sweeps, Integral)
+                or int(fit_adaptive_sweeps) < 1
+            ):
+                raise ValueError(
+                    "fit_adaptive_sweeps must be a positive integer or None."
+                )
+            fit_adaptive_sweeps = int(fit_adaptive_sweeps)
+        block_fit = fit_mode == "two-site" or (
+            fit_mode == "eff" and fit_block_size in {2, 3}
+        )
 
         bdy_obj, bdy_holder = self._resolve_boundary_arg(bdy, "bdy")
         bdy_overlap_obj, bdy_overlap_holder = self._resolve_boundary_arg(
@@ -485,7 +524,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 boundary_options=self.boundary_options,
                 initial_bond=(
                     1
-                    if fit_mode == "two-site" and self.boundary_engine == "dmrg"
+                    if block_fit and self.boundary_engine == "dmrg"
                     else None
                 ),
             )
@@ -496,6 +535,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._set_boundary_pair(bdy_obj, bdy_overlap_obj)
         self.contraction_opt = contraction_opt
         self.fit_mode = fit_mode
+        self.fit_block_size = int(fit_block_size)
+        self.fit_adaptive_sweeps = fit_adaptive_sweeps
         self.fit_max_bond = fit_max_bond
         self.fit_sweep_sequence = fit_sweep_sequence
         self.fit_cutoff_mode = fit_cutoff_mode
@@ -750,7 +791,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError("chi must be >= 1")
 
         two_site_fit = (
-            self.fit_mode == "two-site"
+            (
+                self.fit_mode == "two-site"
+                or (
+                    self.fit_mode == "eff"
+                    and getattr(self, "fit_block_size", 1) in {2, 3}
+                )
+            )
             and getattr(self, "boundary_engine", "dmrg") == "dmrg"
         )
         for boundary, target in (
@@ -874,8 +921,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             boundary_options=getattr(self, "boundary_options", None),
             initial_bond=(
                 1
-                if self.fit_mode == "two-site"
-                and getattr(self, "boundary_engine", "dmrg") == "dmrg"
+                if (
+                    (
+                        self.fit_mode == "two-site"
+                        or (
+                            self.fit_mode == "eff"
+                            and getattr(self, "fit_block_size", 1) in {2, 3}
+                        )
+                    )
+                    and getattr(self, "boundary_engine", "dmrg") == "dmrg"
+                )
                 else None
             ),
         )
@@ -943,7 +998,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             _, overlap_norm = build_bra_ket(ket=self.state_target, bra=self.state)
             bdy_overlap_new = BdyMPS(
                 tn_double=overlap_norm,
-                chi=1 if self.fit_mode == "two-site" else chi_overlap,
+                chi=(
+                    1
+                    if (
+                        self.fit_mode == "two-site"
+                        or (
+                            self.fit_mode == "eff"
+                            and getattr(self, "fit_block_size", 1) in {2, 3}
+                        )
+                    )
+                    else chi_overlap
+                ),
                 single_layer=single_layer,
             )
         self._set_boundary_pair(self.bdy, bdy_overlap_new)
@@ -1000,6 +1065,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 progress=progress,
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=self.fit_mode,
+                fit_block_size=opts.get("fit_block_size", self.fit_block_size),
+                fit_adaptive_sweeps=opts.get(
+                    "fit_adaptive_sweeps", self.fit_adaptive_sweeps
+                ),
                 fit_max_bond=opts.get("fit_max_bond", self.fit_max_bond),
                 fit_sweep_sequence=opts.get(
                     "fit_sweep_sequence", self.fit_sweep_sequence
@@ -1030,6 +1099,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            fit_block_size=opts.get("fit_block_size", self.fit_block_size),
+            fit_adaptive_sweeps=opts.get(
+                "fit_adaptive_sweeps", self.fit_adaptive_sweeps
+            ),
             fit_max_bond=opts.get("fit_max_bond", self.fit_max_bond),
             fit_sweep_sequence=opts.get(
                 "fit_sweep_sequence", self.fit_sweep_sequence
@@ -1075,6 +1148,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         max_separation=1,
         progress=False,
         track_boundary_fidelity=False,
+        fit_block_size=_INHERIT_FIT_OPTION,
+        fit_adaptive_sweeps=_INHERIT_FIT_OPTION,
         fit_max_bond=_INHERIT_FIT_OPTION,
         fit_sweep_sequence=_INHERIT_FIT_OPTION,
         fit_cutoff_mode=_INHERIT_FIT_OPTION,
@@ -1159,6 +1234,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            fit_block_size=_resolve_fit_option(
+                fit_block_size, self.fit_block_size
+            ),
+            fit_adaptive_sweeps=_resolve_fit_option(
+                fit_adaptive_sweeps, self.fit_adaptive_sweeps
+            ),
             fit_max_bond=_resolve_fit_option(fit_max_bond, self.fit_max_bond),
             fit_sweep_sequence=_resolve_fit_option(
                 fit_sweep_sequence,
@@ -2065,6 +2146,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         common = {
             "contraction_opt": self.contraction_opt,
             "fit_mode": self.fit_mode,
+            "fit_block_size": self.fit_block_size,
+            "fit_adaptive_sweeps": self.fit_adaptive_sweeps,
             "fit_sweep_sequence": self.fit_sweep_sequence,
             "fit_cutoff": self.fit_cutoff,
             "fit_cutoff_mode": self.fit_cutoff_mode,

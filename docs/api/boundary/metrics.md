@@ -11,6 +11,14 @@ Selectors are normalized early: `"two_site"` is accepted as an alias for
 `"two-site"`, and `"one-site"` is a descriptive alias for the historical
 `"eff"` spelling. Unknown values fail before boundary work starts.
 
+For `fit_mode="eff"`, set `fit_block_size=2` or `3` to use native block-SVD
+growth through `FIT.run_eff`. Add `fit_adaptive_sweeps=2` to perform two
+block sweeps followed by one-site refinement; omit it to keep fixed block
+sweeps. `fit_rtol`, `fit_min_iter`, and `fit_patience` remain optional
+convergence controls. When `fit_rtol` is enabled, stopping begins only after
+two completed sweeps. The default `fit_block_size=1` path also honors the
+alternating `RL` sequence.
+
 Example:
 
 ```python
@@ -41,6 +49,21 @@ different cap. With `fit_rtol=None`, exactly `n_iter` sweeps run. Reuse a
 calls; pair updates retain the same fixed-plus-moving environment cache
 strategy within each sweep. Newly created two-site boundaries start at bond 1
 and grow locally rather than being padded globally to `chi`.
+
+For example, an adaptive full-chain FIT boundary can be requested with:
+
+```python
+result = pepsy.peps_norm(
+    state,
+    chi=64,
+    fit_mode="eff",
+    fit_block_size=2,
+    fit_adaptive_sweeps=2,
+    fit_sweep_sequence="RL",
+    n_iter=6,
+    return_info=True,
+)
+```
 
 `contract_boundary(...)` always returns `BoundaryContractResult`. The scalar
 helpers `peps_norm(...)`, `boundary_norm(...)`, and `contract_flat(...)` keep

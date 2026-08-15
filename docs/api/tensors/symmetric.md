@@ -858,8 +858,7 @@ linear in span). Landing it on a symmetric MPS needs a Symmray-aware multi-site
 MPO gate application (upstream ``gate_nonlocal`` / MPS-addition are not yet
 Symmray-compatible), so it is deferred. For 2D today: order the lattice with
 ``OneDMap(..., mode="folded-snake")`` to maximize nearest-neighbour bonds, use
-``to_mpo`` for the residual long-range terms, or evolve via a Symmray MPO-TDVP
-sweep (which preserves U1xU1 without gates).
+``to_mpo`` for the residual long-range terms.
 
 When the circuit gate stream should choose the 1D path, use the MPS layout
 finder as a mapping mode. This remains a coordinate/index operation only: it

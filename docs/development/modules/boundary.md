@@ -40,6 +40,16 @@ The local boundary solver is selected with `fit_mode`:
   backend-native SVD, and can discover bond subspaces up to `fit_max_bond`.
 - `"global"` uses the reference global FIT solve.
 
+The `"eff"` path accepts `fit_block_size=2` or `3` for native block-SVD
+growth. With `fit_adaptive_sweeps=N`, it uses that block size for the first
+`N` full-boundary sweeps and then switches to cached one-site refinement.
+Optional `fit_rtol`, `fit_min_iter`, and `fit_patience` controls are forwarded
+to `FIT.run_eff`; with `fit_rtol=None`, no convergence scalar is transferred
+from the backend. When enabled, stopping begins only after two completed
+sweeps, using the relative retained-norm change between consecutive sweeps.
+The default `RL` sequence runs each boundary left-to-right and then
+right-to-left.
+
 Two-site sweeps do not rebuild a complete environment for every pair. One
 side is cached once per sweep and the moving side is updated incrementally, so
 environment construction remains linear in boundary length. PEPS helpers pass

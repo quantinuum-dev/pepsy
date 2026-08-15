@@ -20,6 +20,14 @@ so `normalize()`, `infidelity()`, and `set_target(...)` do not accidentally
 turn bond 1 into the future accuracy cap. A tuple `chi=(chi_norm, chi_overlap)`
 keeps the two caps independent during local sweeps.
 
+The same adaptive schedule is available through `fit_mode="eff"`: set
+`fit_block_size=2` or `3` and `fit_adaptive_sweeps=2` for two initial block-SVD
+sweeps followed by one-site refinement. `fit_rtol`, `fit_min_iter`, and
+`fit_patience` are optional; leaving `fit_rtol=None` keeps fixed-sweep behavior.
+When enabled for the `eff` path, stopping waits for at least two completed
+sweeps and compares consecutive retained-center norms. The default boundary
+sequence is `RL`: left-to-right followed by right-to-left.
+
 `SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
 are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for
 that diagnostic; omitting `fit_rtol` inherits the constructor value. The same

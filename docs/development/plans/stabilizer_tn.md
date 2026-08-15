@@ -318,9 +318,9 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
     runner to an unrun converted queue without mutating the source simulator.
 
 ### R2. Clifford disentangling sweep (repo-aligned)
-- CAMPS: Qian, Huang, Qin, PRL 133, 190402 (arXiv:2405.09217); Clifford-dressed
-  TDVP, arXiv:2407.01692 / 2407.03202; authors' own *Limits of Clifford
-  disentangling*, arXiv:2602.15942 (the repo v1.2 `disentangling experiments/`).
+- CAMPS: Qian, Huang, Qin, PRL 133, 190402 (arXiv:2405.09217); authors' own
+  *Limits of Clifford disentangling*, arXiv:2602.15942 (the repo v1.2
+  `disentangling experiments/`).
 - Periodically sweep 2-qubit Clifford disentanglers over `|nu>` and absorb them
   into the tableau `C` to reduce `|nu>` bond dimension — the paper's "store
   potential entanglement in the basis" future-work item.
