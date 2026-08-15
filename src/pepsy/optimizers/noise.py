@@ -11,14 +11,17 @@ post-gate Pauli faults into a clean deterministic stream.
 
 from __future__ import annotations
 
+import inspect
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from numbers import Integral
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
 from .mps.optimizer import MpsOptimizer, _resolve_conditional
+from .tree.optimizer import TreeOptimizer
 
 __all__ = [
     "CoalescedMeasurementRecord",
@@ -26,6 +29,8 @@ __all__ = [
     "CoalescedTrajectoryLeaf",
     "CoalescedTrajectoryResult",
     "ImportanceSamplingPolicy",
+    "NoisyResult",
+    "MpsNoisyResult",
     "NoisyShotResult",
     "PauliErrorModel",
     "PauliFault",
@@ -50,6 +55,8 @@ __all__ = [
     "run_coalesced_noisy_shots",
     "run_coalesced_stim_shots",
     "run_coalesced_trajectory_shots",
+    "MpsNoisy",
+    "TreeNoisy",
     "sample_coalesced_bits",
     "run_noisy_shots",
     "run_parallel_noisy_shots",
@@ -120,6 +127,13 @@ _CONTROL_NAMES = frozenset(
         "reset_y",
         "reset_z",
         "cap",
+        # Classical feed-forward wrappers are controls too. Their selected
+        # ordinary gate action is handled after the record is resolved.
+        "if",
+        "conditional",
+        "condition",
+        "feed_forward",
+        "feedforward",
         "disentangle",
         "submpo",
     }
@@ -373,8 +387,10 @@ class PauliErrorModel:
         """Sample one noisy replay stream from ``gates``.
 
         Returned entries are ordinary ``(matrix, site)`` Pauli gates and can be
-        passed to either optimizer. Existing control and coefficient-frame
-        ``submpo`` events are preserved but do not receive a physical fault.
+        passed to either optimizer. Ordinary named or matrix actions inside a
+        conditional wrapper receive a matching predicate-wrapped fault;
+        measurement/reset controls, nested controls, and coefficient-frame
+        ``submpo`` events are preserved without an implicit fault.
         """
         stream, _ = _sample_gate_stream(gates, self, np.random.default_rng(seed))
         return stream
@@ -1009,6 +1025,112 @@ class CoalescedTrajectoryResult:
 
 
 @dataclass(frozen=True)
+class NoisyResult:
+    """Stable result facade returned by :class:`MpsNoisy` or :class:`TreeNoisy`.
+
+    The low-level runners intentionally retain their historical result types:
+    independent replay returns a shot-shaped result, while coalesced replay
+    returns one leaf per distinct branch. This facade gives the factory-free
+    API one predictable surface while keeping the original object available as
+    :attr:`raw` (and forwarding specialized attributes to it).
+    """
+
+    raw: NoisyShotResult | TrajectoryShotResult | CoalescedTrajectoryResult
+
+    def __post_init__(self):
+        if not isinstance(
+            self.raw,
+            (NoisyShotResult, TrajectoryShotResult, CoalescedTrajectoryResult),
+        ):
+            raise TypeError("raw must be a supported noisy runner result.")
+
+    @property
+    def coalesced(self) -> bool:
+        """Whether the result stores count-bearing coalesced leaves."""
+        return isinstance(self.raw, CoalescedTrajectoryResult)
+
+    @property
+    def shots(self) -> int:
+        """Number of independent trajectories represented by the result."""
+        return int(self.raw.shots)
+
+    @property
+    def branches(self) -> int:
+        """Number of retained optimizer states in this representation."""
+        return int(self.raw.branches if self.coalesced else self.shots)
+
+    @property
+    def optimizers(self) -> tuple[Any, ...]:
+        """One optimizer per retained state or coalesced leaf."""
+        return self.raw.optimizers
+
+    @property
+    def counts(self) -> tuple[int, ...]:
+        """Shot multiplicity for each retained optimizer state."""
+        if self.coalesced:
+            return self.raw.counts
+        return (1,) * self.shots
+
+    @property
+    def gate_streams(self) -> tuple[tuple[object, ...], ...]:
+        """Concrete replay stream for every retained optimizer state."""
+        if self.coalesced:
+            return tuple(leaf.gate_stream for leaf in self.raw.leaves)
+        return self.raw.gate_streams
+
+    @property
+    def weights(self) -> tuple[float, ...]:
+        """Importance weight for every retained state or leaf."""
+        if self.raw.weights:
+            return tuple(float(weight) for weight in self.raw.weights)
+        return (1.0,) * self.branches
+
+    @property
+    def faults(self):
+        """Pauli faults, grouped by retained state or coalesced leaf."""
+        if self.coalesced:
+            return tuple(leaf.faults for leaf in self.raw.leaves)
+        return getattr(self.raw, "faults", tuple(() for _ in self.optimizers))
+
+    @property
+    def records(self):
+        """Trajectory records, grouped by retained state or coalesced leaf."""
+        if self.coalesced:
+            return tuple(leaf.records for leaf in self.raw.leaves)
+        return getattr(self.raw, "records", tuple(() for _ in self.optimizers))
+
+    @property
+    def measurements(self):
+        """Structured measurement records, grouped by retained state or leaf."""
+        if self.coalesced:
+            return tuple(leaf.measurements for leaf in self.raw.leaves)
+        measurements = getattr(self.raw, "measurements", None)
+        if measurements is not None:
+            return measurements
+        return tuple(
+            _optimizer_measurement_records(optimizer)
+            for optimizer in self.optimizers
+        )
+
+    def estimate(self, values) -> float:
+        """Estimate an observable using the result's shot multiplicities."""
+        return self.raw.estimate(values)
+
+    @property
+    def effective_sample_size(self) -> float:
+        """Return the importance-weight effective sample size."""
+        return float(self.raw.effective_sample_size)
+
+    def __getattr__(self, name):
+        """Preserve access to result-specific data through :attr:`raw`."""
+        return getattr(self.raw, name)
+
+
+# Backward-compatible name from the first MpsNoisy-only API.
+MpsNoisyResult = NoisyResult
+
+
+@dataclass(frozen=True)
 class CoalescedSampleResult:
     """Terminal bit samples drawn leaf-by-leaf from a coalesced ensemble.
 
@@ -1196,6 +1318,41 @@ def _event_support(entry) -> Optional[tuple[int, ...]]:
     if len(entry) != 2:
         raise ValueError(f"Unsupported matrix gate stream entry: {entry!r}.")
     return _sites(entry[1])
+
+
+def _conditional_pauli_support(entry):
+    """Return ``(payload, support)`` for a noisy ordinary conditional action.
+
+    Conditional measurements, resets, control wrappers, and sub-MPO actions do
+    not have a well-defined post-gate one-qubit Pauli channel here. Ordinary
+    named or matrix gates do, and are handled after the predicate is resolved.
+    """
+    parts = MpsOptimizer.control_event_parts(entry)
+    if parts is None or parts[0] != "conditional":
+        return None
+    _name, payload, _where = parts
+    action = payload["action"]
+    if MpsOptimizer.control_event_parts(action) is not None:
+        return None
+    try:
+        support = _event_support(action)
+    except ValueError:
+        # Let the optimizer report the original unsupported action with its
+        # normal, more specific validation path.
+        return None
+    if support is None:
+        return None
+    return payload, support
+
+
+def _conditional_matches(optimizer, payload) -> bool:
+    """Resolve one conditional predicate against an optimizer's records."""
+    record_index, expected = _resolve_conditional(
+        payload, len(getattr(optimizer, "measurements", ()))
+    )
+    record = optimizer.measurements[record_index]
+    outcome = _normalize_optimizer_measurement(record)[2]
+    return int(outcome < 0) == expected
 
 
 def _pauli_matrix(label: str, *, like=None):
@@ -1438,6 +1595,44 @@ def _sample_gate_stream(
                 "PauliErrorModel is a convenience macro for clean deterministic streams."
             )
         stream.append(entry)
+        conditional = _conditional_pauli_support(entry)
+        if conditional is not None:
+            payload, support = conditional
+            action = payload["action"]
+            like = (
+                action[0]
+                if isinstance(action, (tuple, list))
+                and action
+                and not isinstance(action[0], str)
+                else None
+            )
+            for site in support:
+                labels = tuple(target_probabilities)
+                pauli = str(
+                    rng.choice(
+                        labels,
+                        p=tuple(proposal_probabilities[label] for label in labels),
+                    )
+                )
+                target = float(target_probabilities[pauli])
+                proposal = float(proposal_probabilities[pauli])
+                if proposal <= 0.0:
+                    raise ValueError("proposal_model sampled a zero-probability branch.")
+                weight *= target / proposal
+                if pauli == "I":
+                    continue
+                # Keep the fault behind the same predicate. This is valid for
+                # ordinary unitary actions because they do not change records.
+                stream.append(
+                    (
+                        "if",
+                        payload["record"],
+                        payload["bit"],
+                        (_pauli_matrix(pauli, like=like), site),
+                    )
+                )
+                faults.append(PauliFault(gate_index=gate_index, site=site, pauli=pauli))
+            continue
         support = _event_support(entry)
         if support is None:
             continue
@@ -1459,6 +1654,82 @@ def _sample_gate_stream(
     if return_weight:
         return stream, tuple(faults), float(weight)
     return stream, tuple(faults)
+
+
+def _run_noisy_conditional_shot(
+    optimizer,
+    entries,
+    error_model,
+    rng,
+    run_kwargs,
+    *,
+    proposal_model=None,
+):
+    """Replay a Pauli shot while resolving conditional actions online.
+
+    A static noisy stream cannot know whether a feed-forward action will run,
+    so it would either attach metadata to a false branch or apply an
+    importance ratio for a channel that should not have been sampled. Ordinary
+    nonconditional segments remain batched; only the boundaries around a
+    conditional gate are replayed sequentially.
+    """
+    stream = []
+    faults = []
+    pending = []
+    weight = 1.0
+
+    def flush():
+        if pending:
+            _run_trajectory_entries(optimizer, tuple(pending), run_kwargs)
+            stream.extend(pending)
+            pending.clear()
+
+    for gate_index, entry in enumerate(entries):
+        conditional = _conditional_pauli_support(entry)
+        if conditional is None:
+            sampled, local_faults, local_weight = _sample_gate_stream(
+                (entry,),
+                error_model,
+                rng,
+                proposal_model=proposal_model,
+                return_weight=True,
+            )
+            pending.extend(sampled)
+            faults.extend(
+                PauliFault(gate_index, fault.site, fault.pauli)
+                for fault in local_faults
+            )
+            weight *= local_weight
+            continue
+
+        payload, _support = conditional
+        flush()
+        _run_trajectory_entries(optimizer, (entry,), run_kwargs)
+        stream.append(entry)
+        if not _conditional_matches(optimizer, payload):
+            continue
+
+        action = payload["action"]
+        sampled, local_faults, local_weight = _sample_gate_stream(
+            (action,),
+            error_model,
+            rng,
+            proposal_model=proposal_model,
+            return_weight=True,
+        )
+        # ``sampled[0]`` is the ideal action. The original conditional action
+        # has already run, so replay only its sampled post-action faults.
+        for fault_entry in sampled[1:]:
+            _run_trajectory_entries(optimizer, (fault_entry,), run_kwargs)
+            stream.append(fault_entry)
+        faults.extend(
+            PauliFault(gate_index, fault.site, fault.pauli)
+            for fault in local_faults
+        )
+        weight *= local_weight
+
+    flush()
+    return tuple(stream), tuple(faults), float(weight)
 
 
 def sample_noisy_gate_stream(gates, error_model: PauliErrorModel, *, seed=None):
@@ -1593,11 +1864,14 @@ def _importance_label_distribution(
 
 def _expected_pauli_faults(entries, error_model):
     """Return lambda, the expected non-identity Pauli faults per shot."""
-    targets = sum(
-        len(support)
-        for entry in entries
-        if (support := _event_support(entry)) is not None
-    )
+    targets = 0
+    for entry in entries:
+        support = _event_support(entry)
+        if support is None:
+            conditional = _conditional_pauli_support(entry)
+            support = None if conditional is None else conditional[1]
+        if support is not None:
+            targets += len(support)
     return targets * (error_model.p_x + error_model.p_y + error_model.p_z)
 
 
@@ -1624,6 +1898,300 @@ def _auto_prefers_coalescing(entries, error_model, max_expected_faults):
     if _has_unforced_branching_control(entries):
         return False
     return _expected_pauli_faults(entries, error_model) <= max_expected_faults
+
+
+def _mps_shot_factory(initial_mps, mps_settings):
+    """Build a fresh MPS optimizer factory from one initial MPS and settings."""
+    if not isinstance(mps_settings, Mapping):
+        raise TypeError("mps_settings must be a mapping of MpsOptimizer settings.")
+    constructor = dict(mps_settings)
+    forbidden = sorted(set(constructor) & {"p", "gates"})
+    if forbidden:
+        names = ", ".join(repr(name) for name in forbidden)
+        raise TypeError(
+            f"mps_settings cannot contain {names}; pass the initial MPS and gate "
+            "stream to MpsNoisy(...)."
+        )
+    accepted = set(inspect.signature(MpsOptimizer.__init__).parameters)
+    accepted.difference_update({"self", "p", "gates"})
+    unknown = sorted(set(constructor) - accepted)
+    if unknown:
+        names = ", ".join(repr(name) for name in unknown)
+        raise TypeError(f"unknown MpsOptimizer setting(s): {names}.")
+    if "chi" not in constructor:
+        raise ValueError("mps_settings must include the MpsOptimizer 'chi' setting.")
+    try:
+        template = initial_mps.copy()
+    except AttributeError as exc:
+        raise TypeError("initial_mps must provide copy() like a quimb MPS.") from exc
+
+    def make_optimizer():
+        return MpsOptimizer(template.copy(), **constructor)
+
+    return make_optimizer
+
+
+def _tree_layout_stream(gate_stream):
+    """Make a TreeOptimizer-compatible layout stream from noisy entries."""
+    layout_stream = []
+    for entry in gate_stream:
+        trajectory_event = (
+            entry
+            if isinstance(entry, TrajectoryEvent)
+            else _trajectory_event_from_stochastic_entry(entry)
+        )
+        if trajectory_event is not None:
+            outcome = trajectory_event.channel.outcomes[0]
+            layout_stream.append(
+                (_trajectory_matrix(outcome.gate), trajectory_event.where)
+            )
+        else:
+            layout_stream.append(entry)
+    return tuple(layout_stream)
+
+
+def _tree_shot_factory(initial_tn, gate_stream, tree_settings):
+    """Build a fresh TreeOptimizer factory from one initial tree state."""
+    if not isinstance(tree_settings, Mapping):
+        raise TypeError("tree_settings must be a mapping of TreeOptimizer settings.")
+    constructor = dict(tree_settings)
+    forbidden = sorted(set(constructor) & {"gates", "tn", "state", "run"})
+    if forbidden:
+        names = ", ".join(repr(name) for name in forbidden)
+        raise TypeError(
+            f"tree_settings cannot contain {names}; pass the initial tree state and "
+            "gate stream to TreeNoisy(...)."
+        )
+    accepted = set(inspect.signature(TreeOptimizer.__init__).parameters)
+    accepted.difference_update({"self", "gates", "tn", "state", "run"})
+    unknown = sorted(set(constructor) - accepted)
+    if unknown:
+        names = ", ".join(repr(name) for name in unknown)
+        raise TypeError(f"unknown TreeOptimizer setting(s): {names}.")
+    try:
+        template = initial_tn.copy()
+    except AttributeError as exc:
+        raise TypeError(
+            "initial_tn must provide copy() like a TreeTensorNetwork or "
+            "product quimb MPS."
+        ) from exc
+    layout_stream = _tree_layout_stream(gate_stream)
+
+    def make_optimizer():
+        return TreeOptimizer(
+            layout_stream,
+            tn=template.copy(),
+            run=False,
+            **constructor,
+        )
+
+    return make_optimizer
+
+
+class MpsNoisy:
+    """Factory-free noisy MPS gate-stream simulator.
+
+    Parameters
+    ----------
+    initial_mps : quimb.tensor.MatrixProductState
+        Initial state template. It is copied before any trajectory is run.
+    gate_stream : iterable
+        Ordinary bundled gates plus optional measurement, feed-forward, and
+        stream-local stochastic events. The stream is snapshotted so one
+        ``MpsNoisy`` instance can be run repeatedly.
+    mps_settings : mapping, optional
+        Keyword arguments for :class:`MpsOptimizer`. ``"chi"`` is required.
+    **optimizer_settings
+        Convenience constructor settings, such as ``chi=64, mode="mpo"``.
+        These override keys in ``mps_settings``.
+
+    ``run`` dispatches stream-local noise to :func:`run_trajectory_shots`.
+    Passing ``error_model=PauliErrorModel(...)`` instead selects the legacy
+    clean-stream Pauli runner. ``run_trajectory`` and ``run_noisy`` are
+    available when an explicit path is preferred.
+    """
+
+    def __init__(self, initial_mps, gate_stream, *, mps_settings=None, **optimizer_settings):
+        if mps_settings is None:
+            constructor = {}
+        elif not isinstance(mps_settings, Mapping):
+            raise TypeError("mps_settings must be a mapping of MpsOptimizer settings.")
+        else:
+            constructor = dict(mps_settings)
+        constructor.update(optimizer_settings)
+        self.mps_settings = MappingProxyType(dict(constructor))
+        try:
+            self._initial_mps = initial_mps.copy()
+        except AttributeError as exc:
+            raise TypeError("initial_mps must provide copy() like a quimb MPS.") from exc
+        self._factory = _mps_shot_factory(self._initial_mps, self.mps_settings)
+        if isinstance(gate_stream, TrajectoryEvent):
+            entries = (gate_stream,)
+        else:
+            entries = tuple(_as_entries(gate_stream))
+        self.gate_stream = entries
+
+    @property
+    def initial_mps(self):
+        """Return a defensive copy of the configured initial MPS."""
+        return self._initial_mps.copy()
+
+    def run_trajectory(self, shots: int, **runner_kwargs):
+        """Run stream-local trajectory noise through the exact shot runner."""
+        return MpsNoisyResult(
+            run_trajectory_shots(
+                self._factory,
+                self.gate_stream,
+                shots,
+                **runner_kwargs,
+            )
+        )
+
+    def run_noisy(self, error_model: PauliErrorModel, shots: int, **runner_kwargs):
+        """Run a clean stream with the legacy :class:`PauliErrorModel`."""
+        return MpsNoisyResult(
+            run_noisy_shots(
+                self._factory,
+                self.gate_stream,
+                error_model,
+                shots,
+                **runner_kwargs,
+            )
+        )
+
+    def run(
+        self,
+        shots: int,
+        *,
+        error_model: PauliErrorModel | None = None,
+        seed=None,
+        run_kwargs: Optional[Mapping[str, Any]] = None,
+        strategy: str = "auto",
+        max_branches: int | None = _AUTO_MAX_BRANCHES,
+        auto_max_expected_faults: float = _AUTO_MAX_EXPECTED_FAULTS,
+        importance_sampling=None,
+        max_branch_factor: int | None = None,
+        parallel_workers: int = 1,
+        parallel_backend: str = "thread",
+    ) -> NoisyResult:
+        """Run the configured stream using the selected exact strategy.
+
+        The convenience API defaults to ``strategy="auto"`` and retains the
+        bounded coalesced representation when it is safe. If the configured
+        ``max_branches`` cap is reached, auto mode restarts as independent
+        trajectories without dropping or approximating samples.
+        """
+        common = {
+            "seed": seed,
+            "run_kwargs": run_kwargs,
+            "strategy": strategy,
+            "max_branches": max_branches,
+            "importance_sampling": importance_sampling,
+            "max_branch_factor": max_branch_factor,
+            "parallel_workers": parallel_workers,
+            "parallel_backend": parallel_backend,
+        }
+        if error_model is None:
+            return self.run_trajectory(shots, **common)
+        common["auto_max_expected_faults"] = auto_max_expected_faults
+        return self.run_noisy(error_model, shots, **common)
+
+
+class TreeNoisy:
+    """Factory-free noisy tree-tensor gate-stream simulator.
+
+    The public methods mirror :class:`MpsNoisy`, but each shot is constructed
+    with :class:`TreeOptimizer`. The initial state may be an entangled
+    ``TreeTensorNetwork`` or a product quimb MPS; the latter is mounted on the
+    tree selected from ``gate_stream`` and ``tree_settings``. Feed-forward
+    events use the same ``("if", record, bit, action)`` contract as MPS replay.
+    """
+
+    def __init__(self, initial_tn, gate_stream, *, tree_settings=None, **optimizer_settings):
+        if tree_settings is None:
+            constructor = {}
+        elif not isinstance(tree_settings, Mapping):
+            raise TypeError("tree_settings must be a mapping of TreeOptimizer settings.")
+        else:
+            constructor = dict(tree_settings)
+        constructor.update(optimizer_settings)
+        self.tree_settings = MappingProxyType(dict(constructor))
+        try:
+            self._initial_tn = initial_tn.copy()
+        except AttributeError as exc:
+            raise TypeError(
+                "initial_tn must provide copy() like a TreeTensorNetwork or "
+                "product quimb MPS."
+            ) from exc
+        if isinstance(gate_stream, TrajectoryEvent):
+            entries = (gate_stream,)
+        else:
+            entries = tuple(_as_entries(gate_stream))
+        self.gate_stream = entries
+        self._factory = _tree_shot_factory(
+            self._initial_tn,
+            self.gate_stream,
+            self.tree_settings,
+        )
+
+    @property
+    def initial_tn(self):
+        """Return a defensive copy of the configured initial tree state."""
+        return self._initial_tn.copy()
+
+    def run_trajectory(self, shots: int, **runner_kwargs):
+        """Run stream-local trajectory noise through the exact shot runner."""
+        return NoisyResult(
+            run_trajectory_shots(
+                self._factory,
+                self.gate_stream,
+                shots,
+                **runner_kwargs,
+            )
+        )
+
+    def run_noisy(self, error_model: PauliErrorModel, shots: int, **runner_kwargs):
+        """Run a clean stream with the legacy :class:`PauliErrorModel`."""
+        return NoisyResult(
+            run_noisy_shots(
+                self._factory,
+                self.gate_stream,
+                error_model,
+                shots,
+                **runner_kwargs,
+            )
+        )
+
+    def run(
+        self,
+        shots: int,
+        *,
+        error_model: PauliErrorModel | None = None,
+        seed=None,
+        run_kwargs: Optional[Mapping[str, Any]] = None,
+        strategy: str = "auto",
+        max_branches: int | None = _AUTO_MAX_BRANCHES,
+        auto_max_expected_faults: float = _AUTO_MAX_EXPECTED_FAULTS,
+        importance_sampling=None,
+        max_branch_factor: int | None = None,
+        parallel_workers: int = 1,
+        parallel_backend: str = "thread",
+    ) -> NoisyResult:
+        """Run the configured TreeOptimizer gate stream."""
+        common = {
+            "seed": seed,
+            "run_kwargs": run_kwargs,
+            "strategy": strategy,
+            "max_branches": max_branches,
+            "importance_sampling": importance_sampling,
+            "max_branch_factor": max_branch_factor,
+            "parallel_workers": parallel_workers,
+            "parallel_backend": parallel_backend,
+        }
+        if error_model is None:
+            return self.run_trajectory(shots, **common)
+        common["auto_max_expected_faults"] = auto_max_expected_faults
+        return self.run_noisy(error_model, shots, **common)
 
 
 def run_noisy_shots(
@@ -1718,6 +2286,9 @@ def run_noisy_shots(
             "Stateful leakage entries require run_trajectory_shots(...). "
             "PauliErrorModel is a convenience macro for clean deterministic streams."
         )
+    has_dynamic_conditionals = any(
+        _conditional_pauli_support(entry) is not None for entry in entries
+    )
 
     if strategy == "coalesced":
         return run_coalesced_noisy_shots(
@@ -1758,21 +2329,31 @@ def run_noisy_shots(
     weights = []
     for child_seed in child_seeds:
         noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
-        stream, shot_faults, weight = _sample_gate_stream(
-            entries,
-            error_model,
-            np.random.default_rng(noise_seed),
-            proposal_model=importance_sampling,
-            return_weight=True,
-        )
         optimizer = optimizer_factory()
         if not hasattr(optimizer, "set_gates") or not hasattr(optimizer, "run"):
             raise TypeError(
                 "optimizer_factory must return an optimizer with set_gates(...) and run(...)."
             )
         _seed_trajectory_optimizer(optimizer, optimizer_seed)
-        optimizer.set_gates(stream)
-        optimizer.run(**dict(run_kwargs))
+        if has_dynamic_conditionals:
+            stream, shot_faults, weight = _run_noisy_conditional_shot(
+                optimizer,
+                entries,
+                error_model,
+                np.random.default_rng(noise_seed),
+                dict(run_kwargs),
+                proposal_model=importance_sampling,
+            )
+        else:
+            stream, shot_faults, weight = _sample_gate_stream(
+                entries,
+                error_model,
+                np.random.default_rng(noise_seed),
+                proposal_model=importance_sampling,
+                return_weight=True,
+            )
+            optimizer.set_gates(stream)
+            optimizer.run(**dict(run_kwargs))
         optimizers.append(optimizer)
         streams.append(tuple(stream))
         faults.append(shot_faults)
@@ -3975,6 +4556,58 @@ def run_coalesced_noisy_shots(
     for gate_index, entry in enumerate(entries):
         pending.append((gate_index, entry))
         flush()
+        conditional = _conditional_pauli_support(entry)
+        if conditional is not None:
+            payload, support = conditional
+            matched = []
+            unmatched = []
+            for node in nodes:
+                (matched if _conditional_matches(node.optimizer, payload) else unmatched).append(
+                    node
+                )
+            for site in support:
+
+                def apply(node, pauli, proposal_probability):
+                    if pauli == "I":
+                        target = target_probabilities[0]
+                    else:
+                        target = error_model.probabilities[pauli]
+                        fault_entry = (_pauli_matrix(pauli), site)
+                        _run_trajectory_entries(
+                            node.optimizer, (fault_entry,), run_kwargs
+                        )
+                        node.gate_stream.append(fault_entry)
+                        node.faults.append(PauliFault(gate_index, int(site), pauli))
+                    ratio = float(
+                        target / proposal_probabilities[outcomes.index(pauli)]
+                    )
+                    node.weight *= ratio
+
+                available_branches = (
+                    None
+                    if max_branches is None
+                    else max_branches - len(unmatched)
+                )
+                if available_branches is not None and available_branches < 1:
+                    raise _CoalescedBranchCapExceeded(
+                        f"coalesced trajectory branch cap ({max_branches}) exceeded "
+                        "while applying a conditional Pauli error."
+                    )
+                split = _split_coalesced_nodes(
+                    matched,
+                    outcomes,
+                    proposal_probabilities,
+                    apply,
+                    rng,
+                    context="conditional Pauli error model",
+                    max_branches=available_branches,
+                    max_branch_factor=max_branch_factor,
+                    parallel_workers=parallel_workers,
+                    parallel_backend=parallel_backend,
+                )
+                matched = split
+            nodes = unmatched + matched
+            continue
         support = _event_support(entry)
         if support is None:
             continue

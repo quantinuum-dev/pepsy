@@ -6191,6 +6191,44 @@ def test_mps_optimizer_control_event_public_helpers():
     assert where == (2,)
 
 
+@pytest.mark.parametrize(
+    "conditional",
+    [
+        ("if", -1, 1, (np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex), 1)),
+        {
+            "kind": "feed_forward",
+            "record": -1,
+            "value": 1,
+            "then": (np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex), 1),
+        },
+    ],
+)
+def test_mps_optimizer_conditional_gate_follows_measurement_bit(conditional):
+    """MPS feed-forward applies only the matching classical branch."""
+    hadamard = np.array(
+        [[1.0, 1.0], [1.0, -1.0]], dtype=complex
+    ) / np.sqrt(2.0)
+    flip = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+
+    for outcome, expected_index in ((+1, 0), (-1, 3)):
+        entry = conditional.copy() if isinstance(conditional, dict) else conditional
+        if isinstance(entry, dict):
+            entry["then"] = (flip, 1)
+        else:
+            entry = (entry[0], entry[1], entry[2], (flip, 1))
+        optimizer = py.MpsOptimizer(
+            qtn.MPS_computational_state("00", dtype="complex128"),
+            [(hadamard, 0), ("measure", "Z", 0, outcome), entry],
+            chi=4,
+            mode="mpo",
+        )
+        optimizer.run(progbar=False)
+        state = optimizer.to_dense().reshape(-1)
+        expected = np.zeros(4, dtype=complex)
+        expected[expected_index] = 1.0
+        np.testing.assert_allclose(state, expected, atol=1e-10)
+
+
 def test_mps_optimizer_measure_reset_support_layout_finder():
     """measure/reset should replay correctly under the layout finder."""
     su4 = qu.rand_uni(4, seed=5)

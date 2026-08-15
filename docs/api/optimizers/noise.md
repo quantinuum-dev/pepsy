@@ -110,6 +110,68 @@ holds concise `(gate_index, site, pauli)` records. Use
 `sample_noisy_gate_stream(...)` or `sample_noisy_gate_streams(...)` when only
 stream construction is needed.
 
+## `MpsNoisy` convenience API
+
+For ordinary `MpsOptimizer` use, `MpsNoisy` removes the factory boilerplate.
+Pass the initial MPS, the gate stream, and constructor settings once; the
+runner copies the initial state safely and delegates batching, coalescing,
+seeding, and parallel execution to the existing shot runners:
+
+```python
+simulator = pepsy.MpsNoisy(
+    initial_mps,
+    gate_stream,
+    chi=64,
+    mode="mpo",
+)
+result = simulator.run(
+    shots=10_000,
+    strategy="auto",
+    seed=7,
+)
+```
+
+Constructor settings can also be grouped in `mps_settings={"chi": 64,
+"mode": "mpo"}`. Do not put `p` or `gates` in that mapping. With the default
+`error_model=None`, stream-local stochastic entries use trajectory replay. To
+use the legacy clean-stream Pauli model through the same API, call
+`simulator.run_noisy(...)` or pass
+`error_model=pepsy.PauliErrorModel.depolarizing(1e-3)` to `run`. Independent
+results have `.optimizers`; coalesced results have `.leaves` and branch
+multiplicities. `run`, `run_trajectory`, and `run_noisy` return
+`MpsNoisyResult`, which consistently provides `.optimizers`, `.counts`,
+`.gate_streams`, `.weights`, `.shots`, and `.branches`; `.coalesced` tells
+whether those states are count-coalesced. The original runner result remains
+available as `.raw`, while `.leaves` is still forwarded for coalesced-specific
+inspection. The convenience default is `strategy="auto"`: the exact
+coalesced path is attempted under the `max_branches` safety cap and
+automatically restarts independently if that cap would be exceeded. Pass
+`strategy="independent"` or `strategy="coalesced"` to choose the
+representation explicitly.
+The low-level factory-based functions remain available for custom optimizer
+classes or non-MPS backends.
+
+`TreeNoisy` exposes the same API for `TreeOptimizer` and accepts either an
+entangled `TreeTensorNetwork` or a product MPS as its initial state. Its
+`tree_settings` mapping contains `TreeOptimizer` options such as `chi`,
+`layout`, `tree`, and `max_arity`; the gate stream is used when constructing an
+automatic tree layout:
+
+```python
+simulator = pepsy.TreeNoisy(
+    initial_state,
+    gate_stream,
+    tree_settings={"chi": 64, "layout_objective": "congestion"},
+)
+result = simulator.run(shots=10_000, strategy="auto", seed=7)
+```
+
+Tree and MPS optimizers share the logical feed-forward form
+`("if", record, bit, action)`. Tree replay resolves the measurement record
+before applying the action, including in count-coalesced branches. `NoisyResult`
+is the generic result-facade name; `MpsNoisyResult` remains a compatibility
+alias.
+
 ## Exact coalesced ensembles for rare noise
 
 When the total fault rate is small, avoid replaying the same no-error prefix
@@ -249,11 +311,17 @@ result = pepsy.run_trajectory_shots(
 )
 ```
 
-`parallel_backend="gpu"` also uses threads, intentionally keeping Torch/CuPy/JAX
-objects in one process; the optimizer factory must select the device/backend.
-This is concurrent trajectory execution, not an unsafe shared mutable optimizer
-or an automatic device migration. `strategy="auto"` requires choosing either
-`"independent"` or `"coalesced"` when parallelism is requested.
+`parallel_backend="gpu"` also uses threads, intentionally keeping
+Torch/CuPy/JAX objects in one process. It is a scheduling hint, not a device
+selector: place the initial MPS on the desired device once (for example with
+`mps.apply_to_arrays(py.build_backend(device="cuda"))`). `MpsOptimizer` then
+lazily coerces ordinary dense gates to the live MPS backend, and converts
+sub-MPO tensor payloads through `apply_to_arrays`; pre-converting gates is still
+preferable when avoiding per-shot conversion overhead matters. This is
+concurrent trajectory execution, not an unsafe shared mutable optimizer or an
+automatic choice of Torch versus CuPy, CUDA device, or dtype.
+`strategy="auto"` requires choosing either `"independent"` or `"coalesced"`
+when parallelism is requested.
 
 ## User-defined quantum trajectories
 
@@ -352,8 +420,17 @@ count.
 
 Measurement-record feed-forward is also supported: `CX/CY/CZ rec[k] q` is
 lowered to `("if", k, bit, action)`, and the ordinary MPS/STN stream form is
-available directly. `k=-1` means the latest measurement; general
-record-to-record arithmetic is intentionally not lowered.
+available directly. In a hand-written stream, `("if", record, bit, action)`
+uses computational bits (`+1 -> 0`, `-1 -> 1`), with negative records counting
+back from the latest measurement. Independent and coalesced trajectory replay
+resolve the predicate separately for every shot/leaf before applying `action`.
+The `PauliErrorModel` convenience macro treats the conditional wrapper as a
+control event and automatically samples ordinary named or matrix gate actions
+only on the branch where the predicate is true. Conditional measurements,
+resets, nested controls, and sub-MPO actions are left unchanged; use explicit
+stream-local noise entries when those operations need a particular noisy
+channel. `k=-1` means the latest measurement; general record-to-record
+arithmetic is intentionally not lowered.
 
 Supported Stim error channels are `X_ERROR`, `Y_ERROR`, `Z_ERROR`,
 `DEPOLARIZE1`, `DEPOLARIZE2`, `PAULI_CHANNEL_1`, `PAULI_CHANNEL_2`,

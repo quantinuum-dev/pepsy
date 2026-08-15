@@ -63,6 +63,7 @@ from .._fidelity import (
 )
 from ..mps.optimizer import (
     _control_event_parts as _mps_control_event_parts,
+    _resolve_conditional,
     normalize_submpo_where,
     submpo_event_parts,
 )
@@ -141,7 +142,13 @@ def _is_product_tensor_network(state):
     if not callable(max_bond):
         return False
     try:
-        return int(max_bond()) <= 1
+        value = max_bond()
+        # Quimb reports ``None`` for the vacuous bond maximum of a one-site
+        # MPS. That state is still a valid product-state initializer for a
+        # TreeOptimizer.
+        if value is None:
+            return int(getattr(state, "L", 0)) <= 1
+        return int(value) <= 1
     except (TypeError, ValueError):
         return False
 
@@ -923,6 +930,18 @@ class TreeOptimizer:
                     "vec": payload["vec"],
                     "absorb": payload.get("absorb", "left"),
                     "compact_labels": payload.get("compact_labels", True),
+                })
+            elif event_type == "conditional":
+                # Layout discovery only needs the action support. Use a
+                # lightweight placeholder mapping on the original labels;
+                # the live conditional action remains in ``self.G`` and is
+                # replayed unchanged after the tree plan is selected. Avoid
+                # materializing a dense identity for a wide conditional gate.
+                stream.append({
+                    "kind": "conditional",
+                    "record": payload["record"],
+                    "bit": payload["bit"],
+                    "action": {"where": original_where},
                 })
             else:  # pragma: no cover - normalized streams are exhaustive
                 raise ValueError(f"unknown tree layout event {event_type!r}.")
@@ -5680,6 +5699,44 @@ class TreeOptimizer:
 
     def _apply_control_event_impl(self, name, payload, where):
         """Apply a control event without opening another thread context."""
+        if name == "conditional":
+            record_index, expected = _resolve_conditional(
+                payload, len(self.measurements)
+            )
+            record = self.measurements[record_index]
+            outcome = (
+                int(record.outcome)
+                if hasattr(record, "outcome")
+                else int(record[2])
+            )
+            if int(outcome < 0) != expected:
+                return self
+            action_payloads, action_wheres, action_types = self._normalize_gate_queue(
+                (payload["action"],)
+            )
+            if len(action_payloads) != 1:
+                raise ValueError(
+                    "conditional action must normalize to exactly one stream entry."
+                )
+            action_payload = action_payloads[0]
+            action_where = action_wheres[0]
+            action_type = action_types[0]
+            if action_type == "gate":
+                self.apply_gate(action_payload, action_where)
+            elif action_type == "submpo":
+                action_support = self._validate_support(action_where)
+                self._apply_submpo_resolved(
+                    action_payload,
+                    action_support,
+                    logical_where=action_where,
+                    max_bond=self.chi,
+                    cutoff=self.cutoff,
+                )
+            else:
+                self._apply_control_event_impl(
+                    action_type, action_payload, action_where
+                )
+            return self
         if name == "cap":
             self.cap(
                 where[0], payload["vec"],

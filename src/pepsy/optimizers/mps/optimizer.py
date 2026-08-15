@@ -751,7 +751,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``("cap", where, vec[, absorb])``, ``("reset", where[, basis])``, and
         ``("measure_reset", basis, where[, outcome])`` (built by
         :meth:`measure_event`, :meth:`cap_event`, :meth:`reset_event`, and
-        :meth:`measure_reset_event`); a
+        :meth:`measure_reset_event`). Classical feed-forward events use
+        ``("if", record, bit, action)`` or the equivalent mapping form and
+        apply ``action`` only when the referenced measurement has the
+        requested computational bit (``+1 -> 0``, ``-1 -> 1``); negative
+        records are offsets from the latest measurement. A
         ``cap`` event shortens the MPS, so later event site labels refer to the
         shortened chain.
     chi : int

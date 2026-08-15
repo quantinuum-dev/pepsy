@@ -109,6 +109,25 @@ measures each target in `basis`, records the result, then resets it to the
 physical leg with `vec`, absorbs it into the selected neighbour, and shortens
 the MPS by one site.
 
+Classical feed-forward is represented by `("if", record, bit, action)` (the
+aliases `"conditional"`, `"condition"`, `"feed_forward"`, and
+`"feedforward"` are accepted). `record=-1` refers to the latest measurement;
+nonnegative records are absolute measurement indices. Measurement eigenvalue
+`+1` is computational bit `0`, and `-1` is bit `1`. The action is one ordinary
+bundled gate, control event, or sub-MPO event, for example:
+
+```python
+stream = [
+    (qu.hadamard(), 0),
+    ("measure", "Z", 0),
+    ("if", -1, 1, (qu.pauli("X"), 1)),
+]
+```
+
+Mapping form accepts `kind`/`type`/`event`, `record`, `bit` (or `value`), and
+`then` (or `action`). The same event is evaluated per noisy trajectory and per
+coalesced leaf, so the selected action follows that shot's measurement record.
+
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
 `"dmrg1"` uses at most two two-site growth sweeps and then fixed-rank one-site
