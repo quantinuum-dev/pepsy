@@ -2143,6 +2143,83 @@ def test_fit_retag_resolves_environment_and_preserves_info_object():
     assert info["two_site_splits"]
 
 
+def test_fit_retag_keeps_layered_tensor_ownership_near_mps_sites():
+    """Retagging uses nearest graph sites without reordering the target."""
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    bonds = [f"bond{i}" for i in range(3)]
+    tensors = []
+
+    for site in range(4):
+        inds = []
+        shape = []
+        if site:
+            inds.append(bonds[site - 1])
+            shape.append(1)
+        if site < 3:
+            inds.append(bonds[site])
+            shape.append(1)
+        inds.append(state.site_ind(site))
+        shape.append(2)
+        if site == 1:
+            inds.append("path-left")
+            shape.append(1)
+        if site == 2:
+            inds.append("path-right")
+            shape.append(1)
+        tensors.append(qtn.Tensor(np.ones(shape), inds=inds))
+
+    # These tensors have no physical legs. Their graph distances to sites 1
+    # and 2 are deliberately different, so propagation must not simply walk
+    # in the first tag's direction.
+    tensors.extend(
+        [
+            qtn.Tensor(
+                np.ones((1, 1)),
+                inds=("path-left", "path-middle"),
+            ),
+            qtn.Tensor(
+                np.ones((1, 1)),
+                inds=("path-middle", "path-right"),
+            ),
+        ]
+    )
+    target = qtn.TensorNetwork(tensors)
+    original_order = tuple(target.tensor_map)
+
+    fit = py.FIT(target, p=state, retag=True)
+
+    assert tuple(fit.tn.tensor_map) == original_order
+
+    left_path = fit.tn.tensor_map[original_order[4]]
+    right_path = fit.tn.tensor_map[original_order[5]]
+    assert set(left_path.tags) == {"I1", "I2"}
+    assert set(right_path.tags) == {"I1", "I2"}
+
+
+def test_fit_retag_preserves_layered_mps_backbone_regions():
+    """Canonical layered tags keep base MPS tensors on their original sites."""
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    optimizer = py.MpsOptimizer(state.copy(), gates=[], chi=4, mode="dmrg")
+    target = optimizer._build_norm_target(
+        state,
+        qu.CNOT(),
+        (1, 2),
+        0.0,
+        target_strategy="layered",
+    )
+
+    fit = py.FIT(target, p=state, retag=True)
+
+    assert [set(tensor.tags) for tensor in fit.tn] == [
+        {"I0"},
+        {"I1"},
+        {"I2"},
+        {"I3"},
+        {"I1"},
+        {"I2"},
+    ]
+
+
 def test_fit_direct_environment_requires_unique_tensor_per_site():
     """A tensor carrying every site tag must not be cached multiple times."""
     state = qtn.MPS_rand_state(

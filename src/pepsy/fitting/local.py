@@ -9,6 +9,7 @@ import functools
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Mapping
 from copy import deepcopy
 from numbers import Integral
@@ -609,65 +610,148 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     # ------------------------------------------------------------------
     # Target tagging and structural preparation
     # ------------------------------------------------------------------
-    def _deep_tag(self):
-        """
-        Propagates tags through the tensor network to ensure every tensor
-        receives at least one site tag. Useful for layered TNs.
+    def _deep_tag(self, seed_sites):
+        """Partition target tensors into ordered, local site regions.
+
+        ``seed_sites`` maps target tensor ids to the MPS sites whose physical
+        indices touch those tensors. A multi-source shortest-path traversal
+        then assigns every reachable unseeded tensor to the closest site. The
+        site number breaks equal-distance ties, making the result independent
+        of the order in which Quimb stores or exposes tensor neighbors. An
+        unseeded tensor on a region boundary receives both neighboring site
+        tags, so selecting either local region retains the bridge tensor.
+
+        This is deliberately a graph-only operation. It does not reorder
+        tensors, rename indices, or move any tensor data.
         """
         tn = self.tn
-        count = 1
+        tensor_ids = tuple(tn.tensor_map)
+        tensor_order = {tid: order for order, tid in enumerate(tensor_ids)}
+        site_tags = [self.site_tag_id.format(i) for i in range(self.p.L)]
 
-        while count >= 1:
-            tags = tn.tags
-            count = 0
-            for tag in tags:
-                tids = tn.tag_map[tag]
-                neighbors = qtn.oset()
-                for tid in tids:
-                    t = tn.tensor_map[tid]
-                    for ix in t.inds:
-                        neighbors |= tn.ind_map[ix]
-                for tid in neighbors:
-                    t = tn.tensor_map[tid]
-                    if not t.tags:
-                        t.add_tag(tag)
-                        count += 1
+        # Build the target graph once. The existing index map is the source of
+        # truth for connectivity; this temporary adjacency view avoids
+        # repeatedly rediscovering the same neighbors while partitioning.
+        adjacency = {}
+        for tid in tensor_ids:
+            neighbors = set()
+            for index in tn.tensor_map[tid].inds:
+                neighbors.update(tn.ind_map.get(index, ()))
+            neighbors.discard(tid)
+            adjacency[tid] = tuple(
+                sorted(neighbors, key=tensor_order.__getitem__)
+            )
+
+        # ``best`` stores the winning ``(distance, site)`` for each tensor. A
+        # multi-source BFS is linear in the target graph size; seeding the
+        # queue by MPS site number makes equal-distance ownership deterministic.
+        best = {}
+        pending = deque()
+        for tid, sites in sorted(
+            seed_sites.items(),
+            key=lambda item: (min(item[1]), tensor_order[item[0]]),
+        ):
+            if tid not in tensor_order or not sites:
+                continue
+            site = min(sites)
+            best[tid] = (0, site)
+            pending.append((tid, 0, site))
+
+        while pending:
+            tid, distance, site = pending.popleft()
+
+            for neighbor in adjacency[tid]:
+                if neighbor in best:
+                    continue
+                best[neighbor] = (distance + 1, site)
+                pending.append((neighbor, distance + 1, site))
+
+        # Start with all direct and trusted metadata associations. Seed
+        # tensors retain every site they explicitly represent, including a
+        # legitimate multi-site bridge tensor.
+        region_sites = {
+            tid: set(sites) for tid, sites in seed_sites.items()
+        }
+
+        for tid, (_distance, site) in best.items():
+            if tid in seed_sites:
+                continue
+
+            # Normally an unseeded tensor belongs to one nearest region. If
+            # it touches another region's frontier, include the neighboring
+            # site tag too. This creates a one-tensor overlap at boundaries,
+            # preserving local contractions without broadening whole regions.
+            sites = {site}
+            for neighbor in adjacency[tid]:
+                neighbor_sites = seed_sites.get(neighbor)
+                if neighbor_sites is None:
+                    neighbor_sites = {best[neighbor][1]}
+                sites.update(
+                    neighbor_site
+                    for neighbor_site in neighbor_sites
+                    if neighbor_site != site
+                )
+            region_sites[tid] = sites
+
+        for tid, sites in region_sites.items():
+            tensor = tn.tensor_map[tid]
+            for site in sorted(sites):
+                tensor.add_tag(site_tags[site])
 
     def _re_tag(self):
-        """Assign site tags on target TN tensors based on current boundary state."""
-        # Drop all existing tags first.
+        """Assign target tags from physical connectivity to the fitted MPS.
+
+        Every target tensor attached to a site's physical index is seeded with
+        that site's tag. Remaining tensors are assigned to the nearest seeded
+        site in the target tensor graph. This keeps layered target ownership
+        local without changing tensor order, index names, or tensor data.
+        """
+        p = self.p
         tn = self.tn
+        site_tags = tuple(self.site_tag_id.format(i) for i in range(p.L))
+        site_for_tag = {tag: site for site, tag in enumerate(site_tags)}
+
+        # Existing canonical site tags are meaningful layout metadata for a
+        # layered target: gate application can move a physical leg onto a
+        # gate tensor while the original MPS tensor still carries its site
+        # tag. Dropping those hints would make the MPS backbone look closer to
+        # the wrong neighboring site. Keep only tags from the current MPS site
+        # scheme and discard unrelated presentation tags below.
+        seed_sites = {}
+        for tid, tensor in tn.tensor_map.items():
+            hinted_sites = {
+                site_for_tag[tag]
+                for tag in tensor.tags
+                if tag in site_for_tag
+            }
+            if hinted_sites:
+                seed_sites[tid] = hinted_sites
+
         tn.drop_tags()
 
-        # Get outer indices and all site tags from current state.
-        p = self.p
-        site_tags = [self.site_tag_id.format(i) for i in range(p.L)]
-        inds = list(p.outer_inds())
+        outer_inds = frozenset(p.outer_inds())
 
-        # First-layer tagging: pick tensor directly connected to each boundary index.
-        for site_tag in site_tags:
-            site_outer = [idx for idx in p[site_tag].inds if idx in inds]
-            if not site_outer:
-                continue
-            idx = site_outer[0]
+        # Seed from all shared physical indices, not just the first target
+        # tensor returned by ``ind_map``. This is authoritative for physical
+        # ownership; existing canonical tags provide additional backbone
+        # hints for layers whose physical legs have moved to gate tensors.
+        for site in range(p.L):
+            site_tensor = p[site_tags[site]]
+            for index in site_tensor.inds:
+                if index not in outer_inds:
+                    continue
+                for tid in tn.ind_map.get(index, ()):
+                    seed_sites.setdefault(tid, set()).add(site)
 
-            tids = list(tn.ind_map.get(idx, ()))
-            if not tids:
-                continue
-            t = tn.tensor_map[tids[0]]
-
-            if not t.tags:
-                t.add_tag(site_tag)
+        self._deep_tag(seed_sites)
 
         untagged_tensors = [tensor for tensor in tn if not tensor.tags]
-        if untagged_tensors:
-            if self.warning:
-                logger.warning(
-                    "%d tensors are still untagged after initial retagging; "
-                    "propagating tags through neighbors.",
-                    len(untagged_tensors),
-                )
-            self._deep_tag()
+        if untagged_tensors and self.warning:
+            logger.warning(
+                "%d target tensors are disconnected from all MPS physical "
+                "sites and remain untagged after nearest-site retagging.",
+                len(untagged_tensors),
+            )
 
     def run(self, n_iter=6, verbose=False):
         """Run the simple full-contraction reference sweeps.
