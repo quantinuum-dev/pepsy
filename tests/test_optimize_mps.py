@@ -1156,8 +1156,118 @@ def test_fit_run_eff_native_blocks_grow_full_chain(block_size):
     assert fit.info[split_key]
 
 
+@pytest.mark.parametrize("block_size", (2, 3))
+def test_fit_run_eff_adaptive_block_warmup_then_one_site_refinement(block_size):
+    """Full-chain run_eff can switch from block growth to one-site updates."""
+    initial = qtn.MPS_computational_state("00000", dtype="complex128")
+    target = initial.copy()
+    target.gate_(qu.hadamard(), 2, contract=True)
+    target.gate_(
+        qu.CNOT(),
+        (2, 3),
+        contract="split",
+        max_bond=2,
+        cutoff=0.0,
+    )
+    fit = py.FIT(target, p=initial, cutoffs=0.0)
+
+    fit.run_eff(
+        n_iter=4,
+        block_size=block_size,
+        adaptive_block_sweeps=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+    )
+
+    assert fit.iterations_run == 4
+    assert fit.adaptive_sweeps_run == 2
+    assert fit.one_site_sweeps_run == 2
+    assert fit._sweep_environment_reuse_count == 3
+    split_key = "two_site_splits" if block_size == 2 else "three_site_splits"
+    assert fit.info[split_key]
+    assert fit.p.bond_size(2, 3) == 2
+
+
+@pytest.mark.parametrize("block_size", (2, 3))
+@pytest.mark.parametrize("sweep_sequence", ("RL", "LR"))
+def test_fit_run_eff_transition_cache_matches_rebuild(
+    block_size,
+    sweep_sequence,
+):
+    """Block-to-one-site cache extensions preserve the rebuilt result."""
+    initial = qtn.MPS_rand_state(
+        5,
+        bond_dim=1,
+        phys_dim=2,
+        dtype="complex128",
+        seed=610,
+    )
+    target = qtn.MPS_rand_state(
+        5,
+        bond_dim=3,
+        phys_dim=2,
+        dtype="complex128",
+        seed=611,
+    )
+    options = {
+        "n_iter": 3,
+        "block_size": block_size,
+        "adaptive_block_sweeps": 2,
+        "sweep_sequence": sweep_sequence,
+        "max_bond": 3,
+        "cutoff": 1.0e-12,
+    }
+    cached = py.FIT(target, p=initial, cutoffs=1.0e-12)
+    rebuilt = py.FIT(target, p=initial, cutoffs=1.0e-12)
+    rebuilt._allow_sweep_environment_reuse = False
+
+    cached.run_eff(**options)
+    rebuilt.run_eff(**options)
+
+    assert cached._sweep_environment_reuse_count == 2
+    assert rebuilt._sweep_environment_reuse_count == 0
+    assert np.allclose(
+        cached.p.to_dense(),
+        rebuilt.p.to_dense(),
+        atol=1.0e-12,
+    )
+
+
+def test_fit_run_eff_adaptive_rtol_waits_for_one_site_phase():
+    """Adaptive run_eff resets tolerance at the block-to-one-site boundary."""
+    initial = qtn.MPS_computational_state("00000", dtype="complex128")
+    target = initial.copy()
+    target.gate_(qu.hadamard(), 2, contract=True)
+    target.gate_(
+        qu.CNOT(),
+        (2, 3),
+        contract="split",
+        max_bond=2,
+        cutoff=0.0,
+    )
+    fit = py.FIT(target, p=initial, cutoffs=0.0)
+
+    fit.run_eff(
+        n_iter=5,
+        block_size=2,
+        adaptive_block_sweeps=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=0.0,
+        rtol=1.0,
+        patience=2,
+    )
+
+    assert fit.iterations_run >= 3
+    assert fit.adaptive_sweeps_run == 2
+    assert fit.one_site_sweeps_run >= 1
+    assert len(fit.sweep_norm_trace) == fit.iterations_run
+    assert fit.convergence_reason in {"relative_tolerance", "max_sweeps"}
+
+
 def test_fit_run_eff_default_keeps_fixed_rank_one_site_compatibility():
-    """The default full-chain path must remain the legacy one-site solver."""
+    """The default full-chain path remains a fixed-rank one-site solver."""
     initial, target = _three_site_ghz_target()
     fit = py.FIT(target, p=initial, cutoffs=0.0)
 
@@ -1166,6 +1276,75 @@ def test_fit_run_eff_default_keeps_fixed_rank_one_site_compatibility():
     assert fit.p.max_bond() == 1
     assert "two_site_splits" not in fit.info
     assert "three_site_splits" not in fit.info
+
+
+@pytest.mark.parametrize("sweep_sequence", ("RL", "LR"))
+def test_fit_run_eff_fixed_one_site_reuses_opposite_sweep_cache(
+    sweep_sequence,
+):
+    """Fixed-sweep one-site run_eff reuses compatible dense environments."""
+    initial = qtn.MPS_rand_state(
+        5,
+        bond_dim=1,
+        phys_dim=2,
+        dtype="complex128",
+        seed=612,
+    )
+    target = qtn.MPS_rand_state(
+        5,
+        bond_dim=3,
+        phys_dim=2,
+        dtype="complex128",
+        seed=613,
+    )
+    options = {
+        "n_iter": 4,
+        "sweep_sequence": sweep_sequence,
+        "rtol": None,
+    }
+    cached = py.FIT(target, p=initial, cutoffs=1.0e-12)
+    rebuilt = py.FIT(target, p=initial, cutoffs=1.0e-12)
+    rebuilt._allow_sweep_environment_reuse = False
+
+    cached.run_eff(**options)
+    rebuilt.run_eff(**options)
+
+    assert cached._sweep_environment_reuse_count == 3
+    assert rebuilt._sweep_environment_reuse_count == 0
+    assert len(cached.local_norm_trace) == 4
+    assert np.allclose(
+        cached.p.to_dense(),
+        rebuilt.p.to_dense(),
+        atol=1.0e-12,
+    )
+
+
+def test_fit_run_eff_one_site_default_alternates_directions():
+    """Default run_eff sweeps left-to-right and then right-to-left."""
+    initial = qtn.MPS_computational_state("000", dtype="complex128")
+    fit = py.FIT(initial.copy(), p=initial, cutoffs=0.0)
+
+    fit.run_eff(n_iter=2)
+
+    assert fit.iterations_run == 2
+    assert fit.final_direction == "L"
+    assert fit.final_center_site == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"n_iter": 1, "rtol": 1.0e-8}, "n_iter >= 2"),
+        ({"n_iter": 2, "rtol": 1.0e-8, "min_iter": 1}, "min_iter >= 2"),
+    ],
+)
+def test_fit_run_eff_rtol_requires_two_sweeps(kwargs, match):
+    """Adaptive run_eff must have two retained norms to compare."""
+    initial = qtn.MPS_computational_state("000", dtype="complex128")
+    fit = py.FIT(initial.copy(), p=initial, cutoffs=0.0)
+
+    with pytest.raises(ValueError, match=match):
+        fit.run_eff(**kwargs)
 
 
 def test_fit_run_eff_three_site_requires_three_sites():

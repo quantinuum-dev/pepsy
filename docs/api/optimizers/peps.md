@@ -50,6 +50,22 @@ the corresponding scalar `chi`. DMRG two-site boundaries start at bond 1 and
 grow through local SVDs instead of global padding. `fit_mode="eff"` remains
 the default while two-site accuracy and wall time are workload-dependent.
 
+For the full-chain `eff` solver, `boundary_kwargs` can instead select native
+block growth followed by one-site refinement:
+
+```python
+boundary_kwargs={
+    "fit_mode": "eff",
+    "fit_block_size": 2,
+    "fit_adaptive_sweeps": 2,
+    "fit_sweep_sequence": "RL",
+}
+```
+
+This schedule is passed consistently to normalization, infidelity, and sweep
+boundary initialization. `fit_rtol` is optional and adds one terminal norm
+check per completed sweep only when enabled.
+
 ## One Torch SVD/QR policy
 
 Torch autodiff through PEPS cleanup uses both SVD and QR. Configure both with

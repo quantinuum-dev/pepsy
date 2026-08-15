@@ -696,6 +696,68 @@ def test_peps_norm_two_site_can_grow_from_rank_one_without_padding(monkeypatch):
     assert max(mps.max_bond() for mps in bdy.mps_b.values()) == 4
 
 
+def test_peps_norm_eff_can_use_adaptive_run_eff_blocks():
+    """PEPS norm forwards run_eff block warm-up and one-site refinement."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=48, dtype="complex128")
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        method="dmrg",
+        fit_mode="eff",
+        fit_block_size=2,
+        fit_adaptive_sweeps=2,
+        fit_sweep_sequence="RL",
+        n_iter=4,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert abs(result.cost - exact) / abs(exact) < 1.0e-10
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == "eff"
+        and diagnostic.iterations == 4
+        and diagnostic.convergence_reason == "fixed_sweeps"
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+def test_peps_norm_eff_adaptive_rtol_reports_run_eff_convergence():
+    """PEPS boundary diagnostics expose adaptive run_eff stopping metadata."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=49, dtype="complex128")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        method="dmrg",
+        fit_mode="eff",
+        fit_block_size=2,
+        fit_adaptive_sweeps=2,
+        fit_sweep_sequence="RL",
+        n_iter=5,
+        fit_min_iter=2,
+        fit_rtol=1.0,
+        fit_patience=2,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == "eff"
+        and 3 <= diagnostic.iterations <= 5
+        and diagnostic.convergence_reason
+        in {"relative_tolerance", "max_sweeps"}
+        for diagnostic in result.fit_diagnostics
+    )
+
+
 class _DummyNorm:
     """Minimal norm-like object with copy() for contract_boundary tests."""
 

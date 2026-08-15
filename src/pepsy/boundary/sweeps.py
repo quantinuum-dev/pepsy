@@ -3,6 +3,7 @@
 from copy import deepcopy
 import re
 from dataclasses import dataclass
+from numbers import Integral
 import time
 
 import numpy as np
@@ -117,19 +118,28 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         ``"two-site"`` uses cached full-boundary two-site sweeps with a
         native SVD after every pair update;
         ``"global"`` uses ``FIT.run``.
+    fit_block_size : {1, 2, 3}, default=1
+        Block size passed to ``FIT.run_eff`` when ``fit_mode="eff"``.
+        Block sizes 2 and 3 enable native SVD growth for full-boundary fits.
+    fit_adaptive_sweeps : int | None, default=None
+        For ``fit_mode="eff"`` with ``fit_block_size`` 2 or 3, use the block
+        update for this many initial sweeps and then use one-site refinement.
+        ``None`` keeps the selected block size for all fixed sweeps.
     fit_max_bond : int | None, default=None
         Two-site SVD bond cap. When omitted, the current boundary-MPS bond is
         used as a safe cap. PEPS metric helpers pass their requested ``chi``
         explicitly so a lower-rank warm start can grow up to that target.
     fit_sweep_sequence : str, default="RL"
-        Repeating two-site sweep directions. Alternating directions normally
+        Repeating local-fit sweep directions. ``"RL"`` runs each boundary
+        left-to-right and then right-to-left; alternating directions normally
         converges more evenly than repeatedly sweeping from one side.
     fit_cutoff : float, default=1e-12
         Two-site SVD truncation cutoff.
     fit_cutoff_mode : str, default="rsum2"
         Quimb cutoff convention used by the native two-site split.
     fit_min_iter : int | None, default=None
-        Minimum two-site sweeps before adaptive convergence can stop.
+        Minimum completed sweeps before adaptive convergence can stop. For
+        ``FIT.run_eff``, adaptive stopping requires at least two sweeps.
     fit_rtol : float | None, default=None
         Relative final-center-norm tolerance. ``None`` preserves fixed-sweep
         behavior.
@@ -160,6 +170,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         fit_contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_block_size=1,
+        fit_adaptive_sweeps=None,
         fit_max_bond=None,
         fit_sweep_sequence="RL",
         fit_cutoff=1.0e-12,
@@ -180,6 +192,32 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # Validate at construction time rather than after an expensive PEPS
         # boundary has already reached its first local fit.
         self.fit_mode = _canonical_fit_mode_selector(fit_mode)
+        if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
+            1,
+            2,
+            3,
+        }:
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        fit_block_size = int(fit_block_size)
+        if self.fit_mode != "eff" and fit_block_size != 1:
+            raise ValueError(
+                "fit_block_size is only configurable with fit_mode='eff'."
+            )
+        if fit_adaptive_sweeps is not None:
+            if fit_block_size not in {2, 3}:
+                raise ValueError(
+                    "fit_adaptive_sweeps requires fit_block_size=2 or 3."
+                )
+            if (
+                not isinstance(fit_adaptive_sweeps, Integral)
+                or int(fit_adaptive_sweeps) < 1
+            ):
+                raise ValueError(
+                    "fit_adaptive_sweeps must be a positive integer or None."
+                )
+            fit_adaptive_sweeps = int(fit_adaptive_sweeps)
+        self.fit_block_size = fit_block_size
+        self.fit_adaptive_sweeps = fit_adaptive_sweeps
         self.fit_max_bond = fit_max_bond
         self.fit_sweep_sequence = fit_sweep_sequence
         self.fit_cutoff = fit_cutoff
@@ -365,7 +403,32 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             fit.run(n_iter=self.n_iter, verbose=verbose)
             return
         if self.fit_mode == "eff":
-            fit.run_eff(n_iter=self.n_iter, verbose=verbose)
+            if (
+                self.fit_block_size == 1
+                and self.fit_adaptive_sweeps is None
+                and self.fit_min_iter is None
+                and self.fit_rtol is None
+                and self.fit_sweep_sequence == "RL"
+            ):
+                # Keep the historical call shape for lightweight compatible
+                # FIT doubles and the default boundary path.
+                fit.run_eff(n_iter=self.n_iter, verbose=verbose)
+                return
+            max_bond = self.fit_max_bond
+            if max_bond is None and self.fit_block_size in {2, 3}:
+                max_bond = int(boundary_mps.max_bond())
+            fit.run_eff(
+                n_iter=self.n_iter,
+                verbose=verbose,
+                block_size=self.fit_block_size,
+                sweep_sequence=self.fit_sweep_sequence,
+                max_bond=max_bond,
+                cutoff=self.fit_cutoff,
+                adaptive_block_sweeps=self.fit_adaptive_sweeps,
+                min_iter=self.fit_min_iter,
+                rtol=self.fit_rtol,
+                patience=self.fit_patience,
+            )
             return
         if self.fit_mode == "two-site":
             # The complete boundary is the active DMRG interval. ``run_gate``
@@ -418,6 +481,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     ):
         """Append one typed, copy-safe boundary FIT diagnostic."""
         gate_solver_ran = self.fit_mode == "two-site" and boundary_mps.L > 1
+        adaptive_eff_ran = self.fit_mode == "eff" and self.fit_rtol is not None
         if status == "failed":
             # Failure reporting must not assume run_gate reached its normal
             # epilogue. FIT initializes these fields, but getattr keeps this
@@ -428,13 +492,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             relative_change = getattr(fit, "last_relative_change", None)
             center_site = getattr(fit, "final_center_site", None)
             direction = getattr(fit, "final_direction", None)
-        elif gate_solver_ran:
-            iterations = int(fit.iterations_run)
+        elif gate_solver_ran or adaptive_eff_ran:
+            iterations = int(getattr(fit, "iterations_run", self.n_iter))
             converged = bool(fit.converged)
             reason = str(fit.convergence_reason)
-            relative_change = fit.last_relative_change
-            center_site = fit.final_center_site
-            direction = fit.final_direction
+            relative_change = getattr(fit, "last_relative_change", None)
+            center_site = getattr(fit, "final_center_site", None)
+            direction = getattr(fit, "final_direction", None)
         elif status == "complete":
             # ``run`` and ``run_eff`` are fixed-sweep compatibility solvers and
             # predate FIT's adaptive diagnostic fields. Report what actually

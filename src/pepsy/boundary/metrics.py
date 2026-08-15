@@ -833,6 +833,8 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -865,12 +867,14 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     if method == "dmrg":
         fit_mode = _canonical_fit_mode_selector(fit_mode)
         bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
-        two_site_fit = fit_mode == "two-site"
+        block_fit = fit_mode == "two-site" or (
+            fit_mode == "eff" and fit_block_size in {2, 3}
+        )
         _retune_bdy_to_chi(
             bdy_obj,
             chi,
             bdy_name,
-            expand_growth=not two_site_fit,
+            expand_growth=not block_fit,
         )
         if bdy_obj is None:
             if chi is None:
@@ -878,7 +882,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             # A two-site SVD can discover rank as it sweeps. Starting from a
             # product boundary avoids allocating and canonicalizing chi-wide
             # random bonds that may be immediately truncated away.
-            initial_chi = 1 if two_site_fit else chi
+            initial_chi = 1 if block_fit else chi
             if flat:
                 bdy_obj = BdyMPS(
                     tn_flat=norm,
@@ -900,6 +904,8 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             bdy=bdy_obj,
             contraction_opt=contraction_opt,
             fit_mode=fit_mode,
+            fit_block_size=fit_block_size,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_max_bond=chi if fit_max_bond is None else fit_max_bond,
             fit_sweep_sequence=fit_sweep_sequence,
             fit_cutoff=cutoff,
@@ -959,6 +965,8 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -1041,6 +1049,8 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
@@ -1163,6 +1173,8 @@ def contract_boundary(
     direction="y",
     equalize_norms=False,
     strip_exponent=False,
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     """Approximate a scalar contraction using boundary-MPS sweeps.
 
@@ -1183,17 +1195,25 @@ def contract_boundary(
     fit_mode : {"eff", "two-site", "global"}, default="eff"
         Fit backend mode. ``"two-site"`` performs native-SVD pair updates
         while preserving the cached left/right environment sweep.
+    fit_block_size : {1, 2, 3}, default=1
+        Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
+    fit_adaptive_sweeps : int | None, default=None
+        For ``fit_mode="eff"`` and block size 2 or 3, number of initial
+        block-SVD sweeps before one-site refinement. ``None`` keeps fixed
+        block-size sweeps.
     fit_max_bond : int | None, default=None
         Two-site SVD cap. If omitted, use the boundary object's current bond.
         Higher-level PEPS helpers pass their requested ``chi`` explicitly.
     fit_sweep_sequence : str, default="RL"
-        Repeating two-site sweep directions.
+        Repeating local-fit sweep directions. ``"RL"`` runs left-to-right
+        and then right-to-left.
     fit_cutoff : float, default=1e-12
         Two-site SVD truncation cutoff.
     fit_cutoff_mode : str, default="rsum2"
         Quimb cutoff convention used by the two-site split.
     fit_min_iter : int | None, default=None
-        Minimum sweeps before adaptive stopping.
+        Minimum completed sweeps before adaptive stopping. ``FIT.run_eff``
+        requires at least two when ``fit_rtol`` is enabled.
     fit_rtol : float | None, default=None
         Relative convergence tolerance. ``None`` runs exactly ``n_iter``
         sweeps, preserving legacy fixed-iteration behavior.
@@ -1261,6 +1281,8 @@ def contract_boundary(
         mps_boundaries,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff=fit_cutoff,
@@ -1309,6 +1331,8 @@ def _contract_state_norm(
     progress,
     track_boundary_fidelity,
     fit_mode,
+    fit_block_size,
+    fit_adaptive_sweeps,
     fit_max_bond,
     fit_sweep_sequence,
     fit_cutoff_mode,
@@ -1351,6 +1375,8 @@ def _contract_state_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
@@ -1385,6 +1411,8 @@ def peps_normalize(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -1447,6 +1475,13 @@ def peps_normalize(
     fit_mode : {"eff", "two-site", "global"}, default="eff"
         Boundary fitting backend mode. ``"two-site"`` can grow useful bond
         subspaces up to ``fit_max_bond`` through native SVD pair updates.
+    fit_block_size : {1, 2, 3}, default=1
+        Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
+        Sizes 2 and 3 enable native block-SVD growth.
+    fit_adaptive_sweeps : int | None, default=None
+        For block size 2 or 3, use block updates for this many initial
+        sweeps, then refine with one-site updates. ``None`` keeps fixed
+        block-size sweeps.
     fit_max_bond : int | None, default=None
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
@@ -1502,6 +1537,8 @@ def peps_normalize(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
@@ -1565,6 +1602,8 @@ def boundary_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -1615,6 +1654,13 @@ def boundary_norm(
     fit_mode : {"eff", "two-site", "global"}, default="eff"
         Boundary fitting backend mode. ``"two-site"`` uses cached pair
         environments and native SVD truncation.
+    fit_block_size : {1, 2, 3}, default=1
+        Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
+        Sizes 2 and 3 enable native block-SVD growth.
+    fit_adaptive_sweeps : int | None, default=None
+        For block size 2 or 3, use block updates for this many initial
+        sweeps, then refine with one-site updates. ``None`` keeps fixed
+        block-size sweeps.
     fit_max_bond : int | None, default=None
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
@@ -1662,6 +1708,8 @@ def boundary_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
@@ -1698,6 +1746,8 @@ def peps_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -1722,6 +1772,9 @@ def peps_norm(
     contraction methods and boundary controls, including ``method="dmrg"``,
     ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and ``"exact"``.
 
+    ``fit_block_size`` and ``fit_adaptive_sweeps`` are forwarded to the
+    ``fit_mode="eff"`` boundary solver.
+
     Returns
     -------
     complex | float | tuple[complex | float, float] | BoundaryContractResult
@@ -1741,6 +1794,8 @@ def peps_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
@@ -1779,6 +1834,8 @@ def peps_infidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -1863,6 +1920,11 @@ def peps_infidelity(
         Track per-step fidelity during boundary contraction.
     fit_mode : {"eff", "two-site", "global"}, default="eff"
         Boundary fitting backend mode.
+    fit_block_size : {1, 2, 3}, default=1
+        Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
+    fit_adaptive_sweeps : int | None, default=None
+        For block size 2 or 3, number of initial block-SVD sweeps before
+        one-site refinement. ``None`` keeps fixed block-size sweeps.
     fit_max_bond : int | None, default=None
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
@@ -1917,6 +1979,8 @@ def peps_infidelity(
         chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
@@ -2025,6 +2089,8 @@ def peps_fidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="rsum2",
@@ -2075,6 +2141,8 @@ def peps_fidelity(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,

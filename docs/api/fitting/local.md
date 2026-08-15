@@ -135,11 +135,37 @@ fit.run_eff(
 )
 ```
 
-`run_eff(block_size=1)` remains the default compatibility path. The block-2
-and block-3 variants visit the complete chain, reuse cached environments, and
-grow only bonds reached by their native SVD splits. They always perform the
-requested fixed sweep sequence; adaptive `rtol` stopping and detailed timing
-remain controls of `run_gate()`.
+`run_eff(block_size=1)` remains the default compatibility path. All block
+sizes honor the requested sweep sequence, which defaults to `RL` (left to
+right, then right to left). Dense and native bosonic one-site sweeps reuse the
+same opposite-direction environment cache as the block paths; conservative
+mixed-backend and fermionic fixed-sweep compatibility routes retain their
+audited rebuild behavior. The block-2 and block-3 variants visit the complete
+chain, reuse cached environments, and grow only bonds reached by their native
+SVD splits. To use DMRG-style block growth
+followed by cheaper one-site refinement, set `adaptive_block_sweeps=2` (or
+another positive count):
+
+```python
+fit.run_eff(
+    n_iter=6,
+    block_size=2,
+    adaptive_block_sweeps=2,
+    sweep_sequence="RL",
+    max_bond=chi,
+    cutoff=1e-12,
+)
+```
+
+The first two sweeps use two-site SVD growth and the remaining sweeps use
+one-site FIT. `block_size=3` behaves the same way with three-site updates.
+The block-to-one-site transition extends only the terminal cached boundaries
+needed by the reversed one-site sweep. Optional `rtol`, `min_iter`, and
+`patience` controls use the terminal retained-center norm; `rtol=None` keeps
+fixed-sweep behavior and adds no diagnostic transfer. When `rtol` is enabled,
+`run_eff` requires at least two completed sweeps and defaults `min_iter` to 2,
+so the first stopping comparison is always between two retained norms.
+Detailed per-site timing remains a `run_gate(timing=True)` feature.
 
 For an interval containing exactly one neighboring pair,
 `single_pair_fast_path=True` marks structural convergence after one update:
@@ -163,7 +189,8 @@ sweep center, contracts the real outside overlap environments rather than
 substituting graded boundary identities, applies Symmray's dual-leg phase
 correction before each local writeback, and resolves odd dummy-mode global
 phases afterward. The physical ket is restored on both success and failure.
-The same convention supports block-2/3 native `run_eff` sweeps.
+The same convention supports one-, two-, and three-site native `run_eff`
+sweeps.
 
 Before entering that conjugated gauge, a native full-chain MPS fit compares
 the target and guess virtual charge maps. If the target has sectors absent
