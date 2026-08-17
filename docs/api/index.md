@@ -17,6 +17,8 @@ the detailed functions and classes for each area.
 - [Symmetric tensors](tensors/symmetric.md)
 - [Fitting](fitting/local.md)
 - [Operators](operators/gates.md)
+- [Explicit MPO automata](operators/automaton.md)
+- [Higher-order MPO foundation](operators/higher_order_mpo.md)
 - [External circuit adapters](interop.md)
 - [Hamiltonians](operators/hamiltonians.md)
 - [Solvers](solvers/gradient.md), [finite differences](solvers/finite_difference.md)

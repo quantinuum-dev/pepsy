@@ -54,9 +54,25 @@ _GATE_EXPORTS = [
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
 _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
-_SUBMODULES = ("gates", "hamiltonians")
+_AUTOMATON_EXPORTS = ["MPOChannel", "MPOTransition", "MPOAutomaton"]
+_SYMBOL_MODULES.update({name: ".mpo_automaton" for name in _AUTOMATON_EXPORTS})
+_MPO_EXPORTS = [
+    "MPOLevelToken",
+    "MPOLevel",
+    "MPOProductTerm",
+    "MPOCompressionReport",
+    "FirstDegreeMPO",
+]
+_SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_EXPORTS})
+_SUBMODULES = ("gates", "hamiltonians", "mpo", "mpo_automaton")
 
-__all__ = [*_GATE_EXPORTS, "ham_tn", *_SUBMODULES]
+__all__ = [
+    *_GATE_EXPORTS,
+    "ham_tn",
+    *_AUTOMATON_EXPORTS,
+    *_MPO_EXPORTS,
+    *_SUBMODULES,
+]
 
 
 def __getattr__(name):
