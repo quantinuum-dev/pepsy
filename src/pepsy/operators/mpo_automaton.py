@@ -12,7 +12,7 @@ operator builders, where keeping the algebraic channels visible is useful.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from numbers import Integral
 
@@ -49,6 +49,88 @@ def _check_scalar(value, *, name):
         ndim = np.ndim(value)
     if ndim != 0:
         raise TypeError(f"{name} must be scalar, got shape {getattr(value, 'shape', None)}.")
+
+
+def _backend_name(value):
+    """Return Autoray's backend name without forcing host materialization."""
+    try:
+        return ar.infer_backend(value)
+    except Exception:  # pragma: no cover - defensive backend guard
+        return None
+
+
+def _backend_reference(values):
+    """Choose a non-NumPy backend value when one is present."""
+    values = tuple(value for value in values if value is not None)
+    for value in values:
+        if _backend_name(value) not in {"builtins", "numpy"}:
+            return value
+    return values[0] if values else None
+
+
+def _as_backend(value, *, like, dtype=None):
+    """Convert host constants to ``like``'s backend, preserving graph data."""
+    if like is None:
+        return value
+    if _backend_name(value) in {"builtins", "numpy"} and _backend_name(like) not in {
+        "builtins",
+        "numpy",
+    }:
+        if dtype is not None:
+            return ar.do("array", value, like=like, dtype=dtype)
+        return ar.do("array", value, like=like)
+    return value
+
+
+def _multiply_scalar(scalar, value):
+    """Multiply a local operator by a scalar without breaking autodiff."""
+    reference = scalar if _backend_name(scalar) not in {"builtins", "numpy"} else value
+    return ar.do("multiply", scalar, _as_backend(value, like=reference))
+
+
+def _matmul(left, right):
+    """Multiply local matrices after aligning mixed backend constants."""
+    reference = _backend_reference((left, right))
+    return ar.do(
+        "matmul",
+        _as_backend(left, like=reference),
+        _as_backend(right, like=reference),
+    )
+
+
+def _operator_key(operator):
+    """Return an exact, hashable fingerprint for a local operator.
+
+    NumPy-backed operators are fingerprinted by values rather than object
+    identity, which lets independently-created Pauli matrices share
+    channels.  Backends that cannot be safely materialized on the host fall
+    back to object identity and therefore retain the conservative, dedicated
+    channel behavior.
+    """
+    if _backend_name(operator) not in {"builtins", "numpy"}:
+        # Backend arrays may be differentiable or traced. Materializing one
+        # for a fingerprint would make sharing depend on runtime values.
+        return ("backend-object", type(operator), id(operator))
+    try:
+        array = np.asarray(operator)
+        contiguous = np.ascontiguousarray(array)
+        return (
+            "array",
+            tuple(contiguous.shape),
+            contiguous.dtype.str,
+            contiguous.tobytes(),
+        )
+    except Exception:  # pragma: no cover - backend-specific fallback
+        return ("object", type(operator), id(operator))
+
+
+def _metadata_key(value):
+    """Return a conservative key for optional channel metadata."""
+    try:
+        hash(value)
+    except TypeError:
+        return ("object", type(value), id(value))
+    return ("value", value)
 
 
 @dataclass(frozen=True)
@@ -276,6 +358,314 @@ class MPOAutomaton:
         automaton.add_local_term(0, identity)
         return automaton
 
+    @classmethod
+    def from_product_terms(
+        cls,
+        L,
+        terms,
+        *,
+        phys_dim=None,
+        share_channels=True,
+        start_state=("start",),
+        done_state=("done",),
+    ):
+        """Build an automaton from factorized product terms.
+
+        Parameters
+        ----------
+        L : int
+            Number of sites.
+        terms : iterable
+            Objects or mappings with ``sites``, ``operators``,
+            ``coefficient``, ``string_operators``, and optional ``charge``
+            attributes. ``(sites, operators)`` and
+            ``(sites, operators, coefficient)`` pairs are also accepted.
+        share_channels : bool, default=True
+            Share equal product prefixes and identical suffix continuations.
+            This is an exact structural transformation; it does not use a
+            numerical tolerance. Set to ``False`` to retain one dedicated
+            channel path per term.
+
+        Notes
+        -----
+        The sharing pass is deliberately conservative for non-NumPy
+        backends. If an operator cannot be fingerprinted without materializing
+        it on the host, that operator is treated as unique. The resulting
+        automaton remains exact in either case.
+        """
+        if not isinstance(L, Integral):
+            raise TypeError("L must be an integer.")
+        L = int(L)
+        if L < 1:
+            raise ValueError("L must be >= 1.")
+
+        records = []
+        for term in tuple(terms):
+            if isinstance(term, Mapping):
+                sites = term.get("sites", term.get("locations"))
+                operators = term.get("operators", term.get("paulis"))
+                coefficient = term.get("coefficient", 1.0)
+                string_operators = term.get(
+                    "string_operators",
+                    term.get("string_paulis"),
+                )
+                charge = term.get("charge")
+            elif hasattr(term, "sites") and hasattr(term, "operators"):
+                sites = term.sites
+                operators = term.operators
+                coefficient = getattr(term, "coefficient", 1.0)
+                string_operators = getattr(term, "string_operators", None)
+                charge = getattr(term, "charge", None)
+            elif isinstance(term, (tuple, list)) and len(term) in (2, 3):
+                sites, operators = term[:2]
+                coefficient = term[2] if len(term) == 3 else 1.0
+                string_operators = None
+                charge = None
+            else:
+                raise TypeError(
+                    "product terms must provide sites and operators, or be "
+                    "(sites, operators) pairs."
+                )
+
+            if sites is None or operators is None:
+                raise ValueError("each product term needs sites and operators.")
+            sites = tuple(sites)
+            operators = tuple(operators)
+            if not sites or len(sites) != len(operators):
+                raise ValueError(
+                    "product-term sites and operators must be non-empty and aligned."
+                )
+            if not all(isinstance(site, Integral) for site in sites):
+                raise TypeError("product-term sites must contain integers.")
+            sites = tuple(map(int, sites))
+            if any(site < 0 or site >= L for site in sites):
+                raise ValueError(
+                    f"product-term sites must lie in [0, {L - 1}], got {sites!r}."
+                )
+            if any(left >= right for left, right in zip(sites, sites[1:])):
+                raise ValueError("product-term sites must be strictly increasing.")
+            _check_scalar(coefficient, name="coefficient")
+
+            shapes = [_operator_shape(operator) for operator in operators]
+            if any(
+                len(shape) != 2 or shape[0] != shape[1]
+                for shape in shapes
+            ):
+                raise ValueError("product-term operators must be square matrices.")
+            if any(shape != shapes[0] for shape in shapes[1:]):
+                raise ValueError(
+                    "all product-term operators must have the same square shape."
+                )
+            term_phys_dim = shapes[0][0]
+            if phys_dim is None:
+                phys_dim = term_phys_dim
+            if tuple(shapes[0]) != (int(phys_dim), int(phys_dim)):
+                raise ValueError(
+                    f"operators have shape {shapes[0]}, expected "
+                    f"({phys_dim}, {phys_dim})."
+                )
+
+            gap_count = sum(
+                right - left - 1 for left, right in zip(sites, sites[1:])
+            )
+            if string_operators is None:
+                identity = ar.do("eye", int(phys_dim), like=operators[0])
+                string_operators = (identity,) * gap_count
+            else:
+                string_operators = tuple(string_operators)
+                if len(string_operators) != gap_count:
+                    raise ValueError(
+                        f"string_operators must have length {gap_count}, "
+                        f"got {len(string_operators)}."
+                    )
+                string_shapes = [
+                    _operator_shape(operator) for operator in string_operators
+                ]
+                if any(
+                    shape != (int(phys_dim), int(phys_dim))
+                    for shape in string_shapes
+                ):
+                    raise ValueError(
+                        "string_operators must have the same square shape as "
+                        "operators."
+                    )
+            records.append({
+                "sites": sites,
+                "operators": operators,
+                "coefficient": coefficient,
+                "string_operators": string_operators,
+                "charge": charge,
+            })
+
+        if not records:
+            raise ValueError("terms must contain at least one product term.")
+
+        automaton = cls(
+            L,
+            start_state=start_state,
+            done_state=done_state,
+            phys_dim=int(phys_dim),
+        )
+        if not share_channels:
+            for record in records:
+                automaton.add_product_term(**record)
+            return automaton
+
+        # First build a prefix trie. Each non-boundary trie node is a virtual
+        # channel on one cut. Coefficients stay on terminal edges so paths
+        # with a common operator prefix can share their channel exactly.
+        states_by_cut = [[] for _ in range(max(L - 1, 0))]
+        state_keys = [{} for _ in range(max(L - 1, 0))]
+        state_charges = {}
+        state_counter = 0
+        edge_records = []
+        unweighted_edges = set()
+
+        def new_state(cut, key, charge):
+            nonlocal state_counter
+            state = ("shared-term", int(cut), state_counter)
+            state_counter += 1
+            state_keys[cut][key] = state
+            states_by_cut[cut].append(state)
+            state_charges[state] = charge
+            return state
+
+        def add_edge(site, left_state, right_state, operator, *, weighted):
+            if not weighted:
+                edge_key = (
+                    int(site),
+                    left_state,
+                    right_state,
+                    _operator_key(operator),
+                )
+                if edge_key in unweighted_edges:
+                    return
+                unweighted_edges.add(edge_key)
+            edge_records.append(
+                (int(site), left_state, right_state, operator, bool(weighted))
+            )
+
+        for record in records:
+            sites = record["sites"]
+            operators = record["operators"]
+            string_operators = record["string_operators"]
+            coefficient = record["coefficient"]
+            charge = record["charge"]
+            support_positions = {site: pos for pos, site in enumerate(sites)}
+            current = start_state
+            string_pos = 0
+
+            for site in range(sites[0], sites[-1] + 1):
+                if site in support_positions:
+                    position = support_positions[site]
+                    structural_operator = operators[position]
+                    edge_operator = structural_operator
+                    weighted = False
+                else:
+                    structural_operator = string_operators[string_pos]
+                    edge_operator = structural_operator
+                    weighted = False
+                    string_pos += 1
+
+                is_final = site == sites[-1]
+                if is_final:
+                    edge_operator = _multiply_scalar(coefficient, edge_operator)
+                    add_edge(
+                        site,
+                        current,
+                        done_state,
+                        edge_operator,
+                        weighted=weighted,
+                    )
+                    continue
+
+                state_key = (
+                    current,
+                    _operator_key(structural_operator),
+                    _metadata_key(charge),
+                )
+                target = state_keys[site].get(state_key)
+                if target is None:
+                    target = new_state(site, state_key, charge)
+                add_edge(
+                    site,
+                    current,
+                    target,
+                    edge_operator,
+                    weighted=weighted,
+                )
+                current = target
+
+        # Merge states with identical future continuations. Together with
+        # the prefix trie above, this shares both repeated prefixes and exact
+        # suffixes while keeping all operator paths unchanged.
+        state_maps = [{} for _ in range(max(L - 1, 0))]
+        for cut in range(L - 2, -1, -1):
+            signatures = {}
+            for state in states_by_cut[cut]:
+                outgoing = []
+                for site, left, right, operator, _weighted in edge_records:
+                    if site != cut + 1 or left != state:
+                        continue
+                    target = right
+                    if cut + 1 < L - 1:
+                        target = state_maps[cut + 1].get(right, right)
+                    outgoing.append((_operator_key(operator), target))
+                signature = (
+                    _metadata_key(state_charges[state]),
+                    tuple(sorted(outgoing, key=repr)),
+                )
+                canonical = signatures.setdefault(signature, state)
+                state_maps[cut][state] = canonical
+
+        transitions = [[] for _ in range(L)]
+        rebuilt_edges = set()
+        for site, left, right, operator, weighted in edge_records:
+            mapped_left = left
+            mapped_right = right
+            if site > 0 and left not in {start_state, done_state}:
+                mapped_left = state_maps[site - 1][left]
+            if site < L - 1 and right not in {start_state, done_state}:
+                mapped_right = state_maps[site][right]
+            if not weighted:
+                edge_key = (
+                    site,
+                    mapped_left,
+                    mapped_right,
+                    _operator_key(operator),
+                )
+                if edge_key in rebuilt_edges:
+                    continue
+                rebuilt_edges.add(edge_key)
+            transitions[site].append(
+                MPOTransition(mapped_left, mapped_right, operator)
+            )
+
+        channels = []
+        for cut, states in enumerate(states_by_cut):
+            mapped_states = []
+            for state in states:
+                canonical = state_maps[cut][state]
+                if canonical not in mapped_states:
+                    mapped_states.append(canonical)
+            channels.append([
+                MPOChannel(start_state),
+                MPOChannel(done_state),
+                *(
+                    MPOChannel(state, state_charges[state])
+                    for state in mapped_states
+                ),
+            ])
+
+        return cls(
+            L,
+            channels=channels,
+            transitions=transitions,
+            start_state=start_state,
+            done_state=done_state,
+            phys_dim=int(phys_dim),
+        )
+
     def _channel_positions(self, cut):
         return {channel.state: pos for pos, channel in enumerate(self._channels[cut])}
 
@@ -401,7 +791,7 @@ class MPOAutomaton:
             sites[0],
             self.start_state,
             channel_id,
-            coefficient * operators[0],
+            _multiply_scalar(coefficient, operators[0]),
         )
         string_pos = 0
         for support_pos, (left_site, right_site) in enumerate(zip(sites, sites[1:])):
@@ -435,7 +825,7 @@ class MPOAutomaton:
             site,
             self.start_state,
             self.done_state,
-            coefficient * operator,
+            _multiply_scalar(coefficient, operator),
         )
 
     def add_factorized_term(
@@ -585,7 +975,7 @@ class MPOAutomaton:
                     site,
                     remap(transition.left_state),
                     remap(transition.right_state),
-                    coefficient * transition.operator,
+                    _multiply_scalar(coefficient, transition.operator),
                 )
         return self
 
@@ -649,8 +1039,7 @@ class MPOAutomaton:
                         and left_state in {start_state, done_state}
                     ):
                         continue
-                    operator = ar.do(
-                        "matmul",
+                    operator = _matmul(
                         left_transition.operator,
                         right_transition.operator,
                     )
@@ -837,6 +1226,10 @@ class MPOAutomaton:
                 if reference is None:
                     return np.zeros((phys_dim, phys_dim))
                 return ar.do("zeros_like", reference)
+            operators = tuple(
+                _as_backend(operator, like=reference)
+                for operator in operators
+            )
             block = ar.do("zeros_like", operators[0])
             for operator in operators:
                 block = block + operator
@@ -852,7 +1245,7 @@ class MPOAutomaton:
             for site_transitions in self._transitions
             for transition in site_transitions
         ]
-        reference = operators[0] if operators else None
+        reference = _backend_reference(operators)
         identity = (
             ar.do("eye", phys_dim, like=reference)
             if reference is not None

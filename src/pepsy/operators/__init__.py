@@ -57,11 +57,14 @@ _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
 _AUTOMATON_EXPORTS = ["MPOChannel", "MPOTransition", "MPOAutomaton"]
 _SYMBOL_MODULES.update({name: ".mpo_automaton" for name in _AUTOMATON_EXPORTS})
 _MPO_EXPORTS = [
+    "MPOParameter",
     "MPOLevelToken",
     "MPOLevel",
     "MPOProductTerm",
     "MPOCompressionReport",
+    "MPONumericalCompressionReport",
     "FirstDegreeMPO",
+    "MPOBasis",
 ]
 _SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_EXPORTS})
 _SUBMODULES = ("gates", "hamiltonians", "mpo", "mpo_automaton")

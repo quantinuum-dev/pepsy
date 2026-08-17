@@ -30,22 +30,31 @@ finite open chains; fermionic/Symmray compilation is a future backend layer.
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from math import factorial
 from numbers import Integral
+import warnings
 
 import autoray as ar
 import numpy as np
 
-from .mpo_automaton import MPOAutomaton
+from .mpo_automaton import (
+    MPOAutomaton,
+    _as_backend,
+    _backend_name,
+    _multiply_scalar,
+)
 
 __all__ = [
+    "MPOParameter",
     "MPOLevelToken",
     "MPOLevel",
     "MPOProductTerm",
     "MPOCompressionReport",
+    "MPONumericalCompressionReport",
     "FirstDegreeMPO",
+    "MPOBasis",
 ]
 
 
@@ -105,9 +114,32 @@ class MPOProductTerm:
     string_operators: tuple[object, ...] | None = None
     charge: object = None
 
+    @classmethod
+    def from_pauli(
+        cls,
+        sites,
+        paulis,
+        *,
+        coefficient=1.0,
+        string_paulis=None,
+        charge=None,
+    ):
+        """Construct a product term from labels such as ``"ZXY"``.
+
+        ``sites`` lists the non-identity support positions. Gaps receive
+        identities unless ``string_paulis`` supplies one label per gap.
+        """
+        return cls(
+            sites=sites,
+            operators=paulis,
+            coefficient=coefficient,
+            string_operators=string_paulis,
+            charge=charge,
+        )
+
     def __post_init__(self):
         sites = tuple(int(site) for site in self.sites)
-        operators = tuple(self.operators)
+        operators = _normalize_operator_sequence(self.operators, name="operators")
         if not sites or len(sites) != len(operators):
             raise ValueError("sites and operators must be non-empty and aligned.")
         if any(left >= right for left, right in zip(sites, sites[1:])):
@@ -118,7 +150,10 @@ class MPOProductTerm:
             object.__setattr__(
                 self,
                 "string_operators",
-                tuple(self.string_operators),
+                _normalize_operator_sequence(
+                    self.string_operators,
+                    name="string_operators",
+                ),
             )
 
 
@@ -142,12 +177,95 @@ class MPOCompressionReport:
     skipped_candidates: int = 0
 
 
+@dataclass(frozen=True)
+class MPONumericalCompressionReport:
+    """Report the numerical compression boundary delegated to Quimb.
+
+    The semantic history representation cannot survive a numerical bond
+    truncation, so this report deliberately describes the compiled Quimb MPO
+    only.  Quimb's high-level ``MatrixProductOperator.compress`` API does not
+    expose one aggregate operator error, hence ``truncation_error`` is
+    explicitly ``None`` here rather than being inferred from a dense
+    operator norm.
+    """
+
+    method: str
+    form: object
+    max_bond: int | None
+    cutoff: float
+    cutoff_mode: str
+    initial_bond_dimensions: tuple[int, ...]
+    final_bond_dimensions: tuple[int, ...]
+    truncated: bool
+    truncation_error: object = None
+
+
 def _check_scalar(value, *, name):
     ndim = getattr(value, "ndim", None)
     if ndim is None:
         ndim = np.ndim(value)
     if ndim != 0:
         raise TypeError(f"{name} must be scalar, got ndim={ndim}.")
+
+
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class MPOParameter:
+    """A named or positional scalar coefficient resolved by :class:`MPOBasis`.
+
+    The object is intentionally only a reference to a coefficient.  The
+    current backend scalar is supplied to :meth:`MPOBasis.build`, which means
+    Torch/JAX values are never copied into a topology cache and remain in the
+    autodiff graph.
+
+    Parameters
+    ----------
+    name : hashable
+        Mapping key, or integer positional index for sequence-like parameter
+        containers.
+    default : scalar, optional
+        Value used when ``build`` receives no parameter container.  Omitting
+        it makes the parameter required.
+    """
+
+    name: Hashable
+    default: object = _UNSET
+
+    def __post_init__(self):
+        if not isinstance(self.name, Hashable):
+            raise TypeError("MPO parameter names must be hashable.")
+
+    def resolve(self, parameters):
+        """Resolve this reference against a mapping or positional container."""
+        if parameters is None:
+            if self.default is _UNSET:
+                raise KeyError(
+                    f"missing MPO parameter {self.name!r}; pass it to build()."
+                )
+            value = self.default
+        elif isinstance(parameters, Mapping):
+            try:
+                value = parameters[self.name]
+            except KeyError as exc:
+                raise KeyError(
+                    f"missing MPO parameter {self.name!r}; pass it to build()."
+                ) from exc
+        else:
+            if not isinstance(self.name, Integral):
+                raise TypeError(
+                    "non-integer MPO parameter names require a mapping; got "
+                    f"{type(parameters).__name__}."
+                )
+            try:
+                value = parameters[int(self.name)]
+            except (IndexError, KeyError, TypeError) as exc:
+                raise KeyError(
+                    f"missing positional MPO parameter {self.name!r}."
+                ) from exc
+        _check_scalar(value, name=f"parameter {self.name!r}")
+        return value
 
 
 def _as_4d(data, *, site, length):
@@ -172,6 +290,43 @@ def _as_4d(data, *, site, length):
     if out.shape[-1] != out.shape[-2]:
         raise ValueError("MPO physical output and input dimensions must match.")
     return out
+
+
+def _pauli_matrix(label):
+    """Return a dense one-qubit Pauli matrix for a single-character label."""
+    label = str(label).upper()
+    matrices = {
+        "I": np.eye(2, dtype=complex),
+        "X": np.array([[0, 1], [1, 0]], dtype=complex),
+        "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
+        "Z": np.array([[1, 0], [0, -1]], dtype=complex),
+    }
+    try:
+        return matrices[label]
+    except KeyError as exc:
+        raise ValueError(
+            f"Pauli labels must be one of 'I', 'X', 'Y', or 'Z', got {label!r}."
+        ) from exc
+
+
+def _normalize_operator_sequence(operators, *, name):
+    """Normalize a matrix sequence or a compact Pauli label string."""
+    if isinstance(operators, str):
+        operators = tuple(operators)
+    else:
+        operators = tuple(operators)
+    normalized = []
+    for operator in operators:
+        if isinstance(operator, str):
+            if len(operator) != 1:
+                raise ValueError(
+                    f"{name} string entries must be single Pauli labels, "
+                    f"got {operator!r}."
+                )
+            normalized.append(_pauli_matrix(operator))
+        else:
+            normalized.append(operator)
+    return tuple(normalized)
 
 
 def _zeros(shape, *, like):
@@ -208,6 +363,14 @@ def _array_equal(left, right):
             return False
 
 
+def _setitem(array, index, value):
+    """Set one tensor entry on mutable and functional array backends."""
+    if ar.infer_backend(array) == "jax":
+        return array.at[index].set(value)
+    array[index] = value
+    return array
+
+
 def _level_number(token):
     return token.level if isinstance(token, MPOLevelToken) else int(token)
 
@@ -232,18 +395,38 @@ def _term_from_input(term):
     if isinstance(term, MPOProductTerm):
         return term
     if isinstance(term, Mapping):
+        sites = term.get("sites", term.get("locations"))
+        operators = term.get("operators", term.get("paulis"))
+        if sites is None or operators is None:
+            raise ValueError("each product term needs sites and operators.")
+        coefficient = term.get("coefficient", _UNSET)
+        if coefficient is _UNSET:
+            if "parameter" in term:
+                coefficient = MPOParameter(
+                    term["parameter"],
+                    term.get("default", _UNSET),
+                )
+            else:
+                coefficient = 1.0
         return MPOProductTerm(
-            sites=term["sites"],
-            operators=term["operators"],
-            coefficient=term.get("coefficient", 1.0),
-            string_operators=term.get("string_operators"),
+            sites=sites,
+            operators=operators,
+            coefficient=coefficient,
+            string_operators=term.get(
+                "string_operators",
+                term.get("string_paulis"),
+            ),
             charge=term.get("charge"),
         )
-    if isinstance(term, (tuple, list)) and len(term) == 2:
-        return MPOProductTerm(sites=term[0], operators=term[1])
+    if isinstance(term, (tuple, list)) and len(term) in (2, 3):
+        return MPOProductTerm(
+            sites=term[0],
+            operators=term[1],
+            coefficient=term[2] if len(term) == 3 else 1.0,
+        )
     raise TypeError(
         "terms must contain MPOProductTerm values, mappings, or "
-        "(sites, operators) pairs."
+        "(sites, operators[, coefficient]) pairs."
     )
 
 
@@ -308,6 +491,11 @@ class FirstDegreeMPO:
         # need to probe for it after an optional compression stage. It is
         # populated by ``compress_exact`` or ``extensive_exponential``.
         self.compression_report = self.metadata.get("compression_report")
+        # Populated by ``from_automaton`` when the source graph is available.
+        # Keeping this private means direct array construction remains a
+        # supported fallback, while local-term constructors can avoid
+        # materializing unreachable Cartesian history states.
+        self._structural_transitions = None
         self._levels = self._normalize_levels(levels)
         self._validate()
 
@@ -402,7 +590,7 @@ class FirstDegreeMPO:
         unnecessary device transfer; use backend-specific copying before
         editing tensor values in place.
         """
-        return type(self)(
+        out = type(self)(
             self._arrays,
             levels=self.levels,
             degree=self.degree,
@@ -411,6 +599,8 @@ class FirstDegreeMPO:
             site_tag_id=self.site_tag_id,
             metadata=self.metadata,
         )
+        out._structural_transitions = self._structural_transitions
+        return out
 
     @staticmethod
     def _history_for_state(state, *, start_state, done_state):
@@ -462,7 +652,12 @@ class FirstDegreeMPO:
                 done_state=automaton.done_state,
             ),
         )])
-        return cls(arrays, levels=levels, degree=degree, **kwargs)
+        result = cls(arrays, levels=levels, degree=degree, **kwargs)
+        if result.L > 1:
+            result._structural_transitions = (
+                result._structural_transitions_from_automaton(automaton)
+            )
+        return result
 
     @classmethod
     def from_local_terms(
@@ -472,6 +667,7 @@ class FirstDegreeMPO:
         *,
         phys_dim=None,
         degree=1,
+        share_channels=True,
         **kwargs,
     ):
         """Build a first-degree MPO from factorized local product terms.
@@ -486,16 +682,41 @@ class FirstDegreeMPO:
         if phys_dim is None:
             first_operator = terms[0].operators[0]
             phys_dim = int(first_operator.shape[0])
-        automaton = MPOAutomaton(L, phys_dim=phys_dim)
-        for term in terms:
-            automaton.add_product_term(
-                term.sites,
-                term.operators,
-                coefficient=term.coefficient,
-                string_operators=term.string_operators,
-                charge=term.charge,
-            )
+        automaton = MPOAutomaton.from_product_terms(
+            L,
+            terms,
+            phys_dim=phys_dim,
+            share_channels=share_channels,
+        )
         return cls.from_automaton(automaton, degree=degree, **kwargs)
+
+    @classmethod
+    def from_pauli_terms(
+        cls,
+        L,
+        terms,
+        *,
+        degree=1,
+        share_channels=True,
+        **kwargs,
+    ):
+        """Build a first-degree MPO from compact Pauli product terms.
+
+        Each term may be an :class:`MPOProductTerm`, a mapping with
+        ``sites`` (or ``locations``), ``paulis`` (or ``operators``), and an
+        optional ``coefficient``, or a ``(sites, paulis)``/
+        ``(sites, paulis, coefficient)`` tuple. Pauli strings such as
+        ``"ZXY"`` and label sequences such as ``("Z", "X", "Y")`` are
+        accepted. Sites are zero-based and list the non-identity support.
+        """
+        return cls.from_local_terms(
+            L,
+            terms,
+            phys_dim=2,
+            degree=degree,
+            share_channels=share_channels,
+            **kwargs,
+        )
 
     @classmethod
     def identity(cls, L, phys_dim, *, like=None, **kwargs):
@@ -526,8 +747,16 @@ class FirstDegreeMPO:
         # compression, and MPS-application APIs. The semantic object remains
         # attached for code that needs the level histories later. Keeping this
         # adapter one-way avoids duplicating Quimb's MPO implementation here.
+        if self.L == 1:
+            compiled_arrays = (self._arrays[0][0, 0],)
+        else:
+            compiled_arrays = (
+                self._arrays[0][0],
+                *self._arrays[1:-1],
+                self._arrays[-1][:, 0],
+            )
         mpo = qtn.MatrixProductOperator(
-            self._arrays,
+            compiled_arrays,
             shape="lrud",
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
@@ -554,9 +783,99 @@ class FirstDegreeMPO:
             **compress_opts,
         )
 
+    def compress_numerical(
+        self,
+        *,
+        form=None,
+        max_bond=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        create_bond=False,
+        return_report=False,
+        **compress_opts,
+    ):
+        """Numerically compress the compiled MPO through Quimb.
+
+        This is intentionally separate from :meth:`compress_exact` and the
+        paper's analytical Algorithm 4.  The returned object is an ordinary
+        Quimb ``MatrixProductOperator`` because a numerical truncation can no
+        longer be represented faithfully by the original semantic histories.
+        The report records the requested policy and the bond dimensions before
+        and after the Quimb sweep.  Quimb's high-level compressor does not
+        expose a global operator truncation error, so the report leaves that
+        field as ``None``.
+        """
+        if max_bond is not None:
+            if not isinstance(max_bond, Integral) or int(max_bond) < 1:
+                raise ValueError("max_bond must be a positive integer or None.")
+            max_bond = int(max_bond)
+        _check_scalar(cutoff, name="cutoff")
+        cutoff = float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        if not isinstance(cutoff_mode, str):
+            raise TypeError("cutoff_mode must be a string.")
+        if "max_bond" in compress_opts or "cutoff" in compress_opts:
+            raise TypeError(
+                "max_bond and cutoff must be supplied as explicit compression "
+                "arguments, not duplicated in compress_opts."
+            )
+
+        mpo = self.to_mpo()
+        initial_bond_dimensions = tuple(int(size) for size in mpo.bond_sizes())
+        mpo.compress(
+            form=form,
+            create_bond=create_bond,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            **compress_opts,
+        )
+        final_bond_dimensions = tuple(int(size) for size in mpo.bond_sizes())
+        report = MPONumericalCompressionReport(
+            method="quimb",
+            form=form,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            initial_bond_dimensions=initial_bond_dimensions,
+            final_bond_dimensions=final_bond_dimensions,
+            truncated=final_bond_dimensions != initial_bond_dimensions,
+        )
+        # Numerical truncation invalidates the semantic history attachment.
+        mpo.pepsy_first_degree = None
+        mpo.pepsy_numerical_compression_report = report
+        if return_report:
+            return mpo, report
+        return mpo
+
     def expectation(self, mps, *, contraction_opt=None):
         """Evaluate ``<mps|self|mps>`` through Pepsy's MPS contraction API."""
         from pepsy.tensors import expec_mpo  # pylint: disable=import-outside-toplevel
+
+        # Quimb's contraction backend requires every operand to use one
+        # array backend.  A parameterized observable has a Torch/JAX MPO while
+        # a convenient product-state constructor often returns NumPy tensors;
+        # align that fixed state data to the observable backend without
+        # touching the observable's differentiable tensors.
+        reference = next(
+            (
+                array
+                for array in self._arrays
+                if _backend_name(array) not in {"builtins", "numpy"}
+            ),
+            None,
+        )
+        if reference is not None and hasattr(mps, "copy"):
+            mps = mps.copy()
+            for tensor in getattr(mps, "tensors", ()):
+                data = _as_backend(
+                    tensor.data,
+                    like=reference,
+                    dtype=getattr(reference, "dtype", None),
+                )
+                if data is not tensor.data:
+                    tensor.modify(data=data)
 
         return expec_mpo(
             self.to_mpo(),
@@ -568,7 +887,7 @@ class FirstDegreeMPO:
         """Return ``coefficient * self`` by scaling one boundary tensor."""
         _check_scalar(coefficient, name="coefficient")
         arrays = list(self._arrays)
-        arrays[0] = arrays[0] * coefficient
+        arrays[0] = _multiply_scalar(coefficient, arrays[0])
         out = type(self)(
             arrays,
             levels=self.levels,
@@ -578,6 +897,7 @@ class FirstDegreeMPO:
             site_tag_id=self.site_tag_id,
             metadata={**self.metadata, "scale": coefficient},
         )
+        out._structural_transitions = self._structural_transitions
         return out
 
     def add(self, other):
@@ -753,7 +1073,141 @@ class FirstDegreeMPO:
         """
         return self.power(exponent)
 
-    def _history_power_data(self, exponent):
+    def _history_schemas(self):
+        """Return the base-level schema used at every raw-history cut."""
+        return tuple(
+            self._levels[1]
+            if bond == 0
+            else self._levels[-2]
+            if bond == self.L
+            else self._levels[bond]
+            for bond in range(self.L + 1)
+        )
+
+    def _structural_transitions_from_automaton(self, automaton):
+        """Map automaton edges onto the raw-history boundary schemas."""
+        transitions = []
+        schemas = self._history_schemas()
+        for site in range(self.L):
+            left_schema = schemas[site]
+            right_schema = schemas[site + 1]
+            left_labels = {level.label: level for level in left_schema}
+            right_labels = {level.label: level for level in right_schema}
+            edges = set()
+            for transition, _implicit in automaton._materialized_transitions(site):
+                if (
+                    transition.left_state in left_labels
+                    and transition.right_state in right_labels
+                ):
+                    edges.add((transition.left_state, transition.right_state))
+
+            # The finite Hamiltonian's last tensor is right-boundary
+            # contracted onto level 3, while the transformed evolution MPO
+            # uses an all-one right boundary. ``_base_local_block`` supplies
+            # this synthetic identity edge, so include it in the structural
+            # graph as well.
+            if site == self.L - 1:
+                start_level = next(
+                    level
+                    for level in left_schema
+                    if _level_number(level.history[0]) == 1
+                )
+                if start_level.label in right_labels:
+                    edges.add((start_level.label, start_level.label))
+            transitions.append(frozenset(edges))
+        return tuple(transitions)
+
+    def _reachable_history_states(
+        self,
+        schemas,
+        exponent,
+        *,
+        max_bond=None,
+        on_exceed="raise",
+    ):
+        """Generate only raw histories reachable from the left boundary.
+
+        The previous reference implementation materialized every Cartesian
+        product at every cut, including channels that cannot be reached from
+        the finite-chain all-one left boundary.  This forward graph walk keeps
+        the same factor ordering and level metadata while avoiding those dead
+        states.  Direct array construction, which has no source automaton,
+        falls back to the complete local schema for compatibility.
+        """
+        start_levels = tuple(
+            level
+            for level in schemas[0]
+            if _level_number(level.history[0]) == 1
+        )
+        if len(start_levels) != 1:
+            raise ValueError(
+                "history construction requires one level-1 starting channel."
+            )
+        warned = False
+
+        def check_bond_limit(count, site):
+            nonlocal warned
+            if max_bond is None or count <= max_bond or on_exceed == "ignore":
+                return
+            message = (
+                "extensive_exponential history bond dimension "
+                f"{count} exceeds max_bond={max_bond} after site {site}."
+            )
+            if on_exceed == "raise":
+                raise MemoryError(message)
+            if not warned:
+                warnings.warn(message, RuntimeWarning, stacklevel=3)
+                warned = True
+
+        state_lists = [
+            (tuple(start_levels[0] for _ in range(exponent)),)
+        ]
+
+        for site in range(self.L):
+            right_schema = schemas[site + 1]
+            edges = (
+                None
+                if self._structural_transitions is None
+                else self._structural_transitions[site]
+            )
+            next_states = []
+            seen = set()
+            for left_state in state_lists[-1]:
+                options = []
+                for left_level in left_state:
+                    if edges is None:
+                        level_options = right_schema
+                    else:
+                        level_options = tuple(
+                            level
+                            for level in right_schema
+                            if (left_level.label, level.label) in edges
+                        )
+                    if not level_options:
+                        break
+                    options.append(level_options)
+                else:
+                    for right_state in product(*options):
+                        key = tuple(level.label for level in right_state)
+                        if key not in seen:
+                            seen.add(key)
+                            next_states.append(right_state)
+                            check_bond_limit(len(next_states), site)
+            if not next_states:
+                raise ValueError(
+                    f"raw-history construction found no reachable states after "
+                    f"site {site}."
+                )
+            state_lists.append(tuple(next_states))
+        return state_lists
+
+    def _history_power_data(
+        self,
+        exponent,
+        *,
+        max_bond=None,
+        on_exceed="raise",
+    ):
         """Build the full virtual-history representation of ``H**exponent``.
 
         The ordinary :meth:`power` method intentionally keeps singleton open
@@ -771,30 +1225,13 @@ class FirstDegreeMPO:
             raise ValueError("history powers require a first-degree MPO.")
         self._first_degree_structure()
 
-        # At the two open cuts use the adjacent internal channel schema to
-        # provide the full table of possible histories.  The physical edge
-        # tensors still contain zeros for the unreachable states.
-        schemas = []
-        for bond in range(self.L + 1):
-            if bond == 0:
-                schema = self._levels[1]
-            elif bond == self.L:
-                schema = self._levels[-2]
-            else:
-                schema = self._levels[bond]
-            schemas.append(tuple(schema))
-
-        # The Cartesian history table is the clearest reference implementation
-        # of the paper's construction and keeps the factor order explicit.
-        # It is intentionally the first correctness target, not the final
-        # scaling strategy: its temporary bond dimension is ``D**exponent``.
-        # Future work should replace this with a reachable-history iterator or
-        # sparse channel map, preserving the same level metadata and local
-        # transition semantics without materializing zero paths.
-        state_lists = [
-            tuple(product(schema, repeat=exponent))
-            for schema in schemas
-        ]
+        schemas = self._history_schemas()
+        state_lists = self._reachable_history_states(
+            schemas,
+            exponent,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+        )
         levels = []
         for bond, states in enumerate(state_lists):
             levels.append([
@@ -888,7 +1325,8 @@ class FirstDegreeMPO:
         left = arrays[bond - 1]
         left_columns = [left[:, pos] for pos in range(left.shape[1])]
         left_columns[target] = (
-            left_columns[target] + coefficient * left_columns[source]
+            left_columns[target]
+            + _multiply_scalar(coefficient, left_columns[source])
         )
         left_columns = [
             block for pos, block in enumerate(left_columns) if pos != source
@@ -1105,10 +1543,14 @@ class FirstDegreeMPO:
                                     * number_of_threes
                                 )
                             )
-                            arrays[site][left_pos, right_pos] = (
+                            arrays[site] = _setitem(
+                                arrays[site],
+                                (left_pos, right_pos),
                                 arrays[site][left_pos, right_pos]
-                                + coefficient
-                                * next_arrays[site][left_raw, right_raw]
+                                + _multiply_scalar(
+                                    coefficient,
+                                    next_arrays[site][left_raw, right_raw],
+                                ),
                             )
                             added += 1
         return added
@@ -1188,7 +1630,15 @@ class FirstDegreeMPO:
         levels[-1] = [MPOLevel(("boundary", "right", order), boundary_history)]
 
     def _extensive_history_exponential(
-        self, dt, *, order, extend=False, approximate=False,
+        self,
+        dt,
+        *,
+        order,
+        extend=False,
+        approximate=False,
+        mode="base",
+        max_bond=None,
+        on_exceed="raise",
     ):
         """Construct an arbitrary-order MPO using Algorithms 1--4.
 
@@ -1198,7 +1648,11 @@ class FirstDegreeMPO:
         prefactors, Algorithm 2 performs exact compression, and optional
         Algorithm 4 applies the analytical approximation.
         """
-        arrays, levels = self._history_power_data(order)
+        arrays, levels = self._history_power_data(
+            order,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+        )
         initial_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
         )
@@ -1222,6 +1676,13 @@ class FirstDegreeMPO:
             "operation": "extensive_exponential",
             "dt": dt,
             "order": order,
+            "mode": mode,
+            "max_bond": max_bond,
+            "on_exceed": on_exceed,
+            "initial_bond_dimensions": initial_bond_dimensions,
+            "history_generation": (
+                "reachable" if self._structural_transitions is not None else "cartesian"
+            ),
             "algorithms": (1, 2) + ((3,) if extend else ()) + ((4,) if approximate else ()),
             "exact_history_merges": len(exact_merges),
             "approximate_history_merges": approximate_merges,
@@ -1271,7 +1732,15 @@ class FirstDegreeMPO:
         return (0, *active_counts, 0)
 
     def extensive_exponential(
-        self, dt, *, order=1, extend=False, approximate=False,
+        self,
+        dt,
+        *,
+        order=1,
+        extend=False,
+        approximate=False,
+        mode=None,
+        max_bond=None,
+        on_exceed="raise",
     ):
         """Build the paper's size-extensive higher-order MPO.
 
@@ -1294,6 +1763,22 @@ class FirstDegreeMPO:
         approximate : bool, default=False
             Apply Algorithm 4's order-controlled analytical compression after
             exact history compression. This is not a numerical cutoff.
+        mode : {None, "base", "optimal", "approximate"}, optional
+            Named construction policy. ``"base"`` selects Algorithms 1--2,
+            ``"optimal"`` selects the paper's exact extended construction
+            (Algorithms 1--3), and ``"approximate"`` selects the extended
+            construction followed by Algorithm 4. When omitted, the legacy
+            ``extend`` and ``approximate`` flags are used unchanged.
+        max_bond : int, optional
+            Maximum temporary history bond dimension allowed during
+            construction. This guard applies before exact history compression
+            and therefore protects the allocation stage. ``None`` disables
+            the guard.
+        on_exceed : {"raise", "warn", "ignore"}, default="raise"
+            Action when ``max_bond`` is exceeded. ``"raise"`` stops before
+            completing the oversized history table, ``"warn"`` continues,
+            and ``"ignore"`` disables the action while retaining the value in
+            metadata.
 
         Notes
         -----
@@ -1308,12 +1793,53 @@ class FirstDegreeMPO:
         if not isinstance(order, Integral) or int(order) < 1:
             raise ValueError("order must be a positive integer.")
         order = int(order)
+        if max_bond is not None:
+            if not isinstance(max_bond, Integral) or int(max_bond) < 1:
+                raise ValueError("max_bond must be a positive integer or None.")
+            max_bond = int(max_bond)
+        if on_exceed not in {"raise", "warn", "ignore"}:
+            raise ValueError(
+                "on_exceed must be one of 'raise', 'warn', or 'ignore'."
+            )
+        if mode is not None:
+            if not isinstance(mode, str):
+                raise TypeError("mode must be a string or None.")
+            mode_aliases = {
+                "base": (False, False, "base"),
+                "optimal": (True, False, "optimal"),
+                "paper_optimal": (True, False, "optimal"),
+                "approximate": (True, True, "approximate"),
+                "paper_approximate": (True, True, "approximate"),
+            }
+            try:
+                mode_extend, mode_approximate, canonical_mode = mode_aliases[mode]
+            except KeyError as exc:
+                allowed = ", ".join(sorted(mode_aliases))
+                raise ValueError(
+                    f"unknown mode {mode!r}; expected one of {allowed}."
+                ) from exc
+            if extend or approximate:
+                raise ValueError(
+                    "mode cannot be combined with extend or approximate flags."
+                )
+            extend = mode_extend
+            approximate = mode_approximate
+        else:
+            canonical_mode = (
+                "approximate" if approximate and extend
+                else "extended" if extend
+                else "algorithm4" if approximate
+                else "base"
+            )
         if self.L > 1:
             return self._extensive_history_exponential(
                 dt,
                 order=order,
                 extend=extend,
                 approximate=approximate,
+                mode=canonical_mode,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
             )
         if extend or approximate or order >= 3:
             raise NotImplementedError(
@@ -1326,9 +1852,16 @@ class FirstDegreeMPO:
         identity = ar.do("eye", self.phys_dim, like=reference)
         h = reference
         if order == 1:
-            data = identity + dt * h
+            data = identity + _multiply_scalar(dt, h)
         else:
-            data = identity + dt * h + (dt * dt / 2) * ar.do("matmul", h, h)
+            data = (
+                identity
+                + _multiply_scalar(dt, h)
+                + _multiply_scalar(
+                    dt * dt / 2,
+                    ar.do("matmul", h, h),
+                )
+            )
         return type(self)(
             (data,),
             levels=[[
@@ -1348,6 +1881,9 @@ class FirstDegreeMPO:
                 "operation": "extensive_exponential",
                 "dt": dt,
                 "order": order,
+                "mode": canonical_mode,
+                "max_bond": max_bond,
+                "on_exceed": on_exceed,
                 "algorithms": ("one-site-taylor",),
                 "approximate": False,
             },
@@ -1482,3 +2018,217 @@ class FirstDegreeMPO:
 
     def __rmul__(self, coefficient):
         return self.scale(coefficient)
+
+
+class MPOBasis:
+    """Reusable coefficient basis for parameterized first-degree MPOs.
+
+    ``MPOBasis`` separates the topology of a Hamiltonian from the scalar
+    coefficients that are changed by an optimization loop.  It builds one
+    common automaton with one active channel per term and records the first
+    transition of each term as a coefficient slot.  :meth:`build` then only
+    copies the small transition table and reweights those slots; it does not
+    rebuild the term graph or infer channel topology.
+
+    Coefficients can be ordinary scalars, :class:`MPOParameter` references,
+    or callables receiving the parameter container.  The latter two forms are
+    useful when the values are Torch or JAX scalars.  The output is a normal
+    :class:`FirstDegreeMPO`, so it can immediately be passed to
+    :meth:`FirstDegreeMPO.extensive_exponential`.
+
+    The cache is deliberately topology-only.  Caching a completed MPO by a
+    backend tensor's object identity would return stale values after an
+    optimizer updates that tensor and could also retain an obsolete autodiff
+    graph.  Every call to :meth:`build` therefore creates fresh local blocks
+    while reusing the compiled channel layout.
+
+    Parameters
+    ----------
+    L : int
+        Number of sites.
+    terms : iterable
+        ``MPOProductTerm`` values or the same term forms accepted by
+        :meth:`FirstDegreeMPO.from_local_terms`.
+    phys_dim : int, optional
+        Local physical dimension.  It is inferred from the first operator
+        when omitted.
+    """
+
+    def __init__(
+        self,
+        L,
+        terms,
+        *,
+        phys_dim=None,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        site_tag_id="I{}",
+    ):
+        if not isinstance(L, Integral):
+            raise TypeError("L must be an integer.")
+        L = int(L)
+        if L < 1:
+            raise ValueError("L must be >= 1.")
+        terms = tuple(_term_from_input(term) for term in terms)
+        if not terms:
+            raise ValueError("terms must contain at least one product term.")
+        if phys_dim is None:
+            shape = tuple(getattr(terms[0].operators[0], "shape", ()))
+            if len(shape) != 2 or shape[0] != shape[1]:
+                raise ValueError("cannot infer phys_dim from the first operator.")
+            phys_dim = int(shape[0])
+
+        # Compile the topology with unit coefficients once.  The ordinary
+        # unshared path is intentional here: every term needs an independent
+        # slot, while all terms still use this one automaton's identity rails.
+        unit_terms = tuple(replace(term, coefficient=1.0) for term in terms)
+        automaton = MPOAutomaton(
+            L,
+            phys_dim=int(phys_dim),
+        )
+        slots = []
+        for term in unit_terms:
+            site = term.sites[0]
+            transition_index = len(automaton.transitions[site])
+            automaton.add_product_term(
+                term.sites,
+                term.operators,
+                coefficient=1.0,
+                string_operators=term.string_operators,
+                charge=term.charge,
+            )
+            slots.append((site, transition_index))
+
+        self.L = L
+        self.phys_dim = int(phys_dim)
+        self._terms = terms
+        self._slots = tuple(slots)
+        self._automaton = automaton
+        self._template = FirstDegreeMPO.from_automaton(
+            automaton,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            site_tag_id=site_tag_id,
+        )
+        self._build_count = 0
+
+    @classmethod
+    def from_local_terms(
+        cls,
+        L,
+        terms,
+        *,
+        phys_dim=None,
+        **kwargs,
+    ):
+        """Create a reusable basis from factorized local product terms."""
+        return cls(L, terms, phys_dim=phys_dim, **kwargs)
+
+    @classmethod
+    def from_pauli_terms(
+        cls,
+        L,
+        terms,
+        **kwargs,
+    ):
+        """Create a reusable qubit basis from compact Pauli term labels."""
+        return cls(L, terms, phys_dim=2, **kwargs)
+
+    @property
+    def terms(self):
+        """Read-only term specifications, including coefficient references."""
+        return self._terms
+
+    @property
+    def num_terms(self):
+        """Number of coefficient slots in the basis."""
+        return len(self._terms)
+
+    @property
+    def template(self):
+        """The unit-coefficient first-degree MPO defining this basis."""
+        return self._template.copy()
+
+    @property
+    def bond_dimensions(self):
+        """Internal bond dimensions of the cached common automaton."""
+        return self._template.bond_dimensions
+
+    @property
+    def cache_info(self):
+        """Small immutable cache diagnostic for optimization bookkeeping."""
+        return {
+            "compiled": True,
+            "compiled_terms": self.num_terms,
+            "builds": self._build_count,
+            "topology_bond_dimensions": self.bond_dimensions,
+        }
+
+    def _resolve_coefficient(self, coefficient, parameters):
+        if isinstance(coefficient, MPOParameter):
+            return coefficient.resolve(parameters)
+        if callable(coefficient):
+            if parameters is None:
+                raise KeyError(
+                    "callable MPO coefficients require a parameter container."
+                )
+            coefficient = coefficient(parameters)
+        _check_scalar(coefficient, name="MPO coefficient")
+        return coefficient
+
+    def build(self, parameters=None):
+        """Bind current coefficients and return ``H(parameters)``.
+
+        Parameters
+        ----------
+        parameters : mapping or sequence, optional
+            Values used by :class:`MPOParameter` references and coefficient
+            callables.  A backend scalar is inserted directly into the local
+            transition, preserving its autodiff graph.
+        """
+        transitions = [list(site_transitions) for site_transitions in self._automaton.transitions]
+        for term, (site, transition_index) in zip(self._terms, self._slots):
+            coefficient = self._resolve_coefficient(term.coefficient, parameters)
+            transition = transitions[site][transition_index]
+            transitions[site][transition_index] = type(transition)(
+                transition.left_state,
+                transition.right_state,
+                _multiply_scalar(coefficient, transition.operator),
+            )
+
+        automaton = MPOAutomaton(
+            self.L,
+            channels=self._automaton.channels,
+            transitions=transitions,
+            start_state=self._automaton.start_state,
+            done_state=self._automaton.done_state,
+            phys_dim=self.phys_dim,
+        )
+        result = FirstDegreeMPO.from_automaton(
+            automaton,
+            upper_ind_id=self._template.upper_ind_id,
+            lower_ind_id=self._template.lower_ind_id,
+            site_tag_id=self._template.site_tag_id,
+            degree=1,
+        )
+        result.metadata.update({
+            "operation": "mpo_basis_build",
+            "basis_terms": self.num_terms,
+            "basis_build": self._build_count + 1,
+        })
+        self._build_count += 1
+        return result
+
+    __call__ = build
+
+    def extensive_exponential(self, dt, parameters=None, **kwargs):
+        """Build ``exp(dt * H(parameters))`` with the higher-order MPO path."""
+        return self.build(parameters).extensive_exponential(dt, **kwargs)
+
+    def time_evolution(self, dt, parameters=None, **kwargs):
+        """Build the real-time MPO ``exp(-1j * dt * H(parameters))``."""
+        return self.extensive_exponential(-1j * dt, parameters, **kwargs)
+
+    def evolution_mpo(self, parameters=None, *, dt, **kwargs):
+        """Named convenience wrapper for ``exp(-1j * dt * H(parameters))``."""
+        return self.time_evolution(dt, parameters, **kwargs)

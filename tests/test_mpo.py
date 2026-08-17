@@ -7,8 +7,11 @@ import pepsy
 from pepsy.operators import (
     FirstDegreeMPO,
     MPOCompressionReport,
+    MPOBasis,
     MPOLevel,
     MPOLevelToken,
+    MPOParameter,
+    MPONumericalCompressionReport,
     MPOProductTerm,
 )
 
@@ -34,11 +37,75 @@ def _two_term_mpo():
 def test_first_degree_mpo_public_exports_resolve():
     """The new semantic MPO layer belongs to ``pepsy.operators``."""
     assert FirstDegreeMPO is pepsy.operators.FirstDegreeMPO
+    assert MPOBasis is pepsy.operators.MPOBasis
+    assert MPOParameter is pepsy.operators.MPOParameter
     assert MPOLevel is pepsy.operators.MPOLevel
     assert MPOLevelToken is pepsy.operators.MPOLevelToken
     assert MPOProductTerm is pepsy.operators.MPOProductTerm
     assert MPOCompressionReport is pepsy.operators.MPOCompressionReport
+    assert (
+        MPONumericalCompressionReport
+        is pepsy.operators.MPONumericalCompressionReport
+    )
     assert "FirstDegreeMPO" in pepsy.operators.__all__
+
+
+def test_mpo_basis_reuses_compiled_automaton_for_rebinding():
+    """Parameter rebinding changes weights without rebuilding topology."""
+    x, _, z = _paulis()
+    basis = MPOBasis.from_local_terms(
+        3,
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=MPOParameter("J")),
+            {"sites": (1, 2), "operators": (z, z), "parameter": "K"},
+        ],
+    )
+
+    first = basis.build({"J": 2.0, "K": -0.5})
+    second = basis.build({"J": -1.0, "K": 0.25})
+    identity = np.eye(2)
+    expected_first = (
+        2.0 * np.kron(np.kron(x, x), identity)
+        - 0.5 * np.kron(np.kron(identity, z), z)
+    )
+    expected_second = (
+        -np.kron(np.kron(x, x), identity)
+        + 0.25 * np.kron(np.kron(identity, z), z)
+    )
+
+    np.testing.assert_allclose(first.to_mpo().to_dense(), expected_first)
+    np.testing.assert_allclose(second.to_mpo().to_dense(), expected_second)
+    assert basis.cache_info["compiled"] is True
+    assert basis.cache_info["compiled_terms"] == 2
+    assert basis.cache_info["builds"] == 2
+    assert first.bond_dimensions == basis.bond_dimensions
+    assert [level.history[0].level for level in first.levels[1]].count(1) == 1
+    assert [level.history[0].level for level in first.levels[1]].count(3) == 1
+
+
+def test_mpo_basis_evolution_keeps_parameterized_coefficients_differentiable():
+    """The cached basis feeds the paper-style evolution MPO unchanged."""
+    torch = pytest.importorskip("torch")
+    theta = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 2), "ZX", MPOParameter("theta"))],
+    )
+
+    U = basis.evolution_mpo(
+        {"theta": theta},
+        dt=time,
+        order=2,
+        mode="optimal",
+    )
+    loss = sum(array.real.sum() for array in U.arrays)
+    theta_grad, time_grad = torch.autograd.grad(loss, (theta, time))
+
+    assert any(array.requires_grad for array in U.arrays)
+    assert torch.isfinite(theta_grad)
+    assert torch.isfinite(time_grad)
+    assert basis.cache_info["builds"] == 1
 
 
 def test_first_degree_mpo_exposes_optional_compression_report_slot():
@@ -57,11 +124,73 @@ def test_first_degree_mpo_builds_exact_local_term_sum():
     expected += np.kron(np.kron(np.eye(2), z), z)
 
     np.testing.assert_allclose(H.to_mpo().to_dense(), expected)
+    assert H.to_mpo().cyclic is False
     assert H.degree == 1
     assert H.is_first_degree
     assert H.bond_dimensions == (3, 3)
     assert H.levels[1][0].history == (MPOLevelToken(1),)
     assert H.levels[1][2].history[0].level == 2
+
+
+def test_first_degree_mpo_parses_compact_pauli_terms():
+    """Pauli labels compile to an exact long-range product operator."""
+    identity = np.eye(2)
+    x, y, z = _paulis()
+    H = FirstDegreeMPO.from_pauli_terms(
+        5,
+        [((0, 2, 4), "ZXY", 0.7)],
+    )
+    expected = 0.7 * np.kron(
+        np.kron(np.kron(np.kron(z, identity), x), identity), y,
+    )
+
+    np.testing.assert_allclose(H.to_mpo().to_dense(), expected)
+    np.testing.assert_allclose(
+        MPOProductTerm.from_pauli((0, 1), "ZX").operators[0],
+        z,
+    )
+
+
+def test_first_degree_mpo_shares_pauli_prefixes_exactly():
+    """Repeated Pauli paths share channels without changing the operator."""
+    shared = FirstDegreeMPO.from_pauli_terms(
+        5,
+        [((0, 4), "ZX", 1.0), ((0, 4), "ZY", 2.0)],
+    )
+    unshared = FirstDegreeMPO.from_pauli_terms(
+        5,
+        [((0, 4), "ZX", 1.0), ((0, 4), "ZY", 2.0)],
+        share_channels=False,
+    )
+
+    assert shared.bond_dimensions == (3, 3, 3, 3)
+    assert unshared.bond_dimensions == (4, 4, 4, 4)
+    np.testing.assert_allclose(
+        shared.to_mpo().to_dense(),
+        unshared.to_mpo().to_dense(),
+    )
+
+    suffix_shared = FirstDegreeMPO.from_pauli_terms(
+        6,
+        [((0, 4), "ZX"), ((2, 4), "YX")],
+    )
+    suffix_unshared = FirstDegreeMPO.from_pauli_terms(
+        6,
+        [((0, 4), "ZX"), ((2, 4), "YX")],
+        share_channels=False,
+    )
+    assert suffix_shared.bond_dimensions == (3, 3, 3, 3, 2)
+    assert suffix_unshared.bond_dimensions == (3, 3, 4, 4, 2)
+    np.testing.assert_allclose(
+        suffix_shared.to_mpo().to_dense(),
+        suffix_unshared.to_mpo().to_dense(),
+    )
+
+
+def test_first_degree_mpo_rejects_unknown_pauli_labels():
+    """Compact labels fail early with a useful error."""
+    with pytest.raises(ValueError, match="Pauli labels"):
+        FirstDegreeMPO.from_pauli_terms(3, [((0, 2), "ZA")])
 
 
 def test_first_degree_mpo_add_scale_and_product_are_exact():
@@ -180,6 +309,15 @@ def test_extensive_exponential_supports_generic_order_three_histories():
     assert errors[1] / errors[0] == pytest.approx(1.0 / 16.0, rel=3.0e-3)
 
 
+def test_extensive_exponential_uses_reachable_history_channels():
+    """Raw histories omit channels unreachable from the finite left boundary."""
+    H = _two_term_mpo()
+    U = H.extensive_exponential(0.01, order=3)
+
+    assert U.metadata["history_generation"] == "reachable"
+    assert U.metadata["initial_bond_dimensions"][0] < 3**3
+
+
 def test_extensive_exponential_algorithm_three_keeps_bond_dimension():
     """The extension adds selected next-order terms without new channels."""
     scipy_linalg = pytest.importorskip("scipy.linalg")
@@ -198,6 +336,112 @@ def test_extensive_exponential_algorithm_three_keeps_bond_dimension():
     assert extended_error < plain_error
 
 
+def test_extensive_exponential_optimal_mode_selects_paper_extension():
+    """The named optimal mode is the exact Algorithms 1--3 policy."""
+    H = _two_term_mpo()
+    explicit = H.extensive_exponential(0.01, order=2, extend=True)
+    named = H.extensive_exponential(0.01, order=2, mode="optimal")
+
+    assert named.metadata["mode"] == "optimal"
+    assert named.metadata["algorithms"] == (1, 2, 3)
+    assert named.bond_dimensions == explicit.bond_dimensions
+    np.testing.assert_allclose(
+        named.to_mpo().to_dense(),
+        explicit.to_mpo().to_dense(),
+    )
+
+
+def test_extensive_exponential_bond_guard_can_raise_or_warn():
+    """Temporary history growth is bounded before later compression."""
+    H = _two_term_mpo()
+    with pytest.raises(MemoryError, match="max_bond"):
+        H.extensive_exponential(0.01, order=2, max_bond=1)
+
+    with pytest.warns(RuntimeWarning, match="max_bond"):
+        warned = H.extensive_exponential(
+            0.01,
+            order=2,
+            max_bond=1,
+            on_exceed="warn",
+        )
+    assert warned.metadata["max_bond"] == 1
+    assert warned.metadata["on_exceed"] == "warn"
+
+
+def test_extensive_exponential_rejects_conflicting_mode_flags():
+    """Named policies cannot silently disagree with legacy flags."""
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _two_term_mpo().extensive_exponential(
+            0.01,
+            order=2,
+            mode="optimal",
+            approximate=True,
+        )
+
+
+def test_parameterized_pauli_hamiltonian_preserves_torch_autograd():
+    """Backend scalar coefficients survive evolution MPO construction."""
+    torch = pytest.importorskip("torch")
+    theta = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    H = FirstDegreeMPO.from_pauli_terms(
+        3,
+        [((0, 2), "ZX", theta)],
+    )
+
+    U = H.extensive_exponential(
+        -1j * time,
+        order=2,
+        mode="optimal",
+    )
+    dense = U.to_mpo().to_dense()
+    assert isinstance(dense, torch.Tensor)
+    assert dense.requires_grad
+    loss = dense.real.sum()
+    theta_grad, time_grad = torch.autograd.grad(loss, (theta, time))
+    assert torch.isfinite(theta_grad)
+    assert torch.isfinite(time_grad)
+
+
+def test_parameterized_observable_expectation_preserves_torch_autograd():
+    """Parameterized Pauli terms can also be used as observables."""
+    torch = pytest.importorskip("torch")
+    qtn = pytest.importorskip("quimb.tensor")
+    theta = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    observable = FirstDegreeMPO.from_pauli_terms(
+        3,
+        [((0, 2), "ZZ", theta)],
+    )
+    state = qtn.MPS_computational_state("000")
+
+    value = observable.expectation(state)
+    assert isinstance(value, torch.Tensor)
+    assert value.requires_grad
+    torch.testing.assert_close(value.real, theta)
+    (gradient,) = torch.autograd.grad(value.real, (theta,))
+    torch.testing.assert_close(gradient, torch.ones_like(theta))
+
+
+def test_parameterized_pauli_hamiltonian_supports_jax_autodiff():
+    """Functional history updates keep the JAX autodiff path available."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    def objective(theta, time):
+        H = FirstDegreeMPO.from_pauli_terms(
+            3,
+            [((0, 2), "ZX", theta)],
+        )
+        U = H.extensive_exponential(-1j * time, order=2, mode="optimal")
+        return sum(jnp.real(array).sum() for array in U.arrays)
+
+    value, gradients = jax.jit(
+        jax.value_and_grad(objective, argnums=(0, 1)),
+    )(0.7, 0.01)
+    assert jnp.isfinite(value)
+    assert all(jnp.isfinite(gradient) for gradient in gradients)
+
+
 def test_extensive_exponential_algorithm_four_is_explicit_and_order_controlled():
     """Approximate compression is opt-in and lowers the analytical rank."""
     H = _two_term_mpo()
@@ -214,6 +458,35 @@ def test_extensive_exponential_algorithm_four_is_explicit_and_order_controlled()
             exact.bond_dimensions,
         )
     )
+
+
+def test_numerical_compression_delegates_to_quimb_with_report():
+    """Numerical truncation is explicit and drops stale semantic histories."""
+    U = _two_term_mpo().extensive_exponential(0.01, order=2)
+    compressed, report = U.compress_numerical(
+        form="flat",
+        max_bond=1,
+        cutoff=0.0,
+        return_report=True,
+    )
+
+    assert isinstance(report, MPONumericalCompressionReport)
+    assert report.method == "quimb"
+    assert report.max_bond == 1
+    assert report.cutoff == 0.0
+    assert report.truncated is True
+    assert report.truncation_error is None
+    assert compressed.cyclic is False
+    assert compressed.bond_sizes() == [1, 1]
+    assert compressed.pepsy_first_degree is None
+    assert compressed.pepsy_numerical_compression_report is report
+
+
+def test_numerical_compression_validates_max_bond():
+    """The Pepsy wrapper rejects invalid numerical compression policies."""
+    U = _two_term_mpo().extensive_exponential(0.01, order=1)
+    with pytest.raises(ValueError, match="max_bond"):
+        U.compress_numerical(max_bond=0)
 
 
 def test_extensive_exponential_mps_expectation_and_application_are_tensor_network_paths(
