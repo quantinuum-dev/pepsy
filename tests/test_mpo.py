@@ -11,6 +11,7 @@ from pepsy.operators import (
     MPOLevel,
     MPOLevelToken,
     MPOParameter,
+    MPODifferentiableCompressionReport,
     MPONumericalCompressionReport,
     MPOProductTerm,
 )
@@ -43,6 +44,10 @@ def test_first_degree_mpo_public_exports_resolve():
     assert MPOLevelToken is pepsy.operators.MPOLevelToken
     assert MPOProductTerm is pepsy.operators.MPOProductTerm
     assert MPOCompressionReport is pepsy.operators.MPOCompressionReport
+    assert (
+        MPODifferentiableCompressionReport
+        is pepsy.operators.MPODifferentiableCompressionReport
+    )
     assert (
         MPONumericalCompressionReport
         is pepsy.operators.MPONumericalCompressionReport
@@ -106,6 +111,96 @@ def test_mpo_basis_evolution_keeps_parameterized_coefficients_differentiable():
     assert torch.isfinite(theta_grad)
     assert torch.isfinite(time_grad)
     assert basis.cache_info["builds"] == 1
+
+
+def test_mpo_basis_shares_suffixes_and_assembles_terminal_coefficient_groups():
+    """Shared suffix channels remain exact when several terms end together."""
+    x, y, z = _paulis()
+    basis = MPOBasis.from_local_terms(
+        5,
+        [
+            MPOProductTerm((0, 4), (z, x), coefficient=MPOParameter("a")),
+            MPOProductTerm((2, 4), (y, x), coefficient=MPOParameter("b")),
+        ],
+    )
+    expected = (
+        1.25 * np.kron(np.kron(np.kron(np.kron(z, np.eye(2)), np.eye(2)), np.eye(2)), x)
+        - 0.5 * np.kron(np.kron(np.kron(np.kron(np.eye(2), np.eye(2)), y), np.eye(2)), x)
+    )
+    bound = basis.build({"a": 1.25, "b": -0.5})
+
+    np.testing.assert_allclose(bound.to_mpo().to_dense(), expected)
+    assert bound.bond_dimensions == basis.bond_dimensions
+    assert basis.bond_dimensions[-1] < 4
+
+
+def test_mpo_basis_batches_coefficients_and_reuses_history_topology():
+    """Coefficient batches and repeated evolution share structural history."""
+    x, _, z = _paulis()
+    basis = MPOBasis.from_local_terms(
+        3,
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=MPOParameter("a")),
+            MPOProductTerm((1, 2), (z, z), coefficient=MPOParameter("b")),
+        ],
+    )
+
+    first = basis.extensive_exponential(
+        0.01,
+        {"a": 0.7, "b": -0.2},
+        order=2,
+    )
+    second = basis.extensive_exponential(
+        0.01,
+        coefficients=np.array([0.7, -0.2]),
+        order=2,
+    )
+
+    assert basis.coefficients({"a": 0.7, "b": -0.2}).shape == (2,)
+    assert first.metadata["history_cache_hit"] is False
+    assert second.metadata["history_cache_hit"] is True
+    assert basis.template.history_cache_info["orders"] == (2,)
+    np.testing.assert_allclose(first.to_mpo().to_dense(), second.to_mpo().to_dense())
+
+
+def test_fixed_rank_compression_has_fixed_bonds_and_report():
+    """Fixed-rank compression is separate from semantic history compression."""
+    H = _two_term_mpo()
+    compressed, report = H.compress_fixed_rank(2, return_report=True)
+    exact = H.compress_fixed_rank(3)
+
+    assert isinstance(report, MPODifferentiableCompressionReport)
+    assert report.method == "fixed-rank-tt-svd"
+    assert report.max_bond == 2
+    assert report.truncated is True
+    assert compressed.bond_dimensions == (2, 2)
+    assert compressed.metadata["history_valid"] is False
+    np.testing.assert_allclose(
+        exact.to_mpo().to_dense(),
+        H.to_mpo().to_dense(),
+    )
+    with pytest.raises(ValueError, match="fixed-rank compression"):
+        compressed.extensive_exponential(0.01, order=2)
+
+
+def test_fixed_rank_compression_preserves_autodiff():
+    """Torch gradients pass through the fixed-rank SVD sweep."""
+    torch = pytest.importorskip("torch")
+    x, _, z = _paulis()
+    theta = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    basis = MPOBasis.from_local_terms(
+        3,
+        [
+            MPOProductTerm((0, 1), (x, x)),
+            MPOProductTerm((1, 2), (z, z)),
+        ],
+    )
+    H = basis.build(coefficients=torch.stack((theta, 0.3 * theta)))
+    compressed = H.compress_fixed_rank(2)
+    loss = sum(array.real.sum() for array in compressed.arrays)
+    gradient, = torch.autograd.grad(loss, theta)
+
+    assert torch.isfinite(gradient)
 
 
 def test_first_degree_mpo_exposes_optional_compression_report_slot():

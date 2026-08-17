@@ -366,6 +366,7 @@ class MPOAutomaton:
         *,
         phys_dim=None,
         share_channels=True,
+        return_slots=False,
         start_state=("start",),
         done_state=("done",),
     ):
@@ -385,6 +386,10 @@ class MPOAutomaton:
             This is an exact structural transformation; it does not use a
             numerical tolerance. Set to ``False`` to retain one dedicated
             channel path per term.
+        return_slots : bool, default=False
+            Also return ``(site, transition_index)`` coefficient slots. This
+            is intended for reusable parameterized bases; ordinary callers
+            should keep the default and receive only the automaton.
 
         Notes
         -----
@@ -400,7 +405,7 @@ class MPOAutomaton:
             raise ValueError("L must be >= 1.")
 
         records = []
-        for term in tuple(terms):
+        for term_index, term in enumerate(tuple(terms)):
             if isinstance(term, Mapping):
                 sites = term.get("sites", term.get("locations"))
                 operators = term.get("operators", term.get("paulis"))
@@ -490,6 +495,7 @@ class MPOAutomaton:
                         "operators."
                     )
             records.append({
+                "term_index": term_index,
                 "sites": sites,
                 "operators": operators,
                 "coefficient": coefficient,
@@ -507,13 +513,24 @@ class MPOAutomaton:
             phys_dim=int(phys_dim),
         )
         if not share_channels:
+            slots = []
             for record in records:
-                automaton.add_product_term(**record)
-            return automaton
+                site = record["sites"][0]
+                slot = len(automaton.transitions[site])
+                automaton.add_product_term(
+                    record["sites"],
+                    record["operators"],
+                    coefficient=record["coefficient"],
+                    string_operators=record["string_operators"],
+                    charge=record["charge"],
+                )
+                slots.append((site, slot))
+            return (automaton, tuple(slots)) if return_slots else automaton
 
         # First build a prefix trie. Each non-boundary trie node is a virtual
-        # channel on one cut. Coefficients stay on terminal edges so paths
-        # with a common operator prefix can share their channel exactly.
+        # channel on one cut. In slot mode coefficients are assigned later to
+        # term-unique path edges, so paths can share both prefixes and suffixes
+        # without coupling their parameter values.
         states_by_cut = [[] for _ in range(max(L - 1, 0))]
         state_keys = [{} for _ in range(max(L - 1, 0))]
         state_charges = {}
@@ -530,8 +547,19 @@ class MPOAutomaton:
             state_charges[state] = charge
             return state
 
-        def add_edge(site, left_state, right_state, operator, *, weighted):
-            if not weighted:
+        def add_edge(
+            site,
+            left_state,
+            right_state,
+            operator,
+            *,
+            weighted,
+            term_index=None,
+            structural_operator=None,
+        ):
+            if structural_operator is None:
+                structural_operator = operator
+            if not weighted and not return_slots:
                 edge_key = (
                     int(site),
                     left_state,
@@ -541,9 +569,15 @@ class MPOAutomaton:
                 if edge_key in unweighted_edges:
                     return
                 unweighted_edges.add(edge_key)
-            edge_records.append(
-                (int(site), left_state, right_state, operator, bool(weighted))
-            )
+            edge_records.append((
+                int(site),
+                left_state,
+                right_state,
+                operator,
+                bool(weighted),
+                term_index,
+                structural_operator,
+            ))
 
         for record in records:
             sites = record["sites"]
@@ -551,6 +585,7 @@ class MPOAutomaton:
             string_operators = record["string_operators"]
             coefficient = record["coefficient"]
             charge = record["charge"]
+            term_index = record["term_index"]
             support_positions = {site: pos for pos, site in enumerate(sites)}
             current = start_state
             string_pos = 0
@@ -569,13 +604,16 @@ class MPOAutomaton:
 
                 is_final = site == sites[-1]
                 if is_final:
-                    edge_operator = _multiply_scalar(coefficient, edge_operator)
+                    if not return_slots:
+                        edge_operator = _multiply_scalar(coefficient, edge_operator)
                     add_edge(
                         site,
                         current,
                         done_state,
                         edge_operator,
-                        weighted=weighted,
+                        weighted=False,
+                        term_index=term_index if return_slots else None,
+                        structural_operator=structural_operator,
                     )
                     continue
 
@@ -593,6 +631,8 @@ class MPOAutomaton:
                     target,
                     edge_operator,
                     weighted=weighted,
+                    term_index=term_index if return_slots else None,
+                    structural_operator=structural_operator,
                 )
                 current = target
 
@@ -603,14 +643,22 @@ class MPOAutomaton:
         for cut in range(L - 2, -1, -1):
             signatures = {}
             for state in states_by_cut[cut]:
-                outgoing = []
-                for site, left, right, operator, _weighted in edge_records:
+                outgoing = set()
+                for (
+                    site,
+                    left,
+                    right,
+                    _operator,
+                    _weighted,
+                    _term_index,
+                    structural_operator,
+                ) in edge_records:
                     if site != cut + 1 or left != state:
                         continue
                     target = right
                     if cut + 1 < L - 1:
                         target = state_maps[cut + 1].get(right, right)
-                    outgoing.append((_operator_key(operator), target))
+                    outgoing.add((_operator_key(structural_operator), target))
                 signature = (
                     _metadata_key(state_charges[state]),
                     tuple(sorted(outgoing, key=repr)),
@@ -619,27 +667,116 @@ class MPOAutomaton:
                 state_maps[cut][state] = canonical
 
         transitions = [[] for _ in range(L)]
+        aggregated_edges = {}
+        aggregate_descriptors = {}
         rebuilt_edges = set()
-        for site, left, right, operator, weighted in edge_records:
+        slots = {}
+        mapped_records = []
+        descriptor_terms = {}
+        term_paths = {}
+        for (
+            site,
+            left,
+            right,
+            operator,
+            weighted,
+            term_index,
+            _structural_operator,
+        ) in edge_records:
             mapped_left = left
             mapped_right = right
             if site > 0 and left not in {start_state, done_state}:
                 mapped_left = state_maps[site - 1][left]
             if site < L - 1 and right not in {start_state, done_state}:
                 mapped_right = state_maps[site][right]
-            if not weighted:
-                edge_key = (
-                    site,
-                    mapped_left,
-                    mapped_right,
-                    _operator_key(operator),
-                )
+            descriptor = (
+                site,
+                mapped_left,
+                mapped_right,
+                _operator_key(_structural_operator),
+            )
+            mapped_records.append((
+                site,
+                mapped_left,
+                mapped_right,
+                operator,
+                term_index,
+                _structural_operator,
+                descriptor,
+            ))
+            if return_slots and term_index is not None:
+                descriptor_terms.setdefault(descriptor, set()).add(term_index)
+                term_paths.setdefault(term_index, []).append(descriptor)
+
+        selected_slots = {}
+        if return_slots:
+            for term_index, path in term_paths.items():
+                unique = [
+                    descriptor
+                    for descriptor in path
+                    if descriptor_terms[descriptor] == {term_index}
+                ]
+                # Identical terms have no term-unique edge, so they share the
+                # final slot and their scalar coefficients are summed there.
+                selected_slots[term_index] = unique[0] if unique else path[-1]
+
+        for (
+            site,
+            mapped_left,
+            mapped_right,
+            operator,
+            term_index,
+            structural_operator,
+            descriptor,
+        ) in mapped_records:
+            is_slot = (
+                return_slots
+                and term_index is not None
+                and descriptor == selected_slots[term_index]
+            )
+            if is_slot:
+                aggregate_key = (site, mapped_left, mapped_right)
+                aggregate_pos = aggregated_edges.get(aggregate_key)
+                if aggregate_pos is None:
+                    aggregate_pos = len(transitions[site])
+                    aggregated_edges[aggregate_key] = aggregate_pos
+                    aggregate_descriptors[aggregate_key] = {descriptor}
+                    transitions[site].append(
+                        MPOTransition(mapped_left, mapped_right, structural_operator)
+                    )
+                elif descriptor not in aggregate_descriptors[aggregate_key]:
+                    aggregate_descriptors[aggregate_key].add(descriptor)
+                    previous = transitions[site][aggregate_pos]
+                    reference = _backend_reference(
+                        (previous.operator, structural_operator),
+                    )
+                    combined = ar.do(
+                        "add",
+                        _as_backend(previous.operator, like=reference),
+                        _as_backend(structural_operator, like=reference),
+                    )
+                    transitions[site][aggregate_pos] = MPOTransition(
+                        mapped_left,
+                        mapped_right,
+                        combined,
+                    )
+                if term_index is not None:
+                    slots[term_index] = (site, aggregate_pos)
+                continue
+            if not return_slots:
+                edge_key = descriptor
                 if edge_key in rebuilt_edges:
                     continue
                 rebuilt_edges.add(edge_key)
+            else:
+                if descriptor in rebuilt_edges:
+                    continue
+                rebuilt_edges.add(descriptor)
             transitions[site].append(
                 MPOTransition(mapped_left, mapped_right, operator)
             )
+            if term_index is not None and not return_slots:
+                slots[term_index] = (site, len(transitions[site]) - 1)
 
         channels = []
         for cut, states in enumerate(states_by_cut):
@@ -657,7 +794,7 @@ class MPOAutomaton:
                 ),
             ])
 
-        return cls(
+        automaton = cls(
             L,
             channels=channels,
             transitions=transitions,
@@ -665,6 +802,9 @@ class MPOAutomaton:
             done_state=done_state,
             phys_dim=int(phys_dim),
         )
+        if return_slots:
+            return automaton, tuple(slots[index] for index in range(len(records)))
+        return automaton
 
     def _channel_positions(self, cut):
         return {channel.state: pos for pos, channel in enumerate(self._channels[cut])}

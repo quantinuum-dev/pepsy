@@ -14,6 +14,7 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; named `mode` and temporary `max_bond` guard |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
+| `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
 | `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator` |
 | `FirstDegreeMPO.compress_numerical` | Apply explicit numerical policy | Delegates SVD/QR to Quimb and returns a separate truncation report |
 | `apply_to_mps`, `expectation` | Execute through tensor-network consumers | Delegates to Quimb/Pepsy contraction APIs and does not densify |
@@ -36,21 +37,26 @@ is a structural factorization, not a claim of globally minimal MPO rank;
 `share_channels=False` retains the dedicated-channel construction for
 diagnostics.
 
-Coefficients are deliberately stored on terminal weighted transitions. When
-one is a Torch/JAX scalar, the static local Pauli matrices and identity rails
-are promoted to that backend before stacking, so `dt` and term parameters
-remain differentiable through the history construction and Quimb adapter.
-The same path is used for parameterized observables. Backend arrays with
-functional update semantics, such as JAX arrays, use replacement updates in
-Algorithm 3 rather than in-place mutation.
+`MPOBasis` stores static channel structure separately from coefficient values.
+The shared automaton retains exact prefixes and suffix continuations, while a
+term-specific path edge receives the coefficient slot; identical terms share
+one slot and sum their coefficients. This keeps rebinding exact even when
+different term paths merge before their common suffix. Coefficients can be
+resolved individually from `MPOParameter` objects or supplied as one
+one-dimensional backend batch through `build(coefficients=...)`. Static local
+Pauli matrices and identity rails are promoted to that backend, so term
+parameters remain differentiable through the history construction and Quimb
+adapter. Backend arrays with functional update semantics, such as JAX arrays,
+use replacement updates in Algorithm 3 rather than in-place mutation.
 
 `MPOBasis` is the optimization-facing cache around this input boundary. It
-compiles one common identity-rail automaton with one coefficient slot per
-term, then reweights only the slot transitions in `build(parameters)`. This
-avoids rebuilding the graph for every optimizer iteration while leaving the
-current backend scalar in the autodiff graph. It deliberately does not cache
-completed parameter-value MPOs, because tensor identities are not safe value
-cache keys after in-place optimizer updates.
+compiles one shared identity-rail automaton and coefficient-slot map, then
+assembles only the current slot values in `build(parameters)` or
+`build(coefficients=...)`. It deliberately does not cache completed
+parameter-value MPOs, because tensor identities are not safe value cache keys
+after in-place optimizer updates. Each `FirstDegreeMPO` also caches its raw
+reachable history topology by order; exact history merges remain
+value-dependent and are not cached.
 
 ## Multi-site execution order
 
@@ -79,9 +85,11 @@ temporary edge states and leaves an ordinary open-boundary MPO.
 The current reachable-history table is still a correctness-first reference
 implementation. Its temporary bond dimension can grow exponentially with the
 Taylor order and local MPO bond dimension, although no global dense matrix is
-formed. Exact history compression reduces redundant channels after the table
-is built; reachability removes dead finite-boundary channels but does not change
-the worst-case allocation for a fully reachable local graph.
+formed. The raw topology is now reusable across parameter bindings and time
+steps, while exact history compression remains a value-dependent pass after
+the cached table is assembled. Reachability removes dead finite-boundary
+channels but does not change the worst-case allocation for a fully reachable
+local graph.
 
 The one-site path is intentionally limited to direct orders one and two. It
 provides a simple boundary regression and avoids pretending that the generic
@@ -98,6 +106,10 @@ multi-site history convention already covers every one-site edge case.
 - Numerical SVD/truncation is explicit through `compress_numerical` and is
   delegated to Quimb. The returned report records bond dimensions and policy,
   but does not invent a global operator error that Quimb does not provide.
+- `compress_fixed_rank` uses a backend SVD with a fixed rank cap. Its Torch
+  route scopes Pepsy's regularized SVD policy so rank-deficient blocks retain
+  finite reverse-mode derivatives; it intentionally clears semantic history
+  validity after the numerical sweep.
 - Fermionic/Symmray compilation is not enabled by this workstream. The
   `charge` and `string_operators` fields preserve construction metadata for a
   future native backend without claiming that it is already supported.
@@ -111,13 +123,12 @@ The remaining implementation improvements are:
 1. Replace the reachable history lists with a sparse channel map or streaming
    local iterator for high orders, while preserving the current
    `MPOLevel.history` data.
-2. Add backend-aware batched local products and structural equality/fingerprints
-   so exact compression does not repeatedly materialize backend arrays on the
-   host.
-3. Generate Algorithm 3 transitions directly instead of allocating a complete
+2. Generate Algorithm 3 transitions directly instead of allocating a complete
    order-plus-one reference table.
-4. Generalize the one-site boundary convention to arbitrary order and promote
+3. Generalize the one-site boundary convention to arbitrary order and promote
    that path to the same execution/reporting contract.
+4. Add native fermionic/Symmray compilation for the shared topology and the
+   fixed-rank compression contract.
 
 These are implementation layers, not reasons to widen the current public API.
 The existing semantic and Quimb boundaries should remain stable while they are

@@ -23,6 +23,8 @@ The API is intentionally explicit about exact versus numerical work:
 - no cutoff is silently applied;
 - `extensive_exponential()` exposes the paper's analytical Taylor rewiring,
   while numerical compression remains an explicit Quimb post-processing step;
+- `compress_fixed_rank()` provides a fixed-rank TT-SVD path for autodiff,
+  while keeping the history-aware and cutoff-based paths separate;
 - native Symmray compilation remains separate without changing the ordinary
   MPO contract.
 
@@ -81,11 +83,24 @@ U = basis.evolution_mpo(
 `exp(-1j * dt * H(parameters))`; use `extensive_exponential()` directly when
 an imaginary-time or otherwise signed scalar step is required.
 
-`basis.cache_info` reports the compiled topology and number of bindings. The
-cache intentionally stores structure, not completed MPO values: caching a
-Torch/JAX result would risk stale optimizer values and retain an obsolete
-autodiff graph. `MPOBasis` keeps one common identity-rail automaton, so its
-output is directly compatible with `extensive_exponential()`.
+`basis.cache_info` reports the compiled topology, number of bindings, and raw
+history orders already generated. The cache intentionally stores structure,
+not completed MPO values: caching a Torch/JAX result would risk stale
+optimizer values and retain an obsolete autodiff graph. Raw history topology
+is cached by Taylor order because it depends only on channels and reachability;
+value-dependent Algorithm 2 merges are still recomputed for each build.
+`MPOBasis` shares exact prefixes and suffix continuations while retaining
+term-specific coefficient slots on a path edge, so its output is directly
+compatible with `extensive_exponential()`.
+
+For optimizers that already evaluate parameters in a backend batch, pass that
+batch directly and avoid per-term coefficient resolution:
+
+```python
+coefficients = torch.stack((J, V))
+H = basis.build(coefficients=coefficients)
+U = basis.evolution_mpo(coefficients=coefficients, dt=0.01, order=2)
+```
 
 The current layer supports exact finite open-boundary construction, addition,
 scaling, products, commutators, powers, and the paper's conservative exact
@@ -216,6 +231,15 @@ before and after compression. Numerical truncation clears the attached
 longer describes the compressed MPO. Quimb's high-level sweep does not expose
 a single global operator error, so `report.truncation_error` is explicitly
 `None`.
+
+For differentiable numerical compression with a fixed rank, use
+`compress_fixed_rank(max_bond=...)`. It performs a TT-SVD sweep with a rank
+selected from matrix dimensions and the fixed cap, so it does not branch on a
+singular-value cutoff. The Torch path automatically uses Pepsy's regularized
+SVD VJP for zero or repeated singular values. The returned
+`MPODifferentiableCompressionReport` records the bond dimensions and the
+`FirstDegreeMPO` has `metadata["history_valid"] == False`, because numerical
+compression changes the analytical history representation.
 
 The current implementation targets ordinary NumPy/Autoray-compatible local
 blocks. Native fermionic/Symmray compilation remains separate and is not

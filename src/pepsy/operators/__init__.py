@@ -63,6 +63,7 @@ _MPO_EXPORTS = [
     "MPOProductTerm",
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
+    "MPODifferentiableCompressionReport",
     "FirstDegreeMPO",
     "MPOBasis",
 ]
