@@ -58,14 +58,14 @@ Stateful leakage entries are also Pepsy-native trajectory events:
 - `("leakage_depolarize", p, q)` applies that depolarizing replacement for a
   single event regardless of the current `leak2depolar` mode
 
-Leakage state is carried per shot outside the qubit MPS. While a qubit is
-leaked, ordinary gates touching it are suppressed. `reset` and `measure_reset`
-clear the leakage flag; `measure_reset` first records the leaked-qubit
-measurement as bit `1`. The sampled diagnostics live in
-`TrajectoryShotResult.leakage_records` as `LeakageRecord` objects. Because this
-state changes which later gates are replayed, leakage entries currently use
-independent trajectories; `run_trajectory_shots(..., strategy="auto")` stays
-independent, and explicit `strategy="coalesced"` raises for leakage streams.
+Leakage state is carried per shot or coalesced leaf outside the qubit MPS. While
+a qubit is leaked, ordinary gates touching it are suppressed. `reset` and
+`measure_reset` clear the leakage flag; `measure_reset` first records the
+leaked-qubit measurement as bit `1`. The sampled diagnostics live in
+`TrajectoryShotResult.leakage_records` or
+`CoalescedTrajectoryLeaf.leakage_records` as `LeakageRecord` objects. Leakage
+streams support independent and coalesced replay; coalescing branches only when
+the classical leakage outcome changes the represented state.
 
 `PauliErrorModel` remains a convenience macro for clean deterministic streams.
 It samples independent **physical Pauli trajectories**, not a density matrix.
@@ -110,15 +110,15 @@ holds concise `(gate_index, site, pauli)` records. Use
 `sample_noisy_gate_stream(...)` or `sample_noisy_gate_streams(...)` when only
 stream construction is needed.
 
-## `MpsNoisy` convenience API
+## Shot-aware `MpsOptimizer` API
 
-For ordinary `MpsOptimizer` use, `MpsNoisy` removes the factory boilerplate.
-Pass the initial MPS, the gate stream, and constructor settings once; the
-runner copies the initial state safely and delegates batching, coalescing,
-seeding, and parallel execution to the existing shot runners:
+`MpsOptimizer` now owns the ordinary and noisy replay APIs. Pass the initial
+MPS and gate stream once; `run()` keeps the existing single-state behavior for
+ordinary streams, while a stream-local noisy event or `shots > 1` dispatches to
+the trajectory runner:
 
 ```python
-simulator = pepsy.MpsNoisy(
+simulator = pepsy.MpsOptimizer(
     initial_mps,
     gate_stream,
     chi=64,
@@ -131,25 +131,29 @@ result = simulator.run(
 )
 ```
 
-Constructor settings can also be grouped in `mps_settings={"chi": 64,
-"mode": "mpo"}`. Do not put `p` or `gates` in that mapping. With the default
-`error_model=None`, stream-local stochastic entries use trajectory replay. To
-use the legacy clean-stream Pauli model through the same API, call
-`simulator.run_noisy(...)` or pass
-`error_model=pepsy.PauliErrorModel.depolarizing(1e-3)` to `run`. Independent
-results have `.optimizers`; coalesced results have `.leaves` and branch
-multiplicities. `run`, `run_trajectory`, and `run_noisy` return
-`MpsNoisyResult`, which consistently provides `.optimizers`, `.counts`,
-`.gate_streams`, `.weights`, `.shots`, and `.branches`; `.coalesced` tells
-whether those states are count-coalesced. The original runner result remains
-available as `.raw`, while `.leaves` is still forwarded for coalesced-specific
-inspection. The convenience default is `strategy="auto"`: the exact
-coalesced path is attempted under the `max_branches` safety cap and
-automatically restarts independently if that cap would be exceeded. Pass
-`strategy="independent"` or `strategy="coalesced"` to choose the
-representation explicitly.
-The low-level factory-based functions remain available for custom optimizer
-classes or non-MPS backends.
+With `error_model=None`, stream-local stochastic entries use trajectory replay.
+For the legacy clean-stream Pauli model, pass
+`error_model=pepsy.PauliErrorModel.depolarizing(1e-3)` to `run`. The result is a
+`NoisyResult` with `.optimizers`, `.counts`, `.gate_streams`, `.weights`,
+`.shots`, and `.branches`; `.coalesced` identifies count-coalesced storage and
+`.raw` retains the original runner result. `strategy="auto"` shares exact
+prefixes under the `max_branches` safety cap. It performs a conservative
+branch-cap preflight when possible, avoiding a partial coalesced replay that is
+guaranteed to restart; the exact branch cap remains a hard safety limit.
+
+The `retain` option is available on `MpsOptimizer`, `MpsNoisy`, `TreeNoisy`,
+and the low-level shot runners. `retain="all"` keeps states and replay
+metadata, `retain="final"` keeps only final states and weights, and
+`retain="none"` keeps no final optimizer states. Use the last form for runs
+whose outputs are consumed during execution rather than inspected afterward.
+
+For repeated custom-runner use, `compile_trajectory_stream(gates)` returns a
+backend-neutral `TrajectoryStreamPlan`. It parses stochastic entries once and
+records ordinary-segment boundaries; live optimizers still perform their own
+device/backend conversion.
+
+`MpsNoisy` remains as a compatibility wrapper. The low-level factory-based
+functions remain available for custom optimizer classes or non-MPS backends.
 
 `TreeNoisy` exposes the same API for `TreeOptimizer` and accepts either an
 entangled `TreeTensorNetwork` or a product MPS as its initial state. Its
@@ -196,12 +200,24 @@ for leaf in result.leaves:
 
 The represented samples are still independent draws; only their identical
 state evolution is shared. `run_coalesced_trajectory_shots(...)` provides the
-same exact tree for `TrajectoryEvent` mixtures and state-dependent Kraus
-channels. It also branches mid-circuit `measure`, `reset`, and
-`measure_reset` controls with exact binomial counts, which is useful for
-ancilla-based circuits. Reset is replayed natively once per live leaf (it is
-trace preserving and does not create duplicate reset branches); leaf
+same exact tree for `TrajectoryEvent` mixtures, state-dependent Kraus channels,
+leakage, and mid-circuit controls. It branches `measure`, `reset`, and
+`measure_reset` with exact binomial counts when a hidden measurement outcome
+can change the pure state. Product-state resets use a one-leaf fast path; leaf
 `measurements` records selected projective outcomes.
+
+Every trajectory result exposes a lightweight `diagnostics` summary:
+
+```python
+print(result.diagnostics.max_kraus_probability_residual)
+print(result.diagnostics.used_kraus_copy_fallback)
+```
+
+`max_kraus_probability_residual` is the largest deviation of the raw Kraus
+branch probabilities from one before the sampler normalizes them. A small
+residual is expected from finite-bond truncation; a large residual indicates
+that the channel, local contraction, or compression settings should be
+checked.
 
 This is normally more useful than `torch.vmap` for rare faults: after a fault
 or collapse, states have different tensor data and often different bond

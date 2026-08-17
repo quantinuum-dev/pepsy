@@ -4324,6 +4324,33 @@ def test_mps_optimizer_accepts_bundled_gate_stream():
     assert opt.where == [(1,), (0, 3)]
 
 
+def test_mps_optimizer_compiles_gate_stream_once(monkeypatch):
+    """Repeated replay reuses compiled stream metadata."""
+    calls = []
+    original = mps_optimizer_module._normalize_gate_queue
+
+    def count_normalization(gates):
+        calls.append(gates)
+        return original(gates)
+
+    monkeypatch.setattr(
+        mps_optimizer_module,
+        "_normalize_gate_queue",
+        count_normalization,
+    )
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.hadamard(), (1,)), (qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="svd",
+    )
+
+    assert len(calls) == 1
+    opt.run(progbar=False, cutoff=1e-12)
+    opt.run(progbar=False, cutoff=1e-12)
+    assert len(calls) == 1
+
+
 def test_mps_optimizer_forwards_custom_ind_id_to_gate_application():
     """Optimizer gate application should honor non-default physical indices."""
     p0 = qtn.MPS_computational_state("000", dtype=np.complex128)

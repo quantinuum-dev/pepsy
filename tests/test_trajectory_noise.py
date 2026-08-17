@@ -103,10 +103,341 @@ def test_mps_noisy_uses_coalesced_trajectory_runner():
     np.testing.assert_allclose(initial.to_dense().reshape(-1), [1.0, 0.0])
 
 
-def test_mps_noisy_dispatches_pauli_error_model():
-    """The same API routes an explicit Pauli model to Pauli coalescing."""
+def test_mps_optimizer_owns_default_trajectory_shot_replay():
+    """MpsOptimizer dispatches noisy streams without a wrapper object."""
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("identity", 0.5, _I), ("bit_flip", 0.5, _X))
+    )
     initial = qtn.MPS_computational_state("0", dtype="complex128")
-    simulator = pepsy.MpsNoisy(
+    optimizer = pepsy.MpsOptimizer(
+        initial,
+        [pepsy.TrajectoryEvent(channel, 0)],
+        chi=4,
+        mode="mpo",
+    )
+
+    result = optimizer.run(
+        seed=5,
+        strategy="coalesced",
+        run_kwargs={"progbar": False},
+    )
+
+    assert isinstance(result, pepsy.NoisyResult)
+    assert result.shots == 1
+    assert optimizer.has_trajectory_events is True
+    np.testing.assert_allclose(optimizer.to_dense().reshape(-1), [1.0, 0.0])
+
+
+def test_mps_optimizer_shots_replay_conditional_noisy_stream():
+    """Shot dispatch preserves per-trajectory measurements and conditionals."""
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("identity", 0.5, _I), ("bit_flip", 0.5, _X))
+    )
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    optimizer = pepsy.MpsOptimizer(
+        initial,
+        [
+            pepsy.TrajectoryEvent(channel, 0),
+            ("measure", "Z", 0),
+            ("if", -1, 1, (_X, 0)),
+        ],
+        chi=4,
+        mode="mpo",
+    )
+
+    result = optimizer.run(
+        shots=16,
+        seed=7,
+        strategy="independent",
+        run_kwargs={"progbar": False},
+    )
+
+    assert isinstance(result, pepsy.NoisyResult)
+    assert result.shots == 16
+    assert all(len(sim.measurements) == 1 for sim in result.optimizers)
+    for sim in result.optimizers:
+        np.testing.assert_allclose(sim.to_dense().reshape(-1), [1.0, 0.0])
+
+
+def test_mps_optimizer_shots_restart_from_initial_state():
+    """Repeated shot calls clone the constructor state, not the live state."""
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    optimizer = pepsy.MpsOptimizer(initial, [(_X, 0)], chi=4, mode="mpo")
+
+    first = optimizer.run(shots=3, strategy="independent", run_kwargs={"progbar": False})
+    second = optimizer.run(shots=2, strategy="independent", run_kwargs={"progbar": False})
+
+    assert first.shots == 3
+    assert second.shots == 2
+    for result in (first, second):
+        for sim in result.optimizers:
+            np.testing.assert_allclose(sim.to_dense().reshape(-1), [0.0, 1.0])
+    np.testing.assert_allclose(optimizer.to_dense().reshape(-1), [1.0, 0.0])
+
+
+def test_mps_optimizer_copy_retains_shot_template():
+    """Public optimizer copies remain valid shot-replay templates."""
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    original = pepsy.MpsOptimizer(initial, [(_X, 0)], chi=4, mode="mpo")
+    copied = original.copy()
+
+    result = copied.run(
+        shots=2,
+        strategy="independent",
+        run_kwargs={"progbar": False},
+    )
+
+    assert result.shots == 2
+    for simulator in result.optimizers:
+        np.testing.assert_allclose(simulator.to_dense().reshape(-1), [0.0, 1.0])
+    np.testing.assert_allclose(original.to_dense().reshape(-1), [1.0, 0.0])
+
+
+def test_trajectory_stream_plan_is_reusable_and_exposes_segments():
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("I", 0.5, _I), ("X", 0.5, _X))
+    )
+    plan = pepsy.compile_trajectory_stream(
+        [("h", 0), pepsy.TrajectoryEvent(channel, 0), ("z", 0)]
+    )
+
+    assert isinstance(plan, pepsy.TrajectoryStreamPlan)
+    assert plan.trajectory_indices == (1,)
+    assert plan.ordinary_segments == ((0, 1), (2, 3))
+    assert pepsy.compile_trajectory_stream(plan) is plan
+
+
+def test_shot_retain_controls_result_memory():
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    simulator = pepsy.MpsOptimizer(initial, [(_X, 0)], chi=4, mode="mpo")
+
+    final = simulator.run(
+        shots=3,
+        strategy="independent",
+        retain="final",
+        run_kwargs={"progbar": False},
+    )
+    assert final.shots == 3
+    assert final.branches == 3
+    assert final.gate_streams == ()
+    assert all(np.allclose(_statevector(opt), [0.0, 1.0]) for opt in final.optimizers)
+
+    none = simulator.run(
+        shots=3,
+        strategy="independent",
+        retain="none",
+        run_kwargs={"progbar": False},
+    )
+    assert none.shots == 3
+    assert none.branches == 0
+    assert none.optimizers == ()
+
+    coalesced = simulator.run(
+        shots=8,
+        strategy="coalesced",
+        retain="none",
+        run_kwargs={"progbar": False},
+    )
+    assert coalesced.shots == 8
+    assert coalesced.branches == 0
+    assert coalesced.leaves == ()
+
+
+def test_trajectory_result_exposes_quality_diagnostics():
+    channel = pepsy.TrajectoryChannel.amplitude_damping(0.25)
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("00", dtype="complex128"),
+            chi=4,
+            mode="mpo",
+        ),
+        [(_X, 0), pepsy.TrajectoryEvent(channel, 0), ("measure", "Z", 0)],
+        shots=4,
+        seed=9,
+        strategy="independent",
+        run_kwargs={"progbar": False},
+    )
+
+    diagnostics = result.diagnostics
+    assert isinstance(diagnostics, pepsy.TrajectoryDiagnostics)
+    assert diagnostics.shots == 4
+    assert diagnostics.stream_events == 3
+    assert diagnostics.trajectory_events == 1
+    assert diagnostics.measurement_events == 1
+    assert diagnostics.max_kraus_probability_residual >= 0.0
+    assert diagnostics.used_kraus_copy_fallback is False
+
+
+def test_coalesced_reset_branches_only_when_target_is_entangled():
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1.0, 0.0, 0.0, 0.0],
+         [0.0, 1.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0, 1.0],
+         [0.0, 0.0, 1.0, 0.0]],
+        dtype=complex,
+    )
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("00", dtype="complex128"),
+            chi=4,
+            mode="mpo",
+        ),
+        [(hadamard, 0), (cnot, (0, 1)), ("reset", 0)],
+        shots=64,
+        seed=12,
+        run_kwargs={"progbar": False},
+    )
+
+    assert result.branches == 2
+    assert sum(result.counts) == 64
+    assert {record.outcome for leaf in result.leaves for record in leaf.measurements} == {
+        -1,
+        1,
+    }
+    assert all(leaf.optimizer.p.norm() == pytest.approx(1.0) for leaf in result.leaves)
+    expected = {
+        1: np.array([1.0, 0.0, 0.0, 0.0], dtype=complex),
+        -1: np.array([0.0, 1.0, 0.0, 0.0], dtype=complex),
+    }
+    for leaf in result.leaves:
+        np.testing.assert_allclose(
+            _statevector(leaf.optimizer), expected[leaf.measurements[0].outcome]
+        )
+
+
+def test_mps_kraus_bell_branches_match_dense_trajectory_states():
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1.0, 0.0, 0.0, 0.0],
+         [0.0, 1.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0, 1.0],
+         [0.0, 0.0, 1.0, 0.0]],
+        dtype=complex,
+    )
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("00", dtype="complex128"),
+            chi=4,
+            mode="mpo",
+        ),
+        [
+            (hadamard, 0),
+            (cnot, (0, 1)),
+            pepsy.TrajectoryEvent(
+                pepsy.TrajectoryChannel.amplitude_damping(0.3), 0
+            ),
+        ],
+        shots=256,
+        seed=9,
+        run_kwargs={"progbar": False},
+    )
+
+    expected = {
+        "no_jump": np.array([1.0, 0.0, 0.0, np.sqrt(0.7)], dtype=complex)
+        / np.sqrt(1.7),
+        "jump": np.array([0.0, 1.0, 0.0, 0.0], dtype=complex),
+    }
+    assert {leaf.records[0].label for leaf in result.leaves} == {
+        "no_jump",
+        "jump",
+    }
+    for leaf in result.leaves:
+        np.testing.assert_allclose(
+            _statevector(leaf.optimizer), expected[leaf.records[0].label]
+        )
+        assert leaf.optimizer.p.norm() == pytest.approx(1.0)
+    assert result.diagnostics.used_kraus_copy_fallback is False
+
+
+@pytest.mark.parametrize("mode", ("exact", "mix", "su"))
+def test_shot_validation_rejects_unsupported_kraus_modes(mode):
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    simulator = pepsy.MpsOptimizer(
+        initial,
+        [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.2), 0)],
+        chi=4,
+        mode=mode,
+    )
+
+    with pytest.raises(ValueError, match="(exact|mix|su|Kraus|trajectory)"):
+        simulator.run(shots=2, strategy="independent", run_kwargs={"progbar": False})
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "su", "exact"),
+)
+def test_unitary_shot_replay_has_a_valid_path_for_each_mps_mode(mode):
+    simulator = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype="complex128"),
+        [(_X, 0)],
+        chi=4,
+        mode=mode,
+    )
+
+    result = simulator.run(
+        shots=2,
+        strategy="independent",
+        retain="final",
+        run_kwargs={"progbar": False, "n_iter": 1},
+    )
+
+    assert result.shots == 2
+    assert result.branches == 2
+    for optimizer in result.optimizers:
+        np.testing.assert_allclose(_statevector(optimizer), [0.0, 1.0])
+
+
+def test_shot_replay_reuses_a_frozen_persistent_layout():
+    simulator = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(_X, 0)],
+        chi=4,
+        mode="mpo",
+    )
+    simulator.apply_layout((2, 0, 1), layout_report=False)
+
+    result = simulator.run(
+        shots=2,
+        strategy="independent",
+        retain="final",
+        run_kwargs={"progbar": False},
+    )
+
+    assert result.shots == 2
+    for optimizer in result.optimizers:
+        np.testing.assert_allclose(
+            optimizer.to_dense(logical_order=True).reshape(-1),
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        )
+
+
+@pytest.mark.parametrize("mode", ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "swap", "svd"))
+def test_canonical_mps_modes_replay_kraus_shots(mode):
+    simulator = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype="complex128"),
+        [(_X, 0), pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(1.0), 0)],
+        chi=4,
+        mode=mode,
+    )
+
+    result = simulator.run(
+        shots=2,
+        strategy="independent",
+        retain="final",
+        run_kwargs={"progbar": False, "n_iter": 1},
+    )
+
+    assert result.shots == 2
+    for optimizer in result.optimizers:
+        np.testing.assert_allclose(_statevector(optimizer), [1.0, 0.0])
+
+
+def test_mps_noisy_dispatches_pauli_error_model():
+    """MpsOptimizer routes an explicit Pauli model to Pauli coalescing."""
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    simulator = pepsy.MpsOptimizer(
         initial,
         [(_X, 0)],
         chi=4,
@@ -377,7 +708,48 @@ def test_leak2depolar_replaces_later_leakage_with_pauli_approximation():
     assert records[2].measurement in {0, 1}
 
 
-def test_stateful_leakage_auto_strategy_stays_independent_for_now():
+def test_coalesced_leakage_tracks_stateful_branches_and_suppresses_gates():
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [
+            ("leakage", 0.5, 0),
+            (_X, 0),
+            ("measure_leaked", 0),
+        ],
+        shots=64,
+        seed=14,
+    )
+
+    assert result.shots == 64
+    assert result.branches == 2
+    assert sum(result.counts) == 64
+    assert any(
+        record.measurement == 2
+        for leaf in result.leaves
+        for record in leaf.leakage_records
+        if record.kind == "measure_leaked"
+    )
+
+
+def test_coalesced_leakage_return_preserves_return_zero_and_one_branches():
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [("leakage", 1.0, 0), ("leakage_return", 1.0, 0)],
+        shots=64,
+        seed=18,
+    )
+
+    assert result.branches == 2
+    assert sum(result.counts) == 64
+    branches = {
+        leaf.leakage_records[-1].branch
+        for leaf in result.leaves
+    }
+    assert branches <= {"return_0", "return_1"}
+    assert branches
+
+
+def test_stateful_leakage_supports_coalesced_and_auto_strategies():
     result = pepsy.run_trajectory_shots(
         lambda: pepsy.MpsStabOptimizer(1, chi=4),
         [("leakage", 1.0, 0)],
@@ -386,15 +758,18 @@ def test_stateful_leakage_auto_strategy_stays_independent_for_now():
         strategy="auto",
     )
 
-    assert isinstance(result, pepsy.TrajectoryShotResult)
-    with pytest.raises(NotImplementedError, match="stateful leakage"):
-        pepsy.run_trajectory_shots(
-            lambda: pepsy.MpsStabOptimizer(1, chi=4),
-            [("leakage", 1.0, 0)],
-            shots=3,
-            seed=4,
-            strategy="coalesced",
-        )
+    assert isinstance(result, pepsy.CoalescedTrajectoryResult)
+    assert result.shots == 3
+    assert result.diagnostics.leakage_events == 1
+    explicit = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [("leakage", 1.0, 0)],
+        shots=3,
+        seed=4,
+        strategy="coalesced",
+    )
+    assert explicit.shots == 3
+    assert explicit.leaves[0].leakage_records[0].finally_leaked is True
 
 
 def test_trajectory_channel_validates_probabilities_dimensions_and_kraus_sum():

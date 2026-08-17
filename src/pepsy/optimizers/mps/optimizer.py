@@ -50,8 +50,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from numbers import Integral
 import math
+import threading
 import time
 import types
 import warnings
@@ -87,6 +89,8 @@ __all__ = [
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
+_SHOT_DEFAULT_MAX_BRANCHES = 128
+_SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS = 0.1
 # This export-oriented list intentionally contains compatibility totals and
 # their named subsets. It is not an additive partition of elapsed FIT time.
 _FIT_TIMING_PHASES = (
@@ -102,6 +106,38 @@ _FIT_TIMING_PHASES = (
     "non_site_elapsed_seconds",
     "sweep_overhead_seconds",
 )
+
+
+@dataclass(frozen=True)
+class _MpsStreamPlan:
+    """Immutable stream metadata with a private backend payload cache.
+
+    ``entries`` and ``event_types`` are the backend-neutral portion of the
+    plan. The cache is deliberately the only mutable part: it stores converted
+    read-only payloads keyed by backend signature and keeps a strong reference
+    to the source payload so object-id reuse cannot return a stale conversion.
+    """
+
+    entries: tuple
+    event_types: tuple[str, ...]
+    has_trajectory_events: bool
+    trajectory_plan: object = field(default=None, compare=False, repr=False)
+    _backend_cache: dict = field(default_factory=dict, compare=False, repr=False)
+    _backend_cache_lock: object = field(
+        default_factory=threading.RLock,
+        compare=False,
+        repr=False,
+    )
+
+    def get_or_create_backend_payload(self, key, source, factory):
+        """Return a cached backend payload, creating it exactly once."""
+        with self._backend_cache_lock:
+            cached = self._backend_cache.get(key)
+            if cached is not None and cached[0] is source:
+                return cached[1]
+            converted = factory()
+            self._backend_cache[key] = (source, converted)
+            return converted
 
 
 def _summarize_fit_timing(records):
@@ -729,6 +765,45 @@ def _normalize_gate_queue(gates):
     )
 
 
+def _prepare_gate_stream(gates):
+    """Compile a stream snapshot and identify trajectory-aware entries.
+
+    The noise module owns the stochastic-entry grammar. Import it lazily here
+    so the ordinary MPS optimizer does not create an import cycle at module
+    load time. Keeping the raw stream is important: trajectory runners need to
+    see the original events, while the single-state path still uses the
+    normalized ``G`` / ``where`` / ``event_types`` representation below.
+    """
+    from ..noise import (  # pylint: disable=import-outside-toplevel
+        TrajectoryEvent,
+        compile_trajectory_stream,
+        _leakage_event_parts,
+    )
+
+    trajectory_plan = compile_trajectory_stream(gates)
+    entries = trajectory_plan.entries
+    event_types = []
+    has_trajectory_events = False
+    for entry in entries:
+        if isinstance(entry, TrajectoryEvent):
+            event_types.append("trajectory")
+            has_trajectory_events = True
+        elif _leakage_event_parts(entry) is not None:
+            event_types.append("leakage")
+            has_trajectory_events = True
+        elif _submpo_event_parts(entry) is not None:
+            event_types.append("submpo")
+        else:
+            control_parts = _control_event_parts(entry)
+            event_types.append("gate" if control_parts is None else control_parts[0])
+    return _MpsStreamPlan(
+        entries=entries,
+        event_types=tuple(event_types),
+        has_trajectory_events=has_trajectory_events,
+        trajectory_plan=trajectory_plan,
+    )
+
+
 class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     """High-level wrapper for MPS gate-sweep objectives.
 
@@ -757,7 +832,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         requested computational bit (``+1 -> 0``, ``-1 -> 1``); negative
         records are offsets from the latest measurement. A
         ``cap`` event shortens the MPS, so later event site labels refer to the
-        shortened chain.
+        shortened chain. Stream-local trajectory events and stochastic entries
+        are also accepted. They are replayed through the shot runner when
+        :meth:`run` is called, so state-dependent channels, measurements, and
+        feed-forward actions are sampled independently per trajectory.
     chi : int
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
@@ -780,6 +858,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     inplace : bool, default=False
         Whether to optimize the provided input state object directly. If
         ``False``, a copy is made and the original input remains unchanged.
+    The input state and gate stream are snapshotted at construction. Repeated
+    ``run(shots=...)`` calls therefore restart every trajectory from the same
+    initial state rather than continuing from an earlier ensemble.
     gauges : dict | None, default=None
         Simple-update bond gauges used only by ``mode="su"``. The dictionary
         is mutated in place and is exposed as :attr:`gauges`. If omitted, the
@@ -889,6 +970,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _dmrg_alias_block_size(cls, mode):
         """Return the fixed block size requested by a DMRG mode alias."""
         return cls._DMRG_MODE_ALIASES.get(str(mode).strip().lower())
+
+    @staticmethod
+    def _effective_max_bond(p=None):
+        """Return a numeric maximum bond, treating product-state ``None`` as 1."""
+        value = p.max_bond() if p is not None else None
+        return 1 if value is None else int(value)
 
     @classmethod
     def _normalize_submpo_method(cls, method):
@@ -1281,6 +1368,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ind_id="k{}",
         inplace=False,
         gauges=None,
+        _capture_initial=True,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -1296,7 +1384,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.inplace = bool(inplace)
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
-        self.G, self.where, self.event_types = _normalize_gate_queue(gates)
+        self._initial_p = self.p.copy() if _capture_initial else None
+        # A normal optimizer owns its stream cache. Shot-created optimizers
+        # explicitly opt into sharing the immutable plan cache after
+        # construction; initialize both fields before installing the plan so
+        # the constructor follows the same path as set_gates/add_gates.
+        self._shared_backend_cache = False
+        self._backend_cache_plan = None
+        self._install_stream_plan(_prepare_gate_stream(gates))
         self.chi = int(chi)
         mode_name = str(mode).strip().lower()
         self._dmrg_mode_alias = (
@@ -1938,6 +2033,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # cannot leave this optimizer half-updated after a failed assignment.
         self._state_backend_info_for(new_p)
         self.p = new_p
+        self._initial_p = self.p.copy()
         self._unitary_previous_norm = None
         self._dmrg1_one_site_locked = False
         self.qubits = list(range(int(getattr(self.p, "L", 0))))
@@ -2016,16 +2112,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._invalidate_unitary_norm_baseline()
         return old_norm
 
-    def copy(self) -> "MpsOptimizer":
-        """Return an independent optimizer copy at its current MPS state.
-
-        The copied optimizer owns a deep copy of the represented MPS and an
-        independent canonical-centre cache.  Queue entries are intentionally
-        retained (without copying immutable gate payloads), so callers can
-        continue a partially prepared replay independently.  This is useful
-        for exact branch/tree sampling, where a state is copied only at a
-        genuine stochastic split.
-        """
+    def _copy_impl(self, *, capture_initial):
+        """Copy optimizer state, optionally retaining a shot-replay template."""
         copied = type(self)(
             self.p.copy(),
             gates=[],
@@ -2035,13 +2123,33 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ind_id=self.ind_id,
             inplace=True,
             gauges=deepcopy(self.gauges),
+            _capture_initial=False,
         )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
-        # Restore the source's tracked centre afterwards. It describes the
-        # same represented state and must remain optimizer-local.
-        copied.info_c = deepcopy(self.info_c)
+        # ``MatrixProductState.copy()`` does not promise to preserve the
+        # physical orthogonality centre. The constructor canonicalizes the
+        # copied state, so its freshly initialized ``info_c`` is authoritative
+        # here. Overwriting it with the source cache can claim that site 0 is
+        # canonical while the copied tensors are centered at site ``L // 2``;
+        # a subsequent projective replay can then lose the branch norm.
+        if copied.mode not in {"exact", "su"}:
+            copied.info_c["cur_orthog"] = tuple(
+                int(site) for site in copied.p.calc_current_orthog_center()
+            )
+        else:
+            copied.info_c = deepcopy(self.info_c)
         copied.inplace = self.inplace
+        # Coalesced trajectory branches are copied immediately before an
+        # ordinary replay and never become nested shot runners. Avoid a
+        # second MPS copy for that internal path; public ``copy()`` retains
+        # the constructor-state template needed by ``run(shots=...)``.
+        copied._initial_p = self.p.copy() if capture_initial else None
+        copied._stream_plan = self._stream_plan
+        copied._gate_stream = tuple(self._gate_stream)
+        copied._has_trajectory_events = self._has_trajectory_events
+        copied._shared_backend_cache = self._shared_backend_cache
+        copied._backend_cache_plan = self._backend_cache_plan
         copied.G = list(self.G)
         copied.where = list(self.where)
         copied.event_types = list(self.event_types)
@@ -2066,6 +2174,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._backend_conversion_warnings = set(
             self._backend_conversion_warnings
         )
+        copied._trajectory_diagnostics = deepcopy(
+            getattr(self, "_trajectory_diagnostics", None)
+        )
         copied._su_gauges_supplied = True
         copied._su_gauges_ready = self._su_gauges_ready
         copied._su_gauges_state = copied.p if self._su_gauges_ready else None
@@ -2075,6 +2186,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         return copied
+
+    def _copy_for_trajectory_branch(self):
+        """Return a branch copy without an unused nested-shot snapshot."""
+        return self._copy_impl(capture_initial=False)
+
+    def copy(self) -> "MpsOptimizer":
+        """Return an independent optimizer copy at its current MPS state.
+
+        The copied optimizer owns a deep copy of the represented MPS and an
+        independent canonical-centre cache. Queue entries are intentionally
+        retained (without copying immutable gate payloads), so callers can
+        continue a partially prepared replay independently. The copy also
+        snapshots its current state for a later ``run(shots=...)`` call.
+        """
+        return self._copy_impl(capture_initial=True)
 
     def set_mode(self, mode):
         """Switch optimization mode while preserving the represented state."""
@@ -2260,13 +2386,252 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         logical_inds = [self.p.site_ind(self.position(site)) for site in range(self.p.L)]
         return self.p.to_dense(logical_inds, **kwargs)
 
+    @property
+    def gate_stream(self):
+        """Return the snapshotted raw stream, including trajectory events."""
+        return self._gate_stream
+
+    @property
+    def has_trajectory_events(self):
+        """Whether this optimizer owns a stream requiring shot replay."""
+        return bool(self._has_trajectory_events)
+
+    def _install_stream_plan(self, plan):
+        """Install a compiled stream plan and rebuild the single-state queue."""
+        if not isinstance(plan, _MpsStreamPlan):
+            raise TypeError("plan must be an internal MPS stream plan.")
+        self._stream_plan = plan
+        self._gate_stream = plan.entries
+        self._has_trajectory_events = plan.has_trajectory_events
+        if not self._shared_backend_cache:
+            self._backend_cache_plan = plan
+        if self._has_trajectory_events:
+            # Stochastic and stateful leakage entries are consumed by the shot
+            # runner, which lowers each sampled branch into an ordinary stream.
+            # They cannot be normalized into the single-state queue here.
+            self.G, self.where, self.event_types = [], [], []
+        else:
+            self.G, self.where, self.event_types = _normalize_gate_queue(
+                plan.entries
+            )
+
+    def _shot_factory(self):
+        """Build fresh optimizers from this instance's initial state."""
+        template = self._initial_p
+        mode = self._dmrg_mode_alias or self.mode
+        stream = self._gate_stream
+        constructor = {
+            "chi": self.chi,
+            "mode": mode,
+            "contraction_opt": self.contraction_opt,
+            "ind_id": self.ind_id,
+        }
+
+        def make_optimizer():
+            options = dict(constructor)
+            options["gauges"] = deepcopy(self.gauges)
+            options["inplace"] = True
+            options["_capture_initial"] = False
+            optimizer = type(self)(template.copy(), [], **options)
+            optimizer._stream_plan = self._stream_plan
+            optimizer._gate_stream = stream
+            optimizer._has_trajectory_events = self._has_trajectory_events
+            optimizer._shared_backend_cache = True
+            optimizer._backend_cache_plan = self._backend_cache_plan
+            if self._has_trajectory_events:
+                optimizer.G, optimizer.where, optimizer.event_types = [], [], []
+            else:
+                optimizer.G = list(self.G)
+                optimizer.where = list(self.where)
+                optimizer.event_types = list(self.event_types)
+            if self._persistent_layout_plan is not None:
+                # The shot template is already in the frozen physical order.
+                # Install only the logical mapping on the child; calling
+                # apply_layout again would reorder the state a second time.
+                optimizer._persistent_layout_plan = deepcopy(
+                    self._persistent_layout_plan
+                )
+                optimizer.layout_plan = deepcopy(self.layout_plan)
+                optimizer.last_layout_plan = deepcopy(self.last_layout_plan)
+                optimizer.logical_order = list(self.logical_order)
+                optimizer.qubits = list(self.qubits)
+            return optimizer
+
+        return make_optimizer
+
+    @staticmethod
+    def _shot_runner_requested(
+        shots,
+        *,
+        has_trajectory_events,
+        error_model,
+        strategy,
+        run_kwargs,
+        max_branches,
+        importance_sampling,
+        max_branch_factor,
+        parallel_workers,
+        parallel_backend,
+        auto_max_expected_faults,
+        retain,
+    ):
+        """Return whether ``run`` needs the multi-shot trajectory machinery."""
+        if has_trajectory_events or error_model is not None:
+            return True
+        if isinstance(shots, bool) or not isinstance(shots, Integral):
+            return True
+        if int(shots) != 1:
+            return True
+        return any(
+            (
+                strategy != "auto",
+                run_kwargs is not None,
+                max_branches != _SHOT_DEFAULT_MAX_BRANCHES,
+                importance_sampling is not None,
+                max_branch_factor is not None,
+                parallel_workers != 1,
+                parallel_backend != "thread",
+                auto_max_expected_faults
+                != _SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS,
+                retain != "all",
+            )
+        )
+
+    def _validate_shot_compatibility(self, error_model=None):
+        """Reject known-invalid mode and trajectory combinations early."""
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            TrajectoryEvent,
+            _has_unforced_branching_control,
+            _leakage_event_parts,
+        )
+
+        entries = self._gate_stream
+        trajectory_events = tuple(
+            entry for entry in entries if isinstance(entry, TrajectoryEvent)
+        )
+        controls = tuple(
+            entry for entry in entries if self.control_event_parts(entry) is not None
+        )
+        has_leakage = any(_leakage_event_parts(entry) is not None for entry in entries)
+        has_submpo = any(_is_submpo_event(entry) for entry in entries)
+        if has_submpo and self.mode != "mpo":
+            raise ValueError(
+                "shot replay of sub-MPO events requires mode='mpo'; "
+                f"mode={self.mode!r} cannot consume sub-MPO payloads."
+            )
+        if self.mode == "exact":
+            if any(event.channel.mode == "kraus" for event in trajectory_events):
+                raise ValueError(
+                    "state-dependent trajectory channels require an MPS mode; "
+                    "mode='exact' cannot evaluate Kraus probabilities."
+                )
+            if controls or has_leakage:
+                raise ValueError(
+                    "shot replay with mode='exact' supports unitary/mixture "
+                    "streams only; controls and leakage require an MPS mode."
+                )
+        if self.mode == "mix" and (controls or has_leakage):
+            raise ValueError(
+                "mode='mix' is unitary-only and cannot replay controls or leakage."
+            )
+        if self.mode == "mix" and any(
+            event.channel.mode == "kraus" for event in trajectory_events
+        ):
+            raise ValueError(
+                "mode='mix' is unitary-only and cannot replay Kraus channels."
+            )
+        if self.mode == "su" and (controls or has_leakage):
+            raise ValueError(
+                "mode='su' supports gate-only shot replay; controls and leakage "
+                "require a canonical MPS mode."
+            )
+        if self.mode == "su" and any(
+            event.channel.mode == "kraus" for event in trajectory_events
+        ):
+            raise ValueError(
+                "mode='su' is not a physical-norm trajectory backend; use "
+                "mode='mpo', 'svd', 'swap', or a DMRG mode for Kraus channels."
+            )
+        if error_model is not None and _has_unforced_branching_control(entries):
+            raise ValueError(
+                "error_model shot replay cannot combine unforced controls; "
+                "use stream-local trajectory events instead."
+            )
+
+    def _run_shots(
+        self,
+        shots,
+        *,
+        error_model=None,
+        seed=None,
+        run_kwargs=None,
+        strategy="auto",
+        max_branches=_SHOT_DEFAULT_MAX_BRANCHES,
+        auto_max_expected_faults=_SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
+    ):
+        """Replay this stream as an independent or coalesced shot ensemble."""
+        self._validate_shot_compatibility(error_model=error_model)
+        if self.mode == "perm" and self.logical_order != list(
+            range(int(getattr(self.p, "L", 0)))
+        ):
+            raise ValueError(
+                "shot replay does not support a permuted live MPS; "
+                "create a fresh optimizer before running shots."
+            )
+        if error_model is not None and self._has_trajectory_events:
+            raise ValueError(
+                "do not combine stream-local trajectory events with error_model; "
+                "use one noise representation per gate stream."
+            )
+
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            NoisyResult,
+            run_noisy_shots,
+            run_trajectory_shots,
+        )
+
+        common = {
+            "seed": seed,
+            "run_kwargs": run_kwargs,
+            "strategy": strategy,
+            "max_branches": max_branches,
+            "importance_sampling": importance_sampling,
+            "max_branch_factor": max_branch_factor,
+            "parallel_workers": parallel_workers,
+            "parallel_backend": parallel_backend,
+            "retain": retain,
+        }
+        if error_model is None:
+            raw = run_trajectory_shots(
+                self._shot_factory(),
+                self._stream_plan.trajectory_plan,
+                shots,
+                **common,
+            )
+        else:
+            raw = run_noisy_shots(
+                self._shot_factory(),
+                self._gate_stream,
+                error_model,
+                shots,
+                auto_max_expected_faults=auto_max_expected_faults,
+                **common,
+            )
+        return NoisyResult(raw)
+
     def set_gates(self, gates):
         """Replace the current gate list.
 
         After calling this, ``run(...)`` applies only this new list
         (unless you call :meth:`add_gates` before running).
         """
-        self.G, self.where, self.event_types = _normalize_gate_queue(gates)
+        self._shared_backend_cache = False
+        self._install_stream_plan(_prepare_gate_stream(gates))
         return self
 
     def add_gates(self, gates):
@@ -2275,10 +2640,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         This preserves previously queued gates and extends them with
         new ones.
         """
-        G_new, where_new, event_types_new = _normalize_gate_queue(gates)
-        self.G.extend(G_new)
-        self.where.extend(where_new)
-        self.event_types.extend(event_types_new)
+        new_plan = _prepare_gate_stream(gates)
+        self._install_stream_plan(
+            _prepare_gate_stream(self._gate_stream + new_plan.entries)
+        )
         return self
 
     @staticmethod
@@ -2508,7 +2873,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
 
         if target_order != current_order:
-            if int(self.p.max_bond()) == 1:
+            if self._effective_max_bond(self.p) == 1:
                 self._relabel_product_mps(target_order, current_order=current_order)
             elif not allow_lossy_reorder:
                 raise ValueError(
@@ -2535,6 +2900,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._persistent_layout_plan = plan
         self.layout_plan = plan
         self.last_layout_plan = plan
+        # Shot replay starts from the configured template. Once a persistent
+        # layout is installed, that template must include the one-time reorder
+        # so every fresh child can reuse the frozen physical arrangement.
+        self._initial_p = self.p.copy()
         if target_order != current_order:
             # Exact product relabeling preserves the norm, while an explicitly
             # lossy entangled reorder can change it. Re-establish the raw
@@ -2804,6 +3173,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         timing_sync_device=False,
         quality_check_every=None,
         quality_check_repair=True,
+        shots=1,
+        error_model=None,
+        strategy="auto",
+        run_kwargs=None,
+        max_branches=_SHOT_DEFAULT_MAX_BRANCHES,
+        auto_max_expected_faults=_SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
     ):
         """Run the currently queued gates.
 
@@ -3000,12 +3380,76 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         quality_check_repair : bool, default=True
             Re-canonicalize the live MPS when a periodic gauge check detects
             missing canonical coverage.
+        shots : int, default=1
+            Number of trajectories to replay. The default preserves the
+            single-state return value for ordinary streams. A stream-local
+            noisy stream, an explicit ``shots != 1``, or shot-runner options
+            dispatches to the trajectory result facade.
+        error_model : PauliErrorModel | None, default=None
+            Optional legacy Pauli error model for a clean gate stream. This
+            selects the Pauli shot runner and cannot be combined with
+            stream-local trajectory or leakage entries.
+        strategy : {"auto", "independent", "coalesced"}, default="auto"
+            Shot representation strategy. ``"auto"`` shares deterministic
+            prefixes when the branch count remains bounded and otherwise
+            restarts with independent trajectories.
+        run_kwargs : mapping | None, default=None
+            Keyword arguments forwarded to each fresh optimizer's ordinary
+            single-trajectory ``run`` call.
+        max_branches : int | None, default=128
+            Safety cap for coalesced trajectory replay.
+        auto_max_expected_faults : float, default=0.1
+            Expected-fault threshold used by automatic legacy Pauli replay.
+        importance_sampling : ImportanceSamplingPolicy | None, default=None
+            Optional proposal policy for trajectory events.
+        max_branch_factor : int | None, default=None
+            Optional per-event branch-growth cap for coalesced replay.
+        parallel_workers : int, default=1
+            Number of workers for explicit parallel shot execution.
+        parallel_backend : {"thread", "gpu", "serial"}, default="thread"
+            Backend used for explicit parallel shot execution.
+        retain : {"all", "final", "none"}, default="all"
+            Result retention policy for shot replay. ``"all"`` retains final
+            states and replay metadata, ``"final"`` retains final states only,
+            and ``"none"`` retains no optimizer states.
 
         Returns
         -------
-        qtn.TensorNetwork
-            The updated ``self.p`` state after replaying the queued gate stream.
+        qtn.TensorNetwork | NoisyResult
+            The updated ``self.p`` state for a single ordinary replay, or a
+            stable noisy result facade when shot replay is selected.
         """
+        if self._shot_runner_requested(
+            shots,
+            has_trajectory_events=self._has_trajectory_events,
+            error_model=error_model,
+            strategy=strategy,
+            run_kwargs=run_kwargs,
+            max_branches=max_branches,
+            importance_sampling=importance_sampling,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
+            auto_max_expected_faults=auto_max_expected_faults,
+            retain=retain,
+        ):
+            if mode is not None:
+                self.set_mode(mode)
+            return self._run_shots(
+                shots,
+                error_model=error_model,
+                seed=seed,
+                run_kwargs=run_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                auto_max_expected_faults=auto_max_expected_faults,
+                importance_sampling=importance_sampling,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
+                retain=retain,
+            )
+
         timing = bool(timing)
         timing_sync_device = bool(timing_sync_device)
         cutoff = self._resolve_cutoff(cutoff)
@@ -3264,7 +3708,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_rtol = None
             else:
                 fit_rtol = self._resolve_fit_rtol(fit_rtol)
-            if self.mode == "mix" and self.p.max_bond() > self.chi:
+            current_max_bond = self.p.max_bond()
+            if (
+                self.mode == "mix"
+                and current_max_bond is not None
+                and current_max_bond > self.chi
+            ):
                 raise ValueError(
                     "mode='mix' requires the initial MPS max bond to be <= chi; "
                     "compress the state first or increase chi."
@@ -4037,6 +4486,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_signature = _array_backend_signature(like)
         prepared = []
         stream_converter = infer_backend_converter_from_sample(like)
+        cache_plan = self._backend_cache_plan
         for gate, event_type in zip(gates, event_types):
             if event_type == "gate":
                 source_signature = _array_backend_signature(gate)
@@ -4044,7 +4494,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self._warn_backend_conversion(
                         source_signature, target_signature, kind="gate"
                     )
-                    gate = self.to_backend(gate)
+                    cache_key = ("gate", id(gate), repr(target_signature))
+                    gate = cache_plan.get_or_create_backend_payload(
+                        cache_key,
+                        gate,
+                        lambda gate=gate: self.to_backend(gate),
+                    )
             elif event_type == "submpo":
                 # ``apply_to_arrays`` changes only the raw tensor payloads,
                 # unlike rebuilding an MPO, which can lose custom labels or
@@ -4060,14 +4515,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             self._warn_backend_conversion(
                                 source_signature, target_signature, kind="sub-MPO"
                             )
-                    gate = gate.copy()
-                    apply_to_arrays = getattr(gate, "apply_to_arrays", None)
-                    if not callable(apply_to_arrays):
-                        raise TypeError(
-                            "sub-MPO payloads must provide apply_to_arrays() "
-                            "for backend conversion."
-                        )
-                    apply_to_arrays(stream_converter or self.to_backend)
+                    source_gate = gate
+                    cache_key = ("submpo", id(source_gate), repr(target_signature))
+
+                    def convert_submpo():
+                        converted = source_gate.copy()
+                        apply_to_arrays = getattr(converted, "apply_to_arrays", None)
+                        if not callable(apply_to_arrays):
+                            raise TypeError(
+                                "sub-MPO payloads must provide apply_to_arrays() "
+                                "for backend conversion."
+                            )
+                        apply_to_arrays(stream_converter or self.to_backend)
+                        return converted
+
+                    # A sub-MPO may be mutated by a downstream compression
+                    # routine, so cache a converted template but give each
+                    # execution its own shallow network copy.
+                    gate = cache_plan.get_or_create_backend_payload(
+                        cache_key,
+                        source_gate,
+                        convert_submpo,
+                    ).copy()
             prepared.append(gate)
         return prepared
 
@@ -5130,7 +5599,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("DMRG batch produced non-finite MPS tensor data.")
-        if int(self.p.max_bond()) > int(self.chi):
+        if self._effective_max_bond(self.p) > int(self.chi):
             raise RuntimeError(
                 "DMRG batch exceeded the mixed-mode chi bond limit."
             )
@@ -5611,7 +6080,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
 
                 step = mix_step_offset + idx + 1
-                start_bond = int(self.p.max_bond())
+                start_bond = self._effective_max_bond(self.p)
                 active_bond_is_short = self._mix_active_bond_is_short(
                     where, target_sizes=target_sizes
                 )
@@ -5654,7 +6123,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         "target_bond": int(target_bond),
                         "backend": "mpo",
                         "reason": reason,
-                        "end_bond": int(self.p.max_bond()),
+                        "end_bond": self._effective_max_bond(self.p),
                     }
                     if self._mix_dmrg_disabled_reason is not None:
                         entry["dmrg_disabled_reason"] = (
@@ -5785,7 +6254,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         raise
                     mpo_steps += len(batch_G)
                     fallback_steps += len(batch_G)
-                    final_bond = int(self.p.max_bond())
+                    final_bond = self._effective_max_bond(self.p)
                     entries = []
                     for offset, (step_i, where_i, logical_i) in enumerate(
                         zip(batch_steps, batch_where, batch_logical_where)
@@ -5834,7 +6303,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise
 
                 dmrg_steps += len(batch_G)
-                final_bond = int(self.p.max_bond())
+                final_bond = self._effective_max_bond(self.p)
                 entries = []
                 for offset, (step_i, where_i, logical_i) in enumerate(
                     zip(batch_steps, batch_where, batch_logical_where)
@@ -5882,7 +6351,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "mpo_steps": int(mpo_steps),
             "dmrg_steps": int(dmrg_steps),
             "fallback_steps": int(fallback_steps),
-            "final_bond": int(self.p.max_bond()),
+            "final_bond": self._effective_max_bond(self.p),
             "chi": int(self.chi),
             "target_bond": int(target_bond),
             "dmrg_disabled": self._mix_dmrg_disabled_reason is not None,
