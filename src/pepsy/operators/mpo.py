@@ -411,7 +411,16 @@ def _array_equal(left, right):
 
 def _setitem(array, index, value):
     """Set one tensor entry on mutable and functional array backends."""
-    if ar.infer_backend(array) == "jax":
+    backend = ar.infer_backend(array)
+    value_dtype = getattr(value, "dtype", None)
+    if value_dtype is None and backend == "numpy":
+        value_dtype = np.asarray(value).dtype
+    if value_dtype is not None and getattr(array, "dtype", None) != value_dtype:
+        # Real Hamiltonian tensors must be promoted before Algorithm 3 inserts
+        # complex real-time terms. Otherwise NumPy/Torch assignment or JAX
+        # scatter updates silently discard the imaginary component.
+        array = ar.do("astype", array, value_dtype)
+    if backend == "jax":
         return array.at[index].set(value)
     array[index] = value
     return array
