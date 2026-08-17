@@ -1,9 +1,10 @@
-"""Small dense accuracy benchmarks for higher-order MPO baselines.
+"""Small and large-chain accuracy benchmarks for higher-order MPO baselines.
 
 These are intentionally regression-sized rather than performance harnesses:
 they compare the finite MPO construction with first-order Trotter and a
-two-site cluster-expansion baseline on a four-site chain. Larger timing runs
-belong outside the package repository.
+two-site cluster-expansion baseline on a four-site chain. The slow benchmark
+also compares parameterized transverse-field Ising MPOs with Trotter MPOs at
+``L=32`` without forming dense operators.
 """
 
 from itertools import product
@@ -430,3 +431,162 @@ def test_parameterized_mpo_jax_gradients_match_finite_differences():
         rtol=3.0e-3,
         atol=3.0e-4,
     )
+
+
+def _tfi_basis(L):
+    """Build one cached basis for ``J ZZ + hx X + hz Z`` on an open chain."""
+    x, _, z = _paulis()
+    terms = [
+        MPOProductTerm((site, site + 1), (z, z), MPOParameter("J"))
+        for site in range(L - 1)
+    ]
+    terms.extend(
+        MPOProductTerm((site,), (x,), MPOParameter("hx"))
+        for site in range(L)
+    )
+    terms.extend(
+        MPOProductTerm((site,), (z,), MPOParameter("hz"))
+        for site in range(L)
+    )
+    return MPOBasis.from_local_terms(L, terms)
+
+
+def _tfi_gate_stream(L, parameters, dt):
+    """Return a fixed-order local gate stream for one TFI Trotter step."""
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    x, _, z = _paulis()
+    gates = [
+        (
+            scipy_linalg.expm(
+                -1j * dt * parameters["J"] * np.kron(z, z),
+            ),
+            (site, site + 1),
+        )
+        for site in range(L - 1)
+    ]
+    gates.extend(
+        (
+            scipy_linalg.expm(-1j * dt * parameters["hx"] * x),
+            (site,),
+        )
+        for site in range(L)
+    )
+    gates.extend(
+        (
+            scipy_linalg.expm(-1j * dt * parameters["hz"] * z),
+            (site,),
+        )
+        for site in range(L)
+    )
+    return gates
+
+
+def _run_tfi_trotter(L, parameters, dt, order, *, n_substeps=1):
+    """Replay Lie or Strang Trotter steps as an MPO without densifying."""
+    qtn = pytest.importorskip("quimb.tensor")
+    from pepsy import MpoOptimizer  # pylint: disable=import-outside-toplevel
+
+    stream = []
+    for _ in range(n_substeps):
+        if order == 1:
+            stream.extend(
+                _tfi_gate_stream(L, parameters, dt / n_substeps),
+            )
+            continue
+        if order != 2:
+            raise ValueError("the TFI regression supports Trotter orders 1 and 2")
+        half_step = _tfi_gate_stream(
+            L,
+            parameters,
+            dt / (2 * n_substeps),
+        )
+        stream.extend(half_step)
+        stream.extend(reversed(half_step))
+
+    # MpoOptimizer accepts Quimb's gate convention (output, input) and
+    # transposes it internally before applying a ket-only gate.
+    optimizer = MpoOptimizer(
+        qtn.MPO_identity(L, dtype="complex128"),
+        gates=[((gate.T, None), where) for gate, where in stream],
+        chi=32,
+        mode="mpo",
+    )
+    return optimizer.run(
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+    )
+
+
+def _relative_mpo_error(left, right):
+    """Return a normalized MPO norm difference, retaining tensor-network form."""
+    return float(abs((left - right).norm() / right.norm()))
+
+
+@pytest.mark.slow
+def test_parameterized_tfi_large_chain_mpo_against_higher_order_trotter():
+    """Compare cached TFI MPO orders with Lie and Strang Trotter at ``L=32``.
+
+    The two parameter sets exercise rebinding of the same compiled ``J``,
+    ``hx``, and ``hz`` topology. The four-substep Strang result is a more
+    accurate MPO reference, so no dense ``2**L`` operator is required.
+    """
+    L = 32
+    dt = 0.02
+    parameter_sets = (
+        {"J": 1.0, "hx": 0.7, "hz": 0.2},
+        {"J": 0.35, "hx": 1.1, "hz": -0.25},
+    )
+    basis = _tfi_basis(L)
+
+    for parameters in parameter_sets:
+        hamiltonian = basis.build(parameters)
+        mpo_order_2 = hamiltonian.extensive_exponential(
+            -1j * dt,
+            order=2,
+            mode="optimal",
+            cache_history=False,
+            history_storage="streaming",
+        ).to_mpo()
+        mpo_order_3 = hamiltonian.extensive_exponential(
+            -1j * dt,
+            order=3,
+            mode="optimal",
+            cache_history=False,
+            history_storage="streaming",
+        ).to_mpo()
+
+        trotter_order_1 = _run_tfi_trotter(
+            L,
+            parameters,
+            dt,
+            order=1,
+        )
+        trotter_order_2 = _run_tfi_trotter(
+            L,
+            parameters,
+            dt,
+            order=2,
+        )
+        reference = _run_tfi_trotter(
+            L,
+            parameters,
+            dt,
+            order=2,
+            n_substeps=4,
+        )
+
+        errors = {
+            "mpo_order_2": _relative_mpo_error(mpo_order_2, reference),
+            "mpo_order_3": _relative_mpo_error(mpo_order_3, reference),
+            "trotter_order_1": _relative_mpo_error(trotter_order_1, reference),
+            "trotter_order_2": _relative_mpo_error(trotter_order_2, reference),
+        }
+        assert errors["mpo_order_3"] < errors["mpo_order_2"]
+        assert errors["trotter_order_2"] < errors["trotter_order_1"]
+        assert errors["mpo_order_3"] < errors["trotter_order_2"]
+        assert all(np.isfinite(error) for error in errors.values())
+
+    assert basis.cache_info["compiled"] is True
+    assert basis.cache_info["compiled_terms"] == 3 * L - 1
+    assert basis.cache_info["builds"] == len(parameter_sets)
