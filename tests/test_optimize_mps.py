@@ -98,11 +98,13 @@ def _assert_event_sites_locally_normalized(mps, event):
         assert _tensor_data_norm(mps, site) == pytest.approx(1.0)
 
 
-def test_mps_optimizer_has_no_infidelity_tracking_api():
-    """Infidelity tracking is no longer part of the MPS optimizer API."""
+def test_mps_optimizer_has_automatic_norm_tracking_without_legacy_api():
+    """Norm-survival diagnostics are automatic, without an opt-in flag."""
     state = qtn.MPS_computational_state("00", dtype="complex128")
     opt = py.MpsOptimizer(state, gates=[], chi=2, mode="svd")
 
+    assert callable(opt.norm_diagnostics)
+    assert opt.norm_diagnostics()["tracking"] is True
     assert not hasattr(opt, "get_fidelities")
     assert not hasattr(opt, "get_true_infidelities")
     assert not hasattr(opt, "get_norm_infidelity_samples")
@@ -5852,6 +5854,12 @@ def test_mps_optimizer_measure_forced_outcome_collapses_and_records():
     assert where == (2,)
     assert outcome == 1
     assert 0.0 <= prob <= 1.0
+    event = opt.get_norm_events()[0]
+    assert event["kind"] == "measure"
+    assert event["branch_probability"] == pytest.approx(prob)
+    assert event["physical_boundary"] is True
+    assert event["renormalized"] is True
+    assert event["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_mps_optimizer_measure_multisite_pauli():
@@ -6081,6 +6089,8 @@ def test_mps_optimizer_reset_returns_qubit_to_zero():
     assert opt.p.L == 3
     assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (1,)), 1.0)
     assert opt.measurements == []
+    assert [event["kind"] for event in opt.get_norm_events()] == ["reset"]
+    assert opt.norm_diagnostics()["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("axis", ["X", "Y", "Z"])
@@ -6413,7 +6423,31 @@ def test_standalone_compression_modes_honor_unitary_stabilization(mode):
 
     assert _mps_data_norm(stabilized.p) == pytest.approx(1.0, abs=2.0e-5)
     assert _mps_data_norm(unstabilized.p) < 0.999
+    assert stabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+        0.5, abs=2.0e-5
+    )
+    assert unstabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+        0.5, abs=2.0e-5
+    )
+    assert stabilized.get_norm_events()[0]["kind"] == "unitary_compression"
     assert stabilized.get_run_timing()["stages"][f"{mode}.stabilize"]["calls"] == 1
+
+
+@pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
+def test_dmrg_schedules_record_automatic_norm_survival(mode):
+    """All named DMRG schedules use the same automatic norm ledger."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 2))],
+        chi=1,
+        mode=mode,
+    )
+    opt.run(progbar=False, cutoff=0.0, n_iter=3)
+
+    diagnostics = opt.norm_diagnostics()
+    assert diagnostics["events"] == 1
+    assert diagnostics["norm_infidelity"] == pytest.approx(0.5, abs=2.0e-5)
+    assert _mps_data_norm(opt.p) == pytest.approx(1.0, abs=2.0e-5)
 
 
 def test_fit_run_gate_reuse_resets_per_run_traces_and_split_diagnostics():

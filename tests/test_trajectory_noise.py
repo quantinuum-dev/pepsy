@@ -879,6 +879,37 @@ def test_state_dependent_kraus_branches_are_sampled_from_the_current_state(kind)
         expected = [1.0, 0.0] if records[0].label == "jump" else [0.0, 1.0]
         np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-8)
         assert abs(optimizer.p.norm()) == pytest.approx(1.0, abs=1e-8)
+        if kind == "mps":
+            diagnostics = optimizer.norm_diagnostics()
+            event = optimizer.get_norm_events()[0]
+            assert event["kind"] == "trajectory_kraus"
+            assert event["branch_probability"] == pytest.approx(0.5)
+            assert event["physical_boundary"] is True
+            assert event["renormalized"] is True
+            assert diagnostics["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+
+
+def test_coalesced_ordinary_mps_kraus_norm_is_a_physical_boundary():
+    """Coalesced branches retain Born norms without counting them as loss."""
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("1", dtype="complex128"),
+            chi=4,
+            mode="mpo",
+        ),
+        [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.5), 0)],
+        shots=24,
+        seed=8,
+        run_kwargs={"progbar": False},
+    )
+
+    assert result.branches == 2
+    for leaf in result.leaves:
+        diagnostics = leaf.optimizer.norm_diagnostics()
+        event = leaf.optimizer.get_norm_events()[0]
+        assert event["kind"] == "trajectory_kraus"
+        assert event["branch_probability"] == pytest.approx(0.5)
+        assert diagnostics["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state():

@@ -346,6 +346,22 @@ is disabled. Set `stabilize_unitary=False` only to reproduce historical
 norm-decay behavior. The old `fit_stabilize_unitary` spelling remains as a
 deprecated alias.
 
+Norm-survival bookkeeping is automatic; there is no
+`track_infidelity` constructor or run flag for `MpsOptimizer`. Every retained
+unitary compression records an event in `opt.get_norm_events()`. Its
+`norm_fidelity` is the clipped squared ratio of retained norm to the expected
+pre-compression norm, while `norm_fidelity_raw` preserves the unclipped ratio.
+`opt.norm_diagnostics()` reports the cumulative product in `norm_survival` and
+the corresponding `norm_infidelity`; `norm` and `total_norm_proxy` are its
+square root. Measurement, reset, and state-dependent Kraus events are also
+recorded, including `branch_probability`, `physical_boundary`, and
+`renormalized`. Their expected norm includes the Born probability, so a normal
+physical branch has zero compression infidelity. Renormalization closes the
+current raw-norm baseline but does not erase the cumulative compression ledger.
+This same contract is used by the DMRG1/2/3 schedules and the MPO, SVD,
+swap/perm, and mixed backends. The metric is a norm-survival proxy: it does
+not replace a directional state fidelity check.
+
 `cutoff="auto"` selects `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
 data, and `1e-12` for 64-bit data. Explicit numeric cutoffs are unchanged.
 Set `quality_check_every=N` to record finite-data and canonical-gauge health in
@@ -414,10 +430,11 @@ once. Timing also remains independent of `collect_split_diagnostics`;
 profiling an MPS run does not allocate per-SVD truncation dictionaries.
 
 The diagnostic accessors are copy-safe: `get_quality_checks()`,
-`get_normalizations()`, and `get_fit_diagnostics()` return independent
-snapshots, so editing a returned list or record cannot corrupt optimizer-owned
-state. `get_fit_diagnostics()` returns a copy of the last DMRG/FIT record or
-`None` before a FIT update and for modes that do not use FIT. The record
+`get_normalizations()`, `get_norm_events()`, and `get_fit_diagnostics()` return
+independent snapshots, so editing a returned list or record cannot corrupt
+optimizer-owned state. `get_fit_diagnostics()` returns a copy of the last
+DMRG/FIT record or `None` before a FIT update and for modes that do not use
+FIT. The record
 includes the iteration count, convergence reason, relative change, active block
 size, adaptive and one-site sweep counts, and the DMRG1 one-site lock state
 when applicable.

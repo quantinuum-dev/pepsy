@@ -393,6 +393,14 @@ one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS or TTN replay,
 replace the factory above with a fresh `MpsOptimizer(initial_mps, ...)` or
 `TreeOptimizer(...)` and pass its usual options through `run_kwargs`.
 
+For ordinary `MpsOptimizer`, Kraus normalization is tracked automatically in
+the optimizer's norm-survival ledger. The selected branch event retains its
+Born `branch_probability` and is marked as a `physical_boundary`; the expected
+norm includes that probability, so physical renormalization is not reported as
+compression infidelity. Inspect `optimizer.norm_diagnostics()` and
+`optimizer.get_norm_events()` after independent or coalesced replay. No
+`track_infidelity` flag is needed.
+
 For `MpsStabOptimizer(track_infidelity=True)`, a selected Kraus outcome is a
 normalized trajectory boundary, just like a measurement/reset: its Born weight
 is retained in the trajectory record but is not treated as compression loss.

@@ -3429,6 +3429,18 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         raise TypeError(
             "State-dependent trajectory channels require an optimizer with normalize()."
         )
+    if isinstance(norm_event, dict) and "input_norm" in norm_event:
+        probability = float(norm_event["branch_probability"])
+        projected_norm = optimizer._real_float(optimizer.p.norm())
+        optimizer._record_norm_event(
+            "trajectory_kraus",
+            expected_norm=float(norm_event["input_norm"]) * np.sqrt(probability),
+            observed_norm=projected_norm,
+            where=_trajectory_where(where),
+            branch_probability=probability,
+            physical_boundary=True,
+            renormalized=True,
+        )
     normalize()
     # MpsOptimizer stores removed scale in ``p.exponent`` so norm diagnostics
     # see the represented non-unitary norm. A quantum-trajectory branch is
@@ -3739,11 +3751,18 @@ def _apply_trajectory_event(
     probability = float(target[index])
     proposal_probability = float(proposal[index]) if importance_policy is not None else None
     likelihood_ratio = float(ratios[index])
-    norm_event = (
-        optimizer._make_norm_event("trajectory_kraus", branch_probability=probability)
-        if non_unitary and _is_mps_stabilizer_trajectory_optimizer(optimizer)
-        else None
-    )
+    if non_unitary and _is_mps_stabilizer_trajectory_optimizer(optimizer):
+        norm_event = optimizer._make_norm_event(
+            "trajectory_kraus", branch_probability=probability
+        )
+    elif non_unitary and isinstance(optimizer, MpsOptimizer):
+        norm_event = {
+            "kind": "trajectory_kraus",
+            "branch_probability": float(probability),
+            "input_norm": optimizer._real_float(optimizer.p.norm()),
+        }
+    else:
+        norm_event = None
     _run_trajectory_entries(
         optimizer,
         [_entry_from_trajectory_outcome(outcome, event.where)],
@@ -5218,13 +5237,18 @@ def _apply_coalesced_trajectory_outcome(
 ):
     """Apply a previously selected channel outcome to one count-bearing node."""
     non_unitary = event.channel.mode == "kraus"
-    norm_event = (
-        node.optimizer._make_norm_event(
+    if non_unitary and _is_mps_stabilizer_trajectory_optimizer(node.optimizer):
+        norm_event = node.optimizer._make_norm_event(
             "trajectory_kraus", branch_probability=target_probability
         )
-        if non_unitary and _is_mps_stabilizer_trajectory_optimizer(node.optimizer)
-        else None
-    )
+    elif non_unitary and isinstance(node.optimizer, MpsOptimizer):
+        norm_event = {
+            "kind": "trajectory_kraus",
+            "branch_probability": float(target_probability),
+            "input_norm": node.optimizer._real_float(node.optimizer.p.norm()),
+        }
+    else:
+        norm_event = None
     entry = _entry_from_trajectory_outcome(outcome, event.where)
     _run_trajectory_entries(
         node.optimizer, (entry,), run_kwargs, non_unitary=non_unitary

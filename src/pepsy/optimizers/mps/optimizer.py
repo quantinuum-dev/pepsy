@@ -880,6 +880,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         base-10 ``p.exponent``. The raw tensor data are rescaled; the
         represented norm remains available through ``p.norm()`` because quimb
         applies ``p.exponent``.
+    norm_events : list[dict]
+        Automatic norm-survival records for compressed gates and physical
+        projective/Kraus boundaries. Physical branch probabilities are stored
+        on their event but are not multiplied into compression infidelity.
     quality_checks : list[dict]
         Optional finite-data and canonical-gauge health records from
         ``run(quality_check_every=...)``.
@@ -1421,6 +1425,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._persistent_layout_plan = None
         self.layout_plan = None
         self.normalizations = []
+        self.norm_events = []
+        self._norm_log_survival = 0.0
         self.quality_checks = []
         self.last_layout_plan = self._persistent_layout_plan
         self.mix_history = []
@@ -2035,6 +2041,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.p = new_p
         self._initial_p = self.p.copy()
         self._unitary_previous_norm = None
+        self.norm_events = []
+        self._norm_log_survival = 0.0
         self._dmrg1_one_site_locked = False
         self.qubits = list(range(int(getattr(self.p, "L", 0))))
         self.logical_order = list(self.qubits)
@@ -2159,6 +2167,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
         copied.normalizations = deepcopy(self.normalizations)
+        copied.norm_events = deepcopy(self.norm_events)
+        copied._norm_log_survival = self._norm_log_survival
         copied.quality_checks = deepcopy(self.quality_checks)
         copied.mix_history = deepcopy(self.mix_history)
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
@@ -4660,6 +4670,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         renormalize,
         cutoff,
         cutoff_mode,
+        norm_kind="measure",
     ):
         """Measure Pauli ``pauli`` on ``where``, collapse, and record the result.
 
@@ -4687,6 +4698,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # local and exactly tracked.
         anchor = min(int(site) for site in where)
         self.canonize_mps(self.p, anchor)
+        input_norm = self._real_float(ar.do("abs", self.p.norm()))
         self._apply_dense_operator(
             self.p,
             projector,
@@ -4694,6 +4706,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             max_bond=self.chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+        )
+        projected_norm = self._real_float(ar.do("abs", self.p.norm()))
+        self._record_norm_event(
+            norm_kind,
+            expected_norm=input_norm * math.sqrt(float(prob)),
+            observed_norm=projected_norm,
+            where=where,
+            branch_probability=prob,
+            physical_boundary=True,
+            renormalized=renormalize,
         )
         self._recanonize_center(anchor, renormalize=renormalize)
         self.measurements.append(
@@ -4730,6 +4752,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # Centre at q, collapse, renormalize, and (if needed) flip |1> -> |0>,
             # keeping the tracked centre at q throughout.
             self.canonize_mps(self.p, q)
+            input_norm = self._real_float(ar.do("abs", self.p.norm()))
             self._apply_dense_operator(
                 self.p,
                 projector,
@@ -4737,6 +4760,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 max_bond=self.chi,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+            )
+            projected_norm = self._real_float(ar.do("abs", self.p.norm()))
+            branch_probability = p_plus if m > 0 else 1.0 - p_plus
+            self._record_norm_event(
+                "reset",
+                expected_norm=input_norm * math.sqrt(float(branch_probability)),
+                observed_norm=projected_norm,
+                where=(q,),
+                branch_probability=branch_probability,
+                physical_boundary=True,
+                renormalized=True,
             )
             self._recanonize_center(q, renormalize=True)
             if m < 0:
@@ -4769,6 +4803,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 renormalize=True,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                norm_kind="measure_reset",
             )
             if m < 0:
                 self._apply_basis_flip(
@@ -4928,6 +4963,191 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         before applying a gate.
         """
         self._unitary_previous_norm = None
+
+    @staticmethod
+    def _norm_fidelity_ratio(observed_norm, expected_norm):
+        """Return raw and clipped squared norm survival for one event."""
+        observed_norm = float(abs(observed_norm))
+        expected_norm = float(abs(expected_norm))
+        if (
+            expected_norm <= 0.0
+            or observed_norm < 0.0
+            or not np.isfinite(expected_norm)
+            or not np.isfinite(observed_norm)
+        ):
+            return None, None
+        raw = (observed_norm / expected_norm) ** 2
+        return raw, min(1.0, max(0.0, raw))
+
+    def _record_norm_event(
+        self,
+        kind,
+        *,
+        expected_norm,
+        observed_norm,
+        where=(),
+        branch_probability=None,
+        physical_boundary=False,
+        renormalized=None,
+    ):
+        """Record automatic norm survival without treating physical loss as error.
+
+        ``expected_norm`` is the norm of the exact physical target before
+        compression. For a unitary update it is the pre-compression norm; for
+        a Kraus/projective branch it includes the branch's Born probability.
+        Only the observed/expected norm ratio contributes to the cumulative
+        compression survival product.
+        """
+        raw, survival = self._norm_fidelity_ratio(observed_norm, expected_norm)
+        if (
+            kind == "unitary_compression"
+            and raw is not None
+            and raw > 1.0 + 1.0e-6
+        ):
+            raise FloatingPointError(
+                "Retained unitary-compression norm exceeds its expected norm "
+                f"(squared ratio={raw:.6g}); canonical projection metadata "
+                "is inconsistent."
+            )
+        event = {
+            "kind": str(kind),
+            "where": tuple(int(site) for site in where),
+            "valid": raw is not None,
+            "expected_norm": None if raw is None else float(abs(expected_norm)),
+            "expected_norm_sq": None if raw is None else float(abs(expected_norm) ** 2),
+            "observed_norm": None if raw is None else float(abs(observed_norm)),
+            "observed_norm_sq": None if raw is None else float(abs(observed_norm) ** 2),
+            "norm_fidelity_raw": None if raw is None else float(raw),
+            "norm_fidelity": None if survival is None else float(survival),
+            "norm_infidelity": None if survival is None else float(1.0 - survival),
+            "branch_probability": (
+                None
+                if branch_probability is None
+                else float(branch_probability)
+            ),
+            "physical_boundary": bool(physical_boundary),
+            "renormalized": (
+                None if renormalized is None else bool(renormalized)
+            ),
+        }
+        if survival is not None:
+            if survival == 0.0:
+                self._norm_log_survival = -np.inf
+            elif np.isfinite(self._norm_log_survival):
+                self._norm_log_survival += math.log(survival)
+            cumulative = (
+                0.0
+                if self._norm_log_survival == -np.inf
+                else float(math.exp(self._norm_log_survival))
+            )
+            event["cumulative_norm_fidelity"] = cumulative
+            event["cumulative_norm_infidelity"] = float(1.0 - cumulative)
+        else:
+            event["cumulative_norm_fidelity"] = None
+            event["cumulative_norm_infidelity"] = None
+        self.norm_events.append(event)
+        if physical_boundary:
+            self._invalidate_unitary_norm_baseline()
+        return event
+
+    def norm_diagnostics(self):
+        """Return automatic cumulative norm-survival diagnostics.
+
+        The reported infidelity is a norm-survival/compression proxy. Born
+        probabilities for stochastic branches are retained in ``norm_events``
+        but deliberately do not reduce the cumulative compression fidelity.
+        """
+        valid = [event for event in self.norm_events if event.get("valid")]
+        physical = [
+            event for event in valid if event.get("physical_boundary")
+        ]
+        if not valid:
+            survival = None
+            infidelity = None
+        elif self._norm_log_survival == -np.inf:
+            survival = 0.0
+            infidelity = 1.0
+        else:
+            survival = float(math.exp(self._norm_log_survival))
+            infidelity = float(1.0 - survival)
+        current = valid[-1] if valid else None
+        event_survivals = [float(event["norm_fidelity"]) for event in valid]
+        event_infidelities = [
+            float(event["norm_infidelity"]) for event in valid
+        ]
+        if event_survivals and any(value <= 0.0 for value in event_survivals):
+            geometric_survival = 0.0
+        elif event_survivals:
+            geometric_survival = float(
+                math.exp(sum(math.log(value) for value in event_survivals)
+                         / len(event_survivals))
+            )
+        else:
+            geometric_survival = None
+        return {
+            "tracking": True,
+            "current_valid": current is not None,
+            "events": len(self.norm_events),
+            "completed_events": len(valid),
+            "completed_segments": len(valid),
+            "segments_including_current": len(valid),
+            "completed_segment_norms": [
+                float(max(0.0, value) ** 0.5) for value in event_survivals
+            ],
+            "completed_segment_infidelities": event_infidelities,
+            "norm_survival": survival,
+            "norm_infidelity": infidelity,
+            "fidelity": survival,
+            "infidelity": infidelity,
+            "norm": None if survival is None else float(survival**0.5),
+            "total_survival_proxy": survival,
+            "total_infidelity_proxy": infidelity,
+            "total_norm_proxy": None if survival is None else float(survival**0.5),
+            "geometric_mean_survival": geometric_survival,
+            "geometric_mean_norm": (
+                None
+                if geometric_survival is None
+                else float(geometric_survival**0.5)
+            ),
+            "mean_segment_infidelity": (
+                None
+                if not event_infidelities
+                else float(sum(event_infidelities) / len(event_infidelities))
+            ),
+            "max_segment_infidelity": (
+                None if not event_infidelities else float(max(event_infidelities))
+            ),
+            "current_event_kind": None if current is None else current["kind"],
+            "current_segment_norm": (
+                None
+                if current is None
+                else float(max(0.0, current["norm_fidelity"]) ** 0.5)
+            ),
+            "current_segment_infidelity": (
+                None if current is None else current["norm_infidelity"]
+            ),
+            "current_norm_fidelity": (
+                None if current is None else current["norm_fidelity"]
+            ),
+            "current_norm_infidelity": (
+                None if current is None else current["norm_infidelity"]
+            ),
+            "completed_norm_infidelities": [
+                event["norm_infidelity"] for event in valid
+            ],
+            "physical_boundary_events": len(physical),
+            "physical_boundary_infidelities": [
+                event["norm_infidelity"]
+                for event in physical
+            ],
+            "completed_projector_infidelities": [
+                event["norm_infidelity"] for event in physical
+            ],
+            "completed_nonunitary_infidelities": [
+                event["norm_infidelity"] for event in physical
+            ],
+            "completed_combined_infidelities": event_infidelities,
+        }
 
     @staticmethod
     def _accumulate_exponent(p, scale):
@@ -5417,13 +5637,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         current_norm=None,
         center_site=None,
+        restore=True,
     ):
-        """Restore a unitary compressed state to its pre-compression raw norm.
+        """Record compression norm survival and optionally restore its scale.
 
-        The removed scale is deliberately *not* accumulated into ``exponent``:
-        it is approximation loss, not physical non-unitary evolution. This
-        keeps complex64 center tensors near unit scale instead of underflowing
-        in deep streams.
+        The removed scale is deliberately *not* accumulated into ``exponent``
+        for unitary evolution: it is approximation loss, not physical
+        non-unitary evolution. ``restore=False`` preserves the historical
+        un-stabilized output while still recording the norm change.
         """
         span = self._normalize_span(where)
         if current_norm is None or center_site is None:
@@ -5446,9 +5667,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise FloatingPointError(
                 "Cannot stabilize a unitary FIT state with a zero or non-finite norm."
             )
-        p[center].modify(data=p[center].data * (target_norm / current_norm))
+        self._record_norm_event(
+            "unitary_compression",
+            expected_norm=target_float,
+            observed_norm=current_float,
+            where=span,
+        )
+        if restore:
+            p[center].modify(data=p[center].data * (target_norm / current_norm))
+        else:
+            self._unitary_previous_norm = current_float
         self._record_orthog_span(p, (center, center))
-        self._unitary_previous_norm = target_float
+        if restore:
+            self._unitary_previous_norm = target_float
 
     def _stabilize_unitary_fit_state(self, *args, **kwargs):
         """Compatibility wrapper for the generalized compression stabilizer."""
@@ -5648,8 +5879,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "p_exponent": getattr(self.p, "exponent", None),
             "info_c": deepcopy(self.info_c),
             "unitary_previous_norm": self._unitary_previous_norm,
+            "norm_log_survival": self._norm_log_survival,
             "lengths": {
                 "normalizations": len(self.normalizations),
+                "norm_events": len(self.norm_events),
             },
         }
 
@@ -5708,6 +5941,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self.p.exponent = snapshot["p_exponent"]
         self.info_c = snapshot["info_c"]
         self._unitary_previous_norm = snapshot["unitary_previous_norm"]
+        self._norm_log_survival = snapshot["norm_log_survival"]
         for attr, length in snapshot["lengths"].items():
             del getattr(self, attr)[length:]
 
@@ -6451,7 +6685,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         last_where = self._current_orthog(p)
         last_normalized_step = None
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
-        if stabilize_unitary and self._unitary_previous_norm is None:
+        if not non_unitary and self._unitary_previous_norm is None:
             self._start_unitary_norm_tracking(p)
 
         if progbar:
@@ -6599,7 +6833,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         if fit_center is not None
                         else (xmin, xmax),
                     )
-                    if stabilize_unitary:
+                    if not non_unitary:
                         self._timed_call(
                             "dmrg.stabilize",
                             self._stabilize_unitary_fit_state,
@@ -6608,6 +6842,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             unitary_target_norm,
                             current_norm=fit_norm,
                             center_site=fit_center,
+                            restore=stabilize_unitary,
                         )
                     self._maybe_lock_dmrg1_one_site_phase()
                     self._last_dmrg_fit_diagnostics[
@@ -6733,7 +6968,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         if fit_center is not None
                         else (xmin, xmax),
                     )
-                    if stabilize_unitary:
+                    if not non_unitary:
                         self._timed_call(
                             "dmrg.stabilize",
                             self._stabilize_unitary_fit_state,
@@ -6742,6 +6977,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             unitary_target_norm,
                             current_norm=fit_norm,
                             center_site=fit_center,
+                            restore=stabilize_unitary,
                         )
                     self._maybe_lock_dmrg1_one_site_phase()
                     self._last_dmrg_fit_diagnostics[
@@ -6889,7 +7125,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
-        if stabilize_unitary and self._unitary_previous_norm is None:
+        if not non_unitary and self._unitary_previous_norm is None:
             self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
         submpo_count = 0
@@ -6913,7 +7149,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(G_seq):
             compressed = False
             unitary_target_norm = (
-                self._unitary_previous_norm if stabilize_unitary else None
+                self._unitary_previous_norm if not non_unitary else None
             )
             where = where_seq[idx]
             gate = G_seq[idx]
@@ -6940,7 +7176,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if stabilize_unitary:
+                if not non_unitary:
                     approx_norm, approx_center = self._retained_center_norm(
                         p, (xmin, xmax)
                     )
@@ -6952,6 +7188,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         unitary_target_norm,
                         current_norm=approx_norm,
                         center_site=approx_center,
+                        restore=stabilize_unitary,
                     )
             elif len(where) == 1:
                 self._apply_gate(
@@ -6999,7 +7236,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if stabilize_unitary:
+                if not non_unitary:
                     approx_norm, approx_center = self._retained_center_norm(
                         p, (xmin, xmax)
                     )
@@ -7011,6 +7248,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         unitary_target_norm,
                         current_norm=approx_norm,
                         center_site=approx_center,
+                        restore=stabilize_unitary,
                     )
 
             event = self._maybe_normalize_after_step(
@@ -7083,7 +7321,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
-        if stabilize_unitary and self._unitary_previous_norm is None:
+        if not non_unitary and self._unitary_previous_norm is None:
             self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
         last_where = self._current_orthog(p)
@@ -7106,7 +7344,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(G_seq):
             compressed = False
             unitary_target_norm = (
-                self._unitary_previous_norm if stabilize_unitary else None
+                self._unitary_previous_norm if not non_unitary else None
             )
             logical_where = where_seq[idx]
             where = (
@@ -7153,7 +7391,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if stabilize_unitary:
+                if not non_unitary:
                     approx_norm, approx_center = self._retained_center_norm(
                         p, (xmin, xmax)
                     )
@@ -7165,6 +7403,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         unitary_target_norm,
                         current_norm=approx_norm,
                         center_site=approx_center,
+                        restore=stabilize_unitary,
                     )
 
             event = self._maybe_normalize_after_step(
@@ -7224,7 +7463,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
-        if stabilize_unitary and self._unitary_previous_norm is None:
+        if not non_unitary and self._unitary_previous_norm is None:
             self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
         last_where = self._current_orthog(p)
@@ -7247,7 +7486,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(G_seq):
             compressed = False
             unitary_target_norm = (
-                self._unitary_previous_norm if stabilize_unitary else None
+                self._unitary_previous_norm if not non_unitary else None
             )
             where = where_seq[idx]
             gate = G_seq[idx]
@@ -7312,7 +7551,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if stabilize_unitary:
+                if not non_unitary:
                     approx_norm, approx_center = self._retained_center_norm(
                         p, (xmin, xmax)
                     )
@@ -7324,6 +7563,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         unitary_target_norm,
                         current_norm=approx_norm,
                         center_site=approx_center,
+                        restore=stabilize_unitary,
                     )
 
             event = self._maybe_normalize_after_step(
@@ -7481,3 +7721,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``log10_scale``, event ``reason``, and resulting base-10 ``exponent``.
         """
         return deepcopy(self.normalizations)
+
+    def get_norm_events(self):
+        """Return a defensive copy of automatic norm-survival events."""
+        return deepcopy(self.norm_events)
