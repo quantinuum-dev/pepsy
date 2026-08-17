@@ -1,6 +1,7 @@
 """Tests for the semantic higher-order MPO foundation."""
 
 import numpy as np
+import pytest
 
 import pepsy
 from pepsy.operators import (
@@ -103,3 +104,53 @@ def test_first_degree_mpo_identity_is_degree_zero():
     identity = FirstDegreeMPO.identity(3, 2)
     np.testing.assert_allclose(identity.to_mpo().to_dense(), np.eye(8))
     assert identity.degree == 0
+
+
+def test_extensive_exponential_builds_local_order_one_mpo():
+    """Order one uses local MPO blocks and folds the done rail into one."""
+    H = _two_term_mpo()
+    U = H.extensive_exponential(0.01, order=1)
+
+    assert U.metadata["operation"] == "extensive_exponential"
+    assert U.metadata["order"] == 1
+    assert U.bond_dimensions == (2, 2)
+    assert all(array.ndim == 4 for array in U.arrays)
+    assert all(level.history[0].level == 1 for level in U.levels[0])
+    assert all(level.history[0].level == 1 for level in U.levels[-1])
+
+
+def test_extensive_exponential_matches_dense_taylor_orders():
+    """The tensor-network construction has the paper's expected order."""
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    H = _two_term_mpo()
+    dense_h = H.to_mpo().to_dense()
+    identity = np.eye(dense_h.shape[0])
+
+    for order in (1, 2):
+        errors = []
+        for dt in (1.0e-2, 5.0e-3):
+            dense_u = H.extensive_exponential(dt, order=order).to_mpo().to_dense()
+            errors.append(np.linalg.norm(dense_u - scipy_linalg.expm(dt * dense_h)))
+
+        assert errors[1] / errors[0] == pytest.approx(
+            0.25 if order == 1 else 0.125,
+            rel=3.0e-3,
+        )
+        zero_step = H.extensive_exponential(0.0, order=order).to_mpo().to_dense()
+        np.testing.assert_allclose(zero_step, identity)
+
+
+def test_extensive_exponential_handles_one_site_terms():
+    """The finite-chain boundary construction also covers L=1."""
+    _, _, z = _paulis()
+    H = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (z,))],
+    )
+
+    for order in (1, 2):
+        U = H.extensive_exponential(0.2, order=order)
+        expected = np.eye(2) + 0.2 * z
+        if order == 2:
+            expected = expected + 0.2**2 * (z @ z) / 2
+        np.testing.assert_allclose(U.to_mpo().to_dense(), expected)

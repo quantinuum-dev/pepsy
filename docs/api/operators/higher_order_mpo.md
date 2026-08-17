@@ -54,7 +54,25 @@ scaling, products, commutators, powers, and the paper's conservative exact
 history/column compression. `to_mpo()` returns an ordinary Quimb
 `MatrixProductOperator` and performs no numerical truncation.
 
-Numerical row compression, the Taylor-level coefficient rewiring, and native
+The first tensor-network-aware time-evolution path is available through
+`extensive_exponential(dt, order=1 or 2)`. It reads the first-degree `I`, `A`,
+`B`, `C`, and `D` blocks from the local MPO tensors and assembles the
+size-extensive order-one or order-two MPO directly. It never forms a global
+dense Hamiltonian or matrix exponential. The resulting internal bond spaces
+are the paper's compressed level spaces: `1 + chi` for order one and
+`1 + 2 * chi + chi**2` for order two, with `chi` allowed to vary by cut.
+This path currently targets ordinary NumPy/Autoray-compatible local blocks;
+native fermionic/Symmray compilation remains separate.
+
+```python
+U1 = H.extensive_exponential(dt=0.01, order=1)
+U2 = H.extensive_exponential(dt=0.01, order=2)
+
+# Quimb remains the compiled interchange boundary.
+mpo = U2.to_mpo()
+```
+
+General-order Taylor extension, approximate row compression, and native
 Symmray compilation are intentionally separate follow-up stages. Keeping these
 stages explicit prevents a numerical cutoff from being confused with the
 paper's algebraically exact compression.

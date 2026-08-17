@@ -6,9 +6,10 @@ keeps the virtual-level history separate from the tensor data.  Ordinary
 Quimb MPOs remain the compiled interchange format, while :class:`FirstDegreeMPO`
 retains enough structure for exact algebra and history compression.
 
-The implementation is finite-chain and exact at this stage.  Numerical bond
-truncation, native Symmray compilation, and Taylor-level rewiring are separate
-follow-up layers.
+The implementation is finite-chain and exact at this stage.  The extensive
+Taylor construction is assembled from local MPO blocks and virtual channels;
+it never forms a global operator matrix.  Numerical bond truncation and native
+Symmray compilation remain separate follow-up layers.
 """
 
 from __future__ import annotations
@@ -599,6 +600,324 @@ class FirstDegreeMPO:
         for _ in range(1, exponent):
             result = result.non_disjoint_product(self)
         return result
+
+    def power_raw(self, exponent):
+        """Return an exact MPO power without forming a global dense operator.
+
+        The virtual indices are paired at every site and the physical blocks
+        are multiplied locally.  The resulting histories therefore retain the
+        factor order required by the higher-order MPO construction.
+        """
+        return self.power(exponent)
+
+    def _first_degree_block(self, site, kind, left_index=None, right_index=None):
+        """Return one local first-degree block ``I, A, B, C,`` or ``D``.
+
+        The implementation works from the virtual-level metadata and local
+        MPO tensors only.  It is deliberately separate from ``to_dense`` so
+        the extensive construction remains tensor-network aware.
+        """
+        left_levels = self._levels[site]
+        right_levels = self._levels[site + 1]
+
+        def positions(levels, number):
+            return [
+                pos
+                for pos, level in enumerate(levels)
+                if _level_number(level.history[0]) == number
+            ]
+
+        left_one = positions(left_levels, 1)
+        left_two = positions(left_levels, 2)
+        right_two = positions(right_levels, 2)
+        right_three = positions(right_levels, 3)
+        array = self._arrays[site]
+        reference = array[0, 0]
+
+        def zero():
+            return ar.do("zeros_like", reference)
+
+        def choose(values, index, label):
+            if not values:
+                return None
+            if index is None:
+                if len(values) != 1:
+                    raise ValueError(
+                        f"first-degree block {label!r} needs an explicit channel index."
+                    )
+                return values[0]
+            if not 0 <= int(index) < len(values):
+                raise IndexError(
+                    f"{label} channel index {index} is outside [0, {len(values) - 1}]."
+                )
+            return values[int(index)]
+
+        if kind == "I":
+            return ar.do("eye", self.phys_dim, like=reference)
+        if kind == "C":
+            left = choose(left_one, None, "C-left")
+            right = choose(right_two, right_index, "C-right")
+        elif kind == "D":
+            left = choose(left_one, None, "D-left")
+            right = choose(right_three, None, "D-right")
+        elif kind == "A":
+            left = choose(left_two, left_index, "A-left")
+            right = choose(right_two, right_index, "A-right")
+        elif kind == "B":
+            left = choose(left_two, left_index, "B-left")
+            right = choose(right_three, None, "B-right")
+        else:
+            raise ValueError(f"unknown first-degree block kind {kind!r}.")
+
+        if left is None or right is None:
+            return zero()
+        return array[left, right]
+
+    def _first_degree_structure(self):
+        """Validate and return active channel counts on each virtual bond."""
+        if self.L == 1:
+            return (0,)
+        if _level_number(self._levels[0][0].history[0]) != 1:
+            raise ValueError("the left MPO boundary must be level 1.")
+        if _level_number(self._levels[-1][0].history[0]) != 3:
+            raise ValueError("the Hamiltonian MPO right boundary must be level 3.")
+        active_counts = []
+        for bond, levels in enumerate(self._levels[1:-1], start=1):
+            numbers = [_level_number(level.history[0]) for level in levels]
+            if numbers.count(1) != 1 or numbers.count(3) != 1:
+                raise ValueError(
+                    "extensive_exponential requires one level-1 and one level-3 "
+                    f"rail on internal bond {bond}, got {numbers!r}."
+                )
+            if any(number not in (1, 2, 3) for number in numbers):
+                raise ValueError("first-degree virtual levels must be 1, 2, or 3.")
+            active_counts.append(numbers.count(2))
+        return (0, *active_counts, 0)
+
+    def _extensive_specs(self, bond, order, active_counts):
+        """Return output virtual-state specifications for one bond."""
+        if bond in (0, self.L):
+            return [(("1", None, None) if order == 1 else ("11", None, None))]
+        active = range(active_counts[bond])
+        if order == 1:
+            return [("1", None, None), *(('2', i, None) for i in active)]
+        return [
+            ("11", None, None),
+            *(('12', i, None) for i in active),
+            *(('22', i, j) for i in active for j in active),
+            *(('23', i, None) for i in active),
+        ]
+
+    def _extensive_history(self, bond, spec):
+        """Convert an output state specification to its level history."""
+        if spec[0] == "1":
+            if bond == self.L:
+                return (MPOLevelToken(1),)
+            return (
+                next(
+                    level.history[0]
+                    for level in self._levels[bond]
+                    if _level_number(level.history[0]) == 1
+                ),
+            )
+        if spec[0] == "2":
+            active = [
+                level for level in self._levels[bond]
+                if _level_number(level.history[0]) == 2
+            ]
+            return (active[spec[1]].history[0],)
+
+        if spec[0] == "11" and bond in (0, self.L):
+            return (MPOLevelToken(1), MPOLevelToken(1))
+
+        active = [
+            level for level in self._levels[bond]
+            if _level_number(level.history[0]) == 2
+        ]
+        one = (
+            MPOLevelToken(1)
+            if bond == self.L
+            else next(
+                level.history[0]
+                for level in self._levels[bond]
+                if _level_number(level.history[0]) == 1
+            )
+        )
+        three = next(
+            level.history[0]
+            for level in self._levels[bond]
+            if _level_number(level.history[0]) == 3
+        )
+        if spec[0] == "11":
+            return (one, one)
+        if spec[0] == "12":
+            return (one, active[spec[1]].history[0])
+        if spec[0] == "22":
+            return (
+                active[spec[1]].history[0],
+                active[spec[2]].history[0],
+            )
+        if spec[0] == "23":
+            return (active[spec[1]].history[0], three)
+        raise ValueError(f"unknown extensive state specification {spec!r}.")
+
+    def _extensive_level(self, bond, spec, order):
+        history = self._extensive_history(bond, spec)
+        return MPOLevel(
+            ("extensive", order, bond, spec),
+            history,
+        )
+
+    def _extensive_local_block(self, site, left, right, order, dt):
+        """Build one local block of the paper's order-1/2 MPO."""
+        lk, li, lj = left
+        rk, ri, rj = right
+        I = lambda: self._first_degree_block(site, "I")
+        C = lambda index: self._first_degree_block(site, "C", right_index=index)
+        D = lambda: self._first_degree_block(site, "D")
+        A = lambda i, j: self._first_degree_block(
+            site, "A", left_index=i, right_index=j
+        )
+        B = lambda i: self._first_degree_block(site, "B", left_index=i)
+        matmul = lambda x, y: ar.do("matmul", x, y)
+
+        def add(*terms):
+            result = terms[0]
+            for term in terms[1:]:
+                result = result + term
+            return result
+
+        if order == 1:
+            if lk == "1" and rk == "1":
+                return add(I(), dt * D())
+            if lk == "1" and rk == "2":
+                return C(ri)
+            if lk == "2" and rk == "1":
+                return dt * B(li)
+            if lk == "2" and rk == "2":
+                return A(li, ri)
+            return self._first_degree_block(site, "I") * 0
+
+        half_dt2 = (dt * dt) / 2
+        if lk == "11" and rk == "11":
+            return add(I(), dt * D(), half_dt2 * matmul(D(), D()))
+        if lk == "11" and rk == "12":
+            return C(ri)
+        if lk == "11" and rk == "22":
+            return matmul(C(ri), C(rj))
+        if lk == "11" and rk == "23":
+            return add(matmul(C(ri), D()), matmul(D(), C(ri)))
+        if lk == "12" and rk == "11":
+            return add(
+                dt * B(li),
+                half_dt2 * matmul(D(), B(li)),
+                half_dt2 * matmul(B(li), D()),
+            )
+        if lk == "12" and rk == "12":
+            return A(li, ri)
+        if lk == "12" and rk == "22":
+            return add(matmul(C(ri), A(li, rj)), matmul(A(li, ri), C(rj)))
+        if lk == "12" and rk == "23":
+            return add(
+                matmul(C(ri), B(li)),
+                matmul(A(li, ri), D()),
+                matmul(D(), A(li, ri)),
+                matmul(B(li), C(ri)),
+            )
+        if lk == "22" and rk == "11":
+            return half_dt2 * matmul(B(li), B(lj))
+        if lk == "22" and rk == "22":
+            return matmul(A(li, ri), A(lj, rj))
+        if lk == "22" and rk == "23":
+            return add(matmul(A(li, ri), B(lj)), matmul(B(li), A(lj, ri)))
+        if lk == "23" and rk == "11":
+            return half_dt2 * B(li)
+        if lk == "23" and rk == "23":
+            return A(li, ri)
+        return self._first_degree_block(site, "I") * 0
+
+    def extensive_exponential(self, dt, *, order=1):
+        """Build the paper's size-extensive order-1 or order-2 MPO.
+
+        The construction is local in the MPO tensors.  It contracts only
+        physical operator blocks at each site and assembles the new virtual
+        channels with ``stack``; it never forms ``H`` or ``exp(dt * H)`` as a
+        global dense matrix.
+
+        Parameters
+        ----------
+        dt : scalar
+            Time-step or imaginary-time parameter ``tau``.
+        order : {1, 2}, default=1
+            Taylor order implemented by the exact paper construction.
+
+        Notes
+        -----
+        This first implementation targets ordinary NumPy/Autoray-compatible
+        local MPO blocks. Native fermionic/Symmray compilation is deliberately
+        not enabled by this method yet.
+        """
+        _check_scalar(dt, name="dt")
+        if order not in (1, 2):
+            raise NotImplementedError(
+                "extensive_exponential currently implements order=1 and order=2."
+            )
+        active_counts = self._first_degree_structure()
+        if self.L == 1:
+            reference = self._arrays[0][0, 0]
+            identity = ar.do("eye", self.phys_dim, like=reference)
+            h = reference
+            if order == 1:
+                data = identity + dt * h
+            else:
+                data = identity + dt * h + (dt * dt / 2) * ar.do("matmul", h, h)
+            return type(self)(
+                (data,),
+                levels=[[
+                    MPOLevel(
+                        ("extensive", order, 0, ("11", None, None)),
+                        tuple(
+                            self._levels[0][0].history[0]
+                            for _ in range(order)
+                        ),
+                    )
+                ]] * 2,
+                degree=order,
+                upper_ind_id=self.upper_ind_id,
+                lower_ind_id=self.lower_ind_id,
+                site_tag_id=self.site_tag_id,
+                metadata={"operation": "extensive_exponential", "dt": dt, "order": order},
+            )
+
+        specs = [
+            self._extensive_specs(bond, order, active_counts)
+            for bond in range(self.L + 1)
+        ]
+        arrays = []
+        levels = []
+        for bond, bond_specs in enumerate(specs):
+            levels.append([
+                self._extensive_level(bond, spec, order)
+                for spec in bond_specs
+            ])
+        for site in range(self.L):
+            rows = []
+            for left in specs[site]:
+                rows.append(_stack([
+                    self._extensive_local_block(site, left, right, order, dt)
+                    for right in specs[site + 1]
+                ], axis=0))
+            arrays.append(_stack(rows, axis=0))
+
+        return type(self)(
+            arrays,
+            levels=levels,
+            degree=order,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            site_tag_id=self.site_tag_id,
+            metadata={"operation": "extensive_exponential", "dt": dt, "order": order},
+        )
 
     def compress_exact(self, *, inplace=False):
         """Apply exact history/column compression without a numerical cutoff.
