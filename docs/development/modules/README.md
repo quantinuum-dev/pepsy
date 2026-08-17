@@ -8,3 +8,4 @@ Concise implementation guides for the main Pepsy package areas:
 - [PEPS optimizer](peps_optimizer.md)
 - [Sweep optimizer](sweep_optimizer.md)
 - [VMC](vmc.md)
+- [Higher-order MPO](higher_order_mpo.md)

@@ -41,6 +41,14 @@ def test_first_degree_mpo_public_exports_resolve():
     assert "FirstDegreeMPO" in pepsy.operators.__all__
 
 
+def test_first_degree_mpo_exposes_optional_compression_report_slot():
+    """The report attribute is stable before and after compression."""
+    H = _two_term_mpo()
+
+    assert H.compression_report is None
+    assert H.compress_exact().compression_report is not None
+
+
 def test_first_degree_mpo_builds_exact_local_term_sum():
     """Factorized local terms compile to the expected ordinary MPO."""
     x, _, z = _paulis()
@@ -154,6 +162,7 @@ def test_extensive_exponential_handles_one_site_terms():
         if order == 2:
             expected = expected + 0.2**2 * (z @ z) / 2
         np.testing.assert_allclose(U.to_mpo().to_dense(), expected)
+        assert U.metadata["algorithms"] == ("one-site-taylor",)
 
 
 def test_extensive_exponential_supports_generic_order_three_histories():

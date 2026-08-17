@@ -52,17 +52,19 @@ print(H2_exact.compression_report)
 The current layer supports exact finite open-boundary construction, addition,
 scaling, products, commutators, powers, and the paper's conservative exact
 history/column compression. `to_mpo()` returns an ordinary Quimb
-`MatrixProductOperator` and performs no numerical truncation.
+`MatrixProductOperator` and performs no numerical truncation. The semantic
+object remains the source of truth for history-aware operations; the Quimb
+object is the execution and interoperability boundary.
 
 The tensor-network-aware time-evolution path is available through
-`extensive_exponential(dt, order=N)`. For chains longer than one site it
+`extensive_exponential(dt, order=N)`. For chains with at least two sites it
 constructs the full local history power, applies the paper's Algorithms 1 and
 2 as virtual-bond rewiring operations, and only then contracts the finite
 all-one boundary vectors. Every operation is local to MPO tensors; no global
 dense Hamiltonian or matrix exponential is formed. The raw history space grows
 as the local MPO channel space to the power `N`, while exact history
-compression removes permutation-equivalent channels before the result is
-returned.
+compression removes equivalent channels after that reference table is built.
+The one-site path currently supports direct orders one and two.
 
 ```python
 import quimb.tensor as qtn
@@ -90,6 +92,11 @@ applies Algorithm 4 after exact compression. It is an order-controlled
 analytical approximation, not a numerical SVD cutoff, and is therefore exposed
 as a separate opt-in flag. Numerical Quimb compression remains a separate
 post-processing step.
+
+`product(kind=...)` and `disjoint_product` currently label provenance only;
+they do not perform support-overlap analysis. See the [development module
+map](../../development/modules/higher_order_mpo.md) for the execution order,
+design rationale, and prioritized future improvements.
 
 `apply_to_mps` delegates to Quimb's MPO–MPS compression methods, while
 `expectation` delegates to Pepsy's normalized MPS contraction helper. These

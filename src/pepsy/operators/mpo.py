@@ -10,6 +10,21 @@ The implementation is finite-chain and exact at this stage.  The extensive
 Taylor construction is assembled from local MPO blocks and virtual channels;
 it never forms a global operator matrix.  Numerical bond truncation and native
 Symmray compilation remain separate follow-up layers.
+
+Design contract
+---------------
+``FirstDegreeMPO`` is the semantic construction object.  Its virtual-bond
+histories are part of the data model because the paper's Algorithms 1--4 act
+on those histories, not just on the numerical MPO entries.  ``to_mpo()`` is
+the compatibility boundary: it produces an ordinary Quimb MPO for existing
+contraction and MPS-application code, while retaining a copy of the semantic
+object on the compiled MPO.
+
+The exact paths only use local tensor operations and exact equality checks.
+``approximate=True`` is deliberately separate because Algorithm 4 changes the
+analytical history representation even though it does not use an SVD cutoff.
+This module currently targets ordinary NumPy/Autoray-compatible tensors and
+finite open chains; fermionic/Symmray compilation is a future backend layer.
 """
 
 from __future__ import annotations
@@ -41,7 +56,8 @@ class MPOLevelToken:
     ``level`` follows the paper's first-degree convention: ``1`` and ``3``
     denote the two identity rails and ``2`` denotes an active operator
     channel.  ``payload`` distinguishes independent operator channels that
-    happen to have the same level number.
+    happen to have the same level number.  The level number is intentionally
+    small and symbolic; backend charge information belongs on ``MPOLevel``.
     """
 
     level: int
@@ -66,13 +82,22 @@ class MPOLevel:
         if not isinstance(self.label, Hashable):
             raise TypeError("MPO level labels must be hashable.")
         object.__setattr__(self, "history", tuple(self.history))
+        if not self.history:
+            raise ValueError("MPO level history must contain at least one token.")
         if not all(isinstance(token, MPOLevelToken) for token in self.history):
             raise TypeError("MPO level history must contain MPOLevelToken values.")
 
 
 @dataclass(frozen=True)
 class MPOProductTerm:
-    """A factorized local product term used to build a first-degree MPO."""
+    """A factorized local product term used to build a first-degree MPO.
+
+    ``sites`` and ``operators`` describe only the non-identity factors.  A
+    string operator can be supplied for fermion-compatible automaton routes,
+    but this higher-order implementation does not enable native fermionic
+    compilation yet.  ``charge`` is carried as metadata for a future
+    block-sparse backend and is not interpreted by this class.
+    """
 
     sites: tuple[int, ...]
     operators: tuple[object, ...]
@@ -99,7 +124,14 @@ class MPOProductTerm:
 
 @dataclass(frozen=True)
 class MPOCompressionReport:
-    """Diagnostics returned by exact history compression."""
+    """Diagnostics returned by exact or analytical history compression.
+
+    ``exact`` distinguishes scalar gauge eliminations from Algorithm 4's
+    order-controlled analytical approximation.  ``merges`` contains stable,
+    human-readable provenance records rather than backend tensor objects, so
+    reports can be logged or serialized by callers.  The report describes the
+    semantic history stage; it does not describe a later Quimb SVD/truncation.
+    """
 
     method: str
     exact: bool
@@ -161,6 +193,10 @@ def _concat(blocks, *, axis):
 
 def _array_equal(left, right):
     """Check exact equality without introducing a numerical cutoff."""
+    # NumPy is the cheap path for ordinary arrays.  The Autoray fallback keeps
+    # backend tensors supported, but may still transfer a small local block to
+    # the host through ``np.asarray``.  Future native backends should register
+    # a structural equality/fingerprint here to avoid that synchronization.
     try:
         return bool(np.array_equal(np.asarray(left), np.asarray(right)))
     except Exception:
@@ -219,6 +255,17 @@ class FirstDegreeMPO:
     the current expression; it is ``1`` for a Hamiltonian built from local
     terms and increases under products.
 
+    The public algebraic methods return new semantic objects.  The one
+    exception is ``compress_exact(inplace=True)``, which is explicit because
+    it mutates virtual-bond tensors and histories.  ``arrays`` is a read-only
+    tuple view, but the backend arrays inside it are not copied; callers that
+    need ownership should call :meth:`copy` before mutating backend data.
+
+    This is a semantic MPO for the paper's construction, not a drop-in
+    replacement for every arbitrary Quimb MPO.  Higher-order history methods
+    require the first-degree level-1/2/3 rail structure created by
+    :meth:`from_automaton` or :meth:`from_local_terms`.
+
     Parameters
     ----------
     arrays : sequence[array_like]
@@ -257,6 +304,10 @@ class FirstDegreeMPO:
         self.lower_ind_id = lower_ind_id
         self.site_tag_id = site_tag_id
         self.metadata = dict(metadata or {})
+        # Keep this attribute present on every instance so callers do not
+        # need to probe for it after an optional compression stage. It is
+        # populated by ``compress_exact`` or ``extensive_exponential``.
+        self.compression_report = self.metadata.get("compression_report")
         self._levels = self._normalize_levels(levels)
         self._validate()
 
@@ -319,7 +370,11 @@ class FirstDegreeMPO:
 
     @property
     def arrays(self):
-        """Read-only tuple of normalized ``(left, right, up, down)`` tensors."""
+        """Read-only tuple of normalized ``(left, right, up, down)`` tensors.
+
+        The tuple itself is immutable, but the backend tensors are returned
+        by reference to preserve Autoray dtype/device/backend behavior.
+        """
         return self._arrays
 
     @property
@@ -340,6 +395,13 @@ class FirstDegreeMPO:
         return self.degree == 1
 
     def copy(self):
+        """Return a semantic copy sharing backend tensor storage.
+
+        This is intentionally a structural copy, not a deep array copy.  It
+        is sufficient for the non-mutating algebraic API and avoids an
+        unnecessary device transfer; use backend-specific copying before
+        editing tensor values in place.
+        """
         return type(self)(
             self._arrays,
             levels=self.levels,
@@ -360,7 +422,12 @@ class FirstDegreeMPO:
 
     @classmethod
     def from_automaton(cls, automaton, *, degree=1, **kwargs):
-        """Compile an :class:`MPOAutomaton` into a semantic MPO."""
+        """Compile an :class:`MPOAutomaton` into a semantic MPO.
+
+        The automaton remains the source of numerical local blocks, while the
+        returned object adds the symbolic level histories needed by the
+        higher-order algorithms.  No dense operator is constructed.
+        """
         if not isinstance(automaton, MPOAutomaton):
             raise TypeError("automaton must be an MPOAutomaton.")
         arrays = automaton.to_arrays()
@@ -407,7 +474,12 @@ class FirstDegreeMPO:
         degree=1,
         **kwargs,
     ):
-        """Build a first-degree MPO from factorized local product terms."""
+        """Build a first-degree MPO from factorized local product terms.
+
+        This is the preferred public constructor for Hamiltonian-like sums.
+        The input terms are compiled through :class:`MPOAutomaton`, which
+        keeps the identity rails and active channels explicit.
+        """
         terms = tuple(_term_from_input(term) for term in terms)
         if not terms:
             raise ValueError("terms must contain at least one product term.")
@@ -427,7 +499,12 @@ class FirstDegreeMPO:
 
     @classmethod
     def identity(cls, L, phys_dim, *, like=None, **kwargs):
-        """Construct an exact identity MPO with degree zero."""
+        """Construct an exact identity MPO with degree zero.
+
+        ``like`` optionally supplies the backend and dtype for the local
+        identity blocks; it is useful when the identity is used as the
+        neutral element of a backend-native algebraic operation.
+        """
         return cls.from_automaton(
             MPOAutomaton.identity(L, phys_dim, like=like),
             degree=0,
@@ -435,13 +512,20 @@ class FirstDegreeMPO:
         )
 
     def to_mpo(self):
-        """Compile to a Quimb ``MatrixProductOperator`` without compression."""
+        """Compile to a Quimb ``MatrixProductOperator`` without compression.
+
+        This method is the deliberate interop boundary.  It preserves local
+        tensor backend/dtype information, performs no SVD or bond truncation,
+        and attaches a semantic copy as ``pepsy_first_degree`` so callers can
+        move between Quimb execution and Pepsy history inspection.
+        """
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
         # Quimb is the stable tensor-network interchange boundary: callers
         # can immediately use the returned object with existing contraction,
-        # compression, and MPS-application APIs.  The semantic object remains
-        # attached for code that needs the level histories later.
+        # compression, and MPS-application APIs. The semantic object remains
+        # attached for code that needs the level histories later. Keeping this
+        # adapter one-way avoids duplicating Quimb's MPO implementation here.
         mpo = qtn.MatrixProductOperator(
             self._arrays,
             shape="lrud",
@@ -545,9 +629,17 @@ class FirstDegreeMPO:
     def product(self, other, *, kind="ordinary"):
         """Return an exact virtual-space product of two MPO expressions.
 
-        ``kind`` is metadata at this stage.  The tensor product is exact and
-        keeps all paths; the paper-specific extensive-path filtering will be
-        added by the Taylor builder after this foundational layer.
+        ``kind`` is provenance metadata only; it does not change the
+        multiplication.  The tensor product is exact and keeps all paths.
+        The paper-specific extensive-path filtering is intentionally applied
+        later by the Taylor builder so this foundational algebra remains
+        predictable.
+
+        The explicit local loops are a deliberate tensor-network choice: they
+        multiply physical blocks site by site and retain histories, rather
+        than converting either MPO to a global matrix.  A future optimized
+        implementation can replace the loops with a backend-aware batched
+        kernel without changing this semantic contract.
         """
         self._check_compatible(other)
         arrays = []
@@ -608,12 +700,19 @@ class FirstDegreeMPO:
         disconnected paths.  The later Taylor construction will apply the
         paper's level rewiring and exact-compression rules; keeping this
         operation explicit prevents accidental use of generic Quimb MPO
-        multiplication in that implementation.
+        multiplication in that implementation.  The name records that no
+        support analysis or connected-term filtering has happened yet.
         """
         return self.product(other, kind="non_disjoint")
 
     def disjoint_product(self, other):
-        """Return an explicitly labelled exact product of two expressions."""
+        """Return an explicitly labelled exact product of two expressions.
+
+        ``disjoint`` is currently a provenance label, not an assertion or an
+        automatic support decomposition.  Future extensive builders can use
+        this hook for overlap-aware channel pruning once that analysis is
+        implemented.
+        """
         return self.product(other, kind="disjoint")
 
     def commutator(self, other):
@@ -647,6 +746,10 @@ class FirstDegreeMPO:
         The virtual indices are paired at every site and the physical blocks
         are multiplied locally.  The resulting histories therefore retain the
         factor order required by the higher-order MPO construction.
+
+        This compatibility spelling currently delegates to :meth:`power`.
+        It remains explicit because callers working from the paper often need
+        to distinguish a raw power from a later history-rewired power.
         """
         return self.power(exponent)
 
@@ -681,6 +784,13 @@ class FirstDegreeMPO:
                 schema = self._levels[bond]
             schemas.append(tuple(schema))
 
+        # The Cartesian history table is the clearest reference implementation
+        # of the paper's construction and keeps the factor order explicit.
+        # It is intentionally the first correctness target, not the final
+        # scaling strategy: its temporary bond dimension is ``D**exponent``.
+        # Future work should replace this with a reachable-history iterator or
+        # sparse channel map, preserving the same level metadata and local
+        # transition semantics without materializing zero paths.
         state_lists = [
             tuple(product(schema, repeat=exponent))
             for schema in schemas
@@ -769,7 +879,12 @@ class FirstDegreeMPO:
 
     @staticmethod
     def _remove_history_column(arrays, levels, bond, source, target, coefficient):
-        """Apply an Algorithm-1/column-gauge elimination at one cut."""
+        """Apply an Algorithm-1/column-gauge elimination at one cut.
+
+        The helper mutates the working arrays and level list in place.  All
+        callers operate on freshly built history data, so this keeps the
+        rewiring cheap without making mutation part of the public API.
+        """
         left = arrays[bond - 1]
         left_columns = [left[:, pos] for pos in range(left.shape[1])]
         left_columns[target] = (
@@ -791,7 +906,13 @@ class FirstDegreeMPO:
 
     @staticmethod
     def _remove_history_row(arrays, levels, bond, source, target):
-        """Apply the Algorithm-2 row-gauge elimination at one cut."""
+        """Apply the Algorithm-2 row-gauge elimination at one cut.
+
+        Row and column eliminations are kept as separate helpers because the
+        paper assigns different coefficients and equality directions to them.
+        A future sparse implementation should preserve these two operations as
+        its primitive virtual-channel updates.
+        """
         if bond >= len(arrays):
             return False
         right = arrays[bond]
@@ -812,7 +933,13 @@ class FirstDegreeMPO:
         return True
 
     def _algorithm_one(self, arrays, levels, order, dt):
-        """Apply the paper's extensive prefactor transformation."""
+        """Apply the paper's extensive prefactor transformation.
+
+        This pass removes all-identity/all-level-3 histories into the all-one
+        target with the paper's factorial coefficient.  It is intentionally
+        separate from Algorithm 2 so a report can distinguish coefficient
+        rewiring from exact equal-history compression.
+        """
         coefficient_denominator = factorial(order)
         for bond in range(1, self.L + 1):
             for number_of_threes in range(1, order + 1):
@@ -853,7 +980,13 @@ class FirstDegreeMPO:
                     )
 
     def _algorithm_two(self, arrays, levels):
-        """Apply the paper's exact history-only compression transformations."""
+        """Apply the paper's exact history-only compression transformations.
+
+        The implementation chooses the row or column orientation from the
+        number of level-1 and level-3 tokens.  This is a structural rule from
+        the paper, not a numerical rank heuristic; no backend conversion or
+        tolerance is involved.
+        """
         merges = []
         for bond in range(1, self.L + 1):
             changed = True
@@ -900,7 +1033,13 @@ class FirstDegreeMPO:
         return merges
 
     def _algorithm_three_extension(self, arrays, levels, order, dt):
-        """Add Algorithm 3's selected ``N + 1`` local history transitions."""
+        """Add Algorithm 3's selected ``N + 1`` local history transitions.
+
+        The current route builds an order ``N + 1`` reference table and uses
+        only the selected local transitions.  Future work should generate
+        those transitions directly so ``extend=True`` does not allocate the
+        complete next-order Cartesian table.
+        """
         next_arrays, next_levels = self._history_power_data(order + 1)
         next_positions = [
             {level.history: pos for pos, level in enumerate(bond_levels)}
@@ -975,7 +1114,13 @@ class FirstDegreeMPO:
         return added
 
     def _algorithm_four(self, arrays, levels, order, dt):
-        """Apply the paper's order-controlled approximate compression."""
+        """Apply the paper's order-controlled approximate compression.
+
+        This approximation is coefficient-aware and analytical; it is not a
+        substitute for a numerical SVD compression.  Keeping it as an opt-in
+        pass leaves room for a future policy object that can combine this step
+        with explicit backend truncation tolerances.
+        """
         removed = 0
         for bond in range(1, self.L + 1):
             while True:
@@ -1021,7 +1166,13 @@ class FirstDegreeMPO:
         return removed
 
     def _contract_history_boundaries(self, arrays, levels, order):
-        """Impose the finite-chain all-one boundary vectors."""
+        """Impose the finite-chain all-one boundary vectors.
+
+        Boundary contraction is delayed until after Algorithms 1--4 because
+        those algorithms need the histories at both open cuts.  This ordering
+        is essential to the finite-chain implementation and avoids treating
+        unreachable edge states as physical channels.
+        """
         boundary_history = tuple(MPOLevelToken(1) for _ in range(order))
         left_target = self._find_history(levels[0], boundary_history)
         right_target = self._find_history(levels[-1], boundary_history)
@@ -1039,7 +1190,14 @@ class FirstDegreeMPO:
     def _extensive_history_exponential(
         self, dt, *, order, extend=False, approximate=False,
     ):
-        """Construct an arbitrary-order MPO using Algorithms 1--4."""
+        """Construct an arbitrary-order MPO using Algorithms 1--4.
+
+        This is the single multi-site execution path.  The order of passes is
+        part of the paper implementation contract: optional Algorithm 3 first
+        adds selected next-order terms, Algorithm 1 rewires extensive
+        prefactors, Algorithm 2 performs exact compression, and optional
+        Algorithm 4 applies the analytical approximation.
+        """
         arrays, levels = self._history_power_data(order)
         initial_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
@@ -1091,69 +1249,6 @@ class FirstDegreeMPO:
         output.metadata["compression_report"] = report
         return output
 
-    def _first_degree_block(self, site, kind, left_index=None, right_index=None):
-        """Return one local first-degree block ``I, A, B, C,`` or ``D``.
-
-        The implementation works from the virtual-level metadata and local
-        MPO tensors only.  It is deliberately separate from ``to_dense`` so
-        the extensive construction remains tensor-network aware.
-        """
-        left_levels = self._levels[site]
-        right_levels = self._levels[site + 1]
-
-        def positions(levels, number):
-            return [
-                pos
-                for pos, level in enumerate(levels)
-                if _level_number(level.history[0]) == number
-            ]
-
-        left_one = positions(left_levels, 1)
-        left_two = positions(left_levels, 2)
-        right_two = positions(right_levels, 2)
-        right_three = positions(right_levels, 3)
-        array = self._arrays[site]
-        reference = array[0, 0]
-
-        def zero():
-            return ar.do("zeros_like", reference)
-
-        def choose(values, index, label):
-            if not values:
-                return None
-            if index is None:
-                if len(values) != 1:
-                    raise ValueError(
-                        f"first-degree block {label!r} needs an explicit channel index."
-                    )
-                return values[0]
-            if not 0 <= int(index) < len(values):
-                raise IndexError(
-                    f"{label} channel index {index} is outside [0, {len(values) - 1}]."
-                )
-            return values[int(index)]
-
-        if kind == "I":
-            return ar.do("eye", self.phys_dim, like=reference)
-        if kind == "C":
-            left = choose(left_one, None, "C-left")
-            right = choose(right_two, right_index, "C-right")
-        elif kind == "D":
-            left = choose(left_one, None, "D-left")
-            right = choose(right_three, None, "D-right")
-        elif kind == "A":
-            left = choose(left_two, left_index, "A-left")
-            right = choose(right_two, right_index, "A-right")
-        elif kind == "B":
-            left = choose(left_two, left_index, "B-left")
-            right = choose(right_three, None, "B-right")
-        else:
-            raise ValueError(f"unknown first-degree block kind {kind!r}.")
-
-        if left is None or right is None:
-            return zero()
-        return array[left, right]
-
     def _first_degree_structure(self):
         """Validate and return active channel counts on each virtual bond."""
         if self.L == 1:
@@ -1175,148 +1270,6 @@ class FirstDegreeMPO:
             active_counts.append(numbers.count(2))
         return (0, *active_counts, 0)
 
-    def _extensive_specs(self, bond, order, active_counts):
-        """Return output virtual-state specifications for one bond."""
-        if bond in (0, self.L):
-            return [(("1", None, None) if order == 1 else ("11", None, None))]
-        active = range(active_counts[bond])
-        if order == 1:
-            return [("1", None, None), *(('2', i, None) for i in active)]
-        return [
-            ("11", None, None),
-            *(('12', i, None) for i in active),
-            *(('22', i, j) for i in active for j in active),
-            *(('23', i, None) for i in active),
-        ]
-
-    def _extensive_history(self, bond, spec):
-        """Convert an output state specification to its level history."""
-        if spec[0] == "1":
-            if bond == self.L:
-                return (MPOLevelToken(1),)
-            return (
-                next(
-                    level.history[0]
-                    for level in self._levels[bond]
-                    if _level_number(level.history[0]) == 1
-                ),
-            )
-        if spec[0] == "2":
-            active = [
-                level for level in self._levels[bond]
-                if _level_number(level.history[0]) == 2
-            ]
-            return (active[spec[1]].history[0],)
-
-        if spec[0] == "11" and bond in (0, self.L):
-            return (MPOLevelToken(1), MPOLevelToken(1))
-
-        active = [
-            level for level in self._levels[bond]
-            if _level_number(level.history[0]) == 2
-        ]
-        one = (
-            MPOLevelToken(1)
-            if bond == self.L
-            else next(
-                level.history[0]
-                for level in self._levels[bond]
-                if _level_number(level.history[0]) == 1
-            )
-        )
-        three = next(
-            level.history[0]
-            for level in self._levels[bond]
-            if _level_number(level.history[0]) == 3
-        )
-        if spec[0] == "11":
-            return (one, one)
-        if spec[0] == "12":
-            return (one, active[spec[1]].history[0])
-        if spec[0] == "22":
-            return (
-                active[spec[1]].history[0],
-                active[spec[2]].history[0],
-            )
-        if spec[0] == "23":
-            return (active[spec[1]].history[0], three)
-        raise ValueError(f"unknown extensive state specification {spec!r}.")
-
-    def _extensive_level(self, bond, spec, order):
-        history = self._extensive_history(bond, spec)
-        return MPOLevel(
-            ("extensive", order, bond, spec),
-            history,
-        )
-
-    def _extensive_local_block(self, site, left, right, order, dt):
-        """Build one local block of the paper's order-1/2 MPO."""
-        lk, li, lj = left
-        rk, ri, rj = right
-        I = lambda: self._first_degree_block(site, "I")
-        C = lambda index: self._first_degree_block(site, "C", right_index=index)
-        D = lambda: self._first_degree_block(site, "D")
-        A = lambda i, j: self._first_degree_block(
-            site, "A", left_index=i, right_index=j
-        )
-        B = lambda i: self._first_degree_block(site, "B", left_index=i)
-        matmul = lambda x, y: ar.do("matmul", x, y)
-
-        def add(*terms):
-            result = terms[0]
-            for term in terms[1:]:
-                result = result + term
-            return result
-
-        if order == 1:
-            if lk == "1" and rk == "1":
-                return add(I(), dt * D())
-            if lk == "1" and rk == "2":
-                return C(ri)
-            if lk == "2" and rk == "1":
-                return dt * B(li)
-            if lk == "2" and rk == "2":
-                return A(li, ri)
-            return self._first_degree_block(site, "I") * 0
-
-        half_dt2 = (dt * dt) / 2
-        if lk == "11" and rk == "11":
-            return add(I(), dt * D(), half_dt2 * matmul(D(), D()))
-        if lk == "11" and rk == "12":
-            return C(ri)
-        if lk == "11" and rk == "22":
-            return matmul(C(ri), C(rj))
-        if lk == "11" and rk == "23":
-            return add(matmul(C(ri), D()), matmul(D(), C(ri)))
-        if lk == "12" and rk == "11":
-            return add(
-                dt * B(li),
-                half_dt2 * matmul(D(), B(li)),
-                half_dt2 * matmul(B(li), D()),
-            )
-        if lk == "12" and rk == "12":
-            return A(li, ri)
-        if lk == "12" and rk == "22":
-            return add(matmul(C(ri), A(li, rj)), matmul(A(li, ri), C(rj)))
-        if lk == "12" and rk == "23":
-            return add(
-                matmul(C(ri), B(li)),
-                matmul(A(li, ri), D()),
-                matmul(D(), A(li, ri)),
-                matmul(B(li), C(ri)),
-            )
-        if lk == "22" and rk == "11":
-            return half_dt2 * matmul(B(li), B(lj))
-        if lk == "22" and rk == "22":
-            return matmul(A(li, ri), A(lj, rj))
-        if lk == "22" and rk == "23":
-            return add(matmul(A(li, ri), B(lj)), matmul(B(li), A(lj, ri)))
-        if lk == "23" and rk == "11":
-            return half_dt2 * B(li)
-        if lk == "23" and rk == "23":
-            return A(li, ri)
-        return self._first_degree_block(site, "I") * 0
-
     def extensive_exponential(
         self, dt, *, order=1, extend=False, approximate=False,
     ):
@@ -1332,8 +1285,9 @@ class FirstDegreeMPO:
         dt : scalar
             Time-step or imaginary-time parameter ``tau``.
         order : int, default=1
-            Taylor order. Orders one and two use the established compact local
-            formulas; order three and higher use the generic history engine.
+            Taylor order. Multi-site chains use the generic history engine for
+            every positive order. One-site chains currently support orders one
+            and two through a direct local Taylor polynomial.
         extend : bool, default=False
             Include Algorithm 3's selected order ``N + 1`` terms without
             increasing the analytical history bond dimension.
@@ -1343,9 +1297,12 @@ class FirstDegreeMPO:
 
         Notes
         -----
-        This first implementation targets ordinary NumPy/Autoray-compatible
+        The first implementation targets ordinary NumPy/Autoray-compatible
         local MPO blocks. Native fermionic/Symmray compilation is deliberately
-        not enabled by this method yet.
+        not enabled by this method yet. The one-site special case is kept
+        small and explicit; a future implementation can route arbitrary
+        one-site orders through the same history engine once its boundary
+        convention is generalized.
         """
         _check_scalar(dt, name="dt")
         if not isinstance(order, Integral) or int(order) < 1:
@@ -1362,61 +1319,38 @@ class FirstDegreeMPO:
             raise NotImplementedError(
                 "generic history construction requires at least two sites."
             )
-        active_counts = self._first_degree_structure()
-        if self.L == 1:
-            reference = self._arrays[0][0, 0]
-            identity = ar.do("eye", self.phys_dim, like=reference)
-            h = reference
-            if order == 1:
-                data = identity + dt * h
-            else:
-                data = identity + dt * h + (dt * dt / 2) * ar.do("matmul", h, h)
-            return type(self)(
-                (data,),
-                levels=[[
-                    MPOLevel(
-                        ("extensive", order, 0, ("11", None, None)),
-                        tuple(
-                            self._levels[0][0].history[0]
-                            for _ in range(order)
-                        ),
-                    )
-                ]] * 2,
-                degree=order,
-                upper_ind_id=self.upper_ind_id,
-                lower_ind_id=self.lower_ind_id,
-                site_tag_id=self.site_tag_id,
-                metadata={"operation": "extensive_exponential", "dt": dt, "order": order},
-            )
-
-        specs = [
-            self._extensive_specs(bond, order, active_counts)
-            for bond in range(self.L + 1)
-        ]
-        arrays = []
-        levels = []
-        for bond, bond_specs in enumerate(specs):
-            levels.append([
-                self._extensive_level(bond, spec, order)
-                for spec in bond_specs
-            ])
-        for site in range(self.L):
-            rows = []
-            for left in specs[site]:
-                rows.append(_stack([
-                    self._extensive_local_block(site, left, right, order, dt)
-                    for right in specs[site + 1]
-                ], axis=0))
-            arrays.append(_stack(rows, axis=0))
-
+        # The only remaining case is a one-site direct Taylor polynomial. The
+        # multi-site history route returned above, and unsupported one-site
+        # options were rejected just before this branch.
+        reference = self._arrays[0][0, 0]
+        identity = ar.do("eye", self.phys_dim, like=reference)
+        h = reference
+        if order == 1:
+            data = identity + dt * h
+        else:
+            data = identity + dt * h + (dt * dt / 2) * ar.do("matmul", h, h)
         return type(self)(
-            arrays,
-            levels=levels,
+            (data,),
+            levels=[[
+                MPOLevel(
+                    ("extensive", order, 0, ("11", None, None)),
+                    tuple(
+                        self._levels[0][0].history[0]
+                        for _ in range(order)
+                    ),
+                )
+            ]] * 2,
             degree=order,
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
-            metadata={"operation": "extensive_exponential", "dt": dt, "order": order},
+            metadata={
+                "operation": "extensive_exponential",
+                "dt": dt,
+                "order": order,
+                "algorithms": ("one-site-taylor",),
+                "approximate": False,
+            },
         )
 
     def compress_exact(self, *, inplace=False):
