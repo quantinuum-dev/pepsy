@@ -1,9 +1,9 @@
 """MPO optimization helpers centered on :class:`MpoOptimizer`.
 
-:class:`MpoOptimizer` replays a queue of gates ``[(gate, where), ...]`` against
-an MPO ``O`` of length ``L`` with two physical index families (``ind_id_k``,
-``ind_id_b``).  Each bundled entry specifies what acts on the ket and bra
-legs:
+:class:`MpoOptimizer` replays a queue of one- or multi-site gates
+``[(gate, where), ...]`` against an MPO ``O`` of length ``L`` with two
+physical index families (``ind_id_k``, ``ind_id_b``). Each bundled entry
+specifies what acts on the ket and bra legs:
 
 * ``gate``                       → apply ``gate`` on ket and ``gate†`` on bra
   (default "unitary conjugation" semantics ``G O G†``);
@@ -12,7 +12,7 @@ legs:
 * ``(G, B)``                     → apply ``G`` on ket and ``B†`` on bra.
 
 Three execution backends are supported, all returning the same kind of MPO
-but differing in *how* two-site updates are compressed back to bond ``chi``:
+but differing in *how* local gate updates are compressed back to bond ``chi``:
 
 * ``mode="dmrg"`` — fit a target MPO with :class:`pepsy.fitting.local.FIT`
   inside a local window ``[xmin, xmax]``; supports batching consecutive
@@ -20,8 +20,8 @@ but differing in *how* two-site updates are compressed back to bond ``chi``:
 * ``mode="svd"``  — apply the gate with ``reduce-split`` then canonicalize +
   left-compress to ``chi``;
 * ``mode="mpo"``  — use :func:`pepsy.operators.gates.gate_nonlocal_opt` to
-  apply each layer independently on the ket and bra families. Symmray MPOs
-  use the block-aware SVD path instead.
+  apply each multi-site layer independently on the ket and bra families.
+  Symmray MPOs use the block-aware SVD path instead.
 
 The class also tracks a running "normalized-norm" proxy
 ``sqrt(<O|O> / <O0|O0>)`` that equals ``1`` for purely unitary two-sided
@@ -83,7 +83,9 @@ class MpoOptimizer:
     chi : int
         Working bond dimension used by all compression backends.
     mode : {"dmrg", "svd", "mpo"}, default="dmrg"
-        Execution backend for two-site updates (see module docstring).
+        Execution backend for local updates (see module docstring). The dense
+        ``mode="mpo"`` path supports arbitrary one-dimensional gate supports;
+        ``"svd"`` and ``"dmrg"`` retain their one- and two-site update paths.
     ind_id_k : str, default="k{}"
         Site-index format string for the ket physical leg family.
     ind_id_b : str, default="b{}"
@@ -361,8 +363,8 @@ class MpoOptimizer:
     def _prepare_gate_tensor(gate, n_sites):
         """Reorder a gate tensor into ``(input, output)`` ket-index order.
 
-        Quimb gates are stored as ``(output, input)`` matrices (or rank-4
-        ``(o1, o2, i1, i2)`` tensors for two-site gates).  ``apply_gate``
+        Quimb gates are stored as ``(output, input)`` matrices (or tensors
+        with all output axes followed by all input axes). ``apply_gate``
         below expects the opposite ordering, so we transpose accordingly.
         """
         # Native Symmray gates already carry explicit dual metadata describing
@@ -372,27 +374,23 @@ class MpoOptimizer:
         if MpoOptimizer._is_symmray_array(gate):
             return gate
 
-        if n_sites == 1:
-            return ar.do("transpose", gate, (1, 0))
-        elif n_sites == 2:
-            shape = getattr(gate, "shape", ())
-            if len(shape) == 2:
-                # 4x4 matrix form: just a matrix transpose.
-                din, dout = shape
-                if int(din) != int(dout):
-                    raise ValueError(
-                        "Two-site gate matrix must be square with shape (d**2, d**2)."
-                    )
-                return ar.do("transpose", gate, (1, 0))
-            elif len(shape) == 4:
-                # Rank-4 form: swap output and input pairs.
-                return ar.do("transpose", gate, (2, 3, 0, 1))
-            else:
+        shape = tuple(getattr(gate, "shape", ()))
+        if len(shape) == 2:
+            if int(shape[0]) != int(shape[1]):
                 raise ValueError(
-                    "Two-site gate must have shape (d**2, d**2) or (d, d, d, d)."
+                    f"{n_sites}-site gate matrix must be square, got {shape}."
                 )
-        else:
-            raise ValueError("Each gate location must have one or two sites.")
+            return ar.do("transpose", gate, (1, 0))
+        if len(shape) == 2 * n_sites:
+            return ar.do(
+                "transpose",
+                gate,
+                tuple(range(n_sites, 2 * n_sites)) + tuple(range(n_sites)),
+            )
+        raise ValueError(
+            f"{n_sites}-site gate must have a square matrix or "
+            f"{2 * n_sites}-axis tensor shape, got {shape}."
+        )
 
     @classmethod
     def _symmray_physical_map(cls, p, site, ind_id):
@@ -549,8 +547,8 @@ class MpoOptimizer:
         At least one of the two sides must be non-``None``.
         """
         where_norm = tuple(where_i)
-        if len(where_norm) not in (1, 2):
-            raise ValueError("Each gate location must have one or two sites.")
+        if not where_norm:
+            raise ValueError("Each gate location must contain at least one site.")
 
         if isinstance(G_i, (tuple, list)):
             if len(G_i) == 1:
@@ -1006,13 +1004,13 @@ class MpoOptimizer:
     def _run_mpo(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", fidelity_samples=10):
         """Sweep the gate stream with :func:`gate_nonlocal_opt` compression.
 
-        Two-site gates are routed through ``gate_nonlocal_opt`` independently
+        Multi-site gates are routed through ``gate_nonlocal_opt`` independently
         on the upper (ket) and lower (bra) MPO families using
-        ``method="direct"``.  One-site gates are applied directly via
+        ``method="direct"``. One-site gates are applied directly via
         :meth:`_apply_gate_pair`.
         """
         p = self.p
-        two_qubit_count = 0
+        nonlocal_count = 0
         sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
         norm_proxy = self.losses[-1]
 
@@ -1043,8 +1041,8 @@ class MpoOptimizer:
                     contract=True,
                     inplace=True,
                 )
-            elif n_sites == 2:
-                two_qubit_count += 1
+            elif n_sites >= 2:
+                nonlocal_count += 1
                 g_k, g_b = self._prepare_gate_pair(
                     gate,
                     n_sites,
@@ -1072,16 +1070,13 @@ class MpoOptimizer:
                         cutoff_mode=cutoff_mode,
                     )
                 self.p = p
-            else:
-                raise ValueError("Each gate location must have one or two sites.")
-
             idx += 1
             if idx in sample_steps:
                 norm_proxy = self._append_norm_proxy_sample(self.p)
 
             if pbar is not None:
                 postfix = {
-                    "2q": two_qubit_count,
+                    "nonlocal": nonlocal_count,
                     "~F": norm_proxy,
                     "bnd": self.p.max_bond(),
                 }

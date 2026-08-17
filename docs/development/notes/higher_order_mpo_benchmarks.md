@@ -36,6 +36,20 @@ substep Strang MPO supplies the reference, so this test remains outside the
 dense `2**L` regime. `MpoOptimizer` replays the Trotter gate streams with
 `mode="mpo"`, zero truncation cutoff, and a fixed working bond dimension.
 
+The extended slow regression adds an independent `hy` field and a long-range
+three-site coupling
+
+```text
+gxyz sum_i X_i Y_{i+1} Z_{i+3}
+```
+
+to the same family. It exercises MPO Algorithms 1, 2, and 3 at `L=32` and
+replays one-, two-, and non-contiguous three-site Trotter gates through
+`MpoOptimizer(mode="mpo")`. The direct MPO backend now accepts arbitrary
+one-dimensional gate supports; the SVD and DMRG paths intentionally retain
+their existing one-/two-site contracts. Because the three-site replay is more
+expensive, it uses `chi=8` and a two-substep Strang reference.
+
 The benchmark records Frobenius errors for `order=1, 2, 3` and checks the
 expected Taylor and first-order Trotter convergence. It does not assert that
 Trotter or the cluster expansion must have a particular error ordering: they

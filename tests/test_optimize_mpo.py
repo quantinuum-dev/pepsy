@@ -479,6 +479,29 @@ def test_mpo_optimizer_mpo_mode_smoke():
     assert out.max_bond() <= 8
 
 
+def test_mpo_optimizer_mpo_mode_supports_three_site_gate():
+    """MPO mode should accept a non-contiguous three-site gate support."""
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+    z = np.diag([1.0, -1.0])
+    local_xyz = np.kron(np.kron(x, y), z)
+    gate = scipy_linalg.expm(-1j * 0.03 * local_xyz)
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+
+    opt = py.MpoOptimizer(
+        mpo0.copy(),
+        gates=[((gate.T, None), (0, 1, 3))],
+        chi=16,
+        mode="mpo",
+    )
+    out = opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+
+    assert out.L == 4
+    assert out.max_bond() <= 16
+    assert not np.allclose(out.to_dense(), mpo0.to_dense())
+
+
 def test_mpo_optimizer_mpo_mode_unitary_evolution_preserves_norm():
     """Two-sided unitary evolution in MPO mode should preserve the normalized norm."""
     mpo0 = qtn.MPO_identity(4, dtype="complex128")

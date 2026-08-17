@@ -20,6 +20,13 @@ opt = pepsy.MpoOptimizer(
 mpo = opt.run(progbar=False)
 ```
 
+For dense MPOs, `mode="mpo"` accepts one- or multi-site dense gates, including
+non-contiguous supports such as `(0, 1, 3)`. The gate matrix has dimension
+`2**len(where)` by `2**len(where)` for qubit sites. `mode="svd"` and
+`mode="dmrg"` retain their one-/two-site replay contracts. Native Symmray
+`mode="mpo"` uses the symmetry-aware SVD route and therefore follows that
+one-/two-site restriction.
+
 For an explicit neutral term collection, arbitrary one- or multi-site support
 is accepted:
 

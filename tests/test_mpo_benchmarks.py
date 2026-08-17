@@ -590,3 +590,187 @@ def test_parameterized_tfi_large_chain_mpo_against_higher_order_trotter():
     assert basis.cache_info["compiled"] is True
     assert basis.cache_info["compiled_terms"] == 3 * L - 1
     assert basis.cache_info["builds"] == len(parameter_sets)
+
+
+def _tfi_xyz_basis(L):
+    """Build a TFI basis with a Y field and long-range ``X Y Z`` terms."""
+    x, y, z = _paulis()
+    terms = [
+        MPOProductTerm((site, site + 1), (z, z), MPOParameter("J"))
+        for site in range(L - 1)
+    ]
+    terms.extend(
+        MPOProductTerm((site,), (x,), MPOParameter("hx"))
+        for site in range(L)
+    )
+    terms.extend(
+        MPOProductTerm((site,), (y,), MPOParameter("hy"))
+        for site in range(L)
+    )
+    terms.extend(
+        MPOProductTerm((site,), (z,), MPOParameter("hz"))
+        for site in range(L)
+    )
+    terms.extend(
+        MPOProductTerm(
+            (site, site + 1, site + 3),
+            (x, y, z),
+            MPOParameter("gxyz"),
+        )
+        for site in range(L - 3)
+    )
+    return MPOBasis.from_local_terms(L, terms)
+
+
+def _tfi_xyz_gate_stream(L, parameters, dt):
+    """Return Trotter gates for the extended TFI/long-range XYZ model."""
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    x, y, z = _paulis()
+    gates = [
+        (
+            scipy_linalg.expm(
+                -1j * dt * parameters["J"] * np.kron(z, z),
+            ),
+            (site, site + 1),
+        )
+        for site in range(L - 1)
+    ]
+    gates.extend(
+        (
+            scipy_linalg.expm(-1j * dt * parameters["hx"] * x),
+            (site,),
+        )
+        for site in range(L)
+    )
+    gates.extend(
+        (
+            scipy_linalg.expm(-1j * dt * parameters["hy"] * y),
+            (site,),
+        )
+        for site in range(L)
+    )
+    gates.extend(
+        (
+            scipy_linalg.expm(-1j * dt * parameters["hz"] * z),
+            (site,),
+        )
+        for site in range(L)
+    )
+    xyz = np.kron(np.kron(x, y), z)
+    gates.extend(
+        (
+            scipy_linalg.expm(-1j * dt * parameters["gxyz"] * xyz),
+            (site, site + 1, site + 3),
+        )
+        for site in range(L - 3)
+    )
+    return gates
+
+
+def _run_tfi_xyz_trotter(L, parameters, dt, order, *, n_substeps=1):
+    """Replay the extended TFI Trotter stream through ``MpoOptimizer``."""
+    qtn = pytest.importorskip("quimb.tensor")
+    from pepsy import MpoOptimizer  # pylint: disable=import-outside-toplevel
+
+    stream = []
+    for _ in range(n_substeps):
+        if order == 1:
+            stream.extend(
+                _tfi_xyz_gate_stream(L, parameters, dt / n_substeps),
+            )
+            continue
+        if order != 2:
+            raise ValueError("the XYZ regression supports Trotter orders 1 and 2")
+        half_step = _tfi_xyz_gate_stream(
+            L,
+            parameters,
+            dt / (2 * n_substeps),
+        )
+        stream.extend(half_step)
+        stream.extend(reversed(half_step))
+
+    # The direct MPO backend supports the non-contiguous three-site gates.
+    # Ket-only input uses the public (output, input) gate convention.
+    optimizer = MpoOptimizer(
+        qtn.MPO_identity(L, dtype="complex128"),
+        gates=[((gate.T, None), where) for gate, where in stream],
+        chi=8,
+        mode="mpo",
+    )
+    return optimizer.run(
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+    )
+
+
+@pytest.mark.slow
+def test_parameterized_tfi_xyz_large_chain_algorithms_one_two_three():
+    """Compare MPO Algorithms 1/2/3 with Trotter for ``X_i Y_{i+1} Z_{i+3}``."""
+    L = 32
+    dt = 0.01
+    parameters = {
+        "J": 1.0,
+        "hx": 0.7,
+        "hy": -0.23,
+        "hz": 0.2,
+        "gxyz": 0.15,
+    }
+    rebinding = {
+        "J": 0.35,
+        "hx": 1.1,
+        "hy": 0.4,
+        "hz": -0.25,
+        "gxyz": -0.3,
+    }
+    basis = _tfi_xyz_basis(L)
+    hamiltonian = basis.build(parameters)
+    # Compile and bind a second coupling point as well, verifying that the
+    # long-range XYZ coefficient shares the same cached topology.
+    rebound_hamiltonian = basis.build(rebinding)
+
+    mpo = {
+        order: hamiltonian.extensive_exponential(
+            -1j * dt,
+            order=order,
+            mode="optimal",
+            cache_history=False,
+            history_storage="streaming",
+        ).to_mpo()
+        for order in (1, 2, 3)
+    }
+    trotter_order_1 = _run_tfi_xyz_trotter(
+        L,
+        parameters,
+        dt,
+        order=1,
+    )
+    trotter_order_2 = _run_tfi_xyz_trotter(
+        L,
+        parameters,
+        dt,
+        order=2,
+    )
+    reference = _run_tfi_xyz_trotter(
+        L,
+        parameters,
+        dt,
+        order=2,
+        n_substeps=2,
+    )
+
+    errors = {
+        "mpo_algorithm_1": _relative_mpo_error(mpo[1], reference),
+        "mpo_algorithm_2": _relative_mpo_error(mpo[2], reference),
+        "mpo_algorithm_3": _relative_mpo_error(mpo[3], reference),
+        "trotter_order_1": _relative_mpo_error(trotter_order_1, reference),
+        "trotter_order_2": _relative_mpo_error(trotter_order_2, reference),
+    }
+    assert errors["mpo_algorithm_3"] < errors["mpo_algorithm_2"]
+    assert errors["mpo_algorithm_2"] < errors["mpo_algorithm_1"]
+    assert errors["trotter_order_2"] < errors["trotter_order_1"]
+    assert errors["mpo_algorithm_3"] < errors["trotter_order_2"]
+    assert all(np.isfinite(error) for error in errors.values())
+    assert basis.cache_info["compiled_terms"] == 5 * L - 4
+    assert basis.cache_info["builds"] == 2
+    assert rebound_hamiltonian.bond_dimensions == basis.bond_dimensions
