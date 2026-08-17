@@ -54,25 +54,48 @@ scaling, products, commutators, powers, and the paper's conservative exact
 history/column compression. `to_mpo()` returns an ordinary Quimb
 `MatrixProductOperator` and performs no numerical truncation.
 
-The first tensor-network-aware time-evolution path is available through
-`extensive_exponential(dt, order=1 or 2)`. It reads the first-degree `I`, `A`,
-`B`, `C`, and `D` blocks from the local MPO tensors and assembles the
-size-extensive order-one or order-two MPO directly. It never forms a global
-dense Hamiltonian or matrix exponential. The resulting internal bond spaces
-are the paper's compressed level spaces: `1 + chi` for order one and
-`1 + 2 * chi + chi**2` for order two, with `chi` allowed to vary by cut.
-This path currently targets ordinary NumPy/Autoray-compatible local blocks;
-native fermionic/Symmray compilation remains separate.
+The tensor-network-aware time-evolution path is available through
+`extensive_exponential(dt, order=N)`. For chains longer than one site it
+constructs the full local history power, applies the paper's Algorithms 1 and
+2 as virtual-bond rewiring operations, and only then contracts the finite
+all-one boundary vectors. Every operation is local to MPO tensors; no global
+dense Hamiltonian or matrix exponential is formed. The raw history space grows
+as the local MPO channel space to the power `N`, while exact history
+compression removes permutation-equivalent channels before the result is
+returned.
 
 ```python
+import quimb.tensor as qtn
+
 U1 = H.extensive_exponential(dt=0.01, order=1)
 U2 = H.extensive_exponential(dt=0.01, order=2)
+U3 = H.extensive_exponential(dt=0.01, order=3)
+
+# Optional paper extensions, kept explicit in the API.
+U2_extended = H.extensive_exponential(dt=0.01, order=2, extend=True)
+U2_approx = H.extensive_exponential(dt=0.01, order=2, approximate=True)
 
 # Quimb remains the compiled interchange boundary.
 mpo = U2.to_mpo()
+
+# Tensor-network application and expectation evaluation.
+state = qtn.MPS_computational_state("0000")
+state_next = U2.apply_to_mps(state, method="direct", cutoff=1e-10)
+energy_factor = U2.expectation(state)
 ```
 
-General-order Taylor extension, approximate row compression, and native
-Symmray compilation are intentionally separate follow-up stages. Keeping these
-stages explicit prevents a numerical cutoff from being confused with the
-paper's algebraically exact compression.
+`extend=True` applies Algorithm 3: selected order `N + 1` local histories are
+added without increasing the exact-history bond dimension. `approximate=True`
+applies Algorithm 4 after exact compression. It is an order-controlled
+analytical approximation, not a numerical SVD cutoff, and is therefore exposed
+as a separate opt-in flag. Numerical Quimb compression remains a separate
+post-processing step.
+
+`apply_to_mps` delegates to Quimb's MPO–MPS compression methods, while
+`expectation` delegates to Pepsy's normalized MPS contraction helper. These
+methods are the intended validation and execution path for larger systems;
+dense conversion is only appropriate as a small-system regression oracle.
+
+The current implementation targets ordinary NumPy/Autoray-compatible local
+blocks. Native fermionic/Symmray compilation remains separate and is not
+changed by this API.

@@ -154,3 +154,89 @@ def test_extensive_exponential_handles_one_site_terms():
         if order == 2:
             expected = expected + 0.2**2 * (z @ z) / 2
         np.testing.assert_allclose(U.to_mpo().to_dense(), expected)
+
+
+def test_extensive_exponential_supports_generic_order_three_histories():
+    """Generic histories reproduce the expected third-order scaling."""
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    H = _two_term_mpo()
+    dense_h = H.to_mpo().to_dense()
+    errors = []
+    for dt in (1.0e-2, 5.0e-3):
+        U = H.extensive_exponential(dt, order=3)
+        errors.append(np.linalg.norm(U.to_mpo().to_dense() - scipy_linalg.expm(dt * dense_h)))
+        assert U.metadata["algorithms"] == (1, 2)
+        assert all(len(level.history) == 3 for level in U.levels[1])
+
+    assert errors[1] / errors[0] == pytest.approx(1.0 / 16.0, rel=3.0e-3)
+
+
+def test_extensive_exponential_algorithm_three_keeps_bond_dimension():
+    """The extension adds selected next-order terms without new channels."""
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    H = _two_term_mpo()
+    dense_h = H.to_mpo().to_dense()
+    plain = H.extensive_exponential(0.01, order=2)
+    extended = H.extensive_exponential(0.01, order=2, extend=True)
+
+    assert extended.bond_dimensions == plain.bond_dimensions
+    assert extended.metadata["algorithms"] == (1, 2, 3)
+    assert extended.metadata["extension_terms"] > 0
+    plain_error = np.linalg.norm(plain.to_mpo().to_dense() - scipy_linalg.expm(0.01 * dense_h))
+    extended_error = np.linalg.norm(
+        extended.to_mpo().to_dense() - scipy_linalg.expm(0.01 * dense_h),
+    )
+    assert extended_error < plain_error
+
+
+def test_extensive_exponential_algorithm_four_is_explicit_and_order_controlled():
+    """Approximate compression is opt-in and lowers the analytical rank."""
+    H = _two_term_mpo()
+    exact = H.extensive_exponential(0.01, order=2)
+    approximate = H.extensive_exponential(0.01, order=2, approximate=True)
+
+    assert approximate.metadata["algorithms"] == (1, 2, 4)
+    assert approximate.metadata["approximate"] is True
+    assert approximate.metadata["approximate_history_merges"] > 0
+    assert all(
+        approximate_dim <= exact_dim
+        for approximate_dim, exact_dim in zip(
+            approximate.bond_dimensions,
+            exact.bond_dimensions,
+        )
+    )
+
+
+def test_extensive_exponential_mps_expectation_and_application_are_tensor_network_paths(
+    monkeypatch,
+):
+    """The public MPS helpers contract and apply without MPO densification."""
+    qtn = pytest.importorskip("quimb.tensor")
+    scipy_linalg = pytest.importorskip("scipy.linalg")
+    H = _two_term_mpo()
+    state = qtn.MPS_computational_state("000")
+    dense_h = H.to_mpo().to_dense()
+    state_vector = np.asarray(state.to_dense()).reshape(-1)
+
+    errors = []
+    for dt in (1.0e-2, 5.0e-3):
+        U = H.extensive_exponential(dt, order=3)
+        exact = scipy_linalg.expm(dt * dense_h)
+        expected = np.vdot(state_vector, exact @ state_vector)
+        errors.append(abs(U.expectation(state) - expected))
+    assert errors[1] / errors[0] == pytest.approx(1.0 / 16.0, rel=3.0e-3)
+
+    U = H.extensive_exponential(0.01, order=2)
+    expected_state = U.to_mpo().to_dense() @ state_vector
+
+    def forbid_mpo_dense(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("MPS application must not densify the MPO")
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "to_dense", forbid_mpo_dense)
+    applied = U.apply_to_mps(state, method="direct", cutoff=0.0)
+    np.testing.assert_allclose(
+        np.asarray(applied.to_dense()).reshape(-1),
+        expected_state,
+        atol=1.0e-10,
+    )
