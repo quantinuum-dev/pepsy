@@ -134,7 +134,10 @@ Every operation is local to MPO tensors; no global dense Hamiltonian or matrix
 exponential is formed. The reachable history space can still grow
 exponentially with `N`, but it avoids allocating disconnected boundary and
 edge channels that cannot contribute to the finite-chain operator.
-The one-site path currently supports direct orders one and two.
+The one-site path evaluates the direct local Taylor polynomial at arbitrary
+positive order. In `mode="optimal"` or with `extend=True`, it includes one
+additional local Taylor term; a one-site chain has no non-trivial virtual
+history for Algorithm 3 or 4 to rewire.
 
 ```python
 import quimb.tensor as qtn
@@ -142,6 +145,10 @@ import quimb.tensor as qtn
 U1 = H.extensive_exponential(dt=0.01, order=1)
 U2 = H.extensive_exponential(dt=0.01, order=2)
 U3 = H.extensive_exponential(dt=0.01, order=3)
+
+# One-site Hamiltonians use the same direct Taylor API at arbitrary order.
+single_site = FirstDegreeMPO.from_pauli_terms(1, [((0,), "Z")])
+U5 = single_site.extensive_exponential(dt=0.01, order=5)
 
 # Optional paper extensions, kept explicit in the API.
 U2_extended = H.extensive_exponential(dt=0.01, order=2, extend=True)
@@ -178,6 +185,18 @@ The named `mode` policies are `"base"` (Algorithms 1--2), `"optimal"`
 to a globally minimum-bond MPO. `max_bond` limits the temporary history bonds
 before exact compression; `on_exceed="raise"` stops safely, while
 `on_exceed="warn"` continues with a warning.
+
+History storage is controlled independently with
+`history_storage="auto"|"dense"|"sparse"|"streaming"`. The default uses the
+cached dense topology for repeated calls, and automatically switches to the
+streaming two-cut builder when `cache_history=False`. `"sparse"` also avoids
+evaluating structurally impossible local transition products. In all modes the
+final local MPO tensors are materialized because Algorithms 1--4 rewrite them;
+the streaming mode requires `cache_history=False` and guarantees that earlier
+history cuts and dead local products are not retained during construction.
+Metadata reports the selected mode and
+`history_storage_blocks` gives the structurally stored versus considered local
+block counts.
 
 `product(kind=...)` and `disjoint_product` currently label provenance only;
 they do not perform support-overlap analysis. See the [development module
@@ -247,9 +266,12 @@ the SVD/QR sweep to Quimb, returns a compiled Quimb MPO, and can return an
 `MPONumericalCompressionReport` with the requested policy and bond dimensions
 before and after compression. Numerical truncation clears the attached
 `pepsy_first_degree` semantic object because its original history table no
-longer describes the compressed MPO. Quimb's high-level sweep does not expose
-a single global operator error, so `report.truncation_error` is explicitly
-`None`.
+longer describes the compressed MPO. Set `estimate_error=True` to contract the
+operator-level Frobenius norm of `MPO_before - MPO_after` without densifying
+the operators; the report exposes both
+`operator_frobenius_error` and
+`operator_frobenius_relative_error`. This is an explicit contraction because
+it can be expensive for large MPOs.
 
 For differentiable numerical compression with a fixed rank, use
 `compress_fixed_rank(max_bond=...)`. It performs a TT-SVD sweep with a rank
@@ -262,5 +284,7 @@ compression changes the analytical history representation.
 
 The current implementation targets finite open-boundary NumPy, Torch, and JAX
 Autoray-compatible local blocks, including the optimal extension path under
-Torch/JAX autodiff. Native fermionic/Symmray compilation and infinite/unit-cell
-MPOs remain separate future work.
+Torch/JAX autodiff. A small accuracy regression benchmark compares orders
+one--three with a first-order Trotter product and a finite two-site cluster
+expansion; see `tests/test_mpo_benchmarks.py`. Native fermionic/Symmray
+compilation and infinite/unit-cell MPOs remain separate future work.

@@ -185,10 +185,10 @@ class MPONumericalCompressionReport:
 
     The semantic history representation cannot survive a numerical bond
     truncation, so this report deliberately describes the compiled Quimb MPO
-    only.  Quimb's high-level ``MatrixProductOperator.compress`` API does not
-    expose one aggregate operator error, hence ``truncation_error`` is
-    explicitly ``None`` here rather than being inferred from a dense
-    operator norm.
+    only.  When requested, the operator error is measured as a tensor-network
+    Frobenius norm of the difference between the pre- and post-compression
+    MPOs.  This avoids forming a global dense matrix, but remains an optional
+    contraction because it can be expensive for a large MPO.
     """
 
     method: str
@@ -200,6 +200,9 @@ class MPONumericalCompressionReport:
     final_bond_dimensions: tuple[int, ...]
     truncated: bool
     truncation_error: object = None
+    operator_frobenius_error: object = None
+    operator_frobenius_relative_error: object = None
+    error_estimator: str | None = None
 
 
 @dataclass(frozen=True)
@@ -839,6 +842,7 @@ class FirstDegreeMPO:
         cutoff=1.0e-10,
         cutoff_mode="rel",
         create_bond=False,
+        estimate_error=False,
         return_report=False,
         **compress_opts,
     ):
@@ -849,9 +853,9 @@ class FirstDegreeMPO:
         Quimb ``MatrixProductOperator`` because a numerical truncation can no
         longer be represented faithfully by the original semantic histories.
         The report records the requested policy and the bond dimensions before
-        and after the Quimb sweep.  Quimb's high-level compressor does not
-        expose a global operator truncation error, so the report leaves that
-        field as ``None``.
+        and after the Quimb sweep.  Set ``estimate_error=True`` to additionally
+        contract the Frobenius norm of ``MPO_before - MPO_after`` without
+        densifying either operator.
         """
         if max_bond is not None:
             if not isinstance(max_bond, Integral) or int(max_bond) < 1:
@@ -863,12 +867,15 @@ class FirstDegreeMPO:
             raise ValueError("cutoff must be non-negative.")
         if not isinstance(cutoff_mode, str):
             raise TypeError("cutoff_mode must be a string.")
+        if not isinstance(estimate_error, bool):
+            raise TypeError("estimate_error must be a boolean.")
         if "max_bond" in compress_opts or "cutoff" in compress_opts:
             raise TypeError(
                 "max_bond and cutoff must be supplied as explicit compression "
                 "arguments, not duplicated in compress_opts."
             )
 
+        reference = self.to_mpo() if estimate_error else None
         mpo = self.to_mpo()
         initial_bond_dimensions = tuple(int(size) for size in mpo.bond_sizes())
         mpo.compress(
@@ -880,6 +887,25 @@ class FirstDegreeMPO:
             **compress_opts,
         )
         final_bond_dimensions = tuple(int(size) for size in mpo.bond_sizes())
+        operator_frobenius_error = None
+        operator_frobenius_relative_error = None
+        error_estimator = None
+        if estimate_error:
+            # ``TensorNetwork.norm`` contracts the doubled network and hence
+            # computes the operator Frobenius norm here. Keeping this behind
+            # an explicit flag leaves the normal compression path unchanged.
+            difference = reference - mpo
+            operator_frobenius_error = difference.norm()
+            reference_norm = reference.norm()
+            try:
+                has_reference_norm = bool(reference_norm != 0)
+            except (TypeError, ValueError):  # pragma: no cover - tracer guard
+                has_reference_norm = True
+            if has_reference_norm:
+                operator_frobenius_relative_error = (
+                    operator_frobenius_error / reference_norm
+                )
+            error_estimator = "tensor-network-frobenius"
         report = MPONumericalCompressionReport(
             method="quimb",
             form=form,
@@ -889,6 +915,10 @@ class FirstDegreeMPO:
             initial_bond_dimensions=initial_bond_dimensions,
             final_bond_dimensions=final_bond_dimensions,
             truncated=final_bond_dimensions != initial_bond_dimensions,
+            truncation_error=operator_frobenius_error,
+            operator_frobenius_error=operator_frobenius_error,
+            operator_frobenius_relative_error=operator_frobenius_relative_error,
+            error_estimator=error_estimator,
         )
         # Numerical truncation invalidates the semantic history attachment.
         mpo.pepsy_first_degree = None
@@ -1407,6 +1437,174 @@ class FirstDegreeMPO:
                     warned = True
         return state_lists, cache_hit
 
+    def _history_levels_for_states(self, state_lists, exponent):
+        """Convert raw state tuples into the public level metadata."""
+        return [
+            [
+                MPOLevel(
+                    ("raw-history", exponent, bond, pos),
+                    tuple(
+                        token
+                        for factor in state
+                        for token in factor.history
+                    ),
+                    charge=tuple(factor.charge for factor in state),
+                )
+                for pos, state in enumerate(states)
+            ]
+            for bond, states in enumerate(state_lists)
+        ]
+
+    def _history_state_step(
+        self,
+        schemas,
+        left_states,
+        site,
+        *,
+        max_bond,
+        on_exceed,
+        warned,
+    ):
+        """Advance one raw-history cut without retaining earlier cuts."""
+        right_schema = schemas[site + 1]
+        edges = (
+            None
+            if self._structural_transitions is None
+            else self._structural_transitions[site]
+        )
+        next_states = []
+        seen = set()
+        for left_state in left_states:
+            options = []
+            for left_level in left_state:
+                if edges is None:
+                    level_options = right_schema
+                else:
+                    level_options = tuple(
+                        level
+                        for level in right_schema
+                        if (left_level.label, level.label) in edges
+                    )
+                if not level_options:
+                    break
+                options.append(level_options)
+            else:
+                for right_state in product(*options):
+                    key = tuple(level.label for level in right_state)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    next_states.append(right_state)
+                    if max_bond is not None and len(next_states) > max_bond:
+                        message = (
+                            "extensive_exponential history bond dimension "
+                            f"{len(next_states)} exceeds max_bond={max_bond} "
+                            f"after site {site}."
+                        )
+                        if on_exceed == "raise":
+                            raise MemoryError(message)
+                        if on_exceed == "warn" and not warned[0]:
+                            warnings.warn(message, RuntimeWarning, stacklevel=3)
+                            warned[0] = True
+        if not next_states:
+            raise ValueError(
+                f"raw-history construction found no reachable states after "
+                f"site {site}."
+            )
+        return tuple(next_states)
+
+    def _history_transition_allowed(self, site, left_state, right_state):
+        """Return whether a compound history has a structural local edge."""
+        if self._structural_transitions is None:
+            return True
+        edges = self._structural_transitions[site]
+        return all(
+            (left_level.label, right_level.label) in edges
+            for left_level, right_level in zip(left_state, right_state)
+        )
+
+    def _stream_history_power_data(
+        self,
+        exponent,
+        *,
+        schemas,
+        max_bond,
+        on_exceed,
+        sparse,
+    ):
+        """Build history tensors while retaining only two adjacent cuts.
+
+        The final MPO tensors still have to be materialized for Algorithms
+        1--4, but this path does not retain a complete topology table. Its
+        sparse variant also avoids structurally impossible local block
+        products. It is the memory-bounded path used by
+        ``cache_history=False`` together with ``history_storage='sparse'`` or
+        ``'streaming'``.
+        """
+        start_levels = tuple(
+            level
+            for level in schemas[0]
+            if _level_number(level.history[0]) == 1
+        )
+        if len(start_levels) != 1:
+            raise ValueError(
+                "history construction requires one level-1 starting channel."
+            )
+        left_states = (tuple(start_levels[0] for _ in range(exponent)),)
+        levels = [
+            self._history_levels_for_states((left_states,), exponent)[0]
+        ]
+        arrays = []
+        total_blocks = 0
+        stored_blocks = 0
+        warned = [False]
+
+        for site in range(self.L):
+            right_states = self._history_state_step(
+                schemas,
+                left_states,
+                site,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                warned=warned,
+            )
+            rows = []
+            reference = self._arrays[site][0, 0]
+            zero_block = None
+            for left_state in left_states:
+                blocks = []
+                for right_state in right_states:
+                    total_blocks += 1
+                    allowed = (
+                        not sparse
+                        or self._history_transition_allowed(
+                            site, left_state, right_state,
+                        )
+                    )
+                    if allowed:
+                        block = self._history_local_product(
+                            site, left_state, right_state,
+                        )
+                        stored_blocks += 1
+                    else:
+                        if zero_block is None:
+                            zero_block = ar.do("zeros_like", reference)
+                        block = zero_block
+                    blocks.append(block)
+                rows.append(_stack(blocks, axis=0))
+            arrays.append(_stack(rows, axis=0))
+            left_states = right_states
+            levels.append(
+                self._history_levels_for_states((left_states,), exponent)[0]
+            )
+
+        storage_info = {
+            "mode": "sparse" if sparse else "streaming",
+            "stored_blocks": stored_blocks,
+            "total_blocks": total_blocks,
+        }
+        return arrays, levels, False, storage_info
+
     @property
     def history_cache_info(self):
         """Describe cached raw history topologies without exposing arrays."""
@@ -1425,6 +1623,7 @@ class FirstDegreeMPO:
         max_bond=None,
         on_exceed="raise",
         cache_history=True,
+        history_storage="dense",
     ):
         """Build the full virtual-history representation of ``H**exponent``.
 
@@ -1448,40 +1647,71 @@ class FirstDegreeMPO:
             raise ValueError("history powers require a first-degree MPO.")
         self._first_degree_structure()
 
+        if history_storage not in {"auto", "dense", "sparse", "streaming"}:
+            raise ValueError(
+                "history_storage must be one of 'auto', 'dense', 'sparse', "
+                "or 'streaming'."
+            )
+        if history_storage == "streaming" and cache_history:
+            raise ValueError(
+                "history_storage='streaming' requires cache_history=False; "
+                "use history_storage='auto' for cached construction."
+            )
+        if history_storage == "auto":
+            history_storage = "streaming" if not cache_history else "dense"
+        schemas = self._history_schemas()
+        if history_storage in {"sparse", "streaming"} and not cache_history:
+            return self._stream_history_power_data(
+                exponent,
+                schemas=schemas,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                sparse=history_storage == "sparse",
+            )
+
         state_lists, cache_hit = self._history_topology(
             exponent,
             max_bond=max_bond,
             on_exceed=on_exceed,
             cache_history=cache_history,
         )
-        levels = []
-        for bond, states in enumerate(state_lists):
-            levels.append([
-                MPOLevel(
-                    ("raw-history", exponent, bond, pos),
-                    tuple(
-                        token
-                        for factor in state
-                        for token in factor.history
-                    ),
-                    charge=tuple(factor.charge for factor in state),
-                )
-                for pos, state in enumerate(states)
-            ])
+        levels = self._history_levels_for_states(state_lists, exponent)
 
         arrays = []
+        total_blocks = 0
+        stored_blocks = 0
         for site in range(self.L):
             rows = []
+            reference = self._arrays[site][0, 0]
+            zero_block = None
             for left_state in state_lists[site]:
                 blocks = []
                 for right_state in state_lists[site + 1]:
-                    block = self._history_local_product(
-                        site, left_state, right_state,
+                    total_blocks += 1
+                    allowed = (
+                        history_storage == "dense"
+                        or self._history_transition_allowed(
+                            site, left_state, right_state,
+                        )
                     )
+                    if allowed:
+                        block = self._history_local_product(
+                            site, left_state, right_state,
+                        )
+                        stored_blocks += 1
+                    else:
+                        if zero_block is None:
+                            zero_block = ar.do("zeros_like", reference)
+                        block = zero_block
                     blocks.append(block)
                 rows.append(_stack(blocks, axis=0))
             arrays.append(_stack(rows, axis=0))
-        return arrays, levels, cache_hit
+        storage_info = {
+            "mode": history_storage,
+            "stored_blocks": stored_blocks,
+            "total_blocks": total_blocks,
+        }
+        return arrays, levels, cache_hit, storage_info
 
     def _level_position(self, levels, wanted):
         """Find a base-level position by label or symbolic token."""
@@ -1946,6 +2176,7 @@ class FirstDegreeMPO:
         max_bond=None,
         on_exceed="raise",
         cache_history=True,
+        history_storage="auto",
     ):
         """Construct an arbitrary-order MPO using Algorithms 1--4.
 
@@ -1955,11 +2186,12 @@ class FirstDegreeMPO:
         prefactors, Algorithm 2 performs exact compression, and optional
         Algorithm 4 applies the analytical approximation.
         """
-        arrays, levels, history_cache_hit = self._history_power_data(
+        arrays, levels, history_cache_hit, storage_info = self._history_power_data(
             order,
             max_bond=max_bond,
             on_exceed=on_exceed,
             cache_history=cache_history,
+            history_storage=history_storage,
         )
         initial_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
@@ -1988,6 +2220,9 @@ class FirstDegreeMPO:
             "max_bond": max_bond,
             "on_exceed": on_exceed,
             "cache_history": bool(cache_history),
+            "history_storage": storage_info["mode"],
+            "history_storage_requested": history_storage,
+            "history_storage_blocks": storage_info,
             "initial_bond_dimensions": initial_bond_dimensions,
             "history_generation": (
                 "reachable" if self._structural_transitions is not None else "cartesian"
@@ -2052,6 +2287,7 @@ class FirstDegreeMPO:
         max_bond=None,
         on_exceed="raise",
         cache_history=True,
+        history_storage="auto",
     ):
         """Build the paper's size-extensive higher-order MPO.
 
@@ -2066,8 +2302,8 @@ class FirstDegreeMPO:
             Time-step or imaginary-time parameter ``tau``.
         order : int, default=1
             Taylor order. Multi-site chains use the generic history engine for
-            every positive order. One-site chains currently support orders one
-            and two through a direct local Taylor polynomial.
+            every positive order. One-site chains use a direct local Taylor
+            polynomial at arbitrary order.
         extend : bool, default=False
             Include Algorithm 3's selected order ``N + 1`` terms without
             increasing the analytical history bond dimension.
@@ -2093,16 +2329,25 @@ class FirstDegreeMPO:
         cache_history : bool, default=True
             Retain the raw reachable history topology for later calls. Set
             this to ``False`` for large-order or one-off constructions so the
-            topology is released after the current MPO is assembled.
+            topology is released after the current MPO is assembled. With the
+            default ``history_storage="auto"``, this also selects the
+            streaming local-history builder.
+        history_storage : {"auto", "dense", "sparse", "streaming"}, default="auto"
+            Storage policy for temporary raw-history tensors. ``"dense"``
+            retains the reference implementation. ``"sparse"`` skips
+            structurally impossible local transition products and
+            ``"streaming"`` retains only adjacent history cuts while building
+            the current MPO. ``"auto"`` selects ``"dense"`` when the topology
+            cache is enabled and ``"streaming"`` otherwise. The final MPO
+            tensors are necessarily materialized for Algorithms 1--4.
 
         Notes
         -----
         The first implementation targets ordinary NumPy/Autoray-compatible
         local MPO blocks. Native fermionic/Symmray compilation is deliberately
-        not enabled by this method yet. The one-site special case is kept
-        small and explicit; a future implementation can route arbitrary
-        one-site orders through the same history engine once its boundary
-        convention is generalized.
+        not enabled by this method yet. The one-site path is exact through its
+        requested local Taylor order; Algorithm 3/4 have no virtual history to
+        extend or merge there.
         """
         _check_scalar(dt, name="dt")
         if not isinstance(order, Integral) or int(order) < 1:
@@ -2118,6 +2363,16 @@ class FirstDegreeMPO:
             )
         if not isinstance(cache_history, bool):
             raise TypeError("cache_history must be a boolean.")
+        if history_storage not in {"auto", "dense", "sparse", "streaming"}:
+            raise ValueError(
+                "history_storage must be one of 'auto', 'dense', 'sparse', "
+                "or 'streaming'."
+            )
+        if history_storage == "streaming" and cache_history:
+            raise ValueError(
+                "history_storage='streaming' requires cache_history=False; "
+                "use history_storage='auto' for cached construction."
+            )
         if mode is not None:
             if not isinstance(mode, str):
                 raise TypeError("mode must be a string or None.")
@@ -2158,53 +2413,53 @@ class FirstDegreeMPO:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 cache_history=cache_history,
+                history_storage=history_storage,
             )
-        if extend or approximate or order >= 3:
-            raise NotImplementedError(
-                "generic history construction requires at least two sites."
-            )
-        # The only remaining case is a one-site direct Taylor polynomial. The
-        # multi-site history route returned above, and unsupported one-site
-        # options were rejected just before this branch.
+        # A one-site operator has no non-trivial virtual history. Evaluate its
+        # requested Taylor polynomial directly, with Algorithm 3's extension
+        # represented by one additional local Taylor term.
+        effective_order = order + int(extend)
         reference = self._arrays[0][0, 0]
         identity = ar.do("eye", self.phys_dim, like=reference)
         h = reference
-        if order == 1:
-            data = identity + _multiply_scalar(dt, h)
-        else:
-            data = (
-                identity
-                + _multiply_scalar(dt, h)
-                + _multiply_scalar(
-                    dt * dt / 2,
-                    ar.do("matmul", h, h),
-                )
+        data = identity
+        power = identity
+        for power_order in range(1, effective_order + 1):
+            power = ar.do("matmul", power, h)
+            data = data + _multiply_scalar(
+                dt ** power_order / factorial(power_order),
+                power,
             )
         return type(self)(
             (data,),
             levels=[[
                 MPOLevel(
-                    ("extensive", order, 0, ("11", None, None)),
+                    ("extensive", effective_order, 0, ("11", None, None)),
                     tuple(
                         self._levels[0][0].history[0]
-                        for _ in range(order)
+                        for _ in range(effective_order)
                     ),
                 )
             ]] * 2,
-            degree=order,
+            degree=effective_order,
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
             metadata={
                 "operation": "extensive_exponential",
                 "dt": dt,
-                "order": order,
+                "order": effective_order,
+                "requested_order": order,
                 "mode": canonical_mode,
                 "max_bond": max_bond,
                 "on_exceed": on_exceed,
                 "cache_history": bool(cache_history),
+                "history_storage": "one-site-local",
+                "history_storage_requested": history_storage,
                 "algorithms": ("one-site-taylor",),
                 "approximate": False,
+                "approximation_requested": bool(approximate),
+                "extension_requested": bool(extend),
             },
         )
 

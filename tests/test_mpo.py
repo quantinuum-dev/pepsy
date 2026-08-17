@@ -1,5 +1,7 @@
 """Tests for the semantic higher-order MPO foundation."""
 
+from math import factorial
+
 import numpy as np
 import pytest
 
@@ -389,6 +391,114 @@ def test_extensive_exponential_handles_one_site_terms():
         assert U.metadata["algorithms"] == ("one-site-taylor",)
 
 
+def test_extensive_exponential_one_site_supports_arbitrary_order_and_extension():
+    """One-site Taylor evaluation supports high orders and Algorithm 3 mode."""
+    _, _, z = _paulis()
+    H = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (z,))],
+    )
+
+    for order in (3, 5):
+        U = H.extensive_exponential(0.2, order=order)
+        expected = sum(
+            0.2**power * np.linalg.matrix_power(z, power) / factorial(power)
+            for power in range(order + 1)
+        )
+        np.testing.assert_allclose(U.to_mpo().to_dense(), expected)
+        assert U.metadata["order"] == order
+
+        extended = H.extensive_exponential(0.2, order=order, mode="optimal")
+        expected_extended = sum(
+            0.2**power
+            * np.linalg.matrix_power(z, power)
+            / factorial(power)
+            for power in range(order + 2)
+        )
+        np.testing.assert_allclose(
+            extended.to_mpo().to_dense(),
+            expected_extended,
+        )
+        assert extended.metadata["extension_requested"] is True
+
+
+def test_extensive_exponential_one_site_arbitrary_order_supports_torch_autograd():
+    """The direct local Taylor loop preserves Torch parameter gradients."""
+    torch = pytest.importorskip("torch")
+    _, _, z = _paulis()
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+    H = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (z,), coefficient)],
+    )
+    U = H.extensive_exponential(time, order=5, mode="optimal")
+    loss = U.arrays[0].real.sum()
+    coefficient_gradient, time_gradient = torch.autograd.grad(
+        loss,
+        (coefficient, time),
+    )
+    assert torch.isfinite(coefficient_gradient)
+    assert torch.isfinite(time_gradient)
+
+
+def test_extensive_exponential_one_site_arbitrary_order_supports_jax_jit():
+    """The direct local Taylor loop remains functional under JAX JIT."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    _, _, z = _paulis()
+
+    def objective(coefficient, time):
+        H = FirstDegreeMPO.from_local_terms(
+            1,
+            [MPOProductTerm((0,), (z,), coefficient)],
+        )
+        U = H.extensive_exponential(time, order=5, mode="optimal")
+        return jnp.real(U.arrays[0]).sum()
+
+    value, gradients = jax.jit(
+        jax.value_and_grad(objective, argnums=(0, 1)),
+    )(0.7, 0.2)
+    assert jnp.isfinite(value)
+    assert all(jnp.isfinite(gradient) for gradient in gradients)
+
+
+def test_extensive_exponential_streaming_and_sparse_storage_match_dense():
+    """Ephemeral storage modes avoid dead local products without changing U."""
+    H = _two_term_mpo()
+    dense = H.extensive_exponential(
+        0.01,
+        order=3,
+        mode="optimal",
+        cache_history=True,
+        history_storage="dense",
+    )
+    streaming = H.extensive_exponential(
+        0.01,
+        order=3,
+        mode="optimal",
+        cache_history=False,
+    )
+    sparse = H.extensive_exponential(
+        0.01,
+        order=3,
+        mode="optimal",
+        cache_history=False,
+        history_storage="sparse",
+    )
+
+    expected = dense.to_mpo().to_dense()
+    np.testing.assert_allclose(streaming.to_mpo().to_dense(), expected)
+    np.testing.assert_allclose(sparse.to_mpo().to_dense(), expected)
+    assert streaming.metadata["history_storage"] == "streaming"
+    assert sparse.metadata["history_storage"] == "sparse"
+    assert sparse.metadata["history_storage_blocks"]["stored_blocks"] < (
+        sparse.metadata["history_storage_blocks"]["total_blocks"]
+    )
+    assert streaming.history_cache_info["orders"] == ()
+    assert sparse.history_cache_info["orders"] == ()
+
+
 def test_extensive_exponential_supports_generic_order_three_histories():
     """Generic histories reproduce the expected third-order scaling."""
     scipy_linalg = pytest.importorskip("scipy.linalg")
@@ -622,6 +732,27 @@ def test_numerical_compression_delegates_to_quimb_with_report():
     assert compressed.bond_sizes() == [1, 1]
     assert compressed.pepsy_first_degree is None
     assert compressed.pepsy_numerical_compression_report is report
+
+
+def test_numerical_compression_can_estimate_operator_frobenius_error():
+    """Compression diagnostics can contract an MPO-level error estimate."""
+    U = _two_term_mpo().extensive_exponential(0.01, order=2)
+    original_dense = U.to_mpo().to_dense()
+    compressed, report = U.compress_numerical(
+        form="flat",
+        max_bond=1,
+        cutoff=0.0,
+        estimate_error=True,
+        return_report=True,
+    )
+
+    expected = np.linalg.norm(original_dense - compressed.to_dense())
+    assert report.error_estimator == "tensor-network-frobenius"
+    assert report.operator_frobenius_error == pytest.approx(expected)
+    assert report.truncation_error == pytest.approx(expected)
+    assert report.operator_frobenius_relative_error == pytest.approx(
+        expected / np.linalg.norm(original_dense),
+    )
 
 
 def test_numerical_compression_validates_max_bond():

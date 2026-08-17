@@ -82,20 +82,22 @@ contracting the finite-chain boundary vectors earlier would discard the
 channels they operate on. The final boundary contraction removes those
 temporary edge states and leaves an ordinary open-boundary MPO.
 
-The current reachable-history table is still a correctness-first reference
-implementation. Its temporary bond dimension can grow exponentially with the
-Taylor order and local MPO bond dimension, although no global dense matrix is
-formed. The raw topology is now reusable across parameter bindings and time
-steps, while exact history compression remains a value-dependent pass after
-the cached table is assembled. Reachability removes dead finite-boundary
-channels but does not change the worst-case allocation for a fully reachable
-local graph. `cache_history=False` provides an ephemeral mode for one-off
-large-order builds; a future sparse tensor backend can reduce the dense local
-transition storage itself.
+The reachable-history table can still grow exponentially with the Taylor order
+and local MPO bond dimension, although no global dense matrix is formed. The
+raw topology is reusable across parameter bindings and time steps, while exact
+history compression remains a value-dependent pass after the cached table is
+assembled. `history_storage="streaming"` (which requires
+`cache_history=False`) retains only adjacent cuts while
+building the current MPO, and `history_storage="sparse"` additionally skips
+structurally invalid local transition products. `cache_history=False` selects
+streaming automatically under the default `history_storage="auto"`; no
+persistent topology or complete history table is retained after the call.
+The final MPO tensors still must exist for the in-place Algorithm 1--4 passes.
 
-The one-site path is intentionally limited to direct orders one and two. It
-provides a simple boundary regression and avoids pretending that the generic
-multi-site history convention already covers every one-site edge case.
+The one-site path now evaluates an arbitrary-order local Taylor polynomial.
+With `extend=True` or `mode="optimal"`, it evaluates one additional local
+Taylor term; there are no non-trivial virtual channels for Algorithm 3 or 4 to
+rewire on a one-site chain.
 
 ## Deliberate implementation decisions
 
@@ -106,8 +108,9 @@ multi-site history convention already covers every one-site edge case.
   corresponding operator-valued row or column. A history match alone is not
   sufficient for an exact merge.
 - Numerical SVD/truncation is explicit through `compress_numerical` and is
-  delegated to Quimb. The returned report records bond dimensions and policy,
-  but does not invent a global operator error that Quimb does not provide.
+  delegated to Quimb. With `estimate_error=True`, the returned report also
+  contracts an operator-level Frobenius error through the MPO difference and
+  reports its relative value; the default avoids that extra contraction.
 - `compress_fixed_rank` uses a backend SVD with a fixed rank cap. Its Torch
   route scopes Pepsy's regularized SVD policy so rank-deficient blocks retain
   finite reverse-mode derivatives; it intentionally clears semantic history
@@ -122,17 +125,12 @@ multi-site history convention already covers every one-site edge case.
 
 ## Future implementation improvements
 
-The remaining implementation improvements are:
-
-1. Replace the reachable history lists with a sparse channel map or streaming
-   local iterator for high orders, while preserving the current
-   `MPOLevel.history` data.
-2. Generalize the one-site boundary convention to arbitrary order and promote
-   that path to the same execution/reporting contract.
-3. Add operator-level error estimates for numerical compression and benchmark
-   them against dense small-system or tensor-network norm references.
-4. Add native fermionic/Symmray compilation for the shared topology and the
-   fixed-rank compression contract.
+The remaining implementation improvements are native fermionic/Symmray
+compilation for the shared topology and fixed-rank compression, plus larger
+external timing studies. The maintained small-system accuracy regression in
+`tests/test_mpo_benchmarks.py` compares the finite MPO orders with first-order
+Trotter and a p=2 two-site cluster baseline; it is deliberately not a timing
+harness.
 
 These are implementation layers, not reasons to widen the current public API.
 The existing semantic and Quimb boundaries should remain stable while they are
