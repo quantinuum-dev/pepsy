@@ -109,6 +109,7 @@ _SYMBOL_MODULES = {
     "z": ".operators",
     "GlobalOptimizer": ".optimizers",
     "MpoOptimizer": ".optimizers",
+    "MpoChannelEvent": ".optimizers",
     "MpsEnergyOptimizer": ".optimizers",
     "MpsOptimizer": ".optimizers",
     "MpsStabOptimizer": ".optimizers",
@@ -383,7 +384,7 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan, TreeStabOptimizer, build_tree_operator, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
+    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoChannelEvent, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan, TreeStabOptimizer, build_tree_operator, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
     from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsSampler, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler  # noqa: F401
     from .solvers import FDSolver  # noqa: F401
     from .tensors import (  # noqa: F401

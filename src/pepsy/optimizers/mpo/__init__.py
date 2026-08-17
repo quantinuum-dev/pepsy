@@ -2,10 +2,11 @@
 
 from importlib import import_module
 
-from .optimizer import MpoOptimizer
+from .optimizer import MpoChannelEvent, MpoOptimizer
 
 __all__ = [
     "MpoOptimizer",
+    "MpoChannelEvent",
     "compression",
     "optimizer",
     "targets",

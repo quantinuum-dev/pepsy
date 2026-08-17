@@ -17,6 +17,10 @@ but differing in *how* two-site updates are compressed back to bond ``chi``:
 * ``mode="dmrg"`` — fit a target MPO with :class:`pepsy.fitting.local.FIT`
   inside a local window ``[xmin, xmax]``; supports batching consecutive
   two-site gates via ``k_2q_batch``;
+* ``mode="dmrg1"``, ``"dmrg2"``, or ``"dmrg3"`` — named DMRG schedules
+  sharing the same local MPO/FIT kernel: two-site growth for at most two
+  sweeps (``dmrg1``) or a configurable warm-up (``dmrg2``), three-site
+  warm-up (``dmrg3``), then one-site refinement;
 * ``mode="svd"``  — apply the gate with ``reduce-split`` then canonicalize +
   left-compress to ``chi``;
 * ``mode="mpo"``  — use :func:`pepsy.operators.gates.gate_nonlocal_opt` to
@@ -30,6 +34,11 @@ evolution (useful as a quick sanity signal).
 
 from __future__ import annotations
 
+import math
+import threading
+import time
+from copy import deepcopy
+from dataclasses import dataclass, field
 from numbers import Integral
 
 import autoray as ar
@@ -39,12 +48,142 @@ from ...tensors.core import tn_norm
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
-__all__ = ["MpoOptimizer"]
+__all__ = ["MpoChannelEvent", "MpoOptimizer"]
+
+
+@dataclass(frozen=True)
+class MpoChannelEvent:
+    """A deterministic local channel-sum event for :class:`MpoOptimizer`.
+
+    ``kraus`` contains local operator matrices ``K_i`` and the event applies
+    ``sum_i weights[i] * K_i O K_i†``. ``semantics='sum'`` is the only
+    executable MPO semantics: an MPO represents the deterministic channel
+    sum. ``semantics='sample'`` is retained as an explicit declaration and is
+    rejected at replay time because sampled branches belong to the MPS
+    trajectory API.
+    """
+
+    kraus: tuple
+    where: tuple
+    weights: tuple | None = None
+    labels: tuple | None = None
+    semantics: str = "sum"
+
+    def __post_init__(self):
+        kraus = tuple(self.kraus)
+        where = (int(self.where),) if isinstance(self.where, Integral) else tuple(
+            int(site) for site in self.where
+        )
+        if not kraus:
+            raise ValueError("MpoChannelEvent needs at least one Kraus operator.")
+        if len(where) not in {1, 2}:
+            raise ValueError("MpoChannelEvent supports one- or two-site channels.")
+        matrices = []
+        for operator in kraus:
+            matrix = np.asarray(ar.to_numpy(operator))
+            if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+                raise ValueError("Kraus operators must be square matrices.")
+            matrices.append(matrix)
+        dimension = matrices[0].shape[0]
+        if any(matrix.shape != (dimension, dimension) for matrix in matrices):
+            raise ValueError("All Kraus operators must have the same dimension.")
+        if len(where) == 2:
+            local_dimension = int(round(np.sqrt(dimension)))
+            if local_dimension * local_dimension != dimension:
+                raise ValueError(
+                    "Two-site channel matrices must have dimension d**2 by d**2."
+                )
+        semantics = str(self.semantics).strip().lower().replace("-", "_")
+        if semantics not in {"sum", "sample"}:
+            raise ValueError("channel semantics must be 'sum' or 'sample'.")
+        weights = (
+            tuple(1.0 for _ in matrices)
+            if self.weights is None
+            else tuple(float(weight) for weight in self.weights)
+        )
+        if len(weights) != len(matrices) or any(
+            not math.isfinite(weight) or weight < 0.0 for weight in weights
+        ):
+            raise ValueError("channel weights must be finite and non-negative.")
+        labels = (
+            tuple(str(index) for index in range(len(matrices)))
+            if self.labels is None
+            else tuple(str(label) for label in self.labels)
+        )
+        if len(labels) != len(matrices) or len(set(labels)) != len(labels):
+            raise ValueError("channel labels must be unique and match kraus operators.")
+        object.__setattr__(self, "kraus", tuple(matrices))
+        object.__setattr__(self, "where", where)
+        object.__setattr__(self, "weights", weights)
+        object.__setattr__(self, "labels", labels)
+        object.__setattr__(self, "semantics", semantics)
+
+    @classmethod
+    def from_channel(cls, channel, where, *, semantics="sum"):
+        """Adapt a public ``TrajectoryChannel`` to deterministic MPO semantics."""
+        outcomes = tuple(getattr(channel, "outcomes", ()))
+        if not outcomes:
+            raise TypeError("channel must expose non-empty outcomes.")
+        weights = tuple(
+            1.0
+            if getattr(channel, "mode", "kraus") == "kraus"
+            else float(outcome.probability)
+            for outcome in outcomes
+        )
+        return cls(
+            tuple(outcome.gate for outcome in outcomes),
+            where,
+            weights=weights,
+            labels=tuple(outcome.label for outcome in outcomes),
+            semantics=semantics,
+        )
+
+
+@dataclass(frozen=True)
+class _MpoStreamPlan:
+    """Immutable MPO stream metadata with a thread-safe payload cache."""
+
+    entries: tuple
+    gates: tuple
+    where: tuple
+    event_types: tuple[str, ...]
+    arities: tuple[int, ...]
+    spans: tuple[tuple[int, int], ...]
+    _prepared_cache: dict = field(default_factory=dict, compare=False, repr=False)
+    _cache_lock: object = field(
+        default_factory=threading.RLock,
+        compare=False,
+        repr=False,
+    )
+
+    def get_or_create(self, key, source, factory):
+        """Return a prepared gate payload, invalidating stale source identities."""
+        with self._cache_lock:
+            cached = self._prepared_cache.get(key)
+            if cached is not None and cached[0] is source:
+                return cached[1]
+            value = factory()
+            self._prepared_cache[key] = (source, value)
+            return value
 
 
 def _normalize_gate_queue(gates):
     """Return ``(gate_list, where_list)`` from canonical bundled stream input."""
-    entries = _normalize_gate_entries(gates, where=None, allow_empty=True)
+    if isinstance(gates, MpoChannelEvent):
+        return [gates], [gates.where]
+    if isinstance(gates, (tuple, list)) and any(
+        isinstance(entry, MpoChannelEvent) for entry in gates
+    ):
+        entries = []
+        for entry in gates:
+            if isinstance(entry, MpoChannelEvent):
+                entries.append((entry, entry.where))
+            else:
+                entries.extend(
+                    _normalize_gate_entries((entry,), where=None, allow_empty=False)
+                )
+    else:
+        entries = _normalize_gate_entries(gates, where=None, allow_empty=True)
     if not entries:
         return [], []
     gate_list, where_list = zip(*entries)
@@ -57,6 +196,33 @@ def _normalize_gate_queue(gates):
         return where
 
     return list(gate_list), [normalize_where(where) for where in where_list]
+
+
+def _prepare_mpo_stream(gates):
+    """Compile immutable MPO stream metadata once at queue boundaries."""
+    gate_list, where_list = _normalize_gate_queue(gates)
+    entries = tuple(zip(gate_list, where_list))
+    event_types = []
+    arities = []
+    spans = []
+    for gate, where in entries:
+        if isinstance(gate, MpoChannelEvent):
+            event_types.append(f"channel_{gate.semantics}")
+        else:
+            event_types.append("gate")
+        arity = len(where)
+        if arity not in {1, 2}:
+            raise ValueError("Each MPO stream entry must touch one or two sites.")
+        arities.append(arity)
+        spans.append((min(where), max(where)))
+    return _MpoStreamPlan(
+        entries=entries,
+        gates=tuple(gate_list),
+        where=tuple(where_list),
+        event_types=tuple(event_types),
+        arities=tuple(arities),
+        spans=tuple(spans),
+    )
 
 
 class MpoOptimizer:
@@ -78,11 +244,16 @@ class MpoOptimizer:
         * ``(None, B)``    → apply ``B†`` on bra only;
         * ``(G, B)``       → apply ``G`` on ket and ``B†`` on bra.
 
+        A :class:`MpoChannelEvent` is also accepted as a stream entry. It
+        applies a deterministic weighted Kraus sum and records trace-
+        preservation diagnostics separately from Hilbert-Schmidt norm
+        survival. Sampled branch semantics are intentionally rejected here.
+
         For backward compatibility, passing a bare ``int`` is treated as
         ``chi`` with an empty gate queue.
     chi : int
         Working bond dimension used by all compression backends.
-    mode : {"dmrg", "svd", "mpo"}, default="dmrg"
+    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo"}, default="dmrg"
         Execution backend for two-site updates (see module docstring).
     ind_id_k : str, default="k{}"
         Site-index format string for the ket physical leg family.
@@ -109,7 +280,10 @@ class MpoOptimizer:
         orthogonality center / span).
     """
 
-    _ALLOWED_MODES = frozenset({"dmrg", "svd", "mpo"})
+    _DMRG_MODE_ALIASES = {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3}
+    _ALLOWED_MODES = frozenset(
+        {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo"}
+    )
 
     @staticmethod
     def _is_symmray_array(value):
@@ -171,10 +345,19 @@ class MpoOptimizer:
     def _normalize_mode(cls, mode):
         """Lower-case and validate ``mode`` against :attr:`_ALLOWED_MODES`."""
         mode_norm = str(mode).strip().lower()
+        # Keep one maintained DMRG/FIT implementation while retaining the
+        # requested named schedule separately in ``_dmrg_mode_alias``.
+        if mode_norm in cls._DMRG_MODE_ALIASES:
+            mode_norm = "dmrg"
         if mode_norm not in cls._ALLOWED_MODES:
             supported = ", ".join(sorted(cls._ALLOWED_MODES))
             raise ValueError(f"Unknown mode: {mode}. Supported modes: {supported}")
         return mode_norm
+
+    @classmethod
+    def _dmrg_alias_block_size(cls, mode):
+        """Return the native FIT block size selected by a named mode."""
+        return cls._DMRG_MODE_ALIASES.get(str(mode).strip().lower())
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -202,18 +385,228 @@ class MpoOptimizer:
         self.inplace = bool(inplace)
         # Work on a copy by default so the user's input MPO stays unchanged.
         self.p = mpo if self.inplace else mpo.copy()
-        self.G, self.where = _normalize_gate_queue(gates)
+        self._stream_plan = _prepare_mpo_stream(gates)
+        self.G = list(self._stream_plan.gates)
+        self.where = list(self._stream_plan.where)
+        if not isinstance(chi, Integral) or int(chi) < 1:
+            raise ValueError("chi must be a positive integer.")
         self.chi = int(chi)
+        mode_name = str(mode).strip().lower()
+        self._dmrg_mode_alias = (
+            mode_name if mode_name in self._DMRG_MODE_ALIASES else None
+        )
         self.mode = self._normalize_mode(mode)
         self.ind_id_k = str(ind_id_k)
         self.ind_id_b = str(ind_id_b)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
 
-        # Reference norm used to normalize the loss proxy in `_normalize_norm`.
+        # Reference norm used to normalize the compatibility norm proxy. The
+        # structured norm ledger below tracks compression survival separately.
         self.norm_mpo = self._measure_norm(self.p)
+        self._reference_log_norm = self._log_norm_from_measurement(self.norm_mpo)
         self.info_c = {}
         self.losses = [1.0]
+        self.norm_events = []
+        self._norm_log_survival = 0.0
+        self.fit_diagnostics = []
+        self._last_dmrg_fit_diagnostics = None
+        self.last_run_timing = None
+        self.last_run_status = "not_run"
+        self.last_run_error = None
+        self.last_run_fallback = None
+        self.channel_events = []
+        self.fallback_events = []
+        self.trace_events = []
+        self.logical_order = list(range(int(self.p.L)))
+        self._persistent_layout_plan = None
+        self.last_layout_plan = None
         self._init_canonicalization()
+
+    @property
+    def gate_stream(self):
+        """Return the immutable compiled MPO gate/event stream."""
+        return self._stream_plan.entries
+
+    @property
+    def stream_plan(self):
+        """Return compiled stream metadata and cache statistics source."""
+        return self._stream_plan
+
+    def compile_gate_stream(self):
+        """Return a reusable summary of the current compiled gate stream."""
+        return {
+            "entries": self._stream_plan.entries,
+            "event_types": self._stream_plan.event_types,
+            "arities": self._stream_plan.arities,
+            "spans": self._stream_plan.spans,
+            "length": len(self._stream_plan.entries),
+            "prepared_cache_size": len(self._stream_plan._prepared_cache),
+        }
+
+    def clear_gate_cache(self):
+        """Clear prepared gate payloads while retaining the compiled stream."""
+        with self._stream_plan._cache_lock:
+            self._stream_plan._prepared_cache.clear()
+        return self
+
+    def gate_stream_layout(self, *, sites=None, L=None, order="quality", **kwargs):
+        """Find a physical MPO order that reduces long-range gate spans."""
+        if any(event_type != "gate" for event_type in self._stream_plan.event_types):
+            raise ValueError(
+                "MPO layout planning currently requires an ordinary gate stream; "
+                "plan channel streams separately."
+            )
+        from ..mps.layout import MpsGateStreamLayoutFinder
+
+        finder = MpsGateStreamLayoutFinder(self.gate_stream, sites=sites, L=L)
+        return finder.run(order=order, **kwargs)
+
+    def _validate_layout_plan(self, plan):
+        """Validate a layout plan against the MPO site positions."""
+        length = int(self.p.L)
+        site_order = tuple(plan.get("site_order", plan.get("qubit_inds", ())))
+        if site_order != tuple(int(site) for site in site_order):
+            raise ValueError("MPO layout sites must be integer positions.")
+        if set(site_order) != set(range(length)) or len(site_order) != length:
+            raise ValueError("MPO layout must be a permutation of range(mpo.L).")
+        site_map = plan.get("site_map", plan.get("layout"))
+        expected = {site: position for position, site in enumerate(site_order)}
+        if not isinstance(site_map, dict) or dict(site_map) != expected:
+            raise ValueError("MPO layout site_map must match site_order.")
+
+    def _resolve_layout_plan(self, plan_or_order, layout_kwargs=None):
+        """Resolve an explicit, finder-generated, or position layout plan."""
+        if isinstance(plan_or_order, dict):
+            plan = dict(plan_or_order)
+        elif isinstance(plan_or_order, str):
+            plan = self.gate_stream_layout(
+                order=plan_or_order,
+                **dict(layout_kwargs or {}),
+            )
+        else:
+            site_order = tuple(int(site) for site in plan_or_order)
+            plan = {
+                "kind": "mpo_gate_stream_layout",
+                "selected_order": "explicit",
+                "site_order": site_order,
+                "qubit_inds": site_order,
+                "site_map": {
+                    site: position for position, site in enumerate(site_order)
+                },
+            }
+        self._validate_layout_plan(plan)
+        return plan
+
+    def apply_layout(
+        self,
+        plan_or_order="quality",
+        *,
+        cutoff=0.0,
+        cutoff_mode="rsum2",
+        allow_lossy_reorder=False,
+        layout_kwargs=None,
+    ):
+        """Install a persistent physical MPO order using exact SWAP conjugations.
+
+        The gate stream remains expressed in logical site labels; subsequent
+        replay maps those labels through the installed ``site_map``. Reordering
+        an already entangled MPO can require bond growth, so lossy compression
+        during this one-time operation is opt-in.
+        """
+        if self._persistent_layout_plan is not None:
+            raise ValueError("an MPO layout is already installed on this optimizer.")
+        plan = self._resolve_layout_plan(plan_or_order, layout_kwargs)
+        if self.p.max_bond() > 1 and not allow_lossy_reorder:
+            raise ValueError(
+                "reordering an entangled MPO requires allow_lossy_reorder=True."
+            )
+        import quimb as qu
+
+        cutoff = self._resolve_cutoff(cutoff, self.p)
+        current_order = list(range(int(self.p.L)))
+        for target_position, logical_site in enumerate(plan["site_order"]):
+            current_position = current_order.index(int(logical_site))
+            while current_position > target_position:
+                left = current_position - 1
+                expected = self._canonical_norm_value(self.p)
+                swap = qu.swap()
+                self._apply_gate_pair(
+                    self.p,
+                    swap,
+                    (left, current_position),
+                    bra_gate=swap,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    contract="reduce-split",
+                    inplace=True,
+                )
+                self.canonize_mpo(self.p, (left, current_position))
+                for site in range(current_position, left, -1):
+                    self.p.right_canonize_site(site, bra=None)
+                self.p.left_compress(
+                    start=left,
+                    stop=current_position,
+                    max_bond=self.chi,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
+                self.info_c["cur_orthog"] = (current_position, current_position)
+                observed = self._canonical_norm_value(
+                    self.p, center=current_position
+                )
+                self._record_norm_event(
+                    "layout_swap",
+                    expected_norm=expected,
+                    observed_norm=observed,
+                    target_norm=expected,
+                    where=(left, current_position),
+                )
+                current_order[left], current_order[current_position] = (
+                    current_order[current_position],
+                    current_order[left],
+                )
+                current_position -= 1
+        self._persistent_layout_plan = plan
+        self.logical_order = list(plan["site_order"])
+        self.last_layout_plan = plan
+        return self
+
+    def _execution_stream(self):
+        """Return the compiled stream mapped into the installed MPO order."""
+        if self._persistent_layout_plan is None:
+            return list(self.G), list(self.where)
+        site_map = self._persistent_layout_plan["site_map"]
+        gates = []
+        wheres = []
+        for gate, where in self._stream_plan.entries:
+            mapped = tuple(site_map[int(site)] for site in where)
+            if isinstance(gate, MpoChannelEvent):
+                gate = MpoChannelEvent(
+                    gate.kraus,
+                    mapped,
+                    weights=gate.weights,
+                    labels=gate.labels,
+                    semantics=gate.semantics,
+                )
+            gates.append(gate)
+            wheres.append(mapped)
+        return gates, wheres
+
+    @staticmethod
+    def channel_event(channel, where, *, semantics="sum"):
+        """Create an MPO channel event from ``TrajectoryChannel``-like input."""
+        return MpoChannelEvent.from_channel(channel, where, semantics=semantics)
+
+    @staticmethod
+    def kraus_event(kraus, where, *, labels=None, weights=None, semantics="sum"):
+        """Create a deterministic or explicitly rejected sampled Kraus event."""
+        return MpoChannelEvent(
+            tuple(kraus),
+            where,
+            labels=labels,
+            weights=weights,
+            semantics=semantics,
+        )
 
     def _current_orthog(self, p=None):
         """Return cached ``(min_site, max_site)`` orthogonality span.
@@ -265,25 +658,52 @@ class MpoOptimizer:
     def set_mpo(self, mpo):
         """Assign a new MPO and reset canonicalization metadata."""
         self.p = mpo if self.inplace else mpo.copy()
+        if not isinstance(self.chi, Integral) or self.chi < 1:
+            raise ValueError("chi must be a positive integer.")
         self.norm_mpo = self._measure_norm(self.p)
+        self._reference_log_norm = self._log_norm_from_measurement(self.norm_mpo)
+        self.losses = [1.0]
+        self.norm_events = []
+        self._norm_log_survival = 0.0
+        self.fit_diagnostics = []
+        self._last_dmrg_fit_diagnostics = None
+        self.last_run_timing = None
+        self.last_run_status = "not_run"
+        self.last_run_error = None
+        self.last_run_fallback = None
+        self.channel_events = []
+        self.fallback_events = []
+        self.trace_events = []
+        self.logical_order = list(range(int(self.p.L)))
+        self._persistent_layout_plan = None
+        self.last_layout_plan = None
         self._init_canonicalization()
         return self
 
     def set_mode(self, mode):
         """Set execution mode."""
+        mode_name = str(mode).strip().lower()
+        self._dmrg_mode_alias = (
+            mode_name if mode_name in self._DMRG_MODE_ALIASES else None
+        )
         self.mode = self._normalize_mode(mode)
         return self
 
     def set_gates(self, gates):
         """Replace the current gate queue with canonical bundled entries."""
-        self.G, self.where = _normalize_gate_queue(gates)
+        self._stream_plan = _prepare_mpo_stream(gates)
+        self.G = list(self._stream_plan.gates)
+        self.where = list(self._stream_plan.where)
         return self
 
     def add_gates(self, gates):
         """Append canonical bundled entries to the existing gate queue."""
-        G_new, where_new = _normalize_gate_queue(gates)
-        self.G.extend(G_new)
-        self.where.extend(where_new)
+        new_plan = _prepare_mpo_stream(gates)
+        self._stream_plan = _prepare_mpo_stream(
+            self._stream_plan.entries + new_plan.entries
+        )
+        self.G = list(self._stream_plan.gates)
+        self.where = list(self._stream_plan.where)
         return self
 
     @staticmethod
@@ -329,9 +749,81 @@ class MpoOptimizer:
                 pass
         return float(real_value)
 
+    @staticmethod
+    def _log_norm_from_measurement(norm_val):
+        """Return the natural log of an MPO norm measurement.
+
+        ``tn_norm(..., strip_exponent=True)`` returns a mantissa/exponent pair
+        for the squared norm. Keeping the logarithm here avoids reconstructing
+        huge or tiny norms merely to form a relative ratio.
+        """
+        mantissa, exponent = norm_val
+        mantissa = float(abs(mantissa))
+        exponent = float(exponent)
+        if mantissa == 0.0:
+            return -math.inf
+        if not math.isfinite(mantissa) or not math.isfinite(exponent):
+            return math.nan
+        return 0.5 * (math.log(mantissa) + exponent * math.log(10.0))
+
+    @staticmethod
+    def _exp_from_log(value):
+        """Exponentiate a log value while preserving useful overflow semantics."""
+        value = float(value)
+        if math.isnan(value):
+            return math.nan
+        if value == -math.inf:
+            return 0.0
+        if value >= math.log(np.finfo(float).max):
+            return math.inf
+        if value <= math.log(np.nextafter(0.0, 1.0)):
+            return 0.0
+        return float(math.exp(value))
+
+    def _canonical_norm_value(self, p, center=None):
+        """Return the represented MPO norm from a one-site center when possible.
+
+        Quimb's open-boundary MPO canonical form makes the center tensor norm
+        equal to the full Hilbert-Schmidt MPO norm. This is the cheap local
+        measurement used for progress and compression events. Disposable target
+        MPOs are allowed to recanonicalize in place; the live optimizer cache is
+        updated only when ``p is self.p``.
+        """
+        try:
+            if center is None:
+                # Native block-sparse MPOs can make ``calc_current_orthog_center``
+                # fall through an allclose-to-identity check that densifies a
+                # very large virtual tensor. The optimizer already maintains a
+                # valid center after every compression, so prefer that cache for
+                # the live state and only discover a center for disposable MPOs.
+                if p is self.p:
+                    center = self.info_c.get("cur_orthog")
+                if center in (None, "calc"):
+                    center = p.calc_current_orthog_center()
+            if isinstance(center, Integral):
+                site = int(center)
+                span = (site, site)
+            else:
+                span = tuple(int(value) for value in center)
+                site = int(span[-1])
+                span = (min(span), max(span))
+            if span[0] != span[1]:
+                p.canonize([site], cur_orthog=span)
+            norm = self._real_float(ar.do("abs", p[site].norm()))
+            if p is self.p:
+                self.info_c["cur_orthog"] = (site, site)
+            return norm
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            mantissa, exponent = self._measure_norm(p)
+            return self._exp_from_log(
+                self._log_norm_from_measurement((mantissa, exponent))
+            )
+
     def _append_norm_proxy_sample(self, p):
         """Append current normalized MPO norm and return it."""
-        norm_val = self._normalize_norm(self._measure_norm(p))
+        norm_value = self._canonical_norm_value(p)
+        log_norm = math.log(abs(norm_value)) if norm_value > 0.0 else -math.inf
+        norm_val = self._exp_from_log(log_norm - self._reference_log_norm)
         self.losses.append(norm_val)
         return norm_val
 
@@ -351,11 +843,125 @@ class MpoOptimizer:
         MPO norms relative to the construction-time reference ``norm_mpo``.
         For purely unitary two-sided evolution this stays equal to ``1``.
         """
-        m, e = norm_val
-        m0, e0 = self.norm_mpo
-        if m0 == 0.0:
-            return 0.0 if m == 0.0 else float("inf")
-        return float(np.sqrt(abs(m / m0))) * 10 ** ((e - e0) / 2)
+        log_norm = self._log_norm_from_measurement(norm_val)
+        return self._exp_from_log(log_norm - self._reference_log_norm)
+
+    @staticmethod
+    def _norm_fidelity_ratio(observed_norm, expected_norm):
+        """Return raw and clipped squared norm survival for one compression."""
+        observed_norm = float(abs(observed_norm))
+        expected_norm = float(abs(expected_norm))
+        if (
+            expected_norm <= 0.0
+            or not math.isfinite(expected_norm)
+            or not math.isfinite(observed_norm)
+        ):
+            return None, None
+        raw = (observed_norm / expected_norm) ** 2
+        return raw, min(1.0, max(0.0, raw))
+
+    def _record_norm_event(
+        self,
+        kind,
+        *,
+        expected_norm,
+        observed_norm,
+        where=(),
+        target_norm=None,
+    ):
+        """Record automatic MPO compression norm survival.
+
+        The expected norm is measured from the disposable target before FIT or
+        direct compression. A physical norm change therefore does not appear
+        as compression infidelity; only the retained/expected norm ratio is
+        accumulated.
+        """
+        raw, survival = self._norm_fidelity_ratio(observed_norm, expected_norm)
+        if survival is not None:
+            if survival == 0.0:
+                self._norm_log_survival = -math.inf
+            elif math.isfinite(self._norm_log_survival):
+                self._norm_log_survival += math.log(survival)
+
+        event = {
+            "kind": str(kind),
+            "where": tuple(int(site) for site in where),
+            "valid": raw is not None,
+            "expected_norm": (
+                None if raw is None else float(abs(expected_norm))
+            ),
+            "observed_norm": (
+                None if raw is None else float(abs(observed_norm))
+            ),
+            "target_norm": (
+                None if target_norm is None else float(abs(target_norm))
+            ),
+            "norm_fidelity_raw": None if raw is None else float(raw),
+            "norm_fidelity": None if survival is None else float(survival),
+            "norm_infidelity": (
+                None if survival is None else float(1.0 - survival)
+            ),
+            "cumulative_norm_fidelity": self._cumulative_norm_fidelity(),
+            "cumulative_norm_infidelity": self._cumulative_norm_infidelity(),
+        }
+        self.norm_events.append(event)
+        return event
+
+    def _cumulative_norm_fidelity(self):
+        """Return cumulative squared norm survival in a stable form."""
+        return self._exp_from_log(self._norm_log_survival)
+
+    def _cumulative_norm_infidelity(self):
+        """Return cumulative norm infidelity using stable ``expm1``."""
+        if self._norm_log_survival == -math.inf:
+            return 1.0
+        if not math.isfinite(self._norm_log_survival):
+            return math.nan
+        return float(-math.expm1(self._norm_log_survival))
+
+    def norm_diagnostics(self):
+        """Return structured MPO norm-survival diagnostics."""
+        valid = [event for event in self.norm_events if event["valid"]]
+        return {
+            "tracking": True,
+            "events": len(self.norm_events),
+            "completed_events": len(valid),
+            "norm_survival": self._cumulative_norm_fidelity(),
+            "norm_infidelity": self._cumulative_norm_infidelity(),
+            "fidelity": self._cumulative_norm_fidelity(),
+            "infidelity": self._cumulative_norm_infidelity(),
+            "current_event": None if not valid else deepcopy(valid[-1]),
+            "segment_infidelities": [
+                event["norm_infidelity"] for event in valid
+            ],
+            "max_segment_infidelity": (
+                None
+                if not valid
+                else max(event["norm_infidelity"] for event in valid)
+            ),
+        }
+
+    def get_trace_events(self):
+        """Return channel trace-preservation records."""
+        return deepcopy(self.trace_events)
+
+    def channel_diagnostics(self):
+        """Return channel-sum and trace-preservation diagnostics."""
+        events = self.get_trace_events()
+        return {
+            "events": len(events),
+            "channel_events": deepcopy(self.channel_events),
+            "fallback_events": deepcopy(self.fallback_events),
+            "trace_events": events,
+            "trace_preserving": all(
+                event["channel_trace_preserving"] for event in events
+            ),
+            "max_trace_preservation_residual": (
+                0.0
+                if not events
+                else max(event["trace_preservation_residual"] for event in events)
+            ),
+        }
 
     @staticmethod
     def _prepare_gate_tensor(gate, n_sites):
@@ -536,6 +1142,57 @@ class MpoOptimizer:
                 )
         return p
 
+    def _build_mpo_target(
+        self,
+        p,
+        gate,
+        where,
+        bra_gate,
+        cutoff,
+        cutoff_mode="rsum2",
+    ):
+        """Build an uncapped regular MPO target for one gate pair."""
+        p_g = p.copy()
+        if len(where) == 1:
+            self._apply_gate_pair(
+                p_g,
+                gate,
+                where,
+                bra_gate=bra_gate,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                contract=True,
+                inplace=True,
+            )
+            return p_g
+
+        g_k, g_b = self._prepare_gate_pair(
+            gate,
+            len(where),
+            bra_gate=bra_gate,
+            p=p_g,
+            where=where,
+            ind_id=self.ind_id_k,
+        )
+        for prepared, which in ((g_k, "upper"), (g_b, "lower")):
+            if prepared is None:
+                continue
+            p_g = gate_nonlocal_opt(
+                p_g,
+                prepared,
+                where,
+                which=which,
+                method="direct",
+                info={},
+                inplace=True,
+                ind_id_k=self.ind_id_k,
+                ind_id_b=self.ind_id_b,
+                max_bond=None,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        return p_g
+
     @staticmethod
     def _parse_gate_entry(G_i, where_i):
         """Decompose one stream entry into ``(ket_gate, bra_gate, where)``.
@@ -586,14 +1243,39 @@ class MpoOptimizer:
         two index families stay decoupled.
         """
         n_sites = len(where)
-        g_k, g_b = self._prepare_gate_pair(
-            gate,
-            n_sites,
-            bra_gate=bra_gate,
-            p=p,
-            where=where,
-            ind_id=self.ind_id_k,
+        needs_state_adaptation = self._has_symmray_data(p) or any(
+            self._is_fermionic_array(operator)
+            for operator in (gate, bra_gate)
+            if operator is not None
         )
+        if needs_state_adaptation:
+            g_k, g_b = self._prepare_gate_pair(
+                gate,
+                n_sites,
+                bra_gate=bra_gate,
+                p=p,
+                where=where,
+                ind_id=self.ind_id_k,
+            )
+        else:
+            key = (
+                "pair",
+                id(gate),
+                id(bra_gate),
+                n_sites,
+                self.ind_id_k,
+                self.ind_id_b,
+            )
+            source = gate if gate is not None else bra_gate
+            g_k, g_b = self._stream_plan.get_or_create(
+                key,
+                source,
+                lambda: self._prepare_gate_pair(
+                    gate,
+                    n_sites,
+                    bra_gate=bra_gate,
+                ),
+            )
 
         if g_k is not None:
             apply_gate(
@@ -631,6 +1313,7 @@ class MpoOptimizer:
         cutoff_mode="rsum2",
         *,
         target_cutoff=None,
+        target_strategy="auto",
     ):
         """Return ``p`` with one two-site gate pair applied via ``split-gate``.
 
@@ -639,6 +1322,25 @@ class MpoOptimizer:
         """
         if target_cutoff is None:
             target_cutoff = cutoff
+        target_strategy = self._validate_fit_target_strategy(target_strategy)
+        if target_strategy == "auto":
+            target_strategy = (
+                "mpo" if self._has_symmray_data(p) else "layered"
+            )
+        if target_strategy == "layered" and self._has_symmray_data(p):
+            raise ValueError(
+                "fit_target_strategy='layered' is only available for dense MPOs; "
+                "use 'auto' or 'mpo' for native Symmray data."
+            )
+        if target_strategy == "mpo" and not self._has_symmray_data(p):
+            return self._build_mpo_target(
+                p,
+                gate,
+                where,
+                bra_gate,
+                target_cutoff,
+                cutoff_mode,
+            )
         p_g = p.copy()
         self._apply_gate_pair(
             p_g,
@@ -675,6 +1377,8 @@ class MpoOptimizer:
         while idx < len(G_seq) and two_qubit_in_batch < k_2q_batch:
             where = tuple(where_seq[idx])
             gate = G_seq[idx]
+            if isinstance(gate, MpoChannelEvent):
+                break
             if max_span is not None and batch_where:
                 sites = [site for previous in batch_where for site in previous]
                 sites.extend(where)
@@ -703,6 +1407,7 @@ class MpoOptimizer:
         cutoff_mode="rsum2",
         *,
         target_cutoff=None,
+        target_strategy="auto",
     ):
         """Apply a collected DMRG batch onto a copy of ``p``.
 
@@ -712,9 +1417,31 @@ class MpoOptimizer:
         """
         if target_cutoff is None:
             target_cutoff = cutoff
+        target_strategy = self._validate_fit_target_strategy(target_strategy)
+        if target_strategy == "auto":
+            target_strategy = "mpo" if self._has_symmray_data(p) else "layered"
+        if target_strategy == "layered" and self._has_symmray_data(p):
+            raise ValueError(
+                "fit_target_strategy='layered' is only available for dense MPOs; "
+                "use 'auto' or 'mpo' for native Symmray data."
+            )
         p_g = p.copy()
         for G_i, where_i in zip(batch_G, batch_where):
             gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
+            if (
+                target_strategy == "mpo"
+                and not self._has_symmray_data(p_g)
+                and len(where) == 2
+            ):
+                p_g = self._build_mpo_target(
+                    p_g,
+                    gate,
+                    where,
+                    bra_gate,
+                    target_cutoff,
+                    cutoff_mode,
+                )
+                continue
             contract = True if len(where) == 1 else "split-gate"
             self._apply_gate_pair(
                 p_g,
@@ -727,6 +1454,450 @@ class MpoOptimizer:
                 inplace=True,
             )
         return p_g
+
+    @staticmethod
+    def _validate_fit_target_strategy(strategy):
+        """Normalize the MPO FIT target representation policy."""
+        strategy = str(strategy).strip().lower()
+        if strategy not in {"auto", "layered", "mpo"}:
+            raise ValueError(
+                "fit_target_strategy must be 'auto', 'layered', or 'mpo'."
+            )
+        return strategy
+
+    @staticmethod
+    def _is_unitary_gate(gate):
+        """Return whether ``gate`` is a numerically unitary operator.
+
+        This is deliberately a small-gate check. It lets the norm ledger use
+        the already canonical live MPO as the expected-norm measurement for
+        the common ``U O U†`` path, avoiding a second target contraction. If
+        the gate cannot be inspected cheaply, return ``False`` so explicit
+        target construction remains the conservative choice.
+        """
+        if gate is None:
+            return False
+        try:
+            dense = gate.to_dense()
+        except AttributeError:
+            dense = gate
+        try:
+            dense = np.asarray(ar.to_numpy(dense))
+        except (TypeError, ValueError):
+            return False
+        if dense.ndim == 4:
+            dense = dense.reshape(
+                int(np.prod(dense.shape[:2])),
+                int(np.prod(dense.shape[2:])),
+            )
+        if dense.ndim != 2 or dense.shape[0] != dense.shape[1]:
+            return False
+        try:
+            gram = dense.conj().T @ dense
+            return bool(
+                np.allclose(
+                    gram,
+                    np.eye(dense.shape[0], dtype=dense.dtype),
+                    rtol=1.0e-10,
+                    atol=1.0e-12,
+                )
+            )
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return False
+
+    def _expected_target_norm(
+        self,
+        p,
+        gate,
+        where,
+        bra_gate,
+        *,
+        target=None,
+        target_cutoff=0.0,
+        cutoff_mode="rsum2",
+        target_strategy="auto",
+    ):
+        """Measure the expected post-gate norm without redundant work.
+
+        A bare unitary gate (the default MPO API meaning) preserves the MPO
+        Hilbert-Schmidt norm before compression. In that case the live
+        canonical center is the exact expected norm. Explicit ket/bra pairs
+        and non-unitary gates use the materialized target, so physical norm
+        changes are still separated from truncation loss.
+        """
+        if bra_gate is gate and self._is_unitary_gate(gate):
+            return self._canonical_norm_value(p)
+        if target is None:
+            target = self._build_dmrg_target(
+                p,
+                gate,
+                where,
+                bra_gate,
+                cutoff=0.0,
+                cutoff_mode=cutoff_mode,
+                target_cutoff=target_cutoff,
+                target_strategy=target_strategy,
+            )
+        return self._canonical_norm_value(target)
+
+    def _expected_batch_target_norm(
+        self,
+        p,
+        batch_G,
+        batch_where,
+        *,
+        target,
+        cutoff_mode="rsum2",
+    ):
+        """Measure a batched target norm, skipping it for all-unitary batches."""
+        all_unitary = True
+        for G_i, where_i in zip(batch_G, batch_where):
+            gate, bra_gate, _ = self._parse_gate_entry(G_i, where_i)
+            if bra_gate is not gate or not self._is_unitary_gate(gate):
+                all_unitary = False
+                break
+        if all_unitary:
+            return self._canonical_norm_value(p)
+        return self._canonical_norm_value(target)
+
+    def _resolve_dmrg_fit_block_size(self, p, xmin, xmax, requested):
+        """Resolve the live native FIT block for one MPO target window.
+
+        ``dmrg1`` starts directly in its one-site phase when all bonds in a
+        non-adjacent active window already have their attainable rank. This
+        mirrors the MPS schedule and avoids repeating growth decompositions
+        after the MPO has reached its local bond ceiling. If a backend does
+        not expose the rank helpers for an MPO, retaining the requested block
+        is the safe fallback.
+        """
+        active = min(int(requested), int(xmax) - int(xmin) + 1)
+        if (
+            self._dmrg_mode_alias != "dmrg1"
+            or active != 2
+            or int(xmax) - int(xmin) < 2
+        ):
+            return active
+        try:
+            at_target = FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+                p,
+                int(xmin),
+                int(xmax),
+                self.chi,
+            )
+        except (AttributeError, TypeError, ValueError):
+            at_target = False
+        return 1 if at_target else active
+
+    def _record_fit_diagnostics(self, fit, *, where, block_size, step):
+        """Store a compact diagnostic record for the latest MPO FIT call."""
+        record = {
+            "step": int(step),
+            "where": tuple(int(site) for site in where),
+            "block_size": int(block_size),
+            "iterations": int(getattr(fit, "iterations_run", 0)),
+            "converged": bool(getattr(fit, "converged", False)),
+            "convergence_reason": getattr(fit, "convergence_reason", None),
+            "relative_change": getattr(fit, "last_relative_change", None),
+            "center_site": getattr(fit, "final_center_site", None),
+            "direction": getattr(fit, "final_direction", None),
+            "final_norm": getattr(fit, "final_norm", None),
+            "adaptive_sweeps": int(getattr(fit, "adaptive_sweeps_run", 0)),
+            "one_site_refinement_sweeps": int(
+                getattr(fit, "one_site_sweeps_run", 0)
+            ),
+        }
+        timing_records = getattr(fit, "_take_timing_records", None)
+        if callable(timing_records):
+            record["timing"] = timing_records()
+        self.fit_diagnostics.append(record)
+        self._last_dmrg_fit_diagnostics = record
+        return record
+
+    @staticmethod
+    def _finite_mpo(p):
+        """Return whether every dense or block-sparse MPO array is finite."""
+        for tensor in getattr(p, "tensors", ()):
+            data = getattr(tensor, "data", None)
+            arrays = getattr(data, "blocks", None)
+            if isinstance(arrays, dict):
+                arrays = arrays.values()
+            elif arrays is None:
+                arrays = (data,)
+            for array in arrays:
+                try:
+                    finite = ar.do("all", ar.do("isfinite", array))
+                    if not bool(ar.to_numpy(finite)):
+                        return False
+                except (TypeError, ValueError, AttributeError):
+                    try:
+                        if not np.all(np.isfinite(np.asarray(array))):
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+        return True
+
+    def _check_finite(self, finite_check, p=None):
+        """Run the requested MPO finite-data check after a replay step."""
+        if finite_check in (None, False):
+            return
+        state = self.p if p is None else p
+        if callable(finite_check):
+            valid = bool(finite_check(state))
+        else:
+            valid = self._finite_mpo(state)
+        if not valid:
+            raise FloatingPointError(
+                "MPO replay produced non-finite tensor data."
+            )
+
+    @staticmethod
+    def _measure_trace(p):
+        """Return the real trace of an MPO, with a scalar backend fallback."""
+        value = p.trace()
+        return float(np.real(ar.to_numpy(value)))
+
+    @staticmethod
+    def _relative_trace_residual(value, reference):
+        """Return a scale-aware absolute trace residual."""
+        scale = max(1.0, abs(float(reference)))
+        return abs(float(value) - float(reference)) / scale
+
+    def _build_channel_target(self, p, event, *, cutoff_mode="rsum2"):
+        """Build the exact deterministic channel sum before output compression."""
+        target = None
+        for operator, weight in zip(event.kraus, event.weights):
+            if weight == 0.0:
+                continue
+            branch = self._build_dmrg_target(
+                p,
+                operator,
+                event.where,
+                operator,
+                cutoff=0.0,
+                cutoff_mode=cutoff_mode,
+                target_cutoff=0.0,
+                # A channel sum is assembled with MPO addition, which needs
+                # one tensor per site. Materialize each disposable branch
+                # before adding it, even on dense backends where ordinary FIT
+                # targets can remain layered.
+                target_strategy="mpo",
+            )
+            if weight != 1.0:
+                branch.multiply_(weight)
+            if target is None:
+                target = branch
+            else:
+                target.add_MPO_(branch)
+        if target is None:
+            raise ValueError("channel event has no nonzero outcome weight.")
+        return target
+
+    def _record_trace_event(self, p_before, target, p_after, event):
+        """Record channel trace preservation separately from norm survival."""
+        input_trace = self._measure_trace(p_before)
+        target_trace = self._measure_trace(target)
+        observed_trace = self._measure_trace(p_after)
+        completeness = sum(
+            float(weight) * matrix.conj().T @ matrix
+            for matrix, weight in zip(event.kraus, event.weights)
+        )
+        identity = np.eye(completeness.shape[0], dtype=completeness.dtype)
+        completeness_residual = float(
+            np.linalg.norm(completeness - identity)
+            / max(1.0, np.linalg.norm(identity))
+        )
+        target_residual = self._relative_trace_residual(target_trace, input_trace)
+        compression_residual = self._relative_trace_residual(
+            observed_trace, target_trace
+        )
+        record = {
+            "kind": "channel_sum",
+            "where": tuple(event.where),
+            "semantics": event.semantics,
+            "labels": tuple(event.labels),
+            "weights": tuple(float(weight) for weight in event.weights),
+            "input_trace": input_trace,
+            "target_trace": target_trace,
+            "observed_trace": observed_trace,
+            "channel_completeness_residual": completeness_residual,
+            "channel_trace_preserving": bool(completeness_residual <= 1.0e-10),
+            "target_trace_residual": target_residual,
+            "compression_trace_residual": compression_residual,
+            "trace_preservation_residual": max(target_residual, compression_residual),
+        }
+        self.trace_events.append(record)
+        return record
+
+    def _run_channel_sum_event(
+        self,
+        p,
+        event,
+        *,
+        cutoff,
+        cutoff_mode,
+        backend,
+        fit_runner=None,
+        fit_block_size=2,
+        step=None,
+        transactional_steps=True,
+        fit_fallback=None,
+    ):
+        """Apply and compress one deterministic channel event."""
+        if event.semantics == "sample":
+            raise ValueError(
+                "MPO channel events require semantics='sum'; sampled branches "
+                "belong to MpsOptimizer trajectory replay."
+            )
+        snapshot = (
+            self._capture_run_state(p)
+            if backend == "dmrg" and (transactional_steps or fit_fallback is not None)
+            else None
+        )
+        # Target construction works on branch copies, so the live ``p`` is
+        # still the pre-channel state when trace diagnostics are evaluated.
+        # FIT and direct compression are intentionally allowed to mutate their
+        # input MPO in place. Keep an immutable pre-channel witness so the
+        # trace-preservation report compares input -> target -> retained output
+        # rather than accidentally comparing the output to itself.
+        p_before = p.copy()
+        target = self._build_channel_target(p, event, cutoff_mode=cutoff_mode)
+        expected_norm = self._canonical_norm_value(target)
+        fit = None
+        if backend == "dmrg" and max(event.where) > min(event.where):
+            xmin, xmax = min(event.where), max(event.where)
+            self.canonize_mpo(p, (xmin, xmax))
+            fit = FIT(
+                target,
+                p=p,
+                cutoffs=cutoff,
+                contraction_opt=self.contraction_opt,
+                retag=False,
+                range_int=[xmin, xmax],
+                inplace=True,
+                copy_target=False,
+            )
+            active_block_size = min(int(fit_block_size), xmax - xmin + 1)
+            try:
+                fit_runner(fit, active_block_size)
+            except Exception as exc:
+                if snapshot is None:
+                    raise
+                self._restore_run_state(snapshot)
+                self._record_fit_failure(
+                    exc,
+                    where=event.where,
+                    block_size=active_block_size,
+                    step=step or 0,
+                )
+                if fit_fallback is None:
+                    raise
+                fallback_backend = "mpo" if fit_fallback == "mpo" else "svd"
+                p_after = self._run_channel_sum_event(
+                    self.p,
+                    event,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    backend=fallback_backend,
+                    transactional_steps=False,
+                )
+                self.fallback_events.append(
+                    {
+                        "kind": "fit_fallback",
+                        "where": tuple(int(site) for site in event.where),
+                        "backend": fit_fallback,
+                        "step": int(step or 0),
+                    }
+                )
+                self.last_run_fallback = fit_fallback
+                return p_after
+            p_after = fit.p
+            final_center = fit.final_center_site
+            if final_center is None:
+                final_center = xmax
+            observed_norm = self._canonical_norm_value(p_after, final_center)
+            self.info_c["cur_orthog"] = (int(final_center), int(final_center))
+            self._record_fit_diagnostics(
+                fit,
+                where=event.where,
+                block_size=active_block_size,
+                step=step or 0,
+            )
+        else:
+            p_after = target
+            p_after.compress(
+                form="left",
+                max_bond=self.chi,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+            self.p = p_after
+            self._init_canonicalization()
+            observed_norm = self._canonical_norm_value(p_after)
+        self.p = p_after
+        self._record_norm_event(
+            "channel_sum",
+            expected_norm=expected_norm,
+            observed_norm=observed_norm,
+            target_norm=expected_norm,
+            where=event.where,
+        )
+        trace_record = self._record_trace_event(p_before, target, p_after, event)
+        self.channel_events.append(
+            {
+                "kind": "channel_sum",
+                "where": tuple(event.where),
+                "outcomes": len(event.kraus),
+                "backend": backend,
+                "trace_preserving": trace_record["channel_trace_preserving"],
+                "trace_preservation_residual": trace_record[
+                    "trace_preservation_residual"
+                ],
+            }
+        )
+        return p_after
+
+    def _capture_run_state(self, p=None):
+        """Capture optimizer state needed for atomic DMRG recovery."""
+        return {
+            "p": (self.p if p is None else p).copy(),
+            "info_c": deepcopy(self.info_c),
+            "losses": list(self.losses),
+            "norm_events": deepcopy(self.norm_events),
+            "norm_log_survival": self._norm_log_survival,
+            "fit_diagnostics": deepcopy(self.fit_diagnostics),
+            "last_fit": deepcopy(self._last_dmrg_fit_diagnostics),
+            "channel_events": deepcopy(self.channel_events),
+            "fallback_events": deepcopy(self.fallback_events),
+            "trace_events": deepcopy(self.trace_events),
+        }
+
+    def _restore_run_state(self, snapshot):
+        """Restore an atomic replay snapshot."""
+        self.p = snapshot["p"]
+        self.info_c = snapshot["info_c"]
+        self.losses = snapshot["losses"]
+        self.norm_events = snapshot["norm_events"]
+        self._norm_log_survival = snapshot["norm_log_survival"]
+        self.fit_diagnostics = snapshot["fit_diagnostics"]
+        self._last_dmrg_fit_diagnostics = snapshot["last_fit"]
+        self.channel_events = snapshot["channel_events"]
+        self.fallback_events = snapshot["fallback_events"]
+        self.trace_events = snapshot["trace_events"]
+
+    def _record_fit_failure(self, exc, *, where, block_size, step):
+        """Retain a failed FIT attempt in the public per-update history."""
+        record = {
+            "step": int(step),
+            "where": tuple(int(site) for site in where),
+            "block_size": int(block_size),
+            "iterations": 0,
+            "converged": False,
+            "convergence_reason": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        self.fit_diagnostics.append(record)
+        self._last_dmrg_fit_diagnostics = record
+        return record
 
     def _run_dmrg(
         self,
@@ -743,6 +1914,19 @@ class MpoOptimizer:
         fit_max_span=None,
         fit_three_site_sweeps=1,
         target_cutoff=0.0,
+        adaptive_block_sweeps=None,
+        adaptive_until_rank=False,
+        single_pair_fast_path=False,
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=1,
+        finite_check=False,
+        timing=False,
+        timing_sync_device=False,
+        collect_split_diagnostics=False,
+        fit_target_strategy="auto",
+        transactional_steps=True,
+        fit_fallback=None,
     ):
         """Sweep the gate stream with local DMRG-style FIT compression.
 
@@ -751,7 +1935,9 @@ class MpoOptimizer:
         bond ``chi`` inside the gate window ``[xmin, xmax]``. ``fit_block_size``
         selects the one-, two-, or three-site native SVD update, and its
         cutoff policy is forwarded explicitly to both SVD splits and the
-        requested sweep sequence.
+        requested sweep sequence. Named DMRG modes additionally pass FIT's
+        adaptive block schedule so the larger block is followed by fixed-rank
+        one-site refinement.
         """
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
@@ -762,6 +1948,8 @@ class MpoOptimizer:
         }:
             raise ValueError("fit_block_size must be 1, 2, or 3.")
         fit_block_size = int(fit_block_size)
+        fit_target_strategy = self._validate_fit_target_strategy(fit_target_strategy)
+        transactional_steps = bool(transactional_steps)
 
         p = self.p
         two_qubit_count = 0
@@ -780,8 +1968,134 @@ class MpoOptimizer:
                 colour="CYAN",
             )
 
+        def run_local_fit(fit, active_block_size):
+            """Run FIT while keeping generic and named schedules separate."""
+            fit_kwargs = {
+                "n_iter": n_iter,
+                "verbose": False,
+                "block_size": active_block_size,
+                "sweep_sequence": fit_sweep_sequence,
+                "max_bond": self.chi,
+                "cutoff": cutoff,
+                "cutoff_mode": cutoff_mode,
+                "three_site_sweeps": fit_three_site_sweeps,
+                "min_iter": fit_min_iter,
+                "rtol": fit_rtol,
+                "patience": fit_patience,
+                "finite_check": finite_check,
+                "timing": timing,
+                "timing_sync_device": timing_sync_device,
+                "collect_split_diagnostics": collect_split_diagnostics,
+            }
+            if adaptive_block_sweeps is not None:
+                fit_kwargs.update(
+                    adaptive_block_sweeps=adaptive_block_sweeps,
+                    adaptive_until_rank=adaptive_until_rank,
+                )
+            if single_pair_fast_path:
+                fit_kwargs["single_pair_fast_path"] = True
+            fit.run_gate(**fit_kwargs)
+
+        def run_local_fit_transactional(
+            fit,
+            active_block_size,
+            *,
+            step_start,
+            step_end,
+            where,
+        ):
+            """Run one FIT update with optional per-update recovery/fallback."""
+            nonlocal p
+            snapshot = (
+                self._capture_run_state(p)
+                if transactional_steps or fit_fallback is not None
+                else None
+            )
+            try:
+                run_local_fit(fit, active_block_size)
+            except Exception as exc:
+                if snapshot is None:
+                    self._record_fit_failure(
+                        exc,
+                        where=where,
+                        block_size=active_block_size,
+                        step=step_start + 1,
+                    )
+                    raise
+                self._restore_run_state(snapshot)
+                p = self.p
+                # Restoring the per-step snapshot also restores diagnostic
+                # history, so append the failed attempt after the rollback.
+                self._record_fit_failure(
+                    exc,
+                    where=where,
+                    block_size=active_block_size,
+                    step=step_start + 1,
+                )
+                if fit_fallback is None:
+                    raise
+                direct_runner = self._run_mpo if (
+                    fit_fallback == "mpo" and not self._has_symmray_data(p)
+                ) else self._run_svd
+                direct_runner(
+                    G_seq[step_start:step_end],
+                    where_seq[step_start:step_end],
+                    progbar=False,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=0,
+                    finite_check=finite_check,
+                    fit_target_strategy=fit_target_strategy,
+                )
+                p = self.p
+                self.fallback_events.append(
+                    {
+                        "kind": "fit_fallback",
+                        "where": tuple(int(site) for site in where),
+                        "backend": fit_fallback,
+                        "step": int(step_start + 1),
+                    }
+                )
+                self.last_run_fallback = fit_fallback
+                return p, None
+            return fit.p, fit
+
         idx = 0
         while idx < len(G_seq):
+            if isinstance(G_seq[idx], MpoChannelEvent):
+                event = G_seq[idx]
+                if len(event.where) == 2:
+                    two_qubit_count += 1
+                p = self._run_channel_sum_event(
+                    p,
+                    event,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    backend="dmrg",
+                    fit_runner=run_local_fit,
+                    fit_block_size=fit_block_size,
+                    step=idx + 1,
+                    transactional_steps=transactional_steps,
+                    fit_fallback=fit_fallback,
+                )
+                idx += 1
+                self._check_finite(finite_check, p)
+                norm_proxy = (
+                    self._append_norm_proxy_sample(p)
+                    if idx in sample_steps
+                    else norm_proxy
+                )
+                if pbar is not None:
+                    pbar.set_postfix(
+                        {
+                            "2q": two_qubit_count,
+                            "~F": self._cumulative_norm_fidelity(),
+                            "norm": norm_proxy,
+                            "bnd": p.max_bond(),
+                        }
+                    )
+                    pbar.update(1)
+                continue
             gate, bra_gate, where = self._parse_gate_entry(G_seq[idx], where_seq[idx])
             n_sites = len(where)
             if n_sites == 1:
@@ -810,6 +2124,7 @@ class MpoOptimizer:
                         cutoff,
                         cutoff_mode,
                         target_cutoff=target_cutoff,
+                        target_strategy=fit_target_strategy,
                     )
 
                     fit = FIT(
@@ -819,26 +2134,59 @@ class MpoOptimizer:
                         contraction_opt=self.contraction_opt,
                         retag=False,
                         range_int=[xmin, xmax],
+                        inplace=True,
+                        copy_target=False,
                     )
-                    active_fit_block_size = min(
-                        fit_block_size,
-                        xmax - xmin + 1,
-                    )
-                    fit.run_gate(
-                        n_iter=n_iter,
-                        verbose=False,
-                        block_size=active_fit_block_size,
-                        sweep_sequence=fit_sweep_sequence,
-                        max_bond=self.chi,
-                        cutoff=cutoff,
+                    expected_norm = self._expected_target_norm(
+                        p,
+                        gate,
+                        where,
+                        bra_gate,
+                        target=p_g,
+                        target_cutoff=target_cutoff,
+                        target_strategy=fit_target_strategy,
                         cutoff_mode=cutoff_mode,
-                        three_site_sweeps=fit_three_site_sweeps,
                     )
-                    p = fit.p
-
-                    self.info_c["cur_orthog"] = (xmin, xmax)
-                    idx += 1
-                    advanced = 1
+                    active_fit_block_size = self._resolve_dmrg_fit_block_size(
+                        p,
+                        xmin,
+                        xmax,
+                        fit_block_size,
+                    )
+                    p, fit_result = run_local_fit_transactional(
+                        fit,
+                        active_fit_block_size,
+                        step_start=idx,
+                        step_end=idx + 1,
+                        where=where,
+                    )
+                    if fit_result is None:
+                        idx += 1
+                        advanced = 1
+                    else:
+                        final_center = fit.final_center_site
+                        if final_center is None:
+                            final_center = p.calc_current_orthog_center()[-1]
+                        observed_norm = self._canonical_norm_value(p, final_center)
+                        self.info_c["cur_orthog"] = (
+                            int(final_center),
+                            int(final_center),
+                        )
+                        self._record_norm_event(
+                            "dmrg_compression",
+                            expected_norm=expected_norm,
+                            observed_norm=observed_norm,
+                            target_norm=expected_norm,
+                            where=(xmin, xmax),
+                        )
+                        self._record_fit_diagnostics(
+                            fit,
+                            where=(xmin, xmax),
+                            block_size=active_fit_block_size,
+                            step=idx + 1,
+                        )
+                        idx += 1
+                        advanced = 1
                 else:
                     batch_G, batch_where, two_qubit_in_batch, next_idx = (
                         self._collect_dmrg_batch(
@@ -863,6 +2211,7 @@ class MpoOptimizer:
                         cutoff,
                         cutoff_mode,
                         target_cutoff=target_cutoff,
+                        target_strategy=fit_target_strategy,
                     )
 
                     fit = FIT(
@@ -872,36 +2221,74 @@ class MpoOptimizer:
                         contraction_opt=self.contraction_opt,
                         retag=False,
                         range_int=[xmin, xmax],
+                        inplace=True,
+                        copy_target=False,
                     )
-                    active_fit_block_size = min(
-                        fit_block_size,
-                        xmax - xmin + 1,
-                    )
-                    fit.run_gate(
-                        n_iter=n_iter,
-                        verbose=False,
-                        block_size=active_fit_block_size,
-                        sweep_sequence=fit_sweep_sequence,
-                        max_bond=self.chi,
-                        cutoff=cutoff,
+                    expected_norm = self._expected_batch_target_norm(
+                        p,
+                        batch_G,
+                        batch_where,
+                        target=p_g,
                         cutoff_mode=cutoff_mode,
-                        three_site_sweeps=fit_three_site_sweeps,
                     )
-                    p = fit.p
-
-                    self.info_c["cur_orthog"] = (xmin, xmax)
-                    advanced = next_idx - idx
-                    idx = next_idx
+                    active_fit_block_size = self._resolve_dmrg_fit_block_size(
+                        p,
+                        xmin,
+                        xmax,
+                        fit_block_size,
+                    )
+                    p, fit_result = run_local_fit_transactional(
+                        fit,
+                        active_fit_block_size,
+                        step_start=idx,
+                        step_end=next_idx,
+                        where=(xmin, xmax),
+                    )
+                    if fit_result is None:
+                        advanced = next_idx - idx
+                        idx = next_idx
+                    else:
+                        final_center = fit.final_center_site
+                        if final_center is None:
+                            final_center = p.calc_current_orthog_center()[-1]
+                        observed_norm = self._canonical_norm_value(p, final_center)
+                        self.info_c["cur_orthog"] = (
+                            int(final_center),
+                            int(final_center),
+                        )
+                        self._record_norm_event(
+                            "dmrg_compression",
+                            expected_norm=expected_norm,
+                            observed_norm=observed_norm,
+                            target_norm=expected_norm,
+                            where=(xmin, xmax),
+                        )
+                        self._record_fit_diagnostics(
+                            fit,
+                            where=(xmin, xmax),
+                            block_size=active_fit_block_size,
+                            step=idx + 1,
+                        )
+                        advanced = next_idx - idx
+                        idx = next_idx
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 
-            if idx in sample_steps:
+            self._check_finite(finite_check, p)
+            # A batched update represents several gate steps, so its endpoint
+            # can skip all linearly selected sample indices. Preserve the
+            # historical per-update trace in that case while keeping
+            # ``fidelity_samples=0`` opt-out semantics.
+            if idx in sample_steps or (
+                fidelity_samples > 0 and advanced > 1 and idx < len(G_seq)
+            ):
                 norm_proxy = self._append_norm_proxy_sample(p)
 
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": norm_proxy,
+                    "~F": self._cumulative_norm_fidelity(),
+                    "norm": norm_proxy,
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -912,7 +2299,17 @@ class MpoOptimizer:
 
         self.p = p
 
-    def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", fidelity_samples=10):
+    def _run_svd(
+        self,
+        G_seq,
+        where_seq,
+        progbar=False,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        fidelity_samples=10,
+        finite_check=False,
+        fit_target_strategy="auto",
+    ):
         """Sweep the gate stream with local ``reduce-split`` + left-compress.
 
         Two-site updates use ``apply_gate(..., contract='reduce-split')``
@@ -938,6 +2335,32 @@ class MpoOptimizer:
 
         idx = 0
         while idx < len(G_seq):
+            if isinstance(G_seq[idx], MpoChannelEvent):
+                event = G_seq[idx]
+                if len(event.where) == 2:
+                    two_qubit_count += 1
+                p = self._run_channel_sum_event(
+                    p,
+                    event,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    backend="svd",
+                )
+                idx += 1
+                self._check_finite(finite_check, p)
+                if idx in sample_steps:
+                    norm_proxy = self._append_norm_proxy_sample(p)
+                if pbar is not None:
+                    pbar.set_postfix(
+                        {
+                            "2q": two_qubit_count,
+                            "~F": self._cumulative_norm_fidelity(),
+                            "norm": norm_proxy,
+                            "bnd": p.max_bond(),
+                        }
+                    )
+                    pbar.update(1)
+                continue
             gate, bra_gate, where = self._parse_gate_entry(G_seq[idx], where_seq[idx])
             n_sites = len(where)
             if n_sites == 1:
@@ -954,6 +2377,28 @@ class MpoOptimizer:
             elif n_sites == 2:
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
+                target = None
+                if bra_gate is not gate or not self._is_unitary_gate(gate):
+                    target = self._build_dmrg_target(
+                        p,
+                        gate,
+                        where,
+                        bra_gate,
+                        cutoff=0.0,
+                        cutoff_mode=cutoff_mode,
+                        target_cutoff=0.0,
+                        target_strategy=fit_target_strategy,
+                    )
+                expected_norm = self._expected_target_norm(
+                    p,
+                    gate,
+                    where,
+                    bra_gate,
+                    target=target,
+                    target_cutoff=0.0,
+                    target_strategy=fit_target_strategy,
+                    cutoff_mode=cutoff_mode,
+                )
                 contract = (
                     "split-gate"
                     if self._has_symmray_data(p) and (xmax - xmin > 1)
@@ -981,9 +2426,23 @@ class MpoOptimizer:
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                 )
+                # ``left_compress`` leaves the active window's right edge as
+                # the canonical center. Supplying it explicitly avoids a
+                # native block-sparse center discovery that may densify a
+                # large virtual tensor.
+                observed_norm = self._canonical_norm_value(p, center=xmax)
+                self.info_c["cur_orthog"] = (xmax, xmax)
+                self._record_norm_event(
+                    "svd_compression",
+                    expected_norm=expected_norm,
+                    observed_norm=observed_norm,
+                    target_norm=expected_norm,
+                    where=(xmin, xmax),
+                )
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 
+            self._check_finite(finite_check, p)
             idx += 1
             if idx in sample_steps:
                 norm_proxy = self._append_norm_proxy_sample(p)
@@ -991,7 +2450,8 @@ class MpoOptimizer:
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": norm_proxy,
+                    "~F": self._cumulative_norm_fidelity(),
+                    "norm": norm_proxy,
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -1003,7 +2463,17 @@ class MpoOptimizer:
         self.p = p
 
 
-    def _run_mpo(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", fidelity_samples=10):
+    def _run_mpo(
+        self,
+        G_seq,
+        where_seq,
+        progbar=False,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        fidelity_samples=10,
+        finite_check=False,
+        fit_target_strategy="auto",
+    ):
         """Sweep the gate stream with :func:`gate_nonlocal_opt` compression.
 
         Two-site gates are routed through ``gate_nonlocal_opt`` independently
@@ -1030,6 +2500,33 @@ class MpoOptimizer:
 
         idx = 0
         while idx < len(G_seq):
+            if isinstance(G_seq[idx], MpoChannelEvent):
+                event = G_seq[idx]
+                if len(event.where) == 2:
+                    two_qubit_count += 1
+                p = self._run_channel_sum_event(
+                    p,
+                    event,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    backend="mpo",
+                )
+                idx += 1
+                self.p = p
+                self._check_finite(finite_check, p)
+                if idx in sample_steps:
+                    norm_proxy = self._append_norm_proxy_sample(p)
+                if pbar is not None:
+                    pbar.set_postfix(
+                        {
+                            "2q": two_qubit_count,
+                            "~F": self._cumulative_norm_fidelity(),
+                            "norm": norm_proxy,
+                            "bnd": p.max_bond(),
+                        }
+                    )
+                    pbar.update(1)
+                continue
             gate, bra_gate, where = self._parse_gate_entry(G_seq[idx], where_seq[idx])
             n_sites = len(where)
             if n_sites == 1:
@@ -1045,6 +2542,28 @@ class MpoOptimizer:
                 )
             elif n_sites == 2:
                 two_qubit_count += 1
+                target = None
+                if bra_gate is not gate or not self._is_unitary_gate(gate):
+                    target = self._build_dmrg_target(
+                        p,
+                        gate,
+                        where,
+                        bra_gate,
+                        cutoff=0.0,
+                        cutoff_mode=cutoff_mode,
+                        target_cutoff=0.0,
+                        target_strategy=fit_target_strategy,
+                    )
+                expected_norm = self._expected_target_norm(
+                    p,
+                    gate,
+                    where,
+                    bra_gate,
+                    target=target,
+                    target_cutoff=0.0,
+                    target_strategy=fit_target_strategy,
+                    cutoff_mode=cutoff_mode,
+                )
                 g_k, g_b = self._prepare_gate_pair(
                     gate,
                     n_sites,
@@ -1072,9 +2591,22 @@ class MpoOptimizer:
                         cutoff_mode=cutoff_mode,
                     )
                 self.p = p
+                observed_center = self.info_c.get("cur_orthog")
+                observed_norm = self._canonical_norm_value(
+                    p,
+                    center=observed_center,
+                )
+                self._record_norm_event(
+                    "mpo_compression",
+                    expected_norm=expected_norm,
+                    observed_norm=observed_norm,
+                    target_norm=expected_norm,
+                    where=where,
+                )
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 
+            self._check_finite(finite_check, p)
             idx += 1
             if idx in sample_steps:
                 norm_proxy = self._append_norm_proxy_sample(self.p)
@@ -1082,7 +2614,8 @@ class MpoOptimizer:
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": norm_proxy,
+                    "~F": self._cumulative_norm_fidelity(),
+                    "norm": norm_proxy,
                     "bnd": self.p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -1108,7 +2641,24 @@ class MpoOptimizer:
         fit_sweep_sequence="RL",
         fit_max_span="auto",
         fit_three_site_sweeps=1,
+        fit_adaptive_sweeps=2,
+        fit_single_pair_fast_path=True,
         target_cutoff=0.0,
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=1,
+        fit_finite_check=False,
+        timing=False,
+        timing_sync_device=False,
+        fit_collect_split_diagnostics=False,
+        fit_target_strategy="auto",
+        layout=None,
+        layout_order="quality",
+        layout_kwargs=None,
+        layout_allow_lossy_reorder=False,
+        atomic=True,
+        transactional_steps=True,
+        fit_fallback=None,
     ):
         """Run queued gates on both MPO index families.
 
@@ -1117,7 +2667,7 @@ class MpoOptimizer:
         n_iter : int, default=6
             Inner iterations for DMRG ``FIT`` updates on two-site gates.
             Ignored by ``svd`` mode.
-        mode : {"dmrg", "svd", "mpo"} | None, default=None
+        mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo"} | None, default=None
             Optional mode override for this run.
         progbar : bool, default=False
             Show tqdm progress bar.
@@ -1147,9 +2697,57 @@ class MpoOptimizer:
         fit_three_site_sweeps : int, default=1
             ``dmrg`` mode only: initial three-site warm-up sweeps before
             one-site refinement when ``fit_block_size=3``.
+        fit_adaptive_sweeps : int, default=2
+            Named DMRG modes only: number of initial two- or three-site
+            warm-up sweeps before one-site refinement. ``dmrg1`` always uses
+            two sweeps; ``dmrg2`` uses two-site FIT and ``dmrg3`` uses
+            three-site FIT. The value is clipped to ``n_iter``.
+        fit_single_pair_fast_path : bool, default=True
+            Named DMRG modes only: stop an adjacent two-site window after its
+            single exact variational update. This avoids repeating a local
+            solve whose effective pair is already complete.
         target_cutoff : float, default=0.0
             ``dmrg`` mode only: cutoff used while constructing the target
             MPO. The output FIT SVD remains controlled by ``cutoff``.
+        fit_min_iter : int | None, default=None
+            Minimum FIT sweeps before ``fit_rtol`` can stop a DMRG update.
+        fit_rtol : float | None, default=None
+            Relative retained-center norm tolerance for early FIT stopping.
+            ``None`` preserves fixed ``n_iter`` behavior.
+        fit_patience : int, default=1
+            Number of stable FIT norm samples required by ``fit_rtol``.
+        fit_finite_check : bool | callable, default=False
+            Check every fitted MPO for finite tensor data. A callable receives
+            the current MPO and must return a truthy value.
+        timing : bool, default=False
+            Record wall-clock and FIT sweep timing in ``last_run_timing``.
+        timing_sync_device : bool, default=False
+            Request backend synchronization for FIT timing measurements.
+        fit_collect_split_diagnostics : bool, default=False
+            Retain native FIT split metadata in the fit diagnostics.
+        fit_target_strategy : {"auto", "layered", "mpo"}, default="auto"
+            Dense MPO targets use lazy layered gate tensors by default;
+            native Symmray targets use the block-aware MPO representation.
+        layout : mapping | sequence | str | None, default=None
+            Optional persistent logical-to-physical layout. A string selects a
+            gate-stream layout order; a mapping or sequence supplies an
+            explicit order.
+        layout_order : str, default="quality"
+            Finder order used when ``layout=True`` or ``layout`` is omitted.
+        layout_kwargs : mapping | None, default=None
+            Extra layout-finder options.
+        layout_allow_lossy_reorder : bool, default=False
+            Allow truncation while installing a layout on an entangled MPO.
+        atomic : bool, default=True
+            Restore the optimizer state if replay fails. With ``inplace=True``
+            the optimizer is restored, but external references to the original
+            MPO may already have observed in-place changes.
+        transactional_steps : bool, default=True
+            Snapshot each DMRG gate or batch before FIT so ``atomic=False`` can
+            still preserve all completed updates when one local update fails.
+        fit_fallback : {None, "mpo", "svd"}, default=None
+            If DMRG FIT fails, restore the pre-run state and replay the complete
+            stream through the selected direct compression backend.
 
         Returns
         -------
@@ -1165,14 +2763,63 @@ class MpoOptimizer:
         if mode is not None:
             self.set_mode(mode)
 
+        if layout is not None and layout is not False:
+            requested_layout = layout_order if layout is True else layout
+            self.apply_layout(
+                requested_layout,
+                cutoff=cutoff,
+                allow_lossy_reorder=layout_allow_lossy_reorder,
+                layout_kwargs=layout_kwargs,
+            )
+
         cutoff = self._resolve_cutoff(cutoff, self.p)
 
-        G_seq = list(self.G)
-        where_seq = list(self.where)
+        G_seq, where_seq = self._execution_stream()
         if not G_seq:
             return self.p
 
+        if not isinstance(fit_patience, Integral) or int(fit_patience) < 1:
+            raise ValueError("fit_patience must be a positive integer.")
+        if fit_min_iter is not None and (
+            not isinstance(fit_min_iter, Integral) or int(fit_min_iter) < 1
+        ):
+            raise ValueError("fit_min_iter must be a positive integer or None.")
+        if fit_rtol is not None:
+            fit_rtol = float(fit_rtol)
+            if not math.isfinite(fit_rtol) or fit_rtol < 0.0:
+                raise ValueError("fit_rtol must be a finite non-negative number or None.")
+        if self.mode == "dmrg" and (
+            not isinstance(k_2q_batch, Integral) or int(k_2q_batch) < 1
+        ):
+            raise ValueError("k_2q_batch must be >= 1.")
+        if isinstance(k_2q_batch, Integral):
+            k_2q_batch = int(k_2q_batch)
+        if fit_fallback not in {None, "mpo", "svd"}:
+            raise ValueError("fit_fallback must be None, 'mpo', or 'svd'.")
+        fit_target_strategy = self._validate_fit_target_strategy(fit_target_strategy)
+        atomic = bool(atomic)
+        timing = bool(timing)
+        timing_sync_device = bool(timing_sync_device)
+        if fit_finite_check not in (None, False, True) and not callable(
+            fit_finite_check
+        ):
+            raise TypeError("fit_finite_check must be bool, callable, or None.")
+
+        snapshot = self._capture_run_state() if atomic or fit_fallback else None
+        fallback_event_count = len(self.fallback_events)
+        run_started = time.perf_counter()
+        self.last_run_status = "running"
+        self.last_run_error = None
+        self.last_run_fallback = None
+        self.last_run_timing = None
+
         if self.mode == "dmrg":
+            dmrg_alias = self._dmrg_mode_alias
+            if dmrg_alias is not None:
+                # Named modes are readable schedule aliases, not separate
+                # compression backends. Their block size is authoritative;
+                # callers tune the warm-up length with fit_adaptive_sweeps.
+                fit_block_size = self._dmrg_alias_block_size(dmrg_alias)
             if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
                 1,
                 2,
@@ -1184,11 +2831,41 @@ class MpoOptimizer:
                 or int(fit_three_site_sweeps) < 1
             ):
                 raise ValueError("fit_three_site_sweeps must be a positive integer.")
-            if int(fit_block_size) != 3 and int(fit_three_site_sweeps) != 1:
+            if (
+                dmrg_alias is None
+                and int(fit_block_size) != 3
+                and int(fit_three_site_sweeps) != 1
+            ):
                 raise ValueError(
                     "fit_three_site_sweeps is only configurable when "
                     "fit_block_size=3."
                 )
+            if dmrg_alias is not None:
+                if (
+                    not isinstance(n_iter, Integral)
+                    or int(n_iter) < 1
+                ):
+                    raise ValueError("n_iter must be a positive integer.")
+                if (
+                    not isinstance(fit_adaptive_sweeps, Integral)
+                    or int(fit_adaptive_sweeps) < 1
+                ):
+                    raise ValueError(
+                        "fit_adaptive_sweeps must be a positive integer."
+                    )
+                adaptive_block_sweeps = min(
+                    2 if dmrg_alias == "dmrg1" else int(fit_adaptive_sweeps),
+                    int(n_iter),
+                )
+                adaptive_until_rank = False
+                # ``fit_three_site_sweeps`` is the legacy generic-DMRG
+                # spelling. Named modes use the common adaptive schedule.
+                fit_three_site_sweeps = 1
+                single_pair_fast_path = bool(fit_single_pair_fast_path)
+            else:
+                adaptive_block_sweeps = None
+                adaptive_until_rank = False
+                single_pair_fast_path = False
             fit_max_span = self._resolve_fit_max_span(
                 fit_max_span,
                 k_2q_batch,
@@ -1202,40 +2879,110 @@ class MpoOptimizer:
             # native SVD splits. It must not take Quimb's eager bond-padding
             # route, but it otherwise follows the same variational DMRG path
             # as dense MPOs. ``mode='mpo'`` remains the direct SVD path.
-            self._prepare_dmrg_state(fit_block_size=fit_block_size)
-            self._run_dmrg(
-                G_seq,
-                where_seq,
-                n_iter=n_iter,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                k_2q_batch=k_2q_batch,
-                fidelity_samples=fidelity_samples,
-                fit_block_size=fit_block_size,
-                fit_sweep_sequence=fit_sweep_sequence,
-                fit_max_span=fit_max_span,
-                fit_three_site_sweeps=int(fit_three_site_sweeps),
-                target_cutoff=target_cutoff,
-            )
+            try:
+                self._prepare_dmrg_state(fit_block_size=fit_block_size)
+                self._run_dmrg(
+                    G_seq,
+                    where_seq,
+                    n_iter=n_iter,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    k_2q_batch=k_2q_batch,
+                    fidelity_samples=fidelity_samples,
+                    fit_block_size=fit_block_size,
+                    fit_sweep_sequence=fit_sweep_sequence,
+                    fit_max_span=fit_max_span,
+                    fit_three_site_sweeps=int(fit_three_site_sweeps),
+                    target_cutoff=target_cutoff,
+                    adaptive_block_sweeps=adaptive_block_sweeps,
+                    adaptive_until_rank=adaptive_until_rank,
+                    single_pair_fast_path=single_pair_fast_path,
+                    fit_min_iter=None if fit_min_iter is None else int(fit_min_iter),
+                    fit_rtol=fit_rtol,
+                    fit_patience=int(fit_patience),
+                    finite_check=fit_finite_check,
+                    timing=timing,
+                    timing_sync_device=timing_sync_device,
+                    collect_split_diagnostics=bool(fit_collect_split_diagnostics),
+                    fit_target_strategy=fit_target_strategy,
+                    transactional_steps=transactional_steps,
+                    fit_fallback=fit_fallback,
+                )
+            except Exception as exc:
+                self.last_run_status = "failed"
+                self.last_run_error = f"{type(exc).__name__}: {exc}"
+                failed_fit_records = []
+                if snapshot is not None:
+                    failed_fit_records = deepcopy(
+                        [
+                            record
+                            for record in self.fit_diagnostics[
+                                len(snapshot["fit_diagnostics"]):
+                            ]
+                            if record.get("convergence_reason") == "failed"
+                        ]
+                    )
+                if fit_fallback is not None:
+                    if snapshot is None:
+                        raise RuntimeError(
+                            "fit_fallback requires atomic replay state."
+                        ) from exc
+                    self._restore_run_state(snapshot)
+                    self.fit_diagnostics.extend(failed_fit_records)
+                    if failed_fit_records:
+                        self._last_dmrg_fit_diagnostics = failed_fit_records[-1]
+                    self.last_run_fallback = fit_fallback
+                    try:
+                        direct_runner = self._run_mpo if (
+                            fit_fallback == "mpo"
+                            and not self._has_symmray_data(self.p)
+                        ) else self._run_svd
+                        direct_runner(
+                            G_seq,
+                            where_seq,
+                            progbar=progbar,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            fidelity_samples=fidelity_samples,
+                            finite_check=fit_finite_check,
+                        )
+                    except Exception:
+                        self._restore_run_state(snapshot)
+                        raise
+                    self.fallback_events.append(
+                        {
+                            "kind": "run_fallback",
+                            "backend": fit_fallback,
+                            "step": None,
+                        }
+                    )
+                    self.last_run_status = "fallback"
+                else:
+                    if snapshot is not None:
+                        self._restore_run_state(snapshot)
+                        self.fit_diagnostics.extend(failed_fit_records)
+                        if failed_fit_records:
+                            self._last_dmrg_fit_diagnostics = failed_fit_records[-1]
+                    raise
+            if self.last_run_status == "running":
+                self.last_run_status = (
+                    "fallback"
+                    if len(self.fallback_events) > fallback_event_count
+                    else "complete"
+                )
+            self.last_run_timing = {
+                "status": self.last_run_status,
+                "mode": self.mode,
+                "mode_alias": self._dmrg_mode_alias,
+                "elapsed_seconds": time.perf_counter() - run_started,
+                "fit_calls": len(self.fit_diagnostics),
+                "fallback": self.last_run_fallback,
+            }
             return self.p
 
         if self.mode == "svd":
-            self._run_svd(
-                G_seq,
-                where_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
-            )
-            return self.p
-
-        if self.mode == "mpo":
-            # ``gate_nonlocal_opt`` creates a dense auxiliary sub-MPO and its
-            # generic compression currently loses multi-sector Symmray bond
-            # metadata. Reuse the block-aware local SVD route for these MPOs.
-            if self._has_symmray_data(self.p):
+            try:
                 self._run_svd(
                     G_seq,
                     where_seq,
@@ -1243,16 +2990,84 @@ class MpoOptimizer:
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     fidelity_samples=fidelity_samples,
+                    finite_check=fit_finite_check,
+                    fit_target_strategy=fit_target_strategy,
                 )
+            except Exception as exc:
+                self.last_run_status = "failed"
+                self.last_run_error = f"{type(exc).__name__}: {exc}"
+                if snapshot is not None:
+                    self._restore_run_state(snapshot)
+                raise
+            self.last_run_status = "complete"
+            self.last_run_timing = {
+                "status": self.last_run_status,
+                "mode": self.mode,
+                "mode_alias": self._dmrg_mode_alias,
+                "elapsed_seconds": time.perf_counter() - run_started,
+                "fit_calls": len(self.fit_diagnostics),
+                "fallback": None,
+            }
+            return self.p
+
+        if self.mode == "mpo":
+            # ``gate_nonlocal_opt`` creates a dense auxiliary sub-MPO and its
+            # generic compression currently loses multi-sector Symmray bond
+            # metadata. Reuse the block-aware local SVD route for these MPOs.
+            if self._has_symmray_data(self.p):
+                try:
+                    self._run_svd(
+                        G_seq,
+                        where_seq,
+                        progbar=progbar,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        fidelity_samples=fidelity_samples,
+                        finite_check=fit_finite_check,
+                        fit_target_strategy=fit_target_strategy,
+                    )
+                except Exception as exc:
+                    self.last_run_status = "failed"
+                    self.last_run_error = f"{type(exc).__name__}: {exc}"
+                    if snapshot is not None:
+                        self._restore_run_state(snapshot)
+                    raise
+                self.last_run_status = "complete"
+                self.last_run_timing = {
+                    "status": self.last_run_status,
+                    "mode": self.mode,
+                    "mode_alias": self._dmrg_mode_alias,
+                    "elapsed_seconds": time.perf_counter() - run_started,
+                    "fit_calls": len(self.fit_diagnostics),
+                    "fallback": None,
+                }
                 return self.p
-            self._run_mpo(
-                G_seq,
-                where_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
-            )
+            try:
+                self._run_mpo(
+                    G_seq,
+                    where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                    finite_check=fit_finite_check,
+                    fit_target_strategy=fit_target_strategy,
+                )
+            except Exception as exc:
+                self.last_run_status = "failed"
+                self.last_run_error = f"{type(exc).__name__}: {exc}"
+                if snapshot is not None:
+                    self._restore_run_state(snapshot)
+                raise
+            self.last_run_status = "complete"
+            self.last_run_timing = {
+                "status": self.last_run_status,
+                "mode": self.mode,
+                "mode_alias": self._dmrg_mode_alias,
+                "elapsed_seconds": time.perf_counter() - run_started,
+                "fit_calls": len(self.fit_diagnostics),
+                "fallback": None,
+            }
             return self.p
 
         supported = ", ".join(sorted(self._ALLOWED_MODES))
@@ -1284,8 +3099,28 @@ class MpoOptimizer:
         self.info_c["cur_orthog"] = target_orthog
 
     def get_fidelities(self):
-        """Return the running loss history."""
+        """Return the legacy normalized-MPO-norm history.
+
+        This compatibility accessor is not the compression-fidelity ledger;
+        use :meth:`norm_diagnostics` or :meth:`get_norm_events` for that.
+        """
         return self.losses
+
+    def get_norm_events(self):
+        """Return a defensive copy of automatic MPO norm events."""
+        return deepcopy(self.norm_events)
+
+    def get_fit_diagnostics(self):
+        """Return a defensive copy of the latest MPO FIT diagnostic record."""
+        return deepcopy(self._last_dmrg_fit_diagnostics)
+
+    def get_fit_history(self):
+        """Return defensive copies of all FIT records from the latest replay."""
+        return deepcopy(self.fit_diagnostics)
+
+    def get_run_timing(self):
+        """Return the latest opt-in MPO replay timing record."""
+        return deepcopy(self.last_run_timing)
 
     def compress(self, *, cutoff=1e-12, cutoff_mode="rsum2"):
         """Compress the current MPO to ``chi`` while preserving its backend.
@@ -1294,6 +3129,8 @@ class MpoOptimizer:
         also useful when the optimizer is constructed with an empty gate
         queue and the caller only wants a bond-dimension reduction.
         """
+        cutoff = self._resolve_cutoff(cutoff, self.p)
+        before = self._canonical_norm_value(self.p)
         self.p.compress(
             form="left",
             max_bond=self.chi,
@@ -1301,4 +3138,13 @@ class MpoOptimizer:
             cutoff_mode=cutoff_mode,
         )
         self._init_canonicalization()
+        after = self._canonical_norm_value(self.p)
+        self._record_norm_event(
+            "manual_compression",
+            expected_norm=before,
+            observed_norm=after,
+            target_norm=before,
+            where=tuple(self.info_c.get("cur_orthog", ())),
+        )
+        self._append_norm_proxy_sample(self.p)
         return self.p

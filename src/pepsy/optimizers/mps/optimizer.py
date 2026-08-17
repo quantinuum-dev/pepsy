@@ -5040,8 +5040,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 if self._norm_log_survival == -np.inf
                 else float(math.exp(self._norm_log_survival))
             )
+            cumulative_infidelity = (
+                1.0
+                if self._norm_log_survival == -np.inf
+                else float(-math.expm1(self._norm_log_survival))
+            )
             event["cumulative_norm_fidelity"] = cumulative
-            event["cumulative_norm_infidelity"] = float(1.0 - cumulative)
+            event["cumulative_norm_infidelity"] = cumulative_infidelity
         else:
             event["cumulative_norm_fidelity"] = None
             event["cumulative_norm_infidelity"] = None
@@ -5069,7 +5074,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             infidelity = 1.0
         else:
             survival = float(math.exp(self._norm_log_survival))
-            infidelity = float(1.0 - survival)
+            infidelity = float(-math.expm1(self._norm_log_survival))
         current = valid[-1] if valid else None
         event_survivals = [float(event["norm_fidelity"]) for event in valid]
         event_infidelities = [
@@ -5558,6 +5563,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _format_progress_scalar(value):
         """Format displayed progress scalar with stable precision."""
         return f"{MpsOptimizer._real_float(value):.6f}"
+
+    def _cumulative_norm_fidelity(self):
+        """Return displayed cumulative fidelity from the log-space ledger."""
+        if self._norm_log_survival == -np.inf:
+            return 0.0
+        return float(math.exp(self._norm_log_survival))
 
     @staticmethod
     def _collect_dmrg_batch(
@@ -6286,6 +6297,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "dmrg": dmrg_steps,
                     "fallback": fallback_steps,
                     "bond": f"{final['end_bond']}/{self.chi}",
+                    "~F": self._format_progress_scalar(
+                        self._cumulative_norm_fidelity()
+                    ),
                 }
                 pbar.set_postfix(postfix)
                 pbar.update(len(entries))
@@ -7008,6 +7022,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
+                    "~F": self._format_progress_scalar(
+                        self._cumulative_norm_fidelity()
+                    ),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -7264,6 +7281,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
+                    "~F": self._format_progress_scalar(
+                        self._cumulative_norm_fidelity()
+                    ),
                     "bnd": p.max_bond(),
                 }
                 if submpo_count:
@@ -7419,6 +7439,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
+                    "~F": self._format_progress_scalar(
+                        self._cumulative_norm_fidelity()
+                    ),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -7579,6 +7602,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
+                    "~F": self._format_progress_scalar(
+                        self._cumulative_norm_fidelity()
+                    ),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -7650,14 +7676,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if len(where) == 1:
                 if pbar is not None:
                     pbar.set_postfix(
-                        {"2q": two_qubit_count, "~F": self._format_progress_scalar(1.0), "bnd": "inf"}
+                        {
+                            "2q": two_qubit_count,
+                            "~F": self._format_progress_scalar(
+                                self._cumulative_norm_fidelity()
+                            ),
+                            "bnd": "inf",
+                        }
                     )
                     pbar.update(1)
                 continue
 
             two_qubit_count += 1
             if pbar is not None:
-                pbar.set_postfix({"2q": two_qubit_count, "~F": self._format_progress_scalar(1.0), "bnd": "inf"})
+                pbar.set_postfix(
+                    {
+                        "2q": two_qubit_count,
+                        "~F": self._format_progress_scalar(
+                            self._cumulative_norm_fidelity()
+                        ),
+                        "bnd": "inf",
+                    }
+                )
                 pbar.update(1)
 
         if pbar is not None:

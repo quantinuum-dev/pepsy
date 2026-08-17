@@ -380,7 +380,9 @@ stored in `opt.mix_history` and summarized in `opt.last_mix_summary`; entries
 include logical `where`, execution `execution_where`, FIT iterations and
 convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
 `progbar=True`, the progress bar shows the current backend, cumulative
-MPO/DMRG/fallback counts, and `bond=current/chi`.
+MPO/DMRG/fallback counts, `~F` (the cumulative norm fidelity), and
+`bond=current/chi`. `~F` is converted from the log-survival ledger only for
+display; accumulation remains logarithmic and numerically stable.
 
 Replay timing is opt-in and does not print by itself:
 

@@ -29,6 +29,7 @@ _SYMBOL_MODULES = {
     "build_qmera_contraction_optimizer": ".qmera",
     "load_qmera_prototype_layout": ".qmera",
     "MpoOptimizer": ".mpo",
+    "MpoChannelEvent": ".mpo",
     "MpsOptimizer": ".mps",
     "SimulatorCandidate": ".planning",
     "SimulatorPlan": ".planning",
