@@ -93,6 +93,22 @@ value-dependent Algorithm 2 merges are still recomputed for each build.
 term-specific coefficient slots on a path edge, so its output is directly
 compatible with `extensive_exponential()`.
 
+For one-off large-order constructions, disable persistent history caching:
+
+```python
+U = basis.evolution_mpo(
+    {"J": 0.7, "V": 0.2},
+    dt=0.01,
+    order=4,
+    mode="optimal",
+    cache_history=False,
+)
+```
+
+This keeps the current MPO tensors materialized, but releases the reusable
+raw topology after the build. It is useful when orders are not repeated and
+the process should not retain all history tables.
+
 For optimizers that already evaluate parameters in a backend batch, pass that
 batch directly and avoid per-term coefficient resolution:
 
@@ -147,7 +163,10 @@ energy_factor = U2.expectation(state)
 ```
 
 `extend=True` applies Algorithm 3: selected order `N + 1` local histories are
-added without increasing the exact-history bond dimension. `approximate=True`
+generated directly from the existing order-`N` transitions and added without
+increasing the exact-history bond dimension. The implementation does not
+materialize a complete order-`N + 1` MPO just to extract those transitions.
+`approximate=True`
 applies Algorithm 4 after exact compression. It is an order-controlled
 analytical approximation, not a numerical SVD cutoff, and is therefore exposed
 as a separate opt-in flag. Numerical Quimb compression remains a separate
@@ -241,6 +260,7 @@ SVD VJP for zero or repeated singular values. The returned
 `FirstDegreeMPO` has `metadata["history_valid"] == False`, because numerical
 compression changes the analytical history representation.
 
-The current implementation targets ordinary NumPy/Autoray-compatible local
-blocks. Native fermionic/Symmray compilation remains separate and is not
-changed by this API.
+The current implementation targets finite open-boundary NumPy, Torch, and JAX
+Autoray-compatible local blocks, including the optimal extension path under
+Torch/JAX autodiff. Native fermionic/Symmray compilation and infinite/unit-cell
+MPOs remain separate future work.

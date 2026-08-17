@@ -12,7 +12,7 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | `MPOProductTerm` | Describe a factorized local product term | Matrix operators or compact Pauli labels; `charge` is preserved but not interpreted |
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
-| `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; named `mode` and temporary `max_bond` guard |
+| `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
 | `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
 | `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator` |
@@ -89,7 +89,9 @@ formed. The raw topology is now reusable across parameter bindings and time
 steps, while exact history compression remains a value-dependent pass after
 the cached table is assembled. Reachability removes dead finite-boundary
 channels but does not change the worst-case allocation for a fully reachable
-local graph.
+local graph. `cache_history=False` provides an ephemeral mode for one-off
+large-order builds; a future sparse tensor backend can reduce the dense local
+transition storage itself.
 
 The one-site path is intentionally limited to direct orders one and two. It
 provides a simple boundary regression and avoids pretending that the generic
@@ -110,9 +112,11 @@ multi-site history convention already covers every one-site edge case.
   route scopes Pepsy's regularized SVD policy so rank-deficient blocks retain
   finite reverse-mode derivatives; it intentionally clears semantic history
   validity after the numerical sweep.
-- Fermionic/Symmray compilation is not enabled by this workstream. The
-  `charge` and `string_operators` fields preserve construction metadata for a
-  future native backend without claiming that it is already supported.
+- Finite Torch and JAX paths use functional tensor updates, so Algorithm 3
+  remains compatible with reverse-mode autodiff and JIT tracing. Fermionic/
+  Symmray compilation is not enabled by this workstream; `charge` and
+  `string_operators` preserve construction metadata for a future native
+  backend without claiming that it is already supported.
 - Public algebraic operations are non-mutating. Mutation is available only
   through the named `inplace=True` compression option.
 
@@ -123,10 +127,10 @@ The remaining implementation improvements are:
 1. Replace the reachable history lists with a sparse channel map or streaming
    local iterator for high orders, while preserving the current
    `MPOLevel.history` data.
-2. Generate Algorithm 3 transitions directly instead of allocating a complete
-   order-plus-one reference table.
-3. Generalize the one-site boundary convention to arbitrary order and promote
+2. Generalize the one-site boundary convention to arbitrary order and promote
    that path to the same execution/reporting contract.
+3. Add operator-level error estimates for numerical compression and benchmark
+   them against dense small-system or tensor-network norm references.
 4. Add native fermionic/Symmray compilation for the shared topology and the
    fixed-rank compression contract.
 

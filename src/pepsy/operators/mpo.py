@@ -1362,6 +1362,7 @@ class FirstDegreeMPO:
         *,
         max_bond=None,
         on_exceed="raise",
+        cache_history=True,
     ):
         """Return cached raw history states and whether the cache was used.
 
@@ -1373,7 +1374,11 @@ class FirstDegreeMPO:
         reusable topology cache.
         """
         exponent = int(exponent)
-        state_lists = self._history_topology_cache.get(exponent)
+        state_lists = (
+            self._history_topology_cache.get(exponent)
+            if cache_history
+            else None
+        )
         cache_hit = state_lists is not None
         if state_lists is None:
             state_lists = self._reachable_history_states(
@@ -1382,6 +1387,7 @@ class FirstDegreeMPO:
                 max_bond=None,
                 on_exceed="ignore",
             )
+        if cache_history and not cache_hit:
             self._history_topology_cache[exponent] = state_lists
 
         warned = False
@@ -1418,6 +1424,7 @@ class FirstDegreeMPO:
         *,
         max_bond=None,
         on_exceed="raise",
+        cache_history=True,
     ):
         """Build the full virtual-history representation of ``H**exponent``.
 
@@ -1445,6 +1452,7 @@ class FirstDegreeMPO:
             exponent,
             max_bond=max_bond,
             on_exceed=on_exceed,
+            cache_history=cache_history,
         )
         levels = []
         for bond, states in enumerate(state_lists):
@@ -1519,6 +1527,77 @@ class FirstDegreeMPO:
             local = self._base_local_block(site, left_level, right_level)
             block = local if block is None else ar.do("matmul", block, local)
         return block
+
+    def _history_levels_from_tokens(self, schemas, bond, history):
+        """Resolve flattened history tokens to base levels at one cut."""
+        levels = []
+        schema = schemas[bond]
+        for token in history:
+            level = next(
+                (
+                    candidate
+                    for candidate in schema
+                    if candidate.history == (token,)
+                ),
+                None,
+            )
+            if level is None:
+                return None
+            levels.append(level)
+        return tuple(levels)
+
+    def _history_tokens_reachable(
+        self,
+        schemas,
+        bond,
+        history,
+        cache,
+    ):
+        """Check one raw-history state without building its order table.
+
+        Raw product histories are reachable exactly when each factor follows
+        a valid base-MPO transition from the finite all-one left boundary.
+        This factor-wise check is equivalent to the forward product walk in
+        ``_reachable_history_states`` but only resolves the candidate state
+        requested by Algorithm 3.
+        """
+        key = (bond, tuple(history))
+        if key in cache:
+            return cache[key]
+        factor_levels = self._history_levels_from_tokens(
+            schemas,
+            bond,
+            history,
+        )
+        if factor_levels is None:
+            cache[key] = None
+            return None
+        if self._structural_transitions is not None:
+            start_label = next(
+                level.label
+                for level in schemas[0]
+                if _level_number(level.history[0]) == 1
+            )
+            for factor_level in factor_levels:
+                possible_labels = {factor_level.label}
+                for site in range(bond - 1, -1, -1):
+                    edges = self._structural_transitions[site]
+                    possible_labels = {
+                        candidate.label
+                        for candidate in schemas[site]
+                        if any(
+                            (candidate.label, right_label) in edges
+                            for right_label in possible_labels
+                        )
+                    }
+                    if not possible_labels:
+                        cache[key] = None
+                        return None
+                if start_label not in possible_labels:
+                    cache[key] = None
+                    return None
+        cache[key] = factor_levels
+        return factor_levels
 
     @staticmethod
     def _find_history(levels, history):
@@ -1687,16 +1766,14 @@ class FirstDegreeMPO:
     def _algorithm_three_extension(self, arrays, levels, order, dt):
         """Add Algorithm 3's selected ``N + 1`` local history transitions.
 
-        The current route builds an order ``N + 1`` reference table and uses
-        only the selected local transitions.  Future work should generate
-        those transitions directly so ``extend=True`` does not allocate the
-        complete next-order Cartesian table.
+        This pass generates only the candidate extended histories that can
+        connect an existing order-``N`` transition. It deliberately avoids
+        constructing the complete order ``N + 1`` history tensors: each
+        candidate is checked by a structural backwards reachability walk and
+        its local product is assembled directly into the existing tensor.
         """
-        next_arrays, next_levels, _ = self._history_power_data(order + 1)
-        next_positions = [
-            {level.history: pos for pos, level in enumerate(bond_levels)}
-            for bond_levels in next_levels
-        ]
+        schemas = self._history_schemas()
+        reachable_cache = {}
         added = 0
         snapshot = [tuple(bond_levels) for bond_levels in levels]
 
@@ -1722,8 +1799,13 @@ class FirstDegreeMPO:
                             + (MPOLevelToken(1),)
                             + left_history[insert_left:]
                         )
-                        left_raw = next_positions[site].get(extended_left)
-                        if left_raw is None:
+                        left_state = self._history_tokens_reachable(
+                            schemas,
+                            site,
+                            extended_left,
+                            reachable_cache,
+                        )
+                        if left_state is None:
                             continue
                         for insert_right in range(order + 1):
                             extended_right = (
@@ -1731,8 +1813,13 @@ class FirstDegreeMPO:
                                 + (MPOLevelToken(3),)
                                 + right_history[insert_right:]
                             )
-                            right_raw = next_positions[site + 1].get(extended_right)
-                            if right_raw is None:
+                            right_state = self._history_tokens_reachable(
+                                schemas,
+                                site + 1,
+                                extended_right,
+                                reachable_cache,
+                            )
+                            if right_state is None:
                                 continue
                             number_of_ones = (
                                 sum(
@@ -1757,13 +1844,18 @@ class FirstDegreeMPO:
                                     * number_of_threes
                                 )
                             )
+                            extension = self._history_local_product(
+                                site,
+                                left_state,
+                                right_state,
+                            )
                             arrays[site] = _setitem(
                                 arrays[site],
                                 (left_pos, right_pos),
                                 arrays[site][left_pos, right_pos]
                                 + _multiply_scalar(
                                     coefficient,
-                                    next_arrays[site][left_raw, right_raw],
+                                    extension,
                                 ),
                             )
                             added += 1
@@ -1853,6 +1945,7 @@ class FirstDegreeMPO:
         mode="base",
         max_bond=None,
         on_exceed="raise",
+        cache_history=True,
     ):
         """Construct an arbitrary-order MPO using Algorithms 1--4.
 
@@ -1866,6 +1959,7 @@ class FirstDegreeMPO:
             order,
             max_bond=max_bond,
             on_exceed=on_exceed,
+            cache_history=cache_history,
         )
         initial_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
@@ -1893,6 +1987,7 @@ class FirstDegreeMPO:
             "mode": mode,
             "max_bond": max_bond,
             "on_exceed": on_exceed,
+            "cache_history": bool(cache_history),
             "initial_bond_dimensions": initial_bond_dimensions,
             "history_generation": (
                 "reachable" if self._structural_transitions is not None else "cartesian"
@@ -1956,6 +2051,7 @@ class FirstDegreeMPO:
         mode=None,
         max_bond=None,
         on_exceed="raise",
+        cache_history=True,
     ):
         """Build the paper's size-extensive higher-order MPO.
 
@@ -1994,6 +2090,10 @@ class FirstDegreeMPO:
             completing the oversized history table, ``"warn"`` continues,
             and ``"ignore"`` disables the action while retaining the value in
             metadata.
+        cache_history : bool, default=True
+            Retain the raw reachable history topology for later calls. Set
+            this to ``False`` for large-order or one-off constructions so the
+            topology is released after the current MPO is assembled.
 
         Notes
         -----
@@ -2016,6 +2116,8 @@ class FirstDegreeMPO:
             raise ValueError(
                 "on_exceed must be one of 'raise', 'warn', or 'ignore'."
             )
+        if not isinstance(cache_history, bool):
+            raise TypeError("cache_history must be a boolean.")
         if mode is not None:
             if not isinstance(mode, str):
                 raise TypeError("mode must be a string or None.")
@@ -2055,6 +2157,7 @@ class FirstDegreeMPO:
                 mode=canonical_mode,
                 max_bond=max_bond,
                 on_exceed=on_exceed,
+                cache_history=cache_history,
             )
         if extend or approximate or order >= 3:
             raise NotImplementedError(
@@ -2099,6 +2202,7 @@ class FirstDegreeMPO:
                 "mode": canonical_mode,
                 "max_bond": max_bond,
                 "on_exceed": on_exceed,
+                "cache_history": bool(cache_history),
                 "algorithms": ("one-site-taylor",),
                 "approximate": False,
             },

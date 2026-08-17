@@ -424,11 +424,26 @@ def test_extensive_exponential_algorithm_three_keeps_bond_dimension():
     assert extended.bond_dimensions == plain.bond_dimensions
     assert extended.metadata["algorithms"] == (1, 2, 3)
     assert extended.metadata["extension_terms"] > 0
+    assert H.history_cache_info["orders"] == (2,)
     plain_error = np.linalg.norm(plain.to_mpo().to_dense() - scipy_linalg.expm(0.01 * dense_h))
     extended_error = np.linalg.norm(
         extended.to_mpo().to_dense() - scipy_linalg.expm(0.01 * dense_h),
     )
     assert extended_error < plain_error
+
+
+def test_extensive_exponential_can_release_history_topology_after_build():
+    """One-off large-order builds can avoid retaining the topology cache."""
+    H = _two_term_mpo()
+    result = H.extensive_exponential(
+        0.01,
+        order=3,
+        cache_history=False,
+    )
+
+    assert result.metadata["cache_history"] is False
+    assert result.metadata["history_cache_hit"] is False
+    assert H.history_cache_info["orders"] == ()
 
 
 def test_extensive_exponential_optimal_mode_selects_paper_extension():
@@ -527,7 +542,12 @@ def test_parameterized_pauli_hamiltonian_supports_jax_autodiff():
             3,
             [((0, 2), "ZX", theta)],
         )
-        U = H.extensive_exponential(-1j * time, order=2, mode="optimal")
+        U = H.extensive_exponential(
+            -1j * time,
+            order=2,
+            mode="optimal",
+            cache_history=False,
+        )
         return sum(jnp.real(array).sum() for array in U.arrays)
 
     value, gradients = jax.jit(
@@ -535,6 +555,33 @@ def test_parameterized_pauli_hamiltonian_supports_jax_autodiff():
     )(0.7, 0.01)
     assert jnp.isfinite(value)
     assert all(jnp.isfinite(gradient) for gradient in gradients)
+
+
+def test_parameterized_mpo_basis_supports_jax_batched_coefficients():
+    """The finite optimal path supports JAX coefficient batches under jit."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    def objective(coefficients, time):
+        U = basis.evolution_mpo(
+            coefficients=coefficients,
+            dt=time,
+            order=2,
+            mode="optimal",
+            cache_history=False,
+        )
+        return sum(jnp.real(array).sum() for array in U.arrays)
+
+    value, gradients = jax.jit(
+        jax.value_and_grad(objective, argnums=(0, 1)),
+    )(jnp.array([0.7, -0.2]), 0.01)
+
+    assert jnp.isfinite(value)
+    assert all(jnp.all(jnp.isfinite(gradient)) for gradient in gradients)
 
 
 def test_extensive_exponential_algorithm_four_is_explicit_and_order_controlled():
