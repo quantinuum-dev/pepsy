@@ -187,6 +187,10 @@ reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
 later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
 warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
 same fixed warm-up schedule with three-site FIT and then one-site FIT.
+For dense DMRG1 growth windows, FIT starts from an isolated MPO-compressed
+MPS guess for the current gate; the exact FIT target and DMRG1 two-site/
+one-site schedule are unchanged. Native Symmray and fermionic states retain
+their native warm-start path.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
 schedule. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up

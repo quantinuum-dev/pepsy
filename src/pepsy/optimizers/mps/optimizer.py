@@ -5375,6 +5375,45 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return p_target
 
+    def _build_mpo_fit_guess(
+        self,
+        p,
+        gate,
+        where,
+        *,
+        cutoff,
+        cutoff_mode,
+        non_unitary,
+        stabilize_unitary,
+    ):
+        """Build an MPO-compressed MPS guess for a DMRG1 gate target.
+
+        The MPO replay runs on an isolated copy.  The returned state is only
+        FIT's initial guess; the exact gate target and DMRG1 schedule remain
+        unchanged, and the live MPS is not replaced by the MPO result.
+        """
+        guess = p.copy(deep=True)
+        mpo_optimizer = type(self)(
+            guess,
+            gates=[(gate, where)],
+            chi=self.chi,
+            mode="mpo",
+            contraction_opt=self.contraction_opt,
+            ind_id=self.ind_id,
+            inplace=True,
+            _capture_initial=False,
+        )
+        mpo_optimizer.run(
+            progbar=False,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            non_unitary=non_unitary,
+            normalize_every=None,
+            normalize_final=False,
+            stabilize_unitary=stabilize_unitary,
+        )
+        return mpo_optimizer.p
+
     @staticmethod
     def _normalize_every_interval(normalize_every, non_unitary=False):
         """Return whether non-unitary local scale control is enabled.
@@ -6859,21 +6898,45 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (xmin, xmax),
                         fit_block_size,
                     )
-                    target_support = self._build_dmrg_target_support(
-                        p,
-                        (gate,),
-                        (where,),
-                        start=xmin,
-                        stop=xmax,
-                        block_size=active_fit_block_size,
-                        target_cutoff=target_cutoff,
-                        cutoff_mode=cutoff_mode,
+                    mpo_fit_guess_used = False
+                    fit_guess = p
+                    if (
+                        self._dmrg_mode_alias == "dmrg1"
+                        and active_fit_block_size == 2
+                        and not self._has_symmray_data(p)
+                        and not p.isfermionic()
+                    ):
+                        fit_guess = self._timed_call(
+                            "dmrg.mpo_guess",
+                            self._build_mpo_fit_guess,
+                            p,
+                            gate,
+                            where,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            non_unitary=non_unitary,
+                            stabilize_unitary=stabilize_unitary,
+                        )
+                        mpo_fit_guess_used = True
+                    target_support = (
+                        None
+                        if mpo_fit_guess_used
+                        else self._build_dmrg_target_support(
+                            p,
+                            (gate,),
+                            (where,),
+                            start=xmin,
+                            stop=xmax,
+                            block_size=active_fit_block_size,
+                            target_cutoff=target_cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
                     )
                     active_adaptive_sweeps = adaptive_sweeps
                     active_adaptive_rank_schedule = adaptive_rank_schedule
                     fit = FIT(
                         p_g,
-                        p=p,
+                        p=fit_guess,
                         cutoffs=cutoff,
                         contraction_opt=self.contraction_opt,
                         retag=False,
@@ -6923,6 +6986,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "native_fermionic_warm_start": bool(
                                 native_fermionic_warm_start
                             ),
+                            "mpo_fit_guess_used": bool(mpo_fit_guess_used),
                             "target_strategy": fit_target_strategy,
                             "target_support_expansion": fit.info.get(
                                 "target_subspace_expansion"
