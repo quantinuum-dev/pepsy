@@ -1,8 +1,10 @@
 """Basic public API smoke tests for the pepsy package."""
 
+import importlib
 import importlib.util
 from pathlib import Path
 
+import pytest
 import pepsy
 
 
@@ -53,6 +55,37 @@ def test_top_level_compatibility_surface_matches_manifest():
         *manifest,
     }
     assert set(pepsy.__all__) == expected_all
+
+
+def test_root_aliases_resolve_from_canonical_namespaces():
+    """Every root alias has an advertised owner and canonical import path."""
+    missing = []
+    for name, module_name in pepsy._SYMBOL_MODULES.items():
+        module = importlib.import_module(module_name, pepsy.__name__)
+        if name not in getattr(module, "__all__", ()):
+            missing.append(f"{name} -> {module.__name__}")
+    assert not missing, f"aliases without canonical exports: {missing}"
+
+
+def test_deprecated_backend_alias_warns_and_matches_canonical_namespace():
+    """The old tensor backend path remains lazy and explicitly deprecated."""
+    import pepsy.backends as backends
+    import pepsy.tensors as tensors
+
+    tensors.__dict__.pop("backend_numpy", None)
+    with pytest.warns(DeprecationWarning, match="pepsy.backends.backend_numpy"):
+        alias = tensors.backend_numpy
+    assert alias is backends.backend_numpy
+
+
+def test_deprecated_mera_alias_warns_and_matches_qmera():
+    """The old MERA discovery name remains a lazy QMERA compatibility alias."""
+    import pepsy.experimental as experimental
+
+    experimental.__dict__.pop("mera", None)
+    with pytest.warns(DeprecationWarning, match="experimental.qmera"):
+        alias = experimental.mera
+    assert alias is experimental.qmera
 
 
 def test_tree_optimizers_are_available_from_high_level_api():

@@ -17,6 +17,11 @@ The stable core is intended for normal application code:
 Stable APIs follow semantic versioning, include regression tests, and receive
 deprecation warnings before removal whenever practical.
 
+`pepsy.interop` and the high-level `pepsy.optimizers` namespace are stable
+orchestration surfaces. Their advanced subdomains—such as QMERA, tree and
+stabilizer tensor networks, noisy trajectories, and Symmray workflows—remain
+explicit domain APIs and may require optional dependencies.
+
 ## Top-level compatibility facade
 
 The top-level `pepsy` namespace is a frozen compatibility facade. Existing

@@ -16,9 +16,11 @@ The current package exposes:
 - lazy advanced-domain discovery through `pepsy.experimental`.
 
 Every current root symbol already has an owning namespace. The root facade is
-therefore compatibility convenience, not a second canonical API. New symbols
-must be added to the owning namespace and to the manifest only when an
-intentional compatibility decision approves a new root alias.
+therefore compatibility convenience, not a second canonical API. The manifest
+test verifies that the owner map, each owner's `__all__`, and root `__all__`
+remain synchronized. New symbols must be added to the owning namespace and to
+the manifest only when an intentional compatibility decision approves a new
+root alias.
 
 ## Redundancy identified
 

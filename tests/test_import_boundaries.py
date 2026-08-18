@@ -29,6 +29,7 @@ _CORE_MODULES = (
     "pepsy.fitting",
     "pepsy.interop",
     "pepsy.operators",
+    "pepsy.optimizers",
     "pepsy.sampling",
     "pepsy.solvers",
     "pepsy.tensors",
@@ -84,6 +85,22 @@ roots = {roots}
 print(*sorted(
     name for name in sys.modules
     if any(name == root or name.startswith(root + '.') for root in roots)
+))
+"""
+    )
+    assert not loaded
+
+
+def test_sampling_namespace_is_lazy():
+    """Discovering samplers does not import sampler implementations eagerly."""
+    loaded = _run_clean_import(
+        """
+import sys
+import pepsy.sampling
+
+print(*sorted(
+    name for name in sys.modules
+    if name in {'pepsy.sampling.samplers', 'pepsy.sampling.tree'}
 ))
 """
     )

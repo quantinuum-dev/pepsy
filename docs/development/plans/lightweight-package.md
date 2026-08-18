@@ -1,6 +1,6 @@
 # Lightweight package plan
 
-Status: active, phases 0-3 complete; API baseline recorded
+Status: active, phases 0-3 complete; phase 5 inventory and canonical ownership recorded
 Last updated: 2026-08-18
 Owner: Pepsy maintainers
 
@@ -138,6 +138,13 @@ boundary, not an immediate package rename or compatibility break.
 - Prefer one canonical namespace for each public symbol.
 - Deprecate redundant namespace aliases before removing them in a planned
   breaking release.
+
+The first phase of this work is complete: the root inventory is recorded in
+`docs/development/api-manifest.txt`, canonical ownership is enforced by the
+public API tests, backend aliases in `pepsy.tensors` warn and redirect to
+`pepsy.backends`, and `pepsy.experimental.mera` redirects to `qmera`. The
+sampling facade is also lazy, and the maintained notebook example uses
+canonical namespace imports. No public names have been removed.
 
 ## Acceptance criteria
 
