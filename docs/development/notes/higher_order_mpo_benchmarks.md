@@ -56,3 +56,21 @@ Trotter or the cluster expansion must have a particular error ordering: they
 are independent baselines with different approximation structures. Larger
 timing and memory studies should run outside the package repository so normal
 test execution remains deterministic and lightweight.
+
+## History-plan implementation
+
+Algorithms 1--3 keep the paper's order and coefficients, but their structural
+work is compiled separately from numerical tensor evaluation. Algorithms 1 and
+2 use a topology-only elimination plan keyed by source and target histories.
+Algorithm 3 uses batched insertion plans: each site and insertion-position
+pair stores valid left/right history lists and base local-block indices, then
+executes one backend-native batch of physical matrix products. It therefore
+does not materialize the full order-`N + 1` history reference or a scalar
+record for every left/right history pair.
+
+This follows the useful MPSKit/TensorKit design principle of fusing local MPO
+tensors and separating structural bond changes from numerical data. The plan
+cache stores no Torch/JAX arrays or autodiff graph; coefficient rebinding
+recomputes numerical local blocks while reusing the symbolic plan. A scalar
+reference test in `tests/test_mpo.py` covers the batched Algorithm 3 path for
+orders 1--3.

@@ -165,6 +165,27 @@ def test_mpo_basis_batches_coefficients_and_reuses_history_topology():
     np.testing.assert_allclose(first.to_mpo().to_dense(), second.to_mpo().to_dense())
 
 
+def test_history_algorithms_reuse_symbolic_execution_plans():
+    """Algorithms 1--3 reuse topology plans without retaining tensor values."""
+    H = _two_term_mpo()
+    first = H.extensive_exponential(0.01, order=2, mode="optimal")
+    second = H.extensive_exponential(0.02, order=2, mode="optimal")
+
+    assert first.metadata["compression_plan_cache_hit"] is False
+    assert first.metadata["extension_plan_cache_hit"] is False
+    assert second.metadata["compression_plan_cache_hit"] is True
+    assert second.metadata["extension_plan_cache_hit"] is True
+    assert H.history_cache_info["compression_plan_orders"] == (2,)
+    assert H.history_cache_info["extension_plan_orders"] == (2,)
+    assert H.history_cache_info["extension_plan_batches"][2] > 0
+    assert all(
+        not hasattr(value, "requires_grad")
+        for plan in H._history_extension_plan_cache.values()
+        for batch in plan["batches"]
+        for value in batch.values()
+    )
+
+
 def test_fixed_rank_compression_has_fixed_bonds_and_report():
     """Fixed-rank compression is separate from semantic history compression."""
     H = _two_term_mpo()

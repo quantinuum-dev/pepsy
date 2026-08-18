@@ -108,4 +108,40 @@ To compress an existing MPO without replaying gates, use
 `MpoOptimizer(mpo, gates=[], chi=...).compress()`. Symmray may retain a small
 sector-multiplicity overshoot above the requested numeric bond cap.
 
+## Parameterized higher-order MPO construction
+
+`MPOBasis` is the reusable API for a Hamiltonian whose couplings change during
+an optimization:
+
+```python
+basis = MPOBasis.from_pauli_terms(
+    L,
+    [((i, i + 1), "ZZ", MPOParameter("J")) for i in range(L - 1)]
+    + [((i,), "X", MPOParameter("hx")) for i in range(L)],
+)
+U = basis.extensive_exponential(
+    -1j * dt,
+    {"J": J, "hx": hx},
+    order=2,
+    mode="optimal",
+)
+```
+
+`mode="base"` applies Algorithms 1--2. `mode="optimal"` applies Algorithms
+1--3, where Algorithm 3 adds selected order-`N + 1` terms without increasing
+the analytical history bond dimension. `mode="approximate"` additionally
+enables the paper's Algorithm 4. `MPOProductTerm` also accepts arbitrary
+one-dimensional supports, for example `(0, 1, 3)` with operators `"XYZ"`.
+
+The first build compiles the first-degree MPO topology and symbolic history
+plans. Later calls reuse only level indices, reachability information, and
+merge/insertion plans; local tensors are rebuilt from the supplied numerical
+parameters. This separation keeps Torch and JAX autodiff graphs correct. The
+plan state is visible through `basis.cache_info["history"]`, including
+`compression_plan_orders`, `extension_plan_orders`, and
+`extension_plan_batches`. `cache_history=False` avoids retaining a new raw
+history topology for one-off large builds, while `history_storage="streaming"`
+retains only adjacent history cuts during generation before assembling the
+current MPO needed by Algorithms 1--3.
+
 > API details are maintained as handwritten Markdown in this page.

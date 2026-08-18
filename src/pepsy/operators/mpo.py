@@ -392,6 +392,32 @@ def _concat(blocks, *, axis):
     return ar.do("concatenate", tuple(blocks), axis=axis)
 
 
+def _drop_axis(array, axis, position):
+    """Remove one virtual channel without rebuilding every remaining block."""
+    size = int(array.shape[axis])
+    if size <= 1:
+        raise ValueError("cannot remove the last virtual channel.")
+    pieces = []
+    if position:
+        index = [slice(None)] * len(array.shape)
+        index[axis] = slice(0, position)
+        pieces.append(array[tuple(index)])
+    if position + 1 < size:
+        index = [slice(None)] * len(array.shape)
+        index[axis] = slice(position + 1, None)
+        pieces.append(array[tuple(index)])
+    if len(pieces) == 1:
+        return pieces[0]
+    return _concat(pieces, axis=axis)
+
+
+def _backend_index_2d(array, rows, columns):
+    """Gather a virtual submatrix on the active Autoray backend."""
+    rows = _as_backend(np.asarray(rows, dtype=int), like=array)
+    columns = _as_backend(np.asarray(columns, dtype=int), like=array)
+    return array[rows[:, None], columns[None, :]]
+
+
 def _array_equal(left, right):
     """Check exact equality without introducing a numerical cutoff."""
     # NumPy is the cheap path for ordinary arrays.  The Autoray fallback keeps
@@ -422,6 +448,23 @@ def _setitem(array, index, value):
         array = ar.do("astype", array, value_dtype)
     if backend == "jax":
         return array.at[index].set(value)
+    if backend == "torch":
+        # Do not mutate a view participating in an autodiff graph.  A clone
+        # retains the graph while turning the indexed update into a tracked
+        # CopySlices operation, avoiding Torch's version-counter error during
+        # the later virtual-channel contractions.
+        updated = array.clone()
+        if isinstance(index, tuple):
+            index = tuple(
+                _as_backend(item, like=array)
+                if isinstance(item, np.ndarray)
+                else item
+                for item in index
+            )
+        elif isinstance(index, np.ndarray):
+            index = _as_backend(index, like=array)
+        updated[index] = value
+        return updated
     array[index] = value
     return array
 
@@ -555,6 +598,13 @@ class FirstDegreeMPO:
         # Taylor order. Keep it separate from value-dependent exact merges so
         # parameterized builds can reuse the expensive graph walk safely.
         self._history_topology_cache = {}
+        # The following caches contain symbolic indices and histories only.
+        # Numerical tensors are deliberately never retained here: a bound
+        # Torch/JAX MPO must build a new autodiff graph for every call.
+        self._history_symbolic_cache = None
+        self._history_extension_plan_cache = {}
+        self._history_compression_plan_cache = {}
+        self._base_level_position_cache = None
         self._levels = self._normalize_levels(levels)
         self._validate()
 
@@ -660,6 +710,10 @@ class FirstDegreeMPO:
         )
         out._structural_transitions = self._structural_transitions
         out._history_topology_cache = self._history_topology_cache
+        out._history_symbolic_cache = self._history_symbolic_cache
+        out._history_extension_plan_cache = self._history_extension_plan_cache
+        out._history_compression_plan_cache = self._history_compression_plan_cache
+        out._base_level_position_cache = self._base_level_position_cache
         return out
 
     @staticmethod
@@ -717,6 +771,7 @@ class FirstDegreeMPO:
             result._structural_transitions = (
                 result._structural_transitions_from_automaton(automaton)
             )
+            result._history_symbolic_cache = None
         return result
 
     @classmethod
@@ -1278,6 +1333,123 @@ class FirstDegreeMPO:
             for bond in range(self.L + 1)
         )
 
+    def _history_symbolic_data(self):
+        """Build structural history lookup tables once per MPO topology.
+
+        The history algorithms used to resolve a token by scanning a whole
+        level list and to test reachability by walking all earlier sites for
+        every candidate.  Both operations are structural.  This table turns
+        them into dictionary lookups and one precomputed forward reachability
+        walk.  It is safe to retain across parameter rebinding because it
+        contains no numerical tensor or backend scalar.
+        """
+        if self._history_symbolic_cache is not None:
+            return self._history_symbolic_cache
+
+        schemas = self._history_schemas()
+        token_levels = tuple(
+            {
+                level.history: level
+                for level in schema
+                if len(level.history) == 1
+            }
+            for schema in schemas
+        )
+        reachable_labels = None
+        if self._structural_transitions is not None:
+            start_labels = frozenset(
+                level.label
+                for level in schemas[0]
+                if _level_number(level.history[0]) == 1
+            )
+            reachable = [start_labels]
+            for edges in self._structural_transitions:
+                reachable.append(frozenset(
+                    right
+                    for left, right in edges
+                    if left in reachable[-1]
+                ))
+            reachable_labels = tuple(reachable)
+
+        self._history_symbolic_cache = {
+            "schemas": schemas,
+            "token_levels": token_levels,
+            "reachable_labels": reachable_labels,
+            "inserted_states": {},
+        }
+        return self._history_symbolic_cache
+
+    def _history_inserted_states(self, bond, history, token):
+        """Return reachable factor states after inserting one token.
+
+        Equal insertions (for example inserting a level-1 token next to an
+        existing level-1 token) are grouped with a multiplicity.  This is the
+        same sum as the paper's insertion loop, but avoids evaluating the
+        same local product repeatedly.
+        """
+        symbolic = self._history_symbolic_data()
+        key = (bond, tuple(history), token)
+        cached = symbolic["inserted_states"].get(key)
+        if cached is not None:
+            return cached
+
+        grouped = {}
+        for position in range(len(history) + 1):
+            extended = (
+                history[:position]
+                + (token,)
+                + history[position:]
+            )
+            state = self._history_tokens_reachable(
+                symbolic["schemas"],
+                bond,
+                extended,
+                {},
+            )
+            if state is None:
+                continue
+            if extended in grouped:
+                old_state, multiplicity = grouped[extended]
+                grouped[extended] = (old_state, multiplicity + 1)
+            else:
+                grouped[extended] = (state, 1)
+
+        result = tuple(grouped.values())
+        symbolic["inserted_states"][key] = result
+        return result
+
+    @staticmethod
+    def _history_level_positions(levels):
+        """Return the current virtual positions indexed by history."""
+        return {
+            level.history: position
+            for position, level in enumerate(levels)
+        }
+
+    def _base_level_positions(self):
+        """Cache label/history positions for the original first-degree MPO."""
+        if self._base_level_position_cache is None:
+            self._base_level_position_cache = tuple(
+                {
+                    "label": {
+                        level.label: position
+                        for position, level in enumerate(levels)
+                    },
+                    "history": {
+                        level.history: position
+                        for position, level in enumerate(levels)
+                    },
+                    "number": {
+                        number: position
+                        for position, level in enumerate(levels)
+                        for number in [_level_number(level.history[0])]
+                        if number in (1, 3)
+                    },
+                }
+                for levels in self._levels
+            )
+        return self._base_level_position_cache
+
     def _structural_transitions_from_automaton(self, automaton):
         """Map automaton edges onto the raw-history boundary schemas."""
         transitions = []
@@ -1623,6 +1795,16 @@ class FirstDegreeMPO:
                 order: tuple(len(states) for states in state_lists[1:-1])
                 for order, state_lists in self._history_topology_cache.items()
             },
+            "compression_plan_orders": tuple(
+                sorted(self._history_compression_plan_cache),
+            ),
+            "extension_plan_orders": tuple(
+                sorted(self._history_extension_plan_cache),
+            ),
+            "extension_plan_batches": {
+                order: len(plan["batches"])
+                for order, plan in self._history_extension_plan_cache.items()
+            },
         }
 
     def _history_power_data(
@@ -1737,10 +1919,17 @@ class FirstDegreeMPO:
     def _base_local_block(self, site, left_level, right_level):
         """Read a first-degree local block, returning zero for edge padding."""
         array = self._arrays[site]
-        left_levels = self._levels[site]
-        right_levels = self._levels[site + 1]
-        left_pos = self._level_position(left_levels, left_level)
-        right_pos = self._level_position(right_levels, right_level)
+        positions = self._base_level_positions()
+        left_map = positions[site]
+        right_map = positions[site + 1]
+        if left_level.label in left_map["label"]:
+            left_pos = left_map["label"][left_level.label]
+        else:
+            left_pos = left_map["history"].get(left_level.history)
+        if right_level.label in right_map["label"]:
+            right_pos = right_map["label"][right_level.label]
+        else:
+            right_pos = right_map["history"].get(right_level.history)
         reference = array[0, 0]
         left_number = _level_number(left_level.history[0])
         right_number = _level_number(right_level.history[0])
@@ -1769,17 +1958,10 @@ class FirstDegreeMPO:
 
     def _history_levels_from_tokens(self, schemas, bond, history):
         """Resolve flattened history tokens to base levels at one cut."""
+        token_levels = self._history_symbolic_data()["token_levels"][bond]
         levels = []
-        schema = schemas[bond]
         for token in history:
-            level = next(
-                (
-                    candidate
-                    for candidate in schema
-                    if candidate.history == (token,)
-                ),
-                None,
-            )
+            level = token_levels.get((token,))
             if level is None:
                 return None
             levels.append(level)
@@ -1811,30 +1993,13 @@ class FirstDegreeMPO:
         if factor_levels is None:
             cache[key] = None
             return None
-        if self._structural_transitions is not None:
-            start_label = next(
-                level.label
-                for level in schemas[0]
-                if _level_number(level.history[0]) == 1
-            )
-            for factor_level in factor_levels:
-                possible_labels = {factor_level.label}
-                for site in range(bond - 1, -1, -1):
-                    edges = self._structural_transitions[site]
-                    possible_labels = {
-                        candidate.label
-                        for candidate in schemas[site]
-                        if any(
-                            (candidate.label, right_label) in edges
-                            for right_label in possible_labels
-                        )
-                    }
-                    if not possible_labels:
-                        cache[key] = None
-                        return None
-                if start_label not in possible_labels:
-                    cache[key] = None
-                    return None
+        reachable_labels = self._history_symbolic_data()["reachable_labels"]
+        if reachable_labels is not None and any(
+            factor_level.label not in reachable_labels[bond]
+            for factor_level in factor_levels
+        ):
+            cache[key] = None
+            return None
         cache[key] = factor_levels
         return factor_levels
 
@@ -1851,27 +2016,21 @@ class FirstDegreeMPO:
         """Apply an Algorithm-1/column-gauge elimination at one cut.
 
         The helper mutates the working arrays and level list in place.  All
-        callers operate on freshly built history data, so this keeps the
-        rewiring cheap without making mutation part of the public API.
+        callers operate on freshly built history data.  Slicing and
+        concatenating the virtual axis avoids Python-level reconstruction of
+        every remaining block on large history bonds.
         """
         left = arrays[bond - 1]
-        left_columns = [left[:, pos] for pos in range(left.shape[1])]
-        left_columns[target] = (
-            left_columns[target]
-            + _multiply_scalar(coefficient, left_columns[source])
+        left = _setitem(
+            left,
+            (slice(None), target),
+            left[:, target]
+            + _multiply_scalar(coefficient, left[:, source]),
         )
-        left_columns = [
-            block for pos, block in enumerate(left_columns) if pos != source
-        ]
-        arrays[bond - 1] = _stack(left_columns, axis=1)
+        arrays[bond - 1] = _drop_axis(left, axis=1, position=source)
 
         if bond < len(arrays):
-            right = arrays[bond]
-            right_rows = [right[pos] for pos in range(right.shape[0])]
-            right_rows = [
-                block for pos, block in enumerate(right_rows) if pos != source
-            ]
-            arrays[bond] = _stack(right_rows, axis=0)
+            arrays[bond] = _drop_axis(arrays[bond], axis=0, position=source)
         levels[bond].pop(source)
 
     @staticmethod
@@ -1886,83 +2045,71 @@ class FirstDegreeMPO:
         if bond >= len(arrays):
             return False
         right = arrays[bond]
-        right_rows = [right[pos] for pos in range(right.shape[0])]
-        right_rows[target] = right_rows[target] + right_rows[source]
-        right_rows = [
-            block for pos, block in enumerate(right_rows) if pos != source
-        ]
-        arrays[bond] = _stack(right_rows, axis=0)
+        right = _setitem(
+            right,
+            (target, slice(None)),
+            right[target] + right[source],
+        )
+        arrays[bond] = _drop_axis(right, axis=0, position=source)
 
         left = arrays[bond - 1]
-        left_columns = [left[:, pos] for pos in range(left.shape[1])]
-        left_columns = [
-            block for pos, block in enumerate(left_columns) if pos != source
-        ]
-        arrays[bond - 1] = _stack(left_columns, axis=1)
+        arrays[bond - 1] = _drop_axis(left, axis=1, position=source)
         levels[bond].pop(source)
         return True
 
-    def _algorithm_one(self, arrays, levels, order, dt):
-        """Apply the paper's extensive prefactor transformation.
+    def _history_compression_plan(self, levels, order, *, cache_history):
+        """Compile Algorithms 1--2 as a topology-only elimination plan.
 
-        This pass removes all-identity/all-level-3 histories into the all-one
-        target with the paper's factorial coefficient.  It is intentionally
-        separate from Algorithm 2 so a report can distinguish coefficient
-        rewiring from exact equal-history compression.
+        The plan is generated by simulating only virtual histories.  Applying
+        it later performs the same ordered eliminations on the current
+        numerical arrays, with ``dt`` supplied at execution time.  This is
+        the key separation needed by parameter optimization: the expensive
+        history decisions are cached, while all values remain differentiable
+        and are recomputed for each call.
         """
-        coefficient_denominator = factorial(order)
+        if cache_history:
+            cached = self._history_compression_plan_cache.get(order)
+            if cached is not None:
+                return cached, True
+
+        working = [list(bond_levels) for bond_levels in levels]
+        algorithm_one = []
+        target_history = tuple(MPOLevelToken(1) for _ in range(order))
         for bond in range(1, self.L + 1):
             for number_of_threes in range(1, order + 1):
-                coefficient = (
-                    dt ** number_of_threes
-                    * factorial(order - number_of_threes)
-                    / coefficient_denominator
-                )
-                while True:
-                    source = next(
-                        (
-                            pos for pos, level in enumerate(levels[bond])
-                            if (
-                                all(
-                                    _level_number(token) in (1, 3)
-                                    for token in level.history
-                                )
-                                and sum(
-                                    _level_number(token) == 3
-                                    for token in level.history
-                                ) == number_of_threes
-                            )
-                        ),
-                        None,
-                    )
-                    if source is None:
-                        break
-                    target = self._find_history(
-                        levels[bond],
-                        tuple(MPOLevelToken(1) for _ in range(order)),
-                    )
-                    if target is None or target == source:
+                for level in tuple(working[bond]):
+                    history = level.history
+                    if not (
+                        all(
+                            _level_number(token) in (1, 3)
+                            for token in history
+                        )
+                        and sum(
+                            _level_number(token) == 3 for token in history
+                        ) == number_of_threes
+                    ):
+                        continue
+                    positions = self._history_level_positions(working[bond])
+                    source = positions.get(history)
+                    target = positions.get(target_history)
+                    if source is None or target is None or source == target:
                         raise ValueError(
                             "history power lost its all-one Algorithm-1 target."
                         )
-                    self._remove_history_column(
-                        arrays, levels, bond, source, target, coefficient,
-                    )
+                    algorithm_one.append((
+                        bond,
+                        history,
+                        target_history,
+                        number_of_threes,
+                    ))
+                    working[bond].pop(source)
 
-    def _algorithm_two(self, arrays, levels):
-        """Apply the paper's exact history-only compression transformations.
-
-        The implementation chooses the row or column orientation from the
-        number of level-1 and level-3 tokens.  This is a structural rule from
-        the paper, not a numerical rank heuristic; no backend conversion or
-        tolerance is involved.
-        """
-        merges = []
+        algorithm_two = []
         for bond in range(1, self.L + 1):
             changed = True
             while changed:
                 changed = False
-                for source, level in enumerate(tuple(levels[bond])):
+                for level in tuple(working[bond]):
                     history = level.history
                     number_of_ones = sum(
                         _level_number(token) == 1 for token in history
@@ -1978,127 +2125,383 @@ class FirstDegreeMPO:
                         mode = "column"
                     if canonical == history:
                         continue
-                    target = self._find_history(levels[bond], canonical)
-                    if target is None or target == source:
+                    positions = self._history_level_positions(working[bond])
+                    source = positions.get(history)
+                    target = positions.get(canonical)
+                    if source is None or target is None or source == target:
                         continue
-                    if mode == "row":
-                        applied = self._remove_history_row(
-                            arrays, levels, bond, source, target,
-                        )
-                    else:
-                        self._remove_history_column(
-                            arrays, levels, bond, source, target, 1.0,
-                        )
-                        applied = True
-                    if applied:
-                        merges.append({
-                            "bond": bond - 1,
-                            "source": level.label,
-                            "target": canonical,
-                            "mode": mode,
-                            "history": history,
-                        })
-                        changed = True
-                        break
+                    algorithm_two.append((
+                        bond,
+                        history,
+                        canonical,
+                        mode,
+                        level.label,
+                    ))
+                    working[bond].pop(source)
+                    changed = True
+                    break
+
+        plan = {
+            "algorithm_one": tuple(algorithm_one),
+            "algorithm_two": tuple(algorithm_two),
+        }
+        if cache_history:
+            self._history_compression_plan_cache[order] = plan
+        return plan, False
+
+    def _algorithm_one(self, arrays, levels, order, dt, *, plan=None):
+        """Apply the paper's extensive prefactor transformation.
+
+        This pass removes all-identity/all-level-3 histories into the all-one
+        target with the paper's factorial coefficient.  It is intentionally
+        separate from Algorithm 2 so a report can distinguish coefficient
+        rewiring from exact equal-history compression.
+        """
+        if plan is None:
+            plan, _ = self._history_compression_plan(
+                levels, order, cache_history=False,
+            )
+        coefficient_denominator = factorial(order)
+        for bond, source_history, target_history, number_of_threes in plan[
+            "algorithm_one"
+        ]:
+            positions = self._history_level_positions(levels[bond])
+            source = positions.get(source_history)
+            target = positions.get(target_history)
+            if source is None:
+                continue
+            if target is None or target == source:
+                raise ValueError(
+                    "history power lost its all-one Algorithm-1 target."
+                )
+            coefficient = (
+                dt ** number_of_threes
+                * factorial(order - number_of_threes)
+                / coefficient_denominator
+            )
+            self._remove_history_column(
+                arrays, levels, bond, source, target, coefficient,
+            )
+
+    def _algorithm_two(self, arrays, levels, *, plan=None):
+        """Apply the paper's exact history-only compression transformations.
+
+        The implementation chooses the row or column orientation from the
+        number of level-1 and level-3 tokens.  This is a structural rule from
+        the paper, not a numerical rank heuristic; no backend conversion or
+        tolerance is involved.
+        """
+        if plan is None:
+            plan, _ = self._history_compression_plan(
+                levels, len(levels[0][0].history), cache_history=False,
+            )
+        merges = []
+        for bond, source_history, canonical, mode, source_label in plan[
+            "algorithm_two"
+        ]:
+            positions = self._history_level_positions(levels[bond])
+            source = positions.get(source_history)
+            target = positions.get(canonical)
+            if source is None or target is None or target == source:
+                continue
+            if mode == "row":
+                applied = self._remove_history_row(
+                    arrays, levels, bond, source, target,
+                )
+            else:
+                self._remove_history_column(
+                    arrays, levels, bond, source, target, 1.0,
+                )
+                applied = True
+            if applied:
+                merges.append({
+                    "bond": bond - 1,
+                    "source": source_label,
+                    "target": canonical,
+                    "mode": mode,
+                    "history": source_history,
+                })
         return merges
 
-    def _algorithm_three_extension(self, arrays, levels, order, dt):
-        """Add Algorithm 3's selected ``N + 1`` local history transitions.
+    def _base_level_position(self, bond, level):
+        """Resolve a symbolic base level to its original virtual position."""
+        positions = self._base_level_positions()[bond]
+        position = positions["label"].get(level.label)
+        if position is not None:
+            return position
+        return positions["history"].get(level.history)
 
-        This pass generates only the candidate extended histories that can
-        connect an existing order-``N`` transition. It deliberately avoids
-        constructing the complete order ``N + 1`` history tensors: each
-        candidate is checked by a structural backwards reachability walk and
-        its local product is assembled directly into the existing tensor.
+    def _history_extension_plan(self, levels, order, *, cache_history):
+        """Compile Algorithm 3 as batched local insertion transitions.
+
+        The naive pseudocode has a pair of history loops inside every site.
+        The selected contribution is separable at the virtual level: for a
+        fixed insertion position, one only needs the valid left state list,
+        the valid right state list, and the local base-block positions for
+        each factor.  Store those short lists and let execution perform one
+        batched physical-matrix product per insertion pair.  This keeps the
+        plan ``O(L N D)`` instead of materializing ``O(L N^2 D^2)`` scalar
+        transition records.
         """
-        schemas = self._history_schemas()
-        reachable_cache = {}
-        added = 0
+        if cache_history:
+            cached = self._history_extension_plan_cache.get(order)
+            if cached is not None:
+                return cached, True
+
+        symbolic = self._history_symbolic_data()
+        schemas = symbolic["schemas"]
         snapshot = [tuple(bond_levels) for bond_levels in levels]
+        one = MPOLevelToken(1)
+        three = MPOLevelToken(3)
+        batches = []
+        selected_terms = 0
 
         for site in range(self.L):
             left_levels = snapshot[site]
             right_levels = snapshot[site + 1]
+            left_candidates = []
             for left_pos, left_level in enumerate(left_levels):
-                left_history = left_level.history
-                left_numbers = _history_signature(left_history)
-                for right_pos, right_level in enumerate(right_levels):
-                    right_history = right_level.history
-                    right_numbers = _history_signature(right_history)
-                    if not all(number > 1 for number in right_numbers):
+                history = left_level.history
+                numbers = _history_signature(history)
+                if all(number in (1, 3) for number in numbers) and 3 in numbers:
+                    continue
+                left_candidates.append((left_pos, history, numbers))
+            right_candidates = [
+                (right_pos, right_level.history, _history_signature(right_level.history))
+                for right_pos, right_level in enumerate(right_levels)
+                if all(number > 1 for number in _history_signature(right_level.history))
+            ]
+            if not left_candidates or not right_candidates:
+                continue
+
+            left_insertions = []
+            for insert_position in range(order + 1):
+                entries = []
+                for left_pos, history, numbers in left_candidates:
+                    extended = (
+                        history[:insert_position]
+                        + (one,)
+                        + history[insert_position:]
+                    )
+                    state = self._history_tokens_reachable(
+                        schemas,
+                        site,
+                        extended,
+                        {},
+                    )
+                    if state is not None:
+                        entries.append((left_pos, numbers, state))
+                if entries:
+                    left_insertions.append(tuple(entries))
+                else:
+                    left_insertions.append(())
+
+            right_insertions = []
+            for insert_position in range(order + 1):
+                entries = []
+                for right_pos, history, numbers in right_candidates:
+                    extended = (
+                        history[:insert_position]
+                        + (three,)
+                        + history[insert_position:]
+                    )
+                    state = self._history_tokens_reachable(
+                        schemas,
+                        site + 1,
+                        extended,
+                        {},
+                    )
+                    if state is not None:
+                        entries.append((right_pos, numbers, state))
+                if entries:
+                    right_insertions.append(tuple(entries))
+                else:
+                    right_insertions.append(())
+
+            for left_entries in left_insertions:
+                if not left_entries:
+                    continue
+                for right_entries in right_insertions:
+                    if not right_entries:
                         continue
-                    if (
-                        all(number in (1, 3) for number in left_numbers)
-                        and 3 in left_numbers
-                    ):
-                        continue
-                    for insert_left in range(order + 1):
-                        extended_left = (
-                            left_history[:insert_left]
-                            + (MPOLevelToken(1),)
-                            + left_history[insert_left:]
+                    left_targets = np.asarray(
+                        [entry[0] for entry in left_entries],
+                        dtype=int,
+                    )
+                    right_targets = np.asarray(
+                        [entry[0] for entry in right_entries],
+                        dtype=int,
+                    )
+                    left_weights = np.asarray(
+                        [
+                            1.0 / ((order + 1) * (entry[1].count(1) + 1))
+                            for entry in left_entries
+                        ],
+                        dtype=float,
+                    )
+                    right_weights = np.asarray(
+                        [1.0 / (entry[1].count(3) + 1) for entry in right_entries],
+                        dtype=float,
+                    )
+                    left_states = tuple(entry[2] for entry in left_entries)
+                    right_states = tuple(entry[2] for entry in right_entries)
+                    left_positions = tuple(
+                        np.asarray(
+                            [
+                                self._base_level_position(site, state[factor])
+                                if self._base_level_position(site, state[factor]) is not None
+                                else -1
+                                for state in left_states
+                            ],
+                            dtype=int,
                         )
-                        left_state = self._history_tokens_reachable(
-                            schemas,
-                            site,
-                            extended_left,
-                            reachable_cache,
+                        for factor in range(order + 1)
+                    )
+                    right_positions = tuple(
+                        np.asarray(
+                            [
+                                self._base_level_position(site + 1, state[factor])
+                                if self._base_level_position(site + 1, state[factor]) is not None
+                                else -1
+                                for state in right_states
+                            ],
+                            dtype=int,
                         )
-                        if left_state is None:
-                            continue
-                        for insert_right in range(order + 1):
-                            extended_right = (
-                                right_history[:insert_right]
-                                + (MPOLevelToken(3),)
-                                + right_history[insert_right:]
-                            )
-                            right_state = self._history_tokens_reachable(
-                                schemas,
-                                site + 1,
-                                extended_right,
-                                reachable_cache,
-                            )
-                            if right_state is None:
-                                continue
-                            number_of_ones = (
-                                sum(
-                                    _level_number(token) == 1
-                                    for token in left_history
-                                )
-                                + 1
-                            )
-                            number_of_threes = (
-                                sum(
-                                    _level_number(token) == 3
-                                    for token in right_history
-                                )
-                                + 1
-                            )
-                            coefficient = (
-                                dt
-                                * factorial(order)
-                                / (
-                                    factorial(order + 1)
-                                    * number_of_ones
-                                    * number_of_threes
-                                )
-                            )
-                            extension = self._history_local_product(
-                                site,
-                                left_state,
-                                right_state,
-                            )
-                            arrays[site] = _setitem(
-                                arrays[site],
-                                (left_pos, right_pos),
-                                arrays[site][left_pos, right_pos]
-                                + _multiply_scalar(
-                                    coefficient,
-                                    extension,
-                                ),
-                            )
-                            added += 1
-        return added
+                        for factor in range(order + 1)
+                    )
+                    left_identity = tuple(
+                        np.asarray(
+                            [
+                                _level_number(state[factor].history[0]) == 1
+                                for state in left_states
+                            ],
+                            dtype=bool,
+                        )
+                        for factor in range(order + 1)
+                    )
+                    right_identity = tuple(
+                        np.asarray(
+                            [
+                                _level_number(state[factor].history[0]) == 1
+                                for state in right_states
+                            ],
+                            dtype=bool,
+                        )
+                        for factor in range(order + 1)
+                    )
+                    weight_matrix = left_weights[:, None] * right_weights[None, :]
+                    batches.append({
+                        "site": site,
+                        "left_targets": left_targets,
+                        "right_targets": right_targets,
+                        "left_positions": left_positions,
+                        "right_positions": right_positions,
+                        "left_identity": left_identity,
+                        "right_identity": right_identity,
+                        "weights": weight_matrix,
+                    })
+                    selected_terms += int(left_targets.size * right_targets.size)
+
+        plan = {
+            "batches": tuple(batches),
+            "selected_terms": selected_terms,
+        }
+        if cache_history:
+            self._history_extension_plan_cache[order] = plan
+        return plan, False
+
+    def _history_local_product_batch(self, batch, order):
+        """Evaluate one Algorithm-3 batch as a backend-native matrix product."""
+        site = batch["site"]
+        reference = self._arrays[site][0, 0]
+        product_block = None
+        for factor in range(order + 1):
+            left_positions = batch["left_positions"][factor]
+            right_positions = batch["right_positions"][factor]
+            left_valid = left_positions >= 0
+            right_valid = right_positions >= 0
+            safe_left = np.where(left_valid, left_positions, 0)
+            safe_right = np.where(right_valid, right_positions, 0)
+            local = _backend_index_2d(
+                self._arrays[site],
+                safe_left,
+                safe_right,
+            )
+            valid = _as_backend(
+                left_valid[:, None] & right_valid[None, :],
+                like=local,
+            )
+            local = ar.do(
+                "where",
+                valid[..., None, None],
+                local,
+                ar.do("zeros_like", local),
+            )
+            synthetic = _as_backend(
+                batch["left_identity"][factor][:, None]
+                & (~right_valid[None, :])
+                & batch["right_identity"][factor][None, :],
+                like=local,
+            )
+            if bool(np.any(batch["right_identity"][factor] & ~right_valid)):
+                identity = ar.do("eye", self.phys_dim, like=reference)
+                local = ar.do(
+                    "where",
+                    synthetic[..., None, None],
+                    identity,
+                    local,
+                )
+            product_block = (
+                local
+                if product_block is None
+                else ar.do("matmul", product_block, local)
+            )
+        return product_block
+
+    def _algorithm_three_extension(
+        self,
+        arrays,
+        levels,
+        order,
+        dt,
+        *,
+        cache_history=True,
+    ):
+        """Add Algorithm 3's selected ``N + 1`` local history transitions.
+
+        The topology-only insertion plan is cached; this numerical pass only
+        evaluates selected local products and scatters them into the existing
+        order-``N`` tensor.  Thus parameter rebinding does not reuse a stale
+        backend value or autodiff graph.
+        """
+        plan, cache_hit = self._history_extension_plan(
+            levels,
+            order,
+            cache_history=cache_history,
+        )
+        for batch in plan["batches"]:
+            site = batch["site"]
+            extension = self._history_local_product_batch(batch, order)
+            weights = _as_backend(batch["weights"], like=extension)
+            extension = ar.do(
+                "multiply",
+                extension,
+                weights[..., None, None],
+            )
+            current = _backend_index_2d(
+                arrays[site],
+                batch["left_targets"],
+                batch["right_targets"],
+            )
+            arrays[site] = _setitem(
+                arrays[site],
+                (
+                    batch["left_targets"][:, None],
+                    batch["right_targets"][None, :],
+                ),
+                current + _multiply_scalar(dt, extension),
+            )
+        return plan["selected_terms"], cache_hit
 
     def _algorithm_four(self, arrays, levels, order, dt):
         """Apply the paper's order-controlled approximate compression.
@@ -2161,8 +2564,12 @@ class FirstDegreeMPO:
         unreachable edge states as physical channels.
         """
         boundary_history = tuple(MPOLevelToken(1) for _ in range(order))
-        left_target = self._find_history(levels[0], boundary_history)
-        right_target = self._find_history(levels[-1], boundary_history)
+        left_target = self._history_level_positions(levels[0]).get(
+            boundary_history,
+        )
+        right_target = self._history_level_positions(levels[-1]).get(
+            boundary_history,
+        )
         if left_target is None or right_target is None:
             raise ValueError("history construction lost a finite boundary state.")
 
@@ -2205,13 +2612,37 @@ class FirstDegreeMPO:
         initial_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
         )
-        extension_terms = 0
-        if extend:
-            extension_terms = self._algorithm_three_extension(
-                arrays, levels, order, dt,
+        compression_plan, compression_plan_cache_hit = (
+            self._history_compression_plan(
+                levels,
+                order,
+                cache_history=cache_history,
             )
-        self._algorithm_one(arrays, levels, order, dt)
-        exact_merges = self._algorithm_two(arrays, levels)
+        )
+        extension_terms = 0
+        extension_plan_cache_hit = False
+        if extend:
+            extension_terms, extension_plan_cache_hit = (
+                self._algorithm_three_extension(
+                    arrays,
+                    levels,
+                    order,
+                    dt,
+                    cache_history=cache_history,
+                )
+            )
+        self._algorithm_one(
+            arrays,
+            levels,
+            order,
+            dt,
+            plan=compression_plan,
+        )
+        exact_merges = self._algorithm_two(
+            arrays,
+            levels,
+            plan=compression_plan,
+        )
         approximate_merges = 0
         if approximate:
             approximate_merges = self._algorithm_four(
@@ -2237,6 +2668,8 @@ class FirstDegreeMPO:
                 "reachable" if self._structural_transitions is not None else "cartesian"
             ),
             "history_cache_hit": history_cache_hit,
+            "compression_plan_cache_hit": compression_plan_cache_hit,
+            "extension_plan_cache_hit": extension_plan_cache_hit,
             "algorithms": (1, 2) + ((3,) if extend else ()) + ((4,) if approximate else ()),
             "exact_history_merges": len(exact_merges),
             "approximate_history_merges": approximate_merges,
@@ -2262,6 +2695,13 @@ class FirstDegreeMPO:
         )
         output.compression_report = report
         output.metadata["compression_report"] = report
+        if not cache_history:
+            # One-off builds should not leave the raw topology, insertion
+            # states, or execution plans attached to the source object.
+            self._history_topology_cache.pop(order, None)
+            self._history_symbolic_cache = None
+            self._history_extension_plan_cache.pop(order, None)
+            self._history_compression_plan_cache.pop(order, None)
         return output
 
     def _first_degree_structure(self):
@@ -2577,6 +3017,7 @@ class FirstDegreeMPO:
             *self._arrays[bond + 1 :],
         )
         self._levels[bond].pop(source)
+        self._base_level_position_cache = None
         self._validate()
         return True
 
@@ -2890,6 +3331,13 @@ class MPOBasis:
             degree=1,
         )
         result._history_topology_cache = self._template._history_topology_cache
+        result._history_symbolic_cache = self._template._history_symbolic_cache
+        result._history_extension_plan_cache = (
+            self._template._history_extension_plan_cache
+        )
+        result._history_compression_plan_cache = (
+            self._template._history_compression_plan_cache
+        )
         result.metadata.update({
             "operation": "mpo_basis_build",
             "basis_terms": self.num_terms,
