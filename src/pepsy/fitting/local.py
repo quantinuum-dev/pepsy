@@ -2060,6 +2060,67 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             }
         )
 
+    def _prepare_dense_target_support(self, start, stop, block_size):
+        """Seed missing dense Schmidt subspaces from an MPS target.
+
+        With a non-zero SVD cutoff, a local overlap fit started from a
+        product MPS can see only the component parallel to the current
+        product sector. The exact-zero singular values carrying a remote
+        gate's new Schmidt sector are discarded before a later sweep can use
+        them, leaving the solver at a false local optimum. For ordinary
+        dense MPS targets, the deterministic analogue of native sector
+        initialization is to use a private copy of the target as the initial
+        variational state. The subsequent local SVDs still enforce the user's
+        bond and cutoff limits.
+        """
+        diagnostic = {
+            "applied": False,
+            "strategy": "target_mps",
+            "reason": "not_needed",
+            "bonds": (),
+        }
+        self.info["dense_target_initialization"] = diagnostic
+        if (
+            int(block_size) not in {2, 3}
+            or int(stop) - int(start) < 2
+            or not isinstance(self.p, qtn.MatrixProductState)
+            or not isinstance(self.tn, qtn.MatrixProductState)
+            or int(self.tn.num_tensors) != int(self.L)
+            or self.p.isfermionic()
+            or self.tn.isfermionic()
+            or self._target_site_tensors is None
+        ):
+            diagnostic["reason"] = "incompatible_target"
+            return False
+
+        gaps = []
+        try:
+            for site in range(int(start), int(stop)):
+                current = int(self.p.bond_size(site, site + 1))
+                target = int(self.tn.bond_size(site, site + 1))
+                if target > current:
+                    gaps.append(
+                        {
+                            "bond": (int(site), int(site + 1)),
+                            "current_bond_dim": current,
+                            "target_bond_dim": target,
+                        }
+                    )
+        except (AttributeError, TypeError, ValueError):
+            diagnostic["reason"] = "bond_dimensions_unavailable"
+            return False
+
+        diagnostic["bonds"] = tuple(gaps)
+        if not gaps:
+            return False
+
+        seed = self.tn.copy(deep=True)
+        seed.reindex_({index: qtn.rand_uuid() for index in seed.inner_inds()})
+        self.p = seed
+        diagnostic["applied"] = True
+        diagnostic["reason"] = "missing_target_bond_rank"
+        return True
+
     def _prepare_fermionic_effective_tensor(
         self,
         tensor,
@@ -3139,6 +3200,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         adaptive_until_rank=False,
         final_one_site_sweeps=0,
         collect_split_diagnostics=True,
+        target_support_init=False,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
 
@@ -3192,6 +3254,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         three sites; it is ignored for a two-site window.
         ``collect_split_diagnostics=False`` avoids allocating SVD metadata when
         the caller only needs the fitted state.
+        ``target_support_init=True`` deterministically seeds missing dense MPS
+        Schmidt subspaces from the target before block FIT. It is intended
+        for gate-target fits; arbitrary target fits retain their supplied
+        initial state by default.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -3257,6 +3323,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing_sync_device = bool(timing_sync_device)
         single_pair_fast_path = bool(single_pair_fast_path)
         collect_split_diagnostics = bool(collect_split_diagnostics)
+        target_support_init = bool(target_support_init)
         self._timing_sync_device = timing and timing_sync_device
         self._timing_synchronizer = (
             self._make_backend_synchronizer(self.p)
@@ -3297,6 +3364,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "block_size=3 requires range_int to span at least three sites."
             )
+        if target_support_init:
+            self._prepare_dense_target_support(start, stop, block_size)
+        psi = self.p
         if (
             adaptive_schedule
             and block_size in {2, 3}

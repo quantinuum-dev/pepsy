@@ -479,6 +479,47 @@ def test_simulator_random_1q_matrix_matches_dense():
     assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_stabilizer_mps_matches_shared_stream_and_diagnostic_api():
+    """The STN facade exposes the same stream/ledger surface as ordinary MPS."""
+    sim = MpsStabOptimizer(1)
+
+    assert sim.norm_diagnostics()["tracking"] is True
+    assert sim.gate_stream() == ()
+    assert sim.has_trajectory_events is False
+    assert MpsStabOptimizer.measure_event("Z", 0) == ("measure", "Z", (0,))
+    assert MpsStabOptimizer.reset_event(0) == ("reset", (0,))
+    assert MpsStabOptimizer.measure_reset_event("Z", 0) == (
+        "measure_reset", "Z", (0,)
+    )
+    assert sim.get_fit_diagnostics() is None
+    assert sim.get_quality_checks() == []
+
+
+def test_stabilizer_mps_run_replays_noisy_stream_through_shared_runner():
+    sim = MpsStabOptimizer(1, gates=[("x_error", 0.5, 0)])
+
+    result = sim.run(shots=8, seed=3)
+
+    assert type(result).__name__ == "NoisyResult"
+    assert result.shots == 8
+    assert result.branches == 2
+    assert all(
+        optimizer.norm_diagnostics()["tracking"]
+        for optimizer in result.optimizers
+    )
+
+
+def test_stabilizer_mps_transactional_run_restores_state_and_queue():
+    sim = MpsStabOptimizer(1, gates=[("h", 0), ("not-a-gate", 0)])
+
+    with pytest.raises(ValueError, match="Unknown gate"):
+        sim.run(transactional=True)
+
+    assert len(sim._queue) == 2
+    np.testing.assert_allclose(sim.to_statevector(), [1.0, 0.0])
+    assert sim.norm_diagnostics()["infidelity"] is None
+
+
 def test_simulator_submpo_event_in_nu_frame():
     # A sub-MPO event acts directly on the coefficient MPS p; from |0...0> the
     # basis is identity so it also equals the physical operator.

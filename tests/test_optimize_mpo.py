@@ -889,6 +889,94 @@ def test_mpo_optimizer_mpo_mode_smoke():
     assert out.max_bond() <= 8
 
 
+def _embed_two_site_operator(operator, length, where):
+    """Embed a two-site operator while preserving the MPO site ordering."""
+    where = tuple(where)
+    rest = [site for site in range(length) if site not in where]
+    embedded = np.zeros((2**length, 2**length), dtype=complex)
+    for row in range(2**length):
+        row_bits = [(row >> (length - 1 - site)) & 1 for site in range(length)]
+        local_row = sum(
+            row_bits[site] << (len(where) - 1 - offset)
+            for offset, site in enumerate(where)
+        )
+        for col in range(2**length):
+            col_bits = [(col >> (length - 1 - site)) & 1 for site in range(length)]
+            if any(row_bits[site] != col_bits[site] for site in rest):
+                continue
+            local_col = sum(
+                col_bits[site] << (len(where) - 1 - offset)
+                for offset, site in enumerate(where)
+            )
+            embedded[row, col] = operator[local_row, local_col]
+    return embedded
+
+
+@pytest.mark.parametrize("where", [(0, 1), (0, 5)])
+def test_mpo_mode_complex_gate_matches_dmrg2(where):
+    """MPO mode must match DMRG2 for nonsymmetric complex two-site gates."""
+    length = 6
+    initial = qtn.MPO_rand(
+        length, bond_dim=2, phys_dim=2, dtype="complex128", seed=2718
+    )
+    rng = np.random.default_rng(20260817)
+    random_matrix = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    gate = np.linalg.qr(random_matrix)[0]
+
+    effective_gate = _embed_two_site_operator(gate.T, length, where)
+    expected = (
+        effective_gate
+        @ initial.to_dense()
+        @ effective_gate.conj().T
+    )
+
+    mpo_out = py.MpoOptimizer(
+        initial.copy(), gates=[(gate, where)], chi=64, mode="mpo"
+    ).run(progbar=False, cutoff=1e-13, fidelity_samples=1)
+    dmrg_out = py.MpoOptimizer(
+        initial.copy(), gates=[(gate, where)], chi=64, mode="dmrg2"
+    ).run(
+        n_iter=6,
+        progbar=False,
+        cutoff=1e-13,
+        fidelity_samples=1,
+        fit_adaptive_sweeps=2,
+    )
+
+    np.testing.assert_allclose(mpo_out.to_dense(), expected, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(dmrg_out.to_dense(), expected, atol=1e-10, rtol=1e-10)
+
+
+def test_mpo_mode_complex_gate_pair_sides_match_dense_action():
+    """MPO mode preserves explicit ket-only and bra-only gate semantics."""
+    length = 6
+    where = (0, 5)
+    initial = qtn.MPO_rand(
+        length, bond_dim=2, phys_dim=2, dtype="complex128", seed=2719
+    )
+    rng = np.random.default_rng(20260818)
+    random_matrix = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    gate = np.linalg.qr(random_matrix)[0]
+    effective_gate = _embed_two_site_operator(gate.T, length, where)
+    initial_dense = initial.to_dense()
+
+    ket_out = py.MpoOptimizer(
+        initial.copy(), gates=[((gate, None), where)], chi=64, mode="mpo"
+    ).run(progbar=False, cutoff=1e-13, fidelity_samples=1)
+    bra_out = py.MpoOptimizer(
+        initial.copy(), gates=[((None, gate), where)], chi=64, mode="mpo"
+    ).run(progbar=False, cutoff=1e-13, fidelity_samples=1)
+
+    np.testing.assert_allclose(
+        ket_out.to_dense(), effective_gate @ initial_dense, atol=1e-10, rtol=1e-10
+    )
+    np.testing.assert_allclose(
+        bra_out.to_dense(), initial_dense @ effective_gate.conj().T,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
 def test_mpo_optimizer_mpo_mode_unitary_evolution_preserves_norm():
     """Two-sided unitary evolution in MPO mode should preserve the normalized norm."""
     mpo0 = qtn.MPO_identity(4, dtype="complex128")

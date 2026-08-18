@@ -1118,6 +1118,42 @@ class MpoOptimizer:
         return g_k, g_b
 
     @classmethod
+    def _prepare_nonlocal_gate_pair(
+        cls, gate, n_sites, bra_gate=None, *, p=None, where=None, ind_id="k{}"
+    ):
+        """Prepare gates for :func:`gate_nonlocal_opt`.
+
+        ``gate_nonlocal_opt`` uses a different dense gate convention for the
+        lower MPO layer than :func:`apply_gate`. The ket payload has the same
+        input/output reordering as the regular gate path, but the lower
+        payload must be the elementwise-conjugated raw bra operator. Reusing
+        :meth:`_prepare_gate_pair` here silently transposes that bra payload
+        a second time and gives incorrect results for nonsymmetric complex
+        gates.
+        """
+        if gate is None and bra_gate is None:
+            raise ValueError("At least one of ket gate or bra gate must be provided.")
+
+        if p is not None and where is not None:
+            gate = (
+                None
+                if gate is None
+                else cls._fermionic_gate_to_bosonic(p, gate, where, ind_id)
+            )
+            bra_gate = (
+                None
+                if bra_gate is None
+                else cls._fermionic_gate_to_bosonic(p, bra_gate, where, ind_id)
+            )
+
+        # The upper layer needs the input/output reordering performed by
+        # ``_prepare_gate_tensor``. For the lower layer, ``from_dense``
+        # expects ``conj(B)`` directly, not ``conj(B.T)``.
+        g_k = None if gate is None else cls._prepare_gate_tensor(gate, n_sites)
+        g_b = None if bra_gate is None else ar.do("conj", bra_gate)
+        return g_k, g_b
+
+    @classmethod
     def _materialize_split_gate(cls, p, where):
         """Contract lazy native split-gate tensors back into site tensors.
 
@@ -1166,7 +1202,7 @@ class MpoOptimizer:
             )
             return p_g
 
-        g_k, g_b = self._prepare_gate_pair(
+        g_k, g_b = self._prepare_nonlocal_gate_pair(
             gate,
             len(where),
             bra_gate=bra_gate,
@@ -2564,7 +2600,7 @@ class MpoOptimizer:
                     target_strategy=fit_target_strategy,
                     cutoff_mode=cutoff_mode,
                 )
-                g_k, g_b = self._prepare_gate_pair(
+                g_k, g_b = self._prepare_nonlocal_gate_pair(
                     gate,
                     n_sites,
                     bra_gate=bra_gate,

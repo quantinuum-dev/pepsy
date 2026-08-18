@@ -67,6 +67,7 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ...tensors.observables import tn_fidelity
 from ...operators.gates import (
     _normalize_gate_entries,
     gate as apply_gate,
@@ -5386,6 +5387,107 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return p_target
 
     @staticmethod
+    def _dense_target_rank_gaps(p, target, start, stop):
+        """Return active bonds whose target rank exceeds the current rank.
+
+        Two-/three-site overlap FIT cannot discover a completely absent dense
+        Schmidt subspace when the requested SVD cutoff removes the exact-zero
+        singular values that would otherwise seed it.  Compare dimensions
+        explicitly so the caller can seed only genuinely under-rank windows.
+        """
+        if (
+            not isinstance(target, qtn.MatrixProductState)
+            or int(target.num_tensors) != int(target.L)
+        ):
+            return ()
+        gaps = []
+        try:
+            for site in range(int(start), int(stop)):
+                current = int(p.bond_size(site, site + 1))
+                wanted = int(target.bond_size(site, site + 1))
+                if wanted > current:
+                    gaps.append(
+                        {
+                            "bond": (int(site), int(site + 1)),
+                            "current_bond_dim": current,
+                            "target_bond_dim": wanted,
+                        }
+                    )
+        except (AttributeError, TypeError, ValueError):
+            return ()
+        return tuple(gaps)
+
+    def _maybe_seed_dense_dmrg_target(
+        self,
+        p,
+        seed_target,
+        *,
+        start,
+        stop,
+        block_size,
+        force=False,
+    ):
+        """Seed missing dense Schmidt subspaces from the exact gate target.
+
+        This is deterministic target-support initialization, not an MPO
+        replay or a random perturbation. The target is already the exact
+        pre-compression gate output; copying it only when it has larger active
+        bond ranks gives local FIT a nonzero variational direction. The
+        subsequent FIT SVDs still enforce ``max_bond`` and ``cutoff``.
+        """
+        if (
+            int(block_size) not in {2, 3}
+            or int(stop) - int(start) < 2
+            or self._has_symmray_data(p)
+            or p.isfermionic()
+            or not isinstance(seed_target, qtn.MatrixProductState)
+        ):
+            return p, False, ()
+
+        gaps = self._dense_target_rank_gaps(p, seed_target, start, stop)
+        if not gaps and not force:
+            return p, False, ()
+        return seed_target.copy(deep=True), True, gaps
+
+    def _dmrg1_target_requires_block_warmup(
+        self,
+        p,
+        seed_target,
+        *,
+        start,
+        stop,
+    ):
+        """Detect a nontrivial target hidden by DMRG1's one-site lock.
+
+        Reaching ``chi`` on every bond only says that the current MPS has no
+        *rank* growth left. It does not say that its Schmidt subspaces are the
+        right ones for the next nonlocal gate. A one-site update cannot rotate
+        those subspaces reliably across a long interval, so DMRG1 needs a
+        fresh block warm-up whenever the exact gate target is not the current
+        physical state. Identity/no-op targets deliberately return ``False``
+        and retain the cheap one-site phase.
+        """
+        if (
+            not isinstance(seed_target, qtn.MatrixProductState)
+            or int(seed_target.num_tensors) != int(seed_target.L)
+            or self._has_symmray_data(p)
+            or p.isfermionic()
+            or int(stop) - int(start) < 2
+        ):
+            return False
+
+        if self._dense_target_rank_gaps(p, seed_target, start, stop):
+            return True
+
+        fidelity = tn_fidelity(
+            p,
+            seed_target,
+            contraction_opt=self.contraction_opt,
+        )
+        fidelity = self._real_float(ar.do("real", fidelity))
+        return fidelity < 1.0 - 1.0e-10
+
+    @staticmethod
     def _normalize_every_interval(normalize_every, non_unitary=False):
         """Return whether non-unitary local scale control is enabled.
 
@@ -5639,6 +5741,39 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     copy=False,
                 )
         return p_g
+
+    def _build_dmrg_batch_seed_target(
+        self,
+        p,
+        batch_G,
+        batch_where,
+        target_cutoff,
+        cutoff_mode="rsum2",
+    ):
+        """Build a materialized MPS copy used only for rank initialization."""
+        p_seed = p.copy()
+        for gate, where in zip(batch_G, batch_where):
+            if len(where) == 1:
+                p_seed = self._apply_gate(
+                    p_seed,
+                    gate,
+                    where,
+                    contract=True,
+                    cutoff=target_cutoff,
+                    cutoff_mode=cutoff_mode,
+                    inplace=True,
+                )
+            else:
+                p_seed = self._build_norm_target(
+                    p_seed,
+                    gate,
+                    where,
+                    target_cutoff,
+                    cutoff_mode,
+                    target_strategy="mps",
+                    copy=False,
+                )
+        return p_seed
 
     def _stabilize_unitary_compression_state(
         self,
@@ -6760,6 +6895,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.canonize_mps(p, (xmin, xmax))
                     unitary_target_norm = self._unitary_previous_norm
 
+                    # Keep a transaction for an unexpected FIT exception.
+                    # Normal low-rank long-range starts are repaired directly
+                    # below by deterministic target-subspace initialization;
+                    # norm loss is never silently converted into an MPO result.
+                    fit_state_snapshot = (
+                        p.copy(deep=True)
+                        if xmax - xmin > 1 and self.mode != "mix"
+                        else None
+                    )
+                    fit_info_snapshot = (
+                        dict(self.info_c)
+                        if fit_state_snapshot is not None
+                        else None
+                    )
+
                     p_g = self._timed_call(
                         "dmrg.target",
                         self._build_norm_target,
@@ -6784,6 +6934,79 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (xmin, xmax),
                         fit_block_size,
                     )
+                    target_seeded = False
+                    target_seed_gaps = ()
+                    target_seed_reason = None
+                    seed_target = None
+                    dmrg1_block_warmup = False
+                    if (
+                        active_fit_block_size in {2, 3}
+                        and xmax - xmin >= 2
+                    ):
+                        seed_target = (
+                            p_g
+                            if (
+                                isinstance(p_g, qtn.MatrixProductState)
+                                and int(p_g.num_tensors) == int(p_g.L)
+                            )
+                            else self._build_norm_target(
+                                p,
+                                gate,
+                                where,
+                                target_cutoff,
+                                cutoff_mode,
+                                target_strategy="mps",
+                            )
+                        )
+                    elif (
+                        self._dmrg_mode_alias == "dmrg1"
+                        and int(fit_block_size) >= 2
+                        and active_fit_block_size == 1
+                        and xmax - xmin >= 2
+                    ):
+                        # A rank-saturated DMRG1 state can still have the
+                        # wrong Schmidt subspaces for a nonlocal gate. Build
+                        # the exact materialized target solely to decide
+                        # whether the one-site lock is still valid.
+                        seed_target = self._build_norm_target(
+                            p,
+                            gate,
+                            where,
+                            target_cutoff,
+                            cutoff_mode,
+                            target_strategy="mps",
+                        )
+                        dmrg1_block_warmup = (
+                            self._dmrg1_target_requires_block_warmup(
+                                p,
+                                seed_target,
+                                start=xmin,
+                                stop=xmax,
+                            )
+                        )
+                        if dmrg1_block_warmup:
+                            self._dmrg1_one_site_locked = False
+                            active_fit_block_size = min(
+                                int(fit_block_size),
+                                xmax - xmin + 1,
+                            )
+                    p, target_seeded, target_seed_gaps = (
+                        self._maybe_seed_dense_dmrg_target(
+                            p,
+                            seed_target,
+                            start=xmin,
+                            stop=xmax,
+                            block_size=active_fit_block_size,
+                            force=dmrg1_block_warmup,
+                        )
+                    )
+                    if target_seeded:
+                        target_seed_reason = (
+                            "dmrg1_subspace_change"
+                            if dmrg1_block_warmup and not target_seed_gaps
+                            else "rank_gap"
+                        )
+                        self.p = p
                     active_adaptive_sweeps = adaptive_sweeps
                     active_adaptive_rank_schedule = adaptive_rank_schedule
                     fit = FIT(
@@ -6799,6 +7022,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     # Apply the selected one-, two-, or three-site FIT update to
                     # this gate window. ``run_gate`` reuses environments on
                     # both sides while leaving the rest of the MPS fixed.
+                    fit_error = None
                     try:
                         self._run_fit_gate(
                             fit,
@@ -6818,7 +7042,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             adaptive_until_rank=active_adaptive_rank_schedule,
                             final_one_site_sweeps=0,
                             collect_split_diagnostics=False,
+                            target_support_init=True,
                         )
+                    except Exception as exc:
+                        fit_error = exc
                     finally:
                         self._last_dmrg_fit_diagnostics = {
                             "iterations": int(fit.iterations_run),
@@ -6835,28 +7062,94 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 native_fermionic_warm_start
                             ),
                             "target_strategy": fit_target_strategy,
+                            "target_seeded": bool(target_seeded),
+                            "target_seed_gaps": tuple(target_seed_gaps),
+                            "target_seed_reason": target_seed_reason,
                         }
 
-                    p = self._install_represented_norm(fit.p)
-                    self.p = p
                     fit_center = fit.final_center_site
                     fit_norm = fit.final_norm
-                    self._record_orthog_span(
-                        p,
-                        (fit_center, fit_center)
-                        if fit_center is not None
-                        else (xmin, xmax),
-                    )
-                    if not non_unitary:
-                        self._timed_call(
-                            "dmrg.stabilize",
-                            self._stabilize_unitary_fit_state,
+                    fit_fallback_reason = None
+                    if fit_error is not None and self.mode != "mix":
+                        fit_fallback_reason = "fit_exception"
+
+                    if fit_fallback_reason is not None:
+                        if fit_state_snapshot is None:
+                            if fit_error is not None:
+                                raise fit_error.with_traceback(
+                                    fit_error.__traceback__
+                                )
+                            raise RuntimeError(
+                                "DMRG FIT requested an MPO fallback without "
+                                "a transactional state snapshot."
+                            )
+                        self.p = self._install_represented_norm(
+                            fit_state_snapshot
+                        )
+                        self.info_c = fit_info_snapshot
+                        self._last_dmrg_fit_diagnostics.update(
+                            {
+                                "backend": "mpo",
+                                "fallback": True,
+                                "fallback_reason": fit_fallback_reason,
+                                "fit_norm": (
+                                    None
+                                    if fit_norm is None
+                                    else self._real_float(
+                                        ar.do("abs", fit_norm)
+                                    )
+                                ),
+                            }
+                        )
+                        try:
+                            self._run_mpo(
+                                [gate],
+                                [where],
+                                ["gate"],
+                                progbar=False,
+                                cutoff=cutoff,
+                                cutoff_mode=cutoff_mode,
+                                normalize_every=None,
+                                normalize_final=False,
+                                non_unitary=non_unitary,
+                                stabilize_unitary=stabilize_unitary,
+                            )
+                        except Exception:
+                            if fit_error is not None:
+                                raise fit_error.with_traceback(
+                                    fit_error.__traceback__
+                                )
+                            raise
+                        p = self.p
+                    else:
+                        if fit_error is not None:
+                            raise fit_error.with_traceback(
+                                fit_error.__traceback__
+                            )
+                        p = self._install_represented_norm(fit.p)
+                        self.p = p
+                        self._record_orthog_span(
                             p,
-                            (xmin, xmax),
-                            unitary_target_norm,
-                            current_norm=fit_norm,
-                            center_site=fit_center,
-                            restore=stabilize_unitary,
+                            (fit_center, fit_center)
+                            if fit_center is not None
+                            else (xmin, xmax),
+                        )
+                        if not non_unitary:
+                            self._timed_call(
+                                "dmrg.stabilize",
+                                self._stabilize_unitary_fit_state,
+                                p,
+                                (xmin, xmax),
+                                unitary_target_norm,
+                                current_norm=fit_norm,
+                                center_site=fit_center,
+                                restore=stabilize_unitary,
+                            )
+                        self._last_dmrg_fit_diagnostics.update(
+                            {
+                                "backend": "fit",
+                                "fallback": False,
+                            }
                         )
                     self._maybe_lock_dmrg1_one_site_phase()
                     self._last_dmrg_fit_diagnostics[
@@ -6898,6 +7191,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     self.canonize_mps(p, (xmin, xmax))
                     unitary_target_norm = self._unitary_previous_norm
+                    fit_state_snapshot = (
+                        p.copy(deep=True)
+                        if xmax - xmin > 1 and self.mode != "mix"
+                        else None
+                    )
+                    fit_info_snapshot = (
+                        dict(self.info_c)
+                        if fit_state_snapshot is not None
+                        else None
+                    )
                     p_g = self._timed_call(
                         "dmrg.target",
                         self._build_dmrg_batch_target,
@@ -6922,6 +7225,73 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (xmin, xmax),
                         fit_block_size,
                     )
+                    target_seeded = False
+                    target_seed_gaps = ()
+                    target_seed_reason = None
+                    seed_target = None
+                    dmrg1_block_warmup = False
+                    if (
+                        active_fit_block_size in {2, 3}
+                        and xmax - xmin >= 2
+                    ):
+                        seed_target = (
+                            p_g
+                            if (
+                                isinstance(p_g, qtn.MatrixProductState)
+                                and int(p_g.num_tensors) == int(p_g.L)
+                            )
+                            else self._build_dmrg_batch_seed_target(
+                                p,
+                                batch_G,
+                                batch_where,
+                                target_cutoff,
+                                cutoff_mode,
+                            )
+                        )
+                    elif (
+                        self._dmrg_mode_alias == "dmrg1"
+                        and int(fit_block_size) >= 2
+                        and active_fit_block_size == 1
+                        and xmax - xmin >= 2
+                    ):
+                        seed_target = self._build_dmrg_batch_seed_target(
+                            p,
+                            batch_G,
+                            batch_where,
+                            target_cutoff,
+                            cutoff_mode,
+                        )
+                        dmrg1_block_warmup = (
+                            self._dmrg1_target_requires_block_warmup(
+                                p,
+                                seed_target,
+                                start=xmin,
+                                stop=xmax,
+                            )
+                        )
+                        if dmrg1_block_warmup:
+                            self._dmrg1_one_site_locked = False
+                            active_fit_block_size = min(
+                                int(fit_block_size),
+                                xmax - xmin + 1,
+                            )
+                    p, target_seeded, target_seed_gaps = (
+                        self._maybe_seed_dense_dmrg_target(
+                            p,
+                            seed_target,
+                            start=xmin,
+                            stop=xmax,
+                            block_size=active_fit_block_size,
+                            force=dmrg1_block_warmup,
+                        )
+                    )
+                    if target_seeded:
+                        target_seed_reason = (
+                            "dmrg1_subspace_change"
+                            if dmrg1_block_warmup and not target_seed_gaps
+                            else "rank_gap"
+                        )
+                        self.p = p
                     active_adaptive_sweeps = adaptive_sweeps
                     active_adaptive_rank_schedule = adaptive_rank_schedule
                     fit = FIT(
@@ -6934,6 +7304,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         inplace=True,
                         copy_target=False,
                     )
+                    fit_error = None
                     try:
                         self._run_fit_gate(
                             fit,
@@ -6953,7 +7324,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             adaptive_until_rank=active_adaptive_rank_schedule,
                             final_one_site_sweeps=0,
                             collect_split_diagnostics=False,
+                            target_support_init=True,
                         )
+                    except Exception as exc:
+                        fit_error = exc
                     finally:
                         self._last_dmrg_fit_diagnostics = {
                             "iterations": int(fit.iterations_run),
@@ -6970,28 +7344,94 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 native_fermionic_warm_start
                             ),
                             "target_strategy": fit_target_strategy,
+                            "target_seeded": bool(target_seeded),
+                            "target_seed_gaps": tuple(target_seed_gaps),
+                            "target_seed_reason": target_seed_reason,
                         }
 
-                    p = self._install_represented_norm(fit.p)
-                    self.p = p
                     fit_center = fit.final_center_site
                     fit_norm = fit.final_norm
-                    self._record_orthog_span(
-                        p,
-                        (fit_center, fit_center)
-                        if fit_center is not None
-                        else (xmin, xmax),
-                    )
-                    if not non_unitary:
-                        self._timed_call(
-                            "dmrg.stabilize",
-                            self._stabilize_unitary_fit_state,
+                    fit_fallback_reason = None
+                    if fit_error is not None and self.mode != "mix":
+                        fit_fallback_reason = "fit_exception"
+
+                    if fit_fallback_reason is not None:
+                        if fit_state_snapshot is None:
+                            if fit_error is not None:
+                                raise fit_error.with_traceback(
+                                    fit_error.__traceback__
+                                )
+                            raise RuntimeError(
+                                "DMRG FIT requested an MPO fallback without "
+                                "a transactional state snapshot."
+                            )
+                        self.p = self._install_represented_norm(
+                            fit_state_snapshot
+                        )
+                        self.info_c = fit_info_snapshot
+                        self._last_dmrg_fit_diagnostics.update(
+                            {
+                                "backend": "mpo",
+                                "fallback": True,
+                                "fallback_reason": fit_fallback_reason,
+                                "fit_norm": (
+                                    None
+                                    if fit_norm is None
+                                    else self._real_float(
+                                        ar.do("abs", fit_norm)
+                                    )
+                                ),
+                            }
+                        )
+                        try:
+                            self._run_mpo(
+                                batch_G,
+                                batch_where,
+                                ["gate"] * len(batch_G),
+                                progbar=False,
+                                cutoff=cutoff,
+                                cutoff_mode=cutoff_mode,
+                                normalize_every=None,
+                                normalize_final=False,
+                                non_unitary=non_unitary,
+                                stabilize_unitary=stabilize_unitary,
+                            )
+                        except Exception:
+                            if fit_error is not None:
+                                raise fit_error.with_traceback(
+                                    fit_error.__traceback__
+                                )
+                            raise
+                        p = self.p
+                    else:
+                        if fit_error is not None:
+                            raise fit_error.with_traceback(
+                                fit_error.__traceback__
+                            )
+                        p = self._install_represented_norm(fit.p)
+                        self.p = p
+                        self._record_orthog_span(
                             p,
-                            (xmin, xmax),
-                            unitary_target_norm,
-                            current_norm=fit_norm,
-                            center_site=fit_center,
-                            restore=stabilize_unitary,
+                            (fit_center, fit_center)
+                            if fit_center is not None
+                            else (xmin, xmax),
+                        )
+                        if not non_unitary:
+                            self._timed_call(
+                                "dmrg.stabilize",
+                                self._stabilize_unitary_fit_state,
+                                p,
+                                (xmin, xmax),
+                                unitary_target_norm,
+                                current_norm=fit_norm,
+                                center_site=fit_center,
+                                restore=stabilize_unitary,
+                            )
+                        self._last_dmrg_fit_diagnostics.update(
+                            {
+                                "backend": "fit",
+                                "fallback": False,
+                            }
                         )
                     self._maybe_lock_dmrg1_one_site_phase()
                     self._last_dmrg_fit_diagnostics[

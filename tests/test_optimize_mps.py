@@ -589,6 +589,42 @@ def test_mps_optimizer_timing_record_identifies_named_dmrg_mode():
     assert timing["fit_diagnostics"]["block_size"] == 2
 
 
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+def test_mps_optimizer_long_range_dmrg_seeds_missing_target_subspaces(mode):
+    """Long-range FIT grows missing dense Schmidt subspaces directly."""
+    stream = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 7)),
+    ]
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        stream,
+        chi=4,
+        mode="mpo",
+    ).run(progbar=False)
+
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        stream,
+        chi=4,
+        mode=mode,
+    )
+    out = optimizer.run(progbar=False, n_iter=4, fit_rtol=None)
+
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+    assert out.max_bond() == 2
+    assert optimizer.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+        0.0, abs=1.0e-12
+    )
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["backend"] == "fit"
+    assert diagnostics["fallback"] is False
+    assert diagnostics["target_seeded"] is True
+    assert diagnostics["target_seed_gaps"]
+
+
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd"])
 def test_mps_optimizer_compression_timing_separates_norm_stages(mode):
     """Enabled timing records stabilization work without diagnostic stages."""
@@ -1120,6 +1156,36 @@ def test_fit_gate_two_site_grows_only_active_bonds():
     assert [record["direction"] for record in fit.get_timing()] == []
 
 
+def test_fit_gate_target_support_initialization_handles_cutoff_from_product_state():
+    """Block FIT must seed remote-gate sectors before applying its cutoff."""
+    initial = qtn.MPS_computational_state("0000", dtype="complex128")
+    initial.gate_(qu.hadamard(), 0, contract=True)
+    target = initial.copy()
+    target.gate_nonlocal_(
+        qu.CNOT(),
+        (0, 3),
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+    fit = py.FIT(target, p=initial, range_int=[0, 3], cutoffs=1.0e-12)
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=1.0e-12,
+        target_support_init=True,
+    )
+
+    assert fit.info["dense_target_initialization"]["applied"] is True
+    assert [fit.p.bond_size(i, i + 1) for i in range(3)] == [2, 2, 2]
+    assert float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+
+
 @pytest.mark.parametrize("block_size", (2, 3))
 def test_fit_run_eff_native_blocks_grow_full_chain(block_size):
     """Full-chain block FIT should grow only bonds supported by the target."""
@@ -1620,6 +1686,50 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
     assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
     assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
     assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
+
+
+def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
+    """DMRG1 must rotate saturated subspaces for a nonlocal gate."""
+    state = (
+        qtn.MPS_computational_state("00000000", dtype="complex128")
+        + qtn.MPS_computational_state("11111111", dtype="complex128")
+    ) / np.sqrt(2.0)
+    controlled_phase = np.diag([1.0, 1.0, 1.0, -1.0]).astype("complex128")
+    stream = [(controlled_phase, (0, 7))]
+    reference = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=2,
+        mode="mpo",
+    ).run(progbar=False, cutoff=1.0e-12, stabilize_unitary=False)
+    optimizer = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=2,
+        mode="dmrg1",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        n_iter=6,
+        cutoff=1.0e-12,
+        target_cutoff=1.0e-12,
+        fit_rtol=None,
+        stabilize_unitary=False,
+        timing=True,
+    )
+
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["target_seeded"] is True
+    assert diagnostics["target_seed_gaps"] == ()
+    assert diagnostics["target_seed_reason"] == "dmrg1_subspace_change"
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [2, 2, 1, 1, 1, 1]
 
 
 def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
@@ -3609,16 +3719,16 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         timing=True,
     )
     assert optimizer._last_dmrg_fit_diagnostics["block_size"] == 3
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 3
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [3, 3, 3]
+    ] == [3, 3, 1]
     assert [
         record["site_count"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 2]
+    ] == [2, 2, 4]
 
     adjacent = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
