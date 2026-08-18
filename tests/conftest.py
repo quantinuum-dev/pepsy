@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 _SMOKE_MODULES = frozenset(
     {
         "test_backends.py",
+        "test_import_boundaries.py",
         "test_package_layout.py",
         "test_public_api.py",
         "test_tensor_constructors.py",
@@ -37,6 +38,25 @@ _INTEGRATION_MODULES = frozenset(
         "test_vmc_api.py",
     }
 )
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Avoid importing extended modules during the default smoke run.
+
+    Pytest normally imports every test module before applying ``-m smoke``.
+    That defeats the lightweight default when an extended module imports an
+    optional backend at module scope. Keep explicit file or directory runs
+    unchanged, and let ``pytest -o addopts=''`` collect the complete suite.
+    """
+    if config.getoption("markexpr") != "smoke":
+        return False
+    path = Path(collection_path)
+    return (
+        path.is_file()
+        and path.suffix == ".py"
+        and path.name.startswith("test_")
+        and path.name not in _SMOKE_MODULES
+    )
 
 
 def pytest_collection_modifyitems(config, items):
