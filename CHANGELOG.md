@@ -41,6 +41,12 @@ Changes for the next release should be added here before the version is bumped.
   `cutoff_mode`, allowing Tree truncations to use the same Quimb
   singular-value cutoff conventions as MPS truncations.
 
+### Deprecated
+
+- Backend helpers imported from `pepsy.tensors` now warn and direct callers to
+  their canonical `pepsy.backends` namespace. `pepsy.experimental.mera` now
+  directs callers to `pepsy.experimental.qmera`.
+
 ### Fixed
 
 - Stabilizer planner diagnostics now explicitly describe when a cap changes

@@ -1,8 +1,20 @@
 """Basic public API smoke tests for the pepsy package."""
 
 import importlib.util
+from pathlib import Path
 
 import pepsy
+
+
+_ROOT_API_MANIFEST = Path(__file__).parents[1] / "docs/development/api-manifest.txt"
+
+
+def _manifest_symbols():
+    return {
+        line.strip()
+        for line in _ROOT_API_MANIFEST.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
 
 def test_package_version_available():
@@ -28,6 +40,19 @@ def test_namespace_exports_have_clear_core_and_advanced_groups():
     assert core.isdisjoint(advanced)
     assert core | advanced <= set(pepsy.__all__)
     assert all(getattr(pepsy, name) is not None for name in core | advanced)
+
+
+def test_top_level_compatibility_surface_matches_manifest():
+    """Root aliases stay frozen until an intentional API review changes them."""
+    manifest = _manifest_symbols()
+    assert set(pepsy._SYMBOL_MODULES) == manifest
+    expected_all = {
+        "__version__",
+        *pepsy._CORE_MODULES,
+        *pepsy._ADVANCED_MODULES,
+        *manifest,
+    }
+    assert set(pepsy.__all__) == expected_all
 
 
 def test_tree_optimizers_are_available_from_high_level_api():

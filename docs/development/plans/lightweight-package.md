@@ -1,6 +1,6 @@
 # Lightweight package plan
 
-Status: active, phases 0-3 complete
+Status: active, phases 0-3 complete; API baseline recorded
 Last updated: 2026-08-18
 Owner: Pepsy maintainers
 
@@ -130,6 +130,14 @@ boundary, not an immediate package rename or compatibility break.
 - Move shared protocols and small utilities into responsibility-based modules.
 - Consider separate distributions only if dependency or release measurements
   show that extras are insufficient.
+
+### 5. API surface cleanup
+
+- Keep the root compatibility surface in a reviewed machine-readable
+  manifest.
+- Prefer one canonical namespace for each public symbol.
+- Deprecate redundant namespace aliases before removing them in a planned
+  breaking release.
 
 ## Acceptance criteria
 
