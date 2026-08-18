@@ -14,7 +14,7 @@ simple-update gauge dictionary, and their Frobenius norm can be measured with
 `PEPO.norm()`. The D2BP loop-cluster route accepts the evolved PEPO directly:
 
 ```python
-from pepsy import Fermion, OneDMap
+from pepsy.tensors import Fermion, OneDMap
 from pepsy.operators.gates import gate_simple
 from pepsy.bp import loop_cluster_expand
 
@@ -944,7 +944,7 @@ native contraction, and normalizes the accumulated numerator by the
 accumulated denominator:
 
 ```python
-from pepsy import build_contraction
+from pepsy.tensors import build_contraction
 from pepsy.bp import compute_local_expectation_open_loop_series
 
 contraction_opt = build_contraction(

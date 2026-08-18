@@ -45,7 +45,9 @@ Changes for the next release should be added here before the version is bumped.
 
 - Backend helpers imported from `pepsy.tensors` now warn and direct callers to
   their canonical `pepsy.backends` namespace. `pepsy.experimental.mera` now
-  directs callers to `pepsy.experimental.qmera`.
+  directs callers to `pepsy.experimental.qmera`; the equivalent
+  `pepsy.optimizers.mera` compatibility namespace directs callers to
+  `pepsy.optimizers.qmera`.
 
 ### Fixed
 

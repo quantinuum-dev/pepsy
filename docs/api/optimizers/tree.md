@@ -55,7 +55,7 @@ ordinary compatibility chain MPO with the tree operator attached. The native
 path includes `U1FermionicArray` and `U1U1FermionicArray` tensors:
 
 ```python
-from pepsy import Fermion
+from pepsy.tensors import Fermion
 from pepsy.optimizers.tree import TreeLayoutFinder
 
 finder = TreeLayoutFinder(gates, n=8, max_arity=2)
@@ -74,7 +74,7 @@ aliases. `TreeMPO` exposes the optional chain representation without mixing
 the two tensor-network geometries:
 
 ```python
-from pepsy import Fermion
+from pepsy.tensors import Fermion
 
 tree_operator = fermion.build_tree_operator(
     hamiltonian=hamiltonian,

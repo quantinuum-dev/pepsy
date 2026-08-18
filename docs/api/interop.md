@@ -8,7 +8,8 @@ they contain a straight-line sequence of standard quantum operations:
 ```python
 from guppylang import guppy
 from guppylang.std.quantum import cx, h, qubit
-from pepsy import guppy_gate_stream, MpsStabOptimizer
+from pepsy.interop import guppy_gate_stream
+from pepsy.optimizers import MpsStabOptimizer
 
 @guppy
 def circuit() -> None:

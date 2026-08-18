@@ -529,7 +529,7 @@ final closure after CTMRG. It does not change the boundary/CTMRG truncation
 set by `chi` and `cutoff`.
 
 ```python
-from pepsy import build_optimizer
+from pepsy.tensors import build_optimizer
 
 final_contraction_opt = build_optimizer(
     progbar=False,
@@ -732,7 +732,7 @@ Hamiltonian (or its terms) because `Fermion` intentionally stores no model
 couplings:
 
 ```python
-from pepsy import Fermion
+from pepsy.tensors import Fermion
 
 fermion = Fermion(spinful=True, symmetry="U1U1")
 edges = ((0, 1), (1, 2), (2, 3))

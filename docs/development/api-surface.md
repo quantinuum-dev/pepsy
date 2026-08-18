@@ -39,10 +39,10 @@ The canonical home for all of them is `pepsy.backends`. The
 for the current 0.x line and are protected by the existing compatibility
 tests.
 
-`pepsy.experimental.mera` and `pepsy.experimental.qmera` also point to the
-same QMERA implementation. `qmera` is the preferred spelling; `mera` remains
-a transitional discovery alias and now emits a deprecation warning when
-accessed.
+`pepsy.optimizers.mera`, `pepsy.experimental.mera`, and their `qmera`
+counterparts point to the same QMERA implementation. `qmera` is the preferred
+spelling; the two `mera` paths remain transitional compatibility aliases and
+emit deprecation warnings when accessed.
 
 ## Cleanup policy
 
