@@ -23,6 +23,75 @@ def test_mpo_optimizer_accepts_svd_mode():
     assert opt.mode == "svd"
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_block", "expected_warmup", "requested_warmup"),
+    [
+        ("dmrg1", 2, 2, 5),
+        ("dmrg2", 2, 1, 1),
+        ("dmrg3", 3, 2, 2),
+    ],
+)
+def test_mpo_optimizer_dmrg_mode_aliases_select_fit_schedule(
+    monkeypatch,
+    mode,
+    expected_block,
+    expected_warmup,
+    requested_warmup,
+):
+    """Named MPO DMRG modes select their native block schedule."""
+    calls = []
+    original_run_gate = py.FIT.run_gate
+
+    def recording_run_gate(self, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_run_gate(self, *args, **kwargs)
+
+    monkeypatch.setattr(py.FIT, "run_gate", recording_run_gate)
+
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(5, dtype="complex128"),
+        gates=[((qu.CNOT(), None), (0, 4))],
+        chi=2,
+        mode=mode,
+    )
+    out = opt.run(
+        n_iter=3,
+        progbar=False,
+        cutoff=1.0e-12,
+        fit_adaptive_sweeps=requested_warmup,
+    )
+
+    assert opt.mode == "dmrg"
+    assert opt._dmrg_mode_alias == mode
+    assert out.max_bond() <= 2
+    assert len(calls) == 1
+    assert calls[0]["block_size"] == expected_block
+    assert calls[0]["adaptive_block_sweeps"] == expected_warmup
+    assert calls[0]["adaptive_until_rank"] is False
+    assert calls[0]["single_pair_fast_path"] is True
+
+
+def test_mpo_optimizer_dmrg_mode_alias_set_mode_tracks_schedule():
+    """Switching modes updates the named DMRG schedule metadata."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(3, dtype="complex128"),
+        gates=[],
+        chi=4,
+        mode="dmrg1",
+    )
+
+    assert opt.mode == "dmrg"
+    assert opt._dmrg_mode_alias == "dmrg1"
+
+    opt.set_mode("dmrg3")
+    assert opt.mode == "dmrg"
+    assert opt._dmrg_mode_alias == "dmrg3"
+
+    opt.set_mode("svd")
+    assert opt.mode == "svd"
+    assert opt._dmrg_mode_alias is None
+
+
 def test_fit_two_site_preserves_mpo_view_and_dense_readout():
     """Direct FIT on an MPO must return a functional MPO, not an MPS view."""
     guess = qtn.MPO_rand(
@@ -157,6 +226,222 @@ def test_mpo_optimizer_accepts_bundled_gate_stream():
 
     assert out.L == 4
     assert opt.where == [(1,), (0, 3)]
+
+
+def test_mpo_optimizer_compiles_and_caches_gate_stream_payloads():
+    """Ordinary gate replay should reuse the compiled transpose payload."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1)), (qu.CNOT(), (0, 1))],
+        chi=4,
+        mode="svd",
+    )
+
+    plan = opt.compile_gate_stream()
+    assert plan["length"] == 2
+    assert plan["event_types"] == ("gate", "gate")
+    assert plan["arities"] == (2, 2)
+    assert plan["prepared_cache_size"] == 0
+    assert isinstance(opt.gate_stream, tuple)
+
+    opt.run(progbar=False, cutoff=1.0e-12, fidelity_samples=0)
+    assert opt.compile_gate_stream()["prepared_cache_size"] == 1
+
+    opt.clear_gate_cache()
+    assert opt.compile_gate_stream()["prepared_cache_size"] == 0
+
+
+def test_mpo_optimizer_layered_and_materialized_targets_are_distinct():
+    """Dense FIT targets expose lazy-layered and materialized MPO policies."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[],
+        chi=4,
+        mode="dmrg",
+    )
+    layered = opt._build_dmrg_target(
+        opt.p,
+        qu.CNOT(),
+        (0, 3),
+        qu.CNOT(),
+        cutoff=0.0,
+        target_cutoff=0.0,
+        target_strategy="layered",
+    )
+    materialized = opt._build_dmrg_target(
+        opt.p,
+        qu.CNOT(),
+        (0, 3),
+        qu.CNOT(),
+        cutoff=0.0,
+        target_cutoff=0.0,
+        target_strategy="mpo",
+    )
+
+    assert len(layered.tensors) > len(materialized.tensors)
+    assert len(materialized.tensors) == opt.p.L
+
+
+def test_mpo_optimizer_layout_reduces_long_range_execution_span():
+    """A persistent explicit layout should swap the MPO and remap supports."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=4,
+        mode="svd",
+    )
+
+    opt.apply_layout((0, 3, 1, 2))
+    assert opt.logical_order == [0, 3, 1, 2]
+    assert opt.last_layout_plan["site_map"][3] == 1
+    assert opt._execution_stream()[1] == [(0, 1)]
+
+    out = opt.run(progbar=False, cutoff=1.0e-12, fidelity_samples=0)
+    assert out.max_bond() <= 4
+    assert any(event["kind"] == "layout_swap" for event in opt.get_norm_events())
+
+
+def test_mpo_optimizer_channel_sum_reports_trace_preservation_separately():
+    """A deterministic Kraus sum has a separate trace-preservation ledger."""
+    channel = py.TrajectoryChannel.amplitude_damping(0.25)
+    event = py.MpoOptimizer.channel_event(channel, 0)
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(2, dtype="complex128"),
+        gates=[event],
+        chi=4,
+        mode="svd",
+    )
+
+    out = opt.run(progbar=False, cutoff=1.0e-12, fidelity_samples=0)
+    diagnostics = opt.channel_diagnostics()
+    trace_event = diagnostics["trace_events"][0]
+
+    assert out.L == 2
+    assert opt.compile_gate_stream()["event_types"] == ("channel_sum",)
+    assert diagnostics["trace_preserving"] is True
+    assert trace_event["channel_completeness_residual"] < 1.0e-10
+    assert trace_event["trace_preservation_residual"] < 1.0e-10
+    assert opt.norm_diagnostics()["events"] == 1
+
+
+def test_mpo_optimizer_dmrg_handles_nonlocal_channel_sum():
+    """A two-site Kraus sum remains executable through the DMRG backend."""
+    identity = np.eye(4, dtype=np.complex128)
+    phase = np.diag([1.0, 1.0, 1.0, -1.0]).astype(np.complex128)
+    event = py.MpoOptimizer.kraus_event(
+        (identity, phase),
+        (0, 3),
+        weights=(0.5, 0.5),
+    )
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[event],
+        chi=4,
+        mode="dmrg",
+    )
+
+    out = opt.run(n_iter=1, progbar=False, cutoff=1.0e-12, fidelity_samples=0)
+    assert out.max_bond() <= 4
+    assert opt.channel_diagnostics()["channel_events"][0]["backend"] == "dmrg"
+    assert opt.channel_diagnostics()["trace_preserving"] is True
+
+
+def test_mpo_optimizer_non_trace_preserving_channel_is_reported():
+    """Non-TP operator sums must not be conflated with compression loss."""
+    event = py.MpoOptimizer.kraus_event((0.5 * np.eye(2),), 0)
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(2, dtype="complex128"),
+        gates=[event],
+        chi=4,
+        mode="svd",
+    )
+
+    opt.run(progbar=False, cutoff=1.0e-12, fidelity_samples=0)
+    trace_event = opt.get_trace_events()[0]
+    assert trace_event["channel_trace_preserving"] is False
+    assert trace_event["channel_completeness_residual"] == pytest.approx(0.75)
+    assert trace_event["target_trace_residual"] == pytest.approx(0.75)
+
+
+def test_mpo_optimizer_rejects_sampled_channel_semantics():
+    """MPO replay must not silently turn a channel sum into one trajectory."""
+    channel = py.TrajectoryChannel.amplitude_damping(0.25)
+    event = py.MpoOptimizer.channel_event(channel, 0, semantics="sample")
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(2, dtype="complex128"),
+        gates=[event],
+        chi=4,
+        mode="svd",
+    )
+
+    with pytest.raises(ValueError, match="semantics='sum'.*sampled branches"):
+        opt.run(progbar=False, fidelity_samples=0)
+
+
+def test_mpo_optimizer_transactional_fit_failure_preserves_completed_steps(monkeypatch):
+    """Per-update rollback keeps earlier gates and records the failed FIT."""
+    original_run_gate = py.FIT.run_gate
+    calls = {"count": 0}
+
+    def fail_second(self, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("forced local FIT failure")
+        return original_run_gate(self, *args, **kwargs)
+
+    monkeypatch.setattr(py.FIT, "run_gate", fail_second)
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1)), (qu.CNOT(), (2, 3))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    with pytest.raises(RuntimeError, match="forced local FIT failure"):
+        opt.run(
+            n_iter=1,
+            progbar=False,
+            fidelity_samples=0,
+            atomic=False,
+            transactional_steps=True,
+        )
+
+    assert len(opt.get_norm_events()) == 1
+    assert opt.get_fit_history()[-1]["convergence_reason"] == "failed"
+
+
+def test_mpo_optimizer_per_gate_fit_fallback_continues_stream(monkeypatch):
+    """A local FIT failure can fall back without discarding later gates."""
+    original_run_gate = py.FIT.run_gate
+    calls = {"count": 0}
+
+    def fail_first(self, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("forced local FIT failure")
+        return original_run_gate(self, *args, **kwargs)
+
+    monkeypatch.setattr(py.FIT, "run_gate", fail_first)
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1)), (qu.CNOT(), (2, 3))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    out = opt.run(
+        n_iter=1,
+        progbar=False,
+        fidelity_samples=0,
+        atomic=False,
+        fit_fallback="svd",
+    )
+
+    assert out.max_bond() <= 2
+    assert opt.last_run_status == "fallback"
+    assert opt.last_run_fallback == "svd"
+    assert len(opt.fallback_events) == 1
+    assert len(opt.get_norm_events()) == 2
 
 
 def test_mpo_optimizer_default_inplace_false_keeps_input_unchanged():
@@ -316,6 +601,131 @@ def test_mpo_optimizer_dmrg_forwards_native_fit_controls(
     assert calls[0]["max_bond"] == 2
     assert calls[0]["cutoff"] == pytest.approx(2.0e-2)
     assert calls[0]["cutoff_mode"] == "rel"
+
+
+def test_mpo_optimizer_norm_ledger_separates_gate_norm_from_compression():
+    """Compression survival should be tracked independently of gate norm changes."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    nonunitary = np.diag([2.0, 1.0, 1.0, 1.0]).astype(np.complex128)
+    gates = [
+        (qu.CNOT(), (0, 1)),
+        ((nonunitary, None), (2, 3)),
+    ]
+
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="svd")
+    opt.run(progbar=False, cutoff=1.0e-12, fidelity_samples=0)
+
+    events = opt.get_norm_events()
+    diagnostics = opt.norm_diagnostics()
+    assert len(events) == 2
+    assert all(event["valid"] for event in events)
+    assert events[0]["norm_fidelity"] == pytest.approx(1.0, abs=1.0e-10)
+    assert events[1]["expected_norm"] != pytest.approx(events[0]["expected_norm"])
+    assert diagnostics["events"] == 2
+    assert diagnostics["completed_events"] == 2
+    assert diagnostics["norm_survival"] == pytest.approx(
+        np.prod([event["norm_fidelity"] for event in events])
+    )
+
+
+def test_mpo_optimizer_set_mpo_resets_lifecycle_diagnostics():
+    """Replacing the live MPO must start a fresh norm and run ledger."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=4,
+        mode="svd",
+    )
+    opt.run(progbar=False, cutoff=1.0e-12, fidelity_samples=1)
+    assert opt.get_norm_events()
+    assert len(opt.get_fidelities()) > 1
+
+    opt.set_mpo(qtn.MPO_identity(4, dtype="complex128"))
+    assert opt.get_norm_events() == []
+    assert opt.get_fidelities() == [1.0]
+    assert opt.norm_diagnostics()["events"] == 0
+    assert opt.last_run_status == "not_run"
+
+
+def test_mpo_optimizer_reports_fit_controls_and_timing():
+    """DMRG should expose FIT convergence and opt-in timing diagnostics."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+    opt.run(
+        n_iter=3,
+        progbar=False,
+        cutoff=1.0e-12,
+        fidelity_samples=0,
+        fit_min_iter=1,
+        fit_rtol=1.0e-8,
+        fit_patience=1,
+        fit_finite_check=True,
+        timing=True,
+        fit_collect_split_diagnostics=True,
+    )
+
+    fit_diagnostics = opt.get_fit_diagnostics()
+    timing = opt.get_run_timing()
+    assert opt.last_run_status == "complete"
+    assert fit_diagnostics["iterations"] >= 1
+    assert fit_diagnostics["convergence_reason"] is not None
+    assert fit_diagnostics["final_norm"] is not None
+    assert fit_diagnostics["timing"]
+    assert timing["status"] == "complete"
+    assert timing["fit_calls"] == 1
+
+
+def test_mpo_optimizer_atomic_failure_restores_state():
+    """A failed FIT replay should raise and leave the pre-run MPO intact."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    opt = py.MpoOptimizer(
+        mpo0.copy(),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        opt.run(
+            n_iter=2,
+            progbar=False,
+            fit_finite_check=lambda _state: False,
+            fidelity_samples=0,
+        )
+
+    assert opt.last_run_status == "failed"
+    assert opt.get_norm_events() == []
+    assert np.allclose(opt.p.to_dense(), mpo0.to_dense())
+
+
+def test_mpo_optimizer_fit_fallback_replays_from_atomic_snapshot(monkeypatch):
+    """A configured direct fallback should replay from the original MPO."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    def fail_fit(*_args, **_kwargs):
+        raise RuntimeError("forced FIT failure")
+
+    monkeypatch.setattr(opt, "_run_dmrg", fail_fit)
+    out = opt.run(
+        n_iter=2,
+        progbar=False,
+        fidelity_samples=0,
+        fit_fallback="svd",
+    )
+
+    assert out.max_bond() <= 2
+    assert opt.last_run_status == "fallback"
+    assert opt.last_run_fallback == "svd"
+    assert len(opt.get_norm_events()) == 1
 
 
 def test_mpo_optimizer_tracks_fidelity_proxy_for_two_site_fit():
@@ -500,6 +910,94 @@ def test_mpo_optimizer_mpo_mode_supports_three_site_gate():
     assert out.L == 4
     assert out.max_bond() <= 16
     assert not np.allclose(out.to_dense(), mpo0.to_dense())
+
+
+def _embed_two_site_operator(operator, length, where):
+    """Embed a two-site operator while preserving the MPO site ordering."""
+    where = tuple(where)
+    rest = [site for site in range(length) if site not in where]
+    embedded = np.zeros((2**length, 2**length), dtype=complex)
+    for row in range(2**length):
+        row_bits = [(row >> (length - 1 - site)) & 1 for site in range(length)]
+        local_row = sum(
+            row_bits[site] << (len(where) - 1 - offset)
+            for offset, site in enumerate(where)
+        )
+        for col in range(2**length):
+            col_bits = [(col >> (length - 1 - site)) & 1 for site in range(length)]
+            if any(row_bits[site] != col_bits[site] for site in rest):
+                continue
+            local_col = sum(
+                col_bits[site] << (len(where) - 1 - offset)
+                for offset, site in enumerate(where)
+            )
+            embedded[row, col] = operator[local_row, local_col]
+    return embedded
+
+
+@pytest.mark.parametrize("where", [(0, 1), (0, 5)])
+def test_mpo_mode_complex_gate_matches_dmrg2(where):
+    """MPO mode must match DMRG2 for nonsymmetric complex two-site gates."""
+    length = 6
+    initial = qtn.MPO_rand(
+        length, bond_dim=2, phys_dim=2, dtype="complex128", seed=2718
+    )
+    rng = np.random.default_rng(20260817)
+    random_matrix = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    gate = np.linalg.qr(random_matrix)[0]
+
+    effective_gate = _embed_two_site_operator(gate.T, length, where)
+    expected = (
+        effective_gate
+        @ initial.to_dense()
+        @ effective_gate.conj().T
+    )
+
+    mpo_out = py.MpoOptimizer(
+        initial.copy(), gates=[(gate, where)], chi=64, mode="mpo"
+    ).run(progbar=False, cutoff=1e-13, fidelity_samples=1)
+    dmrg_out = py.MpoOptimizer(
+        initial.copy(), gates=[(gate, where)], chi=64, mode="dmrg2"
+    ).run(
+        n_iter=6,
+        progbar=False,
+        cutoff=1e-13,
+        fidelity_samples=1,
+        fit_adaptive_sweeps=2,
+    )
+
+    np.testing.assert_allclose(mpo_out.to_dense(), expected, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(dmrg_out.to_dense(), expected, atol=1e-10, rtol=1e-10)
+
+
+def test_mpo_mode_complex_gate_pair_sides_match_dense_action():
+    """MPO mode preserves explicit ket-only and bra-only gate semantics."""
+    length = 6
+    where = (0, 5)
+    initial = qtn.MPO_rand(
+        length, bond_dim=2, phys_dim=2, dtype="complex128", seed=2719
+    )
+    rng = np.random.default_rng(20260818)
+    random_matrix = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    gate = np.linalg.qr(random_matrix)[0]
+    effective_gate = _embed_two_site_operator(gate.T, length, where)
+    initial_dense = initial.to_dense()
+
+    ket_out = py.MpoOptimizer(
+        initial.copy(), gates=[((gate, None), where)], chi=64, mode="mpo"
+    ).run(progbar=False, cutoff=1e-13, fidelity_samples=1)
+    bra_out = py.MpoOptimizer(
+        initial.copy(), gates=[((None, gate), where)], chi=64, mode="mpo"
+    ).run(progbar=False, cutoff=1e-13, fidelity_samples=1)
+
+    np.testing.assert_allclose(
+        ket_out.to_dense(), effective_gate @ initial_dense, atol=1e-10, rtol=1e-10
+    )
+    np.testing.assert_allclose(
+        bra_out.to_dense(), initial_dense @ effective_gate.conj().T,
+        atol=1e-10,
+        rtol=1e-10,
+    )
 
 
 def test_mpo_optimizer_mpo_mode_unitary_evolution_preserves_norm():

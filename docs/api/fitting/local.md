@@ -37,6 +37,8 @@ fit = pepsy.FIT(
     # Keep the safe default for caller-owned targets. MpsOptimizer transfers
     # its fresh disposable target with copy_target=False.
     copy_target=True,
+    # Optional separate support MPS; it is never installed as fit.p.
+    target_support=target_support,
 )
 fit.run_gate(
     n_iter=4,
@@ -192,18 +194,15 @@ phases afterward. The physical ket is restored on both success and failure.
 The same convention supports one-, two-, and three-site native `run_eff`
 sweeps.
 
-Before entering that conjugated gauge, a native full-chain MPS fit compares
-the target and guess virtual charge maps. If the target has sectors absent
-from the guess, FIT initializes from a target copy compressed natively with
-the requested `max_bond`, `cutoff`, and `cutoff_mode`. This deterministic
-target-informed initialization prevents an overlap environment from
-projecting every missing sector to zero; it uses neither random noise nor a
-dense representation. The decision is recorded under
-`info["native_sector_initialization"]`. A partial-window fit cannot replace
-its fixed outside boundary safely, so it leaves sector creation to its native
-two-/three-site block updates. If the actual effective tensor is nevertheless
-empty, FIT raises an explicit disconnected-sector error rather than an
-internal Symmray decomposition failure.
+FIT never replaces its live `p` with a target copy. Dense MPS gate replay can
+pass an optional separate `target_support` MPS. During a two- or three-site
+block update, if an active bond is below `max_bond`, FIT uses only local target
+Schmidt factors to open that bond, capped at `max_bond`; once the bond has
+reached its target rank or cap, ordinary fixed-rank FIT continues. The
+support template is not the variational objective and is never used for a
+global rank-`chi` warm start. Native Symmray fits retain their graded local
+SVD/auto-swap sector rules and raise an explicit disconnected-sector error if
+the supplied current sectors cannot reach the target locally.
 
 `environment_strategy="auto"` selects
 `"mps-direct"` for an ordinary dense one-tensor-per-site target,

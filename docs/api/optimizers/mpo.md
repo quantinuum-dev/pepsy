@@ -64,13 +64,15 @@ Symmray gates keep their charge and dual metadata and are not coerced to dense
 arrays. Native graded gates from `Fermion.strang_gate_stream(...)` are accepted
 as well; even gates are adapted explicitly to the MPO's Jordan-Wigner
 convention. `mode="svd"` and native `mode="mpo"` use symmetry-aware direct
-compression, while native `mode="dmrg"` uses block-aware FIT. All three avoid
+compression, while native `mode="dmrg"` and its `dmrg1`/`dmrg2`/`dmrg3`
+schedule aliases use block-aware FIT. All three avoid
 generic dense auxiliary MPO compression and bond padding, which do not support
 multi-sector Symmray bonds reliably.
 
 Native MPO tensors retain their Symmray graded metadata throughout replay and
 compression. `mode="svd"` and `mode="mpo"` use the block-aware direct SVD path
-for native Symmray MPOs, while `mode="dmrg"` uses native block-aware FIT; the
+for native Symmray MPOs, while `mode="dmrg"` and the named DMRG schedules use
+native block-aware FIT; the
 optimizer does not require a dense conversion of the input MPO.
 
 For MPO DMRG, `fit_block_size=2` is the default native two-site FIT update.
@@ -86,10 +88,142 @@ active window is formed. `cutoff="auto"` selects a dtype-aware cutoff.
 target construction and output compression remain separate choices. Use
 `fit_block_size=1` to retain the legacy fixed-rank one-site path.
 
+The named modes are schedule aliases over this same MPO/FIT implementation:
+
+| mode | warm-up block | warm-up policy | following sweeps |
+| --- | --- | --- | --- |
+| `dmrg1` | two-site | exactly two sweeps, unless the active window is already at its attainable rank ceiling | one-site FIT |
+| `dmrg2` | two-site | `fit_adaptive_sweeps` (default two) | one-site FIT |
+| `dmrg3` | three-site | `fit_adaptive_sweeps` (default two) | one-site FIT |
+
+The aliases normalize the backend to `opt.mode == "dmrg"` while retaining the
+requested schedule in `opt._dmrg_mode_alias`, matching `MpsOptimizer`'s API
+shape. Passing `fit_block_size` does not override a named mode; the mode's
+block size is authoritative. `fit_single_pair_fast_path=True` (the default)
+advances an adjacent two-site gate after its single exact local variational
+update, so a named mode does not waste additional sweeps on a complete pair.
+The generic `mode="dmrg"` path remains unchanged and continues to use
+`fit_block_size` and `fit_three_site_sweeps` directly.
+
 As with MPS DMRG, `n_iter` counts FIT sweeps. `mode="mpo"` applies each gate
 with one direct MPO compression step and does not perform variational sweeps;
 the two modes therefore have different one-iteration behavior for a
 non-local gate even when they use the same `chi` and SVD cutoff.
+
+## Norm and run diagnostics
+
+Every two-site compression records an automatic norm-survival event. The
+event compares the observed canonical-center norm after compression with the
+expected norm of the uncompressed gate target. For a provably unitary default
+`U O U†` gate, the expected value is read from the live canonical center, so no
+extra target contraction is needed. Explicit ket/bra pairs and non-unitary
+gates use a disposable exact target, keeping physical norm changes separate
+from truncation loss.
+
+```python
+diagnostics = opt.norm_diagnostics()
+events = opt.get_norm_events()
+
+print(diagnostics["fidelity"])
+print(diagnostics["infidelity"])
+```
+
+`diagnostics["fidelity"]` is the stable cumulative product of the per-event
+`norm_fidelity` values, evaluated in log space. `infidelity` is
+`1 - fidelity`, evaluated with `expm1` for small losses. The progress bar's
+`~F` field uses this same cumulative value. `get_fidelities()` remains the
+legacy normalized-MPO-norm history and is not the compression ledger.
+
+DMRG FIT controls are exposed directly through `run`: `fit_min_iter`,
+`fit_rtol`, `fit_patience`, `fit_finite_check`, `timing`,
+`timing_sync_device`, and `fit_collect_split_diagnostics`. The latest local
+FIT record is available from `get_fit_diagnostics()`, the complete replay
+history from `get_fit_history()`, and the run-level timing/status record from
+`get_run_timing()`.
+
+`atomic=True` restores the optimizer state when replay fails. Set
+`fit_fallback="svd"` or `fit_fallback="mpo"` to restore the pre-run state and
+replay the complete stream through a direct backend if DMRG FIT raises. The
+fallback is automatically routed through the native block-aware SVD path for
+Symmray MPOs. With `inplace=True`, the optimizer state is restored, but an
+external reference to the original MPO may already have observed in-place
+updates.
+
+`transactional_steps=True` adds a smaller rollback boundary around every DMRG
+gate or batch. Thus `atomic=False` can retain completed earlier updates while
+restoring only the failed local FIT trial. A configured `fit_fallback` is also
+attempted at that local boundary; `get_fit_history()` records the failed FIT
+and `channel_diagnostics()` reports each fallback. This is the useful setting
+for long streams where one ill-conditioned window should not discard the
+whole replay.
+
+For dense MPOs, `fit_target_strategy="auto"` uses a lazy layered target: gate
+layers are split onto their physical endpoints and FIT contracts the resulting
+network without repeatedly forming a chi-capped intermediate MPO. Set
+`fit_target_strategy="mpo"` to materialize the disposable target back to one
+MPO tensor per site, or use `"layered"` explicitly. Native Symmray MPOs use
+the block-aware `"mpo"` representation; requesting `"layered"` for native
+data raises rather than dropping symmetry metadata. `target_cutoff` affects
+only disposable target construction, while the output `cutoff` remains the
+compression policy.
+
+Gate streams are compiled once at construction and queue updates. The
+immutable plan is inspectable with `opt.compile_gate_stream()` and includes
+event type, arity, support span, and prepared-payload cache size. Dense gate
+transposes are cached by stream source identity and can be released with
+`opt.clear_gate_cache()`; state-dependent native gate adaptation remains
+uncached so charge and layout metadata are always taken from the live MPO.
+
+Long-range streams can install a physical order before replay:
+
+```python
+opt = pepsy.MpoOptimizer(mpo, gates, chi=32, mode="dmrg")
+plan = opt.gate_stream_layout(L=mpo.L, order="quality")
+opt.apply_layout(plan, cutoff=1e-12)
+out = opt.run(progbar=False)
+```
+
+`apply_layout` performs the required logical SWAP conjugations, records their
+norm survival, and remaps later gate supports through `site_map`. Reordering
+an already entangled MPO is rejected unless
+`allow_lossy_reorder=True`, because the layout installation itself may need
+compression. The layout is persistent for that optimizer; construct a fresh
+optimizer to compare another order.
+
+## Deterministic operator channels
+
+`MpoChannelEvent` provides the operator-channel API for MPO replay. It applies
+
+\[
+  O \mapsto \sum_a w_a K_a O K_a^\dagger
+\]
+
+as one deterministic event. Build it from the shared noise channel objects or
+directly from Kraus matrices:
+
+```python
+channel = pepsy.TrajectoryChannel.amplitude_damping(0.25)
+event = pepsy.MpoOptimizer.channel_event(channel, where=0)
+
+opt = pepsy.MpoOptimizer(mpo, gates=[event], chi=32, mode="dmrg2")
+out = opt.run(progbar=False)
+```
+
+`semantics="sum"` is the only executable MPO meaning. Passing
+`semantics="sample"` raises a clear error: sampled branches are an MPS
+trajectory operation and require branch probabilities, branch normalization,
+and per-trajectory state. The MPO path never silently selects one Kraus
+branch. `MpoChannelEvent.from_channel` uses unit weights for a state-dependent
+Kraus channel and declared mixture probabilities for a classical mixture.
+
+Channel trace preservation is deliberately separate from Hilbert-Schmidt norm
+survival. `opt.get_norm_events()` and `opt.norm_diagnostics()` report
+compression retention, while `opt.get_trace_events()` and
+`opt.channel_diagnostics()` report the completeness residual
+\(\|\sum_a w_a K_a^\dagger K_a-I\|\), input/target/retained traces, and any
+trace change caused by output compression. A non-trace-preserving operator
+therefore remains physically visible instead of being misreported as
+compression infidelity.
 
 `ham_tn.build_mpo(..., fermionic=True)` is also routed to the native
 `Fermion.build_mpo(...)` entry point. `Fermion.to_mpo(...)` remains a

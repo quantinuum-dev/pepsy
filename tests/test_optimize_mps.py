@@ -98,11 +98,13 @@ def _assert_event_sites_locally_normalized(mps, event):
         assert _tensor_data_norm(mps, site) == pytest.approx(1.0)
 
 
-def test_mps_optimizer_has_no_infidelity_tracking_api():
-    """Infidelity tracking is no longer part of the MPS optimizer API."""
+def test_mps_optimizer_has_automatic_norm_tracking_without_legacy_api():
+    """Norm-survival diagnostics are automatic, without an opt-in flag."""
     state = qtn.MPS_computational_state("00", dtype="complex128")
     opt = py.MpsOptimizer(state, gates=[], chi=2, mode="svd")
 
+    assert callable(opt.norm_diagnostics)
+    assert opt.norm_diagnostics()["tracking"] is True
     assert not hasattr(opt, "get_fidelities")
     assert not hasattr(opt, "get_true_infidelities")
     assert not hasattr(opt, "get_norm_infidelity_samples")
@@ -585,6 +587,77 @@ def test_mps_optimizer_timing_record_identifies_named_dmrg_mode():
     assert timing["mode_alias"] == "dmrg2"
     assert timing["fit_diagnostics"] == optimizer.get_fit_diagnostics()
     assert timing["fit_diagnostics"]["block_size"] == 2
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+def test_mps_optimizer_long_range_dmrg_enriches_local_target_support(mode):
+    """DMRG keeps the current MPS and enriches only active bonds."""
+    stream = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 7)),
+    ]
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        stream,
+        chi=4,
+        mode="mpo",
+    ).run(progbar=False)
+
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        stream,
+        chi=4,
+        mode=mode,
+    )
+    out = optimizer.run(progbar=False, n_iter=4, fit_rtol=None)
+
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+    assert out.max_bond() == 2
+    assert optimizer.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+        0.0, abs=1.0e-12
+    )
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["backend"] == "fit"
+    assert diagnostics["fallback"] is False
+    expansion = diagnostics["target_support_expansion"]
+    assert expansion["enabled"] is True
+    assert expansion["updates"] > 0
+    assert all(record["new_rank"] <= 4 for record in expansion["bonds"])
+
+
+def test_fit_target_support_never_replaces_current_mps():
+    """FIT keeps the supplied current state as its live variational MPS."""
+    state = qtn.MPS_computational_state("0" * 8, dtype="complex128")
+    state.gate_(qu.hadamard(), 0, contract=True)
+    target = state.copy(deep=True)
+    target.gate_nonlocal_(
+        qu.CNOT(),
+        (0, 7),
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+    fit = py.FIT(
+        target,
+        p=state,
+        range_int=[0, 7],
+        cutoffs=1.0e-12,
+        inplace=True,
+        target_support=target,
+    )
+    assert fit.p is state
+    fit.run_gate(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=1.0e-12,
+        adaptive_block_sweeps=2,
+    )
+    assert fit.p is state
+    assert fit.info["target_subspace_expansion"]["updates"] > 0
 
 
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd"])
@@ -1118,6 +1191,43 @@ def test_fit_gate_two_site_grows_only_active_bonds():
     assert [record["direction"] for record in fit.get_timing()] == []
 
 
+def test_fit_gate_target_support_enrichment_handles_cutoff_from_product_state():
+    """Local support expansion opens remote-gate sectors before the cutoff."""
+    initial = qtn.MPS_computational_state("0000", dtype="complex128")
+    initial.gate_(qu.hadamard(), 0, contract=True)
+    target = initial.copy()
+    target.gate_nonlocal_(
+        qu.CNOT(),
+        (0, 3),
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+    fit = py.FIT(
+        target,
+        p=initial,
+        range_int=[0, 3],
+        cutoffs=1.0e-12,
+        inplace=True,
+        target_support=target,
+    )
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=1.0e-12,
+    )
+
+    assert fit.p is initial
+    assert fit.info["target_subspace_expansion"]["updates"] > 0
+    assert [fit.p.bond_size(i, i + 1) for i in range(3)] == [2, 2, 2]
+    assert float(
+        np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+
+
 @pytest.mark.parametrize("block_size", (2, 3))
 def test_fit_run_eff_native_blocks_grow_full_chain(block_size):
     """Full-chain block FIT should grow only bonds supported by the target."""
@@ -1618,6 +1728,49 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
     assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
     assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
     assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
+
+
+def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
+    """DMRG1 must rotate saturated subspaces for a nonlocal gate."""
+    state = (
+        qtn.MPS_computational_state("00000000", dtype="complex128")
+        + qtn.MPS_computational_state("11111111", dtype="complex128")
+    ) / np.sqrt(2.0)
+    controlled_phase = np.diag([1.0, 1.0, 1.0, -1.0]).astype("complex128")
+    stream = [(controlled_phase, (0, 7))]
+    reference = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=2,
+        mode="mpo",
+    ).run(progbar=False, cutoff=1.0e-12, stabilize_unitary=False)
+    optimizer = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=2,
+        mode="dmrg1",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        n_iter=6,
+        cutoff=1.0e-12,
+        target_cutoff=1.0e-12,
+        fit_rtol=None,
+        stabilize_unitary=False,
+        timing=True,
+    )
+
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["target_support_expansion"]["enabled"] is False
+    assert diagnostics["target_support_expansion"]["updates"] == 0
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [1, 1, 1, 1, 1, 1]
 
 
 def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
@@ -3261,40 +3414,29 @@ def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
 
 @pytest.mark.parametrize("block_size", [1, 2, 3])
 @pytest.mark.parametrize(
-    ("spinful", "symmetry", "occupations", "expect_initialization"),
+    ("spinful", "symmetry", "occupations"),
     [
-        (False, "U1", (1, 0, 1, 0, 1, 0), True),
+        (False, "U1", (1, 0, 1, 0, 1, 0)),
         (
             True,
             "U1U1",
             ((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
-            True,
         ),
-        (False, "Z2", (1, 0, 1, 0, 1, 0), False),
+        (False, "Z2", (1, 0, 1, 0, 1, 0)),
     ],
 )
-def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
+def test_fit_fermionic_arbitrary_target_keeps_native_guess_separate(
     block_size,
     spinful,
     symmetry,
     occupations,
-    expect_initialization,
     monkeypatch,
 ):
-    """Full-chain FIT seeds target sectors without dense conversion."""
+    """Native FIT does not replace its current state with the target."""
     pytest.importorskip("symmray")
     fermion = py.Fermion(
         spinful=spinful,
         symmetry=symmetry,
-        dtype="complex128",
-    )
-    guess = py.hrs_to_mps(
-        6,
-        fermion=fermion,
-        occupations=occupations,
-        chi=2,
-        random_rounds=3,
-        seed=29,
         dtype="complex128",
     )
     target = py.hrs_to_mps(
@@ -3306,6 +3448,7 @@ def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
         seed=37,
         dtype="complex128",
     )
+    guess = target.copy(deep=True)
     fit = py.FIT(
         target.copy(deep=True),
         p=guess.copy(deep=True),
@@ -3340,13 +3483,7 @@ def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
         patcher.setattr(qtn.TensorNetwork, "contract", fail_network_contract)
         fit.run_gate(**run_options)
 
-    initialization = fit.info["native_sector_initialization"]
-    assert initialization["applied"] is expect_initialization
-    if expect_initialization:
-        assert initialization["reason"] == "missing_virtual_charge_support"
-        assert initialization["bonds"]
-    else:
-        assert initialization["reason"] == "compatible_virtual_charge_support"
+    assert "native_sector_initialization" not in fit.info
     assert all(
         type(tensor.data).__module__.split(".", 1)[0] == "symmray"
         and type(tensor.data).__name__.endswith("FermionicArray")
@@ -3357,8 +3494,8 @@ def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
     ) == pytest.approx(1.0, abs=1.0e-10)
 
 
-def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
-    """Native block run_eff shares full-chain target-informed initialization."""
+def test_fit_run_eff_fermionic_keeps_current_state_as_initial_guess():
+    """Native block run_eff does not replace its current state."""
     pytest.importorskip("symmray")
     fermion = py.Fermion(
         spinful=True,
@@ -3373,15 +3510,6 @@ def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
         (1, 0),
         (0, 1),
     )
-    guess = py.hrs_to_mps(
-        6,
-        fermion=fermion,
-        occupations=occupations,
-        chi=2,
-        random_rounds=3,
-        seed=29,
-        dtype="complex128",
-    )
     target = py.hrs_to_mps(
         6,
         fermion=fermion,
@@ -3391,6 +3519,7 @@ def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
         seed=37,
         dtype="complex128",
     )
+    guess = target.copy(deep=True)
     fit = py.FIT(
         target,
         p=guess,
@@ -3404,9 +3533,7 @@ def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
         cutoff=1.0e-12,
     )
 
-    initialization = fit.info["native_sector_initialization"]
-    assert initialization["applied"] is True
-    assert initialization["reason"] == "missing_virtual_charge_support"
+    assert "native_sector_initialization" not in fit.info
     assert float(
         np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-10)
@@ -3607,16 +3734,16 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         timing=True,
     )
     assert optimizer._last_dmrg_fit_diagnostics["block_size"] == 3
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 3
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [3, 3, 3]
+    ] == [3, 3, 1]
     assert [
         record["site_count"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 2]
+    ] == [2, 2, 4]
 
     adjacent = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
@@ -4322,6 +4449,33 @@ def test_mps_optimizer_accepts_bundled_gate_stream():
 
     assert opt.p.L == 4
     assert opt.where == [(1,), (0, 3)]
+
+
+def test_mps_optimizer_compiles_gate_stream_once(monkeypatch):
+    """Repeated replay reuses compiled stream metadata."""
+    calls = []
+    original = mps_optimizer_module._normalize_gate_queue
+
+    def count_normalization(gates):
+        calls.append(gates)
+        return original(gates)
+
+    monkeypatch.setattr(
+        mps_optimizer_module,
+        "_normalize_gate_queue",
+        count_normalization,
+    )
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.hadamard(), (1,)), (qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="svd",
+    )
+
+    assert len(calls) == 1
+    opt.run(progbar=False, cutoff=1e-12)
+    opt.run(progbar=False, cutoff=1e-12)
+    assert len(calls) == 1
 
 
 def test_mps_optimizer_forwards_custom_ind_id_to_gate_application():
@@ -5825,6 +5979,12 @@ def test_mps_optimizer_measure_forced_outcome_collapses_and_records():
     assert where == (2,)
     assert outcome == 1
     assert 0.0 <= prob <= 1.0
+    event = opt.get_norm_events()[0]
+    assert event["kind"] == "measure"
+    assert event["branch_probability"] == pytest.approx(prob)
+    assert event["physical_boundary"] is True
+    assert event["renormalized"] is True
+    assert event["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_mps_optimizer_measure_multisite_pauli():
@@ -6054,6 +6214,8 @@ def test_mps_optimizer_reset_returns_qubit_to_zero():
     assert opt.p.L == 3
     assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (1,)), 1.0)
     assert opt.measurements == []
+    assert [event["kind"] for event in opt.get_norm_events()] == ["reset"]
+    assert opt.norm_diagnostics()["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("axis", ["X", "Y", "Z"])
@@ -6386,7 +6548,31 @@ def test_standalone_compression_modes_honor_unitary_stabilization(mode):
 
     assert _mps_data_norm(stabilized.p) == pytest.approx(1.0, abs=2.0e-5)
     assert _mps_data_norm(unstabilized.p) < 0.999
+    assert stabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+        0.5, abs=2.0e-5
+    )
+    assert unstabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+        0.5, abs=2.0e-5
+    )
+    assert stabilized.get_norm_events()[0]["kind"] == "unitary_compression"
     assert stabilized.get_run_timing()["stages"][f"{mode}.stabilize"]["calls"] == 1
+
+
+@pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
+def test_dmrg_schedules_record_automatic_norm_survival(mode):
+    """All named DMRG schedules use the same automatic norm ledger."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 2))],
+        chi=1,
+        mode=mode,
+    )
+    opt.run(progbar=False, cutoff=0.0, n_iter=3)
+
+    diagnostics = opt.norm_diagnostics()
+    assert diagnostics["events"] == 1
+    assert diagnostics["norm_infidelity"] == pytest.approx(0.5, abs=2.0e-5)
+    assert _mps_data_norm(opt.p) == pytest.approx(1.0, abs=2.0e-5)
 
 
 def test_fit_run_gate_reuse_resets_per_run_traces_and_split_diagnostics():

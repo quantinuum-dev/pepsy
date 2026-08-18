@@ -50,6 +50,7 @@ from __future__ import annotations
 import math
 import time
 import warnings
+from copy import deepcopy
 from collections.abc import Mapping
 from numbers import Integral
 from typing import List, Optional
@@ -451,7 +452,10 @@ class MpsStabOptimizer:
         coefficient MPS, so this guard keeps the exponential fallback explicit.
         ``None`` opts out of the guard.
     track_infidelity : bool
-        If ``True``, record ``1 - ||nu||**2`` after compressed unitary updates.
+        Legacy compatibility switch. Norm/infidelity diagnostics are enabled by
+        default and follow the same automatic ledger as ``MpsOptimizer``.
+        Passing ``False`` retains the old opt-out behavior for existing callers;
+        new code should omit this argument.
         The normalized initial coefficient state is not renormalized during
         unitary evolution, so this is a cheap cumulative norm-loss proxy read
         from the canonical centre. Compressing a dense multi-qubit non-unitary
@@ -543,7 +547,7 @@ class MpsStabOptimizer:
         ),
         max_pauli_terms: Optional[int] = 256,
         max_dense_cap_qubits: Optional[int] = 10,
-        track_infidelity: bool = False,
+        track_infidelity: bool = True,
         exact_cooling: bool = True,
         seed: Optional[int] = None,
         dtype: str = "complex128",
@@ -623,6 +627,7 @@ class MpsStabOptimizer:
         self._norm_infidelity_valid = True
         self._current_norm_infidelity = 0.0 if self.track_infidelity else None
         self._norm_segment_open = False
+        self._norm_log_survival = 0.0
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
         self.logical_order = list(range(self.state.n))
@@ -645,6 +650,11 @@ class MpsStabOptimizer:
         self.backend_info()
 
         self._queue: List[object] = []
+        self._gate_stream = ()
+        self._trajectory_plan = None
+        self._has_trajectory_events = False
+        self._last_run_timing = None
+        self._quality_checks: list[dict] = []
         self.infidelities: List[float] = []
         self._nonunitary_infidelities: List[float] = []
         self.norm_events: List[NormEventRecord] = []
@@ -669,6 +679,10 @@ class MpsStabOptimizer:
                 layout_kwargs=layout_kwargs,
                 layout_report=layout_report,
             )
+        # Shot replay, like ``MpsOptimizer``, always starts from the state that
+        # existed when this optimizer was constructed. Capture it after a
+        # static layout has been installed so logical labels remain valid.
+        self._initial_state = self.state.copy()
 
     # ------------------------------------------------------------------ #
     # Initial-state constructors (product / GHZ / user tableau+MPS)
@@ -769,19 +783,121 @@ class MpsStabOptimizer:
 
     def set_gates(self, gates) -> "MpsStabOptimizer":
         """Replace the queued gate stream."""
-        self._queue = list(self._as_entries(gates))
+        entries = self._as_entries(gates)
+        self._install_stream_plan(entries)
         return self
 
     def add_gates(self, gates) -> "MpsStabOptimizer":
         """Append to the queued gate stream."""
-        self._queue.extend(self._as_entries(gates))
+        entries = list(self._queue) + self._as_entries(gates)
+        self._install_stream_plan(entries)
         return self
+
+    def _install_stream_plan(self, entries) -> None:
+        """Install the backend-neutral trajectory plan for a queued stream."""
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            compile_trajectory_stream,
+        )
+
+        plan = compile_trajectory_stream(tuple(entries))
+        self._trajectory_plan = plan
+        self._gate_stream = tuple(plan.entries)
+        self._has_trajectory_events = bool(
+            plan.has_trajectory_events or plan.has_leakage
+        )
+        self._queue = list(plan.entries)
+
+    def gate_stream(self):
+        """Return the immutable, compiled stream owned by this optimizer."""
+        return self._gate_stream
+
+    @property
+    def has_trajectory_events(self) -> bool:
+        """Whether this optimizer's stream requires the shot runner."""
+        return bool(self._has_trajectory_events)
+
+    @staticmethod
+    def submpo_event(mpo, where):
+        """Return the canonical coefficient-frame sub-MPO event."""
+        return ("submpo", mpo, _normalize_sites(where))
+
+    @staticmethod
+    def submpo_event_parts(entry, *, normalize_where=False):
+        """Return ``(mpo, where)`` for a sub-MPO event."""
+        return submpo_event_parts(entry, normalize_where=normalize_where)
+
+    @staticmethod
+    def is_submpo_event(entry):
+        """Return whether ``entry`` is a sub-MPO event."""
+        return is_submpo_event(entry)
+
+    @staticmethod
+    def measure_event(pauli, where, outcome=None, absorb_basis=None):
+        """Build a canonical Pauli-measurement event shared with MPS."""
+        where = _normalize_sites(where)
+        entry = ("measure", str(pauli), where)
+        if absorb_basis is None:
+            if outcome is not None:
+                entry += (int(outcome),)
+        else:
+            entry += (None if outcome is None else int(outcome), bool(absorb_basis))
+        return entry
+
+    @staticmethod
+    def cap_event(where, vec, absorb="left"):
+        """Build a canonical physical cap event."""
+        sites = _normalize_sites(where)
+        if len(sites) != 1:
+            raise ValueError("cap event where must reference exactly one site.")
+        return (
+            "cap",
+            int(sites[0]),
+            np.asarray(vec, dtype=complex).ravel(),
+            _normalize_absorb(absorb),
+        )
+
+    @staticmethod
+    def reset_event(where, basis="Z"):
+        """Build a canonical reset event."""
+        where = _normalize_sites(where)
+        axes = _normalize_pauli_axes(basis, where, event="reset")
+        if all(axis == "Z" for axis in axes):
+            return ("reset", where)
+        return ("reset", where, "".join(axes))
+
+    @staticmethod
+    def measure_reset_event(pauli, where, outcome=None, absorb_basis=None):
+        """Build a canonical measure-then-reset event."""
+        where = _normalize_sites(where)
+        axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
+        outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
+        entry = ("measure_reset", "".join(axes), where)
+        value = None if outcome is None else (
+            outcomes[0] if len(outcomes) == 1 else outcomes
+        )
+        if absorb_basis is None:
+            if outcome is not None:
+                entry += (value,)
+        else:
+            entry += (value, bool(absorb_basis))
+        return entry
 
     @staticmethod
     def _as_entries(gates) -> List[object]:
         """Normalize a stream into a list of entries."""
         if gates is None:
             return []
+        # Keep the import local: noise is an optional higher-level facade and
+        # imports ``MpsOptimizer`` itself.
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            TrajectoryEvent,
+            TrajectoryStreamPlan,
+        )
+
+        if isinstance(gates, TrajectoryStreamPlan):
+            return list(gates.entries)
+        if isinstance(gates, TrajectoryEvent):
+            return [gates]
         # A single sub-MPO event (tuple/mapping) is one entry.
         if is_submpo_event(gates):
             return [gates]
@@ -2230,7 +2346,179 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Execution
     # ------------------------------------------------------------------ #
-    def run(self, *, progbar: bool = False) -> "MpsStabOptimizer":
+    def _shot_factory(self):
+        """Build fresh STN optimizers for the shared trajectory runners."""
+        template = getattr(self, "_initial_state", self.state)
+        logical_order = tuple(self.logical_order)
+        layout_plan = deepcopy(self.layout_plan)
+
+        def make_optimizer():
+            optimizer = type(self)(
+                template.copy(),
+                chi=self.chi,
+                cutoff=self.cutoff,
+                operator_tol=self.operator_tol,
+                max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
+                max_pauli_terms=self.max_pauli_terms,
+                max_dense_cap_qubits=self.max_dense_cap_qubits,
+                track_infidelity=self.track_infidelity,
+                exact_cooling=self.exact_cooling,
+                dtype=self.dtype,
+                to_backend=self.to_backend,
+                inplace=True,
+            )
+            if logical_order != tuple(range(optimizer.n)):
+                optimizer.logical_order = list(logical_order)
+                optimizer._refresh_layout_map()
+                optimizer.layout_plan = deepcopy(layout_plan)
+                optimizer.last_layout_plan = deepcopy(layout_plan)
+            return optimizer
+
+        return make_optimizer
+
+    def _run_shots(
+        self,
+        shots,
+        *,
+        error_model=None,
+        seed=None,
+        run_kwargs=None,
+        strategy="auto",
+        max_branches=128,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
+        auto_max_expected_faults=0.1,
+    ):
+        """Dispatch noisy replay through the shared MPS/STN runner."""
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            NoisyResult,
+            run_noisy_shots,
+            run_trajectory_shots,
+        )
+
+        common = {
+            "seed": seed,
+            "run_kwargs": run_kwargs,
+            "strategy": strategy,
+            "max_branches": max_branches,
+            "importance_sampling": importance_sampling,
+            "max_branch_factor": max_branch_factor,
+            "parallel_workers": parallel_workers,
+            "parallel_backend": parallel_backend,
+            "retain": retain,
+        }
+        if error_model is None:
+            plan = self._trajectory_plan
+            if plan is None:
+                from ..noise import compile_trajectory_stream
+
+                plan = compile_trajectory_stream(self._gate_stream)
+            raw = run_trajectory_shots(
+                self._shot_factory(),
+                plan,
+                shots,
+                **common,
+            )
+        else:
+            if self._has_trajectory_events:
+                raise ValueError(
+                    "do not combine stream-local trajectory events with "
+                    "error_model; use one noise representation per stream."
+                )
+            raw = run_noisy_shots(
+                self._shot_factory(),
+                self._gate_stream,
+                error_model,
+                shots,
+                auto_max_expected_faults=auto_max_expected_faults,
+                **common,
+            )
+        return NoisyResult(raw)
+
+    def _execution_snapshot(self):
+        """Capture the mutable replay state for optional atomic recovery."""
+        rng_state = deepcopy(self._rng.bit_generator.state)
+        return {
+            "state": self.state.copy(),
+            "infidelities": list(self.infidelities),
+            "nonunitary_infidelities": list(self._nonunitary_infidelities),
+            "norm_events": deepcopy(self.norm_events),
+            "norm_log_survival": self._norm_log_survival,
+            "norm_infidelity_valid": self._norm_infidelity_valid,
+            "current_norm_infidelity": self._current_norm_infidelity,
+            "norm_segment_open": self._norm_segment_open,
+            "bond_history": list(self.bond_history),
+            "exact_cooling_events": deepcopy(self.exact_cooling_events),
+            "measurements": list(self.measurements),
+            "immediate_projection_events": deepcopy(self.immediate_projection_events),
+            "last_immediate_injection_report": deepcopy(
+                self.last_immediate_injection_report
+            ),
+            "deferred_projection_events": deepcopy(self.deferred_projection_events),
+            "last_deferred_injection_report": deepcopy(
+                self.last_deferred_injection_report
+            ),
+            "logical_order": list(self.logical_order),
+            "layout_plan": deepcopy(self.layout_plan),
+            "last_layout_plan": deepcopy(self.last_layout_plan),
+            "rng_state": rng_state,
+        }
+
+    def _restore_execution_snapshot(self, snapshot) -> None:
+        """Restore a snapshot made by :meth:`_execution_snapshot`."""
+        self.state = snapshot["state"]
+        self.infidelities = list(snapshot["infidelities"])
+        self._nonunitary_infidelities = list(snapshot["nonunitary_infidelities"])
+        self.norm_events = deepcopy(snapshot["norm_events"])
+        self._norm_log_survival = snapshot["norm_log_survival"]
+        self._norm_infidelity_valid = snapshot["norm_infidelity_valid"]
+        self._current_norm_infidelity = snapshot["current_norm_infidelity"]
+        self._norm_segment_open = snapshot["norm_segment_open"]
+        self.bond_history = list(snapshot["bond_history"])
+        self.exact_cooling_events = deepcopy(snapshot["exact_cooling_events"])
+        self.measurements = list(snapshot["measurements"])
+        self.immediate_projection_events = deepcopy(
+            snapshot["immediate_projection_events"]
+        )
+        self.last_immediate_injection_report = deepcopy(
+            snapshot["last_immediate_injection_report"]
+        )
+        self.deferred_projection_events = deepcopy(
+            snapshot["deferred_projection_events"]
+        )
+        self.last_deferred_injection_report = deepcopy(
+            snapshot["last_deferred_injection_report"]
+        )
+        self.logical_order = list(snapshot["logical_order"])
+        self._refresh_layout_map()
+        self.layout_plan = deepcopy(snapshot["layout_plan"])
+        self.last_layout_plan = deepcopy(snapshot["last_layout_plan"])
+        self._rng.bit_generator.state = deepcopy(snapshot["rng_state"])
+        self.backend_info()
+
+    def run(
+        self,
+        *,
+        progbar: bool = False,
+        shots: int = 1,
+        error_model=None,
+        seed=None,
+        run_kwargs=None,
+        strategy="auto",
+        max_branches=128,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
+        auto_max_expected_faults=0.1,
+        timing: bool = False,
+        transactional: bool = False,
+        atomic=None,
+    ):
         """Apply all queued gates in order, consuming successful entries.
 
         If an entry raises, successfully applied entries are removed while the
@@ -2243,10 +2531,70 @@ class MpsStabOptimizer:
             Show a ``tqdm`` progress bar reporting the current stream part and
             the MPS-compatible ``infidelity`` diagnostic. The legacy
             ``norm_infidelity`` key is emitted alongside it.
+        shots, error_model, strategy, ...
+            Shot/noise options matching :meth:`MpsOptimizer.run`. They use the
+            shared trajectory runner and return :class:`pepsy.NoisyResult`.
+        timing : bool
+            Record a lightweight wall-clock replay record available through
+            :meth:`get_run_timing`.
+        transactional : bool
+            If true, restore the STN state and diagnostics when an entry fails;
+            the failed entry and suffix remain queued for retry. This is opt-in
+            because a full STN snapshot is intentionally expensive.
+        atomic : bool | None
+            Alias for ``transactional``.
         """
+        if atomic is not None:
+            transactional = bool(atomic)
+        if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+            raise ValueError("shots must be a nonnegative integer.")
+        if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
+            raise TypeError("run_kwargs must be a mapping or None.")
+        shot_requested = bool(
+            self._has_trajectory_events
+            or error_model is not None
+            or int(shots) != 1
+            or run_kwargs is not None
+            or strategy != "auto"
+            or max_branches != 128
+            or importance_sampling is not None
+            or max_branch_factor is not None
+            or int(parallel_workers) != 1
+            or parallel_backend != "thread"
+            or retain != "all"
+        )
+        if shot_requested:
+            started = time.perf_counter()
+            result = self._run_shots(
+                shots,
+                error_model=error_model,
+                seed=seed,
+                run_kwargs=run_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                importance_sampling=importance_sampling,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
+                retain=retain,
+                auto_max_expected_faults=auto_max_expected_faults,
+            )
+            self._last_run_timing = {
+                "enabled": bool(timing),
+                "mode": "trajectory" if error_model is None else "noisy",
+                "entries": len(self._gate_stream),
+                "elapsed_seconds": float(time.perf_counter() - started),
+            }
+            return result
+
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
         queue = tuple(self._queue)
         completed = 0
         pbar = None
+        snapshot = self._execution_snapshot() if transactional else None
+        rolled_back = False
+        started = time.perf_counter()
         if progbar and queue:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
@@ -2268,11 +2616,23 @@ class MpsStabOptimizer:
                         infidelity=formatted_infidelity,
                         norm_infidelity=formatted_infidelity,
                     )
+        except BaseException:
+            if snapshot is not None:
+                self._restore_execution_snapshot(snapshot)
+                rolled_back = True
+            raise
         finally:
             if pbar is not None:
                 pbar.close()
-            if completed:
+            if completed and not rolled_back:
                 del self._queue[:completed]
+            self._last_run_timing = {
+                "enabled": bool(timing),
+                "mode": "direct",
+                "entries": len(queue),
+                "completed": completed,
+                "elapsed_seconds": float(time.perf_counter() - started),
+            }
         return self
 
     def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
@@ -2296,6 +2656,34 @@ class MpsStabOptimizer:
     def get_infidelities(self):
         """Return the cumulative ``infidelity`` trace like ``MpsOptimizer``."""
         return self.infidelities
+
+    def get_norm_events(self):
+        """Return defensive copies of projective/Kraus norm events."""
+        return [
+            event.as_dict() if isinstance(event, NormEventRecord) else dict(event)
+            for event in self.norm_events
+        ]
+
+    def get_normalizations(self):
+        """Return explicit normalization records.
+
+        STN keeps projective and Kraus normalization in ``norm_events`` rather
+        than exposing MPS tensor-scale records, so this compatibility method is
+        intentionally empty.
+        """
+        return []
+
+    def get_quality_checks(self):
+        """Return finite/gauge checks collected by this optimizer."""
+        return deepcopy(self._quality_checks)
+
+    def get_fit_diagnostics(self):
+        """Return ``None`` because STN replay has no variational FIT stage."""
+        return None
+
+    def get_run_timing(self):
+        """Return the most recent replay timing record."""
+        return deepcopy(self._last_run_timing)
 
     def to_statevector(self) -> np.ndarray:
         """Dense statevector ``|psi> = C|nu>`` (small ``n`` only)."""
@@ -2443,6 +2831,26 @@ class MpsStabOptimizer:
         event["post_norm"] = post_norm
         event["post_norm_sq"] = float(post_norm * post_norm)
         self.norm_events.append(event)
+        # Keep the cumulative product in log space. This is both cheaper than
+        # repeatedly contracting the full state and stable for long streams
+        # whose survival can underflow in ordinary floating point products.
+        if event.get("valid") and event.get("segment_infidelity") is not None:
+            survival = max(
+                0.0,
+                min(1.0, 1.0 - float(event["segment_infidelity"])),
+            )
+            projector_survival = event.get("projector_survival")
+            if projector_survival is not None:
+                survival *= max(0.0, min(1.0, float(projector_survival)))
+            self._accumulate_norm_survival(survival)
+
+    def _accumulate_norm_survival(self, survival: float) -> None:
+        """Accumulate one validated norm-survival factor in log space."""
+        survival = max(0.0, min(1.0, float(survival)))
+        if survival == 0.0:
+            self._norm_log_survival = -math.inf
+        elif np.isfinite(self._norm_log_survival):
+            self._norm_log_survival += math.log(survival)
 
     def norm_diagnostics(self, *, include_current: bool = True) -> dict:
         """Summarize segmented unitary norm-loss diagnostics.
@@ -2496,14 +2904,24 @@ class MpsStabOptimizer:
             survivals.append(min(1.0, max(0.0, 1.0 - current_loss)))
 
         if survivals:
+            current_log_survival = 0.0
+            if current_loss is not None:
+                current_survival = max(0.0, min(1.0, 1.0 - current_loss))
+                current_log_survival = (
+                    -math.inf
+                    if current_survival == 0.0
+                    else math.log(current_survival)
+                )
+            log_survival = self._norm_log_survival + current_log_survival
+            total_survival = (
+                0.0 if log_survival == -math.inf else float(math.exp(log_survival))
+            )
             if any(survival <= 0.0 for survival in survivals):
-                total_survival = 0.0
                 geometric_mean_survival = 0.0
             else:
-                log_survival = sum(math.log(survival) for survival in survivals)
-                total_survival = float(math.exp(log_survival))
                 geometric_mean_survival = float(
-                    math.exp(log_survival / len(survivals))
+                    math.exp(sum(math.log(survival) for survival in survivals)
+                             / len(survivals))
                 )
             event_losses = [1.0 - survival for survival in completed_survivals]
             event_losses.extend(completed_nonunitary_losses)
@@ -2512,7 +2930,7 @@ class MpsStabOptimizer:
             mean_segment_infidelity = float(sum(event_losses) / len(event_losses))
             max_segment_infidelity = float(max(event_losses))
         else:
-            total_survival = None if self.track_infidelity else None
+            total_survival = None
             geometric_mean_survival = None
             mean_segment_infidelity = None
             max_segment_infidelity = None
@@ -2581,6 +2999,9 @@ class MpsStabOptimizer:
             "max_projector_infidelity": (
                 None if not completed_projector_losses
                 else float(max(completed_projector_losses))
+            ),
+            "current_event_kind": (
+                None if not self.norm_events else self.norm_events[-1].get("kind")
             ),
         }
 
@@ -2720,6 +3141,7 @@ class MpsStabOptimizer:
         copied._norm_infidelity_valid = self._norm_infidelity_valid
         copied._current_norm_infidelity = self._current_norm_infidelity
         copied._norm_segment_open = self._norm_segment_open
+        copied._norm_log_survival = self._norm_log_survival
         copied.infidelities = list(self.infidelities)
         copied._nonunitary_infidelities = list(self._nonunitary_infidelities)
         copied.norm_events = [
@@ -2728,13 +3150,13 @@ class MpsStabOptimizer:
             else dict(event)
             for event in self.norm_events
         ]
+        copied._localizer_cache = dict(self._localizer_cache)
         copied.logical_order = list(self.logical_order)
         copied._refresh_layout_map()
-        copied.layout_plan = None if self.layout_plan is None else dict(self.layout_plan)
-        copied.last_layout_plan = (
-            None if self.last_layout_plan is None else dict(self.last_layout_plan)
-        )
-        copied._localizer_cache = dict(self._localizer_cache)
+        copied.layout_plan = deepcopy(self.layout_plan)
+        copied.last_layout_plan = deepcopy(self.last_layout_plan)
+        copied._initial_state = copied.state.copy()
+        copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         return copied
 
     # ------------------------------------------------------------------ #
@@ -5008,6 +5430,7 @@ class MpsStabOptimizer:
             fidelity = min(1.0, max(0.0, fidelity))
         infidelity = float(1.0 - fidelity)
         self._nonunitary_infidelities.append(infidelity)
+        self._accumulate_norm_survival(fidelity)
         self._invalidate_norm_infidelity()
         return infidelity
 

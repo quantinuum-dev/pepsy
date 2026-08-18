@@ -128,6 +128,56 @@ Mapping form accepts `kind`/`type`/`event`, `record`, `bit` (or `value`), and
 `then` (or `action`). The same event is evaluated per noisy trajectory and per
 coalesced leaf, so the selected action follows that shot's measurement record.
 
+### Shot-aware replay
+
+`MpsOptimizer` also owns shot replay. The constructor snapshots the initial MPS
+and raw stream, including `TrajectoryEvent` objects and stochastic entries such
+as `("x_error", p, q)`. Ordinary `run()` calls retain the single-state return
+value. A noisy stream is automatically sent through trajectory replay, and an
+explicit `shots > 1` requests an ensemble for any stream:
+
+```python
+simulator = pepsy.MpsOptimizer(
+    initial_mps,
+    [("h", 0), ("x_error", 1e-3, 0), ("measure", "Z", 0)],
+    chi=64,
+    mode="mpo",
+)
+result = simulator.run(shots=10_000, strategy="auto", seed=7)
+```
+
+Each trajectory starts from the constructor state, so repeated shot runs are
+independent. `strategy="independent"` stores one optimizer per shot, while
+`strategy="coalesced"` or `"auto"` shares deterministic prefixes and preserves
+branch multiplicities in the returned `NoisyResult`. Use `run_kwargs={...}` for
+ordinary single-trajectory replay options such as `progbar=False`.
+
+Use `retain="all"` (the default) for final states plus replay metadata,
+`retain="final"` for final states without concrete streams and records, or
+`retain="none"` when only the shot count/side effects matter. The latter keeps
+no optimizer states in the result and therefore cannot be used to evaluate
+observables afterward. `dmrg2` is the normal variational production backend;
+`mpo` is the direct-compression reference and is required for explicit
+sub-MPO events. `svd`, `swap`, and the other DMRG schedules use the same
+trajectory contract and should be benchmarked for the workload. `mix` and `su`
+are gate-oriented/unitary modes, while `exact` does not support state-dependent
+Kraus channels. Shot
+replay uses a frozen persistent-layout template when one is installed, but
+still requires a fresh identity-order optimizer for an already-permuted `perm`
+state.
+
+The practical shot-mode matrix is:
+
+| mode | trajectory status |
+| --- | --- |
+| `mpo` | direct-compression reference; supports unitary, controls, and Kraus replay |
+| `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
+| `dmrg`, `dmrg1/2/3` | variational compressed replay; `dmrg2` is the production default |
+| `mix` | unitary-only; no controls, leakage, or Kraus channels |
+| `su` | gate-only simple-update; not a physical-norm Kraus backend |
+| `exact` | unitary/mixture replay only; no controls or state-dependent Kraus |
+| `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
+
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
 `"dmrg1"` uses at most two two-site growth sweeps and then fixed-rank one-site
@@ -245,13 +295,13 @@ The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
 native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
 arrays. `dmrg1` uses its bounded two-sweep warm-up and sticky one-site phase,
 while `dmrg2` and `dmrg3` perform their fixed block warm-up before one-site
-refinement. A native nonlocal gate
-still receives its chi-capped graded auto-swap warm start before FIT. For a
-direct full-chain FIT whose arbitrary MPS guess lacks target virtual charge
-sectors, FIT instead uses a target-informed native compressed initialization;
-partial gate windows retain their fixed outside-state contract, grow sectors
-through native local blocks, and reject only a genuinely empty effective
-problem.
+refinement. Ordinary dense MPS replay passes the current MPS directly as
+FIT's `p` and, while an active bond is below `chi`, supplies a separate exact
+MPS support template for local target-sector enrichment. FIT never copies the
+target into `fit.p` and never uses a rank-`chi` target warm start. Native
+nonlocal gates retain their graded auto-swap sector preparation because
+Symmray charge blocks cannot be created by dense support arithmetic; a
+genuinely disconnected native effective problem remains an explicit error.
 
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
@@ -272,12 +322,11 @@ and fermionic data. `target_cutoff=0.0` keeps either representation exact while
 ordinary `cutoff` controls only the two-site output split, so target-
 construction loss is not reported as FIT loss.
 
-For a non-adjacent native fermionic gate, MPS DMRG first replays the target
-gate through Quimb's chi-capped graded auto-swap path and uses that native MPS
-as the FIT starting point. This is the deterministic counterpart of
-SymDMRG2's sector enrichment: it opens the gate-generated virtual charge
-sectors before alternating least squares can project them out. After that
-warm start, fermionic FIT follows the selected DMRG schedule normally:
+For a non-adjacent native fermionic gate, MPS DMRG uses Quimb's chi-capped
+graded auto-swap algebra on the current native MPS to open charge sectors
+before alternating least squares can project them out. This is a native
+sector-support preparation, not a copy of the exact target into `fit.p`.
+After that preparation, fermionic FIT follows the selected DMRG schedule:
 `dmrg2`, for example, can switch from its two block warm-up sweeps to native
 one-site refinement. The uncapped target remains separate. At
 `target_cutoff=0.0`, routed target splits use the smallest
@@ -295,6 +344,22 @@ again. This prevents deep complex64 streams from underflowing. Pass
 is disabled. Set `stabilize_unitary=False` only to reproduce historical
 norm-decay behavior. The old `fit_stabilize_unitary` spelling remains as a
 deprecated alias.
+
+Norm-survival bookkeeping is automatic; there is no
+`track_infidelity` constructor or run flag for `MpsOptimizer`. Every retained
+unitary compression records an event in `opt.get_norm_events()`. Its
+`norm_fidelity` is the clipped squared ratio of retained norm to the expected
+pre-compression norm, while `norm_fidelity_raw` preserves the unclipped ratio.
+`opt.norm_diagnostics()` reports the cumulative product in `norm_survival` and
+the corresponding `norm_infidelity`; `norm` and `total_norm_proxy` are its
+square root. Measurement, reset, and state-dependent Kraus events are also
+recorded, including `branch_probability`, `physical_boundary`, and
+`renormalized`. Their expected norm includes the Born probability, so a normal
+physical branch has zero compression infidelity. Renormalization closes the
+current raw-norm baseline but does not erase the cumulative compression ledger.
+This same contract is used by the DMRG1/2/3 schedules and the MPO, SVD,
+swap/perm, and mixed backends. The metric is a norm-survival proxy: it does
+not replace a directional state fidelity check.
 
 `cutoff="auto"` selects `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
 data, and `1e-12` for 64-bit data. Explicit numeric cutoffs are unchanged.
@@ -314,7 +379,9 @@ stored in `opt.mix_history` and summarized in `opt.last_mix_summary`; entries
 include logical `where`, execution `execution_where`, FIT iterations and
 convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
 `progbar=True`, the progress bar shows the current backend, cumulative
-MPO/DMRG/fallback counts, and `bond=current/chi`.
+MPO/DMRG/fallback counts, `~F` (the cumulative norm fidelity), and
+`bond=current/chi`. `~F` is converted from the log-survival ledger only for
+display; accumulation remains logarithmic and numerically stable.
 
 Replay timing is opt-in and does not print by itself:
 
@@ -364,10 +431,11 @@ once. Timing also remains independent of `collect_split_diagnostics`;
 profiling an MPS run does not allocate per-SVD truncation dictionaries.
 
 The diagnostic accessors are copy-safe: `get_quality_checks()`,
-`get_normalizations()`, and `get_fit_diagnostics()` return independent
-snapshots, so editing a returned list or record cannot corrupt optimizer-owned
-state. `get_fit_diagnostics()` returns a copy of the last DMRG/FIT record or
-`None` before a FIT update and for modes that do not use FIT. The record
+`get_normalizations()`, `get_norm_events()`, and `get_fit_diagnostics()` return
+independent snapshots, so editing a returned list or record cannot corrupt
+optimizer-owned state. `get_fit_diagnostics()` returns a copy of the last
+DMRG/FIT record or `None` before a FIT update and for modes that do not use
+FIT. The record
 includes the iteration count, convergence reason, relative change, active block
 size, adaptive and one-site sweep counts, and the DMRG1 one-site lock state
 when applicable.
