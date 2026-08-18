@@ -79,6 +79,68 @@ def test_deprecated_backend_alias_warns_and_matches_canonical_namespace():
     assert alias is backends.backend_numpy
 
 
+@pytest.mark.parametrize(
+    ("alias_name", "canonical_name"),
+    [
+        ("build_contraction", "build_optimizer"),
+        ("SpinfulFermionHubbard", "SpinfulFermion"),
+        ("hrps_to_mps", "hrs_to_mps"),
+        ("hrps_to_peps", "hrs_to_peps"),
+        ("hrps_to_ttn", "hrs_to_ttn"),
+    ],
+)
+def test_deprecated_tensor_aliases_warn(alias_name, canonical_name):
+    """Historical tensor spellings warn while preserving their values."""
+    import pepsy.tensors as tensors
+
+    tensors.__dict__.pop(alias_name, None)
+    with pytest.warns(DeprecationWarning, match=canonical_name):
+        alias = getattr(tensors, alias_name)
+    assert alias is getattr(tensors, canonical_name)
+
+
+@pytest.mark.parametrize(
+    ("alias_name", "canonical_name"),
+    [("normalize", "peps_normalize"), ("infidelity", "peps_infidelity")],
+)
+def test_deprecated_boundary_aliases_warn(alias_name, canonical_name):
+    """Generic boundary helper names remain available but are deprecated."""
+    import pepsy.boundary as boundary
+
+    boundary.__dict__.pop(alias_name, None)
+    with pytest.warns(DeprecationWarning, match=canonical_name):
+        alias = getattr(boundary, alias_name)
+    assert callable(alias)
+    assert callable(getattr(boundary, canonical_name))
+
+
+@pytest.mark.parametrize(
+    ("alias_name", "canonical_name"),
+    [
+        ("QMeraParametricEnergyOptimizer", "QMeraEnergyOptimizer"),
+        ("MpsStabOptimizer", "StabilizerMpsSimulator"),
+    ],
+)
+def test_deprecated_optimizer_aliases_warn(alias_name, canonical_name):
+    """Optimizer aliases warn while resolving to the canonical implementation."""
+    import pepsy.optimizers as optimizers
+
+    optimizers.__dict__.pop(alias_name, None)
+    with pytest.warns(DeprecationWarning, match=canonical_name):
+        alias = getattr(optimizers, alias_name)
+    assert alias is getattr(optimizers, canonical_name)
+
+
+def test_deprecated_stabilizer_alias_warns():
+    """The briefly used stabilizer class spelling remains a lazy alias."""
+    import pepsy.optimizers.stabilizer_tn as stabilizer_tn
+
+    stabilizer_tn.__dict__.pop("StabilizerMps", None)
+    with pytest.warns(DeprecationWarning, match="MpsStabOptimizer"):
+        alias = stabilizer_tn.StabilizerMps
+    assert alias is stabilizer_tn.MpsStabOptimizer
+
+
 def test_deprecated_mera_alias_warns_and_matches_qmera():
     """The old MERA discovery name remains a lazy QMERA compatibility alias."""
     import pepsy.experimental as experimental
@@ -94,6 +156,19 @@ def test_deprecated_aliases_are_documented():
     migration = _API_MIGRATION_DOC.read_text(encoding="utf-8")
     tensor_aliases = pepsy.tensors._BACKEND_COMPATIBILITY_ALIASES
     assert all(f"`pepsy.tensors.{name}`" in migration for name in tensor_aliases)
+    for alias in (
+        "build_contraction",
+        "SpinfulFermionHubbard",
+        "hrps_to_mps",
+        "hrps_to_peps",
+        "hrps_to_ttn",
+    ):
+        assert f"`pepsy.tensors.{alias}`" in migration
+    assert "`pepsy.boundary.normalize`" in migration
+    assert "`pepsy.boundary.infidelity`" in migration
+    assert "`pepsy.optimizers.QMeraParametricEnergyOptimizer`" in migration
+    assert "`pepsy.optimizers.MpsStabOptimizer`" in migration
+    assert "`pepsy.optimizers.stabilizer_tn.StabilizerMps`" in migration
     assert "`pepsy.experimental.mera`" in migration
     assert "`pepsy.optimizers.mera`" in migration
 

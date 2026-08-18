@@ -64,11 +64,13 @@ Reusing a boundary at a larger `chi` does not globally pad it first; lowering
 - `contract_boundary(...)`: contracts a prebuilt double-layer network with a
   supplied `BdyMPS` or `{"bdy": BdyMPS}` holder and returns
   `BoundaryContractResult`.
-- `peps_normalize(...)` / `normalize(...)`: normalize a PEPS in place.
+- `peps_normalize(...)`: normalize a PEPS in place. The generic
+  `normalize(...)` spelling remains as a deprecated compatibility alias.
 - `boundary_norm(...)` / `peps_norm(...)`: compute `<p|p>` without rescaling.
   Pass `return_info=True` for the structured result instead of only the scalar.
-- `peps_infidelity(...)` / `infidelity(...)`: compute boundary-based
-  infidelity, optionally reusing norm and overlap boundaries.
+- `peps_infidelity(...)`: compute boundary-based infidelity, optionally
+  reusing norm and overlap boundaries. The generic `infidelity(...)` spelling
+  remains as a deprecated compatibility alias.
 - `peps_fidelity(...)`: return only fidelity by default, or preserve all three
   contraction results and their FIT diagnostics with `return_info=True`.
 - `contract_flat(...)`: contract an already-flat PEPS-like tensor network.

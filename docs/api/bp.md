@@ -944,10 +944,10 @@ native contraction, and normalizes the accumulated numerator by the
 accumulated denominator:
 
 ```python
-from pepsy.tensors import build_contraction
+from pepsy.tensors import build_optimizer
 from pepsy.bp import compute_local_expectation_open_loop_series
 
-contraction_opt = build_contraction(
+contraction_opt = build_optimizer(
     max_time=2.0,
     max_repeats=8,
     parallel=False,
@@ -962,7 +962,7 @@ value = compute_local_expectation_open_loop_series(
 ```
 
 The `optimize` object is forwarded to every Quimb contraction, so a reusable
-`build_contraction` optimizer can cache Cotengra path searches across the
+`build_optimizer` result can cache Cotengra path searches across the
 explicit loop terms.
 
 For a finite contraction budget, pass `max_flops_log10` and

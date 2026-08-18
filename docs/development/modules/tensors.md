@@ -52,13 +52,14 @@ Constructors create common tensor-network states and operators:
 - `ps_to_mpo`, `ps_to_pepo`
 - `id_to_mpo`, `id_to_pepo`
 - `haar_random_state`, `random_haar_qubit`
-- `hrs_to_mps` / `hrps_to_mps` (random MPS states), `hrs_to_ttn` /
-  `hrps_to_ttn` (random tree states), `hrs_to_peps` / `hrps_to_peps`
-  (direct Symmray random PEPS states)
+- `hrs_to_mps`, `hrs_to_ttn`, and `hrs_to_peps` are the canonical random-state
+  constructors. The historical `hrps_to_*` spellings remain as deprecated
+  compatibility aliases.
 
 Contraction helpers include:
 
-- `build_optimizer(...)` and `build_compressed_optimizer(...)`
+- `build_optimizer(...)` and `build_compressed_optimizer(...)`; the former
+  `build_contraction(...)` name remains as a deprecated compatibility alias.
 - `contract_hypercompressed_tn(...)`
 - `contract_hypercompressed_tn_batch(...)` — torch-only batched amplitudes
   ``<x|psi>`` for many int64 configs via `torch.vmap`, reusing one fixed

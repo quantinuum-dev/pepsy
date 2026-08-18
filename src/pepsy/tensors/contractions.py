@@ -137,17 +137,10 @@ def build_optimizer(
     return ctg.ReusableHyperOptimizer(**kwargs)
 
 
-def build_contraction(*args, **kwargs):
-    """Build a reusable contraction optimizer.
-
-    This is the short, backend-neutral alias for :func:`build_optimizer`.
-    Numerical contractions use the array backend of the tensors supplied to
-    Quimb; pair it with ``py.build_backend()`` and ``to_backend=`` to run the
-    calculation on Torch CPU while keeping the existing ``build_optimizer``
-    name available.
-    """
-
-    return build_optimizer(*args, **kwargs)
+# Compatibility alias for the former name. The package facade emits the
+# deprecation warning while this identity keeps monkeypatching and introspection
+# consistent across the old and canonical paths.
+build_contraction = build_optimizer
 
 
 def build_compressed_optimizer(

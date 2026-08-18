@@ -23,6 +23,16 @@ New code and documentation should use the canonical import on the right.
 | `pepsy.tensors.set_default_array_backend` | `pepsy.backends.set_default_array_backend` |
 | `pepsy.tensors.set_default_grad_backend` | `pepsy.backends.set_default_grad_backend` |
 | `pepsy.tensors.TorchLinalgConfig` | `pepsy.backends.TorchLinalgConfig` |
+| `pepsy.tensors.build_contraction` | `pepsy.tensors.build_optimizer` |
+| `pepsy.tensors.SpinfulFermionHubbard` | `pepsy.tensors.SpinfulFermion` |
+| `pepsy.tensors.hrps_to_mps` | `pepsy.tensors.hrs_to_mps` |
+| `pepsy.tensors.hrps_to_peps` | `pepsy.tensors.hrs_to_peps` |
+| `pepsy.tensors.hrps_to_ttn` | `pepsy.tensors.hrs_to_ttn` |
+| `pepsy.boundary.normalize` | `pepsy.boundary.peps_normalize` |
+| `pepsy.boundary.infidelity` | `pepsy.boundary.peps_infidelity` |
+| `pepsy.optimizers.QMeraParametricEnergyOptimizer` | `pepsy.optimizers.QMeraEnergyOptimizer` |
+| `pepsy.optimizers.MpsStabOptimizer` | `pepsy.optimizers.StabilizerMpsSimulator` |
+| `pepsy.optimizers.stabilizer_tn.StabilizerMps` | `pepsy.optimizers.stabilizer_tn.MpsStabOptimizer` |
 | `pepsy.experimental.mera` | `pepsy.experimental.qmera` |
 | `pepsy.optimizers.mera` | `pepsy.optimizers.qmera` |
 

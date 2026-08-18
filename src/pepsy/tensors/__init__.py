@@ -156,16 +156,25 @@ _BACKEND_COMPATIBILITY_ALIASES = frozenset(
     }
 )
 
+_DEPRECATED_ALIASES = {
+    **{name: f"pepsy.backends.{name}" for name in _BACKEND_COMPATIBILITY_ALIASES},
+    "build_contraction": "pepsy.tensors.build_optimizer",
+    "SpinfulFermionHubbard": "pepsy.tensors.SpinfulFermion",
+    "hrps_to_mps": "pepsy.tensors.hrs_to_mps",
+    "hrps_to_peps": "pepsy.tensors.hrs_to_peps",
+    "hrps_to_ttn": "pepsy.tensors.hrs_to_ttn",
+}
+
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 
 def __getattr__(name):
     module_name = _SYMBOL_MODULES.get(name)
     if module_name is not None:
-        if name in _BACKEND_COMPATIBILITY_ALIASES:
+        canonical = _DEPRECATED_ALIASES.get(name)
+        if canonical is not None:
             warnings.warn(
-                f"pepsy.tensors.{name} is a compatibility alias; use "
-                f"pepsy.backends.{name} instead.",
+                f"pepsy.tensors.{name} is a compatibility alias; use {canonical} instead.",
                 DeprecationWarning,
                 stacklevel=2,
             )

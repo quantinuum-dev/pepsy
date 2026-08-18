@@ -47,7 +47,11 @@ Changes for the next release should be added here before the version is bumped.
   their canonical `pepsy.backends` namespace. `pepsy.experimental.mera` now
   directs callers to `pepsy.experimental.qmera`; the equivalent
   `pepsy.optimizers.mera` compatibility namespace directs callers to
-  `pepsy.optimizers.qmera`.
+  `pepsy.optimizers.qmera`. The legacy tensor constructor spellings
+  `build_contraction`, `SpinfulFermionHubbard`, and `hrps_to_*`, the generic
+  boundary spellings `normalize` and `infidelity`, the qMERA optimizer alias
+  `QMeraParametricEnergyOptimizer`, and the stabilizer alias
+  `MpsStabOptimizer` now also warn and identify their canonical names.
 
 ### Fixed
 

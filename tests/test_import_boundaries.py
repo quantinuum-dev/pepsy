@@ -126,3 +126,37 @@ print(*sorted(
 """
     )
     assert not loaded
+
+
+def test_legacy_mera_namespace_is_lazy():
+    """The former qMERA namespace does not load qMERA just by being imported."""
+    loaded = _run_clean_import(
+        """
+import sys
+import pepsy.optimizers.mera
+
+print(*sorted(
+    name for name in sys.modules
+    if name == 'pepsy.optimizers.qmera'
+    or name.startswith('pepsy.optimizers.qmera.')
+))
+"""
+    )
+    assert not loaded
+
+
+def test_legacy_mera_child_namespace_is_lazy():
+    """Direct imports of old qMERA child paths stay lazy as well."""
+    loaded = _run_clean_import(
+        """
+import sys
+import pepsy.optimizers.mera.builders
+
+print(*sorted(
+    name for name in sys.modules
+    if name == 'pepsy.optimizers.qmera'
+    or name.startswith('pepsy.optimizers.qmera.')
+))
+"""
+    )
+    assert not loaded
