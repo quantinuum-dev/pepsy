@@ -97,6 +97,16 @@ batch.weights       # p(basis, outcome)
 batch.basis_probability
 ```
 
+`VecSampler` preserves the backend of a dense NumPy, Torch, or CuPy state
+vector for probability evaluation and `sample_batch` / `iter_samples`. Thus a
+CuPy or Torch exact state produces device-resident configurations and
+probabilities; no implicit state-vector copy to NumPy is made. Call
+`batch.to_numpy()` when a host copy is explicitly needed. The legacy
+`sample()` method still returns the list/grid compatibility result on the
+host. It also exposes the common MPS sampler methods `sample_arrays`,
+`amplitudes`, `probabilities`, and `refresh`; `Lx`, `Ly`, `L`,
+`one_d_to_two_d`, and `resolved_backend` follow the same conventions.
+
 Use `basis="X"`, `basis="Y"`, `basis="Z"`, a per-site string such as
 `"XYZZ"`, or `basis="random"`. Random mode chooses each site's basis
 uniformly and independently once per batch, so all shots in that batch share

@@ -1814,6 +1814,49 @@ def test_vec_sampler_samples_valid_dense_state():
     assert result.probs == [1.0, 1.0]
 
 
+def test_vec_sampler_matches_mps_batched_evaluation_api():
+    """Dense-vector sampling should expose the common MPS sampler methods."""
+    site_map = {0: (0, 0), 1: (1, 0)}
+    sampler = sampler_mod.VecSampler(
+        np.array([0.0, 0.0, 1.0, 0.0]),
+        site_map,
+    )
+
+    assert sampler.L == 2
+    assert sampler.resolved_backend == "numpy"
+    inferred = sampler_mod.VecSampler(np.ones(4), None)
+    assert inferred.one_d_to_two_d == {0: (0, 0), 1: (1, 0)}
+    configs, sampled_probs = sampler.sample_arrays(4, seed=3)
+    batch = sampler.sample_batch(4, seed=3)
+    amplitudes = sampler.amplitudes(configs)
+    probabilities = sampler.probabilities(configs)
+
+    assert isinstance(configs, np.ndarray)
+    assert isinstance(sampled_probs, np.ndarray)
+    assert batch.backend == "numpy"
+    np.testing.assert_array_equal(configs, np.array([[1, 0]] * 4))
+    np.testing.assert_allclose(sampled_probs, np.ones(4))
+    np.testing.assert_allclose(amplitudes, np.ones(4))
+    np.testing.assert_allclose(probabilities, sampled_probs)
+    np.testing.assert_allclose(
+        sampler.sample_batch(4, seed=3, to_numpy=True).probs,
+        sampled_probs,
+    )
+
+    sampler.refresh(np.array([1.0, 0.0, 0.0, 0.0]))
+    np.testing.assert_array_equal(
+        sampler.sample_arrays(2, seed=3)[0],
+        np.array([[0, 0]] * 2),
+    )
+
+
+def test_vec_sampler_sample_arrays_requires_positive_count():
+    """The shared raw sampling API should reject empty requests."""
+    sampler = sampler_mod.VecSampler(np.ones(2), {0: (0, 0)})
+    with pytest.raises(ValueError, match="positive integer"):
+        sampler.sample_arrays(0)
+
+
 def test_vec_sampler_supports_fixed_pauli_bases():
     """X and Y sampling rotate eigenstates to deterministic Z outcomes."""
     plus_x = np.array([1.0, 1.0], dtype=complex) / np.sqrt(2.0)
@@ -1835,6 +1878,75 @@ def test_vec_sampler_supports_fixed_pauli_bases():
     assert y_result.configs_1d == [[0]] * 8
     assert x_result.basis == ("X",)
     assert y_result.basis == ("Y",)
+
+
+def test_vec_sampler_native_torch_keeps_vector_and_batch_on_torch():
+    """Exact-vector sampling should preserve a Torch state backend."""
+    torch = pytest.importorskip("torch")
+    plus_x = torch.tensor(
+        [1.0, 1.0],
+        dtype=torch.complex64,
+    ) / torch.sqrt(torch.tensor(2.0))
+    sampler = sampler_mod.VecSampler(plus_x, {0: (0, 0)})
+
+    probabilities = sampler.probability_vector("X")
+    batch = sampler.sample_batch(8, seed=4, basis="X")
+
+    assert sampler.backend == "torch"
+    assert isinstance(sampler._vector, torch.Tensor)
+    assert sampler._vector.dtype == torch.complex64
+    assert isinstance(probabilities, torch.Tensor)
+    assert isinstance(batch.configs, torch.Tensor)
+    assert isinstance(batch.probs, torch.Tensor)
+    torch.testing.assert_close(probabilities, torch.tensor([1.0, 0.0]))
+    torch.testing.assert_close(batch.configs, torch.zeros((8, 1), dtype=torch.int8))
+    torch.testing.assert_close(batch.probs, torch.ones(8, dtype=torch.float32))
+
+
+def test_vec_sampler_torch_large_category_fallback(monkeypatch):
+    """Large Torch categorical vectors use the backend-native CDF path."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
+    state = torch.ones(8, dtype=torch.complex64) / torch.sqrt(
+        torch.tensor(8.0)
+    )
+    sampler = sampler_mod.VecSampler(
+        state,
+        {site: (site, 0) for site in range(3)},
+    )
+    batch = sampler.sample_batch(16, seed=5)
+
+    assert isinstance(batch.configs, torch.Tensor)
+    assert batch.configs.shape == (16, 3)
+    assert torch.all(batch.probs > 0)
+
+
+def test_vec_sampler_native_cupy_keeps_vector_and_batch_on_cupy():
+    """Exact-vector sampling should preserve a CuPy state backend."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    plus_x = cupy.asarray([1.0, 1.0], dtype=cupy.complex64) / cupy.sqrt(
+        cupy.asarray(2.0, dtype=cupy.float32)
+    )
+    sampler = sampler_mod.VecSampler(plus_x, {0: (0, 0)})
+
+    probabilities = sampler.probability_vector("X")
+    batch = sampler.sample_batch(8, seed=4, basis="X")
+
+    assert sampler.backend == "cupy"
+    assert isinstance(sampler._vector, cupy.ndarray)
+    assert sampler._vector.dtype == cupy.complex64
+    assert isinstance(probabilities, cupy.ndarray)
+    assert isinstance(batch.configs, cupy.ndarray)
+    assert isinstance(batch.probs, cupy.ndarray)
+    cupy.testing.assert_allclose(probabilities, cupy.asarray([1.0, 0.0]))
+    cupy.testing.assert_array_equal(batch.configs, cupy.zeros((8, 1), dtype=cupy.int8))
+    cupy.testing.assert_allclose(batch.probs, cupy.ones(8, dtype=cupy.float32))
 
 
 def test_vec_sampler_random_basis_is_per_site_and_seeded():
