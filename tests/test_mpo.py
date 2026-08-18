@@ -115,6 +115,33 @@ def test_mpo_basis_evolution_keeps_parameterized_coefficients_differentiable():
     assert basis.cache_info["builds"] == 1
 
 
+def test_mpo_basis_exp_is_explicit_and_time_evolution_is_its_real_time_alias():
+    """The generic exponential API makes the sign convention visible."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    coefficients = np.array([0.7, -0.2])
+
+    explicit = basis.exp(
+        -1j * 0.01,
+        coefficients,
+        order=2,
+        mode="optimal",
+    )
+    real_time = basis.time_evolution(
+        0.01,
+        coefficients,
+        order=2,
+        mode="optimal",
+    )
+
+    assert explicit.metadata["operation"] == "exp"
+    assert real_time.metadata["operation"] == "time_evolution"
+    for explicit_array, real_time_array in zip(explicit.arrays, real_time.arrays):
+        np.testing.assert_allclose(explicit_array, real_time_array)
+
+
 def test_mpo_basis_approximate_evolution_keeps_parameters_differentiable():
     """The cached Algorithm-4 plan does not capture backend values."""
     torch = pytest.importorskip("torch")
@@ -136,6 +163,68 @@ def test_mpo_basis_approximate_evolution_keeps_parameters_differentiable():
 
     assert U.metadata["algorithms"] == (1, 2, 3, 4)
     assert any(array.requires_grad for array in U.arrays)
+    assert torch.isfinite(theta_grad)
+    assert torch.isfinite(time_grad)
+
+
+def test_mpo_basis_evolution_can_apply_a_final_chi_compression():
+    """Final MPO chi is distinct from the temporary history-bond guard."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    mpo, report = basis.evolution_mpo(
+        coefficients=np.array([0.7, -0.2]),
+        dt=0.01,
+        order=2,
+        mode="optimal",
+        chi=1,
+        cutoff=0.0,
+        return_report=True,
+    )
+
+    assert report.max_bond == 1
+    assert report.final_bond_dimensions == (1, 1)
+    assert mpo.bond_sizes() == [1, 1]
+    assert mpo.pepsy_evolution_metadata["chi"] == 1
+    second = basis.evolution_mpo(
+        coefficients=np.array([0.6, -0.1]),
+        dt=0.02,
+        order=2,
+        mode="optimal",
+        chi=1,
+    )
+    assert mpo.pepsy_evolution_metadata["history_cache_hit"] is False
+    assert second.pepsy_evolution_metadata["history_cache_hit"] is True
+    assert basis.template.history_cache_info["orders"] == (2,)
+
+
+def test_mpo_basis_evolution_chi_fixed_rank_preserves_autodiff():
+    """The parameter-to-MPO path can use fixed-rank differentiable chi."""
+    torch = pytest.importorskip("torch")
+    theta = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    compressed, report = basis.evolution_mpo(
+        coefficients=torch.stack((theta, -0.3 * theta)),
+        dt=time,
+        order=2,
+        mode="optimal",
+        chi=2,
+        differentiable=True,
+        return_report=True,
+    )
+    loss = sum(array.real.sum() for array in compressed.arrays)
+    theta_grad, time_grad = torch.autograd.grad(loss, (theta, time))
+
+    assert isinstance(report, MPODifferentiableCompressionReport)
+    assert compressed.bond_dimensions == (2, 2)
+    assert compressed.metadata["chi"] == 2
     assert torch.isfinite(theta_grad)
     assert torch.isfinite(time_grad)
 
@@ -190,6 +279,35 @@ def test_mpo_basis_batches_coefficients_and_reuses_history_topology():
     np.testing.assert_allclose(first.to_mpo().to_dense(), second.to_mpo().to_dense())
 
 
+def test_mpo_basis_exponential_cache_can_be_cleared_explicitly():
+    """The basis keeps topology reusable without forcing indefinite retention."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    first = basis.exp(
+        -1j * 0.01,
+        coefficients=np.array([0.7, -0.2]),
+        order=2,
+        mode="algorithm4",
+    )
+    assert first.metadata["history_cache_hit"] is False
+    assert basis.cache_info["history"]["orders"] == (2,)
+
+    basis.clear_history_cache()
+    assert basis.cache_info["history"]["orders"] == ()
+    assert basis.cache_info["history"]["approximation_plan_orders"] == ()
+
+    second = basis.time_evolution(
+        0.01,
+        coefficients=np.array([0.7, -0.2]),
+        order=2,
+        mode="algorithm4",
+    )
+    assert second.metadata["history_cache_hit"] is False
+
+
 def test_history_algorithms_reuse_symbolic_execution_plans():
     """Algorithms 1--3 reuse topology plans without retaining tensor values."""
     H = _two_term_mpo()
@@ -222,6 +340,125 @@ def test_history_algorithms_reuse_symbolic_execution_plans():
     )
 
 
+def test_history_tensor_execution_plan_is_cached_separately_from_values():
+    """Repeated numerical builds reuse gather metadata without values."""
+    H = _two_term_mpo()
+    first = H.extensive_exponential(0.01, order=2, mode="base")
+    second = H.extensive_exponential(0.02, order=2, mode="base")
+
+    assert first.metadata["tensor_plan_cache_hit"] is False
+    assert second.metadata["tensor_plan_cache_hit"] is True
+    assert H.history_cache_info["tensor_plan_orders"] == (2,)
+    assert all(
+        not hasattr(value, "requires_grad")
+        for plan in H._history_tensor_plan_cache.values()
+        for site_plan in plan
+        for value in site_plan.values()
+        if value is not None
+    )
+
+
+def test_basis_raw_array_and_batch_apis_preserve_numpy_values():
+    """Raw tensor APIs match semantic outputs and share the history cache."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    coefficients = np.array([0.7, -0.2])
+    semantic = basis.exp(
+        0.01,
+        coefficients=coefficients,
+        order=2,
+        mode="base",
+    )
+    raw = basis.exp_arrays(
+        0.01,
+        coefficients=coefficients,
+        order=2,
+        mode="base",
+    )
+    for raw_array, semantic_array in zip(raw, semantic.arrays):
+        np.testing.assert_allclose(raw_array, semantic_array)
+
+    batch = basis.exp_batch(
+        0.01,
+        np.stack((coefficients, [0.2, 0.3])),
+        order=2,
+        mode="base",
+    )
+    assert batch[0].shape[0] == 2
+    np.testing.assert_allclose(batch[0][0], raw[0])
+
+
+def test_basis_batch_api_preserves_torch_autodiff():
+    """Native Torch batching keeps coefficient and time gradients connected."""
+    torch = pytest.importorskip("torch")
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    coefficients = torch.tensor(
+        [[0.7, -0.2], [0.2, 0.3]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+
+    arrays = basis.exp_batch(
+        time,
+        coefficients,
+        order=2,
+        mode="base",
+    )
+    loss = sum(array.real.sum() for array in arrays)
+    coefficient_grad, time_grad = torch.autograd.grad(loss, (coefficients, time))
+
+    assert arrays[0].shape[0] == 2
+    assert torch.isfinite(coefficient_grad).all()
+    assert torch.isfinite(time_grad)
+
+
+def test_basis_raw_and_batch_apis_support_jax_jit_and_grad():
+    """JAX compilation sees only backend arrays and structural constants."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    coefficients = jnp.array([0.7, -0.2])
+    arrays = jax.jit(
+        lambda values: basis.exp_arrays(
+            jnp.array(0.01),
+            coefficients=values,
+            order=2,
+            mode="base",
+        )
+    )(coefficients)
+    gradient = jax.grad(
+        lambda values: sum(
+            jnp.real(array).sum()
+            for array in basis.exp_arrays(
+                jnp.array(0.01),
+                coefficients=values,
+                order=2,
+                mode="base",
+            )
+        )
+    )(coefficients)
+    batch = basis.exp_batch(
+        jnp.array(0.01),
+        jnp.stack((coefficients, jnp.array([0.2, 0.3]))),
+        order=2,
+        mode="base",
+    )
+
+    assert arrays[0].shape[0] == 1
+    assert batch[0].shape[0] == 2
+    assert jnp.isfinite(gradient).all()
+
+
 def test_history_algorithm_four_reuses_structural_index_plan():
     """Algorithm 4 compiles its ordered virtual-index merges once."""
     H = _two_term_mpo()
@@ -252,6 +489,82 @@ def test_history_algorithm_four_reuses_structural_index_plan():
     )
     for cached_array, uncached_array in zip(second.arrays, uncached.arrays):
         np.testing.assert_allclose(cached_array, uncached_array)
+
+
+def test_algorithm_four_mode_skips_expensive_next_order_extension():
+    """The fast named policy selects Algorithm 4 without Algorithm 3."""
+    H = _two_term_mpo()
+    output = H.extensive_exponential(0.01, order=2, mode="algorithm4")
+
+    assert output.metadata["mode"] == "algorithm4"
+    assert output.metadata["algorithms"] == (1, 2, 4)
+    assert output.metadata["extension_terms"] == 0
+    assert output.metadata["approximate_history_merges"] > 0
+
+
+def test_algorithm_four_fused_replay_matches_sequential_reference():
+    """Fusing one bond's merges preserves the ordered Algorithm-4 update."""
+    H = FirstDegreeMPO.from_pauli_terms(
+        7,
+        [((site, site + 1), "XX") for site in range(6)]
+        + [((site,), "Z") for site in range(7)],
+    )
+    order = 2
+    dt = -1j * 0.013
+    arrays, levels, _, _ = H._history_power_data(
+        order,
+        cache_history=False,
+        history_storage="auto",
+    )
+    compression_plan, _ = H._history_compression_plan(
+        levels,
+        order,
+        cache_history=False,
+    )
+    H._algorithm_one(arrays, levels, order, dt, plan=compression_plan)
+    H._algorithm_two(arrays, levels, plan=compression_plan)
+
+    reference_arrays = [np.array(array, copy=True) for array in arrays]
+    reference_levels = [list(bond_levels) for bond_levels in levels]
+    fused_arrays = [np.array(array, copy=True) for array in arrays]
+    fused_levels = [list(bond_levels) for bond_levels in levels]
+    approximation_plan, _ = H._history_approximation_plan(
+        reference_levels,
+        order,
+        cache_history=False,
+    )
+    for bond, source, target, number_of_threes in approximation_plan["actions"]:
+        if (
+            source >= len(reference_levels[bond])
+            or target >= len(reference_levels[bond])
+        ):
+            continue
+        coefficient = (
+            dt ** number_of_threes
+            * factorial(order - number_of_threes)
+            / factorial(order)
+            if number_of_threes <= order
+            else 0.0
+        )
+        H._remove_history_column(
+            reference_arrays,
+            reference_levels,
+            bond,
+            source,
+            target,
+            coefficient,
+        )
+
+    H._algorithm_four(
+        fused_arrays,
+        fused_levels,
+        order,
+        dt,
+        cache_history=False,
+    )
+    assert fused_levels == reference_levels
+    for fused_array, reference_array in zip(fused_arrays, reference_arrays):
+        np.testing.assert_allclose(fused_array, reference_array)
 
 
 def test_fixed_rank_compression_has_fixed_bonds_and_report():
@@ -651,6 +964,7 @@ def test_extensive_exponential_optimal_mode_selects_paper_extension():
     explicit = H.extensive_exponential(0.01, order=2, extend=True)
     named = H.extensive_exponential(0.01, order=2, mode="optimal")
 
+    assert explicit.metadata["mode"] == "optimal"
     assert named.metadata["mode"] == "optimal"
     assert named.metadata["algorithms"] == (1, 2, 3)
     assert named.bond_dimensions == explicit.bond_dimensions
@@ -665,6 +979,7 @@ def test_extensive_exponential_bond_guard_can_raise_or_warn():
     H = _two_term_mpo()
     with pytest.raises(MemoryError, match="max_bond"):
         H.extensive_exponential(0.01, order=2, max_bond=1)
+    assert H.history_cache_info["orders"] == ()
 
     with pytest.warns(RuntimeWarning, match="max_bond"):
         warned = H.extensive_exponential(
@@ -771,6 +1086,33 @@ def test_parameterized_mpo_basis_supports_jax_batched_coefficients():
             dt=time,
             order=2,
             mode="optimal",
+            cache_history=False,
+        )
+        return sum(jnp.real(array).sum() for array in U.arrays)
+
+    value, gradients = jax.jit(
+        jax.value_and_grad(objective, argnums=(0, 1)),
+    )(jnp.array([0.7, -0.2]), 0.01)
+
+    assert jnp.isfinite(value)
+    assert all(jnp.all(jnp.isfinite(gradient)) for gradient in gradients)
+
+
+def test_parameterized_mpo_basis_algorithm_four_supports_jax_autodiff():
+    """The fast Algorithm-4 policy keeps JAX values and time differentiable."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    def objective(coefficients, time):
+        U = basis.exp(
+            -1j * time,
+            coefficients=coefficients,
+            order=2,
+            mode="algorithm4",
             cache_history=False,
         )
         return sum(jnp.real(array).sum() for array in U.arrays)

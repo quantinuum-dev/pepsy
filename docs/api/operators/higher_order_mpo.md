@@ -21,8 +21,8 @@ The API is intentionally explicit about exact versus numerical work:
 - `compress_exact()` only performs history-guided scalar gauge eliminations
   whose operator rows or columns are exactly equal;
 - no cutoff is silently applied;
-- `extensive_exponential()` exposes the paper's analytical Taylor rewiring,
-  while numerical compression remains an explicit Quimb post-processing step;
+- `exp()` exposes the operator-valued exponential with an explicit scalar
+  step, while `extensive_exponential()` remains the paper-level construction;
 - `compress_fixed_rank()` provides a fixed-rank TT-SVD path for autodiff,
   while keeping the history-aware and cutoff-based paths separate;
 - native Symmray compilation remains separate without changing the ordinary
@@ -71,34 +71,112 @@ basis = MPOBasis.from_pauli_terms(
 
 J = torch.tensor(0.7, requires_grad=True)
 V = torch.tensor(0.2, requires_grad=True)
-U = basis.evolution_mpo(
+U = basis.exp(
+    -1j * 0.01,
     {"J": J, "V": V},
-    dt=0.01,
     order=2,
-    mode="optimal",
+    mode="algorithm4",
 )
 ```
 
-`evolution_mpo()` and `time_evolution()` use the real-time convention
-`exp(-1j * dt * H(parameters))`; use `extensive_exponential()` directly when
-an imaginary-time or otherwise signed scalar step is required.
+`exp(dt, parameters)` uses `dt` as the actual scalar in `exp(dt * H)`. This
+makes the sign and complex convention explicit: use `dt=-1j * tau` for real
+time, a negative real `dt` for imaginary time, or another scalar for a custom
+exponential. `time_evolution(tau, parameters)` remains a convenience wrapper
+for the real-time case, and `evolution_mpo(parameters, dt=tau)` is retained as
+a compatibility alias.
+
+All three entry points share the same analytical controls: `order`, `mode`,
+`max_bond`, `on_exceed`, `cache_history`, and `history_storage`. Use the named
+`mode` policies for new code; `extend=True` and `approximate=True` remain
+backward-compatible flags on the lower-level construction API. `mode="base"`
+is the conservative Algorithms 1--2 path, `mode="algorithm4"` is the fast
+Algorithms 1, 2, and 4 path, `mode="optimal"` adds the exact Algorithm-3
+extension, and `mode="approximate"` adds Algorithm 4 after that extension.
+Legacy flag calls are normalized to these canonical mode names in metadata.
+
+The final numerical bond cap is a separate stage from the temporary history
+construction. Pass `chi` to `exp` when the returned MPO should be compressed
+after the paper construction:
+
+```python
+U_chi, compression_report = basis.exp(
+    -1j * 0.01,
+    {"J": J, "V": V},
+    order=3,
+    mode="approximate",
+    chi=64,
+    cutoff=1.0e-10,
+    return_report=True,
+)
+```
+
+Here `chi` is the final MPO bond cap; it is different from the existing
+`max_bond` argument, which only guards the temporary raw-history bonds before
+analytical compression. The default `chi` path delegates the numerical sweep
+to Quimb and therefore returns an ordinary Quimb `MatrixProductOperator`.
+Numerical compression cannot retain the original paper-history metadata.
+
+For parameter optimization, use a fixed-rank differentiable compression:
+
+```python
+U_chi, compression_report = basis.exp(
+    -1j * 0.01,
+    {"J": J, "V": V},
+    order=3,
+    mode="optimal",
+    chi=64,
+    differentiable=True,
+    return_report=True,
+)
+```
+
+This returns a `FirstDegreeMPO` with fixed-rank TT-SVD tensors and invalidated
+analytical histories. The topology, history, and rewiring plans remain cached;
+the parameter-dependent tensor values and compression factors are evaluated on
+each call so Torch/JAX autodiff graphs cannot become stale.
+
+The parameterized cache is shared by `exp()`, `time_evolution()`, and the
+compatibility alias `evolution_mpo()`. It caches structure, not completed
+parameter-value MPOs. Call `basis.clear_history_cache()` when a long-running
+optimization no longer needs the cached history orders; this leaves the
+compiled term topology intact.
 
 `basis.cache_info` reports the compiled topology, number of bindings, and raw
 history orders already generated. The cache intentionally stores structure,
 not completed MPO values: caching a Torch/JAX result would risk stale
 optimizer values and retain an obsolete autodiff graph. Raw history topology
 is cached by Taylor order because it depends only on channels and reachability;
-value-dependent Algorithm 2 merges are still recomputed for each build.
+the local gather/index plan is cached alongside it. Algorithms 1--4 still
+evaluate scalar weights during each numerical pass, so `dt` and all
+coefficient tensors remain in the current autodiff graph.
 `MPOBasis` shares exact prefixes and suffix continuations while retaining
 term-specific coefficient slots on a path edge, so its output is directly
 compatible with `extensive_exponential()`.
 
+For compiled optimization kernels, use the raw tensor interfaces. They avoid
+the semantic-to-Quimb wrapper boundary and return only backend-native arrays:
+
+```python
+U_arrays = basis.exp_arrays(
+    -1j * time,
+    {"J": J, "V": V},
+    order=2,
+    mode="algorithm4",
+)
+```
+
+`basis.exp_batch(dt, coefficient_batch, ...)` accepts an array with shape
+`(batch, number_of_terms)` and returns tensors with a leading batch axis. JAX
+and current Torch releases use their native `vmap` implementation when
+available; the fallback loop remains autodiff-safe.
+
 For one-off large-order constructions, disable persistent history caching:
 
 ```python
-U = basis.evolution_mpo(
+U = basis.exp(
+    -1j * 0.01,
     {"J": 0.7, "V": 0.2},
-    dt=0.01,
     order=4,
     mode="optimal",
     cache_history=False,
@@ -115,7 +193,7 @@ batch directly and avoid per-term coefficient resolution:
 ```python
 coefficients = torch.stack((J, V))
 H = basis.build(coefficients=coefficients)
-U = basis.evolution_mpo(coefficients=coefficients, dt=0.01, order=2)
+U = basis.exp(-1j * 0.01, coefficients=coefficients, order=2)
 ```
 
 The current layer supports exact finite open-boundary construction, addition,
@@ -153,6 +231,11 @@ U5 = single_site.extensive_exponential(dt=0.01, order=5)
 # Optional paper extensions, kept explicit in the API.
 U2_extended = H.extensive_exponential(dt=0.01, order=2, extend=True)
 U2_approx = H.extensive_exponential(dt=0.01, order=2, approximate=True)
+U2_algorithm4 = H.extensive_exponential(
+    dt=0.01,
+    order=2,
+    mode="algorithm4",
+)
 U2_optimal = H.extensive_exponential(
     dt=0.01,
     order=2,
@@ -179,24 +262,34 @@ analytical approximation, not a numerical SVD cutoff, and is therefore exposed
 as a separate opt-in flag. Numerical Quimb compression remains a separate
 post-processing step.
 
-The named `mode` policies are `"base"` (Algorithms 1--2), `"optimal"`
-(Algorithms 1--3), and `"approximate"` (Algorithms 1--4). The word
-`optimal` refers to the paper's exact extension/compression construction, not
-to a globally minimum-bond MPO. `max_bond` limits the temporary history bonds
-before exact compression; `on_exceed="raise"` stops safely, while
+The named `mode` policies are `"base"` (Algorithms 1--2), `"algorithm4"`
+(Algorithms 1, 2, and 4), `"optimal"` (Algorithms 1--3), and
+`"approximate"` (Algorithms 1--4). The word `optimal` refers to the paper's
+exact extension/compression construction, not to a globally minimum-bond MPO.
+`mode="algorithm4"` is the fast explicit Algorithm-4 policy; it omits the
+selected next-order replay from Algorithm 3. `mode="approximate"` retains the
+full extended approximate construction. `max_bond` limits the temporary
+history bonds before exact compression; `on_exceed="raise"` stops safely, while
 `on_exceed="warn"` continues with a warning.
 
 History storage is controlled independently with
 `history_storage="auto"|"dense"|"sparse"|"streaming"`. The default uses the
-cached dense topology for repeated calls, and automatically switches to the
-streaming two-cut builder when `cache_history=False`. `"sparse"` also avoids
-evaluating structurally impossible local transition products. In all modes the
-final local MPO tensors are materialized because Algorithms 1--4 rewrite them;
-the streaming mode requires `cache_history=False` and guarantees that earlier
-history cuts and dead local products are not retained during construction.
-Metadata reports the selected mode and
+cached structural-sparse path for automaton-built MPOs, and automatically
+switches to the compatibility streaming path when `cache_history=False`.
+`"sparse"` avoids evaluating structurally impossible local transition
+products and batches the remaining physical block products. In all modes the
+final local MPO tensors are materialized as dense virtual arrays because
+Algorithms 1--4 rewrite them; this is not yet MPSKit.jl-style block-sparse
+tensor storage. Metadata reports the selected mode and
 `history_storage_blocks` gives the structurally stored versus considered local
 block counts.
+
+The numerical history pass gathers local products in backend batches. Its
+virtual-channel rewiring uses fused transfer contractions for moderate
+temporary bonds, with a scatter fallback for unusually large dense maps. This
+preserves the exact Algorithms 1--2 result and the order-controlled
+Algorithm-4 approximation while avoiding one full tensor copy per channel
+merge.
 
 `product(kind=...)` and `disjoint_product` currently label provenance only;
 they do not perform support-overlap analysis. See the [development module
@@ -281,6 +374,12 @@ SVD VJP for zero or repeated singular values. The returned
 `MPODifferentiableCompressionReport` records the bond dimensions and the
 `FirstDegreeMPO` has `metadata["history_valid"] == False`, because numerical
 compression changes the analytical history representation.
+
+`compress_to_bond(chi=...)` is the common explicit wrapper used by the
+parameterized evolution API. It selects Quimb cutoff compression by default or
+fixed-rank compression when `differentiable=True`; use it when the evolution
+MPO has already been constructed and only the final bond policy remains to be
+chosen.
 
 The current implementation targets finite open-boundary NumPy, Torch, and JAX
 Autoray-compatible local blocks, including the optimal extension path under
