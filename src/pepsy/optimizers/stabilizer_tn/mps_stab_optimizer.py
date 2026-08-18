@@ -64,6 +64,7 @@ from ...backends import (
     infer_backend_converter_from_sample,
     infer_backend_signature,
 )
+from ...fitting.local import FIT
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
     _resolve_conditional,
@@ -493,6 +494,14 @@ class MpsStabOptimizer:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
+    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "exact"}
+        Compression backend for coefficient-MPS updates. ``"mpo"`` preserves
+        the native stabilizer-MPO path and is the default. The DMRG modes use
+        local FIT on the coefficient target, while ``"svd"``, ``"swap"``, and
+        ``"perm"`` use the native MPS compression path for the already
+        factorized coefficient-frame MPO. ``"exact"`` forces ``chi=None`` and
+        keeps the coefficient MPS lossless up to ``cutoff``. Clifford gates
+        remain tableau-only in every mode.
 
     Attributes
     ----------
@@ -556,6 +565,7 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
+        mode: str = "mpo",
     ):
         if isinstance(state, STNState):
             self.state = state if inplace else state.copy()
@@ -574,7 +584,10 @@ class MpsStabOptimizer:
                 "qubit MatrixProductState."
             )
 
+        self.mode = self._normalize_mode(mode)
         self.chi = None if chi is None else int(chi)
+        if self.mode == "exact":
+            self.chi = None
         self.cutoff = float(cutoff)
         if operator_tol is not None:
             operator_tol = float(operator_tol)
@@ -687,6 +700,22 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Initial-state constructors (product / GHZ / user tableau+MPS)
     # ------------------------------------------------------------------ #
+    _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
+    _ALLOWED_MODES = frozenset(
+        _DMRG_MODES | {"mpo", "svd", "swap", "perm", "exact"}
+    )
+
+    @classmethod
+    def _normalize_mode(cls, mode):
+        """Validate and normalize the coefficient-MPS compression mode."""
+        mode = str(mode).strip().lower()
+        if mode == "fit":
+            mode = "dmrg"
+        if mode not in cls._ALLOWED_MODES:
+            allowed = ", ".join(sorted(cls._ALLOWED_MODES))
+            raise ValueError(f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}.")
+        return mode
+
     @classmethod
     def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
         """Start from a computational-basis product state (``bits`` = str or 0/1 seq)."""
@@ -2356,6 +2385,7 @@ class MpsStabOptimizer:
             optimizer = type(self)(
                 template.copy(),
                 chi=self.chi,
+                mode=self.mode,
                 cutoff=self.cutoff,
                 operator_tol=self.operator_tol,
                 max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
@@ -3128,6 +3158,7 @@ class MpsStabOptimizer:
         copied = MpsStabOptimizer(
             self.state.copy(),
             chi=self.chi,
+            mode=self.mode,
             cutoff=self.cutoff,
             operator_tol=self.operator_tol,
             max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
@@ -4221,16 +4252,19 @@ class MpsStabOptimizer:
         compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
-        p = self.state.p
-        self._ensure_p_center()
-        info = self.state.info
-        p.gate_with_submpo_(
-            mpo,
-            where=where,
-            max_bond=self.chi,
-            cutoff=self.cutoff,
-            info=info,
-        )
+        if self.mode in self._DMRG_MODES:
+            self._evolve_p_dmrg(mpo, where)
+        else:
+            p = self.state.p
+            self._ensure_p_center()
+            info = self.state.info
+            p.gate_with_submpo_(
+                mpo,
+                where=where,
+                max_bond=None if self.mode == "exact" else self.chi,
+                cutoff=self.cutoff,
+                info=info,
+            )
         infidelity = self._unitary_norm_infidelity() if unitary else None
         if renormalize:
             site = self._canonize_p_single()
@@ -4238,6 +4272,54 @@ class MpsStabOptimizer:
             self._reset_norm_infidelity()
             self._commit_norm_event(norm_event, projected_norm=projected_norm)
         return infidelity
+
+    def _fit_coefficient_target(self, target, where):
+        """Fit a coefficient-MPS target with the selected DMRG schedule."""
+        p = self.state.p
+        start, stop = min(where), max(where)
+        block_size = 3 if self.mode == "dmrg3" else 2
+        fit = FIT(
+            target,
+            p=p,
+            cutoffs=self.cutoff,
+            retag=False,
+            range_int=[start, stop],
+            inplace=True,
+            copy_target=False,
+        )
+        fit.run_gate(
+            n_iter=3,
+            block_size=block_size,
+            sweep_sequence="RL",
+            max_bond=self.chi,
+            cutoff=self.cutoff,
+            min_iter=1,
+            rtol=None,
+            patience=1,
+            adaptive_block_sweeps=2,
+            adaptive_until_rank=False,
+            final_one_site_sweeps=1,
+            single_pair_fast_path=True,
+            collect_split_diagnostics=False,
+        )
+        self.state.p = fit.p
+        center = fit.final_center_site
+        if center is None:
+            center = stop
+        self.state.info["cur_orthog"] = (int(center), int(center))
+
+    def _evolve_p_dmrg(self, mpo, where):
+        """Build a lossless MPO target and compress it with coefficient FIT."""
+        target = self.state.p.copy()
+        target.gate_with_submpo_(
+            mpo,
+            where=where,
+            max_bond=None,
+            cutoff=self.cutoff,
+            info={},
+            inplace_mpo=False,
+        )
+        self._fit_coefficient_target(target, where)
 
     # ------------------------------------------------------------------ #
     # Measurement (Lemma 3; non-unitary |nu> update)
@@ -5633,9 +5715,16 @@ class MpsStabOptimizer:
             result.compress(max_bond=max_bond, cutoff=self.cutoff)
             return result
 
-        self.state.p = build(self.chi)
-        # compress() leaves the rebuilt MPS canonical with the centre at site 0.
-        self.state.info["cur_orthog"] = (0, 0)
+        if self.mode in self._DMRG_MODES:
+            logical_support = {site for _, sites in branches for site in sites}
+            self._fit_coefficient_target(
+                build(None),
+                self._mps_sites(sorted(logical_support)),
+            )
+        else:
+            self.state.p = build(None if self.mode == "exact" else self.chi)
+            # compress() leaves the rebuilt MPS canonical with the centre at site 0.
+            self.state.info["cur_orthog"] = (0, 0)
         if unitary:
             return self._unitary_norm_infidelity()
         if target_norm is not None:
@@ -5711,14 +5800,7 @@ class MpsStabOptimizer:
         logical_where = _normalize_sites(where)
         mps_where = self._mps_sites(logical_where)
         mapped_mpo = self._copy_submpo_for_layout(mpo, logical_where)
-        self._ensure_p_center()
-        self.state.p.gate_with_submpo_(
-            self._bk_mpo(mapped_mpo),
-            where=mps_where,
-            max_bond=self.chi,
-            cutoff=self.cutoff,
-            info=self.state.info,
-        )
+        self._evolve_p(self._bk_mpo(mapped_mpo), mps_where)
         self._invalidate_norm_infidelity()
         self._record()
 
@@ -5733,7 +5815,7 @@ class MpsStabOptimizer:
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
-            f"MpsStabOptimizer(n={self.n}, chi={self.chi}, "
+            f"MpsStabOptimizer(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
             f"operator_tol={self.operator_tol}, "
             f"max_pauli_decomposition_qubits="
             f"{self.max_pauli_decomposition_qubits}, "

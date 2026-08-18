@@ -2102,7 +2102,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         else:
             # Exact/SU states do not have a tracked one-site center. Preserve
             # Quimb's general and cyclic normalization implementation there.
-            old_norm = self.p.normalize(eps=eps, insert=insert)
+            normalize = getattr(self.p, "normalize", None)
+            if callable(normalize):
+                old_norm = normalize(eps=eps, insert=insert)
+            else:
+                # Exact replay stores a contracted TensorNetwork, which does
+                # not expose the MPS ``normalize`` helper. Scale the network
+                # directly while retaining the same previous-norm contract.
+                scale = self._real_float(self.p.norm())
+                if scale == 0.0 or not math.isfinite(scale):
+                    raise FloatingPointError(
+                        "Cannot normalize an exact state with a zero or "
+                        "non-finite norm."
+                    )
+                old_norm = scale * scale
+                self.p.multiply(1.0 / scale, inplace=True)
             self._accumulate_exponent(self.p, old_norm**0.5)
         # ``normalize`` preserves the represented physical state through the
         # exponent, but changes the raw center norm used by unitary compression
@@ -2500,15 +2514,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _validate_shot_compatibility(self, error_model=None):
         """Reject known-invalid mode and trajectory combinations early."""
         from ..noise import (  # pylint: disable=import-outside-toplevel
-            TrajectoryEvent,
             _has_unforced_branching_control,
             _leakage_event_parts,
         )
 
         entries = self._gate_stream
-        trajectory_events = tuple(
-            entry for entry in entries if isinstance(entry, TrajectoryEvent)
-        )
         controls = tuple(
             entry for entry in entries if self.control_event_parts(entry) is not None
         )
@@ -2519,38 +2529,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "shot replay of sub-MPO events requires mode='mpo'; "
                 f"mode={self.mode!r} cannot consume sub-MPO payloads."
             )
-        if self.mode == "exact":
-            if any(event.channel.mode == "kraus" for event in trajectory_events):
-                raise ValueError(
-                    "state-dependent trajectory channels require an MPS mode; "
-                    "mode='exact' cannot evaluate Kraus probabilities."
-                )
-            if controls or has_leakage:
-                raise ValueError(
-                    "shot replay with mode='exact' supports unitary/mixture "
-                    "streams only; controls and leakage require an MPS mode."
-                )
         if self.mode == "mix" and (controls or has_leakage):
             raise ValueError(
                 "mode='mix' is unitary-only and cannot replay controls or leakage."
-            )
-        if self.mode == "mix" and any(
-            event.channel.mode == "kraus" for event in trajectory_events
-        ):
-            raise ValueError(
-                "mode='mix' is unitary-only and cannot replay Kraus channels."
             )
         if self.mode == "su" and (controls or has_leakage):
             raise ValueError(
                 "mode='su' supports gate-only shot replay; controls and leakage "
                 "require a canonical MPS mode."
-            )
-        if self.mode == "su" and any(
-            event.channel.mode == "kraus" for event in trajectory_events
-        ):
-            raise ValueError(
-                "mode='su' is not a physical-norm trajectory backend; use "
-                "mode='mpo', 'svd', 'swap', or a DMRG mode for Kraus channels."
             )
         if error_model is not None and _has_unforced_branching_control(entries):
             raise ValueError(
@@ -3138,6 +3124,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mode=None,
         k_2q_batch=1,
         non_unitary=False,
+        _trajectory_non_unitary=False,
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
@@ -3166,6 +3153,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_three_site_sweeps=_DEPRECATED_OPTION,
         target_cutoff=0.0,
         fit_target_strategy="auto",
+        fit_mpo_guess=True,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         fit_stabilize_unitary=_DEPRECATED_OPTION,
@@ -3346,6 +3334,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             intermediate target-MPS rank growth. ``"mps"`` materializes the
             traditional routed target. ``"auto"`` selects layered targets
             for NumPy/Torch/CuPy and the native MPS route for Symmray.
+        fit_mpo_guess : bool, default=True
+            For dense named DMRG1 and DMRG3 growth windows, initialize FIT
+            from an isolated MPO-compressed MPS for the current gate. This
+            does not replace the exact FIT target or live MPS. Set to
+            ``False`` to use the direct current-MPS FIT guess. Native
+            Symmray and fermionic routes retain their native warm-start path.
         fit_single_pair_fast_path : bool, default=True
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
@@ -3631,7 +3625,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         "fit_block_size; use mode='dmrg' for a custom value."
                     )
                 fit_block_size = alias_block_size
-            if self.mode == "mix" and non_unitary:
+            if self.mode == "mix" and non_unitary and not _trajectory_non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
             if not isinstance(n_iter, Integral) or int(n_iter) < 1:
                 raise ValueError("n_iter must be a positive integer.")
@@ -3745,6 +3739,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_max_span=fit_max_span,
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
+            fit_mpo_guess=bool(fit_mpo_guess),
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
             stabilize_unitary=bool(stabilize_unitary),
             quality_check_every=quality_check_every,
@@ -3955,6 +3950,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_max_span="auto",
         target_cutoff=0.0,
         fit_target_strategy="auto",
+        fit_mpo_guess=True,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         quality_check_every=None,
@@ -4004,6 +4000,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_max_span=fit_max_span,
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
+                fit_mpo_guess=fit_mpo_guess,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
                 stabilize_unitary=stabilize_unitary,
                 quality_check_every=quality_check_every,
@@ -4038,6 +4035,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_target_strategy=fit_target_strategy,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
                 stabilize_unitary=stabilize_unitary,
+                non_unitary=non_unitary,
                 quality_check_every=quality_check_every,
                 quality_check_repair=quality_check_repair,
             )
@@ -5386,11 +5384,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary,
         stabilize_unitary,
     ):
-        """Build an MPO-compressed MPS guess for a DMRG1 gate target.
+        """Build an MPO-compressed MPS guess for a named DMRG growth target.
 
         The MPO replay runs on an isolated copy.  The returned state is only
-        FIT's initial guess; the exact gate target and DMRG1 schedule remain
-        unchanged, and the live MPS is not replaced by the MPO result.
+        FIT's initial guess; the exact gate target and named DMRG schedule
+        remain unchanged, and the live MPS is not replaced by the MPO result.
         """
         guess = p.copy(deep=True)
         mpo_optimizer = type(self)(
@@ -6343,18 +6341,39 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
+        non_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
     ):
-        """Apply unitary transactional FIT with an MPO fallback.
+        """Apply transactional FIT with an MPO fallback.
 
         Block FIT grows active bonds directly. When the caller explicitly
         selects one-site FIT, the MPO rank warm-up hands off to a DMRG2-style
-        two-site phase followed by one-site refinement.
+        two-site phase followed by one-site refinement. Non-unitary trajectory
+        branches use the explicit MPO fallback because mixed FIT is defined
+        only for unitary working-norm updates.
         """
         mix_started = (
             time.perf_counter() if self._timing_state is not None else None
         )
+        if non_unitary:
+            # Mixed FIT's transactional contract is unitary. A selected Kraus
+            # branch is still a valid noisy gate, so keep the requested mode
+            # but use its physical MPO compression backend for this step.
+            self._run_mpo(
+                G_seq,
+                where_seq,
+                event_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                normalize_every=None,
+                normalize_final=False,
+                non_unitary=True,
+                submpo_method=submpo_method,
+                stabilize_unitary=False,
+            )
+            return self.p
         if any(event_type == "submpo" for event_type in event_seq):
             raise ValueError("mode='mix' currently supports gate streams only.")
 
@@ -6759,6 +6778,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_max_span=None,
         target_cutoff=0.0,
         fit_target_strategy="auto",
+        fit_mpo_guess=True,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         quality_check_every=None,
@@ -6900,9 +6920,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     mpo_fit_guess_used = False
                     fit_guess = p
+                    is_named_mpo_guess_window = (
+                        (
+                            self._dmrg_mode_alias == "dmrg1"
+                            and active_fit_block_size == 2
+                        )
+                        or (
+                            self._dmrg_mode_alias == "dmrg3"
+                            and active_fit_block_size == 3
+                        )
+                    )
                     if (
-                        self._dmrg_mode_alias == "dmrg1"
-                        and active_fit_block_size == 2
+                        fit_mpo_guess
+                        and is_named_mpo_guess_window
                         and not self._has_symmray_data(p)
                         and not p.isfermionic()
                     ):

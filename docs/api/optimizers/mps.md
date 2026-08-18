@@ -160,8 +160,8 @@ observables afterward. `dmrg2` is the normal variational production backend;
 `mpo` is the direct-compression reference and is required for explicit
 sub-MPO events. `svd`, `swap`, and the other DMRG schedules use the same
 trajectory contract and should be benchmarked for the workload. `mix` and `su`
-are gate-oriented/unitary modes, while `exact` does not support state-dependent
-Kraus channels. Shot
+remain gate-oriented/unitary modes, while `exact` also supports state-dependent
+Kraus branches by evaluating copied dense TensorNetwork leaves. Shot
 replay uses a frozen persistent-layout template when one is installed, but
 still requires a fresh identity-order optimizer for an already-permuted `perm`
 state.
@@ -173,9 +173,9 @@ The practical shot-mode matrix is:
 | `mpo` | direct-compression reference; supports unitary, controls, and Kraus replay |
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
 | `dmrg`, `dmrg1/2/3` | variational compressed replay; `dmrg2` is the production default |
-| `mix` | unitary-only; no controls, leakage, or Kraus channels |
-| `su` | gate-only simple-update; not a physical-norm Kraus backend |
-| `exact` | unitary/mixture replay only; no controls or state-dependent Kraus |
+| `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
+| `su` | gate-only simple-update; selected Kraus gates are normalized after replay |
+| `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
@@ -187,10 +187,12 @@ reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
 later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
 warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
 same fixed warm-up schedule with three-site FIT and then one-site FIT.
-For dense DMRG1 growth windows, FIT starts from an isolated MPO-compressed
-MPS guess for the current gate; the exact FIT target and DMRG1 two-site/
-one-site schedule are unchanged. Native Symmray and fermionic states retain
-their native warm-start path.
+For dense DMRG1 and DMRG3 growth windows, FIT starts from an isolated
+MPO-compressed MPS guess for the current gate; the exact FIT target and named
+two-/three-site plus one-site schedules are unchanged. Native Symmray and
+fermionic states retain their native warm-start path. This is controlled by
+the `fit_mpo_guess` run option, which defaults to `True`; setting it to `False`
+restores the direct current-MPS FIT initial guess.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
 schedule. `mode="mix"` is the transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up

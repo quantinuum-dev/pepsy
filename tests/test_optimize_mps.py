@@ -622,7 +622,7 @@ def test_mps_optimizer_long_range_dmrg_enriches_local_target_support(mode):
     assert diagnostics["backend"] == "fit"
     assert diagnostics["fallback"] is False
     expansion = diagnostics["target_support_expansion"]
-    if mode == "dmrg1":
+    if mode in {"dmrg1", "dmrg3"}:
         assert diagnostics["mpo_fit_guess_used"] is True
         assert expansion["enabled"] is False
         assert expansion["updates"] == 0
@@ -1702,8 +1702,9 @@ def test_dmrg1_under_capacity_grows_twice_then_refines():
     assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
 
 
-def test_dmrg1_uses_mpo_compression_as_fit_guess():
-    """DMRG1 can start FIT from an MPO-compressed current-gate guess."""
+@pytest.mark.parametrize("fit_mpo_guess", [True, False])
+def test_dmrg1_optional_mpo_compression_fit_guess(fit_mpo_guess):
+    """DMRG1 can toggle the MPO-compressed FIT initial guess."""
     hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
     cnot = np.array(
         [
@@ -1735,17 +1736,72 @@ def test_dmrg1_uses_mpo_compression_as_fit_guess():
         cutoff=0.0,
         fit_rtol=None,
         stabilize_unitary=False,
+        fit_mpo_guess=fit_mpo_guess,
         timing=True,
     )
 
     assert float(
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-12)
-    assert optimizer.get_fit_diagnostics()["mpo_fit_guess_used"] is True
+    assert (
+        optimizer.get_fit_diagnostics()["mpo_fit_guess_used"]
+        is fit_mpo_guess
+    )
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
     ] == [2, 2, 1]
+
+
+@pytest.mark.parametrize("fit_mpo_guess", [True, False])
+def test_dmrg3_optional_mpo_compression_fit_guess(fit_mpo_guess):
+    """DMRG3 can toggle the MPO-compressed FIT initial guess."""
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
+    cnot = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    gate = cnot @ np.kron(hadamard, np.eye(2))
+    state = qtn.MPS_computational_state("000", dtype="complex128")
+    stream = [(gate, (0, 2))]
+    reference = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=2,
+        mode="mpo",
+    ).run(progbar=False, cutoff=0.0, stabilize_unitary=False)
+    optimizer = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=2,
+        mode="dmrg3",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        n_iter=3,
+        cutoff=0.0,
+        fit_rtol=None,
+        stabilize_unitary=False,
+        fit_mpo_guess=fit_mpo_guess,
+        timing=True,
+    )
+
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-12)
+    assert (
+        optimizer.get_fit_diagnostics()["mpo_fit_guess_used"]
+        is fit_mpo_guess
+    )
+    assert [
+        record["block_size"]
+        for record in optimizer.get_run_timing()["fit_steps"]
+    ] == [3, 3, 1]
 
 
 def test_dmrg1_latches_one_site_phase_after_full_chain_saturation():
