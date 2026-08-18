@@ -27,6 +27,25 @@ The top-level `pepsy` facade and `pepsy.experimental` use lazy imports. This
 is a good foundation, but it needs explicit regression tests so optional
 dependencies cannot leak into the core import path.
 
+## Dependency audit — 2026-08-18
+
+The first static audit found:
+
+- `cotengra` is directly imported by the shared contraction implementation
+  and the advanced qMERA compiled-contraction implementation;
+- `cotengrust` is imported when Pepsy constructs a reusable contraction
+  optimizer, where the current implementation intentionally requires its
+  accelerated pathfinder;
+- `cmaes` is selected by the current default Cotengra optimizer string rather
+  than imported directly by Pepsy.
+
+Therefore these dependencies must remain mandatory for now. The first safe
+dependency reduction is to define a contraction-provider boundary, implement
+and benchmark a non-Cotengra fallback, and only then move the accelerated
+providers behind an extra. qMERA can be isolated behind its existing advanced
+namespace independently, but that does not by itself remove shared runtime
+dependencies from the base installation.
+
 ## Target architecture
 
 Keep one source repository and one `pepsy` public package initially. Organize
