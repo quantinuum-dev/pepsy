@@ -22,7 +22,7 @@ jobs:
             extras: dev
           - python-version: "3.12"
             profile: extended
-            extras: dev,test-extended
+            extras: dev,test-extended,contraction
           - python-version: "3.12"
             profile: vmc
             extras: dev,vmc
