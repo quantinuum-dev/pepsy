@@ -297,6 +297,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Copy ``tn`` before its internal indices are randomized. Optimizer
         integrations that construct a disposable target can pass ``False``
         and transfer ownership, avoiding one complete target-network copy.
+    target_support : qtn.MatrixProductState | None, default=None
+        Optional separate MPS carrying local target Schmidt support for
+        two- and three-site subspace expansion. It is never installed as
+        ``p``; the live current state remains the FIT initial state.
 
     Attributes
     ----------
@@ -340,6 +344,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         *,
         environment_strategy: str = "auto",
         copy_target: bool = True,
+        target_support: Optional[qtn.MatrixProductState] = None,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
 
         # Validate the fitted network before taking ownership of either input.
@@ -361,6 +366,32 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # have already created a disposable target network.
         self.p = p if inplace else p.copy()
         self.tn = tn.copy() if copy_target else tn
+        # ``target_support`` is an optional, separate target representation
+        # used only for deterministic local subspace expansion.  It is never
+        # installed as ``self.p``: the latter remains the caller's current
+        # variational state throughout FIT.  Keeping this source separate is
+        # important for gate targets represented lazily as layers, where the
+        # overlap target and the local Schmidt-support template need not have
+        # the same tensor topology.
+        if target_support is not None:
+            if not isinstance(target_support, qtn.MatrixProductState):
+                raise TypeError(
+                    "target_support must be an open MatrixProductState or None."
+                )
+            if target_support.cyclic:
+                raise ValueError("target_support must be an open-boundary MPS.")
+            if int(target_support.L) != self.L:
+                raise ValueError("target_support and p must have the same length.")
+            if set(target_support.outer_inds()) != set(self.p.outer_inds()):
+                raise ValueError(
+                    "target_support and p have different outer indices."
+                )
+            self.target_support = target_support.copy(deep=True)
+            self.target_support.reindex_(
+                {idx: qtn.rand_uuid() for idx in self.target_support.inner_inds()}
+            )
+        else:
+            self.target_support = None
 
         if site_tag_id:
             if isinstance(self.p, qtn.MatrixProductOperator):
@@ -530,6 +561,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
         )
         self._sweep_environment_reuse_count = 0
+        self.info.setdefault(
+            "target_subspace_expansion",
+            {
+                "enabled": self.target_support is not None,
+                "updates": 0,
+                "bonds": [],
+            },
+        )
 
     # ------------------------------------------------------------------
     # Target cache, public inspection, and visualization
@@ -1062,13 +1101,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         if block_size in {2, 3}:
             if self._fermionic_bra_working:
-                self._prepare_native_fermionic_target_support(
-                    method_name="run_eff",
-                    max_bond=max_bond,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    sweep_sequence=sweep_sequence,
-                )
                 self._prepare_fermionic_active_fit(
                     psi,
                     0,
@@ -1904,223 +1936,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
         self._fermionic_right_exterior_environment = prior
 
-    @staticmethod
-    def _native_bond_chargemap(mps, site):
-        """Return the left tensor's native charge map for one MPS bond."""
-        bond = mps.bond(site, site + 1)
-        tensor = mps[site]
-        axis = tensor.inds.index(bond)
-        return dict(tensor.data.indices[axis].chargemap)
-
-    def _native_target_support_gaps(self):
-        """Return target virtual charges absent from the fitted native MPS."""
-        if not isinstance(self.tn, qtn.MatrixProductState):
-            return None
-        if self._target_site_tensors is None:
-            return None
-
-        gaps = []
-        try:
-            for site in range(self.L - 1):
-                target_map = self._native_bond_chargemap(self.tn, site)
-                guess_map = self._native_bond_chargemap(self.p, site)
-                missing = tuple(
-                    sorted(
-                        set(target_map).difference(guess_map),
-                        key=repr,
-                    )
-                )
-                if missing:
-                    gaps.append(
-                        {
-                            "bond": (int(site), int(site + 1)),
-                            "missing_charges": missing,
-                            "target_bond_dim": int(sum(target_map.values())),
-                            "guess_bond_dim": int(sum(guess_map.values())),
-                        }
-                    )
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return None
-        return tuple(gaps)
-
-    def _prepare_native_fermionic_target_support(
-        self,
-        *,
-        method_name,
-        max_bond,
-        cutoff,
-        cutoff_mode,
-        sweep_sequence,
-    ):
-        """Seed a full-chain native FIT when the guess lacks target sectors.
-
-        A local variational contraction cannot create a target charge sector
-        when every surrounding overlap environment projects that sector to
-        zero. For a one-tensor-per-site full-chain MPS target, the target is
-        itself the deterministic native sector template: compressing a copy
-        to the requested output policy gives FIT a nonzero representative in
-        every retained sector without random noise, dense conversion, or a
-        Jordan-Wigner representation.
-
-        A partial active window cannot use this replacement safely because its
-        outside fitted tensors are part of the fixed variational boundary.
-        Such a mismatch therefore receives an explicit compatibility error.
-        """
-        diagnostic = {
-            "applied": False,
-            "strategy": "target_mps_compressed",
-            "reason": "not_native_fermionic_mps_target",
-            "bonds": (),
-        }
-        self.info["native_sector_initialization"] = diagnostic
-        if not (
-            isinstance(self.p, qtn.MatrixProductState)
-            and isinstance(self.tn, qtn.MatrixProductState)
-            and self.p.isfermionic()
-            and self.tn.isfermionic()
-        ):
-            return
-
-        gaps = self._native_target_support_gaps()
-        if gaps is None:
-            diagnostic["reason"] = "target_support_not_bond_resolved"
-            return
-        diagnostic["bonds"] = gaps
-        if not gaps:
-            diagnostic["reason"] = "compatible_virtual_charge_support"
-            return
-
-        if method_name == "run_gate":
-            full_chain = self.range_int == [0, self.L - 1]
-        else:
-            full_chain = method_name == "run_eff"
-        if not full_chain:
-            # Missing target charges inside a partial window are not by
-            # themselves an error: a two-/three-site split can introduce them
-            # while preserving the fixed outside state. Defer to that native
-            # local growth and only reject if the resulting effective tensor
-            # is structurally empty.
-            diagnostic["reason"] = "partial_window_local_sector_growth"
-            return
-
-        if max_bond is not None and (
-            not isinstance(max_bond, Integral) or int(max_bond) < 1
-        ):
-            # Preserve run_gate/run_eff's public validation and error text.
-            return
-        max_bond = None if max_bond is None else int(max_bond)
-        if cutoff is None:
-            cutoff = self.cutoffs
-        try:
-            cutoff = self._resolve_cutoff(cutoff)
-        except (TypeError, ValueError):
-            # Preserve run_gate/run_eff's public validation and error text.
-            return
-        if not math.isfinite(cutoff) or cutoff < 0.0:
-            return
-
-        sequence = self._validate_sweep_sequence(sweep_sequence)
-        center = 0 if sequence[0] == "R" else self.L - 1
-        seed = self.tn.copy(deep=True)
-        if max_bond is not None or cutoff > 0.0:
-            seed.compress(
-                form=center,
-                max_bond=max_bond,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-            )
-        # The target and fitted MPS must remain independent layers in every
-        # overlap contraction. Re-randomize only the seed's internal bonds
-        # before transferring its native arrays into the owned fitted MPS.
-        seed.reindex_(
-            {index: qtn.rand_uuid() for index in seed.inner_inds()}
-        )
-        for site in range(self.L):
-            seed_tensor = seed[site]
-            self.p[site].modify(
-                data=seed_tensor.data,
-                inds=seed_tensor.inds,
-                left_inds=seed_tensor.left_inds,
-            )
-        if hasattr(seed, "exponent"):
-            self.p.exponent = seed.exponent
-
-        if self._fermionic_bra_working:
-            # The wrapper restores the physical ket on exit, so retain its
-            # temporary conjugated representation for the upcoming sweep.
-            self.p.conj_()
-
-        diagnostic.update(
-            {
-                "applied": True,
-                "reason": "missing_virtual_charge_support",
-                "max_bond": max_bond,
-                "cutoff": float(cutoff),
-                "cutoff_mode": str(cutoff_mode),
-            }
-        )
-
-    def _prepare_dense_target_support(self, start, stop, block_size):
-        """Seed missing dense Schmidt subspaces from an MPS target.
-
-        With a non-zero SVD cutoff, a local overlap fit started from a
-        product MPS can see only the component parallel to the current
-        product sector. The exact-zero singular values carrying a remote
-        gate's new Schmidt sector are discarded before a later sweep can use
-        them, leaving the solver at a false local optimum. For ordinary
-        dense MPS targets, the deterministic analogue of native sector
-        initialization is to use a private copy of the target as the initial
-        variational state. The subsequent local SVDs still enforce the user's
-        bond and cutoff limits.
-        """
-        diagnostic = {
-            "applied": False,
-            "strategy": "target_mps",
-            "reason": "not_needed",
-            "bonds": (),
-        }
-        self.info["dense_target_initialization"] = diagnostic
-        if (
-            int(block_size) not in {2, 3}
-            or int(stop) - int(start) < 2
-            or not isinstance(self.p, qtn.MatrixProductState)
-            or not isinstance(self.tn, qtn.MatrixProductState)
-            or int(self.tn.num_tensors) != int(self.L)
-            or self.p.isfermionic()
-            or self.tn.isfermionic()
-            or self._target_site_tensors is None
-        ):
-            diagnostic["reason"] = "incompatible_target"
-            return False
-
-        gaps = []
-        try:
-            for site in range(int(start), int(stop)):
-                current = int(self.p.bond_size(site, site + 1))
-                target = int(self.tn.bond_size(site, site + 1))
-                if target > current:
-                    gaps.append(
-                        {
-                            "bond": (int(site), int(site + 1)),
-                            "current_bond_dim": current,
-                            "target_bond_dim": target,
-                        }
-                    )
-        except (AttributeError, TypeError, ValueError):
-            diagnostic["reason"] = "bond_dimensions_unavailable"
-            return False
-
-        diagnostic["bonds"] = tuple(gaps)
-        if not gaps:
-            return False
-
-        seed = self.tn.copy(deep=True)
-        seed.reindex_({index: qtn.rand_uuid() for index in seed.inner_inds()})
-        self.p = seed
-        diagnostic["applied"] = True
-        diagnostic["reason"] = "missing_target_bond_rank"
-        return True
-
     def _prepare_fermionic_effective_tensor(
         self,
         tensor,
@@ -2190,9 +2005,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         raise ValueError(
             "Native fermionic FIT produced an empty effective tensor at "
             f"sites {sites}; the target and initial MPS have disconnected "
-            "charge-sector support. Use a full-chain one-tensor-per-site MPS "
-            "target for automatic target-informed sector initialization, or "
-            "provide a sector-compatible initial MPS."
+            "charge-sector support. Provide a sector-compatible current MPS "
+            "or use a native block update that can open the needed charge "
+            "sectors."
         )
 
     def _resolve_fermionic_writeback_phase(self, *tensors):
@@ -2214,6 +2029,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.sweep_norm_trace = []
         self.info.pop("two_site_splits", None)
         self.info.pop("three_site_splits", None)
+        expansion = self.info.get("target_subspace_expansion")
+        if expansion is not None:
+            expansion["updates"] = 0
+            expansion["bonds"] = []
 
     @staticmethod
     def _sweep_diagnostics_to_host(
@@ -2323,6 +2142,345 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         except (AttributeError, TypeError, ValueError):
             return False
         return all(rank >= target for rank, target in zip(current, targets))
+
+    @staticmethod
+    def _tensor_index_dim(tensor, index):
+        """Return one tensor index dimension without converting its data."""
+        return int(tensor.shape[tensor.inds.index(index)])
+
+    @staticmethod
+    def _attach_uniform_index(tensor, index, dimension):
+        """Attach a normalized deterministic vector on a dangling index.
+
+        A target-support factor can have a virtual index whose fitted-state
+        boundary has a smaller dimension.  The support correction must still
+        retain the fitted boundary leg, so the target leg is reduced and a
+        neutral normalized vector on the current leg is attached.  This is a
+        support template, not a replacement for the target amplitude.
+        """
+        vector = qtn.Tensor(
+            ar.do("ones", (int(dimension),), like=tensor.data),
+            inds=(index,),
+        )
+        vector = vector * (1.0 / math.sqrt(int(dimension)))
+        return qtn.tensor_contract(
+            tensor,
+            vector,
+            output_inds=tensor.inds + (index,),
+        )
+
+    def _target_support_site_factor(
+        self,
+        psi,
+        site,
+        *,
+        include_left_boundary,
+        include_right_boundary,
+    ):
+        """Return one target-support site tensor in the fitted boundary gauge.
+
+        The target-support MPS is used as a local Schmidt template only.  Its
+        internal bond between the selected sites remains open; all boundary
+        legs are either identified with the current MPS when dimensions agree
+        or reduced and replaced by the current boundary leg.  Thus this
+        helper never changes ``psi`` and never installs the target MPS as the
+        FIT state.
+        """
+        target = self.target_support
+        if target is None:
+            return None
+        if any(
+            type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+            for tensor in (*target.tensors, *psi.tensors)
+        ):
+            # Native charge sectors require native block metadata rather than
+            # a dense uniform support vector.  The native FIT path retains its
+            # own graded local-growth rules.
+            return None
+
+        tensor = target[site].copy()
+        target_physical = target.site_ind(site)
+        fitted_physical = psi.site_ind(site)
+        if target_physical != fitted_physical:
+            tensor.reindex_({target_physical: fitted_physical})
+
+        boundary_specs = []
+        if include_left_boundary and site > 0:
+            boundary_specs.append(
+                (
+                    target.bond(site - 1, site),
+                    psi.bond(site - 1, site),
+                )
+            )
+        if include_right_boundary and site + 1 < self.L:
+            boundary_specs.append(
+                (
+                    target.bond(site, site + 1),
+                    psi.bond(site, site + 1),
+                )
+            )
+
+        for target_index, fitted_index in boundary_specs:
+            if target_index not in tensor.inds:
+                continue
+            target_dim = self._tensor_index_dim(tensor, target_index)
+            fitted_dim = self._tensor_index_dim(psi[site], fitted_index)
+            if target_dim == fitted_dim:
+                tensor.reindex_({target_index: fitted_index})
+            else:
+                tensor = tensor.sum_reduce(target_index, inplace=False)
+                tensor = tensor * (1.0 / math.sqrt(target_dim))
+                tensor = self._attach_uniform_index(
+                    tensor,
+                    fitted_index,
+                    fitted_dim,
+                )
+
+        return tensor
+
+    def _target_support_two_site_factors(
+        self,
+        psi,
+        left_site,
+        right_site,
+        left_inds,
+        right_inds,
+    ):
+        """Build open target-support factors for one active two-site bond."""
+        if self.target_support is None:
+            return None
+        target = self.target_support
+        target_bond = target.bond(left_site, right_site)
+        fitted_bond = psi.bond(left_site, right_site)
+        left = self._target_support_site_factor(
+            psi,
+            left_site,
+            include_left_boundary=True,
+            include_right_boundary=False,
+        )
+        right = self._target_support_site_factor(
+            psi,
+            right_site,
+            include_left_boundary=False,
+            include_right_boundary=True,
+        )
+        if left is None or right is None:
+            return None
+        if target_bond not in left.inds or target_bond not in right.inds:
+            return None
+        left.reindex_({target_bond: fitted_bond})
+        right.reindex_({target_bond: fitted_bond})
+        try:
+            left = left.transpose(*(tuple(left_inds) + (fitted_bond,)))
+            right = right.transpose(*((fitted_bond,) + tuple(right_inds)))
+        except ValueError:
+            return None
+        return left, right
+
+    def _target_support_three_site_factors(
+        self,
+        psi,
+        sites,
+        left_inds,
+        middle_inds,
+        right_inds,
+    ):
+        """Build open target-support factors for one active three-site block."""
+        if self.target_support is None:
+            return None
+        left_site, middle_site, right_site = sites
+        target = self.target_support
+        left_bond = psi.bond(left_site, middle_site)
+        right_bond = psi.bond(middle_site, right_site)
+        target_left_bond = target.bond(left_site, middle_site)
+        target_right_bond = target.bond(middle_site, right_site)
+        left = self._target_support_site_factor(
+            psi,
+            left_site,
+            include_left_boundary=True,
+            include_right_boundary=False,
+        )
+        middle = self._target_support_site_factor(
+            psi,
+            middle_site,
+            include_left_boundary=False,
+            include_right_boundary=False,
+        )
+        right = self._target_support_site_factor(
+            psi,
+            right_site,
+            include_left_boundary=False,
+            include_right_boundary=True,
+        )
+        if left is None or middle is None or right is None:
+            return None
+        if not (
+            target_left_bond in left.inds
+            and target_left_bond in middle.inds
+            and target_right_bond in middle.inds
+            and target_right_bond in right.inds
+        ):
+            return None
+        for tensor in (left, middle, right):
+            tensor.reindex_(
+                {
+                    target_left_bond: left_bond,
+                    target_right_bond: right_bond,
+                }
+            )
+        try:
+            left = left.transpose(*(tuple(left_inds) + (left_bond,)))
+            middle = middle.transpose(
+                *(tuple(middle_inds) + (left_bond, right_bond))
+            )
+            right = right.transpose(*((right_bond,) + tuple(right_inds)))
+        except ValueError:
+            return None
+        return left, middle, right
+
+    @staticmethod
+    def _prefix_bond(tensor, bond, keep):
+        """Keep the leading ``keep`` sectors of a local support tensor."""
+        dimension = int(tensor.shape[tensor.inds.index(bond)])
+        if keep >= dimension:
+            return tensor
+        if keep < 1:
+            return None
+        return tensor.isel({bond: slice(0, int(keep))}, inplace=False)
+
+    def _enrich_two_site_split(
+        self,
+        current_left,
+        current_right,
+        target_left,
+        target_right,
+        left_inds,
+        right_inds,
+        max_bond,
+    ):
+        """Add target Schmidt support to a two-site SVD result.
+
+        The ordinary SVD remains the objective update.  When its bond is
+        under-capacity, the target factors provide the missing local support on
+        that bond, capped at ``max_bond``.  This deterministic DMRG enrichment
+        step keeps the separate support source local and never copies the
+        target MPS into the fitted state.
+        """
+        if max_bond is None:
+            return current_left, current_right, False
+        bond = next(iter(current_left.bonds(current_right)))
+        current_rank = int(current_left.shape[current_left.inds.index(bond)])
+        target_rank = int(
+            target_left.shape[target_left.inds.index(bond)]
+        )
+        if (
+            current_rank >= int(max_bond)
+            or target_rank < 1
+            or current_rank >= target_rank
+        ):
+            return current_left, current_right, False
+        # The target factor already represents the missing local Schmidt
+        # support.  Use it for this bond (capped at chi) rather than taking a
+        # direct sum with the old basis, which would duplicate sectors that
+        # are already present and inflate a rank-2 target toward chi=4.
+        target_left = self._prefix_bond(target_left, bond, max_bond)
+        target_right = self._prefix_bond(target_right, bond, max_bond)
+        enriched_left = target_left
+        enriched_right = target_right
+        self.info.setdefault("target_subspace_expansion", {}).setdefault(
+            "updates", 0
+        )
+        self.info["target_subspace_expansion"]["updates"] += 1
+        self.info["target_subspace_expansion"].setdefault("bonds", []).append(
+            {
+                "bond": bond,
+                "current_rank": int(current_rank),
+                "target_rank": int(target_rank),
+                "new_rank": int(
+                    enriched_left.shape[enriched_left.inds.index(bond)]
+                ),
+            }
+        )
+        return enriched_left, enriched_right, True
+
+    def _enrich_three_site_split(
+        self,
+        current_left,
+        current_middle,
+        current_right,
+        target_left,
+        target_middle,
+        target_right,
+        left_inds,
+        middle_inds,
+        right_inds,
+        max_bond,
+    ):
+        """Add target support to both active bonds of a three-site update."""
+        if max_bond is None:
+            return current_left, current_middle, current_right, False
+        left_bond = next(iter(current_left.bonds(current_middle)))
+        right_bond = next(iter(current_middle.bonds(current_right)))
+        current_left_rank = int(current_left.shape[current_left.inds.index(left_bond)])
+        current_right_rank = int(
+            current_middle.shape[current_middle.inds.index(right_bond)]
+        )
+        if current_left_rank >= int(max_bond) or current_right_rank >= int(max_bond):
+            return current_left, current_middle, current_right, False
+
+        target_left_rank = int(target_left.shape[target_left.inds.index(left_bond)])
+        target_right_rank = int(
+            target_middle.shape[target_middle.inds.index(right_bond)]
+        )
+        if (
+            current_left_rank >= target_left_rank
+            and current_right_rank >= target_right_rank
+        ):
+            return current_left, current_middle, current_right, False
+        target_left = self._prefix_bond(target_left, left_bond, max_bond)
+        target_middle = self._prefix_bond(target_middle, left_bond, max_bond)
+        target_middle = self._prefix_bond(target_middle, right_bond, max_bond)
+        target_right = self._prefix_bond(target_right, right_bond, max_bond)
+        enriched_left = target_left
+        enriched_middle = target_middle
+        enriched_right = target_right
+        self.info.setdefault("target_subspace_expansion", {}).setdefault(
+            "updates", 0
+        )
+        self.info["target_subspace_expansion"]["updates"] += 1
+        expansion_bonds = self.info["target_subspace_expansion"].setdefault(
+            "bonds", []
+        )
+        for bond, current_rank, target_rank, enriched in (
+            (
+                left_bond,
+                current_left_rank,
+                target_left_rank,
+                enriched_left,
+            ),
+            (
+                right_bond,
+                current_right_rank,
+                target_right_rank,
+                enriched_middle,
+            ),
+        ):
+            expansion_bonds.append(
+                {
+                    "bond": bond,
+                    "current_rank": int(current_rank),
+                    "target_rank": int(target_rank),
+                    "new_rank": int(enriched.shape[enriched.inds.index(bond)]),
+                }
+            )
+        return enriched_left, enriched_middle, enriched_right, True
+
+    def _projected_local_overlap(self, target_tensor, fitted_tensors):
+        """Measure the true target overlap after a support-only enrichment."""
+        components = [tensor.H for tensor in fitted_tensors]
+        components.append(target_tensor)
+        overlap = self._contract_components(components, output_inds=())
+        return ar.do("abs", overlap)
 
     def _effective_tensor(
         self,
@@ -2703,6 +2861,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if direction == "R"
                 else moving_environments.get(right_site + 1)
             )
+            target_support_factors = self._target_support_two_site_factors(
+                psi,
+                left_site,
+                right_site,
+                left_inds,
+                right_inds,
+            )
             theta = self._effective_tensor(
                 psi,
                 (left_site, right_site),
@@ -2744,6 +2909,18 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 get="tensors",
                 info=split_info,
             )
+            target_support_enriched = False
+            if target_support_factors is not None:
+                new_left, new_right, target_support_enriched = (
+                    self._enrich_two_site_split(
+                        new_left,
+                        new_right,
+                        *target_support_factors,
+                        left_inds,
+                        right_inds,
+                        max_bond,
+                    )
+                )
             split_finished = (
                 self._timing_mark(new_left, new_right)
                 if timing_record is not None
@@ -2773,7 +2950,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             terminal_update = (
                 right_site == stop if direction == "R" else left_site == start
             )
-            retained_norm = center.norm() if terminal_update else None
+            retained_norm = (
+                self._projected_local_overlap(theta, (new_left, new_right))
+                if terminal_update and target_support_enriched
+                else center.norm()
+                if terminal_update
+                else None
+            )
             if terminal_update:
                 self.local_norm_trace.append(ar.do("real", retained_norm))
             if collect_split_diagnostics:
@@ -2950,6 +3133,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if direction == "R"
                 else moving_environments.get(right_site + 1)
             )
+            target_support_factors = self._target_support_three_site_factors(
+                psi,
+                (left_site, middle_site, right_site),
+                left_inds,
+                middle_inds,
+                right_inds,
+            )
             theta = self._effective_tensor(
                 psi,
                 (left_site, middle_site, right_site),
@@ -3046,6 +3236,23 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     get="tensors",
                     info=split_info_left,
                 )
+            target_support_enriched = False
+            if target_support_factors is not None:
+                (
+                    new_left,
+                    new_middle,
+                    new_right,
+                    target_support_enriched,
+                ) = self._enrich_three_site_split(
+                    new_left,
+                    new_middle,
+                    new_right,
+                    *target_support_factors,
+                    left_inds,
+                    middle_inds,
+                    right_inds,
+                    max_bond,
+                )
             split_finished = (
                 self._timing_mark(new_left, new_middle, new_right)
                 if timing_record is not None
@@ -3081,7 +3288,16 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             terminal_update = (
                 right_site == stop if direction == "R" else left_site == start
             )
-            retained_norm = center.norm() if terminal_update else None
+            retained_norm = (
+                self._projected_local_overlap(
+                    theta,
+                    (new_left, new_middle, new_right),
+                )
+                if terminal_update and target_support_enriched
+                else center.norm()
+                if terminal_update
+                else None
+            )
             if terminal_update:
                 self.local_norm_trace.append(ar.do("real", retained_norm))
             if collect_split_diagnostics:
@@ -3200,7 +3416,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         adaptive_until_rank=False,
         final_one_site_sweeps=0,
         collect_split_diagnostics=True,
-        target_support_init=False,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
 
@@ -3254,10 +3469,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         three sites; it is ignored for a two-site window.
         ``collect_split_diagnostics=False`` avoids allocating SVD metadata when
         the caller only needs the fitted state.
-        ``target_support_init=True`` deterministically seeds missing dense MPS
-        Schmidt subspaces from the target before block FIT. It is intended
-        for gate-target fits; arbitrary target fits retain their supplied
-        initial state by default.
+        ``target_support`` supplied to the constructor is consumed only by
+        block-2/3 local subspace expansion. It is never copied into ``p``;
+        once an active bond reaches ``max_bond``, the ordinary fixed-rank FIT
+        update is used.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -3323,7 +3538,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         timing_sync_device = bool(timing_sync_device)
         single_pair_fast_path = bool(single_pair_fast_path)
         collect_split_diagnostics = bool(collect_split_diagnostics)
-        target_support_init = bool(target_support_init)
         self._timing_sync_device = timing and timing_sync_device
         self._timing_synchronizer = (
             self._make_backend_synchronizer(self.p)
@@ -3364,9 +3578,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "block_size=3 requires range_int to span at least three sites."
             )
-        if target_support_init:
-            self._prepare_dense_target_support(start, stop, block_size)
-        psi = self.p
         if (
             adaptive_schedule
             and block_size in {2, 3}
@@ -3379,13 +3590,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
 
         if self._fermionic_bra_working:
-            self._prepare_native_fermionic_target_support(
-                method_name="run_gate",
-                max_bond=max_bond,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                sweep_sequence=sweep_sequence,
-            )
             self._prepare_fermionic_active_fit(
                 psi,
                 start,

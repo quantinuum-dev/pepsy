@@ -295,13 +295,13 @@ The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
 native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
 arrays. `dmrg1` uses its bounded two-sweep warm-up and sticky one-site phase,
 while `dmrg2` and `dmrg3` perform their fixed block warm-up before one-site
-refinement. A native nonlocal gate
-still receives its chi-capped graded auto-swap warm start before FIT. For a
-direct full-chain FIT whose arbitrary MPS guess lacks target virtual charge
-sectors, FIT instead uses a target-informed native compressed initialization;
-partial gate windows retain their fixed outside-state contract, grow sectors
-through native local blocks, and reject only a genuinely empty effective
-problem.
+refinement. Ordinary dense MPS replay passes the current MPS directly as
+FIT's `p` and, while an active bond is below `chi`, supplies a separate exact
+MPS support template for local target-sector enrichment. FIT never copies the
+target into `fit.p` and never uses a rank-`chi` target warm start. Native
+nonlocal gates retain their graded auto-swap sector preparation because
+Symmray charge blocks cannot be created by dense support arithmetic; a
+genuinely disconnected native effective problem remains an explicit error.
 
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
@@ -322,12 +322,11 @@ and fermionic data. `target_cutoff=0.0` keeps either representation exact while
 ordinary `cutoff` controls only the two-site output split, so target-
 construction loss is not reported as FIT loss.
 
-For a non-adjacent native fermionic gate, MPS DMRG first replays the target
-gate through Quimb's chi-capped graded auto-swap path and uses that native MPS
-as the FIT starting point. This is the deterministic counterpart of
-SymDMRG2's sector enrichment: it opens the gate-generated virtual charge
-sectors before alternating least squares can project them out. After that
-warm start, fermionic FIT follows the selected DMRG schedule normally:
+For a non-adjacent native fermionic gate, MPS DMRG uses Quimb's chi-capped
+graded auto-swap algebra on the current native MPS to open charge sectors
+before alternating least squares can project them out. This is a native
+sector-support preparation, not a copy of the exact target into `fit.p`.
+After that preparation, fermionic FIT follows the selected DMRG schedule:
 `dmrg2`, for example, can switch from its two block warm-up sweeps to native
 one-site refinement. The uncapped target remains separate. At
 `target_cutoff=0.0`, routed target splits use the smallest

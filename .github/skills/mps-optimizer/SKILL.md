@@ -143,14 +143,13 @@ deterministic sector enrichment, then follows the selected block-to-one-site
 schedule normally.
 `target_cutoff=0.0` may prune only structural zeros using the smallest positive
 absolute cutoff; every representable nonzero singular value must remain.
-For a direct full-chain native MPS FIT, compare target and guess virtual charge
-maps before sweeping. If target sectors are missing, initialize from a target
-copy compressed with the requested native output policy and record
-`native_sector_initialization`; never seed through dense arrays. Reject the
-same initialization on a partial window because replacing its outside tensors
-would violate the fixed-boundary contract; let native block updates grow local
-sectors there. Treat an empty native effective tensor as a clear
-disconnected-sector error, not as a backend decomposition failure.
+Native FIT never replaces the current MPS with a target copy. Its graded local
+SVD and chi-capped auto-swap algebra are responsible for opening compatible
+charge sectors; if the current sectors and target are disconnected, raise a
+clear disconnected-sector error rather than hiding the failure behind a dense
+conversion or global warm start. Dense FIT may receive a separate
+`target_support` MPS, consumed only by local two-/three-site subspace
+expansion; this support source is never installed as `fit.p`.
 
 ## Profiling contract
 

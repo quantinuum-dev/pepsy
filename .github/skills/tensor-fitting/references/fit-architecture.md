@@ -49,8 +49,13 @@
 For local circuit compression, `MpsOptimizer` builds an exact target,
 constructs `FIT(target, p=current, range_int=[xmin, xmax], inplace=True,
 copy_target=False)`, then calls `run_gate`. Ordinary dense targets default to
-small spatially split gate tensors layered over one owned MPS copy. This avoids
-intermediate target-MPS rank growth and repeated full-state copies. Symmray
+small spatially split gate tensors layered over one owned MPS copy. If an
+active block is still below its attainable chi, the optimizer also constructs
+a separate exact MPS `target_support` source. FIT uses that source only for
+local two-/three-site subspace expansion; it never installs it as `fit.p` and
+never performs a global rank-chi target warm start. This avoids intermediate
+target-MPS rank growth in the normal objective path and repeated full-state
+copies. Symmray
 uses its native auto-swap MPS target until graded layered targets have an
 independently validated tag/phase contract. Left/right overlap environments
 project the target onto the fixed
@@ -58,6 +63,14 @@ outside MPS. A two-site update contracts both target site tensors with those
 environments, yielding the two physical groups and two outer virtual legs.
 `Tensor.split` truncates only the middle bond and absorbs singular values in
 the sweep direction.
+
+During local expansion, FIT first performs the ordinary variational effective
+tensor and SVD. When the active bond is below its target rank and `max_bond`,
+the separate target-support factors provide the missing local Schmidt sectors,
+with the bond capped at `max_bond`. The old current state remains the FIT
+initial state, and once the bond reaches its rank ceiling subsequent sweeps are
+ordinary fixed-rank rotations/refinements. Native Symmray inputs use their
+graded local sector rules instead of dense support factors.
 
 Fresh gate sweeps build fixed environments only beyond the first active
 block. Completed block sweeps retain the minimal cumulative boundaries needed

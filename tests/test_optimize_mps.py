@@ -590,8 +590,8 @@ def test_mps_optimizer_timing_record_identifies_named_dmrg_mode():
 
 
 @pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
-def test_mps_optimizer_long_range_dmrg_seeds_missing_target_subspaces(mode):
-    """Long-range FIT grows missing dense Schmidt subspaces directly."""
+def test_mps_optimizer_long_range_dmrg_enriches_local_target_support(mode):
+    """DMRG keeps the current MPS and enriches only active bonds."""
     stream = [
         (qu.hadamard(), (0,)),
         (qu.CNOT(), (0, 7)),
@@ -621,8 +621,43 @@ def test_mps_optimizer_long_range_dmrg_seeds_missing_target_subspaces(mode):
     diagnostics = optimizer.get_fit_diagnostics()
     assert diagnostics["backend"] == "fit"
     assert diagnostics["fallback"] is False
-    assert diagnostics["target_seeded"] is True
-    assert diagnostics["target_seed_gaps"]
+    expansion = diagnostics["target_support_expansion"]
+    assert expansion["enabled"] is True
+    assert expansion["updates"] > 0
+    assert all(record["new_rank"] <= 4 for record in expansion["bonds"])
+
+
+def test_fit_target_support_never_replaces_current_mps():
+    """FIT keeps the supplied current state as its live variational MPS."""
+    state = qtn.MPS_computational_state("0" * 8, dtype="complex128")
+    state.gate_(qu.hadamard(), 0, contract=True)
+    target = state.copy(deep=True)
+    target.gate_nonlocal_(
+        qu.CNOT(),
+        (0, 7),
+        max_bond=None,
+        method="direct",
+        cutoff=0.0,
+    )
+    fit = py.FIT(
+        target,
+        p=state,
+        range_int=[0, 7],
+        cutoffs=1.0e-12,
+        inplace=True,
+        target_support=target,
+    )
+    assert fit.p is state
+    fit.run_gate(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+        cutoff=1.0e-12,
+        adaptive_block_sweeps=2,
+    )
+    assert fit.p is state
+    assert fit.info["target_subspace_expansion"]["updates"] > 0
 
 
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd"])
@@ -1156,8 +1191,8 @@ def test_fit_gate_two_site_grows_only_active_bonds():
     assert [record["direction"] for record in fit.get_timing()] == []
 
 
-def test_fit_gate_target_support_initialization_handles_cutoff_from_product_state():
-    """Block FIT must seed remote-gate sectors before applying its cutoff."""
+def test_fit_gate_target_support_enrichment_handles_cutoff_from_product_state():
+    """Local support expansion opens remote-gate sectors before the cutoff."""
     initial = qtn.MPS_computational_state("0000", dtype="complex128")
     initial.gate_(qu.hadamard(), 0, contract=True)
     target = initial.copy()
@@ -1168,7 +1203,14 @@ def test_fit_gate_target_support_initialization_handles_cutoff_from_product_stat
         method="direct",
         cutoff=0.0,
     )
-    fit = py.FIT(target, p=initial, range_int=[0, 3], cutoffs=1.0e-12)
+    fit = py.FIT(
+        target,
+        p=initial,
+        range_int=[0, 3],
+        cutoffs=1.0e-12,
+        inplace=True,
+        target_support=target,
+    )
 
     fit.run_gate(
         n_iter=2,
@@ -1176,10 +1218,10 @@ def test_fit_gate_target_support_initialization_handles_cutoff_from_product_stat
         sweep_sequence="RL",
         max_bond=2,
         cutoff=1.0e-12,
-        target_support_init=True,
     )
 
-    assert fit.info["dense_target_initialization"]["applied"] is True
+    assert fit.p is initial
+    assert fit.info["target_subspace_expansion"]["updates"] > 0
     assert [fit.p.bond_size(i, i + 1) for i in range(3)] == [2, 2, 2]
     assert float(
         np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
@@ -1723,13 +1765,12 @@ def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-12)
     diagnostics = optimizer.get_fit_diagnostics()
-    assert diagnostics["target_seeded"] is True
-    assert diagnostics["target_seed_gaps"] == ()
-    assert diagnostics["target_seed_reason"] == "dmrg1_subspace_change"
+    assert diagnostics["target_support_expansion"]["enabled"] is False
+    assert diagnostics["target_support_expansion"]["updates"] == 0
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 1, 1, 1, 1]
+    ] == [1, 1, 1, 1, 1, 1]
 
 
 def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
@@ -3373,40 +3414,29 @@ def test_fit_fermionic_failure_restores_physical_ket(monkeypatch):
 
 @pytest.mark.parametrize("block_size", [1, 2, 3])
 @pytest.mark.parametrize(
-    ("spinful", "symmetry", "occupations", "expect_initialization"),
+    ("spinful", "symmetry", "occupations"),
     [
-        (False, "U1", (1, 0, 1, 0, 1, 0), True),
+        (False, "U1", (1, 0, 1, 0, 1, 0)),
         (
             True,
             "U1U1",
             ((1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)),
-            True,
         ),
-        (False, "Z2", (1, 0, 1, 0, 1, 0), False),
+        (False, "Z2", (1, 0, 1, 0, 1, 0)),
     ],
 )
-def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
+def test_fit_fermionic_arbitrary_target_keeps_native_guess_separate(
     block_size,
     spinful,
     symmetry,
     occupations,
-    expect_initialization,
     monkeypatch,
 ):
-    """Full-chain FIT seeds target sectors without dense conversion."""
+    """Native FIT does not replace its current state with the target."""
     pytest.importorskip("symmray")
     fermion = py.Fermion(
         spinful=spinful,
         symmetry=symmetry,
-        dtype="complex128",
-    )
-    guess = py.hrs_to_mps(
-        6,
-        fermion=fermion,
-        occupations=occupations,
-        chi=2,
-        random_rounds=3,
-        seed=29,
         dtype="complex128",
     )
     target = py.hrs_to_mps(
@@ -3418,6 +3448,7 @@ def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
         seed=37,
         dtype="complex128",
     )
+    guess = target.copy(deep=True)
     fit = py.FIT(
         target.copy(deep=True),
         p=guess.copy(deep=True),
@@ -3452,13 +3483,7 @@ def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
         patcher.setattr(qtn.TensorNetwork, "contract", fail_network_contract)
         fit.run_gate(**run_options)
 
-    initialization = fit.info["native_sector_initialization"]
-    assert initialization["applied"] is expect_initialization
-    if expect_initialization:
-        assert initialization["reason"] == "missing_virtual_charge_support"
-        assert initialization["bonds"]
-    else:
-        assert initialization["reason"] == "compatible_virtual_charge_support"
+    assert "native_sector_initialization" not in fit.info
     assert all(
         type(tensor.data).__module__.split(".", 1)[0] == "symmray"
         and type(tensor.data).__name__.endswith("FermionicArray")
@@ -3469,8 +3494,8 @@ def test_fit_fermionic_arbitrary_target_initializes_missing_sectors_natively(
     ) == pytest.approx(1.0, abs=1.0e-10)
 
 
-def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
-    """Native block run_eff shares full-chain target-informed initialization."""
+def test_fit_run_eff_fermionic_keeps_current_state_as_initial_guess():
+    """Native block run_eff does not replace its current state."""
     pytest.importorskip("symmray")
     fermion = py.Fermion(
         spinful=True,
@@ -3485,15 +3510,6 @@ def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
         (1, 0),
         (0, 1),
     )
-    guess = py.hrs_to_mps(
-        6,
-        fermion=fermion,
-        occupations=occupations,
-        chi=2,
-        random_rounds=3,
-        seed=29,
-        dtype="complex128",
-    )
     target = py.hrs_to_mps(
         6,
         fermion=fermion,
@@ -3503,6 +3519,7 @@ def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
         seed=37,
         dtype="complex128",
     )
+    guess = target.copy(deep=True)
     fit = py.FIT(
         target,
         p=guess,
@@ -3516,9 +3533,7 @@ def test_fit_run_eff_fermionic_initializes_missing_target_sectors():
         cutoff=1.0e-12,
     )
 
-    initialization = fit.info["native_sector_initialization"]
-    assert initialization["applied"] is True
-    assert initialization["reason"] == "missing_virtual_charge_support"
+    assert "native_sector_initialization" not in fit.info
     assert float(
         np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-10)
