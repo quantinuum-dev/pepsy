@@ -9,6 +9,7 @@ import pepsy
 
 
 _ROOT_API_MANIFEST = Path(__file__).parents[1] / "docs/development/api-manifest.txt"
+_API_MIGRATION_DOC = Path(__file__).parents[1] / "docs/development/api-migration.md"
 
 
 def _manifest_symbols():
@@ -86,6 +87,15 @@ def test_deprecated_mera_alias_warns_and_matches_qmera():
     with pytest.warns(DeprecationWarning, match="experimental.qmera"):
         alias = experimental.mera
     assert alias is experimental.qmera
+
+
+def test_deprecated_aliases_are_documented():
+    """Every active deprecation has a migration entry for users."""
+    migration = _API_MIGRATION_DOC.read_text(encoding="utf-8")
+    tensor_aliases = pepsy.tensors._BACKEND_COMPATIBILITY_ALIASES
+    assert all(f"`pepsy.tensors.{name}`" in migration for name in tensor_aliases)
+    assert "`pepsy.experimental.mera`" in migration
+    assert "`pepsy.optimizers.mera`" in migration
 
 
 def test_tree_optimizers_are_available_from_high_level_api():

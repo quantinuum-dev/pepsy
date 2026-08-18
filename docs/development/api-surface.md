@@ -22,6 +22,10 @@ remain synchronized. New symbols must be added to the owning namespace and to
 the manifest only when an intentional compatibility decision approves a new
 root alias.
 
+The owner map is implemented in the private lazy-safe `pepsy._api` module, so
+the top-level initializer does not need to carry the full compatibility
+registry alongside its namespace-loading logic.
+
 ## Redundancy identified
 
 These backend helpers currently appear in both `pepsy.backends` and

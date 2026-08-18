@@ -1,6 +1,6 @@
 # Lightweight package plan
 
-Status: active, phases 0-3 complete; phase 5 inventory and canonical ownership recorded
+Status: active, phases 0-3 complete; phase 5 inventory, migration, and import measurements recorded
 Last updated: 2026-08-18
 Owner: Pepsy maintainers
 
@@ -144,7 +144,10 @@ The first phase of this work is complete: the root inventory is recorded in
 public API tests, backend aliases in `pepsy.tensors` warn and redirect to
 `pepsy.backends`, and `pepsy.experimental.mera` redirects to `qmera`. The
 sampling facade is also lazy, and the maintained notebook example uses
-canonical namespace imports. No public names have been removed.
+canonical namespace imports. The compatibility registry now lives in the
+private lazy-safe `pepsy._api` module, the migration table is in
+`docs/development/api-migration.md`, and repeatable import measurements are
+provided by `tools/measure_imports.py`. No public names have been removed.
 
 ## Acceptance criteria
 
