@@ -115,6 +115,31 @@ def test_mpo_basis_evolution_keeps_parameterized_coefficients_differentiable():
     assert basis.cache_info["builds"] == 1
 
 
+def test_mpo_basis_approximate_evolution_keeps_parameters_differentiable():
+    """The cached Algorithm-4 plan does not capture backend values."""
+    torch = pytest.importorskip("torch")
+    theta = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    U = basis.evolution_mpo(
+        coefficients=torch.stack((theta, -0.3 * theta)),
+        dt=time,
+        order=2,
+        mode="approximate",
+    )
+    loss = sum(array.real.sum() for array in U.arrays)
+    theta_grad, time_grad = torch.autograd.grad(loss, (theta, time))
+
+    assert U.metadata["algorithms"] == (1, 2, 3, 4)
+    assert any(array.requires_grad for array in U.arrays)
+    assert torch.isfinite(theta_grad)
+    assert torch.isfinite(time_grad)
+
+
 def test_mpo_basis_shares_suffixes_and_assembles_terminal_coefficient_groups():
     """Shared suffix channels remain exact when several terms end together."""
     x, y, z = _paulis()
@@ -179,11 +204,54 @@ def test_history_algorithms_reuse_symbolic_execution_plans():
     assert H.history_cache_info["extension_plan_orders"] == (2,)
     assert H.history_cache_info["extension_plan_batches"][2] > 0
     assert all(
+        site_plan is None or site_plan["left_targets"].ndim == 1
+        for site_plan in H._history_extension_plan_cache[2]["site_plans"]
+    )
+    assert all(
         not hasattr(value, "requires_grad")
         for plan in H._history_extension_plan_cache.values()
         for batch in plan["batches"]
         for value in batch.values()
     )
+    assert all(
+        not hasattr(value, "requires_grad")
+        for plan in H._history_extension_plan_cache.values()
+        for site_plan in plan["site_plans"]
+        if site_plan is not None
+        for value in site_plan.values()
+    )
+
+
+def test_history_algorithm_four_reuses_structural_index_plan():
+    """Algorithm 4 compiles its ordered virtual-index merges once."""
+    H = _two_term_mpo()
+    first = H.extensive_exponential(0.01, order=2, mode="approximate")
+    second = H.extensive_exponential(0.02, order=2, mode="approximate")
+
+    assert first.metadata["approximation_plan_cache_hit"] is False
+    assert second.metadata["approximation_plan_cache_hit"] is True
+    assert H.history_cache_info["approximation_plan_orders"] == (2,)
+    actions = H._history_approximation_plan_cache[2]["actions"]
+    assert actions
+    assert all(
+        all(isinstance(value, int) for value in action)
+        for action in actions
+    )
+    assert all(
+        not hasattr(value, "requires_grad")
+        for plan in H._history_approximation_plan_cache.values()
+        for action in plan["actions"]
+        for value in action
+    )
+    uncached = H.extensive_exponential(
+        0.02,
+        order=2,
+        mode="approximate",
+        cache_history=False,
+        history_storage="streaming",
+    )
+    for cached_array, uncached_array in zip(second.arrays, uncached.arrays):
+        np.testing.assert_allclose(cached_array, uncached_array)
 
 
 def test_fixed_rank_compression_has_fixed_bonds_and_report():

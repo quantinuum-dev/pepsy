@@ -418,6 +418,59 @@ def _backend_index_2d(array, rows, columns):
     return array[rows[:, None], columns[None, :]]
 
 
+def _backend_index_pairs(array, rows, columns):
+    """Gather paired virtual entries on the active Autoray backend."""
+    rows = _as_backend(np.asarray(rows, dtype=int), like=array)
+    columns = _as_backend(np.asarray(columns, dtype=int), like=array)
+    return array[rows, columns]
+
+
+def _scatter_add_2d(array, rows, columns, values):
+    """Scatter-add paired virtual blocks without leaving the backend graph."""
+    backend = ar.infer_backend(array)
+    value_dtype = getattr(values, "dtype", None)
+    if value_dtype is not None and getattr(array, "dtype", None) != value_dtype:
+        array = ar.do("astype", array, value_dtype)
+    rows_np = np.asarray(rows, dtype=int)
+    columns_np = np.asarray(columns, dtype=int)
+
+    if backend == "numpy":
+        delta = np.zeros_like(array)
+        np.add.at(delta, (rows_np, columns_np), values)
+        return array + delta
+    if backend == "torch":
+        rows_backend = _as_backend(rows_np, like=array)
+        columns_backend = _as_backend(columns_np, like=array)
+        delta = ar.do("zeros_like", array)
+        delta = delta.index_put(
+            (rows_backend, columns_backend),
+            values,
+            accumulate=True,
+        )
+        return array + delta
+    if backend == "jax":
+        rows_backend = _as_backend(rows_np, like=array)
+        columns_backend = _as_backend(columns_np, like=array)
+        delta = ar.do("zeros_like", array)
+        delta = delta.at[(rows_backend, columns_backend)].add(values)
+        return array + delta
+    if backend == "cupy":
+        import cupy as cp  # pylint: disable=import-outside-toplevel
+
+        delta = cp.zeros_like(array)
+        cp.add.at(delta, (rows_np, columns_np), values)
+        return array + delta
+
+    # Keep an Autoray-compatible fallback for backends without a native
+    # scatter-add rule. The common NumPy/Torch/JAX/CuPy paths above are the
+    # performance-critical implementations.
+    delta = ar.do("zeros_like", array)
+    for row, column, value in zip(rows_np, columns_np, values):
+        current = delta[row, column]
+        delta = _setitem(delta, (row, column), current + value)
+    return array + delta
+
+
 def _array_equal(left, right):
     """Check exact equality without introducing a numerical cutoff."""
     # NumPy is the cheap path for ordinary arrays.  The Autoray fallback keeps
@@ -604,6 +657,7 @@ class FirstDegreeMPO:
         self._history_symbolic_cache = None
         self._history_extension_plan_cache = {}
         self._history_compression_plan_cache = {}
+        self._history_approximation_plan_cache = {}
         self._base_level_position_cache = None
         self._levels = self._normalize_levels(levels)
         self._validate()
@@ -713,6 +767,9 @@ class FirstDegreeMPO:
         out._history_symbolic_cache = self._history_symbolic_cache
         out._history_extension_plan_cache = self._history_extension_plan_cache
         out._history_compression_plan_cache = self._history_compression_plan_cache
+        out._history_approximation_plan_cache = (
+            self._history_approximation_plan_cache
+        )
         out._base_level_position_cache = self._base_level_position_cache
         return out
 
@@ -1798,6 +1855,9 @@ class FirstDegreeMPO:
             "compression_plan_orders": tuple(
                 sorted(self._history_compression_plan_cache),
             ),
+            "approximation_plan_orders": tuple(
+                sorted(self._history_approximation_plan_cache),
+            ),
             "extension_plan_orders": tuple(
                 sorted(self._history_extension_plan_cache),
             ),
@@ -2254,6 +2314,7 @@ class FirstDegreeMPO:
         one = MPOLevelToken(1)
         three = MPOLevelToken(3)
         batches = []
+        batches_by_site = [[] for _ in range(self.L)]
         selected_terms = 0
 
         for site in range(self.L):
@@ -2390,7 +2451,7 @@ class FirstDegreeMPO:
                         for factor in range(order + 1)
                     )
                     weight_matrix = left_weights[:, None] * right_weights[None, :]
-                    batches.append({
+                    batch = {
                         "site": site,
                         "left_targets": left_targets,
                         "right_targets": right_targets,
@@ -2399,11 +2460,82 @@ class FirstDegreeMPO:
                         "left_identity": left_identity,
                         "right_identity": right_identity,
                         "weights": weight_matrix,
-                    })
+                    }
+                    batches.append(batch)
+                    batches_by_site[site].append(batch)
                     selected_terms += int(left_targets.size * right_targets.size)
+
+        site_plans = []
+        for site, site_batches in enumerate(batches_by_site):
+            if not site_batches:
+                site_plans.append(None)
+                continue
+
+            left_targets = []
+            right_targets = []
+            weights = []
+            left_positions = [[] for _ in range(order + 1)]
+            right_positions = [[] for _ in range(order + 1)]
+            left_identity = [[] for _ in range(order + 1)]
+            right_identity = [[] for _ in range(order + 1)]
+            for batch in site_batches:
+                left_size = batch["left_targets"].size
+                right_size = batch["right_targets"].size
+                left_targets.append(
+                    np.repeat(batch["left_targets"], right_size),
+                )
+                right_targets.append(
+                    np.tile(batch["right_targets"], left_size),
+                )
+                weights.append(batch["weights"].reshape(-1))
+                for factor in range(order + 1):
+                    left_positions[factor].append(
+                        np.repeat(
+                            batch["left_positions"][factor],
+                            right_size,
+                        ),
+                    )
+                    right_positions[factor].append(
+                        np.tile(
+                            batch["right_positions"][factor],
+                            left_size,
+                        ),
+                    )
+                    left_identity[factor].append(
+                        np.repeat(
+                            batch["left_identity"][factor],
+                            right_size,
+                        ),
+                    )
+                    right_identity[factor].append(
+                        np.tile(
+                            batch["right_identity"][factor],
+                            left_size,
+                        ),
+                    )
+
+            site_plans.append({
+                "site": site,
+                "left_targets": np.concatenate(left_targets),
+                "right_targets": np.concatenate(right_targets),
+                "left_positions": tuple(
+                    np.concatenate(values) for values in left_positions
+                ),
+                "right_positions": tuple(
+                    np.concatenate(values) for values in right_positions
+                ),
+                "left_identity": tuple(
+                    np.concatenate(values) for values in left_identity
+                ),
+                "right_identity": tuple(
+                    np.concatenate(values) for values in right_identity
+                ),
+                "weights": np.concatenate(weights),
+            })
 
         plan = {
             "batches": tuple(batches),
+            "site_plans": tuple(site_plans),
             "selected_terms": selected_terms,
         }
         if cache_history:
@@ -2458,6 +2590,58 @@ class FirstDegreeMPO:
             )
         return product_block
 
+    def _history_local_product_site_batch(self, site_plan, order):
+        """Evaluate every selected Algorithm-3 product at one site together."""
+        site = site_plan["site"]
+        reference = self._arrays[site][0, 0]
+        product_block = None
+        for factor in range(order + 1):
+            left_positions = site_plan["left_positions"][factor]
+            right_positions = site_plan["right_positions"][factor]
+            left_valid = left_positions >= 0
+            right_valid = right_positions >= 0
+            safe_left = np.where(left_valid, left_positions, 0)
+            safe_right = np.where(right_valid, right_positions, 0)
+            local = _backend_index_pairs(
+                self._arrays[site],
+                safe_left,
+                safe_right,
+            )
+            valid = _as_backend(
+                left_valid & right_valid,
+                like=local,
+            )
+            local = ar.do(
+                "where",
+                valid[..., None, None],
+                local,
+                ar.do("zeros_like", local),
+            )
+            synthetic = _as_backend(
+                site_plan["left_identity"][factor]
+                & (~right_valid)
+                & site_plan["right_identity"][factor],
+                like=local,
+            )
+            if bool(
+                np.any(
+                    site_plan["right_identity"][factor] & ~right_valid,
+                )
+            ):
+                identity = ar.do("eye", self.phys_dim, like=reference)
+                local = ar.do(
+                    "where",
+                    synthetic[..., None, None],
+                    identity,
+                    local,
+                )
+            product_block = (
+                local
+                if product_block is None
+                else ar.do("matmul", product_block, local)
+            )
+        return product_block
+
     def _algorithm_three_extension(
         self,
         arrays,
@@ -2479,45 +2663,44 @@ class FirstDegreeMPO:
             order,
             cache_history=cache_history,
         )
-        for batch in plan["batches"]:
-            site = batch["site"]
-            extension = self._history_local_product_batch(batch, order)
-            weights = _as_backend(batch["weights"], like=extension)
+        for site_plan in plan["site_plans"]:
+            if site_plan is None:
+                continue
+            site = site_plan["site"]
+            extension = self._history_local_product_site_batch(
+                site_plan,
+                order,
+            )
+            weights = _as_backend(site_plan["weights"], like=extension)
             extension = ar.do(
                 "multiply",
                 extension,
                 weights[..., None, None],
             )
-            current = _backend_index_2d(
+            arrays[site] = _scatter_add_2d(
                 arrays[site],
-                batch["left_targets"],
-                batch["right_targets"],
-            )
-            arrays[site] = _setitem(
-                arrays[site],
-                (
-                    batch["left_targets"][:, None],
-                    batch["right_targets"][None, :],
-                ),
-                current + _multiply_scalar(dt, extension),
+                site_plan["left_targets"],
+                site_plan["right_targets"],
+                _multiply_scalar(dt, extension),
             )
         return plan["selected_terms"], cache_hit
 
-    def _algorithm_four(self, arrays, levels, order, dt):
-        """Apply the paper's order-controlled approximate compression.
+    def _history_approximation_plan(self, levels, order, *, cache_history):
+        """Compile Algorithm 4's ordered structural merge actions."""
+        if cache_history:
+            cached = self._history_approximation_plan_cache.get(order)
+            if cached is not None:
+                return cached, True
 
-        This approximation is coefficient-aware and analytical; it is not a
-        substitute for a numerical SVD compression.  Keeping it as an opt-in
-        pass leaves room for a future policy object that can combine this step
-        with explicit backend truncation tolerances.
-        """
-        removed = 0
+        working = [list(bond_levels) for bond_levels in levels]
+        actions = []
         for bond in range(1, self.L + 1):
             while True:
-                source = None
-                target = None
+                positions = self._history_level_positions(working[bond])
+                source_history = None
+                canonical = None
                 number_of_threes = None
-                for pos, level in enumerate(levels[bond]):
+                for level in tuple(working[bond]):
                     history = level.history
                     if any(_level_number(token) == 1 for token in history):
                         continue
@@ -2526,34 +2709,72 @@ class FirstDegreeMPO:
                     )
                     if count == 0:
                         continue
-                    canonical = tuple(
+                    candidate = tuple(
                         MPOLevelToken(
                             1 if _level_number(token) == 3 else token.level,
                             token.payload,
                         )
                         for token in history
                     )
-                    target_pos = self._find_history(levels[bond], canonical)
-                    if target_pos is None or target_pos == pos:
+                    source = positions.get(history)
+                    target = positions.get(candidate)
+                    if source is None or target is None or source == target:
                         continue
-                    source = pos
-                    target = target_pos
+                    source_history = history
+                    canonical = candidate
                     number_of_threes = count
                     break
-                if source is None:
+                if source_history is None:
                     break
-                coefficient = (
-                    dt ** number_of_threes
-                    * factorial(order - number_of_threes)
-                    / factorial(order)
-                    if number_of_threes <= order
-                    else 0.0
-                )
-                self._remove_history_column(
-                    arrays, levels, bond, source, target, coefficient,
-                )
-                removed += 1
-        return removed
+                actions.append((
+                    bond,
+                    positions[source_history],
+                    positions[canonical],
+                    number_of_threes,
+                ))
+                working[bond].pop(positions[source_history])
+
+        plan = {"actions": tuple(actions)}
+        if cache_history:
+            self._history_approximation_plan_cache[order] = plan
+        return plan, False
+
+    def _algorithm_four(
+        self,
+        arrays,
+        levels,
+        order,
+        dt,
+        *,
+        cache_history=True,
+    ):
+        """Apply the paper's order-controlled approximate compression.
+
+        The merge schedule is structural and compiled once per Taylor order.
+        Coefficients are evaluated during every numerical pass so ``dt`` can
+        remain a backend value connected to an autodiff graph.
+        """
+        plan, cache_hit = self._history_approximation_plan(
+            levels,
+            order,
+            cache_history=cache_history,
+        )
+        removed = 0
+        for bond, source, target, number_of_threes in plan["actions"]:
+            if source >= len(levels[bond]) or target >= len(levels[bond]):
+                continue
+            coefficient = (
+                dt ** number_of_threes
+                * factorial(order - number_of_threes)
+                / factorial(order)
+                if number_of_threes <= order
+                else 0.0
+            )
+            self._remove_history_column(
+                arrays, levels, bond, source, target, coefficient,
+            )
+            removed += 1
+        return removed, cache_hit
 
     def _contract_history_boundaries(self, arrays, levels, order):
         """Impose the finite-chain all-one boundary vectors.
@@ -2644,9 +2865,16 @@ class FirstDegreeMPO:
             plan=compression_plan,
         )
         approximate_merges = 0
+        approximation_plan_cache_hit = False
         if approximate:
-            approximate_merges = self._algorithm_four(
-                arrays, levels, order, dt,
+            approximate_merges, approximation_plan_cache_hit = (
+                self._algorithm_four(
+                    arrays,
+                    levels,
+                    order,
+                    dt,
+                    cache_history=cache_history,
+                )
             )
         self._contract_history_boundaries(arrays, levels, order)
         final_bond_dimensions = tuple(
@@ -2670,6 +2898,7 @@ class FirstDegreeMPO:
             "history_cache_hit": history_cache_hit,
             "compression_plan_cache_hit": compression_plan_cache_hit,
             "extension_plan_cache_hit": extension_plan_cache_hit,
+            "approximation_plan_cache_hit": approximation_plan_cache_hit,
             "algorithms": (1, 2) + ((3,) if extend else ()) + ((4,) if approximate else ()),
             "exact_history_merges": len(exact_merges),
             "approximate_history_merges": approximate_merges,
@@ -2702,6 +2931,7 @@ class FirstDegreeMPO:
             self._history_symbolic_cache = None
             self._history_extension_plan_cache.pop(order, None)
             self._history_compression_plan_cache.pop(order, None)
+            self._history_approximation_plan_cache.pop(order, None)
         return output
 
     def _first_degree_structure(self):
@@ -3337,6 +3567,9 @@ class MPOBasis:
         )
         result._history_compression_plan_cache = (
             self._template._history_compression_plan_cache
+        )
+        result._history_approximation_plan_cache = (
+            self._template._history_approximation_plan_cache
         )
         result.metadata.update({
             "operation": "mpo_basis_build",
