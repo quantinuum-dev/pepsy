@@ -14,6 +14,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Core package facades now resolve implementation modules lazily, and the test
+  suite exposes explicit `core`, `optional`, and responsibility-based domain
+  markers with a scheduled full-suite workflow.
+- The top-level `pepsy` namespace is documented and guarded as a frozen
+  compatibility facade; new advanced APIs should live in their owning domain
+  or under `pepsy.experimental`.
 - Accelerated contraction search is now optional through the `contraction`
   extra. Without it, reusable contraction optimizers fall back to Cotengra's
   built-in `sbplx` search and native Python pathfinders.
@@ -37,6 +43,9 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Stabilizer planner diagnostics now explicitly describe when a cap changes
+  the logical MPS width, preserving the warning contract for unavailable
+  static-frame candidates.
 - Native Symmray MPS compression now measures non-unitary target norms from a
   sector-preserving canonical active-span overlap instead of constructing a
   routed target copy, and native bosonic FIT reuses audited reversed-sweep

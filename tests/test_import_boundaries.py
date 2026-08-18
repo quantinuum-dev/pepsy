@@ -23,6 +23,17 @@ _OPTIONAL_ROOTS = (
     "torch",
 )
 
+_CORE_MODULES = (
+    "pepsy.backends",
+    "pepsy.boundary",
+    "pepsy.fitting",
+    "pepsy.interop",
+    "pepsy.operators",
+    "pepsy.sampling",
+    "pepsy.solvers",
+    "pepsy.tensors",
+)
+
 
 def _run_clean_import(script: str) -> set[str]:
     """Run an import probe with only Pepsy's source tree added."""
@@ -46,6 +57,28 @@ def test_import_pepsy_does_not_load_optional_backends():
         f"""
 import sys
 import pepsy
+
+roots = {roots}
+print(*sorted(
+    name for name in sys.modules
+    if any(name == root or name.startswith(root + '.') for root in roots)
+))
+"""
+    )
+    assert not loaded
+
+
+def test_core_namespaces_do_not_load_optional_backends():
+    """Core namespace discovery must remain independent of optional stacks."""
+    modules = repr(_CORE_MODULES)
+    roots = repr(_OPTIONAL_ROOTS)
+    loaded = _run_clean_import(
+        f"""
+import importlib
+import sys
+
+for module_name in {modules}:
+    importlib.import_module(module_name)
 
 roots = {roots}
 print(*sorted(

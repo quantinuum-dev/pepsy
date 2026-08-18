@@ -1,48 +1,36 @@
-"""Boundary-MPS contraction tools for PEPS-like tensor networks."""
+"""Lazy boundary-MPS contraction tools for PEPS-like tensor networks."""
 
 from importlib import import_module
 
-from .metrics import (
-    BoundaryContractResult,
-    boundary_norm,
-    build_bra_ket,
-    contract_boundary,
-    contract_flat,
-    infidelity,
-    normalize,
-    peps_fidelity,
-    peps_infidelity,
-    peps_norm,
-    peps_normalize,
-    quimb_ctmrg_projector_compat,
-)
-from .states import BdyMPS, make_numpy_array_caster
-from .sweeps import BoundaryFitDiagnostic, CompBdy
 
-__all__ = [
-    "BdyMPS",
-    "BoundaryContractResult",
-    "BoundaryFitDiagnostic",
-    "CompBdy",
-    "boundary_norm",
-    "build_bra_ket",
-    "contract_boundary",
-    "contract_flat",
-    "infidelity",
-    "make_numpy_array_caster",
-    "normalize",
-    "peps_fidelity",
-    "peps_infidelity",
-    "peps_norm",
-    "peps_normalize",
-    "quimb_ctmrg_projector_compat",
-    "metrics",
-    "states",
-    "sweeps",
-]
+_SYMBOL_MODULES = {
+    "BoundaryContractResult": ".metrics",
+    "boundary_norm": ".metrics",
+    "build_bra_ket": ".metrics",
+    "contract_boundary": ".metrics",
+    "contract_flat": ".metrics",
+    "infidelity": ".metrics",
+    "normalize": ".metrics",
+    "peps_fidelity": ".metrics",
+    "peps_infidelity": ".metrics",
+    "peps_norm": ".metrics",
+    "peps_normalize": ".metrics",
+    "quimb_ctmrg_projector_compat": ".metrics",
+    "BdyMPS": ".states",
+    "make_numpy_array_caster": ".states",
+    "BoundaryFitDiagnostic": ".sweeps",
+    "CompBdy": ".sweeps",
+}
+
+__all__ = [*_SYMBOL_MODULES, "metrics", "states", "sweeps"]
 
 
 def __getattr__(name):
+    module_name = _SYMBOL_MODULES.get(name)
+    if module_name is not None:
+        value = getattr(import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
     if name in {"metrics", "states", "sweeps"}:
         return import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

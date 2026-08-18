@@ -25,6 +25,9 @@ _CORE_MODULES = (
 _ADVANCED_MODULES = ("bp", "experimental", "vmc")
 _MODULE_EXPORTS = set(_CORE_MODULES) | set(_ADVANCED_MODULES)
 
+# Compatibility facade. This symbol-to-namespace map is a frozen API surface:
+# keep existing aliases working, but add new public functionality to its
+# owning domain namespace (or ``pepsy.experimental``), not to this root map.
 _SYMBOL_MODULES = {
     # Boundary and backend helpers.
     "BdyMPS": ".boundary",

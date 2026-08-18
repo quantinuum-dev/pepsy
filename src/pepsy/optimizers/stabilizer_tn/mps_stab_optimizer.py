@@ -1357,7 +1357,7 @@ class MpsStabOptimizer:
             )
         if counts["cap"]:
             warnings.append(
-                "Cap entries change the qubit/MPS length and disable static "
+                "A cap changes the qubit/MPS length and disables static "
                 "stream-layout assumptions past the cap."
             )
 

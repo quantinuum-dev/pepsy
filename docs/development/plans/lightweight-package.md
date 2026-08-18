@@ -1,6 +1,6 @@
 # Lightweight package plan
 
-Status: proposed, phase 0 complete
+Status: active, phases 0-3 complete
 Last updated: 2026-08-18
 Owner: Pepsy maintainers
 
@@ -18,14 +18,14 @@ At commit `cc4b2d9` the repository contains approximately:
 - 74k lines under `optimizers`, 23k under `bp`, and 23k under `vmc`;
 - 1,800 test declarations across 48 test files.
 
-The package has seven mandatory dependencies: NumPy, Quimb, Cotengra,
-Cotengrust, CMA-ES, Autoray, and tqdm. Torch, JAX/NetKet, Symmray, Stim,
+The package has five direct mandatory dependencies: NumPy, Quimb, Cotengra,
+Autoray, and tqdm. Torch, JAX/NetKet, Symmray, Stim,
 SciPy/NLopt, Nevergrad, Guppy, and plotting dependencies are already optional
 extras.
 
-The top-level `pepsy` facade and `pepsy.experimental` use lazy imports. This
-is a good foundation, but it needs explicit regression tests so optional
-dependencies cannot leak into the core import path.
+The top-level `pepsy` facade, core domain facades, and `pepsy.experimental`
+use lazy imports. Explicit regression tests prevent optional dependencies from
+leaking into the core import path.
 
 ## Dependency audit — 2026-08-18
 
@@ -50,6 +50,12 @@ itself remove shared runtime dependencies from the base installation.
 
 The current base metadata consequently has five mandatory dependencies; the
 `contraction` extra restores the previous accelerated-search profile.
+
+Core namespace facades now resolve their implementation modules lazily, so
+importing `pepsy.backends`, `pepsy.boundary`, `pepsy.fitting`, `pepsy.interop`,
+`pepsy.solvers`, or the other stable domains does not load Torch, SciPy, JAX,
+Symmray, Stim, NetKet, or Nevergrad. The accelerated implementation remains
+available when its public symbol is requested.
 
 ## Target architecture
 
@@ -82,6 +88,8 @@ boundary, not an immediate package rename or compatibility break.
 ### 1. Import and test contracts
 
 - Add tests proving a fresh `import pepsy` does not import optional backends.
+- Add tests proving documented core namespace imports do not import optional
+  backends.
 - Add focused optional-dependency error tests with actionable install hints.
 - Replace broad file-based test classification with explicit core/domain
   markers where practical.
@@ -94,7 +102,13 @@ boundary, not an immediate package rename or compatibility break.
 - Keep backend-specific dependencies lazy at module and function boundaries.
 - Add minimal-install and wheel smoke checks to CI.
 
-### 3. Domain decomposition
+### 3. Test tiers and scheduled validation
+
+- Tag tests with `core`, `optional`, and responsibility-based domain markers.
+- Keep the default `smoke` profile deterministic and fast.
+- Run the complete available extended suite, including slow tests, nightly.
+
+### 4. Domain decomposition
 
 - Keep stable MPS/MPO/PEPS code cohesive.
 - Reduce cross-imports from core into BP, tree, QMERA, stabilizer, and VMC.

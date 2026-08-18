@@ -17,6 +17,18 @@ The stable core is intended for normal application code:
 Stable APIs follow semantic versioning, include regression tests, and receive
 deprecation warnings before removal whenever practical.
 
+## Top-level compatibility facade
+
+The top-level `pepsy` namespace is a frozen compatibility facade. Existing
+root-level names remain available through lazy aliases, but new public names
+should be added to their responsibility-based namespace instead of expanding
+`pepsy.__init__`. Advanced functionality belongs in its explicit domain module
+or under `pepsy.experimental`.
+
+Any proposed root-level addition requires an API-stability review and a
+regression test. This policy prevents the root namespace from becoming a
+second, eager import surface while preserving existing user code.
+
 ## Advanced and experimental domains
 
 BP, MERA, stabilizer tensor networks, tree tensor networks, Symmray-specific

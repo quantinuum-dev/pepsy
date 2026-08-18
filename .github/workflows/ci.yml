@@ -32,6 +32,7 @@ jobs:
       NUMBA_DISABLE_CACHING: "1"
       PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
       MPLCONFIGDIR: /tmp/mplconfig_pepsy
+      MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

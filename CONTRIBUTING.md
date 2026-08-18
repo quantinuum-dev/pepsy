@@ -21,6 +21,18 @@ python -m pip install -e ".[dev,test-extended]"
 pytest -q -o addopts=""
 ```
 
+Test tiers and domain markers are available when a narrower pass is useful:
+
+```bash
+pytest -q -o addopts="" -m "core and not optional"
+pytest -q -o addopts="" -m optional
+pytest -q -o addopts="" -m vmc       # replace with bp, tree, peps, or another domain
+```
+
+The `core and not optional` profile is the dependency-light API contract;
+`core` without the exclusion includes stable APIs exercised through optional
+backends. The full command includes all domain and slow tests.
+
 Use the smallest relevant optional profile when developing a backend:
 
 - `.[contraction]` for accelerated Cotengra path search;
