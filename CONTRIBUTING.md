@@ -33,6 +33,13 @@ The `core and not optional` profile is the dependency-light API contract;
 `core` without the exclusion includes stable APIs exercised through optional
 backends. The full command includes all domain and slow tests.
 
+To measure the local import boundary without importing an advanced domain:
+
+```bash
+python -X importtime -c "import pepsy" 2> /tmp/pepsy-importtime.txt
+tail -n 1 /tmp/pepsy-importtime.txt
+```
+
 Use the smallest relevant optional profile when developing a backend:
 
 - `.[contraction]` for accelerated Cotengra path search;

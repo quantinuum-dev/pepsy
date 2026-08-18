@@ -90,8 +90,17 @@ jobs:
       - name: Smoke test wheel installation
         run: |
           smoke_dir="$(mktemp -d)"
-          python -m venv "$smoke_dir/venv"
-          "$smoke_dir/venv/bin/pip" install --no-deps dist/*.whl
+          python -m venv "$smoke_dir/no-deps-venv"
           expected_version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
-          EXPECTED_VERSION="$expected_version" "$smoke_dir/venv/bin/python" -c \
+          "$smoke_dir/no-deps-venv/bin/pip" install --no-deps dist/*.whl
+          EXPECTED_VERSION="$expected_version" "$smoke_dir/no-deps-venv/bin/python" -c \
             "import importlib.metadata as md, os, pepsy; expected=os.environ['EXPECTED_VERSION']; actual=md.version('pepsy'); assert pepsy.__version__ == actual == expected; assert hasattr(pepsy, 'experimental')"
+      - name: Smoke test base dependency installation
+        run: |
+          smoke_dir="$(mktemp -d)"
+          python -m venv "$smoke_dir/venv"
+          "$smoke_dir/venv/bin/pip" install dist/*.whl
+          "$smoke_dir/venv/bin/python" -c \
+            "import pepsy; import pepsy.backends, pepsy.boundary, pepsy.fitting, pepsy.interop, pepsy.solvers, pepsy.tensors"
+          "$smoke_dir/venv/bin/python" -X importtime -c "import pepsy" 2> "$smoke_dir/importtime.txt"
+          tail -n 1 "$smoke_dir/importtime.txt"

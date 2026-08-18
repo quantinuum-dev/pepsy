@@ -51,6 +51,21 @@ itself remove shared runtime dependencies from the base installation.
 The current base metadata consequently has five mandatory dependencies; the
 `contraction` extra restores the previous accelerated-search profile.
 
+### Transitive runtime weight
+
+The direct requirement count is not the same as the clean-install footprint.
+Quimb's current metadata brings in `autoray`, `cotengra`, `cytoolz`, `numba`,
+`numpy`, `psutil`, `scipy`, and `tqdm` for its standard tensor-network route.
+Cotengra is therefore both a direct Pepsy dependency and a Quimb runtime
+dependency. This explains why the base wheel is smaller and the import path is
+lighter without claiming that a base installation is numerically lightweight.
+
+The next material reduction would require replacing or isolating Quimb's
+standard contraction route, or upstreaming a supported lighter Quimb profile.
+That is a separate benchmark and compatibility project; it is not safe to
+solve by merely moving `cotengra` to an extra while keeping the same Quimb
+runtime path.
+
 Core namespace facades now resolve their implementation modules lazily, so
 importing `pepsy.backends`, `pepsy.boundary`, `pepsy.fitting`, `pepsy.interop`,
 `pepsy.solvers`, or the other stable domains does not load Torch, SciPy, JAX,
