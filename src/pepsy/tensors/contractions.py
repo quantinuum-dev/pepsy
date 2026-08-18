@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 from typing import Any
+import warnings
 
 import autoray as ar
 import cotengra as ctg
@@ -14,16 +17,39 @@ __all__ = [
     "tn_norm",
 ]
 
-def _ensure_cotengrust():
-    """Import cotengrust so cotengra can use accelerated pathfinders."""
+def _optional_import(name: str):
+    """Import an optional acceleration module, returning ``None`` if absent."""
     try:
-        import cotengrust as ctgr  # pylint: disable=import-outside-toplevel
-    except ImportError as exc:  # pragma: no cover - exercised by packaging/env failures
-        raise ImportError(
-            "Pepsy requires 'cotengrust' for accelerated cotengra path search. "
-            "Install it with: pip install cotengrust"
-        ) from exc
-    return ctgr
+        return importlib.import_module(name)
+    except ImportError:
+        return None
+
+
+def _module_available(name: str) -> bool:
+    """Return whether an optional module can be found by the active importer."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def _ensure_cotengrust():
+    """Import cotengrust when available so Cotengra can accelerate pathfinding."""
+    return _optional_import("cotengrust")
+
+
+def _resolve_optlib(optlib: str | None) -> str | None:
+    """Resolve the hyper-optimizer library with a dependency-light fallback."""
+    if optlib == "cmaes" and not _module_available("cmaes"):
+        warnings.warn(
+            "CMA-ES is unavailable; falling back to Cotengra's built-in "
+            "'sbplx' hyper-optimizer. Install pepsy[contraction] for the "
+            "accelerated CMA-ES search.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return "sbplx"
+    return optlib
 
 
 def build_optimizer(
@@ -43,9 +69,10 @@ def build_optimizer(
 ):
     """Build a reusable cotengra contraction optimizer.
 
-    ``cotengrust`` is imported up front so cotengra's ``accel="auto"``
-    pathfinders can use the Rust implementations when constructing greedy,
-    random-greedy, optimal, and reconfiguration paths.
+    ``cotengrust`` is imported when available so cotengra's ``accel="auto"``
+    pathfinders can use the Rust implementations. Without it, Cotengra uses
+    its native Python pathfinders. If CMA-ES is unavailable, the built-in
+    ``sbplx`` hyper-optimizer is selected instead.
 
     Parameters
     ----------
@@ -79,6 +106,7 @@ def build_optimizer(
         Options for interleaved slicing and reconfiguration.
     """
     _ensure_cotengrust()
+    optlib = _resolve_optlib(optlib)
 
     # cotengra expects directory to be str, True, or None — not False.
     if directory is False:

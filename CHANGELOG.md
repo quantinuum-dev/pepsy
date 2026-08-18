@@ -14,6 +14,9 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Accelerated contraction search is now optional through the `contraction`
+  extra. Without it, reusable contraction optimizers fall back to Cotengra's
+  built-in `sbplx` search and native Python pathfinders.
 - MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
   `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
   and `stabilize_unitary` now covers DMRG, mixed MPO warm-up/fallback, and the

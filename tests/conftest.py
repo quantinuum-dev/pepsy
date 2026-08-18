@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 _SMOKE_MODULES = frozenset(
     {
         "test_backends.py",
+        "test_contraction_dependencies.py",
         "test_import_boundaries.py",
         "test_package_layout.py",
         "test_public_api.py",

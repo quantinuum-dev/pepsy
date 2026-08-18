@@ -23,6 +23,7 @@ pytest -q -o addopts=""
 
 Use the smallest relevant optional profile when developing a backend:
 
+- `.[contraction]` for accelerated Cotengra path search;
 - `.[symmetry]` for Symmray-backed tensors;
 - `.[stabilizer]` for Stim-backed stabilizer workflows;
 - `.[vmc-torch]` or `.[vmc-netket]` for VMC integrations;

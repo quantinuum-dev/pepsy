@@ -14,8 +14,6 @@ dependencies = [
   "numpy>=1.24",
   "quimb>=1.8",
   "cotengra>=0.6",
-  "cotengrust>=0.1",
-  "cmaes>=0.10",
   "autoray>=0.6",
   "tqdm>=4.65",
 ]
@@ -26,6 +24,7 @@ Repository = "https://github.com/quantinuum-dev/pepsy"
 Issues = "https://github.com/quantinuum-dev/pepsy/issues"
 
 [project.optional-dependencies]
+contraction = ["cotengrust>=0.1", "cmaes>=0.10"]
 torch = ["torch>=2.0"]
 solvers = ["scipy>=1.10", "nlopt>=2.7"]
 viz = ["matplotlib>=3.7"]

@@ -39,12 +39,17 @@ The first static audit found:
 - `cmaes` is selected by the current default Cotengra optimizer string rather
   than imported directly by Pepsy.
 
-Therefore these dependencies must remain mandatory for now. The first safe
-dependency reduction is to define a contraction-provider boundary, implement
-and benchmark a non-Cotengra fallback, and only then move the accelerated
-providers behind an extra. qMERA can be isolated behind its existing advanced
-namespace independently, but that does not by itself remove shared runtime
-dependencies from the base installation.
+Cotengra remains mandatory because it is part of the shared Quimb contraction
+route. The first safe reduction is now implemented: Cotengrust is best-effort,
+and missing CMA-ES falls back to Cotengra's built-in `sbplx` search. Both
+acceleration packages are available through the `[contraction]` extra. A
+future removal of Cotengra itself still requires a separate provider boundary,
+fallback implementation, and benchmark campaign. qMERA can be isolated
+behind its existing advanced namespace independently, but that does not by
+itself remove shared runtime dependencies from the base installation.
+
+The current base metadata consequently has five mandatory dependencies; the
+`contraction` extra restores the previous accelerated-search profile.
 
 ## Target architecture
 
