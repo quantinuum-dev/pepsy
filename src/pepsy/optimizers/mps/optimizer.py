@@ -5793,6 +5793,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("MPO batch produced non-finite MPS tensor data.")
 
+    def _run_mix_dmrg(self, *args, fit_block_size, **kwargs):
+        """Run mixed DMRG, promoting fixed-rank handoff to DMRG2."""
+        dmrg2_handoff = int(fit_block_size) == 1
+        old_dmrg_alias = self._dmrg_mode_alias
+        old_dmrg_block_size = self._dmrg_mode_block_size
+        if dmrg2_handoff:
+            self._dmrg_mode_alias = "dmrg2"
+            self._dmrg_mode_block_size = 2
+            fit_block_size = 2
+        kwargs["fit_block_size"] = fit_block_size
+        try:
+            return self._run_dmrg(*args, **kwargs)
+        finally:
+            self._dmrg_mode_alias = old_dmrg_alias
+            self._dmrg_mode_block_size = old_dmrg_block_size
+
     def _run_mix_dmrg_step(
         self,
         gate,
@@ -5814,7 +5830,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         stabilize_unitary=True,
     ):
         """Apply one mixed-mode step through the DMRG backend."""
-        self._run_dmrg(
+        self._run_mix_dmrg(
             [gate],
             [where],
             n_iter=n_iter,
@@ -5860,7 +5876,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         stabilize_unitary=True,
     ):
         """Apply a contiguous two-site batch through the DMRG backend."""
-        self._run_dmrg(
+        self._run_mix_dmrg(
             G_seq,
             where_seq,
             n_iter=n_iter,
@@ -6293,8 +6309,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Apply unitary transactional FIT with an MPO fallback.
 
-        Block FIT grows active bonds directly. The MPO rank warm-up is retained
-        only when the caller explicitly selects one-site FIT.
+        Block FIT grows active bonds directly. When the caller explicitly
+        selects one-site FIT, the MPO rank warm-up hands off to a DMRG2-style
+        two-site phase followed by one-site refinement.
         """
         mix_started = (
             time.perf_counter() if self._timing_state is not None else None

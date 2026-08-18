@@ -901,6 +901,42 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
+def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
+    """MPO rank warm-up should feed the DMRG2 two-site/one-site schedule."""
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 1)),
+        (qu.CNOT(), (1, 2)),
+        (qu.CNOT(), (0, 2)),
+    ]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+    out = opt.run(
+        progbar=False,
+        cutoff=1e-12,
+        n_iter=3,
+        fit_block_size=1,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    assert out.max_bond() <= 2
+    assert [event["backend"] for event in opt.mix_history] == [
+        "mpo",
+        "mpo",
+        "mpo",
+        "dmrg",
+    ]
+    fit_steps = opt.get_run_timing()["fit_steps"]
+    assert [record["block_size"] for record in fit_steps] == [2, 2, 1]
+    diagnostics = opt.get_fit_diagnostics()
+    assert diagnostics["adaptive_sweeps"] == 2
+    assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert opt.last_mix_summary["mpo_steps"] == 3
+    assert opt.last_mix_summary["dmrg_steps"] == 1
+
+
 def test_mps_optimizer_mix_one_site_fast_path_keeps_input_identity():
     """Mixed mode should apply one-site gates without a DMRG trial copy."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=17)

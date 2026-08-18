@@ -199,7 +199,9 @@ sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
 optimizer passes the current MPS directly to FIT without pre-padding bonds;
 only bonds visited by the native splits can grow. `fit_block_size=1` retains
 the fixed-rank compatibility algorithm, for which mixed mode still warms short
-active bonds through MPO. Standalone one-site gates use the exact direct/MPO
+active bonds through MPO. After that warm-up, mixed mode hands off to the
+`dmrg2` schedule: two two-site sweeps followed by one-site refinement.
+Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
 the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive,
 but named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
