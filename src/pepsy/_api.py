@@ -101,6 +101,7 @@ _SYMBOL_MODULES = {
     "MpsEnergyOptimizer": ".optimizers",
     "MpsOptimizer": ".optimizers",
     "MpsStabOptimizer": ".optimizers",
+    "MPIRankDiagnostics": ".optimizers",
     "MPIShotError": ".optimizers",
     "MPIShotResult": ".optimizers",
     "MPIShotRunner": ".optimizers",

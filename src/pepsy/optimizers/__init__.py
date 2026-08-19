@@ -32,6 +32,7 @@ _SYMBOL_MODULES = {
     "MpoOptimizer": ".mpo",
     "MpoChannelEvent": ".mpo",
     "MpsOptimizer": ".mps",
+    "MPIRankDiagnostics": ".mpi",
     "MPIShotError": ".mpi",
     "MPIShotResult": ".mpi",
     "MPIShotRunner": ".mpi",

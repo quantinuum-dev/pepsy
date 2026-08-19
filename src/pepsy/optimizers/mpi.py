@@ -11,6 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from numbers import Integral
+import os
+from pathlib import Path
+import pickle
+import tempfile
+import time
 import traceback
 from typing import Any, Callable, Mapping
 
@@ -18,14 +23,21 @@ import numpy as np
 
 from .noise import (
     NoisyResult,
+    NoisyShotResult,
     TrajectoryEvent,
+    TrajectoryShotResult,
     TrajectoryStreamPlan,
     _as_entries,
     run_noisy_shots,
     run_trajectory_shots,
 )
 
-__all__ = ["MPIShotError", "MPIShotResult", "MPIShotRunner"]
+__all__ = [
+    "MPIRankDiagnostics",
+    "MPIShotError",
+    "MPIShotResult",
+    "MPIShotRunner",
+]
 
 
 def _load_mpi():
@@ -67,6 +79,239 @@ def _validate_retain(retain):
     if retain not in {"none", "final", "all"}:
         raise ValueError("retain must be 'none', 'final', or 'all'.")
     return retain
+
+
+def _validate_checkpoint_path(path):
+    if path is None:
+        return None
+    try:
+        path = os.fspath(path)
+    except TypeError as exc:
+        raise TypeError("checkpoint_path must be a path-like value or None.") from exc
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    path = str(path)
+    if not path.strip():
+        raise ValueError("checkpoint_path must not be empty.")
+    return path
+
+
+def _validate_checkpoint_keep(keep):
+    if isinstance(keep, bool) or not isinstance(keep, Integral) or keep < 1:
+        raise ValueError("checkpoint_keep must be a positive integer.")
+    return int(keep)
+
+
+def _rank_checkpoint_path(checkpoint_path, rank):
+    return Path(f"{checkpoint_path}.rank{int(rank)}.pkl")
+
+
+def _rank_checkpoint_snapshot_path(checkpoint_path, rank, progress):
+    return Path(f"{checkpoint_path}.rank{int(rank)}.step{int(progress)}.pkl")
+
+
+def _checkpoint_snapshot_paths(checkpoint_path, rank):
+    latest = _rank_checkpoint_path(checkpoint_path, rank)
+    prefix = f"{Path(checkpoint_path).name}.rank{int(rank)}.step"
+    candidates = []
+    for path in latest.parent.glob(f"{prefix}*.pkl"):
+        suffix = path.name[len(prefix) : -len(".pkl")]
+        try:
+            progress = int(suffix)
+        except ValueError:
+            continue
+        candidates.append((progress, path))
+    return tuple(path for _progress, path in sorted(candidates, reverse=True))
+
+
+def _checkpoint_candidates(checkpoint_path, rank):
+    latest = _rank_checkpoint_path(checkpoint_path, rank)
+    return (latest,) + _checkpoint_snapshot_paths(checkpoint_path, rank)
+
+
+def _checkpoint_exists(checkpoint_path, rank):
+    return any(path.exists() for path in _checkpoint_candidates(checkpoint_path, rank))
+
+
+def _write_checkpoint(path, state):
+    """Atomically and durably write one trusted local checkpoint."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_checkpoint(path):
+    """Read one trusted local streaming checkpoint."""
+    with Path(path).open("rb") as handle:
+        state = pickle.load(handle)
+    if not isinstance(state, Mapping):
+        raise ValueError("checkpoint payload must be a mapping.")
+    return state
+
+
+_CHECKPOINT_VERSION = 1
+
+
+def _validate_checkpoint_state(
+    state,
+    *,
+    shots,
+    start,
+    stop,
+    world_size,
+    rank,
+    strategy,
+    chunk_size,
+    seed,
+    mode,
+    retain,
+):
+    if state.get("version") != _CHECKPOINT_VERSION:
+        raise ValueError("unsupported MPI checkpoint version.")
+    expected = {
+        "shots": int(shots),
+        "start": int(start),
+        "stop": int(stop),
+        "world_size": int(world_size),
+        "rank": int(rank),
+        "strategy": str(strategy),
+        "chunk_size": int(chunk_size),
+        "mode": str(mode),
+        "retain": str(retain),
+    }
+    for name, value in expected.items():
+        if state.get(name) != value:
+            raise ValueError(f"checkpoint metadata mismatch for {name!r}.")
+    try:
+        root_seed = tuple(int(value) for value in state["root_seed"])
+        next_shot = int(state["next_shot"])
+        denominator = float(state["denominator"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("checkpoint is missing valid progress metadata.") from exc
+    if len(root_seed) != 4:
+        raise ValueError("checkpoint root_seed must contain four integers.")
+    if seed is not None and root_seed != _seed_material(seed):
+        raise ValueError("checkpoint seed does not match the requested seed.")
+    if not int(start) <= next_shot <= int(stop):
+        raise ValueError("checkpoint next_shot is outside the local shot range.")
+    if not np.isfinite(denominator) or denominator < 0.0:
+        raise ValueError("checkpoint denominator must be finite and nonnegative.")
+    if mode == "streaming":
+        if "numerator" not in state:
+            raise ValueError("checkpoint is missing its observable numerator.")
+        if "denominator" not in state:
+            raise ValueError("checkpoint is missing its observable denominator.")
+    elif mode == "optimizer_state":
+        if "local_result" not in state:
+            raise ValueError("checkpoint is missing its retained local result.")
+        if state["local_result"] is not None and not isinstance(
+            state["local_result"], NoisyResult
+        ):
+            raise ValueError("checkpoint retained local result is invalid.")
+    else:
+        raise ValueError(f"unsupported MPI checkpoint mode {mode!r}.")
+    return root_seed, next_shot, state
+
+
+def _load_checkpoint(
+    checkpoint_path,
+    rank,
+    *,
+    validator,
+):
+    """Load the newest valid checkpoint, falling back through retained copies."""
+    failures = []
+    for path in _checkpoint_candidates(checkpoint_path, rank):
+        if not path.exists():
+            continue
+        try:
+            state = _read_checkpoint(path)
+            return path, validator(state)
+        except BaseException as exc:  # report all fallback failures together
+            failures.append(f"{path}: {exc}")
+    if failures:
+        detail = "; ".join(failures)
+        raise ValueError(f"no valid MPI checkpoint was found ({detail}).")
+    raise FileNotFoundError(
+        f"no MPI checkpoint exists for rank {int(rank)} at {checkpoint_path}."
+    )
+
+
+def _cleanup_checkpoint_snapshots(checkpoint_path, rank, keep):
+    snapshots = _checkpoint_snapshot_paths(checkpoint_path, rank)
+    for path in snapshots[int(keep) :]:
+        path.unlink(missing_ok=True)
+
+
+def _write_checkpoint_progress(checkpoint_path, rank, state, keep):
+    """Write the latest checkpoint and retain bounded historical snapshots."""
+    latest = _rank_checkpoint_path(checkpoint_path, rank)
+    progress = int(state["next_shot"])
+    if int(keep) > 1:
+        _write_checkpoint(
+            _rank_checkpoint_snapshot_path(checkpoint_path, rank, progress), state
+        )
+    _write_checkpoint(latest, state)
+    _cleanup_checkpoint_snapshots(checkpoint_path, rank, keep)
+
+
+def _merge_retained_results(first, second):
+    """Concatenate two independent retained local result chunks."""
+    if first is None:
+        return second
+    if not isinstance(first, NoisyResult) or not isinstance(second, NoisyResult):
+        raise TypeError("checkpointed local results must be NoisyResult objects.")
+    left = first.raw
+    right = second.raw
+    if type(left) is not type(right):
+        raise TypeError("checkpointed chunks returned incompatible result types.")
+    if isinstance(left, NoisyShotResult):
+        raw = NoisyShotResult(
+            left.optimizers + right.optimizers,
+            left.gate_streams + right.gate_streams,
+            left.faults + right.faults,
+            left.weights + right.weights,
+            shot_count=left.shots + right.shots,
+            diagnostics=None,
+        )
+    elif isinstance(left, TrajectoryShotResult):
+        raw = TrajectoryShotResult(
+            left.optimizers + right.optimizers,
+            left.gate_streams + right.gate_streams,
+            left.records + right.records,
+            left.leakage_records + right.leakage_records,
+            left.measurement_records + right.measurement_records,
+            left.weights + right.weights,
+            shot_count=left.shots + right.shots,
+            diagnostics=None,
+        )
+    else:
+        raise TypeError(
+            "checkpointed optimizer-state runs require independent trajectory "
+            "or Pauli results."
+        )
+    return NoisyResult(raw)
 
 
 def _partition(shots, rank, size):
@@ -181,6 +426,26 @@ class MPIShotError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class MPIRankDiagnostics:
+    """Execution metadata collected from every rank after a successful run."""
+
+    rank: int
+    world_size: int
+    local_shot_start: int
+    local_shot_stop: int
+    elapsed_seconds: float
+    strategy: str
+    retain: str
+    resumed: bool = False
+    checkpoint_file: str | None = None
+
+    @property
+    def local_shots(self):
+        """Number of global shots owned by this rank."""
+        return self.local_shot_stop - self.local_shot_start
+
+
+@dataclass(frozen=True)
 class MPIShotResult:
     """Local result plus communicator metadata for an MPI shot run.
 
@@ -188,6 +453,10 @@ class MPIShotResult:
     :meth:`reduce_mean` or :meth:`reduce_sum` for global observables instead
     of gathering tensor-network states. Streaming runs set ``local_result``
     to ``None`` and retain only the local observable accumulator.
+    Streaming checkpoint runs expose their path through ``checkpoint_path``;
+    ``resumed`` indicates whether local progress was loaded from disk.
+    ``rank_diagnostics`` is ordered by MPI rank and contains execution timing,
+    shot ownership, and checkpoint-file metadata for every rank.
     """
 
     local_result: NoisyResult | None
@@ -198,6 +467,9 @@ class MPIShotResult:
     world_size: int
     retain: str
     strategy: str
+    checkpoint_path: str | None = None
+    resumed: bool = False
+    rank_diagnostics: tuple[MPIRankDiagnostics, ...] = ()
     _comm: Any = field(repr=False, compare=False, default=None)
     _mpi_module: Any = field(repr=False, compare=False, default=None)
     _local_observable_numerator: Any = field(
@@ -325,13 +597,15 @@ class MPIShotRunner:
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError("comm returned an invalid rank or communicator size.")
 
-    def _broadcast_seed(self, seed):
-        # Validate an explicit seed before entering the collective on every
-        # rank. This avoids rank 0 failing during seed construction while the
-        # other ranks wait indefinitely in bcast.
-        explicit_material = None if seed is None else _seed_material(seed)
+    def _broadcast_seed(self, seed, *, explicit_material=None):
+        if explicit_material is None and seed is not None:
+            explicit_material = _seed_material(seed)
         if self.rank == 0:
-            material = _seed_material(seed) if seed is None else explicit_material
+            material = (
+                _seed_material(seed)
+                if explicit_material is None
+                else tuple(int(value) for value in explicit_material)
+            )
         else:
             material = None
         return tuple(self.comm.bcast(material, root=0))
@@ -354,6 +628,35 @@ class MPIShotRunner:
         message = self.comm.bcast(message, root=0)
         raise MPIShotError(message, errors)
 
+    def _collect_rank_diagnostics(
+        self,
+        *,
+        start,
+        stop,
+        elapsed_seconds,
+        strategy,
+        retain,
+        resumed=False,
+        checkpoint_file=None,
+    ):
+        local = MPIRankDiagnostics(
+            rank=self.rank,
+            world_size=self.world_size,
+            local_shot_start=int(start),
+            local_shot_stop=int(stop),
+            elapsed_seconds=float(elapsed_seconds),
+            strategy=str(strategy),
+            retain=str(retain),
+            resumed=bool(resumed),
+            checkpoint_file=(str(checkpoint_file) if checkpoint_file else None),
+        )
+        gathered = self.comm.gather(local, root=0)
+        if self.rank == 0:
+            diagnostics = tuple(sorted(gathered, key=lambda item: item.rank))
+        else:
+            diagnostics = None
+        return tuple(self.comm.bcast(diagnostics, root=0))
+
     def _run_streaming(
         self,
         shots,
@@ -375,14 +678,91 @@ class MPIShotRunner:
         local_workers,
         local_backend,
         chunk_size,
+        checkpoint_path,
+        resume,
+        checkpoint_keep,
     ):
         start, stop = _partition(shots, self.rank, self.world_size)
-        root_seed = self._broadcast_seed(seed)
+        checkpoint_file = (
+            _rank_checkpoint_path(checkpoint_path, self.rank)
+            if checkpoint_path is not None
+            else None
+        )
+        checkpoint_seed = None
+        next_shot = start
         numerator = 0.0
         denominator = 0.0
         local_error = None
+        started = time.perf_counter()
         try:
-            for chunk_start in range(start, stop, chunk_size):
+            if checkpoint_file is not None:
+                if resume:
+                    _path, payload = _load_checkpoint(
+                        checkpoint_path,
+                        self.rank,
+                        validator=lambda state: _validate_checkpoint_state(
+                            state,
+                            shots=shots,
+                            start=start,
+                            stop=stop,
+                            world_size=self.world_size,
+                            rank=self.rank,
+                            strategy=strategy,
+                            chunk_size=chunk_size,
+                            seed=seed,
+                            mode="streaming",
+                            retain="none",
+                        ),
+                    )
+                    checkpoint_seed, next_shot, state = payload
+                    numerator = state["numerator"]
+                    denominator = float(state["denominator"])
+                elif _checkpoint_exists(checkpoint_path, self.rank):
+                    raise FileExistsError(
+                        f"checkpoint already exists: {checkpoint_file}; "
+                        "pass resume=True or choose a new path."
+                    )
+        except BaseException:
+            local_error = traceback.format_exc()
+        self._synchronize_error(local_error)
+
+        root_seed = self._broadcast_seed(
+            seed,
+            explicit_material=checkpoint_seed,
+        )
+        local_error = None
+        try:
+            if checkpoint_seed is not None and tuple(root_seed) != checkpoint_seed:
+                raise ValueError("checkpoint seed differs across MPI ranks.")
+
+            def write_progress(progress):
+                if checkpoint_file is None:
+                    return
+                state = {
+                    "version": _CHECKPOINT_VERSION,
+                    "shots": int(shots),
+                    "start": int(start),
+                    "stop": int(stop),
+                    "world_size": int(self.world_size),
+                    "rank": int(self.rank),
+                    "strategy": str(strategy),
+                    "chunk_size": int(chunk_size),
+                    "mode": "streaming",
+                    "retain": "none",
+                    "root_seed": tuple(root_seed),
+                    "next_shot": int(progress),
+                    "numerator": numerator,
+                    "denominator": float(denominator),
+                }
+                _write_checkpoint_progress(
+                    checkpoint_path,
+                    self.rank,
+                    state,
+                    checkpoint_keep,
+                )
+
+            write_progress(next_shot)
+            for chunk_start in range(next_shot, stop, chunk_size):
                 chunk_stop = min(chunk_start + chunk_size, stop)
                 local_result = self._run_local(
                     chunk_start,
@@ -415,9 +795,20 @@ class MPIShotRunner:
                     else numerator + chunk_numerator
                 )
                 denominator += chunk_denominator
+                next_shot = chunk_stop
+                write_progress(next_shot)
         except BaseException:
             local_error = traceback.format_exc()
         self._synchronize_error(local_error)
+        diagnostics = self._collect_rank_diagnostics(
+            start=start,
+            stop=stop,
+            elapsed_seconds=time.perf_counter() - started,
+            strategy=strategy,
+            retain="none",
+            resumed=resume,
+            checkpoint_file=checkpoint_file,
+        )
         return MPIShotResult(
             local_result=None,
             shots=shots,
@@ -427,10 +818,182 @@ class MPIShotRunner:
             world_size=self.world_size,
             retain="none",
             strategy=strategy,
+            checkpoint_path=checkpoint_path,
+            resumed=bool(resume),
+            rank_diagnostics=diagnostics,
             _comm=self.comm,
             _mpi_module=self._mpi_module,
             _local_observable_numerator=numerator,
             _local_observable_denominator=denominator,
+        )
+
+    def _run_checkpointed_states(
+        self,
+        shots,
+        *,
+        strategy,
+        seed,
+        error_model,
+        run_kwargs,
+        max_branches,
+        max_branch_factor,
+        importance_sampling,
+        auto_max_expected_faults,
+        magic_strategy,
+        magic_ancillas,
+        magic_recycle,
+        magic_reset_ancillas,
+        magic_projection_order,
+        local_workers,
+        local_backend,
+        retain,
+        chunk_size,
+        checkpoint_path,
+        resume,
+        checkpoint_keep,
+    ):
+        """Run independent retained optimizer chunks with resumable state."""
+        start, stop = _partition(shots, self.rank, self.world_size)
+        checkpoint_file = _rank_checkpoint_path(checkpoint_path, self.rank)
+        checkpoint_seed = None
+        next_shot = start
+        accumulated = None
+        local_error = None
+        started = time.perf_counter()
+        try:
+            if resume:
+                _path, payload = _load_checkpoint(
+                    checkpoint_path,
+                    self.rank,
+                    validator=lambda state: _validate_checkpoint_state(
+                        state,
+                        shots=shots,
+                        start=start,
+                        stop=stop,
+                        world_size=self.world_size,
+                        rank=self.rank,
+                        strategy=strategy,
+                        chunk_size=chunk_size,
+                        seed=seed,
+                        mode="optimizer_state",
+                        retain=retain,
+                    ),
+                )
+                checkpoint_seed, next_shot, state = payload
+                accumulated = state["local_result"]
+            elif _checkpoint_exists(checkpoint_path, self.rank):
+                raise FileExistsError(
+                    f"checkpoint already exists: {checkpoint_file}; pass "
+                    "resume=True or choose a new path."
+                )
+        except BaseException:
+            local_error = traceback.format_exc()
+        self._synchronize_error(local_error)
+
+        root_seed = self._broadcast_seed(seed, explicit_material=checkpoint_seed)
+        local_error = None
+        try:
+            if checkpoint_seed is not None and tuple(root_seed) != checkpoint_seed:
+                raise ValueError("checkpoint seed differs across MPI ranks.")
+
+            def write_progress(progress):
+                state = {
+                    "version": _CHECKPOINT_VERSION,
+                    "shots": int(shots),
+                    "start": int(start),
+                    "stop": int(stop),
+                    "world_size": int(self.world_size),
+                    "rank": int(self.rank),
+                    "strategy": str(strategy),
+                    "chunk_size": int(chunk_size),
+                    "mode": "optimizer_state",
+                    "retain": str(retain),
+                    "root_seed": tuple(root_seed),
+                    "next_shot": int(progress),
+                    "local_result": accumulated,
+                    "denominator": 0.0,
+                }
+                _write_checkpoint_progress(
+                    checkpoint_path,
+                    self.rank,
+                    state,
+                    checkpoint_keep,
+                )
+
+            write_progress(next_shot)
+            for chunk_start in range(next_shot, stop, chunk_size):
+                chunk_stop = min(chunk_start + chunk_size, stop)
+                chunk_result = self._run_local(
+                    chunk_start,
+                    chunk_stop,
+                    root_seed,
+                    error_model=error_model,
+                    strategy=strategy,
+                    run_kwargs=run_kwargs,
+                    max_branches=max_branches,
+                    max_branch_factor=max_branch_factor,
+                    importance_sampling=importance_sampling,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    magic_strategy=magic_strategy,
+                    magic_ancillas=magic_ancillas,
+                    magic_recycle=magic_recycle,
+                    magic_reset_ancillas=magic_reset_ancillas,
+                    magic_projection_order=magic_projection_order,
+                    local_workers=local_workers,
+                    local_backend=local_backend,
+                    retain=retain,
+                )
+                accumulated = _merge_retained_results(accumulated, chunk_result)
+                next_shot = chunk_stop
+                write_progress(next_shot)
+            if accumulated is None:
+                accumulated = self._run_local(
+                    start,
+                    stop,
+                    root_seed,
+                    error_model=error_model,
+                    strategy=strategy,
+                    run_kwargs=run_kwargs,
+                    max_branches=max_branches,
+                    max_branch_factor=max_branch_factor,
+                    importance_sampling=importance_sampling,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    magic_strategy=magic_strategy,
+                    magic_ancillas=magic_ancillas,
+                    magic_recycle=magic_recycle,
+                    magic_reset_ancillas=magic_reset_ancillas,
+                    magic_projection_order=magic_projection_order,
+                    local_workers=local_workers,
+                    local_backend=local_backend,
+                    retain=retain,
+                )
+                write_progress(stop)
+        except BaseException:
+            local_error = traceback.format_exc()
+        self._synchronize_error(local_error)
+        diagnostics = self._collect_rank_diagnostics(
+            start=start,
+            stop=stop,
+            elapsed_seconds=time.perf_counter() - started,
+            strategy=strategy,
+            retain=retain,
+            resumed=resume,
+            checkpoint_file=checkpoint_file,
+        )
+        return MPIShotResult(
+            local_result=accumulated,
+            shots=shots,
+            local_shot_start=start,
+            local_shot_stop=stop,
+            rank=self.rank,
+            world_size=self.world_size,
+            retain=retain,
+            strategy=strategy,
+            checkpoint_path=checkpoint_path,
+            resumed=bool(resume),
+            rank_diagnostics=diagnostics,
+            _comm=self.comm,
+            _mpi_module=self._mpi_module,
         )
 
     def _run_local(
@@ -524,6 +1087,9 @@ class MPIShotRunner:
         local_backend="serial",
         observable=None,
         chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
     ):
         """Run a global shot ensemble collectively over MPI ranks.
 
@@ -535,39 +1101,79 @@ class MPIShotRunner:
         a post-run observable will be evaluated with
         :meth:`MPIShotResult.reduce_mean`. Pass ``observable`` to evaluate it
         chunk-by-chunk without retaining the full ensemble.
+        ``checkpoint_path`` and ``resume=True`` enable resumable runs. Streaming
+        observables checkpoint only their accumulator. Independent runs with
+        ``retain='final'`` or ``'all'`` checkpoint retained optimizer states;
+        those states must be pickle-compatible. Checkpoint files are trusted
+        pickle data, one per rank, and require the same communicator size, shot
+        count, strategy, chunk size, retention mode, and seed when resumed.
+        ``checkpoint_keep`` controls the number of historical snapshots kept
+        per rank in addition to the latest checkpoint file.
         """
-        shots = _validate_shots(shots)
-        strategy = str(strategy).strip().lower()
-        if strategy not in {"independent", "coalesced"}:
-            raise ValueError(
-                "MPIShotRunner supports strategy='independent' or 'coalesced'."
-            )
-        retain = _validate_retain(retain)
-        local_workers = _validate_workers(local_workers)
-        local_backend = _validate_backend(local_backend)
-        if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
-            raise TypeError("run_kwargs must be a mapping or None.")
-        if local_workers > 1 and local_backend == "serial":
-            raise ValueError(
-                "local_backend='serial' cannot be used with local_workers > 1."
-            )
-
-        if observable is not None:
-            if not callable(observable):
-                raise TypeError("observable must be callable.")
-            if retain != "none":
+        local_error = None
+        try:
+            shots = _validate_shots(shots)
+            strategy = str(strategy).strip().lower()
+            if strategy not in {"independent", "coalesced"}:
                 raise ValueError(
-                    "streaming observable runs require retain='none'; states are "
-                    "retained only for the current chunk."
+                    "MPIShotRunner supports strategy='independent' or 'coalesced'."
                 )
-            if chunk_size is None:
-                chunk_size = 1024
-            if (
-                isinstance(chunk_size, bool)
-                or not isinstance(chunk_size, Integral)
-                or chunk_size < 1
-            ):
-                raise ValueError("chunk_size must be a positive integer.")
+            retain = _validate_retain(retain)
+            local_workers = _validate_workers(local_workers)
+            local_backend = _validate_backend(local_backend)
+            checkpoint_path = _validate_checkpoint_path(checkpoint_path)
+            checkpoint_keep = _validate_checkpoint_keep(checkpoint_keep)
+            if not isinstance(resume, bool):
+                raise TypeError("resume must be a boolean.")
+            if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
+                raise TypeError("run_kwargs must be a mapping or None.")
+            if local_workers > 1 and local_backend == "serial":
+                raise ValueError(
+                    "local_backend='serial' cannot be used with local_workers > 1."
+                )
+            if seed is not None:
+                _seed_material(seed)
+            if observable is not None:
+                if not callable(observable):
+                    raise TypeError("observable must be callable.")
+                if retain != "none":
+                    raise ValueError(
+                        "streaming observable runs require retain='none'; states are "
+                        "retained only for the current chunk."
+                    )
+                if chunk_size is None:
+                    chunk_size = 1024
+                if (
+                    isinstance(chunk_size, bool)
+                    or not isinstance(chunk_size, Integral)
+                    or chunk_size < 1
+                ):
+                    raise ValueError("chunk_size must be a positive integer.")
+            elif checkpoint_path is not None:
+                if chunk_size is None:
+                    chunk_size = 1024
+                if (
+                    isinstance(chunk_size, bool)
+                    or not isinstance(chunk_size, Integral)
+                    or chunk_size < 1
+                ):
+                    raise ValueError("chunk_size must be a positive integer.")
+                if strategy != "independent":
+                    raise ValueError(
+                        "optimizer-state checkpointing requires strategy='independent'."
+                    )
+                if retain == "none":
+                    raise ValueError(
+                        "optimizer-state checkpointing requires retain='final' or 'all'."
+                    )
+            elif chunk_size is not None:
+                raise ValueError("chunk_size requires an observable or checkpoint.")
+            if resume and checkpoint_path is None:
+                raise ValueError("resume=True requires checkpoint_path.")
+        except BaseException:
+            local_error = traceback.format_exc()
+        self._synchronize_error(local_error)
+        if observable is not None:
             return self._run_streaming(
                 shots,
                 observable=observable,
@@ -587,11 +1193,38 @@ class MPIShotRunner:
                 local_workers=local_workers,
                 local_backend=local_backend,
                 chunk_size=int(chunk_size),
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
             )
-        if chunk_size is not None:
-            raise ValueError("chunk_size requires an observable callback.")
+
+        if checkpoint_path is not None:
+            return self._run_checkpointed_states(
+                shots,
+                strategy=strategy,
+                seed=seed,
+                error_model=error_model,
+                run_kwargs=run_kwargs,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                magic_strategy=magic_strategy,
+                magic_ancillas=magic_ancillas,
+                magic_recycle=magic_recycle,
+                magic_reset_ancillas=magic_reset_ancillas,
+                magic_projection_order=magic_projection_order,
+                local_workers=local_workers,
+                local_backend=local_backend,
+                retain=retain,
+                chunk_size=int(chunk_size),
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+            )
 
         start, stop = _partition(shots, self.rank, self.world_size)
+        started = time.perf_counter()
         root_seed = self._broadcast_seed(seed)
         local_error = None
         local_result = None
@@ -620,6 +1253,13 @@ class MPIShotRunner:
             local_error = traceback.format_exc()
 
         self._synchronize_error(local_error)
+        diagnostics = self._collect_rank_diagnostics(
+            start=start,
+            stop=stop,
+            elapsed_seconds=time.perf_counter() - started,
+            strategy=strategy,
+            retain=retain,
+        )
 
         return MPIShotResult(
             local_result=local_result,
@@ -630,6 +1270,7 @@ class MPIShotRunner:
             world_size=self.world_size,
             retain=retain,
             strategy=strategy,
+            rank_diagnostics=diagnostics,
             _comm=self.comm,
             _mpi_module=self._mpi_module,
         )

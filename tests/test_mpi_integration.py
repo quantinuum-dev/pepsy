@@ -7,6 +7,8 @@ Run explicitly with, for example::
 
 import numpy as np
 import pytest
+import shutil
+import tempfile
 
 import pepsy
 
@@ -200,6 +202,148 @@ def test_real_mpi_independent_shot_seeds_match_mpi_self():
             optimizer.value for optimizer in serial.local_result.optimizers
         ]
         assert distributed_values == pytest.approx(serial_values)
+
+
+@pytest.mark.integration
+def test_real_mpi_synchronizes_preflight_validation_errors():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=comm,
+    )
+    shots = 3 if comm.Get_rank() == 0 else -1
+    with pytest.raises(pepsy.MPIShotError, match="nonnegative integer"):
+        runner.run(shots, seed=61)
+
+
+@pytest.mark.integration
+def test_real_mpi_streaming_checkpoint_resume():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    checkpoint_dir = (
+        tempfile.mkdtemp(prefix="pepsy-mpi-checkpoint-")
+        if comm.Get_rank() == 0
+        else None
+    )
+    checkpoint_dir = comm.bcast(checkpoint_dir, root=0)
+    checkpoint_path = f"{checkpoint_dir}/shots"
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=comm,
+    )
+    calls = 0
+
+    def fail_on_rank_zero_after_one_chunk(optimizer):
+        nonlocal calls
+        calls += 1
+        if comm.Get_rank() == 0 and calls > 2:
+            raise RuntimeError("intentional MPI checkpoint interruption")
+        return optimizer.value
+
+    try:
+        with pytest.raises(pepsy.MPIShotError, match="checkpoint interruption"):
+            runner.run(
+                9,
+                seed=73,
+                observable=fail_on_rank_zero_after_one_chunk,
+                chunk_size=2,
+                checkpoint_path=checkpoint_path,
+            )
+        resumed = runner.run(
+            9,
+            seed=73,
+            observable=lambda optimizer: optimizer.value,
+            chunk_size=2,
+            checkpoint_path=checkpoint_path,
+            resume=True,
+        )
+        fresh = runner.run(
+            9,
+            seed=73,
+            observable=lambda optimizer: optimizer.value,
+            chunk_size=2,
+        )
+        assert resumed.resumed is True
+        assert resumed.reduce_mean() == pytest.approx(fresh.reduce_mean())
+    finally:
+        comm.Barrier()
+        if comm.Get_rank() == 0:
+            shutil.rmtree(checkpoint_dir)
+        comm.Barrier()
+
+
+@pytest.mark.integration
+def test_real_mpi_retained_optimizer_checkpoint_resume():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    checkpoint_dir = (
+        tempfile.mkdtemp(prefix="pepsy-mpi-retained-")
+        if comm.Get_rank() == 0
+        else None
+    )
+    checkpoint_dir = comm.bcast(checkpoint_dir, root=0)
+    checkpoint_path = f"{checkpoint_dir}/shots"
+    calls = 0
+
+    def failing_factory():
+        nonlocal calls
+        calls += 1
+        if comm.Get_rank() == 0 and calls > 2:
+            raise RuntimeError("intentional retained MPI checkpoint interruption")
+        return _MPIProbeOptimizer()
+
+    try:
+        with pytest.raises(
+            pepsy.MPIShotError,
+            match="retained MPI checkpoint interruption",
+        ):
+            pepsy.MPIShotRunner(
+                failing_factory,
+                [(np.eye(2), 0)],
+                comm=comm,
+            ).run(
+                9,
+                seed=74,
+                retain="final",
+                chunk_size=2,
+                checkpoint_path=checkpoint_path,
+                checkpoint_keep=3,
+            )
+        runner = pepsy.MPIShotRunner(
+            _probe_factory,
+            [(np.eye(2), 0)],
+            comm=comm,
+        )
+        resumed = runner.run(
+            9,
+            seed=74,
+            retain="final",
+            chunk_size=2,
+            checkpoint_path=checkpoint_path,
+            checkpoint_keep=3,
+            resume=True,
+        )
+        fresh = runner.run(9, seed=74, retain="final")
+        assert resumed.resumed is True
+        assert resumed.reduce_mean(lambda optimizer: optimizer.value) == pytest.approx(
+            fresh.reduce_mean(lambda optimizer: optimizer.value)
+        )
+        assert len(resumed.rank_diagnostics) == comm.Get_size()
+        assert all(item.world_size == comm.Get_size() for item in resumed.rank_diagnostics)
+    finally:
+        comm.Barrier()
+        if comm.Get_rank() == 0:
+            shutil.rmtree(checkpoint_dir)
+        comm.Barrier()
 
 
 @pytest.mark.integration

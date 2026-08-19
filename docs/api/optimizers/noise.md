@@ -363,6 +363,10 @@ Launch the program with `mpiexec` or `mpirun` after installing the optional
 MPI profile (`pip install -e ".[mpi]"`). Every rank must construct and call
 the runner collectively. Each rank owns complete local optimizer states; MPI
 distributes global shot IDs, not pieces of an MPS or tree tensor network.
+All ranks perform a synchronized preflight for runner arguments before
+entering the shot collectives. Invalid input therefore raises an
+`MPIShotError` on every rank; callers must still provide the same valid run
+configuration on every rank.
 
 MPI supports independent and rank-local coalesced execution. With
 `strategy="independent"`, the global shot ID is part of the trajectory seed,
@@ -424,6 +428,81 @@ mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
 The script reports the slowest-rank wall time and global shots per second.
 Compare independent and local coalesced execution separately; coalescing is
 not rank-count invariant.
+
+For a multi-node Slurm allocation, the repository includes a launcher smoke
+template:
+
+```bash
+sbatch benchmarks/mpi_slurm.sh
+```
+
+It uses `srun` and the cluster's configured PMI/PMIx transport. Set
+`PEPSY_MPI_SHOTS`, `PEPSY_MPI_QUBITS`, `PEPSY_MPI_DEPTH`, or
+`PEPSY_MPI_STRATEGY` in the batch environment to adjust the workload; the
+script assumes Pepsy and its MPI-enabled Python environment are already
+available on every node.
+
+### Resuming a streaming run
+
+For long bounded-memory observable runs, pass a checkpoint prefix. Each rank
+atomically writes its own progress file after every completed chunk:
+
+```python
+checkpoint = "/scratch/pepsy/shots"
+result = runner.run(
+    shots=1_000_000,
+    seed=7,
+    observable=measure_observable,
+    chunk_size=2_048,
+    checkpoint_path=checkpoint,
+)
+```
+
+If a rank fails, rerun the same collective call with `resume=True` and the
+same checkpoint prefix, seed, shot count, strategy, chunk size, retention mode,
+and MPI process count:
+
+```python
+result = runner.run(
+    shots=1_000_000,
+    seed=7,
+    observable=measure_observable,
+    chunk_size=2_048,
+    checkpoint_path=checkpoint,
+    resume=True,
+)
+estimate = result.reduce_mean()
+```
+
+`checkpoint_keep` controls how many historical per-rank snapshots are retained
+in addition to the atomically updated latest file; the default is `2`. If the
+latest file is unreadable, resume searches the retained snapshots from newest
+to oldest. An existing checkpoint is never overwritten by a fresh run; use
+`resume=True` or choose a new prefix.
+
+Checkpointing also supports independent optimizer-state runs when the result
+must retain states:
+
+```python
+retained = runner.run(
+    shots=100_000,
+    seed=7,
+    retain="final",
+    chunk_size=2_048,
+    checkpoint_path="/scratch/pepsy/retained",
+    checkpoint_keep=3,
+)
+```
+
+This mode serializes the accumulated `NoisyResult` in each rank's trusted
+checkpoint. It requires `strategy="independent"`, `retain="final"` or
+`"all"`, and pickle-compatible optimizer states. Coalesced optimizer-state
+checkpoints are intentionally rejected until branch identity and count merges
+have a durable protocol. Checkpoint files must live on a reliable shared
+filesystem, or on rank-local storage with the same path visible to each rank.
+A resumed result exposes `resumed=True`, keeps the prefix in
+`result.checkpoint_path`, and publishes one `MPIRankDiagnostics` record per
+rank through `result.rank_diagnostics` with shot ownership and elapsed time.
 
 ## User-defined quantum trajectories
 

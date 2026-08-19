@@ -73,6 +73,11 @@ jobs:
         run: python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
 
   mpi:
+    name: MPI (${{ matrix.ranks }} ranks)
+    strategy:
+      fail-fast: false
+      matrix:
+        ranks: [2, 3]
     runs-on: ubuntu-latest
     env:
       NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
@@ -97,11 +102,13 @@ jobs:
         run: pytest -q -o addopts="" tests/test_mpi.py
       - name: Run multi-process MPI integration tests
         run: |
-          mpiexec --oversubscribe -n 2 python -m pytest -q -o addopts="" \
+          mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
+            python -m pytest -q -o addopts="" \
             tests/test_mpi_integration.py
       - name: Run MPI benchmark smoke test
         run: |
-          mpiexec --oversubscribe -n 2 python benchmarks/mpi_shots.py \
+          mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
+            python benchmarks/mpi_shots.py \
             --shots 8 --qubits 2 --depth 1 --chi 4
 
   package:

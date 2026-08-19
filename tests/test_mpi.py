@@ -20,10 +20,16 @@ class _FakeComm:
         return self.size
 
     def bcast(self, value, root=0):
+        index = self.shared.setdefault("broadcast_index", {}).setdefault(
+            self.rank, 0
+        )
+        self.shared.setdefault("broadcast_values", {})
         if self.rank == root:
-            self.shared["broadcast"] = value
+            self.shared["broadcast_values"][index] = value
+        self.shared["broadcast_index"][self.rank] = index + 1
+        if self.rank == root:
             return value
-        return self.shared["broadcast"]
+        return self.shared["broadcast_values"][index]
 
     def allreduce(self, value, op=None):
         return value
@@ -76,6 +82,10 @@ def test_mpi_runner_is_lazy_and_reduces_local_observables():
     assert estimate == pytest.approx(expected)
     assert result.reduce_sum(4.5) == pytest.approx(4.5)
     assert np.array_equal(result.reduce_sum([1, 2]), np.asarray([1, 2]))
+    assert len(result.rank_diagnostics) == 1
+    assert result.rank_diagnostics[0].rank == 0
+    assert result.rank_diagnostics[0].local_shots == 6
+    assert result.rank_diagnostics[0].elapsed_seconds >= 0.0
 
 
 def test_mpi_reduces_vector_observables_across_retained_states():
@@ -130,6 +140,163 @@ def test_mpi_without_a_communicator_reports_the_optional_dependency(monkeypatch)
     monkeypatch.setattr(mpi_module, "_load_mpi", missing_mpi)
     with pytest.raises(ImportError, match="mpi4py"):
         mpi_module.MPIShotRunner(_probe_factory, [(np.eye(2), 0)])
+
+
+def test_mpi_preflight_synchronizes_validation_errors():
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    )
+    with pytest.raises(pepsy.MPIShotError, match="nonnegative integer"):
+        runner.run(-1, seed=5)
+
+
+def test_mpi_streaming_checkpoint_resume(tmp_path):
+    checkpoint = tmp_path / "mpi-shots"
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    )
+    calls = 0
+
+    def fail_after_two_chunks(optimizer):
+        nonlocal calls
+        calls += 1
+        if calls > 4:
+            raise RuntimeError("intentional checkpoint interruption")
+        return optimizer.value
+
+    with pytest.raises(pepsy.MPIShotError, match="checkpoint interruption"):
+        runner.run(
+            8,
+            seed=12,
+            observable=fail_after_two_chunks,
+            chunk_size=2,
+            checkpoint_path=checkpoint,
+        )
+
+    assert (checkpoint.parent / f"{checkpoint.name}.rank0.pkl").exists()
+    resumed = runner.run(
+        8,
+        seed=12,
+        observable=lambda optimizer: optimizer.value,
+        chunk_size=2,
+        checkpoint_path=checkpoint,
+        resume=True,
+    )
+    fresh = runner.run(
+        8,
+        seed=12,
+        observable=lambda optimizer: optimizer.value,
+        chunk_size=2,
+    )
+    assert resumed.resumed is True
+    assert resumed.checkpoint_path == str(checkpoint)
+    assert resumed.reduce_mean() == pytest.approx(fresh.reduce_mean())
+
+    with pytest.raises(pepsy.MPIShotError, match="metadata mismatch"):
+        runner.run(
+            9,
+            seed=12,
+            observable=lambda optimizer: optimizer.value,
+            chunk_size=2,
+            checkpoint_path=checkpoint,
+            resume=True,
+        )
+
+    corrupt = tmp_path / "corrupt"
+    corrupt_file = corrupt.parent / f"{corrupt.name}.rank0.pkl"
+    corrupt_file.write_bytes(b"not a pickle")
+    with pytest.raises(pepsy.MPIShotError, match="checkpoint"):
+        runner.run(
+            8,
+            seed=12,
+            observable=lambda optimizer: optimizer.value,
+            chunk_size=2,
+            checkpoint_path=corrupt,
+            resume=True,
+        )
+
+
+def test_mpi_retained_optimizer_checkpoint_resume_and_retention(tmp_path):
+    checkpoint = tmp_path / "retained-shots"
+    calls = 0
+
+    def failing_factory():
+        nonlocal calls
+        calls += 1
+        if calls > 4:
+            raise RuntimeError("intentional retained checkpoint interruption")
+        return _probe_factory()
+
+    with pytest.raises(pepsy.MPIShotError, match="retained checkpoint interruption"):
+        pepsy.MPIShotRunner(
+            failing_factory,
+            [(np.eye(2), 0)],
+            comm=_FakeComm(),
+        ).run(
+            8,
+            seed=18,
+            retain="final",
+            chunk_size=2,
+            checkpoint_path=checkpoint,
+            checkpoint_keep=3,
+        )
+
+    snapshots = sorted(checkpoint.parent.glob(f"{checkpoint.name}.rank0.step*.pkl"))
+    assert len(snapshots) == 3
+    (checkpoint.parent / f"{checkpoint.name}.rank0.pkl").write_bytes(
+        b"corrupt latest checkpoint"
+    )
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    )
+    resumed = runner.run(
+        8,
+        seed=18,
+        retain="final",
+        chunk_size=2,
+        checkpoint_path=checkpoint,
+        checkpoint_keep=3,
+        resume=True,
+    )
+    fresh = runner.run(8, seed=18, retain="final")
+    assert resumed.resumed is True
+    assert len(resumed.local_result.optimizers) == 8
+    assert resumed.reduce_mean(lambda optimizer: optimizer.value) == pytest.approx(
+        fresh.reduce_mean(lambda optimizer: optimizer.value)
+    )
+    assert resumed.rank_diagnostics[0].resumed is True
+    assert len(
+        list(checkpoint.parent.glob(f"{checkpoint.name}.rank0.step*.pkl"))
+    ) == 3
+
+
+def test_mpi_checkpoint_api_rejects_unsupported_modes(tmp_path):
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    )
+    with pytest.raises(pepsy.MPIShotError, match="strategy='independent'"):
+        runner.run(
+            2,
+            seed=5,
+            strategy="coalesced",
+            retain="final",
+            checkpoint_path=tmp_path / "coalesced",
+        )
+    with pytest.raises(pepsy.MPIShotError, match="retain='final' or 'all'"):
+        runner.run(
+            2,
+            seed=5,
+            retain="none",
+            checkpoint_path=tmp_path / "none",
+        )
 
 
 def test_mpi_record_gathering_requires_explicit_record_retention():
