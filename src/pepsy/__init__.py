@@ -81,6 +81,14 @@ if TYPE_CHECKING:
     )
     from .fitting import FIT  # noqa: F401
     from .operators import (  # noqa: F401
+        ActivePEPOBlocks,
+        ClusterExpansionReport,
+        build_cluster_expansion_pepo,
+        build_itf_cluster_expansion_pepo,
+        ClusterExpansionPlan,
+        PauliPEPOTerm,
+        PauliPEPOBasis,
+        CompiledPEPOExp,
         build_mpo_from_gates,
         build_pepo_from_gates,
         cnot,

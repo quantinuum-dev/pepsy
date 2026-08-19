@@ -1,13 +1,17 @@
 # One symbol per line: frozen top-level compatibility aliases.
+ActivePEPOBlocks
 BdyMPS
 BoundaryContractResult
 BoundaryFitDiagnostic
+ClusterExpansionPlan
+ClusterExpansionReport
 CoalescedMeasurementRecord
 CoalescedSampleResult
 CoalescedTrajectoryLeaf
 CoalescedTrajectoryResult
 CoherentCrosstalkModel
 CompBdy
+CompiledPEPOExp
 DeferredInjectionRecord
 DeferredInjectionReport
 DeferredProjectionRecord
@@ -41,6 +45,8 @@ NoisyShotResult
 NormEventRecord
 OneDMap
 PEPSSampleResult
+PauliPEPOTerm
+PauliPEPOBasis
 PauliErrorModel
 PauliFault
 PepsBpSampler
@@ -106,8 +112,10 @@ backend_torch
 boundary_norm
 build_backend
 build_bra_ket
+build_cluster_expansion_pepo
 build_compressed_optimizer
 build_contraction
+build_itf_cluster_expansion_pepo
 build_mpo_from_gates
 build_optimizer
 build_pepo_from_gates

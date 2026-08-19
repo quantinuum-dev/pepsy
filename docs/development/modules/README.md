@@ -9,3 +9,5 @@ Concise implementation guides for the main Pepsy package areas:
 - [Sweep optimizer](sweep_optimizer.md)
 - [VMC](vmc.md)
 - [Higher-order MPO](higher_order_mpo.md)
+- [PEPO cluster expansion](cluster_expansion.md)
+- [Unified exponential API](../../api/operators/exponentials.md)

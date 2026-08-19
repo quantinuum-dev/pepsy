@@ -9,10 +9,13 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | API | Responsibility | Accuracy and ownership |
 | --- | --- | --- |
 | `MPOBasis` / `MPOParameter` | Reuse a parameterized term topology | Structural cache only; each bind creates fresh backend-connected local blocks |
+| `MPOBasis.compile_exp` / `CompiledMPOExp` | Reuse coefficient-slot and higher-order execution plans | Value-only evaluator; static banks are cached, coefficient-dependent arrays and autodiff graphs are fresh |
 | `MPOProductTerm` | Describe a factorized local product term | Matrix operators or compact Pauli labels; `charge` is preserved but not interpreted |
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
+| `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(step * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; real-time uses `step=-1j * tau`; `differentiable=True` selects fixed-rank TT-SVD |
+| `FirstDegreeMPO.clear_history_cache` / `MPOBasis.clear_history_cache` | Release reusable higher-order plans | Keeps current tensors and compiled first-degree topology unchanged |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
 | `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
 | `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator` |
@@ -55,8 +58,20 @@ assembles only the current slot values in `build(parameters)` or
 `build(coefficients=...)`. It deliberately does not cache completed
 parameter-value MPOs, because tensor identities are not safe value cache keys
 after in-place optimizer updates. Each `FirstDegreeMPO` also caches its raw
-reachable history topology by order; exact history merges remain
-value-dependent and are not cached.
+reachable history topology and local gather/index execution plan by order.
+The symbolic merge schedule is reused, while scalar weights and backend
+arrays are rebuilt for each call so parameter and time autodiff graphs remain
+fresh.
+
+`compile_exp()` adds the value-only execution boundary for repeated
+optimization steps. For ordinary static local operators it compiles each
+site into an affine bias/operator bank and evaluates that bank with one
+backend contraction per site. Backend-native operators and oversized banks
+retain the grouped scatter fallback. This avoids rebuilding the semantic
+automaton and first-degree wrapper per call; the remaining dense virtual
+history arrays are still materialized by Algorithms 1--4.
+`compile_evolution()` and `CompiledMPOEvolution` remain compatibility names for
+older callers.
 
 ## Multi-site execution order
 
@@ -72,8 +87,11 @@ history route for every positive `order`:
 6. Contract the all-one boundary histories only after the rewiring passes.
 
 Named policies map to these passes as follows: `mode="base"` selects
-Algorithms 1--2, `mode="optimal"` selects Algorithms 1--3, and
-`mode="approximate"` selects Algorithms 1--4. The `max_bond` guard is checked
+Algorithms 1--2, `mode="algorithm4"` selects Algorithms 1, 2, and 4,
+`mode="optimal"` selects Algorithms 1--3, and `mode="approximate"` selects
+Algorithms 1--4. The fast `algorithm4` policy intentionally omits Algorithm
+3's selected next-order replay; `mode="approximate"` retains it. The
+`max_bond` guard is checked
 while the temporary history table is generated, before exact compression can
 remove channels; `on_exceed="raise"` is the safe default.
 
@@ -84,20 +102,26 @@ temporary edge states and leaves an ordinary open-boundary MPO.
 
 The reachable-history table can still grow exponentially with the Taylor order
 and local MPO bond dimension, although no global dense matrix is formed. The
-raw topology is reusable across parameter bindings and time steps, while exact
-history compression remains a value-dependent pass after the cached table is
-assembled. `history_storage="streaming"` (which requires
-`cache_history=False`) retains only adjacent cuts while
-building the current MPO, and `history_storage="sparse"` additionally skips
-structurally invalid local transition products. `cache_history=False` selects
-streaming automatically under the default `history_storage="auto"`; no
-persistent topology or complete history table is retained after the call.
-The final MPO tensors still must exist for the in-place Algorithm 1--4 passes.
+raw topology and local gather metadata are reusable across parameter bindings
+and time steps. History block products are gathered in backend batches rather than
+dispatched once per virtual pair. `history_storage="sparse"` additionally
+skips structurally invalid local transition products; automaton-built cached
+calls select that path automatically, while `cache_history=False` retains the
+compatibility streaming default. The current implementation still
+materializes dense virtual arrays for the in-place Algorithm 1--4 passes; a
+true block-sparse history tensor is a separate future optimization.
 
 The one-site path now evaluates an arbitrary-order local Taylor polynomial.
 With `extend=True` or `mode="optimal"`, it evaluates one additional local
 Taylor term; there are no non-trivial virtual channels for Algorithm 3 or 4 to
 rewire on a one-site chain.
+
+The final MPO bond cap is intentionally separate from the temporary history
+guard. `max_bond` limits raw history growth before Algorithms 1--4, while
+`chi` is passed to `compress_to_bond` after the analytical construction. The
+ordinary Quimb compression path returns a compiled Quimb MPO because numerical
+truncation invalidates the semantic histories. The fixed-rank path retains a
+semantic wrapper for autodiff but marks `history_valid=False`.
 
 ## Deliberate implementation decisions
 
@@ -125,12 +149,15 @@ rewire on a one-site chain.
 
 ## Future implementation improvements
 
-The remaining implementation improvements are native fermionic/Symmray
-compilation for the shared topology and fixed-rank compression, plus larger
-external timing studies. The maintained small-system accuracy regression in
-`tests/test_mpo_benchmarks.py` compares the finite MPO orders with first-order
-Trotter and a p=2 two-site cluster baseline; it is deliberately not a timing
-harness.
+The dense execution path now uses cached gather metadata, grouped coefficient
+contractions, fused virtual transfer maps, and raw tensor/batch interfaces for
+JAX/Torch compilation. The next larger optimization is a direct reduced
+Taylor automaton that avoids materializing the full order-N history tensor
+before Algorithms 1--4. Native fermionic/Symmray block-sparse compilation
+and larger external timing studies remain separate work. The maintained
+small-system accuracy regression in `tests/test_mpo_benchmarks.py` compares
+the finite MPO orders with first-order Trotter and a p=2 two-site cluster
+baseline; it is deliberately not a timing harness.
 
 These are implementation layers, not reasons to widen the current public API.
 The existing semantic and Quimb boundaries should remain stable while they are
