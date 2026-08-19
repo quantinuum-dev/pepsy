@@ -111,6 +111,7 @@ def test_pauli_mpo_expectation_application_and_quimb_compression():
     np.testing.assert_allclose(applied.to_dense(), expected.to_dense())
 
     compressed, report = operator.compress(
+        basis="mpo",
         max_bond=2,
         return_report=True,
     )
@@ -236,6 +237,10 @@ def test_pauli_mpo_native_cores_canonicalize_and_compress_without_leaving_basis(
     assert max(truncated.pauli_bond_dimensions) <= 2
     assert not report.exact
     assert all(core.shape[2] == 4 for core in truncated.to_pauli_cores())
+
+    default_compressed = operator.compress(max_bond=8)
+    assert isinstance(default_compressed, PauliMPO)
+    assert max(default_compressed.pauli_bond_dimensions) <= 8
 
 
 def test_pauli_mpo_native_core_constructor_round_trips_small_expansion():

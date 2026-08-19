@@ -1181,11 +1181,11 @@ class PauliMPO:
 
     Notes
     -----
-    Numerical MPO compression generally leaves the sparse Pauli-word basis:
-    the default ``compress`` object is a Quimb MPO.  This is unavoidable for
-    a generic low-rank MPO, whose Pauli expansion can be exponentially dense.
-    ``compress(basis="native")`` instead keeps Pauli physical legs in
-    coefficient cores. Exact Pauli algebra remains available before either
+    Native Pauli-basis compression is the default ``compress`` path. Numerical
+    MPO compression generally leaves the sparse Pauli-word basis: request it
+    explicitly with ``compress(basis="mpo")`` or ``compress_numerical``. This
+    is unavoidable for a generic low-rank MPO, whose Pauli expansion can be
+    exponentially dense. Exact Pauli algebra remains available before either
     conversion boundary.
 
     :meth:`compress_pauli` provides the native alternative: it compresses a
@@ -2208,17 +2208,13 @@ class PauliMPO:
 
         return self._semantic_mpo().compress_numerical(**kwargs)
 
-    def compress(self, *, basis="mpo", **kwargs):
+    def compress(self, *, basis="native", **kwargs):
         """Compress in the requested MPO or native Pauli representation.
 
-        ``basis="mpo"`` preserves the historical Quimb-compatible numerical
-        compression boundary.  ``basis="pauli"`` (or ``"native"``) keeps
-        physical indices in the ``I/X/Y/Z`` basis and calls
-        :meth:`compress_pauli`.
-
-        The default result is a Quimb MPO because generic numerical
-        compression does not preserve a sparse Pauli expansion.  The native
-        branch returns a core-backed PauliMPO instead.
+        ``basis="native"`` (or ``"pauli"``) is the default and keeps physical
+        indices in the ``I/X/Y/Z`` basis by calling :meth:`compress_pauli`.
+        ``basis="mpo"`` selects the explicit Quimb-compatible numerical
+        compression boundary and returns a numerical MPO.
         """
 
         basis = str(basis).strip().lower()

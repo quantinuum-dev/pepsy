@@ -70,10 +70,11 @@ for bond in report.bond_reports:
 The native cores have shape `(left_bond, right_bond, 4)` with physical order
 `I, X, Y, Z`. QR canonicalization and SVD rounding act on the coefficient
 tensor train, never on a dense Hilbert-space matrix. The result remains a
-`PauliMPO`; `to_mpo()` is only the execution boundary. The convenience form
-`op.compress(basis="native", ...)` is equivalent to `compress_pauli`, while
-the default `op.compress(...)` continues to return a numerically compressed
-Quimb MPO. Compression follows Quimb's `max_bond`, `cutoff`,
+`PauliMPO`; `to_mpo()` is only the execution boundary. Native compression is
+the default: `op.compress(...)` and `op.compress(basis="native", ...)` are
+equivalent to `compress_pauli`. Use `op.compress(basis="mpo", ...)` or
+`compress_numerical(...)` when a numerically compressed Quimb MPO is wanted.
+Native compression follows Quimb's `max_bond`, `cutoff`,
 `cutoff_mode` (`rel`, `abs`, `sum1`, `rsum1`, `sum2`, `rsum2`), `form`, and
 `renorm` conventions for the native SVD backend. The native canonical forms
 are `"right"`, `"left"`, and an integer center. `form="flat"` performs
@@ -121,10 +122,13 @@ value = op.expectation(mps)
 new_mps = op.apply(mps, max_bond=128, cutoff=1.0e-10)
 mpo = op.to_mpo()
 compressed, report = op.compress(max_bond=64, return_report=True)
+# compressed is a PauliMPO with I/X/Y/Z physical legs
+numerical_mpo = op.compress(basis="mpo", max_bond=64)
 ```
 
-Numerical compression returns a Quimb `MatrixProductOperator`, because a
-generic low-rank MPO does not remain sparse in the Pauli basis. Similarly,
+Numerical compression through `basis="mpo"` returns a Quimb
+`MatrixProductOperator`, because a generic low-rank MPO does not remain sparse
+in the Pauli basis. Similarly,
 `exp()` and `time_evolution()` return the existing semantic/numerical MPO
 objects rather than claiming that a generally dense exponential is a sparse
 Pauli expansion.
