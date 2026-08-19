@@ -78,6 +78,60 @@ def test_mpi_runner_is_lazy_and_reduces_local_observables():
     assert np.array_equal(result.reduce_sum([1, 2]), np.asarray([1, 2]))
 
 
+def test_mpi_reduces_vector_observables_across_retained_states():
+    result = _run_probe(_FakeComm(), 3)
+    estimate = result.reduce_mean(
+        lambda optimizer: np.asarray([optimizer.value, 2.0 * optimizer.value])
+    )
+    expected = np.mean(
+        [
+            [optimizer.value, 2.0 * optimizer.value]
+            for optimizer in result.local_result.optimizers
+        ],
+        axis=0,
+    )
+    np.testing.assert_allclose(estimate, expected)
+
+
+def test_mpi_normalizes_the_thread_backend_alias():
+    result = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    ).run(2, seed=5, retain="final", local_backend="threads")
+    assert result.local_shots == 2
+
+
+def test_mpi_explicit_communicators_can_work_without_mpi4py(monkeypatch):
+    import importlib
+
+    mpi_module = importlib.import_module("pepsy.optimizers.mpi")
+
+    def missing_mpi():
+        raise ImportError("mpi4py intentionally unavailable")
+
+    monkeypatch.setattr(mpi_module, "_load_mpi", missing_mpi)
+    result = mpi_module.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    ).run(1, seed=6, retain="final")
+    assert result.local_shots == 1
+
+
+def test_mpi_without_a_communicator_reports_the_optional_dependency(monkeypatch):
+    import importlib
+
+    mpi_module = importlib.import_module("pepsy.optimizers.mpi")
+
+    def missing_mpi():
+        raise ImportError("mpi4py intentionally unavailable")
+
+    monkeypatch.setattr(mpi_module, "_load_mpi", missing_mpi)
+    with pytest.raises(ImportError, match="mpi4py"):
+        mpi_module.MPIShotRunner(_probe_factory, [(np.eye(2), 0)])
+
+
 def test_mpi_record_gathering_requires_explicit_record_retention():
     runner = pepsy.MPIShotRunner(
         _probe_factory,
@@ -154,6 +208,35 @@ def test_mpi_runner_supports_rank_local_coalesced_batches():
     assert result.strategy == "coalesced"
     assert result.local_result.coalesced is True
     assert sum(result.local_result.counts) == 8
+
+
+@pytest.mark.parametrize("strategy", ["independent", "coalesced"])
+def test_mpi_importance_reduction_matches_unbiased_result_estimate(strategy):
+    identity = np.eye(2)
+    flip = np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("I", 0.99, identity), ("X", 0.01, flip))
+    )
+    policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
+    result = pepsy.MPIShotRunner(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [pepsy.TrajectoryEvent(channel, 0)],
+        comm=_FakeComm(),
+    ).run(
+        256,
+        seed=19,
+        strategy=strategy,
+        importance_sampling=policy,
+        retain="all",
+    )
+    values = [int(records[0].label == "X") for records in result.local_result.records]
+    expected = result.local_result.estimate(values)
+    by_optimizer = {
+        id(optimizer): value
+        for optimizer, value in zip(result.local_result.optimizers, values)
+    }
+    actual = result.reduce_mean(lambda optimizer: by_optimizer[id(optimizer)])
+    assert actual == pytest.approx(expected)
 
 
 def test_mpi_runner_streams_observables_in_bounded_chunks():

@@ -403,11 +403,13 @@ estimate = streamed.reduce_mean()
 
 The callback is evaluated on each temporary optimizer and those states are
 released after each chunk. `retain="none"` is required in this mode.
-`result.reduce_mean(...)` combines rank-local multiplicities and importance
-weights correctly. `result.reduce_sum(value)` combines already-computed local
-scalars or arrays. The runner materializes the gate stream once, so it can be
-reused for multiple collective runs. MPI is the outer process-level
-parallelism; `local_workers` can optionally enable
+The callback may return a scalar or a numeric array, provided its shape is
+consistent across ranks. `result.reduce_mean(...)` uses the same shot-count
+denominator as the underlying result estimator while combining rank-local
+multiplicities and importance weights. `result.reduce_sum(value)` combines
+already-computed local scalars or arrays. The runner materializes the gate
+stream once, so it can be reused for multiple collective runs. MPI is the
+outer process-level parallelism; `local_workers` can optionally enable
 the existing thread/GPU runner inside each rank, but its default is one to
 avoid oversubscription.
 

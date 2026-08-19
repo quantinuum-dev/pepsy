@@ -99,6 +99,10 @@ jobs:
         run: |
           mpiexec --oversubscribe -n 2 python -m pytest -q -o addopts="" \
             tests/test_mpi_integration.py
+      - name: Run MPI benchmark smoke test
+        run: |
+          mpiexec --oversubscribe -n 2 python benchmarks/mpi_shots.py \
+            --shots 8 --qubits 2 --depth 1 --chi 4
 
   package:
     runs-on: ubuntu-latest

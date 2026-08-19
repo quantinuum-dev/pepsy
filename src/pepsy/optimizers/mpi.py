@@ -53,7 +53,9 @@ def _validate_workers(workers):
 
 def _validate_backend(backend):
     backend = str(backend).strip().lower().replace("-", "_")
-    if backend not in {"serial", "thread", "threads", "gpu"}:
+    if backend == "threads":
+        backend = "thread"
+    if backend not in {"serial", "thread", "gpu"}:
         raise ValueError(
             "local_backend must be 'serial', 'thread', or 'gpu'."
         )
@@ -109,7 +111,7 @@ def _allreduce(comm, mpi_module, value, operation):
 
 
 def _observable_totals(local_result, observable, local_shots):
-    """Return local weighted observable numerator and denominator."""
+    """Return a local weighted observable numerator and shot denominator."""
     if not callable(observable):
         raise TypeError("observable must be callable.")
     optimizers = local_result.optimizers
@@ -127,12 +129,16 @@ def _observable_totals(local_result, observable, local_shots):
         raise ValueError(
             "observable must return one scalar or array value per retained state."
         )
+    if len(weights) != len(counts):
+        raise ValueError("retained state weights must match state multiplicities.")
     factors = counts * weights
-    return np.sum(values * factors, axis=0), float(np.sum(factors))
+    factor_shape = (len(factors),) + (1,) * (values.ndim - 1)
+    numerator = np.sum(values * factors.reshape(factor_shape), axis=0)
+    return numerator, float(local_shots)
 
 
 def _reduce_mean_parts(comm, mpi_module, numerator, denominator):
-    """Reduce weighted mean parts, including ranks with no assigned shots."""
+    """Reduce weighted numerators and shot denominators."""
     rank = int(comm.Get_rank())
     world_size = int(comm.Get_size())
     active = int(denominator != 0.0)
