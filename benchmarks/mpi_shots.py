@@ -42,6 +42,23 @@ def _circuit(qubits: int, depth: int):
     return gates
 
 
+def _parse_workers(value):
+    value = str(value).strip().lower()
+    if value == "auto":
+        return "auto"
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "workers must be a positive integer or 'auto'"
+        ) from exc
+    if workers < 1:
+        raise argparse.ArgumentTypeError(
+            "workers must be a positive integer or 'auto'"
+        )
+    return workers
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shots", type=int, default=10_000)
@@ -51,6 +68,12 @@ def main():
     parser.add_argument("--error-rate", type=float, default=0.0)
     parser.add_argument(
         "--strategy", choices=("independent", "coalesced"), default="independent"
+    )
+    parser.add_argument(
+        "--workers",
+        type=_parse_workers,
+        default="auto",
+        help="local workers per MPI rank (default: auto)",
     )
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
@@ -78,6 +101,9 @@ def main():
         error_model=error_model,
         strategy=args.strategy,
         retain="none",
+        local_workers=args.workers,
+        local_backend="auto",
+        progress=False,
     )
     elapsed = MPI.Wtime() - started
     slowest = comm.allreduce(elapsed, op=MPI.MAX)
@@ -87,6 +113,7 @@ def main():
             json.dumps(
                 {
                     "strategy": args.strategy,
+                    "workers": args.workers,
                     "ranks": comm.Get_size(),
                     "shots": completed,
                     "qubits": args.qubits,

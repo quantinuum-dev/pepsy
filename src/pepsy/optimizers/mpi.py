@@ -1027,6 +1027,7 @@ class MPIShotRunner:
         checkpoint_sync,
         configuration_fingerprint,
         collect_diagnostics,
+        progress,
     ):
         start, stop = _partition(shots, self.rank, self.world_size)
         checkpoint_file = (
@@ -1111,44 +1112,65 @@ class MPIShotRunner:
                 )
 
             write_progress(next_shot)
-            for chunk_start in range(next_shot, stop, chunk_size):
-                chunk_stop = min(chunk_start + chunk_size, stop)
-                local_result = self._run_local(
-                    chunk_start,
-                    chunk_stop,
-                    root_seed,
-                    error_model=error_model,
-                    strategy=strategy,
-                    run_kwargs=run_kwargs,
-                    max_branches=max_branches,
-                    max_branch_factor=max_branch_factor,
-                    importance_sampling=importance_sampling,
-                    auto_max_expected_faults=auto_max_expected_faults,
-                    magic_strategy=magic_strategy,
-                    magic_ancillas=magic_ancillas,
-                    magic_recycle=magic_recycle,
-                    magic_reset_ancillas=magic_reset_ancillas,
-                    magic_projection_order=magic_projection_order,
-                    local_workers=local_workers,
-                    local_backend=local_backend,
-                    retain="final",
-                )
-                chunk_numerator, chunk_denominator = _observable_totals(
-                    local_result,
-                    observable,
-                    chunk_stop - chunk_start,
-                )
-                numerator = (
-                    chunk_numerator
-                    if denominator == 0.0
-                    else numerator + chunk_numerator
-                )
-                denominator += chunk_denominator
-                next_shot = chunk_stop
-                write_progress(next_shot)
         except BaseException:
             local_error = traceback.format_exc()
         self._synchronize_error(local_error)
+
+        if progress is not None:
+            progress.update(max(0, next_shot - start))
+        remaining = max(0, stop - next_shot)
+        chunk_count = int(
+            _allreduce(
+                self.comm,
+                self._mpi_module,
+                (remaining + chunk_size - 1) // chunk_size,
+                "MAX",
+            )
+        )
+        for _index in range(chunk_count):
+            chunk_start = next_shot
+            chunk_stop = min(chunk_start + chunk_size, stop)
+            local_error = None
+            try:
+                if chunk_start < chunk_stop:
+                    local_result = self._run_local(
+                        chunk_start,
+                        chunk_stop,
+                        root_seed,
+                        error_model=error_model,
+                        strategy=strategy,
+                        run_kwargs=run_kwargs,
+                        max_branches=max_branches,
+                        max_branch_factor=max_branch_factor,
+                        importance_sampling=importance_sampling,
+                        auto_max_expected_faults=auto_max_expected_faults,
+                        magic_strategy=magic_strategy,
+                        magic_ancillas=magic_ancillas,
+                        magic_recycle=magic_recycle,
+                        magic_reset_ancillas=magic_reset_ancillas,
+                        magic_projection_order=magic_projection_order,
+                        local_workers=local_workers,
+                        local_backend=local_backend,
+                        retain="final",
+                    )
+                    chunk_numerator, chunk_denominator = _observable_totals(
+                        local_result,
+                        observable,
+                        chunk_stop - chunk_start,
+                    )
+                    numerator = (
+                        chunk_numerator
+                        if denominator == 0.0
+                        else numerator + chunk_numerator
+                    )
+                    denominator += chunk_denominator
+                    next_shot = chunk_stop
+                    write_progress(next_shot)
+            except BaseException:
+                local_error = traceback.format_exc()
+            self._synchronize_error(local_error)
+            if progress is not None:
+                progress.update(max(0, next_shot - start))
         diagnostics = self._collect_rank_diagnostics(
             start=start,
             stop=stop,
@@ -1204,6 +1226,7 @@ class MPIShotRunner:
         checkpoint_sync,
         configuration_fingerprint,
         collect_diagnostics,
+        progress,
     ):
         """Run independent retained optimizer chunks with resumable state."""
         start, stop = _partition(shots, self.rank, self.world_size)
@@ -1292,60 +1315,89 @@ class MPIShotRunner:
                 )
 
             write_progress(next_shot)
-            for chunk_start in range(next_shot, stop, chunk_size):
-                chunk_stop = min(chunk_start + chunk_size, stop)
-                chunk_result = self._run_local(
-                    chunk_start,
-                    chunk_stop,
-                    root_seed,
-                    error_model=error_model,
-                    strategy=strategy,
-                    run_kwargs=run_kwargs,
-                    max_branches=max_branches,
-                    max_branch_factor=max_branch_factor,
-                    importance_sampling=importance_sampling,
-                    auto_max_expected_faults=auto_max_expected_faults,
-                    magic_strategy=magic_strategy,
-                    magic_ancillas=magic_ancillas,
-                    magic_recycle=magic_recycle,
-                    magic_reset_ancillas=magic_reset_ancillas,
-                    magic_projection_order=magic_projection_order,
-                    local_workers=local_workers,
-                    local_backend=local_backend,
-                    retain=retain,
-                )
-                chunk_path = _rank_checkpoint_chunk_path(
-                    checkpoint_path,
-                    self.rank,
-                    chunk_start,
-                    chunk_stop,
-                )
-                _write_checkpoint(
-                    chunk_path,
-                    {
-                        "version": _CHECKPOINT_VERSION,
-                        "mode": "optimizer_chunk",
-                        "shots": int(shots),
-                        "start": int(start),
-                        "stop": int(stop),
-                        "chunk_start": int(chunk_start),
-                        "chunk_stop": int(chunk_stop),
-                        "world_size": int(self.world_size),
-                        "rank": int(self.rank),
-                        "strategy": str(strategy),
-                        "chunk_size": int(chunk_size),
-                        "retain": str(retain),
-                        "root_seed": tuple(root_seed),
-                        "configuration_fingerprint": configuration_fingerprint,
-                        "local_result": chunk_result.raw,
-                    },
-                    sync=checkpoint_sync,
-                )
-                accumulated = _merge_retained_results(accumulated, chunk_result)
-                chunks.append((chunk_start, chunk_stop))
-                next_shot = chunk_stop
-                write_progress(next_shot)
-            if accumulated is None:
+        except BaseException:
+            local_error = traceback.format_exc()
+        self._synchronize_error(local_error)
+
+        if progress is not None:
+            progress.update(max(0, next_shot - start))
+        remaining = max(0, stop - next_shot)
+        chunk_count = int(
+            _allreduce(
+                self.comm,
+                self._mpi_module,
+                (remaining + chunk_size - 1) // chunk_size,
+                "MAX",
+            )
+        )
+        for _index in range(chunk_count):
+            chunk_start = next_shot
+            chunk_stop = min(chunk_start + chunk_size, stop)
+            local_error = None
+            try:
+                if chunk_start < chunk_stop:
+                    chunk_result = self._run_local(
+                        chunk_start,
+                        chunk_stop,
+                        root_seed,
+                        error_model=error_model,
+                        strategy=strategy,
+                        run_kwargs=run_kwargs,
+                        max_branches=max_branches,
+                        max_branch_factor=max_branch_factor,
+                        importance_sampling=importance_sampling,
+                        auto_max_expected_faults=auto_max_expected_faults,
+                        magic_strategy=magic_strategy,
+                        magic_ancillas=magic_ancillas,
+                        magic_recycle=magic_recycle,
+                        magic_reset_ancillas=magic_reset_ancillas,
+                        magic_projection_order=magic_projection_order,
+                        local_workers=local_workers,
+                        local_backend=local_backend,
+                        retain=retain,
+                    )
+                    chunk_path = _rank_checkpoint_chunk_path(
+                        checkpoint_path,
+                        self.rank,
+                        chunk_start,
+                        chunk_stop,
+                    )
+                    _write_checkpoint(
+                        chunk_path,
+                        {
+                            "version": _CHECKPOINT_VERSION,
+                            "mode": "optimizer_chunk",
+                            "shots": int(shots),
+                            "start": int(start),
+                            "stop": int(stop),
+                            "chunk_start": int(chunk_start),
+                            "chunk_stop": int(chunk_stop),
+                            "world_size": int(self.world_size),
+                            "rank": int(self.rank),
+                            "strategy": str(strategy),
+                            "chunk_size": int(chunk_size),
+                            "retain": str(retain),
+                            "root_seed": tuple(root_seed),
+                            "configuration_fingerprint": configuration_fingerprint,
+                            "local_result": chunk_result.raw,
+                        },
+                        sync=checkpoint_sync,
+                    )
+                    accumulated = _merge_retained_results(
+                        accumulated, chunk_result
+                    )
+                    chunks.append((chunk_start, chunk_stop))
+                    next_shot = chunk_stop
+                    write_progress(next_shot)
+            except BaseException:
+                local_error = traceback.format_exc()
+            self._synchronize_error(local_error)
+            if progress is not None:
+                progress.update(max(0, next_shot - start))
+
+        if accumulated is None:
+            local_error = None
+            try:
                 accumulated = self._run_local(
                     start,
                     stop,
@@ -1367,9 +1419,9 @@ class MPIShotRunner:
                     retain=retain,
                 )
                 write_progress(stop)
-        except BaseException:
-            local_error = traceback.format_exc()
-        self._synchronize_error(local_error)
+            except BaseException:
+                local_error = traceback.format_exc()
+            self._synchronize_error(local_error)
         diagnostics = self._collect_rank_diagnostics(
             start=start,
             stop=stop,
@@ -1730,60 +1782,82 @@ class MPIShotRunner:
         self._synchronize_error(local_error)
         self._synchronize_configuration(configuration_fingerprint)
         if observable is not None:
-            return self._run_streaming(
+            progress_state = _MPIProgress(
+                self.comm,
+                self._mpi_module,
+                progress if strategy == "independent" else "never",
                 shots,
-                observable=observable,
-                strategy=strategy,
-                seed=seed,
-                error_model=error_model,
-                run_kwargs=run_kwargs,
-                max_branches=max_branches,
-                max_branch_factor=max_branch_factor,
-                importance_sampling=importance_sampling,
-                auto_max_expected_faults=auto_max_expected_faults,
-                magic_strategy=magic_strategy,
-                magic_ancillas=magic_ancillas,
-                magic_recycle=magic_recycle,
-                magic_reset_ancillas=magic_reset_ancillas,
-                magic_projection_order=magic_projection_order,
-                local_workers=local_workers,
-                local_backend=local_backend,
-                chunk_size=int(chunk_size),
-                checkpoint_path=checkpoint_path,
-                resume=resume,
-                checkpoint_keep=checkpoint_keep,
-                checkpoint_sync=checkpoint_sync,
-                configuration_fingerprint=configuration_fingerprint,
-                collect_diagnostics=collect_diagnostics,
+                rank=self.rank,
             )
+            try:
+                return self._run_streaming(
+                    shots,
+                    observable=observable,
+                    strategy=strategy,
+                    seed=seed,
+                    error_model=error_model,
+                    run_kwargs=run_kwargs,
+                    max_branches=max_branches,
+                    max_branch_factor=max_branch_factor,
+                    importance_sampling=importance_sampling,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    magic_strategy=magic_strategy,
+                    magic_ancillas=magic_ancillas,
+                    magic_recycle=magic_recycle,
+                    magic_reset_ancillas=magic_reset_ancillas,
+                    magic_projection_order=magic_projection_order,
+                    local_workers=local_workers,
+                    local_backend=local_backend,
+                    chunk_size=int(chunk_size),
+                    checkpoint_path=checkpoint_path,
+                    resume=resume,
+                    checkpoint_keep=checkpoint_keep,
+                    checkpoint_sync=checkpoint_sync,
+                    configuration_fingerprint=configuration_fingerprint,
+                    collect_diagnostics=collect_diagnostics,
+                    progress=progress_state,
+                )
+            finally:
+                progress_state.close()
 
         if checkpoint_path is not None:
-            return self._run_checkpointed_states(
+            progress_state = _MPIProgress(
+                self.comm,
+                self._mpi_module,
+                progress if strategy == "independent" else "never",
                 shots,
-                strategy=strategy,
-                seed=seed,
-                error_model=error_model,
-                run_kwargs=run_kwargs,
-                max_branches=max_branches,
-                max_branch_factor=max_branch_factor,
-                importance_sampling=importance_sampling,
-                auto_max_expected_faults=auto_max_expected_faults,
-                magic_strategy=magic_strategy,
-                magic_ancillas=magic_ancillas,
-                magic_recycle=magic_recycle,
-                magic_reset_ancillas=magic_reset_ancillas,
-                magic_projection_order=magic_projection_order,
-                local_workers=local_workers,
-                local_backend=local_backend,
-                retain=retain,
-                chunk_size=int(chunk_size),
-                checkpoint_path=checkpoint_path,
-                resume=resume,
-                checkpoint_keep=checkpoint_keep,
-                checkpoint_sync=checkpoint_sync,
-                configuration_fingerprint=configuration_fingerprint,
-                collect_diagnostics=collect_diagnostics,
+                rank=self.rank,
             )
+            try:
+                return self._run_checkpointed_states(
+                    shots,
+                    strategy=strategy,
+                    seed=seed,
+                    error_model=error_model,
+                    run_kwargs=run_kwargs,
+                    max_branches=max_branches,
+                    max_branch_factor=max_branch_factor,
+                    importance_sampling=importance_sampling,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    magic_strategy=magic_strategy,
+                    magic_ancillas=magic_ancillas,
+                    magic_recycle=magic_recycle,
+                    magic_reset_ancillas=magic_reset_ancillas,
+                    magic_projection_order=magic_projection_order,
+                    local_workers=local_workers,
+                    local_backend=local_backend,
+                    retain=retain,
+                    chunk_size=int(chunk_size),
+                    checkpoint_path=checkpoint_path,
+                    resume=resume,
+                    checkpoint_keep=checkpoint_keep,
+                    checkpoint_sync=checkpoint_sync,
+                    configuration_fingerprint=configuration_fingerprint,
+                    collect_diagnostics=collect_diagnostics,
+                    progress=progress_state,
+                )
+            finally:
+                progress_state.close()
 
         start, stop = _partition(shots, self.rank, self.world_size)
         started = time.perf_counter()

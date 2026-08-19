@@ -109,7 +109,7 @@ jobs:
         run: |
           mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
             python benchmarks/mpi_shots.py \
-            --shots 8 --qubits 2 --depth 1 --chi 4
+            --shots 8 --qubits 2 --depth 1 --chi 4 --workers auto
 
   package:
     runs-on: ubuntu-latest

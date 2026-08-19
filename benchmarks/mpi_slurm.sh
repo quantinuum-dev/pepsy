@@ -15,5 +15,6 @@ exec srun ${srun_args} python benchmarks/mpi_shots.py \
   --qubits "${PEPSY_MPI_QUBITS:-16}" \
   --depth "${PEPSY_MPI_DEPTH:-8}" \
   --chi "${PEPSY_MPI_CHI:-64}" \
+  --workers "${PEPSY_MPI_WORKERS:-auto}" \
   --strategy "${PEPSY_MPI_STRATEGY:-independent}" \
   "$@"

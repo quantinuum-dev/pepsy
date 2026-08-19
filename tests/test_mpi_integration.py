@@ -7,6 +7,7 @@ Run explicitly with, for example::
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 import shutil
 import tempfile
 
@@ -77,6 +78,7 @@ def test_real_mpi_partition_reduction_and_streaming():
         seed=31,
         observable=lambda optimizer: optimizer.value,
         chunk_size=2,
+        progress=True,
     )
     assert streamed.local_result is None
     assert streamed.reduce_mean() == pytest.approx(estimate)
@@ -259,6 +261,52 @@ def test_real_mpi_mps_optimizer_run_keyword():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "dmrg",
+        "dmrg1",
+        "dmrg2",
+        "dmrg3",
+        "fit",
+        "mix",
+        "mpo",
+        "svd",
+        "swap",
+        "perm",
+        "exact",
+        "su",
+    ),
+)
+def test_real_mpi_mps_optimizer_modes(mode):
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    optimizer = pepsy.MpsOptimizer(
+        initial,
+        [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
+        chi=4,
+        mode=mode,
+    )
+    result = optimizer.run(
+        shots=4,
+        seed=64,
+        mpi=comm,
+        workers="auto",
+        progress=False,
+        retain="final",
+        run_kwargs={"progbar": False},
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert result.reduce_sum(result.local_shots) == 4
+    assert len(result.local_result.optimizers) == result.local_shots
+    np.testing.assert_allclose(optimizer.p.to_dense(), initial.to_dense())
+
+
+@pytest.mark.integration
 def test_real_mpi_streaming_checkpoint_resume():
     comm = MPI.COMM_WORLD
     if comm.Get_size() < 2:
@@ -301,6 +349,7 @@ def test_real_mpi_streaming_checkpoint_resume():
             chunk_size=2,
             checkpoint_path=checkpoint_path,
             resume=True,
+            progress=True,
         )
         fresh = runner.run(
             9,

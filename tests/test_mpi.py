@@ -206,6 +206,51 @@ def test_mps_run_progress_is_one_outer_shot_bar(monkeypatch):
     assert events[-1] == ("close",)
 
 
+@pytest.mark.parametrize("chunked_mode", ["observable", "checkpoint"])
+def test_mpi_chunked_runs_report_aggregate_progress(monkeypatch, tmp_path, chunked_mode):
+    import importlib
+
+    mpi_module = importlib.import_module("pepsy.optimizers.mpi")
+    events = []
+
+    class _Progress:
+        def update(self, amount):
+            events.append(("update", amount))
+
+        def close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr(
+        mpi_module,
+        "_make_progress_bar",
+        lambda mode, total, **kwargs: _Progress(),
+    )
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    )
+    kwargs = {
+        "shots": 4,
+        "seed": 46,
+        "progress": True,
+        "chunk_size": 2,
+    }
+    if chunked_mode == "observable":
+        kwargs["observable"] = lambda optimizer: optimizer.value
+    else:
+        kwargs.update(
+            checkpoint_path=tmp_path / "progress-checkpoint",
+            retain="final",
+        )
+    result = runner.run(**kwargs)
+
+    assert sum(event[1] for event in events if event[0] == "update") == 4
+    assert events[-1] == ("close",)
+    if chunked_mode == "checkpoint":
+        result.cleanup_checkpoints()
+
+
 def test_mps_run_mpi_keyword_preserves_checkpoint_options(tmp_path):
     checkpoint = tmp_path / "mps-api"
     optimizer = pepsy.MpsOptimizer(

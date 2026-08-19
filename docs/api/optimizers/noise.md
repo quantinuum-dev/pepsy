@@ -335,8 +335,10 @@ sub-MPO tensor payloads through `apply_to_arrays`; pre-converting gates is still
 preferable when avoiding per-shot conversion overhead matters. This is
 concurrent trajectory execution, not an unsafe shared mutable optimizer or an
 automatic choice of Torch versus CuPy, CUDA device, or dtype.
-`strategy="auto"` requires choosing either `"independent"` or `"coalesced"`
-when parallelism is requested.
+The high-level `run_noisy_shots` and `run_trajectory_shots` helpers resolve
+`strategy="auto"` consistently before local parallel dispatch. The lower-level
+`run_parallel_noisy_shots` and `run_parallel_trajectory_shots` helpers still
+expect an explicit `"independent"` or `"coalesced"` strategy.
 
 ## MPI shot ensembles
 
@@ -426,8 +428,12 @@ multiplicities and importance weights. `result.reduce_sum(value)` combines
 already-computed local scalars or arrays. The runner materializes the gate
 stream once, so it can be reused for multiple collective runs. MPI is the
 outer process-level parallelism; `local_workers` can optionally enable
-the existing thread/GPU runner inside each rank, but its default is one to
-avoid oversubscription.
+the existing thread/GPU runner inside each rank. The direct runner defaults to
+one local worker to avoid oversubscription; pass `local_workers="auto"` to
+divide the host CPU allowance among ranks. `progress=True` reports one
+rank-zero aggregate bar for independent ordinary, streaming, and checkpointed
+runs; coalesced runs intentionally suppress shot-level progress because their
+work is branch-based rather than one optimizer per shot.
 
 For rank-scaling measurements, use the repository benchmark script and vary
 only the MPI process count between runs:
@@ -437,7 +443,8 @@ mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
   --shots 10000 --qubits 16 --depth 8
 ```
 
-The script reports the slowest-rank wall time and global shots per second.
+The script defaults to `--workers auto` and reports the slowest-rank wall time
+and global shots per second. Pass `--workers 1` for a process-only baseline.
 Compare independent and local coalesced execution separately; coalescing is
 not rank-count invariant.
 
@@ -449,8 +456,9 @@ sbatch benchmarks/mpi_slurm.sh
 ```
 
 It uses `srun` and the cluster's configured PMI/PMIx transport. Set
-`PEPSY_MPI_SHOTS`, `PEPSY_MPI_QUBITS`, `PEPSY_MPI_DEPTH`, or
-`PEPSY_MPI_STRATEGY` in the batch environment to adjust the workload; the
+`PEPSY_MPI_SHOTS`, `PEPSY_MPI_QUBITS`, `PEPSY_MPI_DEPTH`,
+`PEPSY_MPI_WORKERS`, or `PEPSY_MPI_STRATEGY` in the batch environment to adjust
+the workload; the
 script assumes Pepsy and its MPI-enabled Python environment are already
 available on every node.
 
