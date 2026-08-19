@@ -4,6 +4,10 @@
 higher-order MPO construction used in SciPost Phys. 17, 135. It keeps virtual
 level histories separate from the compiled Quimb MPO tensors.
 
+For the short decision guide and canonical MPO/PEPO examples, see the
+[unified exponential API](exponentials.md). This page documents the detailed
+history, mode, compression, and execution semantics.
+
 ## Why this is a separate API
 
 An ordinary Quimb `MatrixProductOperator` is the right object for contraction
@@ -79,14 +83,13 @@ U = basis.exp(
 )
 ```
 
-`exp(dt, parameters)` uses `dt` as the actual scalar in `exp(dt * H)`. This
-makes the sign and complex convention explicit: use `dt=-1j * tau` for real
-time, a negative real `dt` for imaginary time, or another scalar for a custom
-exponential. `time_evolution(tau, parameters)` remains a convenience wrapper
-for the real-time case, and `evolution_mpo(parameters, dt=tau)` is retained as
-a compatibility alias.
+`exp(step, parameters)` uses `step` as the actual scalar in `exp(step * H)`.
+This makes the sign and complex convention explicit: use `step=-1j * tau` for
+real time, a negative real `step` for imaginary time, or another scalar for a
+custom exponential. `time_evolution` and `evolution_mpo` remain compatibility
+aliases for older callers; new code should use `exp`.
 
-All three entry points share the same analytical controls: `order`, `mode`,
+The exponential entry points share the same analytical controls: `order`, `mode`,
 `max_bond`, `on_exceed`, `cache_history`, and `history_storage`. Use the named
 `mode` policies for new code; `extend=True` and `approximate=True` remain
 backward-compatible flags on the lower-level construction API. `mode="base"`
@@ -136,9 +139,9 @@ analytical histories. The topology, history, and rewiring plans remain cached;
 the parameter-dependent tensor values and compression factors are evaluated on
 each call so Torch/JAX autodiff graphs cannot become stale.
 
-The parameterized cache is shared by `exp()`, `time_evolution()`, and the
-compatibility alias `evolution_mpo()`. It caches structure, not completed
-parameter-value MPOs. Call `basis.clear_history_cache()` when a long-running
+The parameterized cache is shared by `exp()` and `compile_exp()`. It caches
+structure, not completed parameter-value MPOs. Call
+`basis.clear_history_cache()` when a long-running
 optimization no longer needs the cached history orders; this leaves the
 compiled term topology intact.
 
@@ -148,7 +151,7 @@ not completed MPO values: caching a Torch/JAX result would risk stale
 optimizer values and retain an obsolete autodiff graph. Raw history topology
 is cached by Taylor order because it depends only on channels and reachability;
 the local gather/index plan is cached alongside it. Algorithms 1--4 still
-evaluate scalar weights during each numerical pass, so `dt` and all
+evaluate scalar weights during each numerical pass, so `step` and all
 coefficient tensors remain in the current autodiff graph.
 `MPOBasis` shares exact prefixes and suffix continuations while retaining
 term-specific coefficient slots on a path edge, so its output is directly
@@ -166,10 +169,29 @@ U_arrays = basis.exp_arrays(
 )
 ```
 
-`basis.exp_batch(dt, coefficient_batch, ...)` accepts an array with shape
+`basis.exp_batch(step, coefficient_batch, ...)` accepts an array with shape
 `(batch, number_of_terms)` and returns tensors with a leading batch axis. JAX
 and current Torch releases use their native `vmap` implementation when
 available; the fallback loop remains autodiff-safe.
+
+For repeated calls with the same higher-order policy, compile the value-only
+evaluator explicitly:
+
+```python
+compiled = basis.compile_exp(order=3, mode="optimal")
+U_arrays = compiled.exp_arrays(
+    -1j * time,
+    {"J": J, "V": V},
+)
+```
+
+`CompiledMPOExp` caches slot indices, affine static operator banks, and
+higher-order history plans, but never coefficient-dependent tensors. Its raw
+array methods avoid rebuilding `MPOAutomaton` and `FirstDegreeMPO` on every
+step; coefficient assembly is one backend contraction per site while keeping
+Torch/JAX gradients connected. Use `compiled.exp()` when a semantic MPO
+wrapper is required. `compile_evolution`, `CompiledMPOEvolution`, `evaluate`,
+and `time_evolution_arrays` remain compatibility names.
 
 For one-off large-order constructions, disable persistent history caching:
 
@@ -325,7 +347,7 @@ Coefficients may be scalar tensors from an Autoray-compatible autodiff
 backend. Static Pauli matrices are promoted to that backend, so the
 coefficient remains in the computation graph. The same constructor can be
 used for a parameterized Hamiltonian or observable; pass a backend scalar for
-`dt` as well when constructing an evolution MPO:
+the exponential `step` as well when constructing an MPO:
 
 ```python
 import torch

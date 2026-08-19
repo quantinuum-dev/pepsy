@@ -1,7 +1,7 @@
 """Semantic finite-chain MPOs for higher-order operator construction.
 
 This module is the first layer above ordinary Quimb MPO tensors needed by the
-higher-order time-evolution construction of Van Damme et al.  It deliberately
+higher-order exponential construction of Van Damme et al. It deliberately
 keeps the virtual-level history separate from the tensor data.  Ordinary
 Quimb MPOs remain the compiled interchange format, while :class:`FirstDegreeMPO`
 retains enough structure for exact algebra and history compression.
@@ -56,6 +56,8 @@ __all__ = [
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
     "FirstDegreeMPO",
+    "CompiledMPOExp",
+    "CompiledMPOEvolution",
     "MPOBasis",
 ]
 
@@ -66,6 +68,12 @@ __all__ = [
 # bonds, where a dense ``new_bond x old_bond`` map would use more memory than
 # the original gather/scatter implementation.
 _MAX_HISTORY_TRANSFER_ELEMENTS = 4_000_000
+
+# Keep the fused coefficient bank bounded.  Very long-range or high-rank
+# bases can have many terms relative to their small sparse slot count; those
+# cases retain the exact grouped scatter fallback rather than allocating a
+# mostly-zero ``num_terms x left x right x phys x phys`` bank.
+_MAX_FUSED_SLOT_BANK_ELEMENTS = 4_000_000
 
 
 @dataclass(frozen=True)
@@ -237,6 +245,23 @@ def _check_scalar(value, *, name):
         ndim = np.ndim(value)
     if ndim != 0:
         raise TypeError(f"{name} must be scalar, got ndim={ndim}.")
+
+
+def _resolve_exp_step(step, dt):
+    """Resolve the canonical ``step`` and legacy ``dt`` spellings.
+
+    Public exponential methods use ``step`` in their documentation.  The
+    optional ``dt`` keyword is accepted only as a compatibility spelling so
+    existing callers can migrate without changing numerical semantics.
+    """
+    if step is not None and dt is not None:
+        raise TypeError("pass either step or dt, not both.")
+    if step is None:
+        if dt is None:
+            raise TypeError("exp requires a scalar step.")
+        step = dt
+    _check_scalar(step, name="step")
+    return step
 
 
 def _fixed_rank_svd(matrix):
@@ -904,6 +929,44 @@ class FirstDegreeMPO:
         out._base_level_position_cache = self._base_level_position_cache
         return out
 
+    def _bind_arrays(self, arrays):
+        """Make a lightweight view with new local tensors and shared plans.
+
+        ``MPOBasis`` uses this private primitive for its value-only compiled
+        evaluator.  Reconstructing a semantic MPO through ``__init__`` would
+        repeat validation and level normalization on every optimizer step;
+        the structural metadata and history plans are immutable for this
+        purpose, while the backend arrays must remain fresh so their current
+        autodiff graph is never cached.
+        """
+        arrays = tuple(arrays)
+        if len(arrays) != self.L:
+            raise ValueError(f"arrays must have length {self.L}.")
+        out = object.__new__(type(self))
+        out.L = self.L
+        out._arrays = tuple(
+            _as_4d(array, site=site, length=self.L)
+            for site, array in enumerate(arrays)
+        )
+        out.degree = self.degree
+        out.upper_ind_id = self.upper_ind_id
+        out.lower_ind_id = self.lower_ind_id
+        out.site_tag_id = self.site_tag_id
+        out.metadata = {}
+        out.compression_report = None
+        out._structural_transitions = self._structural_transitions
+        out._history_topology_cache = self._history_topology_cache
+        out._history_symbolic_cache = self._history_symbolic_cache
+        out._history_extension_plan_cache = self._history_extension_plan_cache
+        out._history_compression_plan_cache = self._history_compression_plan_cache
+        out._history_approximation_plan_cache = (
+            self._history_approximation_plan_cache
+        )
+        out._history_tensor_plan_cache = self._history_tensor_plan_cache
+        out._base_level_position_cache = self._base_level_position_cache
+        out._levels = self._levels
+        return out
+
     @staticmethod
     def _history_for_state(state, *, start_state, done_state):
         if state == start_state:
@@ -1429,8 +1492,9 @@ class FirstDegreeMPO:
 
     def exp(
         self,
-        dt,
+        step=None,
         *,
+        dt=None,
         order=1,
         mode=None,
         extend=False,
@@ -1446,19 +1510,28 @@ class FirstDegreeMPO:
         differentiable=False,
         return_report=False,
     ):
-        """Build ``exp(dt * self)`` with optional final compression.
+        """Build ``exp(step * self)`` with optional final compression.
 
-        Use ``dt=-1j * tau`` for real-time evolution, or a real ``dt`` for
-        imaginary-time and other exponential operators. ``max_bond`` guards
-        the temporary history construction; ``chi`` controls the returned MPO
-        after the analytical construction. ``mode`` is the preferred named
-        construction policy; ``extend`` and ``approximate`` are retained as
-        explicit compatibility flags.
+        Parameters
+        ----------
+        step : scalar
+            Actual scalar in the exponential. Use ``-1j * tau`` for
+            real-time evolution and ``-beta`` for imaginary time.
+        dt : scalar, optional
+            Compatibility spelling for ``step``. Supplying both raises.
+        order, mode, max_bond, on_exceed, cache_history, history_storage
+            Controls for the analytical higher-order history construction.
+        chi : int, optional
+            Separate final numerical MPO bond cap. It is not the temporary
+            history-bond guard ``max_bond``.
+        differentiable : bool, optional
+            With ``chi``, select fixed-rank autodiff compression instead of a
+            value-dependent numerical cutoff.
         """
-        _check_scalar(dt, name="dt")
+        step = _resolve_exp_step(step, dt)
         return self._exp_with_compression(
-            dt,
-            metadata_dt=dt,
+            step,
+            metadata_dt=step,
             metadata_operation="exp",
             order=order,
             mode=mode,
@@ -1523,8 +1596,9 @@ class FirstDegreeMPO:
 
     def exp_arrays(
         self,
-        dt,
+        step=None,
         *,
+        dt=None,
         order=1,
         mode=None,
         extend=False,
@@ -1534,17 +1608,16 @@ class FirstDegreeMPO:
         cache_history=True,
         history_storage="auto",
     ):
-        """Return exponential tensors without crossing the Quimb boundary.
+        """Return ``exp(step * self)`` tensors without a Quimb wrapper.
 
         This is the low-level numerical interface for compiled optimization
-        loops.  It returns the normalized ``(left, right, up, down)`` tensor
-        tuple directly, while retaining the same construction and
-        autodiff semantics as :meth:`exp`.  Keeping wrapper creation outside
-        a caller's JAX/Torch compiled function avoids repeatedly tracing the
-        semantic metadata layer.
+        loops. It returns the normalized ``(left, right, up, down)`` tensor
+        tuple directly. The backend values remain connected to ``step`` and
+        the Hamiltonian coefficients for autodiff.
         """
+        step = _resolve_exp_step(step, dt)
         return self.exp(
-            dt,
+            step,
             order=order,
             mode=mode,
             extend=extend,
@@ -4213,6 +4286,462 @@ class FirstDegreeMPO:
         return self.scale(coefficient)
 
 
+class CompiledMPOExp:
+    """Value-only higher-order exponential evaluator for an :class:`MPOBasis`.
+
+    The object owns the structural pieces of a parameterized exponential step:
+    the unit-coefficient MPO tensors, coefficient-slot indices, static local
+    operator banks, and the history execution plans. Calls assemble fresh
+    backend tensors and then execute the same Algorithms 1--4 as
+    :meth:`FirstDegreeMPO.extensive_exponential`, so coefficients and the
+    exponential step remain in the current Torch/JAX autodiff graph.
+
+    ``CompiledMPOExp`` is intentionally a numerical boundary.  Its
+    primary methods return raw ``(left, right, up, down)`` tensor tuples;
+    :meth:`evaluate` is available when a semantic :class:`FirstDegreeMPO`
+    wrapper is needed outside a compiled optimizer loop.
+    """
+
+    _MODE_ALIASES = {
+        "base": (False, False, "base"),
+        "algorithm4": (False, True, "algorithm4"),
+        "paper_algorithm4": (False, True, "algorithm4"),
+        "optimal": (True, False, "optimal"),
+        "paper_optimal": (True, False, "optimal"),
+        "approximate": (True, True, "approximate"),
+        "paper_approximate": (True, True, "approximate"),
+    }
+
+    def __init__(
+        self,
+        basis,
+        *,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        history_storage="auto",
+    ):
+        if not isinstance(basis, MPOBasis):
+            raise TypeError("basis must be an MPOBasis.")
+        if mode is not None:
+            if not isinstance(mode, str):
+                raise TypeError("mode must be a string or None.")
+            try:
+                mode_extend, mode_approximate, canonical_mode = (
+                    self._MODE_ALIASES[mode]
+                )
+            except KeyError as exc:
+                allowed = ", ".join(sorted(self._MODE_ALIASES))
+                raise ValueError(
+                    f"unknown mode {mode!r}; expected one of {allowed}."
+                ) from exc
+            if extend or approximate:
+                raise ValueError(
+                    "mode cannot be combined with extend or approximate flags."
+                )
+            extend = mode_extend
+            approximate = mode_approximate
+        else:
+            canonical_mode = (
+                "approximate" if approximate and extend
+                else "optimal" if extend
+                else "algorithm4" if approximate
+                else "base"
+            )
+
+        if history_storage == "streaming":
+            raise ValueError(
+                "compiled evolution requires cached history; use "
+                "history_storage='auto', 'sparse', or 'dense'."
+            )
+
+        self.basis = basis
+        self.order = order
+        self.mode = canonical_mode
+        self.extend = bool(extend)
+        self.approximate = bool(approximate)
+        self.max_bond = max_bond
+        self.on_exceed = on_exceed
+        self.history_storage = history_storage
+
+        # This validates the complete option set and fills every symbolic
+        # history/tensor plan once.  The unit-coefficient numerical result is
+        # discarded; only its structural caches are retained.
+        basis._template.extensive_exponential(  # pylint: disable=protected-access
+            0.0,
+            order=order,
+            mode=canonical_mode,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=True,
+            history_storage=history_storage,
+        )
+
+        self._base_arrays = tuple(basis._template.arrays)  # pylint: disable=protected-access
+        self._site_records = self._compile_slot_records(basis)
+        self._fused_site_banks = self._compile_fused_site_banks(basis)
+
+    @staticmethod
+    def _compile_slot_records(basis):
+        """Resolve coefficient slots to dense virtual tensor positions."""
+        automaton = basis._automaton  # pylint: disable=protected-access
+        records_by_site = [[] for _ in range(basis.L)]
+
+        def position(site, state, *, left):
+            if basis.L == 1:
+                return 0
+            if left and site == 0:
+                return 0
+            if not left and site == basis.L - 1:
+                return 0
+            cut = site - 1 if left else site
+            return {
+                channel.state: index
+                for index, channel in enumerate(automaton.channels[cut])
+            }[state]
+
+        for site, transition_index, contributions in basis._slot_groups:
+            transition = automaton.transitions[site][transition_index]
+            row = position(site, transition.left_state, left=True)
+            column = position(site, transition.right_state, left=False)
+            term_indices = np.asarray(
+                [term_index for term_index, _operator in contributions],
+                dtype=int,
+            )
+            operators = tuple(operator for _term_index, operator in contributions)
+            if all(
+                _backend_name(operator) in {"builtins", "numpy"}
+                for operator in operators
+            ):
+                operator_bank = np.stack(
+                    [np.asarray(operator) for operator in operators],
+                    axis=0,
+                )
+            else:
+                operator_bank = None
+            records_by_site[site].append(
+                (
+                    term_indices,
+                    row,
+                    column,
+                    operators,
+                    transition.operator,
+                    operator_bank,
+                ),
+            )
+
+        compiled = []
+        for records in records_by_site:
+            if not records:
+                compiled.append(None)
+                continue
+            compiled.append(tuple(records))
+        return tuple(compiled)
+
+    def _compile_fused_site_banks(self, basis):
+        """Build optional dense affine coefficient banks per MPO site.
+
+        A unit-coefficient template contains the structural rails and one
+        copy of every slot edge.  Subtracting those unit edge blocks from a
+        static bias leaves an affine representation
+
+        ``local_tensor = bias + sum(term_coefficient * operator_bank[term])``.
+
+        The bank turns coefficient assembly into one backend contraction per
+        site.  It is used only for ordinary host-backed static operators and
+        only below a memory bound; backend-native operator arrays and large
+        sparse layouts use the grouped autodiff-safe fallback.
+        """
+        fused = []
+        for base, records in zip(self._base_arrays, self._site_records):
+            if records is None or _backend_name(base) not in {"builtins", "numpy"}:
+                fused.append(None)
+                continue
+            if any(
+                _backend_name(operator) not in {"builtins", "numpy"}
+                for record in records
+                for operator in (*record[3], record[4])
+            ):
+                fused.append(None)
+                continue
+            try:
+                bank_elements = basis.num_terms * int(np.prod(base.shape))
+                if bank_elements > _MAX_FUSED_SLOT_BANK_ELEMENTS:
+                    fused.append(None)
+                    continue
+                operators = [
+                    np.asarray(operator)
+                    for record in records
+                    for operator in record[3]
+                ]
+                unit_operators = [
+                    np.asarray(record[4])
+                    for record in records
+                ]
+                dtype = np.result_type(
+                    np.asarray(base).dtype,
+                    *(operator.dtype for operator in operators),
+                    *(operator.dtype for operator in unit_operators),
+                    np.float32,
+                )
+                bias = np.asarray(base, dtype=dtype).copy()
+                bank = np.zeros(
+                    (basis.num_terms, *tuple(int(size) for size in base.shape)),
+                    dtype=dtype,
+                )
+                for record in records:
+                    term_indices, row, column, operators, unit_operator, _bank = (
+                        record
+                    )
+                    bias[row, column] -= np.asarray(unit_operator, dtype=dtype)
+                    for term_index, operator in zip(term_indices, operators):
+                        bank[int(term_index), row, column] += np.asarray(
+                            operator,
+                            dtype=dtype,
+                        )
+            except (TypeError, ValueError):
+                fused.append(None)
+                continue
+            fused.append((bias, bank))
+        return tuple(fused)
+
+    @property
+    def cache_info(self):
+        """Return the shared structural cache diagnostics."""
+        info = dict(self.basis.cache_info)
+        info.update({
+            "fused_slot_sites": sum(
+                bank is not None for bank in self._fused_site_banks
+            ),
+            "fused_slot_bank_elements": sum(
+                int(np.prod(bank[1].shape))
+                for bank in self._fused_site_banks
+                if bank is not None
+            ),
+        })
+        return info
+
+    def _assemble_arrays(self, dt, parameters, coefficients):
+        coefficient_values = self.basis._coefficient_values(  # pylint: disable=protected-access
+            parameters,
+            coefficients,
+        )
+        coefficient_batch = _stack(coefficient_values, axis=0)
+        reference = _backend_reference((dt, *coefficient_values, *self._base_arrays))
+        step = _as_backend(dt, like=reference)
+        arrays = []
+
+        for base, records, fused in zip(
+            self._base_arrays,
+            self._site_records,
+            self._fused_site_banks,
+        ):
+            if fused is not None:
+                bias, bank = fused
+                array = _as_backend(bias, like=reference)
+                if _complex_dtype(getattr(step, "dtype", None)) and not _complex_dtype(
+                    getattr(array, "dtype", None)
+                ):
+                    array = ar.do(
+                        "multiply",
+                        array,
+                        _as_backend(1.0 + 0.0j, like=step),
+                    )
+                bank = _as_backend(bank, like=coefficient_batch)
+                coefficients_backend, bank = _align_tensordot_dtypes(
+                    coefficient_batch,
+                    bank,
+                )
+                weighted = ar.do(
+                    "tensordot",
+                    coefficients_backend,
+                    bank,
+                    axes=([0], [0]),
+                )
+                array, weighted = _align_tensordot_dtypes(array, weighted)
+                arrays.append(ar.do("add", array, weighted))
+                continue
+            array = _as_backend(base, like=reference)
+            if _complex_dtype(getattr(step, "dtype", None)) and not _complex_dtype(
+                getattr(array, "dtype", None)
+            ):
+                # Higher-order prefactors can be complex even when H and its
+                # coefficients are real. Promote the fresh local view before
+                # any history transfer so no imaginary component is lost.
+                array = ar.do(
+                    "multiply",
+                    array,
+                    _as_backend(1.0 + 0.0j, like=step),
+                )
+            if records is not None:
+                corrections = []
+                rows = []
+                columns = []
+                for (
+                    term_indices,
+                    row,
+                    column,
+                    operators,
+                    unit_operator,
+                    operator_bank,
+                ) in records:
+                    if operator_bank is not None:
+                        indices = _as_backend(
+                            term_indices,
+                            like=coefficient_batch,
+                        )
+                        selected = coefficient_batch[indices]
+                        operator_values = _as_backend(
+                            operator_bank,
+                            like=selected,
+                        )
+                        selected, operator_values = _align_tensordot_dtypes(
+                            selected,
+                            operator_values,
+                        )
+                        weighted = ar.do(
+                            "tensordot",
+                            selected,
+                            operator_values,
+                            axes=([0], [0]),
+                        )
+                    else:
+                        weighted = None
+                        for term_index, operator in zip(
+                            term_indices,
+                            operators,
+                        ):
+                            contribution = _multiply_scalar(
+                                coefficient_values[term_index],
+                                operator,
+                            )
+                            if weighted is None:
+                                weighted = contribution
+                                continue
+                            reference = _backend_reference(
+                                (weighted, contribution),
+                            )
+                            weighted = ar.do(
+                                "add",
+                                _as_backend(weighted, like=reference),
+                                _as_backend(contribution, like=reference),
+                            )
+                    unit_operator = _as_backend(unit_operator, like=weighted)
+                    weighted, unit_operator = _align_tensordot_dtypes(
+                        weighted,
+                        unit_operator,
+                    )
+                    corrections.append(
+                        ar.do("subtract", weighted, unit_operator),
+                    )
+                    rows.append(row)
+                    columns.append(column)
+                values = _stack(corrections, axis=0)
+                array, values = _align_tensordot_dtypes(array, values)
+                delta = _zeros(array.shape, like=array)
+                delta = _scatter_add_into_2d(
+                    delta,
+                    rows,
+                    columns,
+                    values,
+                )
+                array = ar.do("add", array, delta)
+            arrays.append(array)
+        return tuple(arrays)
+
+    def evaluate_arrays(self, dt, parameters=None, *, coefficients=None):
+        """Compatibility wrapper for :meth:`exp_arrays`."""
+        return self.exp_arrays(dt, parameters, coefficients=coefficients)
+
+    def exp_arrays(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        dt=None,
+    ):
+        """Evaluate ``exp(step * H)`` as fresh backend-native tensor tuples.
+
+        ``dt`` is accepted as a compatibility keyword for ``step``. The
+        returned tuple is suitable for a backend contraction kernel and does
+        not create a semantic MPO wrapper.
+        """
+        step = _resolve_exp_step(step, dt)
+        arrays = self._assemble_arrays(step, parameters, coefficients)
+        bound = self.basis._template._bind_arrays(arrays)  # pylint: disable=protected-access
+        return bound.extensive_exponential(
+            step,
+            order=self.order,
+            mode=self.mode,
+            max_bond=self.max_bond,
+            on_exceed=self.on_exceed,
+            cache_history=True,
+            history_storage=self.history_storage,
+        ).arrays
+
+    def evaluate(self, dt, parameters=None, *, coefficients=None):
+        """Compatibility wrapper for :meth:`exp`."""
+        return self.exp(dt, parameters, coefficients=coefficients)
+
+    def exp(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        dt=None,
+    ):
+        """Evaluate ``exp(step * H)`` as a semantic :class:`FirstDegreeMPO`.
+
+        Use this form when downstream code needs MPO metadata or methods such
+        as ``to_mpo()``. Use :meth:`exp_arrays` when it only needs raw tensors.
+        """
+        step = _resolve_exp_step(step, dt)
+        arrays = self._assemble_arrays(step, parameters, coefficients)
+        bound = self.basis._template._bind_arrays(arrays)  # pylint: disable=protected-access
+        result = bound.extensive_exponential(
+            step,
+            order=self.order,
+            mode=self.mode,
+            max_bond=self.max_bond,
+            on_exceed=self.on_exceed,
+            cache_history=True,
+            history_storage=self.history_storage,
+        )
+        result.metadata["compiled_exp"] = True
+        # Retain the historical metadata key for callers that inspect it.
+        result.metadata["compiled_evolution"] = True
+        return result
+
+    def time_evolution_arrays(self, dt, parameters=None, *, coefficients=None):
+        """Evaluate ``exp(-1j * dt * H)`` as backend-native tensors."""
+        return self.evaluate_arrays(
+            -1j * dt,
+            parameters,
+            coefficients=coefficients,
+        )
+
+    def time_evolution(self, dt, parameters=None, *, coefficients=None):
+        """Evaluate real-time evolution and return a semantic MPO."""
+        return self.evaluate(
+            -1j * dt,
+            parameters,
+            coefficients=coefficients,
+        )
+
+    __call__ = exp_arrays
+
+
+# Compatibility name for callers of the original evolution-oriented API.
+# Keep it as an exact alias so existing isinstance checks remain valid while
+# ``CompiledMPOExp`` remains the canonical class name.
+CompiledMPOEvolution = CompiledMPOExp
+
+
 class MPOBasis:
     """Reusable coefficient basis for parameterized first-degree MPOs.
 
@@ -4329,6 +4858,7 @@ class MPOBasis:
             site_tag_id=site_tag_id,
         )
         self._build_count = 0
+        self._compiled_evolution_cache = {}
 
     @classmethod
     def from_local_terms(
@@ -4379,6 +4909,9 @@ class MPOBasis:
             "compiled": True,
             "compiled_terms": self.num_terms,
             "builds": self._build_count,
+            "compiled_exp_variants": len(self._compiled_evolution_cache),
+            # Compatibility diagnostic name.
+            "compiled_evolution_variants": len(self._compiled_evolution_cache),
             "topology_bond_dimensions": self.bond_dimensions,
             "vectorized_slot_groups": len(self._vectorized_slot_groups),
             "history": self._template.history_cache_info,
@@ -4387,7 +4920,70 @@ class MPOBasis:
     def clear_history_cache(self):
         """Release cached higher-order plans while retaining the basis graph."""
         self._template.clear_history_cache()
+        self._compiled_evolution_cache.clear()
         return self
+
+    def compile_evolution(
+        self,
+        *,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        history_storage="auto",
+    ):
+        """Compatibility wrapper for :meth:`compile_exp`.
+
+        New code should call ``compile_exp``. This historical name remains
+        available for existing programs and returns the same cached
+        :class:`CompiledMPOExp` object.
+        """
+        key = (
+            order,
+            mode,
+            extend,
+            approximate,
+            max_bond,
+            on_exceed,
+            history_storage,
+        )
+        try:
+            compiled = self._compiled_evolution_cache.get(key)
+        except TypeError:
+            compiled = None
+        if compiled is None:
+            compiled = CompiledMPOExp(
+                self,
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            )
+            try:
+                self._compiled_evolution_cache[key] = compiled
+            except TypeError:
+                pass
+        return compiled
+
+    def compile_exp(self, **kwargs):
+        """Compile a reusable value-only exponential evaluator.
+
+        The returned :class:`CompiledMPOExp` stores only reusable structure:
+        history topology, virtual transfer plans, coefficient-slot indices,
+        and static operator banks. Each ``exp`` or ``exp_arrays`` call creates
+        fresh backend values, keeping Torch/JAX autodiff graphs current.
+
+        Parameters are the same as :meth:`MPOBasis.exp`, except that the
+        ``step`` and coefficient values are supplied when the compiled object
+        is called. Use ``compiled.exp`` for a semantic MPO and
+        ``compiled.exp_arrays`` for raw backend tensor tuples.
+        """
+        return self.compile_evolution(**kwargs)
 
     def _resolve_coefficient(self, coefficient, parameters):
         if isinstance(coefficient, MPOParameter):
@@ -4608,10 +5204,11 @@ class MPOBasis:
 
     def exp(
         self,
-        dt,
+        step=None,
         parameters=None,
         *,
         coefficients=None,
+        dt=None,
         order=1,
         mode=None,
         extend=False,
@@ -4627,15 +5224,16 @@ class MPOBasis:
         differentiable=False,
         return_report=False,
     ):
-        """Build ``exp(dt * H(parameters))`` with optional compression.
+        """Build ``exp(step * H(parameters))`` with optional compression.
 
-        ``dt`` is the actual scalar multiplying the Hamiltonian. For
-        real-time evolution, pass ``dt=-1j * tau``. ``chi`` is the final MPO
-        bond cap, while ``max_bond`` in ``kwargs`` only guards the temporary
-        higher-order history representation.
+        ``step`` is the actual scalar multiplying the Hamiltonian. For
+        real-time evolution, pass ``step=-1j * tau``; ``dt=...`` remains a
+        compatibility keyword. ``chi`` is the final MPO bond cap, while
+        ``max_bond`` only guards the temporary higher-order history.
         """
+        step = _resolve_exp_step(step, dt)
         return self.build(parameters, coefficients=coefficients).exp(
-            dt,
+            step,
             order=order,
             mode=mode,
             extend=extend,
@@ -4694,10 +5292,11 @@ class MPOBasis:
 
     def exp_arrays(
         self,
-        dt,
+        step=None,
         parameters=None,
         *,
         coefficients=None,
+        dt=None,
         order=1,
         mode=None,
         extend=False,
@@ -4707,18 +5306,33 @@ class MPOBasis:
         cache_history=True,
         history_storage="auto",
     ):
-        """Evaluate ``exp(dt * H)`` as backend-native tensor tuples.
+        """Evaluate ``exp(step * H)`` as backend-native tensor tuples.
 
         This method is intended for JAX/Torch compiled numerical kernels:
         the reusable basis remains a Python-side structural object, while
         the returned tensors are the only values captured by the optimizer's
         autodiff graph.
         """
+        step = _resolve_exp_step(step, dt)
+        if cache_history:
+            return self.compile_exp(
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            ).exp_arrays(
+                step,
+                parameters,
+                coefficients=coefficients,
+            )
         return self.build(
             parameters,
             coefficients=coefficients,
         ).exp_arrays(
-            dt,
+            step,
             order=order,
             mode=mode,
             extend=extend,
@@ -4745,6 +5359,20 @@ class MPOBasis:
         history_storage="auto",
     ):
         """Evaluate real-time evolution as backend-native tensor tuples."""
+        if cache_history:
+            return self.compile_evolution(
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            ).time_evolution_arrays(
+                dt,
+                parameters,
+                coefficients=coefficients,
+            )
         return self.build(
             parameters,
             coefficients=coefficients,
@@ -4762,9 +5390,10 @@ class MPOBasis:
 
     def exp_batch(
         self,
-        dt,
-        coefficients,
+        step=None,
+        coefficients=None,
         *,
+        dt=None,
         order=1,
         mode=None,
         extend=False,
@@ -4774,14 +5403,17 @@ class MPOBasis:
         cache_history=True,
         history_storage="auto",
     ):
-        """Evaluate a batch of coefficient vectors with shared topology.
+        """Evaluate ``exp(step * H)`` for a batch of coefficient vectors.
 
         The structural plan is compiled once and every row is evaluated with
         fresh backend tensors, preserving gradients with respect to both the
-        coefficient batch and ``dt``. JAX and current Torch releases use
+        coefficient batch and ``step``. JAX and current Torch releases use
         native ``vmap``; NumPy and unsupported backend operations use a small
         autodiff-safe assembly loop.
         """
+        step = _resolve_exp_step(step, dt)
+        if coefficients is None:
+            raise TypeError("exp_batch requires a coefficient batch.")
         shape = getattr(coefficients, "shape", None)
         if shape is None or len(tuple(shape)) != 2:
             raise ValueError(
@@ -4801,13 +5433,60 @@ class MPOBasis:
             "cache_history": cache_history,
             "history_storage": history_storage,
         }
+        if cache_history:
+            compiled = self.compile_exp(
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            )
+            if _backend_name(coefficients) == "jax":
+                import jax  # pylint: disable=import-outside-toplevel
+
+                return jax.vmap(
+                    lambda row: compiled.exp_arrays(
+                        step,
+                        coefficients=row,
+                    )
+                )(coefficients)
+            if _backend_name(coefficients) == "torch":
+                try:
+                    import torch  # pylint: disable=import-outside-toplevel
+
+                    vmap = getattr(torch, "vmap", None)
+                    if vmap is None:
+                        from torch.func import vmap  # pylint: disable=import-outside-toplevel
+                    return vmap(
+                        lambda row: compiled.exp_arrays(
+                            step,
+                            coefficients=row,
+                        )
+                    )(coefficients)
+                except (ImportError, RuntimeError, TypeError):
+                    pass
+            rows = [
+                compiled.exp_arrays(
+                    step,
+                    coefficients=coefficients[index],
+                )
+                for index in range(int(shape[0]))
+            ]
+            if not rows:
+                return tuple()
+            return tuple(
+                ar.do("stack", tuple(row[site] for row in rows), axis=0)
+                for site in range(self.L)
+            )
         backend = _backend_name(coefficients)
         if backend == "jax":
             import jax  # pylint: disable=import-outside-toplevel
 
             return jax.vmap(
                 lambda row: self.exp_arrays(
-                    dt,
+                    step,
                     coefficients=row,
                     **options,
                 )
@@ -4821,7 +5500,7 @@ class MPOBasis:
                     from torch.func import vmap  # pylint: disable=import-outside-toplevel
                 return vmap(
                     lambda row: self.exp_arrays(
-                        dt,
+                        step,
                         coefficients=row,
                         **options,
                     )
@@ -4833,7 +5512,7 @@ class MPOBasis:
                 pass
         rows = [
             self.exp_arrays(
-                dt,
+                step,
                 coefficients=coefficients[index],
                 **options,
             )

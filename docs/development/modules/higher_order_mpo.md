@@ -9,12 +9,12 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | API | Responsibility | Accuracy and ownership |
 | --- | --- | --- |
 | `MPOBasis` / `MPOParameter` | Reuse a parameterized term topology | Structural cache only; each bind creates fresh backend-connected local blocks |
+| `MPOBasis.compile_exp` / `CompiledMPOExp` | Reuse coefficient-slot and higher-order execution plans | Value-only evaluator; static banks are cached, coefficient-dependent arrays and autodiff graphs are fresh |
 | `MPOProductTerm` | Describe a factorized local product term | Matrix operators or compact Pauli labels; `charge` is preserved but not interpreted |
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
-| `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(dt * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; `differentiable=True` selects fixed-rank TT-SVD |
-| `FirstDegreeMPO.time_evolution` / `MPOBasis.time_evolution` | Convenience wrapper for `exp(-1j * tau * H)` | `evolution_mpo` remains a compatibility alias |
+| `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(step * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; real-time uses `step=-1j * tau`; `differentiable=True` selects fixed-rank TT-SVD |
 | `FirstDegreeMPO.clear_history_cache` / `MPOBasis.clear_history_cache` | Release reusable higher-order plans | Keeps current tensors and compiled first-degree topology unchanged |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
 | `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
@@ -62,6 +62,16 @@ reachable history topology and local gather/index execution plan by order.
 The symbolic merge schedule is reused, while scalar weights and backend
 arrays are rebuilt for each call so parameter and time autodiff graphs remain
 fresh.
+
+`compile_exp()` adds the value-only execution boundary for repeated
+optimization steps. For ordinary static local operators it compiles each
+site into an affine bias/operator bank and evaluates that bank with one
+backend contraction per site. Backend-native operators and oversized banks
+retain the grouped scatter fallback. This avoids rebuilding the semantic
+automaton and first-degree wrapper per call; the remaining dense virtual
+history arrays are still materialized by Algorithms 1--4.
+`compile_evolution()` and `CompiledMPOEvolution` remain compatibility names for
+older callers.
 
 ## Multi-site execution order
 

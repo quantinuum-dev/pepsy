@@ -253,7 +253,7 @@ basis = MPOBasis.from_pauli_terms(
     [((i, i + 1), "ZZ", MPOParameter("J")) for i in range(L - 1)]
     + [((i,), "X", MPOParameter("hx")) for i in range(L)],
 )
-U = basis.extensive_exponential(
+U = basis.exp(
     -1j * dt,
     {"J": J, "hx": hx},
     order=2,
@@ -274,8 +274,9 @@ Algorithms 1--3, where Algorithm 3 adds selected order-`N + 1` terms without
 increasing the analytical history bond dimension. `mode="approximate"`
 additionally enables Algorithm 4 after that extension. These modes, together
 with `order`, `max_bond`, `on_exceed`, `cache_history`, and `history_storage`,
-are shared by `basis.exp()`, `basis.time_evolution()`, and the compatibility
-alias `basis.evolution_mpo()`. `MPOProductTerm` also accepts arbitrary
+are shared by `basis.exp()` and `basis.compile_exp()`. The names
+`basis.time_evolution()` and `basis.evolution_mpo()` remain compatibility
+aliases. `MPOProductTerm` also accepts arbitrary
 one-dimensional supports, for example `(0, 1, 3)` with operators `"XYZ"`.
 
 The first build compiles the first-degree MPO topology and symbolic history

@@ -7,6 +7,8 @@ import pytest
 
 import pepsy
 from pepsy.operators import (
+    CompiledMPOEvolution,
+    CompiledMPOExp,
     FirstDegreeMPO,
     MPOCompressionReport,
     MPOBasis,
@@ -40,6 +42,8 @@ def _two_term_mpo():
 def test_first_degree_mpo_public_exports_resolve():
     """The new semantic MPO layer belongs to ``pepsy.operators``."""
     assert FirstDegreeMPO is pepsy.operators.FirstDegreeMPO
+    assert CompiledMPOEvolution is pepsy.operators.CompiledMPOEvolution
+    assert CompiledMPOExp is pepsy.operators.CompiledMPOExp
     assert MPOBasis is pepsy.operators.MPOBasis
     assert MPOParameter is pepsy.operators.MPOParameter
     assert MPOLevel is pepsy.operators.MPOLevel
@@ -55,6 +59,8 @@ def test_first_degree_mpo_public_exports_resolve():
         is pepsy.operators.MPONumericalCompressionReport
     )
     assert "FirstDegreeMPO" in pepsy.operators.__all__
+    assert "CompiledMPOEvolution" in pepsy.operators.__all__
+    assert "CompiledMPOExp" in pepsy.operators.__all__
 
 
 def test_mpo_basis_reuses_compiled_automaton_for_rebinding():
@@ -140,6 +146,30 @@ def test_mpo_basis_exp_is_explicit_and_time_evolution_is_its_real_time_alias():
     assert real_time.metadata["operation"] == "time_evolution"
     for explicit_array, real_time_array in zip(explicit.arrays, real_time.arrays):
         np.testing.assert_allclose(explicit_array, real_time_array)
+
+    keyword = basis.exp(
+        step=-1j * 0.01,
+        coefficients=coefficients,
+        order=2,
+        mode="optimal",
+    )
+    legacy_keyword = basis.exp(
+        dt=-1j * 0.01,
+        coefficients=coefficients,
+        order=2,
+        mode="optimal",
+    )
+    for keyword_array, legacy_array in zip(
+        keyword.arrays,
+        legacy_keyword.arrays,
+    ):
+        np.testing.assert_allclose(keyword_array, legacy_array)
+    with pytest.raises(TypeError, match="either step or dt"):
+        basis.exp(
+            step=0.01,
+            dt=0.01,
+            coefficients=coefficients,
+        )
 
 
 def test_mpo_basis_approximate_evolution_keeps_parameters_differentiable():
@@ -381,13 +411,60 @@ def test_basis_raw_array_and_batch_apis_preserve_numpy_values():
         np.testing.assert_allclose(raw_array, semantic_array)
 
     batch = basis.exp_batch(
-        0.01,
-        np.stack((coefficients, [0.2, 0.3])),
+        step=0.01,
+        coefficients=np.stack((coefficients, [0.2, 0.3])),
         order=2,
         mode="base",
     )
     assert batch[0].shape[0] == 2
     np.testing.assert_allclose(batch[0][0], raw[0])
+
+
+def test_compiled_exp_reuses_slot_bank_without_building_mpo():
+    """The value-only evaluator matches the semantic path without rebinding."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    compiled = basis.compile_exp(order=2, mode="optimal")
+    assert isinstance(compiled, CompiledMPOExp)
+    assert isinstance(compiled, CompiledMPOEvolution)
+    assert compiled is basis.compile_exp(order=2, mode="optimal")
+    assert compiled is basis.compile_evolution(order=2, mode="optimal")
+    assert basis.cache_info["builds"] == 0
+    assert compiled.cache_info["fused_slot_sites"] > 0
+
+    coefficients = np.array([0.7, -0.2])
+    raw = compiled.exp_arrays(step=0.01, coefficients=coefficients)
+    assert basis.cache_info["builds"] == 0
+
+    semantic = compiled.exp(step=0.01, coefficients=coefficients).arrays
+    for compiled_array, semantic_array in zip(raw, semantic):
+        np.testing.assert_allclose(compiled_array, semantic_array)
+
+
+def test_compiled_evolution_keeps_torch_graph_for_coefficients_and_time():
+    """Static slot banks do not capture a stale Torch autodiff graph."""
+    torch = pytest.importorskip("torch")
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    compiled = basis.compile_exp(order=2, mode="optimal")
+    coefficients = torch.tensor(
+        [0.7, -0.2],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    arrays = compiled.exp_arrays(-1j * time, coefficients=coefficients)
+    loss = sum(array.real.sum() for array in arrays)
+    coefficient_grad, time_grad = torch.autograd.grad(loss, (coefficients, time))
+
+    assert any(array.requires_grad for array in arrays)
+    assert torch.isfinite(coefficient_grad).all()
+    assert torch.isfinite(time_grad)
+    assert basis.cache_info["builds"] == 0
 
 
 def test_basis_batch_api_preserves_torch_autodiff():
