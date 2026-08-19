@@ -5,7 +5,8 @@ exact Born samples from a `TreeTensorNetwork` (or the live state of a
 `TreeOptimizer`) with the same public surface and batched efficiency.
 
 ```python
-from pepsy import TreeOptimizer, TreeSampler
+from pepsy.optimizers import TreeOptimizer
+from pepsy.sampling import TreeSampler
 
 opt = TreeOptimizer(gate_stream, n=nqubits, chi=chi)
 sampler = TreeSampler(opt, seed=0)
@@ -53,7 +54,8 @@ up-down` for spinful `phys_dim=4` and `empty, occupied` for spinless
 occupations:
 
 ```python
-from pepsy import Fermion, TreeSampler
+from pepsy.tensors import Fermion
+from pepsy.sampling import TreeSampler
 
 # psi_tree: a native Symmray fermionic TreeTensorNetwork / TreeOptimizer state.
 sampler = TreeSampler(psi_tree, fermion=Fermion(spinful=True, symmetry="U1U1"))

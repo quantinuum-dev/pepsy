@@ -12,7 +12,11 @@ their explicit budget is raised beyond the default two qubits. Set
 `max_pauli_decomposition_qubits=3` (or `max_operator_qubits=3` for TreeStab)
 and keep `max_pauli_terms` bounded; both guards are checked before the operator
 sum is applied. `chi=None` remains exact up to the configured cutoff, while a
-finite `chi` compresses the mapped operator with the normal diagnostics.
+finite `chi` compresses the mapped operator with the normal diagnostics. The
+coefficient-MPS compression backend is selected with `mode="mpo"` (the
+default), `"dmrg"`/`"dmrg1"`/`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`,
+`"perm"`, or `"exact"`. `mode="exact"` forces `chi=None`; Clifford tableau
+updates remain free in every mode.
 
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are

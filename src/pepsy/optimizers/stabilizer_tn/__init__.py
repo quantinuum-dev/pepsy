@@ -21,6 +21,8 @@ basis-updating), basis-aware mid-circuit reset / measure-reset, guarded physical
 cap events, and magic-state injection.
 """
 
+import warnings
+
 from .mps_stab_optimizer import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -40,8 +42,9 @@ from .operators import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotatio
 from .records import StabilizerTreeRunResult
 from .stn_state import STNState
 
-# Backwards-compatible alias (the class was briefly named ``StabilizerMps``).
-StabilizerMps = MpsStabOptimizer
+_DEPRECATED_ALIASES = {
+    "StabilizerMps": "MpsStabOptimizer",
+}
 
 __all__ = [
     "DeferredInjectionRecord",
@@ -64,3 +67,18 @@ __all__ = [
     "run_stabilizer_mps_stream",
     "single_qubit_rotation_matrix",
 ]
+
+
+def __getattr__(name):
+    canonical = _DEPRECATED_ALIASES.get(name)
+    if canonical is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    warnings.warn(
+        f"pepsy.optimizers.stabilizer_tn.{name} is a compatibility alias; "
+        f"use pepsy.optimizers.stabilizer_tn.{canonical} instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    value = globals()[canonical]
+    globals()[name] = value
+    return value

@@ -679,6 +679,92 @@ def test_mpo_optimizer_reports_fit_controls_and_timing():
     assert timing["fit_calls"] == 1
 
 
+@pytest.mark.parametrize(("mode", "block_size"), [("dmrg1", 2), ("dmrg3", 3)])
+@pytest.mark.parametrize("fit_mpo_guess", [True, False])
+def test_mpo_named_dmrg_optional_mpo_fit_guess(mode, block_size, fit_mpo_guess):
+    """Named MPO DMRG modes can toggle their direct MPO FIT guess."""
+    initial = qtn.MPO_rand(
+        5, bond_dim=1, phys_dim=2, dtype="complex128", seed=20260819
+    )
+    opt = py.MpoOptimizer(
+        initial,
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=2,
+        mode=mode,
+    )
+
+    out = opt.run(
+        n_iter=3,
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        fit_rtol=None,
+        fit_mpo_guess=fit_mpo_guess,
+    )
+
+    diagnostics = opt.get_fit_diagnostics()
+    assert out.max_bond() <= 2
+    assert diagnostics["block_size"] == block_size
+    assert diagnostics["mpo_fit_guess_used"] is fit_mpo_guess
+    assert diagnostics["mpo_fit_guess_order"] == (
+        "lower_upper" if fit_mpo_guess else None
+    )
+
+
+def test_mpo_named_dmrg_mpo_fit_guess_defaults_to_enabled():
+    """The MPO FIT guess is enabled by default for named DMRG growth."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_rand(5, bond_dim=1, phys_dim=2, dtype="complex128", seed=20260820),
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    opt.run(n_iter=3, progbar=False, cutoff=0.0, fidelity_samples=0)
+
+    assert opt.get_fit_diagnostics()["mpo_fit_guess_used"] is True
+
+
+@pytest.mark.parametrize(
+    ("order", "expected_layers"),
+    [
+        ("lower_upper", ["lower", "upper"]),
+        ("upper_lower", ["upper", "lower"]),
+    ],
+)
+def test_mpo_fit_guess_layer_order(monkeypatch, order, expected_layers):
+    """MPO FIT guesses apply bra/lower and ket/upper in the requested order."""
+    calls = []
+    original = py.optimizers.mpo.optimizer.gate_nonlocal_opt
+
+    def recording_gate_nonlocal_opt(*args, **kwargs):
+        if kwargs.get("max_bond") == 2:
+            calls.append(kwargs["which"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        py.optimizers.mpo.optimizer,
+        "gate_nonlocal_opt",
+        recording_gate_nonlocal_opt,
+    )
+    opt = py.MpoOptimizer(
+        qtn.MPO_rand(5, bond_dim=1, phys_dim=2, dtype="complex128", seed=20260821),
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    opt.run(
+        n_iter=2,
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        fit_mpo_guess_order=order,
+    )
+
+    assert calls[:2] == expected_layers
+
+
 def test_mpo_optimizer_atomic_failure_restores_state():
     """A failed FIT replay should raise and leave the pre-run MPO intact."""
     mpo0 = qtn.MPO_identity(4, dtype="complex128")

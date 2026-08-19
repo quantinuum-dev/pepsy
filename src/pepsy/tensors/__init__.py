@@ -6,6 +6,7 @@ implementation is split into focused modules, while existing imports from
 """
 
 from importlib import import_module
+import warnings
 
 
 _SYMBOL_MODULES = {}
@@ -135,12 +136,48 @@ _SUBMODULES = (
     "core",
 )
 
+_BACKEND_COMPATIBILITY_ALIASES = frozenset(
+    {
+        "backend_cupy",
+        "backend_jax",
+        "backend_numpy",
+        "backend_torch",
+        "build_backend",
+        "get_default_array_backend",
+        "get_default_grad_backend",
+        "get_torch_linalg_config",
+        "register_jax_linalg",
+        "register_torch_linalg",
+        "reset_default_backends",
+        "reset_linalg_registrations",
+        "set_default_array_backend",
+        "set_default_grad_backend",
+        "TorchLinalgConfig",
+    }
+)
+
+_DEPRECATED_ALIASES = {
+    **{name: f"pepsy.backends.{name}" for name in _BACKEND_COMPATIBILITY_ALIASES},
+    "build_contraction": "pepsy.tensors.build_optimizer",
+    "SpinfulFermionHubbard": "pepsy.tensors.SpinfulFermion",
+    "hrps_to_mps": "pepsy.tensors.hrs_to_mps",
+    "hrps_to_peps": "pepsy.tensors.hrs_to_peps",
+    "hrps_to_ttn": "pepsy.tensors.hrs_to_ttn",
+}
+
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 
 def __getattr__(name):
     module_name = _SYMBOL_MODULES.get(name)
     if module_name is not None:
+        canonical = _DEPRECATED_ALIASES.get(name)
+        if canonical is not None:
+            warnings.warn(
+                f"pepsy.tensors.{name} is a compatibility alias; use {canonical} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         value = getattr(import_module(module_name, __name__), name)
         globals()[name] = value
         return value

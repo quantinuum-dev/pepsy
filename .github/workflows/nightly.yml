@@ -1,0 +1,39 @@
+name: Nightly full suite
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    name: Full available suite (slow tests included)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
+      NUMBA_DISABLE_CACHING: "1"
+      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
+      MPLCONFIGDIR: /tmp/mplconfig_pepsy
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install extended package profile
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,test-extended,contraction]"
+      - name: Validate source syntax
+        run: python -m compileall -q -f src tests
+      - name: Check Python lint
+        run: python -m ruff check src/pepsy tests
+      - name: Run the complete available suite
+        # Empty addopts includes integration and slow tests. VMC/NetKet has a
+        # dedicated CI profile because its dependency set is substantially
+        # larger than the general extended profile.
+        run: pytest -q -o addopts="" --cov=pepsy --cov-report=term-missing --cov-fail-under=60

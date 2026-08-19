@@ -224,6 +224,7 @@ def test_optional_dependency_profiles_are_declared():
     extras = metadata["project"]["optional-dependencies"]
     assert {
         "layout",
+        "contraction",
         "solvers",
         "stabilizer",
         "symmetry",

@@ -38,6 +38,7 @@ Advanced namespaces are explicit:
 ```bash
 pip install -U -e .
 # Optional backends:
+# pip install -e .[contraction]  # accelerated contraction search
 # pip install -e .[torch]
 # pip install -e .[solvers]
 # pip install -e .[symmetry]

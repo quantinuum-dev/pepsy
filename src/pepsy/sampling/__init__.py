@@ -1,38 +1,34 @@
-"""MPS, vector, and PEPS samplers."""
+"""Lazy MPS, vector, PEPS, and tree samplers."""
 
 from importlib import import_module
 
-from .samplers import (
-    FermionConfigurationEncoding,
-    MpsDiagonalEstimate,
-    MpsBatchSampleResult,
-    MpsSampleResult,
-    MpsSampler,
-    PEPSSampleResult,
-    PepsSampler,
-    PepsBpSampler,
-    VecSampler,
-)
-from .tree import TreeBatchSampleResult, TreeSampleResult, TreeSampler
 
-__all__ = [
-    "FermionConfigurationEncoding",
-    "MpsDiagonalEstimate",
-    "MpsBatchSampleResult",
-    "MpsSampleResult",
-    "MpsSampler",
-    "PEPSSampleResult",
-    "PepsSampler",
-    "PepsBpSampler",
-    "TreeBatchSampleResult",
-    "TreeSampleResult",
-    "TreeSampler",
-    "VecSampler",
-    "tree",
-]
+_SYMBOL_MODULES = {
+    "FermionConfigurationEncoding": ".samplers",
+    "MpsDiagonalEstimate": ".samplers",
+    "MpsBatchSampleResult": ".samplers",
+    "MpsSampleResult": ".samplers",
+    "MpsSampler": ".samplers",
+    "PEPSSampleResult": ".samplers",
+    "PepsSampler": ".samplers",
+    "PepsBpSampler": ".samplers",
+    "TreeBatchSampleResult": ".tree",
+    "TreeSampleResult": ".tree",
+    "TreeSampler": ".tree",
+    "VecSampler": ".samplers",
+}
+
+__all__ = [*_SYMBOL_MODULES, "tree"]
 
 
 def __getattr__(name):
+    module_name = _SYMBOL_MODULES.get(name)
+    if module_name is not None:
+        value = getattr(import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
     if name == "tree":
-        return import_module(f".{name}", __name__)
+        value = import_module(f".{name}", __name__)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

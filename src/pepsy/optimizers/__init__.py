@@ -5,6 +5,7 @@ optional numerical stacks, so importing this namespace stays inexpensive.
 """
 
 from importlib import import_module
+import warnings
 
 
 _SYMBOL_MODULES = {
@@ -56,7 +57,6 @@ _SYMBOL_MODULES = {
     "ImportanceSamplingPolicy": ".noise",
     "LeakageRecord": ".noise",
     "NoisyResult": ".noise",
-    "MpsNoisyResult": ".noise",
     "NoisyShotResult": ".noise",
     "PauliErrorModel": ".noise",
     "PauliFault": ".noise",
@@ -82,7 +82,6 @@ _SYMBOL_MODULES = {
     "run_coalesced_noisy_shots": ".noise",
     "run_coalesced_stim_shots": ".noise",
     "run_coalesced_trajectory_shots": ".noise",
-    "MpsNoisy": ".noise",
     "TreeNoisy": ".noise",
     "run_noisy_shots": ".noise",
     "run_parallel_noisy_shots": ".noise",
@@ -133,10 +132,22 @@ _SUBMODULES = (
 
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
+_DEPRECATED_ALIASES = {
+    "QMeraParametricEnergyOptimizer": "QMeraEnergyOptimizer",
+    "MpsStabOptimizer": "StabilizerMpsSimulator",
+}
 
 def __getattr__(name):
     module_name = _SYMBOL_MODULES.get(name)
     if module_name is not None:
+        canonical = _DEPRECATED_ALIASES.get(name)
+        if canonical is not None:
+            warnings.warn(
+                f"pepsy.optimizers.{name} is a compatibility alias; use "
+                f"pepsy.optimizers.{canonical} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         value = getattr(import_module(module_name, __name__), name)
         globals()[name] = value
         return value

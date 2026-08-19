@@ -945,6 +945,46 @@ def test_copy_preserves_pauli_decomposition_budget():
 
 
 @pytest.mark.parametrize(
+    "mode",
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "exact"),
+)
+def test_coefficient_compression_modes_preserve_stn_state(mode):
+    stream = [
+        ("h", 0),
+        ("cnot", 0, 1),
+        ("t", 2),
+        ("rxx", 0.37, 0, 2),
+    ]
+    reference = MpsStabOptimizer(
+        3, mode="exact", exact_cooling=False
+    ).apply(stream)
+    optimizer = MpsStabOptimizer(
+        3,
+        chi=4,
+        mode=mode,
+        exact_cooling=False,
+    ).apply(stream)
+
+    assert optimizer.mode == mode
+    if mode == "exact":
+        assert optimizer.chi is None
+    else:
+        assert optimizer.state.max_bond() <= 4
+    assert _fidelity(optimizer.to_statevector(), reference.to_statevector()) == pytest.approx(
+        1.0, abs=1e-10
+    )
+
+
+def test_stn_mode_validation_and_copy_preservation():
+    with pytest.raises(ValueError, match="Unknown MpsStabOptimizer mode"):
+        MpsStabOptimizer(2, mode="not-a-mode")
+
+    copied = MpsStabOptimizer(2, mode="dmrg3", chi=2).copy()
+    assert copied.mode == "dmrg3"
+    assert "mode='dmrg3'" in repr(copied)
+
+
+@pytest.mark.parametrize(
     ("value", "error"),
     [(-1, ValueError), (1.5, TypeError), (True, TypeError)],
 )

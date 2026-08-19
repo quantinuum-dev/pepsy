@@ -67,17 +67,17 @@ def test_native_stochastic_pauli_entries_are_gate_stream_events():
     np.testing.assert_allclose(sample.gate_stream[2][0], np.diag([1.0, -1.0]))
 
 
-def test_mps_noisy_uses_coalesced_trajectory_runner():
-    """The high-level MPS API owns fresh-state construction and branch reuse."""
+def test_mps_optimizer_reuses_coalesced_trajectory_runner():
+    """MpsOptimizer owns fresh-state construction and branch reuse."""
     channel = pepsy.TrajectoryChannel.mixture(
         (("I", 0.5, _I), ("X", 0.5, _X))
     )
     initial = qtn.MPS_computational_state("0", dtype="complex128")
-    stream = (entry for entry in [pepsy.TrajectoryEvent(channel, 0)])
-    simulator = pepsy.MpsNoisy(
+    simulator = pepsy.MpsOptimizer(
         initial,
-        stream,
-        mps_settings={"chi": 4, "mode": "mpo"},
+        [pepsy.TrajectoryEvent(channel, 0)],
+        chi=4,
+        mode="mpo",
     )
     result = simulator.run(
         shots=32,
@@ -86,13 +86,13 @@ def test_mps_noisy_uses_coalesced_trajectory_runner():
         run_kwargs={"progbar": False},
     )
 
-    assert isinstance(result, pepsy.MpsNoisyResult)
+    assert isinstance(result, pepsy.NoisyResult)
     assert result.coalesced is True
     assert result.shots == 32
     assert result.branches == 2
     assert sum(leaf.count for leaf in result.leaves) == 32
-    repeated = simulator.run_trajectory(
-        8,
+    repeated = simulator.run(
+        shots=8,
         seed=6,
         strategy="coalesced",
         run_kwargs={"progbar": False},
@@ -350,17 +350,17 @@ def test_mps_kraus_bell_branches_match_dense_trajectory_states():
     assert result.diagnostics.used_kraus_copy_fallback is False
 
 
-@pytest.mark.parametrize("mode", ("exact", "mix", "su"))
-def test_shot_validation_rejects_unsupported_kraus_modes(mode):
+@pytest.mark.parametrize("mode", ("mix", "su"))
+def test_gate_oriented_modes_reject_control_shots(mode):
     initial = qtn.MPS_computational_state("0", dtype="complex128")
     simulator = pepsy.MpsOptimizer(
         initial,
-        [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.2), 0)],
+        [("measure", "Z", 0)],
         chi=4,
         mode=mode,
     )
 
-    with pytest.raises(ValueError, match="(exact|mix|su|Kraus|trajectory)"):
+    with pytest.raises(ValueError, match="(mix|su|control|gate-only)"):
         simulator.run(shots=2, strategy="independent", run_kwargs={"progbar": False})
 
 
@@ -413,7 +413,9 @@ def test_shot_replay_reuses_a_frozen_persistent_layout():
         )
 
 
-@pytest.mark.parametrize("mode", ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "swap", "svd"))
+@pytest.mark.parametrize(
+    "mode", ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "svd", "perm", "su", "exact")
+)
 def test_canonical_mps_modes_replay_kraus_shots(mode):
     simulator = pepsy.MpsOptimizer(
         qtn.MPS_computational_state("0", dtype="complex128"),
@@ -434,7 +436,7 @@ def test_canonical_mps_modes_replay_kraus_shots(mode):
         np.testing.assert_allclose(_statevector(optimizer), [1.0, 0.0])
 
 
-def test_mps_noisy_dispatches_pauli_error_model():
+def test_mps_optimizer_dispatches_pauli_error_model():
     """MpsOptimizer routes an explicit Pauli model to Pauli coalescing."""
     initial = qtn.MPS_computational_state("0", dtype="complex128")
     simulator = pepsy.MpsOptimizer(
@@ -457,14 +459,14 @@ def test_mps_noisy_dispatches_pauli_error_model():
     np.testing.assert_allclose(_statevector(result.leaves[0].optimizer), [1.0, 0.0])
 
 
-def test_mps_noisy_rejects_unknown_optimizer_settings_early():
+def test_mps_optimizer_rejects_unknown_settings_early():
     """Configuration typos fail at construction, before any shot starts."""
     initial = qtn.MPS_computational_state("0", dtype="complex128")
-    with pytest.raises(TypeError, match="unknown MpsOptimizer setting"):
-        pepsy.MpsNoisy(initial, [], chi=4, mod="mpo")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'mod'"):
+        pepsy.MpsOptimizer(initial, [], chi=4, mod="mpo")
 
 
-def test_tree_noisy_matches_mps_noisy_api_and_resolves_conditionals():
+def test_tree_noisy_matches_mps_api_and_resolves_conditionals():
     """TreeNoisy uses TreeOptimizer for the same logical feed-forward stream."""
     stream = [
         ("measure", "Z", 0, -1),
@@ -608,11 +610,11 @@ def test_pauli_noise_does_not_fire_for_false_conditional_action():
     assert result.faults == ((),)
 
 
-def test_mps_noisy_auto_strategy_falls_back_at_branch_cap():
+def test_mps_optimizer_auto_strategy_falls_back_at_branch_cap():
     channel = pepsy.TrajectoryChannel.mixture(
         (("I", 0.5, _I), ("X", 0.5, _X))
     )
-    simulator = pepsy.MpsNoisy(
+    simulator = pepsy.MpsOptimizer(
         qtn.MPS_computational_state("0", dtype="complex128"),
         [pepsy.TrajectoryEvent(channel, 0)],
         chi=4,

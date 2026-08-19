@@ -18,7 +18,8 @@ not a collection of SVD trials. It is cheap enough to leave on in ordinary
 simulation. It simply does nothing when the required pivot is absent.
 
 ```python
-from pepsy import MpsStabOptimizer, run_stabilizer_mps_stream
+from pepsy.optimizers import MpsStabOptimizer
+from pepsy.optimizers.stabilizer_tn import run_stabilizer_mps_stream
 
 sim = MpsStabOptimizer(n_qubits, chi=64, exact_cooling=True)
 sim.apply(circuit)

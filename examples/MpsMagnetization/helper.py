@@ -3,9 +3,9 @@
 import math
 import numpy as np
 import quimb
-import quimb.tensor as qtn
-import pepsy as py
+from pepsy.operators import ham_tn, rx, rzz
 from pepsy.tensors import OneDMap, expec_mpo
+from pepsy.tensors import ps_to_mps
 
 
 def build_lattice(Lx, Ly, coupling_j, field_h, cyclic=True, lattice="square", mode="hilbert"):
@@ -17,7 +17,7 @@ def build_lattice(Lx, Ly, coupling_j, field_h, cyclic=True, lattice="square", mo
     (full build_itf_lattice output), and the 1D <-> 2D maps.
     """
     mapper = OneDMap(Lx, Ly, mode=mode)
-    res = py.ham_tn.build_itf_lattice(
+    res = ham_tn.build_itf_lattice(
         L_x=Lx, L_y=Ly, lattice=lattice, cyclic=cyclic,
         J=coupling_j, field=field_h,
         mapper=mapper,
@@ -59,7 +59,7 @@ def build_initial_state(L, coupling_j, field_h, z_coord=4, theta_offset=None):
     sin2theta = np.clip(ratio, -1.0, 1.0)
     theta_min = np.arcsin(sin2theta)
     theta_paper = theta_min + theta_offset
-    psi0 = py.ps_to_mps(L, theta=0.5 * theta_paper)
+    psi0 = ps_to_mps(L, theta=0.5 * theta_paper)
     return psi0, theta_paper
 
 
@@ -68,15 +68,15 @@ def build_trotter_gates(sites, edges_1d, field_h, coupling_j, dt, to_backend):
 
     RX(h·dt) → RZZ(2J·dt) → RX(h·dt)
 
-    Convention: py.rx(θ) = exp(-i θ X / 2), so the half-step
+    Convention: rx(θ) = exp(-i θ X / 2), so the half-step
     exp(-i h·dt/2 · X) requires rx(h·dt).
 
     Returns
     -------
     list of (gate, where) tuples.
     """
-    rx_half = to_backend(py.rx(field_h * dt))
-    rzz_full = to_backend(py.rzz(2 * coupling_j * dt))
+    rx_half = to_backend(rx(field_h * dt))
+    rzz_full = to_backend(rzz(2 * coupling_j * dt))
 
     gates = []
     for site in sites:
@@ -103,10 +103,10 @@ def build_mpo_z_sq(Lx, Ly, mapper):
     L = Lx * Ly
     Z_op = quimb.pauli("Z", dtype="complex128")
 
-    builder = py.ham_tn(Lx=Lx, Ly=Ly, mapper=mapper, data_type="complex128")
+    builder = ham_tn(Lx=Lx, Ly=Ly, mapper=mapper, data_type="complex128")
 
     # Sites in 2D coordinates (what build_mpo expects)
-    res = py.ham_tn.build_itf_lattice(
+    res = ham_tn.build_itf_lattice(
         L_x=Lx, L_y=Ly, lattice="square", cyclic=True,
         J=-1, field=1, mapper=mapper,
     )

@@ -14,8 +14,6 @@ dependencies = [
   "numpy>=1.24",
   "quimb>=1.8",
   "cotengra>=0.6",
-  "cotengrust>=0.1",
-  "cmaes>=0.10",
   "autoray>=0.6",
   "tqdm>=4.65",
 ]
@@ -26,6 +24,7 @@ Repository = "https://github.com/quantinuum-dev/pepsy"
 Issues = "https://github.com/quantinuum-dev/pepsy/issues"
 
 [project.optional-dependencies]
+contraction = ["cotengrust>=0.1", "cmaes>=0.10"]
 torch = ["torch>=2.0"]
 solvers = ["scipy>=1.10", "nlopt>=2.7"]
 viz = ["matplotlib>=3.7"]
@@ -76,6 +75,31 @@ markers = [
   "smoke: small deterministic contract checks for the default developer loop",
   "integration: extended optional-backend and domain-integration coverage",
   "slow: stress or long-running differential coverage",
+  "core: stable API coverage for the core package profile",
+  "optional: coverage that needs an optional dependency or advanced domain",
+  "backends: backend selection and linear algebra coverage",
+  "boundary: boundary-MPS contraction coverage",
+  "bp: belief-propagation coverage",
+  "contractions: contraction planner and fallback coverage",
+  "fermions: fermionic operator and tensor coverage",
+  "interop: external representation interoperability coverage",
+  "mpo: matrix-product-operator coverage",
+  "mps: matrix-product-state coverage",
+  "noise: noisy trajectory and channel coverage",
+  "operators: operator and Hamiltonian coverage",
+  "optimizers: optimizer orchestration coverage",
+  "package: package layout, import, and public API coverage",
+  "peps: projected-entangled-pair-state coverage",
+  "qmera: QMERA coverage",
+  "sampling: vector, MPS, and PEPS sampling coverage",
+  "solvers: parameter-solver coverage",
+  "stabilizer: stabilizer tensor-network coverage",
+  "symmetry: symmetric and Symmray coverage",
+  "tensors: tensor constructors and validation coverage",
+  "tree: tree tensor-network coverage",
+  "tree_stabilizer: tree stabilizer coverage",
+  "vmc: variational Monte Carlo coverage",
+  "benchmarks: benchmark and scaling coverage",
 ]
 
 [tool.coverage.run]

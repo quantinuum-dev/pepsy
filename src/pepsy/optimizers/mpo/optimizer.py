@@ -1204,20 +1204,54 @@ class MpoOptimizer:
             )
             return p_g
 
+        return self._compress_mpo_gate_pair(
+            p_g,
+            gate,
+            where,
+            bra_gate,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            layer_order="upper_lower",
+            max_bond=None,
+        )
+
+    def _compress_mpo_gate_pair(
+        self,
+        p,
+        gate,
+        where,
+        bra_gate,
+        *,
+        cutoff,
+        cutoff_mode="rsum2",
+        layer_order="upper_lower",
+        max_bond=None,
+    ):
+        """Apply and compress both physical MPO layers in a chosen order."""
         g_k, g_b = self._prepare_nonlocal_gate_pair(
             gate,
             len(where),
             bra_gate=bra_gate,
-            p=p_g,
+            p=p,
             where=where,
             ind_id=self.ind_id_k,
         )
-        for prepared, which in ((g_k, "upper"), (g_b, "lower")):
-            if prepared is None:
+        prepared = {"upper": g_k, "lower": g_b}
+        if layer_order == "lower_upper":
+            layers = ("lower", "upper")
+        elif layer_order == "upper_lower":
+            layers = ("upper", "lower")
+        else:
+            raise ValueError(
+                "layer_order must be 'lower_upper' or 'upper_lower'."
+            )
+        for which in layers:
+            payload = prepared[which]
+            if payload is None:
                 continue
-            p_g = gate_nonlocal_opt(
-                p_g,
-                prepared,
+            p = gate_nonlocal_opt(
+                p,
+                payload,
                 where,
                 which=which,
                 method="direct",
@@ -1225,11 +1259,54 @@ class MpoOptimizer:
                 inplace=True,
                 ind_id_k=self.ind_id_k,
                 ind_id_b=self.ind_id_b,
-                max_bond=None,
+                max_bond=max_bond,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
             )
-        return p_g
+        return p
+
+    def _build_mpo_fit_guess(
+        self,
+        p,
+        batch_G,
+        batch_where,
+        *,
+        cutoff,
+        cutoff_mode="rsum2",
+        layer_order="lower_upper",
+    ):
+        """Build a capped MPO replay to initialize a local MPO FIT update."""
+        guess = p.copy()
+        active_sites = []
+        for G_i, where_i in zip(batch_G, batch_where):
+            gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
+            active_sites.extend(where)
+            if len(where) == 1:
+                self._apply_gate_pair(
+                    guess,
+                    gate,
+                    where,
+                    bra_gate=bra_gate,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    contract=True,
+                    inplace=True,
+                )
+            else:
+                guess = self._compress_mpo_gate_pair(
+                    guess,
+                    gate,
+                    where,
+                    bra_gate,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    layer_order=layer_order,
+                    max_bond=self.chi,
+                )
+        if active_sites:
+            xmin, xmax = min(active_sites), max(active_sites)
+            guess.canonize([xmax], cur_orthog=(xmin, xmax))
+        return guess
 
     @staticmethod
     def _parse_gate_entry(G_i, where_i):
@@ -1504,6 +1581,28 @@ class MpoOptimizer:
         return strategy
 
     @staticmethod
+    def _validate_fit_mpo_guess_order(order):
+        """Normalize the layer order used by an MPO FIT initial guess."""
+        order = str(order).strip().lower().replace("-", "_")
+        aliases = {
+            "lower_upper": "lower_upper",
+            "lower_then_upper": "lower_upper",
+            "bra_ket": "lower_upper",
+            "bra_then_ket": "lower_upper",
+            "upper_lower": "upper_lower",
+            "upper_then_lower": "upper_lower",
+            "ket_bra": "upper_lower",
+            "ket_then_bra": "upper_lower",
+        }
+        try:
+            return aliases[order]
+        except KeyError as exc:
+            raise ValueError(
+                "fit_mpo_guess_order must select bra/lower then ket/upper "
+                "('lower_upper') or ket/upper then bra/lower ('upper_lower')."
+            ) from exc
+
+    @staticmethod
     def _is_unitary_gate(gate):
         """Return whether ``gate`` is a numerically unitary operator.
 
@@ -1626,7 +1725,16 @@ class MpoOptimizer:
             at_target = False
         return 1 if at_target else active
 
-    def _record_fit_diagnostics(self, fit, *, where, block_size, step):
+    def _record_fit_diagnostics(
+        self,
+        fit,
+        *,
+        where,
+        block_size,
+        step,
+        mpo_fit_guess_used=False,
+        mpo_fit_guess_order=None,
+    ):
         """Store a compact diagnostic record for the latest MPO FIT call."""
         record = {
             "step": int(step),
@@ -1643,6 +1751,8 @@ class MpoOptimizer:
             "one_site_refinement_sweeps": int(
                 getattr(fit, "one_site_sweeps_run", 0)
             ),
+            "mpo_fit_guess_used": bool(mpo_fit_guess_used),
+            "mpo_fit_guess_order": mpo_fit_guess_order,
         }
         timing_records = getattr(fit, "_take_timing_records", None)
         if callable(timing_records):
@@ -1963,6 +2073,8 @@ class MpoOptimizer:
         timing_sync_device=False,
         collect_split_diagnostics=False,
         fit_target_strategy="auto",
+        fit_mpo_guess=True,
+        fit_mpo_guess_order="lower_upper",
         transactional_steps=True,
         fit_fallback=None,
     ):
@@ -1987,6 +2099,10 @@ class MpoOptimizer:
             raise ValueError("fit_block_size must be 1, 2, or 3.")
         fit_block_size = int(fit_block_size)
         fit_target_strategy = self._validate_fit_target_strategy(fit_target_strategy)
+        fit_mpo_guess = bool(fit_mpo_guess)
+        fit_mpo_guess_order = self._validate_fit_mpo_guess_order(
+            fit_mpo_guess_order
+        )
         transactional_steps = bool(transactional_steps)
 
         p = self.p
@@ -2165,16 +2281,6 @@ class MpoOptimizer:
                         target_strategy=fit_target_strategy,
                     )
 
-                    fit = FIT(
-                        p_g,
-                        p=p,
-                        cutoffs=cutoff,
-                        contraction_opt=self.contraction_opt,
-                        retag=False,
-                        range_int=[xmin, xmax],
-                        inplace=True,
-                        copy_target=False,
-                    )
                     expected_norm = self._expected_target_norm(
                         p,
                         gate,
@@ -2190,6 +2296,46 @@ class MpoOptimizer:
                         xmin,
                         xmax,
                         fit_block_size,
+                    )
+                    mpo_fit_guess_used = False
+                    fit_guess = p
+                    is_named_mpo_guess_window = (
+                        (
+                            self._dmrg_mode_alias == "dmrg1"
+                            and active_fit_block_size == 2
+                        )
+                        or (
+                            self._dmrg_mode_alias == "dmrg3"
+                            and active_fit_block_size == 3
+                        )
+                    )
+                    if (
+                        fit_mpo_guess
+                        and is_named_mpo_guess_window
+                        and not self._has_symmray_data(p)
+                        and not any(
+                            self._is_fermionic_array(tensor.data)
+                            for tensor in p
+                        )
+                    ):
+                        fit_guess = self._build_mpo_fit_guess(
+                            p,
+                            [G_seq[idx]],
+                            [where],
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            layer_order=fit_mpo_guess_order,
+                        )
+                        mpo_fit_guess_used = True
+                    fit = FIT(
+                        p_g,
+                        p=fit_guess,
+                        cutoffs=cutoff,
+                        contraction_opt=self.contraction_opt,
+                        retag=False,
+                        range_int=[xmin, xmax],
+                        inplace=True,
+                        copy_target=False,
                     )
                     p, fit_result = run_local_fit_transactional(
                         fit,
@@ -2222,6 +2368,12 @@ class MpoOptimizer:
                             where=(xmin, xmax),
                             block_size=active_fit_block_size,
                             step=idx + 1,
+                            mpo_fit_guess_used=mpo_fit_guess_used,
+                            mpo_fit_guess_order=(
+                                fit_mpo_guess_order
+                                if mpo_fit_guess_used
+                                else None
+                            ),
                         )
                         idx += 1
                         advanced = 1
@@ -2252,16 +2404,6 @@ class MpoOptimizer:
                         target_strategy=fit_target_strategy,
                     )
 
-                    fit = FIT(
-                        p_g,
-                        p=p,
-                        cutoffs=cutoff,
-                        contraction_opt=self.contraction_opt,
-                        retag=False,
-                        range_int=[xmin, xmax],
-                        inplace=True,
-                        copy_target=False,
-                    )
                     expected_norm = self._expected_batch_target_norm(
                         p,
                         batch_G,
@@ -2274,6 +2416,46 @@ class MpoOptimizer:
                         xmin,
                         xmax,
                         fit_block_size,
+                    )
+                    mpo_fit_guess_used = False
+                    fit_guess = p
+                    is_named_mpo_guess_window = (
+                        (
+                            self._dmrg_mode_alias == "dmrg1"
+                            and active_fit_block_size == 2
+                        )
+                        or (
+                            self._dmrg_mode_alias == "dmrg3"
+                            and active_fit_block_size == 3
+                        )
+                    )
+                    if (
+                        fit_mpo_guess
+                        and is_named_mpo_guess_window
+                        and not self._has_symmray_data(p)
+                        and not any(
+                            self._is_fermionic_array(tensor.data)
+                            for tensor in p
+                        )
+                    ):
+                        fit_guess = self._build_mpo_fit_guess(
+                            p,
+                            batch_G,
+                            batch_where,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            layer_order=fit_mpo_guess_order,
+                        )
+                        mpo_fit_guess_used = True
+                    fit = FIT(
+                        p_g,
+                        p=fit_guess,
+                        cutoffs=cutoff,
+                        contraction_opt=self.contraction_opt,
+                        retag=False,
+                        range_int=[xmin, xmax],
+                        inplace=True,
+                        copy_target=False,
                     )
                     p, fit_result = run_local_fit_transactional(
                         fit,
@@ -2306,6 +2488,12 @@ class MpoOptimizer:
                             where=(xmin, xmax),
                             block_size=active_fit_block_size,
                             step=idx + 1,
+                            mpo_fit_guess_used=mpo_fit_guess_used,
+                            mpo_fit_guess_order=(
+                                fit_mpo_guess_order
+                                if mpo_fit_guess_used
+                                else None
+                            ),
                         )
                         advanced = next_idx - idx
                         idx = next_idx
@@ -2697,6 +2885,8 @@ class MpoOptimizer:
         timing_sync_device=False,
         fit_collect_split_diagnostics=False,
         fit_target_strategy="auto",
+        fit_mpo_guess=True,
+        fit_mpo_guess_order="lower_upper",
         layout=None,
         layout_order="quality",
         layout_kwargs=None,
@@ -2773,6 +2963,16 @@ class MpoOptimizer:
         fit_target_strategy : {"auto", "layered", "mpo"}, default="auto"
             Dense MPO targets use lazy layered gate tensors by default;
             native Symmray targets use the block-aware MPO representation.
+        fit_mpo_guess : bool, default=True
+            For dense named DMRG1 and DMRG3 growth windows, initialize FIT
+            from an isolated, chi-capped direct MPO replay of the current
+            gate batch. This does not replace the exact FIT target or live
+            MPO. Native Symmray MPOs retain their native warm-start path.
+        fit_mpo_guess_order : {"lower_upper", "upper_lower"}, default="lower_upper"
+            Layer order for the isolated MPO guess. ``"lower_upper"`` means
+            bra then ket; ``"upper_lower"`` means ket then bra. In this API
+            the lower layer is bra and the upper layer is ket. Aliases
+            ``"bra_ket"`` and ``"ket_bra"`` are accepted.
         layout : mapping | sequence | str | None, default=None
             Optional persistent logical-to-physical layout. A string selects a
             gate-stream layout order; a mapping or sequence supplies an
@@ -2842,6 +3042,10 @@ class MpoOptimizer:
         if fit_fallback not in {None, "mpo", "svd"}:
             raise ValueError("fit_fallback must be None, 'mpo', or 'svd'.")
         fit_target_strategy = self._validate_fit_target_strategy(fit_target_strategy)
+        fit_mpo_guess = bool(fit_mpo_guess)
+        fit_mpo_guess_order = self._validate_fit_mpo_guess_order(
+            fit_mpo_guess_order
+        )
         atomic = bool(atomic)
         timing = bool(timing)
         timing_sync_device = bool(timing_sync_device)
@@ -2951,6 +3155,8 @@ class MpoOptimizer:
                     timing_sync_device=timing_sync_device,
                     collect_split_diagnostics=bool(fit_collect_split_diagnostics),
                     fit_target_strategy=fit_target_strategy,
+                    fit_mpo_guess=fit_mpo_guess,
+                    fit_mpo_guess_order=fit_mpo_guess_order,
                     transactional_steps=transactional_steps,
                     fit_fallback=fit_fallback,
                 )

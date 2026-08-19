@@ -141,7 +141,7 @@ prefixes under the `max_branches` safety cap. It performs a conservative
 branch-cap preflight when possible, avoiding a partial coalesced replay that is
 guaranteed to restart; the exact branch cap remains a hard safety limit.
 
-The `retain` option is available on `MpsOptimizer`, `MpsNoisy`, `TreeNoisy`,
+The `retain` option is available on `MpsOptimizer`, `TreeNoisy`,
 and the low-level shot runners. `retain="all"` keeps states and replay
 metadata, `retain="final"` keeps only final states and weights, and
 `retain="none"` keeps no final optimizer states. Use the last form for runs
@@ -152,8 +152,8 @@ backend-neutral `TrajectoryStreamPlan`. It parses stochastic entries once and
 records ordinary-segment boundaries; live optimizers still perform their own
 device/backend conversion.
 
-`MpsNoisy` remains as a compatibility wrapper. The low-level factory-based
-functions remain available for custom optimizer classes or non-MPS backends.
+The low-level factory-based functions remain available for custom optimizer
+classes or non-MPS backends.
 
 `TreeNoisy` exposes the same API for `TreeOptimizer` and accepts either an
 entangled `TreeTensorNetwork` or a product MPS as its initial state. Its
@@ -173,8 +173,7 @@ result = simulator.run(shots=10_000, strategy="auto", seed=7)
 Tree and MPS optimizers share the logical feed-forward form
 `("if", record, bit, action)`. Tree replay resolves the measurement record
 before applying the action, including in count-coalesced branches. `NoisyResult`
-is the generic result-facade name; `MpsNoisyResult` remains a compatibility
-alias.
+is the generic result-facade name for all noisy replay backends.
 
 ## Exact coalesced ensembles for rare noise
 

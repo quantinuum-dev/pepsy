@@ -105,6 +105,14 @@ update, so a named mode does not waste additional sweeps on a complete pair.
 The generic `mode="dmrg"` path remains unchanged and continues to use
 `fit_block_size` and `fit_three_site_sweeps` directly.
 
+For dense named `dmrg1` and `dmrg3` growth windows, FIT starts from an isolated
+chi-capped direct MPO replay of the current gate batch by default. Disable this
+with `fit_mpo_guess=False` to use the direct current-MPO FIT guess. The replay
+order is controlled by `fit_mpo_guess_order`, which defaults to
+`"lower_upper"` (bra then ket); `"upper_lower"` (ket then bra) is also
+available. In this API the lower MPO layer is bra and the upper layer is ket.
+Native Symmray MPOs retain their native warm-start path.
+
 As with MPS DMRG, `n_iter` counts FIT sweeps. `mode="mpo"` applies each gate
 with one direct MPO compression step and does not perform variational sweeps;
 the two modes therefore have different one-iteration behavior for a

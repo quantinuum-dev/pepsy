@@ -30,7 +30,6 @@ __all__ = [
     "CoalescedTrajectoryResult",
     "ImportanceSamplingPolicy",
     "NoisyResult",
-    "MpsNoisyResult",
     "NoisyShotResult",
     "PauliErrorModel",
     "PauliFault",
@@ -58,7 +57,6 @@ __all__ = [
     "run_coalesced_noisy_shots",
     "run_coalesced_stim_shots",
     "run_coalesced_trajectory_shots",
-    "MpsNoisy",
     "TreeNoisy",
     "sample_coalesced_bits",
     "run_noisy_shots",
@@ -1199,10 +1197,6 @@ class NoisyResult:
         return getattr(self.raw, name)
 
 
-# Backward-compatible name from the first MpsNoisy-only API.
-MpsNoisyResult = NoisyResult
-
-
 @dataclass(frozen=True)
 class CoalescedSampleResult:
     """Terminal bit samples drawn leaf-by-leaf from a coalesced ensemble.
@@ -2127,44 +2121,6 @@ def _trajectory_coalescing_fits_cap(plan, shots, max_branches, max_branch_factor
     return min(int(shots), possible) <= max_branches
 
 
-def _mps_shot_factory(initial_mps, mps_settings):
-    """Build a fresh MPS optimizer factory from one initial MPS and settings."""
-    if not isinstance(mps_settings, Mapping):
-        raise TypeError("mps_settings must be a mapping of MpsOptimizer settings.")
-    constructor = dict(mps_settings)
-    forbidden = sorted(set(constructor) & {"p", "gates"})
-    if forbidden:
-        names = ", ".join(repr(name) for name in forbidden)
-        raise TypeError(
-            f"mps_settings cannot contain {names}; pass the initial MPS and gate "
-            "stream to MpsNoisy(...)."
-        )
-    accepted = set(inspect.signature(MpsOptimizer.__init__).parameters)
-    accepted.difference_update({"self", "p", "gates", "_capture_initial"})
-    unknown = sorted(set(constructor) - accepted)
-    if unknown:
-        names = ", ".join(repr(name) for name in unknown)
-        raise TypeError(f"unknown MpsOptimizer setting(s): {names}.")
-    if "chi" not in constructor:
-        raise ValueError("mps_settings must include the MpsOptimizer 'chi' setting.")
-    try:
-        initial_mps.copy
-    except AttributeError as exc:
-        raise TypeError("initial_mps must provide copy() like a quimb MPS.") from exc
-    # The caller-owned MpsNoisy instance already keeps one defensive copy.
-    # Keep this factory's template as a reference and make exactly one copy per
-    # shot; constructing an optimizer with ``inplace=True`` avoids copying that
-    # fresh shot state a second time.
-    template = initial_mps
-    shot_constructor = dict(constructor)
-    shot_constructor["inplace"] = True
-
-    def make_optimizer():
-        return MpsOptimizer(template.copy(), **shot_constructor)
-
-    return make_optimizer
-
-
 def _tree_layout_stream(gate_stream):
     """Make a TreeOptimizer-compatible layout stream from noisy entries."""
     layout_stream = []
@@ -2222,121 +2178,10 @@ def _tree_shot_factory(initial_tn, gate_stream, tree_settings):
     return make_optimizer
 
 
-class MpsNoisy:
-    """Factory-free noisy MPS gate-stream simulator.
-
-    Parameters
-    ----------
-    initial_mps : quimb.tensor.MatrixProductState
-        Initial state template. It is copied before any trajectory is run.
-    gate_stream : iterable
-        Ordinary bundled gates plus optional measurement, feed-forward, and
-        stream-local stochastic events. The stream is snapshotted so one
-        ``MpsNoisy`` instance can be run repeatedly.
-    mps_settings : mapping, optional
-        Keyword arguments for :class:`MpsOptimizer`. ``"chi"`` is required.
-    **optimizer_settings
-        Convenience constructor settings, such as ``chi=64, mode="mpo"``.
-        These override keys in ``mps_settings``.
-
-    ``run`` dispatches stream-local noise to :func:`run_trajectory_shots`.
-    Passing ``error_model=PauliErrorModel(...)`` instead selects the legacy
-    clean-stream Pauli runner. ``run_trajectory`` and ``run_noisy`` are
-    available when an explicit path is preferred.
-    """
-
-    def __init__(self, initial_mps, gate_stream, *, mps_settings=None, **optimizer_settings):
-        if mps_settings is None:
-            constructor = {}
-        elif not isinstance(mps_settings, Mapping):
-            raise TypeError("mps_settings must be a mapping of MpsOptimizer settings.")
-        else:
-            constructor = dict(mps_settings)
-        constructor.update(optimizer_settings)
-        self.mps_settings = MappingProxyType(dict(constructor))
-        try:
-            self._initial_mps = initial_mps.copy()
-        except AttributeError as exc:
-            raise TypeError("initial_mps must provide copy() like a quimb MPS.") from exc
-        self._factory = _mps_shot_factory(self._initial_mps, self.mps_settings)
-        if isinstance(gate_stream, TrajectoryEvent):
-            entries = (gate_stream,)
-        else:
-            entries = tuple(_as_entries(gate_stream))
-        self.gate_stream = entries
-
-    @property
-    def initial_mps(self):
-        """Return a defensive copy of the configured initial MPS."""
-        return self._initial_mps.copy()
-
-    def run_trajectory(self, shots: int, **runner_kwargs):
-        """Run stream-local trajectory noise through the exact shot runner."""
-        return MpsNoisyResult(
-            run_trajectory_shots(
-                self._factory,
-                self.gate_stream,
-                shots,
-                **runner_kwargs,
-            )
-        )
-
-    def run_noisy(self, error_model: PauliErrorModel, shots: int, **runner_kwargs):
-        """Run a clean stream with the legacy :class:`PauliErrorModel`."""
-        return MpsNoisyResult(
-            run_noisy_shots(
-                self._factory,
-                self.gate_stream,
-                error_model,
-                shots,
-                **runner_kwargs,
-            )
-        )
-
-    def run(
-        self,
-        shots: int,
-        *,
-        error_model: PauliErrorModel | None = None,
-        seed=None,
-        run_kwargs: Optional[Mapping[str, Any]] = None,
-        strategy: str = "auto",
-        max_branches: int | None = _AUTO_MAX_BRANCHES,
-        auto_max_expected_faults: float = _AUTO_MAX_EXPECTED_FAULTS,
-        importance_sampling=None,
-        max_branch_factor: int | None = None,
-        parallel_workers: int = 1,
-        parallel_backend: str = "thread",
-        retain: str = "all",
-    ) -> NoisyResult:
-        """Run the configured stream using the selected exact strategy.
-
-        The convenience API defaults to ``strategy="auto"`` and retains the
-        bounded coalesced representation when it is safe. If the configured
-        ``max_branches`` cap is reached, auto mode restarts as independent
-        trajectories without dropping or approximating samples.
-        """
-        common = {
-            "seed": seed,
-            "run_kwargs": run_kwargs,
-            "strategy": strategy,
-            "max_branches": max_branches,
-            "importance_sampling": importance_sampling,
-            "max_branch_factor": max_branch_factor,
-            "parallel_workers": parallel_workers,
-            "parallel_backend": parallel_backend,
-            "retain": retain,
-        }
-        if error_model is None:
-            return self.run_trajectory(shots, **common)
-        common["auto_max_expected_faults"] = auto_max_expected_faults
-        return self.run_noisy(error_model, shots, **common)
-
-
 class TreeNoisy:
     """Factory-free noisy tree-tensor gate-stream simulator.
 
-    The public methods mirror :class:`MpsNoisy`, but each shot is constructed
+    The public methods mirror the MPS noisy replay API, but each shot is constructed
     with :class:`TreeOptimizer`. The initial state may be an entangled
     ``TreeTensorNetwork`` or a product quimb MPS; the latter is mounted on the
     tree selected from ``gate_stream`` and ``tree_settings``. Feed-forward
@@ -3089,11 +2934,7 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
 
 
 def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
-    """Evaluate one Kraus branch without mutating the ordinary MPS."""
-    if getattr(optimizer, "mode", None) == "exact":
-        raise ValueError(
-            "State-dependent trajectory channels require an MPS mode, not mode='exact'."
-        )
+    """Evaluate one Kraus branch without mutating an MPS or exact leaf."""
     p = getattr(optimizer, "p", None)
     apply_gate = getattr(optimizer, "_apply_gate", None)
     remap = getattr(optimizer, "_logical_to_physical_where", None)
@@ -3331,6 +3172,8 @@ def _run_trajectory_entries(
         kwargs["non_unitary"] = True
         kwargs["normalize_every"] = False
         kwargs["normalize_final"] = False
+        if isinstance(optimizer, MpsOptimizer):
+            kwargs["_trajectory_non_unitary"] = True
     optimizer.run(**kwargs)
 
 

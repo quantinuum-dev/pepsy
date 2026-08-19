@@ -1,8 +1,23 @@
 """Basic public API smoke tests for the pepsy package."""
 
+import importlib
 import importlib.util
+from pathlib import Path
 
+import pytest
 import pepsy
+
+
+_ROOT_API_MANIFEST = Path(__file__).parents[1] / "docs/development/api-manifest.txt"
+_API_MIGRATION_DOC = Path(__file__).parents[1] / "docs/development/api-migration.md"
+
+
+def _manifest_symbols():
+    return {
+        line.strip()
+        for line in _ROOT_API_MANIFEST.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
 
 def test_package_version_available():
@@ -28,6 +43,134 @@ def test_namespace_exports_have_clear_core_and_advanced_groups():
     assert core.isdisjoint(advanced)
     assert core | advanced <= set(pepsy.__all__)
     assert all(getattr(pepsy, name) is not None for name in core | advanced)
+
+
+def test_top_level_compatibility_surface_matches_manifest():
+    """Root aliases stay frozen until an intentional API review changes them."""
+    manifest = _manifest_symbols()
+    assert set(pepsy._SYMBOL_MODULES) == manifest
+    expected_all = {
+        "__version__",
+        *pepsy._CORE_MODULES,
+        *pepsy._ADVANCED_MODULES,
+        *manifest,
+    }
+    assert set(pepsy.__all__) == expected_all
+
+
+def test_root_aliases_resolve_from_canonical_namespaces():
+    """Every root alias has an advertised owner and canonical import path."""
+    missing = []
+    for name, module_name in pepsy._SYMBOL_MODULES.items():
+        module = importlib.import_module(module_name, pepsy.__name__)
+        if name not in getattr(module, "__all__", ()):
+            missing.append(f"{name} -> {module.__name__}")
+    assert not missing, f"aliases without canonical exports: {missing}"
+
+
+def test_deprecated_backend_alias_warns_and_matches_canonical_namespace():
+    """The old tensor backend path remains lazy and explicitly deprecated."""
+    import pepsy.backends as backends
+    import pepsy.tensors as tensors
+
+    tensors.__dict__.pop("backend_numpy", None)
+    with pytest.warns(DeprecationWarning, match="pepsy.backends.backend_numpy"):
+        alias = tensors.backend_numpy
+    assert alias is backends.backend_numpy
+
+
+@pytest.mark.parametrize(
+    ("alias_name", "canonical_name"),
+    [
+        ("build_contraction", "build_optimizer"),
+        ("SpinfulFermionHubbard", "SpinfulFermion"),
+        ("hrps_to_mps", "hrs_to_mps"),
+        ("hrps_to_peps", "hrs_to_peps"),
+        ("hrps_to_ttn", "hrs_to_ttn"),
+    ],
+)
+def test_deprecated_tensor_aliases_warn(alias_name, canonical_name):
+    """Historical tensor spellings warn while preserving their values."""
+    import pepsy.tensors as tensors
+
+    tensors.__dict__.pop(alias_name, None)
+    with pytest.warns(DeprecationWarning, match=canonical_name):
+        alias = getattr(tensors, alias_name)
+    assert alias is getattr(tensors, canonical_name)
+
+
+@pytest.mark.parametrize(
+    ("alias_name", "canonical_name"),
+    [("normalize", "peps_normalize"), ("infidelity", "peps_infidelity")],
+)
+def test_deprecated_boundary_aliases_warn(alias_name, canonical_name):
+    """Generic boundary helper names remain available but are deprecated."""
+    import pepsy.boundary as boundary
+
+    boundary.__dict__.pop(alias_name, None)
+    with pytest.warns(DeprecationWarning, match=canonical_name):
+        alias = getattr(boundary, alias_name)
+    assert callable(alias)
+    assert callable(getattr(boundary, canonical_name))
+
+
+@pytest.mark.parametrize(
+    ("alias_name", "canonical_name"),
+    [
+        ("QMeraParametricEnergyOptimizer", "QMeraEnergyOptimizer"),
+        ("MpsStabOptimizer", "StabilizerMpsSimulator"),
+    ],
+)
+def test_deprecated_optimizer_aliases_warn(alias_name, canonical_name):
+    """Optimizer aliases warn while resolving to the canonical implementation."""
+    import pepsy.optimizers as optimizers
+
+    optimizers.__dict__.pop(alias_name, None)
+    with pytest.warns(DeprecationWarning, match=canonical_name):
+        alias = getattr(optimizers, alias_name)
+    assert alias is getattr(optimizers, canonical_name)
+
+
+def test_deprecated_stabilizer_alias_warns():
+    """The briefly used stabilizer class spelling remains a lazy alias."""
+    import pepsy.optimizers.stabilizer_tn as stabilizer_tn
+
+    stabilizer_tn.__dict__.pop("StabilizerMps", None)
+    with pytest.warns(DeprecationWarning, match="MpsStabOptimizer"):
+        alias = stabilizer_tn.StabilizerMps
+    assert alias is stabilizer_tn.MpsStabOptimizer
+
+
+def test_deprecated_mera_alias_warns_and_matches_qmera():
+    """The old MERA discovery name remains a lazy QMERA compatibility alias."""
+    import pepsy.experimental as experimental
+
+    experimental.__dict__.pop("mera", None)
+    with pytest.warns(DeprecationWarning, match="experimental.qmera"):
+        alias = experimental.mera
+    assert alias is experimental.qmera
+
+
+def test_deprecated_aliases_are_documented():
+    """Every active deprecation has a migration entry for users."""
+    migration = _API_MIGRATION_DOC.read_text(encoding="utf-8")
+    tensor_aliases = pepsy.tensors._BACKEND_COMPATIBILITY_ALIASES
+    assert all(f"`pepsy.tensors.{name}`" in migration for name in tensor_aliases)
+    for alias in (
+        "build_contraction",
+        "SpinfulFermionHubbard",
+        "hrps_to_mps",
+        "hrps_to_peps",
+        "hrps_to_ttn",
+    ):
+        assert f"`pepsy.tensors.{alias}`" in migration
+    assert "`pepsy.boundary.normalize`" in migration
+    assert "`pepsy.boundary.infidelity`" in migration
+    assert "`pepsy.optimizers.QMeraParametricEnergyOptimizer`" in migration
+    assert "`pepsy.optimizers.MpsStabOptimizer`" in migration
+    assert "`pepsy.optimizers.stabilizer_tn.StabilizerMps`" in migration
+    assert "`pepsy.experimental.mera`" in migration
+    assert "`pepsy.optimizers.mera`" in migration
 
 
 def test_tree_optimizers_are_available_from_high_level_api():
@@ -68,10 +211,10 @@ _EXPECTED_IN_ALL = [
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult",
     "StabilizerTreeRunResult", "StreamAnalysisRecord",
-    "CoalescedMeasurementRecord", "CoalescedSampleResult", "CoalescedTrajectoryLeaf", "CoalescedTrajectoryResult", "LeakageRecord", "NoisyResult", "MpsNoisyResult", "NoisyShotResult", "PauliErrorModel", "PauliFault",
+    "CoalescedMeasurementRecord", "CoalescedSampleResult", "CoalescedTrajectoryLeaf", "CoalescedTrajectoryResult", "LeakageRecord", "NoisyResult", "NoisyShotResult", "PauliErrorModel", "PauliFault",
     "StimCircuitPlan", "StimDetector", "StimHerald", "StimNoiseSample", "StimObservable", "StimObservableRecord", "StimShotResult", "StimSyndromeRecord",
     "CoherentCrosstalkModel", "TrajectoryChannel", "TrajectoryEvent", "TrajectoryMeasurementRecord", "TrajectoryOutcome", "TrajectoryRecord", "TrajectorySample", "TrajectoryShotResult",
-    "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "MpsNoisy", "TreeNoisy", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots",
+    "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots",
     "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
     "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_mpo", "draw_symmray_peps",
@@ -135,7 +278,7 @@ _CALLABLE_EXPORTS = [
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
-    "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "NoisyResult", "MpsNoisyResult", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "MpsNoisy", "TreeNoisy", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
+    "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "NoisyResult", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeMPO", "TreeOptimizer", "build_tree_operator", "tree_mpo",
