@@ -1153,10 +1153,11 @@ class PauliMPO:
 
     Notes
     -----
-    Numerical MPO compression generally leaves the Pauli basis: the
-    compressed object returned by :meth:`compress` is a Quimb MPO.  This is
-    unavoidable for a generic low-rank MPO, whose Pauli expansion can be
-    exponentially dense.  Exact Pauli algebra remains available before the
+    Numerical MPO compression generally leaves the sparse Pauli-word basis:
+    the default ``compress`` object is a Quimb MPO.  This is unavoidable for
+    a generic low-rank MPO, whose Pauli expansion can be exponentially dense.
+    ``compress(basis="native")`` instead keeps Pauli physical legs in
+    coefficient cores. Exact Pauli algebra remains available before either
     conversion boundary.
 
     :meth:`compress_pauli` provides the native alternative: it compresses a

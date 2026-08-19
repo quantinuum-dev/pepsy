@@ -63,6 +63,8 @@ compressed, report = op.compress_pauli(
 
 assert all(core.shape[2] == 4 for core in compressed.to_pauli_cores())
 print(report.final_bond_dimensions, report.discarded_singular_weight)
+for bond in report.bond_reports:
+    print(bond.bond, bond.final_bond, bond.discarded_weight)
 ```
 
 The native cores have shape `(left_bond, right_bond, 4)` with physical order
