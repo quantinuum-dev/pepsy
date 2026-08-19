@@ -359,6 +359,18 @@ result = runner.run(
 )
 ```
 
+For a single ensemble, `run_mpi_shots` is the concise equivalent:
+
+```python
+result = pepsy.run_mpi_shots(
+    lambda: pepsy.MpsStabOptimizer(32, chi=64),
+    noisy_stream,
+    shots=1_000_000,
+    seed=7,
+    retain="final",
+)
+```
+
 Launch the program with `mpiexec` or `mpirun` after installing the optional
 MPI profile (`pip install -e ".[mpi]"`). Every rank must construct and call
 the runner collectively. Each rank owns complete local optimizer states; MPI
@@ -494,15 +506,24 @@ retained = runner.run(
 )
 ```
 
-This mode serializes the accumulated `NoisyResult` in each rank's trusted
-checkpoint. It requires `strategy="independent"`, `retain="final"` or
+This mode serializes each completed raw shot-result chunk plus a small index in
+trusted per-rank checkpoint files, then merges the chunks when resuming. It requires
+`strategy="independent"`, `retain="final"` or
 `"all"`, and pickle-compatible optimizer states. Coalesced optimizer-state
 checkpoints are intentionally rejected until branch identity and count merges
 have a durable protocol. Checkpoint files must live on a reliable shared
 filesystem, or on rank-local storage with the same path visible to each rank.
+When a custom optimizer factory or observable callback changes independently of
+the gate stream, pass the same stable `checkpoint_id` on every run to bind the
+checkpoint to the application-level semantics.
 A resumed result exposes `resumed=True`, keeps the prefix in
 `result.checkpoint_path`, and publishes one `MPIRankDiagnostics` record per
 rank through `result.rank_diagnostics` with shot ownership and elapsed time.
+Set `checkpoint_sync=False` only when an external filesystem policy provides
+the required durability; set `collect_diagnostics=False` to skip the final
+diagnostics gather on very large communicators.
+After a successful run, call `result.cleanup_checkpoints()` collectively on
+all ranks when the files are no longer needed.
 
 ## User-defined quantum trajectories
 

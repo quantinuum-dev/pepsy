@@ -221,6 +221,22 @@ def test_real_mpi_synchronizes_preflight_validation_errors():
 
 
 @pytest.mark.integration
+def test_real_mpi_rejects_mismatched_valid_configurations():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    strategy = "independent" if comm.Get_rank() == 0 else "coalesced"
+    runner = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=comm,
+    )
+    with pytest.raises(pepsy.MPIShotError, match="different valid run configurations"):
+        runner.run(3, seed=62, strategy=strategy, retain="final")
+
+
+@pytest.mark.integration
 def test_real_mpi_streaming_checkpoint_resume():
     comm = MPI.COMM_WORLD
     if comm.Get_size() < 2:

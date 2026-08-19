@@ -105,6 +105,7 @@ _SYMBOL_MODULES = {
     "MPIShotError": ".optimizers",
     "MPIShotResult": ".optimizers",
     "MPIShotRunner": ".optimizers",
+    "run_mpi_shots": ".optimizers",
     "SimulatorCandidate": ".optimizers",
     "SimulatorPlan": ".optimizers",
     "SimulatorPlanner": ".optimizers",

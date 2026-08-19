@@ -88,6 +88,20 @@ def test_mpi_runner_is_lazy_and_reduces_local_observables():
     assert result.rank_diagnostics[0].elapsed_seconds >= 0.0
 
 
+def test_run_mpi_shots_convenience_entry_point():
+    result = pepsy.run_mpi_shots(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        shots=2,
+        comm=_FakeComm(),
+        seed=5,
+        retain="final",
+    )
+
+    assert result.local_shots == 2
+    assert result.local_result is not None
+
+
 def test_mpi_reduces_vector_observables_across_retained_states():
     result = _run_probe(_FakeComm(), 3)
     estimate = result.reduce_mean(
@@ -150,6 +164,17 @@ def test_mpi_preflight_synchronizes_validation_errors():
     )
     with pytest.raises(pepsy.MPIShotError, match="nonnegative integer"):
         runner.run(-1, seed=5)
+
+
+def test_mpi_diagnostics_can_be_disabled():
+    result = _run_probe(_FakeComm(), 2, seed=5)
+    assert result.rank_diagnostics
+    disabled = pepsy.MPIShotRunner(
+        _probe_factory,
+        [(np.eye(2), 0)],
+        comm=_FakeComm(),
+    ).run(2, seed=5, collect_diagnostics=False)
+    assert disabled.rank_diagnostics == ()
 
 
 def test_mpi_streaming_checkpoint_resume(tmp_path):
@@ -274,6 +299,8 @@ def test_mpi_retained_optimizer_checkpoint_resume_and_retention(tmp_path):
     assert len(
         list(checkpoint.parent.glob(f"{checkpoint.name}.rank0.step*.pkl"))
     ) == 3
+    resumed.cleanup_checkpoints()
+    assert not list(checkpoint.parent.glob(f"{checkpoint.name}.rank0*.pkl"))
 
 
 def test_mpi_checkpoint_api_rejects_unsupported_modes(tmp_path):

@@ -36,6 +36,7 @@ _SYMBOL_MODULES = {
     "MPIShotError": ".mpi",
     "MPIShotResult": ".mpi",
     "MPIShotRunner": ".mpi",
+    "run_mpi_shots": ".mpi",
     "SimulatorCandidate": ".planning",
     "SimulatorPlan": ".planning",
     "SimulatorPlanner": ".planning",
