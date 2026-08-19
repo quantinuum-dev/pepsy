@@ -7383,7 +7383,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         and not (
                             self._dmrg_mode_alias is None
                             and active_fit_block_size in {2, 3}
-                            and xmax - xmin > active_fit_block_size
+                            and xmax - xmin + 1 > active_fit_block_size
                         )
                     )
                     fit = FIT(
@@ -7619,7 +7619,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         and not (
                             self._dmrg_mode_alias is None
                             and active_fit_block_size in {2, 3}
-                            and xmax - xmin > active_fit_block_size
+                            and xmax - xmin + 1 > active_fit_block_size
                         )
                     )
                     fit = FIT(

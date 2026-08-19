@@ -4503,6 +4503,74 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
     ] == [2]
 
 
+@pytest.mark.parametrize(
+    ("where", "block_size"),
+    [((0, 2), 2), ((0, 3), 3)],
+)
+def test_mps_optimizer_boundary_long_range_uses_fixed_handoff(
+    where,
+    block_size,
+    monkeypatch,
+):
+    """A window one site wider than its FIT block is not rank-adaptive."""
+    adaptive_rank_flags = []
+    original_run_fit_gate = py.MpsOptimizer._run_fit_gate
+
+    def record_schedule(self, fit, **kwargs):
+        adaptive_rank_flags.append(bool(kwargs["adaptive_until_rank"]))
+        return original_run_fit_gate(self, fit, **kwargs)
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_fit_gate", record_schedule)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state(
+            "0" * (max(where) + 1),
+            dtype="complex128",
+        ),
+        gates=[(qu.CNOT(), where)],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        fit_block_size=block_size,
+    )
+
+    assert adaptive_rank_flags == [False]
+
+
+def test_mps_optimizer_batched_boundary_long_range_uses_fixed_handoff(
+    monkeypatch,
+):
+    """The batched DMRG path applies the same inclusive-span rule."""
+    adaptive_rank_flags = []
+    original_run_fit_gate = py.MpsOptimizer._run_fit_gate
+
+    def record_schedule(self, fit, **kwargs):
+        adaptive_rank_flags.append(bool(kwargs["adaptive_until_rank"]))
+        return original_run_fit_gate(self, fit, **kwargs)
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_fit_gate", record_schedule)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1)), (qu.CNOT(), (1, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        fit_block_size=2,
+        fit_layer_size=2,
+    )
+
+    assert adaptive_rank_flags == [False]
+
+
 @pytest.mark.parametrize("mode", ("dmrg", "mix"))
 @pytest.mark.parametrize("block_size", (2, 3))
 def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
