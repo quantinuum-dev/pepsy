@@ -2421,6 +2421,17 @@ class MpsStabOptimizer:
         parallel_backend="thread",
         retain="all",
         auto_max_expected_faults=0.1,
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
     ):
         """Dispatch noisy replay through the shared MPS/STN runner."""
         from ..noise import (  # pylint: disable=import-outside-toplevel
@@ -2429,43 +2440,157 @@ class MpsStabOptimizer:
             run_trajectory_shots,
         )
 
+        mpi_enabled = mpi is not None and mpi is not False
+        if not mpi_enabled and any(
+            value is not None for value in (observable, checkpoint_path)
+        ):
+            raise ValueError(
+                "observable and checkpoint options require mpi=True or an MPI communicator."
+            )
+        if not mpi_enabled and (
+            resume
+            or checkpoint_keep != 2
+            or checkpoint_sync is not True
+            or collect_diagnostics is not True
+            or checkpoint_id is not None
+        ):
+            raise ValueError(
+                "MPI checkpoint options require mpi=True or an MPI communicator."
+            )
+        if workers not in {None, "auto"}:
+            if (
+                isinstance(workers, bool)
+                or not isinstance(workers, Integral)
+                or workers < 1
+            ):
+                raise ValueError("workers must be a positive integer or 'auto'.")
+        if workers in {None, "auto"} and parallel_workers != 1:
+            workers = parallel_workers
+        if mpi_enabled:
+            from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
+
+            if strategy == "auto":
+                strategy = "independent"
+            child_kwargs = dict(run_kwargs or {})
+            if progress not in {False, "never"}:
+                child_kwargs["progbar"] = False
+            communicator = None if mpi is True else mpi
+            plan = self._trajectory_plan
+            if plan is None and error_model is None:
+                from ..noise import compile_trajectory_stream
+
+                plan = compile_trajectory_stream(self._gate_stream)
+            runner = MPIShotRunner(
+                self._shot_factory(),
+                plan if error_model is None else self._gate_stream,
+                comm=communicator,
+            )
+            return runner.run(
+                shots,
+                seed=seed,
+                error_model=error_model,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                retain=retain,
+                local_workers=workers,
+                local_backend="auto",
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+                progress=progress,
+            )
+        if workers in {None, "auto"}:
+            from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+
+            workers = _resolve_local_workers(workers, shots=shots)
+        from ..mpi import (  # pylint: disable=import-outside-toplevel
+            _make_progress_bar,
+            _validate_progress,
+        )
+        progress_strategy = strategy
+        if workers > 1 and strategy == "auto":
+            from ..noise import _resolve_auto_parallel_strategy
+
+            progress_strategy = _resolve_auto_parallel_strategy(
+                self._gate_stream,
+                shots,
+                error_model=error_model,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                auto_max_expected_faults=auto_max_expected_faults,
+            )
+
+        progress_mode = _validate_progress(progress)
+        progress_bar = _make_progress_bar(
+            progress_mode,
+            shots,
+            desc="shots",
+        ) if workers > 1 and progress_strategy == "independent" else None
+        child_kwargs = dict(run_kwargs or {})
+        if workers > 1 and progress_mode != "never":
+            child_kwargs["progbar"] = False
+
+        def update_progress(delta):
+            if progress_bar is not None:
+                progress_bar.update(int(delta))
+
         common = {
             "seed": seed,
-            "run_kwargs": run_kwargs,
+            "run_kwargs": child_kwargs,
             "strategy": strategy,
             "max_branches": max_branches,
             "importance_sampling": importance_sampling,
             "max_branch_factor": max_branch_factor,
-            "parallel_workers": parallel_workers,
+            "parallel_workers": workers,
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        if error_model is None:
-            plan = self._trajectory_plan
-            if plan is None:
-                from ..noise import compile_trajectory_stream
+        try:
+            if error_model is None:
+                plan = self._trajectory_plan
+                if plan is None:
+                    from ..noise import compile_trajectory_stream
 
-                plan = compile_trajectory_stream(self._gate_stream)
-            raw = run_trajectory_shots(
-                self._shot_factory(),
-                plan,
-                shots,
-                **common,
-            )
-        else:
-            if self._has_trajectory_events:
-                raise ValueError(
-                    "do not combine stream-local trajectory events with "
-                    "error_model; use one noise representation per stream."
+                    plan = compile_trajectory_stream(self._gate_stream)
+                shot_gates = plan.entries if workers > 1 else plan
+                raw = run_trajectory_shots(
+                    self._shot_factory(),
+                    shot_gates,
+                    shots,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
                 )
-            raw = run_noisy_shots(
-                self._shot_factory(),
-                self._gate_stream,
-                error_model,
-                shots,
-                auto_max_expected_faults=auto_max_expected_faults,
-                **common,
-            )
+            else:
+                if self._has_trajectory_events:
+                    raise ValueError(
+                        "do not combine stream-local trajectory events with "
+                        "error_model; use one noise representation per stream."
+                    )
+                raw = run_noisy_shots(
+                    self._shot_factory(),
+                    self._gate_stream,
+                    error_model,
+                    shots,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         return NoisyResult(raw)
 
     def _execution_snapshot(self):
@@ -2545,6 +2670,17 @@ class MpsStabOptimizer:
         parallel_backend="thread",
         retain="all",
         auto_max_expected_faults=0.1,
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
         timing: bool = False,
         transactional: bool = False,
         atomic=None,
@@ -2564,6 +2700,14 @@ class MpsStabOptimizer:
         shots, error_model, strategy, ...
             Shot/noise options matching :meth:`MpsOptimizer.run`. They use the
             shared trajectory runner and return :class:`pepsy.NoisyResult`.
+        mpi : bool | MPI communicator | None
+            Run the shot ensemble collectively over MPI. ``True`` uses
+            ``MPI.COMM_WORLD``.
+        workers : int | "auto" | None
+            Local shot workers. ``"auto"`` divides the process CPU allowance
+            across MPI ranks sharing a host.
+        progress : {"auto", True, False}
+            Show one aggregate rank-zero progress bar for MPI runs.
         timing : bool
             Record a lightweight wall-clock replay record available through
             :meth:`get_run_timing`.
@@ -2592,6 +2736,10 @@ class MpsStabOptimizer:
             or int(parallel_workers) != 1
             or parallel_backend != "thread"
             or retain != "all"
+            or (mpi is not None and mpi is not False)
+            or workers not in {None, "auto"}
+            or observable is not None
+            or checkpoint_path is not None
         )
         if shot_requested:
             started = time.perf_counter()
@@ -2608,6 +2756,17 @@ class MpsStabOptimizer:
                 parallel_backend=parallel_backend,
                 retain=retain,
                 auto_max_expected_faults=auto_max_expected_faults,
+                mpi=mpi,
+                workers=workers,
+                progress=progress,
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
             )
             self._last_run_timing = {
                 "enabled": bool(timing),

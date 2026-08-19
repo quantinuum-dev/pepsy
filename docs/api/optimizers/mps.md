@@ -166,6 +166,29 @@ replay uses a frozen persistent-layout template when one is installed, but
 still requires a fresh identity-order optimizer for an already-permuted `perm`
 state.
 
+For MPI, use the same optimizer-level API by passing `mpi=True` (or an
+explicit communicator). `workers="auto"` divides the available CPU allowance
+across local MPI ranks, while `workers=1` forces serial execution inside each
+rank. `progress="auto"` shows one aggregate rank-zero shot bar only in an
+interactive terminal; child optimizer bars are suppressed during distributed
+execution:
+
+```python
+result = simulator.run(
+    shots=1_000_000,
+    mpi=True,
+    workers="auto",
+    progress="auto",
+    seed=7,
+    retain="none",
+)
+```
+
+Launch the program with `mpiexec -n 4 ...`; `mpi=True` uses the already-launched
+communicator and does not create MPI processes itself. Each shot is initialized
+from the optimizer's constructor snapshot, so repeated seeded ensembles are
+stable and do not mutate the template optimizer.
+
 The practical shot-mode matrix is:
 
 | mode | trajectory status |

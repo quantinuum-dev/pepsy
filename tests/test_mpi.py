@@ -102,6 +102,149 @@ def test_run_mpi_shots_convenience_entry_point():
     assert result.local_result is not None
 
 
+@pytest.mark.parametrize(
+    "mode",
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "fit", "mix", "mpo", "svd", "swap", "perm", "exact", "su"),
+)
+def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
+    initial = qtn.MPS_computational_state("0", dtype="complex128")
+    optimizer = pepsy.MpsOptimizer(
+        initial,
+        [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
+        chi=4,
+        mode=mode,
+    )
+
+    result = optimizer.run(
+        shots=2,
+        seed=41,
+        mpi=_FakeComm(),
+        workers=1,
+        progress=False,
+        retain="final",
+        run_kwargs={"progbar": False},
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert len(result.local_result.optimizers) == 2
+    np.testing.assert_allclose(optimizer.p.to_dense(), initial.to_dense())
+
+
+def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
+    optimizer = pepsy.MpsStabOptimizer(1, gates=[("x", 0)])
+    result = optimizer.run(
+        shots=3,
+        seed=42,
+        mpi=_FakeComm(),
+        workers=1,
+        progress=False,
+        retain="final",
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert len(result.local_result.optimizers) == 3
+    assert optimizer.measurements == []
+
+
+def test_mps_run_auto_workers_is_available_without_mpi():
+    optimizer = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype="complex128"),
+        [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
+        chi=4,
+        mode="mpo",
+    )
+
+    result = optimizer.run(
+        shots=3,
+        seed=43,
+        strategy="independent",
+        workers="auto",
+        progress=False,
+        retain="final",
+        run_kwargs={"progbar": False},
+    )
+
+    assert len(result.optimizers) == 3
+
+
+def test_mps_run_progress_is_one_outer_shot_bar(monkeypatch):
+    import importlib
+
+    mpi_module = importlib.import_module("pepsy.optimizers.mpi")
+    events = []
+
+    class _Progress:
+        def update(self, amount):
+            events.append(("update", amount))
+
+        def close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr(
+        mpi_module,
+        "_make_progress_bar",
+        lambda mode, total, **kwargs: _Progress(),
+    )
+    optimizer = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype="complex128"),
+        [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
+        chi=4,
+        mode="mpo",
+    )
+
+    optimizer.run(
+        shots=4,
+        seed=44,
+        strategy="independent",
+        workers=2,
+        progress=True,
+        retain="none",
+        run_kwargs={"progbar": True},
+    )
+
+    assert sum(event[1] for event in events if event[0] == "update") == 4
+    assert events[-1] == ("close",)
+
+
+def test_mps_run_mpi_keyword_preserves_checkpoint_options(tmp_path):
+    checkpoint = tmp_path / "mps-api"
+    optimizer = pepsy.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype="complex128"),
+        [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
+        chi=4,
+        mode="mpo",
+    )
+
+    first = optimizer.run(
+        shots=4,
+        seed=45,
+        mpi=_FakeComm(),
+        workers=1,
+        progress=False,
+        retain="final",
+        chunk_size=2,
+        checkpoint_path=checkpoint,
+    )
+    resumed = optimizer.run(
+        shots=4,
+        seed=45,
+        mpi=_FakeComm(),
+        workers=1,
+        progress=False,
+        retain="final",
+        chunk_size=2,
+        checkpoint_path=checkpoint,
+        resume=True,
+    )
+
+    assert first.resumed is False
+    assert resumed.resumed is True
+    assert resumed.reduce_mean(lambda state: state.p.norm()) == pytest.approx(
+        first.reduce_mean(lambda state: state.p.norm())
+    )
+    resumed.cleanup_checkpoints()
+
+
 def test_mpi_reduces_vector_observables_across_retained_states():
     result = _run_probe(_FakeComm(), 3)
     estimate = result.reduce_mean(

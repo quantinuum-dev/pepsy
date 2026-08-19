@@ -15,6 +15,7 @@ import hashlib
 import os
 from pathlib import Path
 import pickle
+import sys
 import tempfile
 import time
 import traceback
@@ -69,11 +70,121 @@ def _validate_backend(backend):
     backend = str(backend).strip().lower().replace("-", "_")
     if backend == "threads":
         backend = "thread"
-    if backend not in {"serial", "thread", "gpu"}:
+    if backend not in {"auto", "serial", "thread", "gpu"}:
         raise ValueError(
-            "local_backend must be 'serial', 'thread', or 'gpu'."
+            "local_backend must be 'auto', 'serial', 'thread', or 'gpu'."
         )
     return backend
+
+
+def _validate_progress(progress):
+    if isinstance(progress, bool):
+        return "always" if progress else "never"
+    if progress is None:
+        return "auto"
+    value = str(progress).strip().lower().replace("-", "_")
+    aliases = {"true": "always", "false": "never", "on": "always", "off": "never"}
+    value = aliases.get(value, value)
+    if value not in {"auto", "always", "never"}:
+        raise ValueError("progress must be 'auto', True, or False.")
+    return value
+
+
+def _available_cpu_count():
+    """Return the process CPU allowance when the platform exposes it."""
+    try:
+        affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        affinity = None
+    if affinity:
+        return max(1, len(affinity))
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _local_mpi_size(comm, mpi_module):
+    """Return the number of ranks sharing this rank's host when available."""
+    if comm is None or mpi_module is None:
+        return 1
+    split_type = getattr(comm, "Split_type", None)
+    shared_type = getattr(mpi_module, "COMM_TYPE_SHARED", None)
+    if split_type is None or shared_type is None:
+        return max(1, int(comm.Get_size()))
+    local_comm = None
+    try:
+        local_comm = split_type(shared_type, key=int(comm.Get_rank()))
+        return max(1, int(local_comm.Get_size()))
+    except Exception:  # pragma: no cover - MPI implementation dependent
+        return max(1, int(comm.Get_size()))
+    finally:
+        if local_comm is not None and hasattr(local_comm, "Free"):
+            local_comm.Free()
+
+
+def _resolve_local_workers(workers, *, shots=None, comm=None, mpi_module=None):
+    """Resolve explicit or host-aware local shot workers."""
+    if workers not in {None, "auto"}:
+        return _validate_workers(workers)
+    budget = _available_cpu_count()
+    budget //= _local_mpi_size(comm, mpi_module)
+    budget = max(1, budget)
+    if shots is not None:
+        budget = min(budget, max(1, int(shots)))
+    return budget
+
+
+def _progress_is_visible(mode, *, rank=0, stream=None):
+    if mode != "always" and rank != 0:
+        return False
+    if mode == "never":
+        return False
+    if mode == "always":
+        return rank == 0
+    if stream is None:
+        stream = sys.stderr
+    return rank == 0 and bool(getattr(stream, "isatty", lambda: False)())
+
+
+def _make_progress_bar(mode, total, *, rank=0, desc="shots"):
+    if not _progress_is_visible(mode, rank=rank):
+        return None
+    from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+    return tqdm(
+        total=int(total),
+        desc=desc,
+        unit="shot",
+        position=0,
+        leave=True,
+        dynamic_ncols=True,
+    )
+
+
+class _MPIProgress:
+    """Rank-zero aggregate progress for collectively chunked MPI work."""
+
+    def __init__(self, comm, mpi_module, mode, total, *, rank):
+        self.comm = comm
+        self.mpi_module = mpi_module
+        self.rank = int(rank)
+        requested = _progress_is_visible(mode, rank=self.rank)
+        requested = bool(comm.bcast(requested if self.rank == 0 else None, root=0))
+        self.enabled = requested
+        self.completed = 0
+        self.bar = _make_progress_bar("always" if requested else "never", total, rank=self.rank)
+
+    def update(self, local_completed):
+        if not self.enabled:
+            return
+        completed = int(
+            _allreduce(self.comm, self.mpi_module, int(local_completed), "SUM")
+        )
+        if self.bar is not None:
+            self.bar.update(max(0, completed - self.completed))
+        self.completed = completed
+
+    def close(self):
+        if self.bar is not None:
+            self.bar.close()
 
 
 def _validate_retain(retain):
@@ -1355,6 +1466,96 @@ class MPIShotRunner:
             )
         return NoisyResult(raw)
 
+    def _run_progressive_local(
+        self,
+        start,
+        stop,
+        seed,
+        *,
+        progress,
+        progress_chunk_size,
+        error_model,
+        strategy,
+        run_kwargs,
+        max_branches,
+        max_branch_factor,
+        importance_sampling,
+        auto_max_expected_faults,
+        magic_strategy,
+        magic_ancillas,
+        magic_recycle,
+        magic_reset_ancillas,
+        magic_projection_order,
+        local_workers,
+        local_backend,
+        retain,
+    ):
+        """Run independent chunks so rank zero can report aggregate progress."""
+        local_count = int(stop - start)
+        local_chunks = (local_count + progress_chunk_size - 1) // progress_chunk_size
+        chunk_count = int(
+            _allreduce(self.comm, self._mpi_module, local_chunks, "MAX")
+        )
+        if chunk_count == 0:
+            return self._run_local(
+                start,
+                stop,
+                seed,
+                error_model=error_model,
+                strategy=strategy,
+                run_kwargs=run_kwargs,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                magic_strategy=magic_strategy,
+                magic_ancillas=magic_ancillas,
+                magic_recycle=magic_recycle,
+                magic_reset_ancillas=magic_reset_ancillas,
+                magic_projection_order=magic_projection_order,
+                local_workers=local_workers,
+                local_backend=local_backend,
+                retain=retain,
+            )
+        accumulated = None
+        for index in range(chunk_count):
+            chunk_start = start + index * progress_chunk_size
+            chunk_stop = min(chunk_start + progress_chunk_size, stop)
+            local_error = None
+            chunk_result = None
+            try:
+                if chunk_start < chunk_stop:
+                    chunk_result = self._run_local(
+                        chunk_start,
+                        chunk_stop,
+                        seed,
+                        error_model=error_model,
+                        strategy=strategy,
+                        run_kwargs=run_kwargs,
+                        max_branches=max_branches,
+                        max_branch_factor=max_branch_factor,
+                        importance_sampling=importance_sampling,
+                        auto_max_expected_faults=auto_max_expected_faults,
+                        magic_strategy=magic_strategy,
+                        magic_ancillas=magic_ancillas,
+                        magic_recycle=magic_recycle,
+                        magic_reset_ancillas=magic_reset_ancillas,
+                        magic_projection_order=magic_projection_order,
+                        local_workers=local_workers,
+                        local_backend=local_backend,
+                        retain=retain,
+                    )
+                    if retain != "none":
+                        accumulated = _merge_retained_results(
+                            accumulated,
+                            chunk_result,
+                        )
+            except BaseException:
+                local_error = traceback.format_exc()
+            self._synchronize_error(local_error)
+            progress.update(max(0, chunk_stop - start))
+        return accumulated
+
     def run(
         self,
         shots,
@@ -1383,6 +1584,8 @@ class MPIShotRunner:
         checkpoint_sync=True,
         collect_diagnostics=True,
         checkpoint_id=None,
+        progress="auto",
+        progress_chunk_size=1024,
     ):
         """Run a global shot ensemble collectively over MPI ranks.
 
@@ -1408,22 +1611,43 @@ class MPIShotRunner:
         ``checkpoint_id`` is an optional application-defined identity for
         custom factories or observable callbacks whose semantics are not
         discoverable from their Python objects.
+        ``progress`` shows one rank-zero aggregate progress bar when set to
+        ``True``; ``"auto"`` shows it only on an interactive terminal.
+        ``progress_chunk_size`` controls the shot granularity of that display.
         """
         local_error = None
         configuration_fingerprint = None
         try:
             shots = _validate_shots(shots)
             strategy = str(strategy).strip().lower()
+            if strategy == "auto":
+                strategy = "independent"
             if strategy not in {"independent", "coalesced"}:
                 raise ValueError(
-                    "MPIShotRunner supports strategy='independent' or 'coalesced'."
+                    "MPIShotRunner supports strategy='auto', 'independent', or "
+                    "'coalesced'."
                 )
             retain = _validate_retain(retain)
-            local_workers = _validate_workers(local_workers)
+            local_workers = _resolve_local_workers(
+                local_workers,
+                shots=shots,
+                comm=self.comm,
+                mpi_module=self._mpi_module,
+            )
             local_backend = _validate_backend(local_backend)
+            if local_backend == "auto":
+                local_backend = "thread" if local_workers > 1 else "serial"
             checkpoint_path = _validate_checkpoint_path(checkpoint_path)
             checkpoint_keep = _validate_checkpoint_keep(checkpoint_keep)
             checkpoint_id = _validate_checkpoint_id(checkpoint_id)
+            progress = _validate_progress(progress)
+            if (
+                isinstance(progress_chunk_size, bool)
+                or not isinstance(progress_chunk_size, Integral)
+                or progress_chunk_size < 1
+            ):
+                raise ValueError("progress_chunk_size must be a positive integer.")
+            progress_chunk_size = int(progress_chunk_size)
             checkpoint_sync = _validate_bool(checkpoint_sync, "checkpoint_sync")
             collect_diagnostics = _validate_bool(
                 collect_diagnostics,
@@ -1494,8 +1718,6 @@ class MPIShotRunner:
                     "magic_reset_ancillas": magic_reset_ancillas,
                     "magic_projection_order": magic_projection_order,
                     "retain": retain,
-                    "local_workers": local_workers,
-                    "local_backend": local_backend,
                     "chunk_size": chunk_size,
                     "checkpoint_path": checkpoint_path,
                     "checkpoint_sync": checkpoint_sync,
@@ -1568,29 +1790,62 @@ class MPIShotRunner:
         root_seed = self._broadcast_seed(seed)
         local_error = None
         local_result = None
+        progress_state = _MPIProgress(
+            self.comm,
+            self._mpi_module,
+            progress if strategy == "independent" else "never",
+            shots,
+            rank=self.rank,
+        )
         try:
-            local_result = self._run_local(
-                start,
-                stop,
-                root_seed,
-                error_model=error_model,
-                strategy=strategy,
-                run_kwargs=run_kwargs,
-                max_branches=max_branches,
-                max_branch_factor=max_branch_factor,
-                importance_sampling=importance_sampling,
-                auto_max_expected_faults=auto_max_expected_faults,
-                magic_strategy=magic_strategy,
-                magic_ancillas=magic_ancillas,
-                magic_recycle=magic_recycle,
-                magic_reset_ancillas=magic_reset_ancillas,
-                magic_projection_order=magic_projection_order,
-                local_workers=local_workers,
-                local_backend=local_backend,
-                retain=retain,
-            )
+            if progress_state.enabled and strategy == "independent":
+                local_result = self._run_progressive_local(
+                    start,
+                    stop,
+                    root_seed,
+                    progress=progress_state,
+                    progress_chunk_size=progress_chunk_size,
+                    error_model=error_model,
+                    strategy=strategy,
+                    run_kwargs=run_kwargs,
+                    max_branches=max_branches,
+                    max_branch_factor=max_branch_factor,
+                    importance_sampling=importance_sampling,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    magic_strategy=magic_strategy,
+                    magic_ancillas=magic_ancillas,
+                    magic_recycle=magic_recycle,
+                    magic_reset_ancillas=magic_reset_ancillas,
+                    magic_projection_order=magic_projection_order,
+                    local_workers=local_workers,
+                    local_backend=local_backend,
+                    retain=retain,
+                )
+            else:
+                local_result = self._run_local(
+                    start,
+                    stop,
+                    root_seed,
+                    error_model=error_model,
+                    strategy=strategy,
+                    run_kwargs=run_kwargs,
+                    max_branches=max_branches,
+                    max_branch_factor=max_branch_factor,
+                    importance_sampling=importance_sampling,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    magic_strategy=magic_strategy,
+                    magic_ancillas=magic_ancillas,
+                    magic_recycle=magic_recycle,
+                    magic_reset_ancillas=magic_reset_ancillas,
+                    magic_projection_order=magic_projection_order,
+                    local_workers=local_workers,
+                    local_backend=local_backend,
+                    retain=retain,
+                )
         except BaseException:  # synchronize failures before leaving a collective run
             local_error = traceback.format_exc()
+        finally:
+            progress_state.close()
 
         self._synchronize_error(local_error)
         diagnostics = self._collect_rank_diagnostics(

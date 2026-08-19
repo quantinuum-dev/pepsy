@@ -237,6 +237,28 @@ def test_real_mpi_rejects_mismatched_valid_configurations():
 
 
 @pytest.mark.integration
+def test_real_mpi_mps_optimizer_run_keyword():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    optimizer = pepsy.MpsStabOptimizer(1, gates=[("x", 0)])
+    result = optimizer.run(
+        shots=9,
+        seed=63,
+        mpi=comm,
+        workers="auto",
+        progress=False,
+        retain="final",
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert result.reduce_sum(result.local_shots) == 9
+    assert len(result.local_result.optimizers) == result.local_shots
+    assert optimizer.measurements == []
+
+
+@pytest.mark.integration
 def test_real_mpi_streaming_checkpoint_resume():
     comm = MPI.COMM_WORLD
     if comm.Get_size() < 2:

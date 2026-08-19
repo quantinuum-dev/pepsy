@@ -129,6 +129,16 @@ class _MpsStreamPlan:
         repr=False,
     )
 
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_backend_cache"] = {}
+        state.pop("_backend_cache_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        object.__setattr__(self, "_backend_cache_lock", threading.RLock())
+
     def get_or_create_backend_payload(self, key, source, factory):
         """Return a cached backend payload, creating it exactly once."""
         with self._backend_cache_lock:
@@ -2661,13 +2671,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         parallel_backend,
         auto_max_expected_faults,
         retain,
+        mpi=None,
+        workers="auto",
+        checkpoint_path=None,
+        observable=None,
     ):
         """Return whether ``run`` needs the multi-shot trajectory machinery."""
+        if mpi is not None and mpi is not False:
+            return True
+        if checkpoint_path is not None or observable is not None:
+            return True
         if has_trajectory_events or error_model is not None:
             return True
         if isinstance(shots, bool) or not isinstance(shots, Integral):
             return True
         if int(shots) != 1:
+            return True
+        if workers not in {None, "auto"}:
             return True
         return any(
             (
@@ -2732,9 +2752,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         parallel_workers=1,
         parallel_backend="thread",
         retain="all",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
     ):
         """Replay this stream as an independent or coalesced shot ensemble."""
         self._validate_shot_compatibility(error_model=error_model)
+        if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+            raise ValueError("shots must be a nonnegative integer.")
         if self.mode == "perm" and self.logical_order != list(
             range(int(getattr(self.p, "L", 0)))
         ):
@@ -2754,33 +2787,150 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             run_trajectory_shots,
         )
 
+        mpi_enabled = mpi is not None and mpi is not False
+        if not mpi_enabled and any(
+            value is not None
+            for value in (observable, checkpoint_path)
+        ):
+            raise ValueError(
+                "observable and checkpoint options require mpi=True or an MPI communicator."
+            )
+        if not mpi_enabled and (
+            resume
+            or checkpoint_keep != 2
+            or checkpoint_sync is not True
+            or collect_diagnostics is not True
+            or checkpoint_id is not None
+        ):
+            raise ValueError(
+                "MPI checkpoint options require mpi=True or an MPI communicator."
+            )
+
+        if workers not in {None, "auto"}:
+            if (
+                isinstance(workers, bool)
+                or not isinstance(workers, Integral)
+                or workers < 1
+            ):
+                raise ValueError("workers must be a positive integer or 'auto'.")
+        if workers in {None, "auto"} and parallel_workers != 1:
+            workers = parallel_workers
+        if mpi_enabled:
+            from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
+
+            if strategy == "auto":
+                strategy = "independent"
+            child_kwargs = dict(run_kwargs or {})
+            if progress not in {False, "never"}:
+                child_kwargs["progbar"] = False
+            communicator = None if mpi is True else mpi
+            mpi_gates = (
+                self._stream_plan.trajectory_plan
+                if self._has_trajectory_events
+                else self._gate_stream
+            )
+            runner = MPIShotRunner(
+                self._shot_factory(),
+                mpi_gates,
+                comm=communicator,
+            )
+            return runner.run(
+                shots,
+                seed=seed,
+                error_model=error_model,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                retain=retain,
+                local_workers=workers,
+                local_backend="auto",
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+                progress=progress,
+            )
+
+        if workers in {None, "auto"}:
+            from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+
+            workers = _resolve_local_workers(workers, shots=shots)
+        from ..mpi import (  # pylint: disable=import-outside-toplevel
+            _make_progress_bar,
+            _validate_progress,
+        )
+        progress_strategy = strategy
+        if workers > 1 and strategy == "auto":
+            from ..noise import _resolve_auto_parallel_strategy
+
+            progress_strategy = _resolve_auto_parallel_strategy(
+                self._stream_plan.entries,
+                shots,
+                error_model=error_model,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                auto_max_expected_faults=auto_max_expected_faults,
+            )
+
+        progress_mode = _validate_progress(progress)
+        progress_bar = _make_progress_bar(
+            progress_mode,
+            shots,
+            desc="shots",
+        ) if workers > 1 and progress_strategy == "independent" else None
+        child_kwargs = dict(run_kwargs or {})
+        if workers > 1 and progress_mode != "never":
+            child_kwargs["progbar"] = False
+
+        def update_progress(delta):
+            if progress_bar is not None:
+                progress_bar.update(int(delta))
+
         common = {
             "seed": seed,
-            "run_kwargs": run_kwargs,
+            "run_kwargs": child_kwargs,
             "strategy": strategy,
             "max_branches": max_branches,
             "importance_sampling": importance_sampling,
             "max_branch_factor": max_branch_factor,
-            "parallel_workers": parallel_workers,
+            "parallel_workers": workers,
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        if error_model is None:
-            raw = run_trajectory_shots(
-                self._shot_factory(),
-                self._stream_plan.trajectory_plan,
-                shots,
-                **common,
-            )
-        else:
-            raw = run_noisy_shots(
-                self._shot_factory(),
-                self._gate_stream,
-                error_model,
-                shots,
-                auto_max_expected_faults=auto_max_expected_faults,
-                **common,
-            )
+        try:
+            if error_model is None:
+                shot_gates = (
+                    self._stream_plan.entries
+                    if workers > 1
+                    else self._stream_plan.trajectory_plan
+                )
+                raw = run_trajectory_shots(
+                    self._shot_factory(),
+                    shot_gates,
+                    shots,
+                    _progress=update_progress if progress_bar is not None else None,
+                    **common,
+                )
+            else:
+                raw = run_noisy_shots(
+                    self._shot_factory(),
+                    self._gate_stream,
+                    error_model,
+                    shots,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    _progress=update_progress if progress_bar is not None else None,
+                    **common,
+                )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         return NoisyResult(raw)
 
     def set_gates(self, gates):
@@ -3357,6 +3507,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         max_branch_factor=None,
         parallel_workers=1,
         parallel_backend="thread",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
         retain="all",
     ):
         """Run the currently queued gates.
@@ -3588,6 +3749,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Number of workers for explicit parallel shot execution.
         parallel_backend : {"thread", "gpu", "serial"}, default="thread"
             Backend used for explicit parallel shot execution.
+        mpi : bool | MPI communicator | None, default=None
+            Run the shot ensemble collectively over MPI. ``True`` uses
+            ``MPI.COMM_WORLD``; an explicit communicator can be supplied.
+        workers : int | "auto" | None, default="auto"
+            Local shot workers. ``"auto"`` uses the process CPU allowance and
+            divides it across MPI ranks sharing a host. Use ``1`` to force
+            serial local execution.
+        progress : {"auto", True, False}, default="auto"
+            Show one aggregate rank-zero shot progress bar for MPI runs.
+        observable, chunk_size, checkpoint_path, resume, checkpoint_keep,
+        checkpoint_sync, collect_diagnostics, checkpoint_id
+            MPI checkpointing and bounded-memory reduction options. These
+            require ``mpi=True`` or an explicit MPI communicator.
         retain : {"all", "final", "none"}, default="all"
             Result retention policy for shot replay. ``"all"`` retains final
             states and replay metadata, ``"final"`` retains final states only,
@@ -3595,9 +3769,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         Returns
         -------
-        qtn.TensorNetwork | NoisyResult
+        qtn.TensorNetwork | NoisyResult | MPIShotResult
             The updated ``self.p`` state for a single ordinary replay, or a
-            stable noisy result facade when shot replay is selected.
+            stable noisy/MPI result facade when shot replay is selected.
         """
         if self._shot_runner_requested(
             shots,
@@ -3612,6 +3786,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             parallel_backend=parallel_backend,
             auto_max_expected_faults=auto_max_expected_faults,
             retain=retain,
+            mpi=mpi,
+            workers=workers,
+            checkpoint_path=checkpoint_path,
+            observable=observable,
         ):
             if mode is not None:
                 self.set_mode(mode)
@@ -3628,6 +3806,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
                 retain=retain,
+                mpi=mpi,
+                workers=workers,
+                progress=progress,
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
             )
 
         timing = bool(timing)

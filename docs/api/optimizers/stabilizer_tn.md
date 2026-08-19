@@ -103,6 +103,26 @@ With `progbar=True`, the STN progress bar reports the current stream
 MPS-compatible diagnostic field `infidelity`. The legacy
 `norm_infidelity` field is emitted with the same value.
 
+Shot ensembles can use the same optimizer-level MPI API as ordinary MPS
+optimization:
+
+```python
+result = sim.run(
+    shots=1_000_000,
+    mpi=True,
+    workers="auto",
+    progress="auto",
+    seed=7,
+    retain="none",
+)
+```
+
+`mpi=True` uses the communicator created by `mpiexec`; it does not launch MPI
+processes. Each shot is rebuilt from the simulator's initial snapshot, and
+`workers="auto"` divides the available CPU allowance among ranks on the same
+host. `progress="auto"` emits one rank-zero aggregate bar only in interactive
+terminals.
+
 `exact_cooling=True` is the default constructive pre-check for multi-site
 non-Clifford Pauli rotations. If the frame image has an isolated product
 stabilizer pivot, the optimizer performs one local coefficient rotation and
