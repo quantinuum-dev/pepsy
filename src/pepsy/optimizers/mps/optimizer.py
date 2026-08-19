@@ -3645,9 +3645,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             three-site sweeps used to adapt the active bond spaces. Generic
             rank-adaptive DMRG continues block sweeps until every active bond
             reaches its physical ceiling; rank stagnation never triggers the
-            transition. If a ceiling is not reached, the block phase uses all
-            requested sweeps, and remaining sweeps use fixed-rank one-site
-            FIT. For named ``mode="dmrg1"``, the two-site phase is fixed at
+            transition. Long-range windows use the corresponding fixed block
+            handoff so their terminal canonical center remains authoritative
+            for unitary norm tracking. Otherwise, if a ceiling is not reached,
+            the block phase uses all requested sweeps, and remaining sweeps use
+            fixed-rank one-site FIT. For named ``mode="dmrg1"``, the two-site phase is fixed at
             two sweeps and this value does not extend it; after that, remaining
             sweeps use one-site FIT and the phase latches once all full-chain
             attainable ceilings are reached. For ``mode="dmrg2"`` and
@@ -5342,6 +5344,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         raw = (observed_norm / expected_norm) ** 2
         return raw, min(1.0, max(0.0, raw))
 
+    def _unitary_norm_overshoot_tolerance(self):
+        """Return the dtype-aware tolerance for small norm overshoots.
+
+        The norm ratio is evaluated from the retained canonical-center tensor.
+        For ``float32``/``complex64`` data, the SVD and canonicalization
+        roundoff can accumulate over a gate stream even when the projection is
+        otherwise healthy. Keep the historical tolerance for higher precision,
+        while allowing a bounded multiple of float32 machine epsilon for the
+        low-precision path. The raw ratio is still retained in the event and
+        the fidelity contribution remains clipped at one.
+        """
+        dtype = str(self.backend_dtype).lower()
+        if "32" in dtype or "complex64" in dtype:
+            return max(1.0e-6, 128.0 * np.finfo(np.float32).eps)
+        return 1.0e-6
+
     def _record_norm_event(
         self,
         kind,
@@ -5365,13 +5383,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if (
             kind == "unitary_compression"
             and raw is not None
-            and raw > 1.0 + 1.0e-6
         ):
-            raise FloatingPointError(
-                "Retained unitary-compression norm exceeds its expected norm "
-                f"(squared ratio={raw:.6g}); canonical projection metadata "
-                "is inconsistent."
-            )
+            overshoot_tolerance = self._unitary_norm_overshoot_tolerance()
+            if raw > 1.0 + overshoot_tolerance:
+                raise FloatingPointError(
+                    "Retained unitary-compression norm exceeds its expected norm "
+                    f"(squared ratio={raw:.6g}, "
+                    f"tolerance={overshoot_tolerance:.3g}); "
+                    "canonical projection metadata is inconsistent."
+                )
         event = {
             "kind": str(kind),
             "where": tuple(int(site) for site in where),
@@ -6206,14 +6226,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise FloatingPointError("MPO batch produced non-finite MPS tensor data.")
 
     def _run_mix_dmrg(self, *args, fit_block_size, **kwargs):
-        """Run mixed DMRG, promoting fixed-rank handoff to DMRG2."""
-        dmrg2_handoff = int(fit_block_size) == 1
+        """Run mixed DMRG with a stable named FIT schedule when available.
+
+        Mixed mode may enter DMRG after an MPO warm-up with a two- or
+        three-site FIT window.  Keep that transaction on the corresponding
+        fixed schedule: the generic rank-adaptive schedule can leave a
+        long-range window with a stale represented norm after a short sweep
+        budget, which the unitary invariant must (correctly) reject.
+        """
+        requested_block_size = int(fit_block_size)
+        schedule_alias = {
+            1: ("dmrg2", 2),
+            2: ("dmrg2", 2),
+            3: ("dmrg3", 3),
+        }.get(requested_block_size)
         old_dmrg_alias = self._dmrg_mode_alias
         old_dmrg_block_size = self._dmrg_mode_block_size
-        if dmrg2_handoff:
-            self._dmrg_mode_alias = "dmrg2"
-            self._dmrg_mode_block_size = 2
-            fit_block_size = 2
+        if schedule_alias is not None:
+            self._dmrg_mode_alias, fit_block_size = schedule_alias
+            self._dmrg_mode_block_size = fit_block_size
         kwargs["fit_block_size"] = fit_block_size
         try:
             return self._run_dmrg(*args, **kwargs)
@@ -7176,7 +7207,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # under-capacity window, then one-site refinement. It latches into the
         # one-site phase once every full-chain bond reaches its attainable
         # physical/chi ceiling. ``dmrg2`` and ``dmrg3`` retain their configured
-        # fixed warm-ups, while generic ``dmrg`` remains rank-adaptive.
+        # fixed warm-ups. Generic ``dmrg`` remains rank-adaptive for local
+        # windows and uses the fixed canonical handoff for long-range windows.
         adaptive_rank_schedule = self._dmrg_mode_alias not in {
             "dmrg1",
             "dmrg2",
@@ -7338,7 +7370,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         )
                     )
                     active_adaptive_sweeps = adaptive_sweeps
-                    active_adaptive_rank_schedule = adaptive_rank_schedule
+                    # A rank-adaptive sweep can finish a long-range window
+                    # before its terminal one-site canonicalization has
+                    # completed.  The local FIT norm then no longer describes
+                    # the whole represented state, and the unitary norm guard
+                    # correctly rejects the next gate.  Use the fixed
+                    # block schedule for that window; it retains the same
+                    # target-support enrichment while guaranteeing the
+                    # canonical handoff.  Named modes already use this path.
+                    active_adaptive_rank_schedule = (
+                        adaptive_rank_schedule
+                        and not (
+                            self._dmrg_mode_alias is None
+                            and active_fit_block_size in {2, 3}
+                            and xmax - xmin > active_fit_block_size
+                        )
+                    )
                     fit = FIT(
                         p_g,
                         p=fit_guess,
@@ -7567,7 +7614,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                     )
                     active_adaptive_sweeps = adaptive_sweeps
-                    active_adaptive_rank_schedule = adaptive_rank_schedule
+                    active_adaptive_rank_schedule = (
+                        adaptive_rank_schedule
+                        and not (
+                            self._dmrg_mode_alias is None
+                            and active_fit_block_size in {2, 3}
+                            and xmax - xmin > active_fit_block_size
+                        )
+                    )
                     fit = FIT(
                         p_g,
                         p=p,

@@ -2983,6 +2983,54 @@ def test_dmrg_complex64_deep_unitary_stream_keeps_working_norm_stable():
     assert float(np.real(raw.norm())) == pytest.approx(1.0, abs=2.0e-5)
 
 
+def test_unitary_norm_overshoot_tolerance_is_dtype_aware():
+    """Float32 roundoff is tolerated without hiding larger overshoots."""
+    complex64 = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex64"),
+        gates=[],
+        chi=2,
+        mode="mpo",
+    )
+    complex128 = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="mpo",
+    )
+
+    assert complex64._unitary_norm_overshoot_tolerance() == pytest.approx(
+        128.0 * np.finfo(np.float32).eps
+    )
+    assert complex128._unitary_norm_overshoot_tolerance() == pytest.approx(
+        1.0e-6
+    )
+
+    event = complex64._record_norm_event(
+        "unitary_compression",
+        expected_norm=1.0,
+        observed_norm=np.sqrt(1.0 + 1.0e-5),
+        where=(0, 1),
+    )
+    assert event["norm_fidelity_raw"] == pytest.approx(1.0 + 1.0e-5)
+    assert event["norm_fidelity"] == pytest.approx(1.0)
+
+    with pytest.raises(FloatingPointError, match="squared ratio"):
+        complex64._record_norm_event(
+            "unitary_compression",
+            expected_norm=1.0,
+            observed_norm=np.sqrt(1.0 + 2.0e-5),
+            where=(0, 1),
+        )
+
+    with pytest.raises(FloatingPointError, match="squared ratio"):
+        complex128._record_norm_event(
+            "unitary_compression",
+            expected_norm=1.0,
+            observed_norm=np.sqrt(1.0 + 2.0e-6),
+            where=(0, 1),
+        )
+
+
 def test_dmrg_torch_complex64_two_site_fit_grows_native_dense_bond():
     """Torch complex64 FIT should retain dtype while using two-site SVD."""
     torch = pytest.importorskip("torch")
