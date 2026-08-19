@@ -338,6 +338,91 @@ automatic choice of Torch versus CuPy, CUDA device, or dtype.
 `strategy="auto"` requires choosing either `"independent"` or `"coalesced"`
 when parallelism is requested.
 
+## MPI shot ensembles
+
+Use `MPIShotRunner` when the shot ensemble should be distributed across MPI
+processes. It is an orchestration layer rather than another optimizer, so the
+same factory works for `MpsOptimizer`, `MpsStabOptimizer`, `TreeOptimizer`,
+and `TreeStabOptimizer`:
+
+```python
+import pepsy
+
+runner = pepsy.MPIShotRunner(
+    lambda: pepsy.MpsStabOptimizer(32, chi=64),
+    noisy_stream,
+)
+result = runner.run(
+    shots=1_000_000,
+    seed=7,
+    retain="final",
+)
+```
+
+Launch the program with `mpiexec` or `mpirun` after installing the optional
+MPI profile (`pip install -e ".[mpi]"`). Every rank must construct and call
+the runner collectively. Each rank owns complete local optimizer states; MPI
+distributes global shot IDs, not pieces of an MPS or tree tensor network.
+
+MPI supports independent and rank-local coalesced execution. With
+`strategy="independent"`, the global shot ID is part of the trajectory seed,
+so changing the number of ranks does not change a shot's stochastic stream.
+With `strategy="coalesced"`, each rank coalesces only its local batch; this is
+useful for rare faults but is not rank-count invariant. Use `retain="none"`
+when no post-run state is needed, or `retain="final"`/`"all"` before reducing
+an observable:
+
+Independent MPI execution supports all four optimizer families. Coalesced
+execution additionally requires the backend's trajectory-copy contract; the
+current coalesced backends are `MpsOptimizer`, `MpsStabOptimizer`, and
+`TreeOptimizer`. Use independent MPI execution for `TreeStabOptimizer`.
+
+```python
+def observable(optimizer):
+    # Define this for the optimizer backend you are using.
+    return measure_observable(optimizer)
+
+estimate = result.reduce_mean(observable)
+```
+
+`reduce_mean` requires retained final states (`"final"` or `"all"`). With
+`retain="all"`, `result.gather_records(root=0)` gathers trajectory records in
+global shot order for independent runs; optimizer states are never gathered
+automatically. For million-shot runs, evaluate an observable in bounded
+chunks instead:
+
+```python
+streamed = runner.run(
+    shots=1_000_000,
+    seed=7,
+    observable=measure_observable,
+    chunk_size=2_048,
+)
+estimate = streamed.reduce_mean()
+```
+
+The callback is evaluated on each temporary optimizer and those states are
+released after each chunk. `retain="none"` is required in this mode.
+`result.reduce_mean(...)` combines rank-local multiplicities and importance
+weights correctly. `result.reduce_sum(value)` combines already-computed local
+scalars or arrays. The runner materializes the gate stream once, so it can be
+reused for multiple collective runs. MPI is the outer process-level
+parallelism; `local_workers` can optionally enable
+the existing thread/GPU runner inside each rank, but its default is one to
+avoid oversubscription.
+
+For rank-scaling measurements, use the repository benchmark script and vary
+only the MPI process count between runs:
+
+```bash
+mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
+  --shots 10000 --qubits 16 --depth 8
+```
+
+The script reports the slowest-rank wall time and global shots per second.
+Compare independent and local coalesced execution separately; coalescing is
+not rank-count invariant.
+
 ## User-defined quantum trajectories
 
 `TrajectoryEvent` is the general independent noise-simulation interface. Put

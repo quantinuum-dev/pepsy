@@ -40,6 +40,9 @@ MpsOptimizer
 MpsSampleResult
 MpsSampler
 MpsStabOptimizer
+MPIShotError
+MPIShotResult
+MPIShotRunner
 NoisyResult
 NoisyShotResult
 NormEventRecord
