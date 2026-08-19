@@ -603,11 +603,37 @@ def _coefficient_cutoff(cutoff, cutoff_mode, nsites):
     return cutoff
 
 
+def _align_core_trains(left_cores, right_cores):
+    """Move host cores to the active backend when combining core trains."""
+
+    all_cores = (*left_cores, *right_cores)
+    backend_cores = [
+        core
+        for core in all_cores
+        if _backend_name(core) not in {"builtins", "numpy"}
+    ]
+    if not backend_cores:
+        return tuple(left_cores), tuple(right_cores)
+    like = backend_cores[0]
+    left = tuple(
+        core if _backend_name(core) not in {"builtins", "numpy"}
+        else _array_like(core, like)
+        for core in left_cores
+    )
+    right = tuple(
+        core if _backend_name(core) not in {"builtins", "numpy"}
+        else _array_like(core, like)
+        for core in right_cores
+    )
+    return left, right
+
+
 def _native_direct_sum(left_cores, right_cores, sign=1):
     """Add two Pauli core trains with block-diagonal virtual bonds."""
 
     if len(left_cores) != len(right_cores):
         raise ValueError("Pauli core trains must have the same length.")
+    left_cores, right_cores = _align_core_trains(left_cores, right_cores)
     if len(left_cores) == 1:
         return (_add(left_cores[0], _multiply(sign, right_cores[0])),)
     result = []
@@ -640,6 +666,7 @@ def _native_product(left_cores, right_cores):
 
     if len(left_cores) != len(right_cores):
         raise ValueError("Pauli core trains must have the same length.")
+    left_cores, right_cores = _align_core_trains(left_cores, right_cores)
     product_tensor = np.zeros((4, 4, 4), dtype=complex)
     for (left, right), (out, phase) in _PAULI_PRODUCT.items():
         product_tensor["IXYZ".index(left), "IXYZ".index(right), "IXYZ".index(out)] = phase
@@ -670,6 +697,7 @@ def _native_trace(cores, *, normalized=False):
 def _native_inner(left_cores, right_cores, *, normalized=False):
     if len(left_cores) != len(right_cores):
         raise ValueError("Pauli core trains must have the same length.")
+    left_cores, right_cores = _align_core_trains(left_cores, right_cores)
     use_complex = any(
         _is_complex_array(core) for core in (*left_cores, *right_cores)
     )
