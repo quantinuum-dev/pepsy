@@ -226,6 +226,7 @@ def test_pauli_mpo_native_cores_canonicalize_and_compress_without_leaving_basis(
 
     compressed, report = operator.compress_pauli(max_bond=8, return_report=True)
     assert isinstance(report, PauliCompressionReport)
+    assert compressed.compression_report is report
     assert report.exact
     assert max(compressed.pauli_bond_dimensions) <= 8
     np.testing.assert_allclose(compressed.to_mpo().to_dense(), dense, atol=1e-12)

@@ -1174,6 +1174,7 @@ class PauliMPO:
         self.boundary = _normalize_boundary(boundary)
         self._terms = _canonical_terms(terms, self.nsites)
         self._cores = None
+        self.compression_report = None
 
     @classmethod
     def from_pauli_cores(cls, cores, *, boundary="open", copy=True):
@@ -1192,6 +1193,7 @@ class PauliMPO:
         result.boundary = boundary
         result._terms = None
         result._cores = tuple(cores)
+        result.compression_report = None
         return result
 
     @classmethod
@@ -1324,11 +1326,14 @@ class PauliMPO:
 
     def copy(self):
         if self._cores is not None:
-            return type(self).from_pauli_cores(
+            result = type(self).from_pauli_cores(
                 self._cores,
                 boundary=self.boundary,
             )
-        return type(self)(self.nsites, self.terms, boundary=self.boundary)
+        else:
+            result = type(self)(self.nsites, self.terms, boundary=self.boundary)
+        result.compression_report = self.compression_report
+        return result
 
     def canonicalize(
         self,
@@ -1622,9 +1627,11 @@ class PauliMPO:
             method=method,
             bond_reports=bond_reports,
         )
+        result.compression_report = report
         if inplace:
             self._cores = result.to_pauli_cores(copy=False)
             self._terms = None
+            self.compression_report = report
             result = self
         if return_report:
             return result, report
