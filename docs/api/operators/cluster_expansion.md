@@ -167,6 +167,33 @@ diagnostic to inspect when a loop rank is capped. The fit is intentionally
 not differentiable with respect to coefficients. Use `PauliPEPOBasis` for
 the existing fixed-channel autodiff route.
 
+For loop clusters whose rank is not known in advance, set
+`adaptive_loop_rank=True`. ALS then tries ranks from `loop_rank_start` to
+`max_loop_rank` in `loop_rank_step` increments, stopping when the local fit
+reaches `fit_tol`; `fit_warm_start=True` carries the previous fit into the
+next larger ansatz. The report exposes the number of generic loop solves as
+`cluster_counts["generic_loop_solved"]` and the largest generic loop rank as
+`report.generic_loop_rank`:
+
+```python
+active, report = build_itf_cluster_expansion_pepo(
+    2,
+    3,
+    1e-4j,
+    order=5,
+    fit_method="quimb",
+    adaptive_loop_rank=True,
+    loop_rank_start=1,
+    loop_rank_step=1,
+    max_loop_rank=8,
+    materialize=False,
+    return_report=True,
+)
+```
+
+This is adaptive fitting of each finite cluster residual. It is separate from
+the later global/environment-aware compression of the assembled PEPO.
+
 BP loop-cluster expansion belongs to the contraction side of the workflow.
 It can correct PEPO/PEPS observables or inform environment-aware truncation,
 but it does not create the connected operator terms in `exp(-beta * H)`.

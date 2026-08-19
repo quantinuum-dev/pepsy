@@ -1196,6 +1196,7 @@ class ClusterExpansionReport:
     active_block_count: int
     active_nbytes: int
     dense_nbytes: int
+    generic_loop_rank: int = 0
 
     @property
     def max_residual_norm(self):
@@ -1532,6 +1533,10 @@ def build_real_time_cluster_expansion_pepo(
     fit_tol=1e-10,
     fit_solver_maxiter=8,
     fit_seed=0,
+    adaptive_loop_rank=False,
+    loop_rank_start=None,
+    loop_rank_step=2,
+    fit_warm_start=True,
     materialize=True,
     return_report=False,
 ):
@@ -1572,6 +1577,10 @@ def build_real_time_cluster_expansion_pepo(
         fit_tol=fit_tol,
         fit_solver_maxiter=fit_solver_maxiter,
         fit_seed=fit_seed,
+        adaptive_loop_rank=adaptive_loop_rank,
+        loop_rank_start=loop_rank_start,
+        loop_rank_step=loop_rank_step,
+        fit_warm_start=fit_warm_start,
         materialize=materialize,
         return_report=return_report,
     )
@@ -3776,6 +3785,54 @@ def _cluster_incident_edges(edges, nsites):
     }
 
 
+def _quimb_loop_rank_schedule(
+    local_dim,
+    *,
+    max_loop_rank,
+    max_tree_rank,
+    adaptive,
+    loop_rank_start,
+    loop_rank_step,
+):
+    """Return the loop ranks to try, from economical to expressive."""
+    if not adaptive:
+        return (max_loop_rank,)
+    cap = max_loop_rank
+    if cap is None:
+        cap = max(local_dim**2, max_tree_rank or 1)
+    start = 1 if loop_rank_start is None else min(loop_rank_start, cap)
+    ranks = list(range(start, cap + 1, loop_rank_step))
+    if not ranks or ranks[-1] != cap:
+        ranks.append(cap)
+    return tuple(ranks)
+
+
+def _quimb_warm_start_arrays(
+    fitted_arrays,
+    fitted_edge_ranks,
+    initial_arrays,
+):
+    """Pad a previous loop fit into a larger-rank initial ansatz."""
+    warm_arrays = {}
+    initial_local_arrays, initial_edge_ranks, _ = initial_arrays
+    for site, (new_edge_ids, new_data) in initial_local_arrays.items():
+        old_edge_ids, old_data = fitted_arrays[site]
+        if old_edge_ids != new_edge_ids:
+            raise ValueError("Quimb warm-start edge ordering changed unexpectedly.")
+        if any(
+            fitted_edge_ranks[edge_index] > initial_edge_ranks[edge_index]
+            for edge_index in old_edge_ids
+        ):
+            raise ValueError("Quimb warm-start rank decreased unexpectedly.")
+        slices = tuple(
+            slice(0, fitted_edge_ranks[edge_index])
+            for edge_index in old_edge_ids
+        ) + (slice(None),)
+        new_data[slices] = old_data
+        warm_arrays[site] = (new_edge_ids, new_data)
+    return warm_arrays, initial_edge_ranks, initial_arrays[2]
+
+
 def _quimb_fit_initial_arrays(
     operator,
     edges,
@@ -3902,6 +3959,7 @@ def _quimb_factorize_operator(
     fit_tol,
     fit_solver_maxiter,
     fit_seed,
+    warm_start=None,
 ):
     """Fit a cluster operator tensor with Quimb tree or ALS machinery."""
     if method not in {"tree", "als"}:
@@ -3922,6 +3980,12 @@ def _quimb_factorize_operator(
     if initial is None:
         return None
     local_arrays, edge_ranks, tree_rank = initial
+    if warm_start is not None:
+        local_arrays, edge_ranks, tree_rank = _quimb_warm_start_arrays(
+            warm_start[0],
+            warm_start[1],
+            initial,
+        )
     incident = _cluster_incident_edges(edges, nsites)
     physical_inds = tuple(f"__pepsy_cluster_phys_{site}" for site in range(nsites))
     edge_inds = {
@@ -4256,10 +4320,12 @@ def _add_generic_cluster_levels(
     targets_by_order = {}
     ranks_by_order = {}
     counts_by_order = {}
+    loop_ranks_by_order = {}
     for cluster_order in range(5, plan.order + 1):
         level_residuals = []
         level_targets = []
         level_ranks = []
+        level_loop_ranks = []
         cluster_count = 0
         # Each order subtracts the complete lower-order active PEPO. This is
         # important once P exceeds five: P=6 must include the P=5 correction
@@ -4363,19 +4429,49 @@ def _add_generic_cluster_levels(
                             (index + 1) * (x + 17 * y)
                             for index, (x, y) in enumerate(variant.sites)
                         )
-                    fitted = _quimb_factorize_operator(
-                        residual,
-                        variant.edges,
-                        variant.nsites,
+                    rank_schedule = _quimb_loop_rank_schedule(
                         one_site_exp.shape[0],
-                        method=fit_method,
-                        max_tree_rank=plan.max_tree_rank,
                         max_loop_rank=plan.max_loop_rank,
-                        fit_steps=plan.fit_steps,
-                        fit_tol=plan.fit_tol,
-                        fit_solver_maxiter=plan.fit_solver_maxiter,
-                        fit_seed=fit_seed,
+                        max_tree_rank=plan.max_tree_rank,
+                        adaptive=(
+                            plan.adaptive_loop_rank
+                            and fit_method == "als"
+                            and not variant.is_tree
+                        ),
+                        loop_rank_start=plan.loop_rank_start,
+                        loop_rank_step=plan.loop_rank_step,
                     )
+                    fitted = None
+                    warm_start = None
+                    for loop_rank in rank_schedule:
+                        candidate = _quimb_factorize_operator(
+                            residual,
+                            variant.edges,
+                            variant.nsites,
+                            one_site_exp.shape[0],
+                            method=fit_method,
+                            max_tree_rank=plan.max_tree_rank,
+                            max_loop_rank=loop_rank,
+                            fit_steps=plan.fit_steps,
+                            fit_tol=plan.fit_tol,
+                            fit_solver_maxiter=plan.fit_solver_maxiter,
+                            fit_seed=fit_seed,
+                            warm_start=warm_start
+                            if plan.fit_warm_start
+                            else None,
+                        )
+                        if candidate is None:
+                            break
+                        fitted = candidate
+                        if plan.fit_warm_start:
+                            warm_start = (candidate[0], candidate[1])
+                        factorization_error, factorization_target = candidate[-2:]
+                        if (
+                            len(rank_schedule) == 1
+                            or factorization_error
+                            <= plan.fit_tol * max(factorization_target, np.finfo(float).eps)
+                        ):
+                            break
                     if fitted is None:
                         continue
                     (
@@ -4401,6 +4497,18 @@ def _add_generic_cluster_levels(
                     level_residuals.append(float(factorization_error))
                     level_targets.append(float(factorization_target))
                     level_ranks.append(cluster_rank)
+                    if not variant.is_tree:
+                        level_loop_ranks.append(
+                            max(
+                                edge_ranks[edge_index]
+                                for edge_index in range(len(variant.edges))
+                                if edge_index
+                                not in _spanning_tree_edge_indices(
+                                    variant.edges,
+                                    variant.nsites,
+                                )
+                            )
+                        )
                     continue
 
                 source_to_target, turns = _shape_rotation_map(
@@ -4512,11 +4620,13 @@ def _add_generic_cluster_levels(
         targets_by_order[cluster_order] = level_targets
         ranks_by_order[cluster_order] = level_ranks
         counts_by_order[cluster_order] = cluster_count
+        loop_ranks_by_order[cluster_order] = level_loop_ranks
     return (
         residuals_by_order,
         targets_by_order,
         ranks_by_order,
         counts_by_order,
+        loop_ranks_by_order,
     )
 
 
@@ -4556,6 +4666,10 @@ class ClusterExpansionPlan:
     fit_tol: float = 1e-10
     fit_solver_maxiter: int = 8
     fit_seed: int | None = 0
+    adaptive_loop_rank: bool = False
+    loop_rank_start: int | None = None
+    loop_rank_step: int = 2
+    fit_warm_start: bool = True
     last_report: ClusterExpansionReport | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
@@ -4580,6 +4694,16 @@ class ClusterExpansionPlan:
             self.max_tree_rank = _validate_shape(self.max_tree_rank, "max_tree_rank")
         if self.max_loop_rank is not None:
             self.max_loop_rank = _validate_shape(self.max_loop_rank, "max_loop_rank")
+        if not isinstance(self.adaptive_loop_rank, (bool, np.bool_)):
+            raise TypeError("adaptive_loop_rank must be a bool.")
+        if self.loop_rank_start is not None:
+            self.loop_rank_start = _validate_shape(
+                self.loop_rank_start,
+                "loop_rank_start",
+            )
+        self.loop_rank_step = _validate_shape(self.loop_rank_step, "loop_rank_step")
+        if not isinstance(self.fit_warm_start, (bool, np.bool_)):
+            raise TypeError("fit_warm_start must be a bool.")
         if self.symmetry not in (None, "C4"):
             raise ValueError("symmetry must be None or 'C4'.")
         if self.fit_method not in (None, "quimb", "tree", "als"):
@@ -5019,12 +5143,14 @@ class ClusterExpansionPlan:
         generic_targets = {}
         generic_ranks = {}
         generic_cluster_counts = {}
+        generic_loop_ranks = {}
         if self.order >= 5:
             (
                 generic_residuals,
                 generic_targets,
                 generic_ranks,
                 generic_cluster_counts,
+                generic_loop_ranks,
             ) = _add_generic_cluster_levels(
                 blocks,
                 allocator,
@@ -5115,6 +5241,11 @@ class ClusterExpansionPlan:
             for level_ranks in generic_ranks.values()
             for rank in level_ranks
         )
+        generic_loop_ranks_flat = tuple(
+            rank
+            for level_ranks in generic_loop_ranks.values()
+            for rank in level_ranks
+        )
         counts = {
             "edge": sum(
                 direction in _POSITIVE_DIRECTIONS
@@ -5140,6 +5271,7 @@ class ClusterExpansionPlan:
                 for cluster_order, count in generic_cluster_counts.items()
             },
             "generic_tree_solved": len(generic_ranks_flat),
+            "generic_loop_solved": len(generic_loop_ranks_flat),
         }
         if self.order >= 4:
             for _, orbit in self.triple_orbits:
@@ -5158,13 +5290,14 @@ class ClusterExpansionPlan:
             local_dim=one_site_exp.shape[0],
             edge_rank=start_factors.shape[0],
             tree_rank=max((*path_ranks, *generic_ranks_flat), default=0),
-            loop_rank=loop_rank,
+            loop_rank=max((loop_rank, *generic_loop_ranks_flat), default=0),
             cluster_counts=counts,
             residual_norms=residual_norms,
             relative_residual_norms=relative_residuals,
             active_block_count=active.active_block_count,
             active_nbytes=active.active_nbytes,
             dense_nbytes=active.dense_nbytes,
+            generic_loop_rank=max(generic_loop_ranks_flat, default=0),
         )
         self.last_report = report
         result = active.to_pepo() if materialize else active
@@ -5240,6 +5373,10 @@ def build_cluster_expansion_pepo(
     fit_tol=1e-10,
     fit_solver_maxiter=8,
     fit_seed=0,
+    adaptive_loop_rank=False,
+    loop_rank_start=None,
+    loop_rank_step=2,
+    fit_warm_start=True,
     materialize=True,
     return_report=False,
 ):
@@ -5305,6 +5442,19 @@ def build_cluster_expansion_pepo(
     fit_seed : int | None, default=0
         Seed for Quimb loop-ansatz initialization, or ``None`` for an
         unseeded initializer.
+    adaptive_loop_rank : bool, default=False
+        For generic loop clusters fitted with ALS, try increasing loop ranks
+        from ``loop_rank_start`` through ``max_loop_rank`` until the local
+        residual reaches ``fit_tol``. Tree clusters and fixed-rank fits are
+        unaffected.
+    loop_rank_start : int | None, default=None
+        First loop rank for adaptive fitting. Defaults to one.
+    loop_rank_step : int, default=2
+        Increase between adaptive loop-rank trials. The configured maximum is
+        always included as the final trial.
+    fit_warm_start : bool, default=True
+        Seed each larger adaptive ALS ansatz with the preceding fitted
+        tensors. Disable this to independently initialize every rank.
     return_report : bool, default=False
         Return ``(pepo_or_active_blocks, ClusterExpansionReport)``.
     materialize : bool, default=True
@@ -5340,6 +5490,10 @@ def build_cluster_expansion_pepo(
         fit_tol=fit_tol,
         fit_solver_maxiter=fit_solver_maxiter,
         fit_seed=fit_seed,
+        adaptive_loop_rank=adaptive_loop_rank,
+        loop_rank_start=loop_rank_start,
+        loop_rank_step=loop_rank_step,
+        fit_warm_start=fit_warm_start,
     )
     return plan.build(
         beta,
@@ -5367,6 +5521,10 @@ def build_model_cluster_expansion_pepo(
     fit_tol=1e-10,
     fit_solver_maxiter=8,
     fit_seed=0,
+    adaptive_loop_rank=False,
+    loop_rank_start=None,
+    loop_rank_step=2,
+    fit_warm_start=True,
     materialize=True,
     return_report=False,
 ):
@@ -5402,6 +5560,10 @@ def build_model_cluster_expansion_pepo(
         fit_tol=fit_tol,
         fit_solver_maxiter=fit_solver_maxiter,
         fit_seed=fit_seed,
+        adaptive_loop_rank=adaptive_loop_rank,
+        loop_rank_start=loop_rank_start,
+        loop_rank_step=loop_rank_step,
+        fit_warm_start=fit_warm_start,
         materialize=materialize,
         return_report=return_report,
     )
@@ -5479,6 +5641,10 @@ def build_itf_cluster_expansion_pepo(
     fit_tol=1e-10,
     fit_solver_maxiter=8,
     fit_seed=0,
+    adaptive_loop_rank=False,
+    loop_rank_start=None,
+    loop_rank_step=2,
+    fit_warm_start=True,
     materialize=True,
     return_report=False,
 ):
@@ -5508,6 +5674,10 @@ def build_itf_cluster_expansion_pepo(
         fit_tol=fit_tol,
         fit_solver_maxiter=fit_solver_maxiter,
         fit_seed=fit_seed,
+        adaptive_loop_rank=adaptive_loop_rank,
+        loop_rank_start=loop_rank_start,
+        loop_rank_step=loop_rank_step,
+        fit_warm_start=fit_warm_start,
         materialize=materialize,
         return_report=return_report,
     )

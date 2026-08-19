@@ -121,6 +121,15 @@ and ALS fitters. The fit target and factorization truncation are reported
 separately; the latter is a numerical optimization and is not part of the
 autodiff fixed-channel contract.
 
+Generic cyclic residuals can opt into adaptive ALS ranks. The solver tries a
+rank schedule from `loop_rank_start` through `max_loop_rank`, always including
+the configured cap, and uses the previous fit as the initial tensor data when
+`fit_warm_start=True`. This is intentionally a local residual improvement:
+it does not choose projectors from the environment of the full PEPO. The
+report separates these attempts as `generic_loop_solved` and
+`generic_loop_rank`; `loop_rank` remains the overall report, including the
+explicit four-site plaquette history rank.
+
 The BP loop-cluster API is intentionally not part of this operator builder.
 `pepsy.bp.loop_cluster_expand()` expands a tensor-network contraction around
 BP messages, while the connected-cluster PEPO expansion subtracts lower-order

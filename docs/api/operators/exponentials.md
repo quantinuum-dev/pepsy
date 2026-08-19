@@ -189,6 +189,13 @@ generic loop residuals use complex ALS. This numerical path is not
 coefficient-differentiable; its local fit diagnostics are returned in
 `ClusterExpansionReport`.
 
+For cyclic generic clusters, `adaptive_loop_rank=True` can grow the ALS loop
+rank from `loop_rank_start` to `max_loop_rank` until the local residual meets
+`fit_tol`. `fit_warm_start=True` (the default) reuses the previous rank's
+fitted tensors. This improves local cluster fits; it is not the global PEPO
+compression/environment step used by some infinite or finite-lattice time
+evolution workflows.
+
 ## Caching and autodiff contract
 
 - Compiling a basis caches structure only: topology, channels, histories, and

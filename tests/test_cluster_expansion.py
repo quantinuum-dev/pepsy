@@ -407,6 +407,37 @@ def test_quimb_backend_handles_a_five_site_loop_cluster():
     assert np.isfinite(report.relative_residual_norms["generic_order_5"])
 
 
+def test_quimb_loop_rank_growth_warm_starts_and_reports_loop_solves():
+    """Adaptive loop ALS increases rank and reports the generic loop sector."""
+    twosite, onesite = _itf_terms()
+    active, report = build_cluster_expansion_pepo(
+        2,
+        3,
+        1e-4j,
+        twosite,
+        onesite,
+        order=5,
+        fit_method="quimb",
+        adaptive_loop_rank=True,
+        loop_rank_start=1,
+        loop_rank_step=1,
+        max_loop_rank=2,
+        fit_steps=1,
+        fit_tol=1e-6,
+        fit_solver_maxiter=1,
+        max_tree_rank=1,
+        materialize=False,
+        return_report=True,
+    )
+    assert report.cluster_counts["generic_loop_solved"] > 0
+    assert report.generic_loop_rank == 2
+    assert all(
+        np.isfinite(block).all()
+        for site_blocks in active.blocks.values()
+        for block in site_blocks.values()
+    )
+
+
 def test_order_five_tree_rank_cap_is_reported():
     """Generic tree SVD truncation keeps finite tensors and reports loss."""
     twosite, onesite = _itf_terms()
