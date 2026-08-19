@@ -298,6 +298,20 @@ def test_pauli_mpo_native_core_operations_do_not_need_word_expansion():
     np.testing.assert_allclose(operator.conjugate().to_dense(), dense.conj())
     np.testing.assert_allclose(operator.transpose().to_dense(), dense.T)
     np.testing.assert_allclose(operator.inner(operator), np.trace(dense.conj().T @ dense))
+    np.testing.assert_allclose((operator + operator).to_dense(), 2.0 * dense)
+    np.testing.assert_allclose((operator @ operator).to_dense(), dense @ dense, atol=1e-12)
+
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    transformed = operator.apply_gate(hadamard, 2)
+    full_gate = np.kron(
+        np.kron(np.kron(np.eye(2), np.eye(2)), hadamard),
+        np.eye(2),
+    )
+    np.testing.assert_allclose(
+        transformed.to_dense(),
+        full_gate @ dense @ full_gate.conj().T,
+        atol=1e-12,
+    )
 
     reduced = operator.partial_trace((1, 3))
     dense_tensor = dense.reshape(2, 2, 2, 2, 2, 2, 2, 2)
