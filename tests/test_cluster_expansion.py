@@ -7,14 +7,22 @@ from scipy.linalg import expm
 import pepsy
 from pepsy.operators import (
     ActivePEPOBlocks,
+    ConnectedClusterShape,
     ClusterExpansionReport,
     ClusterExpansionPlan,
+    ClusterModelAdapter,
     CompiledPEPOExp,
     MPOParameter,
     PauliPEPOBasis,
     PauliPEPOTerm,
+    adapt_cluster_model,
     build_cluster_expansion_pepo,
+    build_model_cluster_expansion_pepo,
     build_itf_cluster_expansion_pepo,
+    build_real_time_cluster_expansion_pepo,
+    compose_cluster_expansion_pepo,
+    compose_pepo_layers,
+    generate_connected_cluster_shapes,
 )
 
 
@@ -48,6 +56,93 @@ def _four_site_chain_hamiltonian(twosite, onesite):
     return result
 
 
+def _five_site_chain_hamiltonian(twosite, onesite):
+    identity = np.eye(2)
+    result = np.zeros((32, 32))
+    for position in range(5):
+        factors = [identity] * 5
+        factors[position] = onesite
+        result += _kron_all(factors)
+    for position in range(4):
+        result += np.kron(
+            np.kron(np.eye(2**position), twosite),
+            np.eye(2 ** (3 - position)),
+        )
+    return result
+
+
+def _six_site_chain_hamiltonian(twosite, onesite):
+    identity = np.eye(2)
+    result = sum(
+        (
+            _kron_all(
+                [onesite if site == position else identity for site in range(6)]
+            )
+            for position in range(6)
+        ),
+        start=np.zeros((64, 64), dtype=np.result_type(twosite, onesite)),
+    )
+    for position in range(5):
+        result += np.kron(
+            np.kron(np.eye(2**position), twosite),
+            np.eye(2 ** (4 - position)),
+        )
+    return result
+
+
+def _two_by_two_itf_hamiltonian(onesite):
+    """Return the open-boundary square-lattice ITF Hamiltonian."""
+    identity = np.eye(2)
+    z = np.diag([1.0, -1.0])
+    result = np.zeros((16, 16))
+    for position in range(4):
+        factors = [identity] * 4
+        factors[position] = onesite
+        result += np.kron(
+            np.kron(np.kron(factors[0], factors[1]), factors[2]),
+            factors[3],
+        )
+    for first, second in ((0, 1), (0, 2), (1, 3), (2, 3)):
+        factors = [identity] * 4
+        factors[first] = factors[second] = z
+        result += np.kron(
+            np.kron(np.kron(factors[0], factors[1]), factors[2]),
+            factors[3],
+        )
+    return result
+
+
+def _global_pepo_expectation(pepo, peps):
+    """Evaluate a PEPO expectation through Quimb's global PEPS path."""
+    acted = pepo.apply(peps, contract=True)
+    numerator = (peps.H & acted).contract(all, optimize="auto-hq")
+    denominator = (peps.H & peps).contract(all, optimize="auto-hq")
+    return numerator / denominator
+
+
+def _kron_all(factors):
+    result = factors[0]
+    for factor in factors[1:]:
+        result = np.kron(result, factor)
+    return result
+
+
+def _two_by_two_product_hamiltonian(onesite, first_edge, second_edge):
+    """Build a 2x2 Hamiltonian for a directed product edge term."""
+    identity = np.eye(2)
+    result = np.zeros((16, 16), dtype=complex)
+    for position in range(4):
+        result += _kron_all(
+            [onesite if site == position else identity for site in range(4)]
+        )
+    for first, second in ((0, 1), (0, 2), (1, 3), (2, 3)):
+        factors = [identity] * 4
+        factors[first] = first_edge
+        factors[second] = second_edge
+        result += _kron_all(factors)
+    return result
+
+
 def test_cluster_expansion_builder_is_public():
     """The PEPO builder is exposed through both operator namespaces."""
     assert build_cluster_expansion_pepo is pepsy.build_cluster_expansion_pepo
@@ -59,7 +154,87 @@ def test_cluster_expansion_builder_is_public():
     assert PauliPEPOBasis is pepsy.PauliPEPOBasis
     assert PauliPEPOTerm is pepsy.PauliPEPOTerm
     assert CompiledPEPOExp is pepsy.CompiledPEPOExp
+    assert ConnectedClusterShape is pepsy.ConnectedClusterShape
+    assert ClusterModelAdapter is pepsy.ClusterModelAdapter
+    assert adapt_cluster_model is pepsy.adapt_cluster_model
+    assert build_model_cluster_expansion_pepo is pepsy.build_model_cluster_expansion_pepo
+    assert build_real_time_cluster_expansion_pepo is pepsy.build_real_time_cluster_expansion_pepo
+    assert generate_connected_cluster_shapes is pepsy.generate_connected_cluster_shapes
     assert "build_cluster_expansion_pepo" in pepsy.operators.__all__
+
+
+def test_real_time_coefficient_terms_use_the_exact_sum_convention():
+    """Coefficient pairs are assembled before the complex cluster solve."""
+    twosite, onesite = _itf_terms()
+    time = 0.01
+    assembled_twosite = 0.4 * twosite + 0.3 * twosite
+    assembled_onesite = 0.1 * onesite + 0.2 * onesite
+    exact = expm(
+        -1j * time * _five_site_chain_hamiltonian(
+            assembled_twosite,
+            assembled_onesite,
+        )
+    )
+
+    pepo, report = build_real_time_cluster_expansion_pepo(
+        1,
+        5,
+        time,
+        [(0.4, twosite), (0.3, twosite)],
+        [(0.1, onesite), (0.2, onesite)],
+        order=5,
+        fit_steps=8,
+        fit_tol=1e-11,
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-10)
+    assert report.beta == 1j * time
+    assert report.cluster_counts["generic_order_5"] == 1
+    assert report.residual_norms["generic_order_5"] < 1e-20
+
+
+def test_connected_cluster_geometry_is_translation_canonical_and_connected():
+    """The generic inventory counts fixed square-lattice polyominoes."""
+    shapes = generate_connected_cluster_shapes(5)
+    counts = [sum(shape.nsites == size for shape in shapes) for size in range(1, 6)]
+    assert counts == [1, 2, 6, 19, 63]
+
+    for shape in shapes:
+        assert isinstance(shape, ConnectedClusterShape)
+        assert min(x for x, _ in shape.sites) == 0
+        assert min(y for _, y in shape.sites) == 0
+        assert len(shape.edges) >= shape.nsites - 1
+        assert shape.loops == len(shape.edges) - shape.nsites + 1
+        assert shape.is_tree is (shape.loops == 0)
+
+    plaquettes = [
+        shape
+        for shape in shapes
+        if shape.nsites == 4 and shape.loops == 1
+    ]
+    assert len(plaquettes) == 1
+    assert plaquettes[0].diagonal_edges == ((0, 3), (1, 2))
+
+
+def test_connected_cluster_geometry_can_quotient_c4_rotations():
+    fixed = generate_connected_cluster_shapes(4, min_sites=4)
+    rotated = generate_connected_cluster_shapes(
+        4,
+        min_sites=4,
+        quotient_rotations=True,
+    )
+    assert len(fixed) == 19
+    assert len(rotated) == 7
+    assert len({shape.sites for shape in rotated}) == 7
+
+
+def test_cluster_plan_exposes_geometry_through_order_six():
+    twosite, onesite = _itf_terms()
+    plan = ClusterExpansionPlan(2, 2, twosite, onesite, order=4)
+    assert len(plan.connected_cluster_shapes) == 28
+    order_six = ClusterExpansionPlan(2, 2, twosite, onesite, order=6)
+    assert len(order_six.connected_cluster_shapes) == 307
 
 
 def test_order_three_is_exact_on_a_three_site_chain():
@@ -163,11 +338,168 @@ def test_c4_reduction_solves_two_orbits_and_preserves_dense_result():
     np.testing.assert_allclose(reduced.to_dense(), unreduced.to_dense(), atol=1e-11)
 
 
+def test_c4_generic_order_five_reuses_rotated_tree_factorizations():
+    """Generic finite clusters use C4 transport without dense inflation."""
+    active, report = build_itf_cluster_expansion_pepo(
+        2,
+        3,
+        0.003,
+        order=5,
+        symmetry="C4",
+        materialize=False,
+        return_report=True,
+    )
+    assert report.cluster_counts["generic_order_5"] == 6
+    assert report.cluster_counts["generic_tree_solved"] == 6
+    assert report.residual_norms["generic_order_5"] < 1e-12
+    assert active.active_block_count > 0
+
+
 def test_cluster_expansion_rejects_unimplemented_higher_order():
-    """Orders beyond the tree implementation fail explicitly."""
+    """Orders beyond the generic order-nine implementation fail explicitly."""
     twosite, onesite = _itf_terms()
-    with pytest.raises(NotImplementedError, match="orders 1 through 4"):
-        build_cluster_expansion_pepo(2, 2, 0.1, twosite, onesite, order=5)
+    with pytest.raises(NotImplementedError, match="orders 1 through 9"):
+        build_cluster_expansion_pepo(2, 2, 0.1, twosite, onesite, order=10)
+
+
+def test_order_five_generic_path_is_exact_on_a_five_site_chain():
+    """Generic residual subtraction closes the five-site finite-chain case."""
+    twosite, onesite = _itf_terms()
+    beta = 0.01
+    exact = expm(-beta * _five_site_chain_hamiltonian(twosite, onesite))
+    pepo, report = build_cluster_expansion_pepo(
+        1,
+        5,
+        beta,
+        twosite,
+        onesite,
+        order=5,
+        return_report=True,
+    )
+    np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
+    assert report.cluster_counts["generic_order_5"] == 1
+    assert report.cluster_counts["generic_tree_solved"] == 1
+    assert report.residual_norms["generic_order_5"] < 1e-12
+
+
+def test_quimb_backend_handles_a_five_site_loop_cluster():
+    """The opt-in Quimb backend covers cyclic generic cluster topology."""
+    twosite, onesite = _itf_terms()
+    active, report = build_cluster_expansion_pepo(
+        2,
+        3,
+        1e-4j,
+        twosite,
+        onesite,
+        order=5,
+        fit_method="quimb",
+        fit_steps=1,
+        fit_tol=1e-6,
+        fit_solver_maxiter=1,
+        max_tree_rank=1,
+        max_loop_rank=1,
+        materialize=False,
+        return_report=True,
+    )
+    dense = active.to_pepo().to_dense()
+    assert report.cluster_counts["generic_order_5"] == 6
+    assert np.isfinite(dense).all()
+    assert np.isfinite(report.relative_residual_norms["generic_order_5"])
+
+
+def test_order_five_tree_rank_cap_is_reported():
+    """Generic tree SVD truncation keeps finite tensors and reports loss."""
+    twosite, onesite = _itf_terms()
+    active, report = build_cluster_expansion_pepo(
+        1,
+        5,
+        0.01,
+        twosite,
+        onesite,
+        order=5,
+        max_tree_rank=2,
+        materialize=False,
+        return_report=True,
+    )
+    assert report.tree_rank <= 2
+    assert report.relative_residual_norms["generic_order_5"] > 0.0
+    assert np.isfinite(np.asarray(active.to_pepo().to_dense())).all()
+
+
+def test_order_six_generic_path_is_exact_on_a_six_site_chain():
+    """Generic residual subtraction extends to a six-site finite chain."""
+    twosite, onesite = _itf_terms()
+    beta = 0.006
+    exact = expm(-beta * _six_site_chain_hamiltonian(twosite, onesite))
+    pepo, report = build_cluster_expansion_pepo(
+        1,
+        6,
+        beta,
+        twosite,
+        onesite,
+        order=6,
+        return_report=True,
+    )
+    np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-10)
+    assert report.cluster_counts["generic_order_5"] == 2
+    assert report.cluster_counts["generic_order_6"] == 1
+    assert report.cluster_counts["generic_tree_solved"] == 2
+    assert report.residual_norms["generic_order_6"] < 1e-10
+
+
+def test_order_seven_recurses_through_all_lower_generic_levels():
+    """P=7 includes the P=5 and P=6 corrections before its own solve."""
+    active, report = build_itf_cluster_expansion_pepo(
+        1,
+        7,
+        0.001,
+        order=7,
+        materialize=False,
+        return_report=True,
+    )
+    assert active.active_block_count > 0
+    assert report.cluster_counts["generic_order_5"] == 3
+    assert report.cluster_counts["generic_order_6"] == 2
+    assert report.cluster_counts["generic_order_7"] == 1
+    assert report.cluster_counts["generic_tree_solved"] == 3
+    for order in (5, 6, 7):
+        assert report.residual_norms[f"generic_order_{order}"] < 1e-12
+
+
+def test_dense_model_adapter_builds_standard_spin_models():
+    """Finite model adapters feed the same dense cluster builder."""
+    model = ClusterModelAdapter.ising(J=1.2, field=0.3)
+    assert model.name == "ising"
+    assert model.local_dim == 2
+    assert model.symmetry == "C4"
+
+    direct = build_cluster_expansion_pepo(
+        1,
+        3,
+        0.02,
+        model.twosite_op,
+        model.onesite_op,
+        order=2,
+        symmetry="C4",
+    )
+    adapted = build_model_cluster_expansion_pepo(
+        1,
+        3,
+        0.02,
+        model,
+        order=2,
+    )
+    np.testing.assert_allclose(direct.to_dense(), adapted.to_dense())
+
+    recovered = adapt_cluster_model(
+        {
+            "edge_op": model.twosite_op,
+            "onsite_op": model.onesite_op,
+            "symmetry": "C4",
+        }
+    )
+    np.testing.assert_allclose(recovered.twosite_op, model.twosite_op)
+    np.testing.assert_allclose(recovered.onesite_op, model.onesite_op)
 
 
 def test_order_four_path_is_exact_and_reports_local_residuals():
@@ -255,6 +587,97 @@ def test_order_four_includes_and_closes_a_four_site_plaquette_loop():
     assert report.loop_rank == 16
     assert report.residual_norms["four_site_loop"] > 0.0
     np.testing.assert_allclose(active.to_pepo().to_dense(), exact, atol=1e-11)
+
+
+def test_pepo_global_expectation_matches_dense_reference_across_orders():
+    """Quimb PEPO application preserves global expectations on a PEPS."""
+    qtn = pytest.importorskip("quimb.tensor")
+    _, onesite = _itf_terms()
+    beta = 0.01
+    peps = qtn.PEPS.rand(2, 2, bond_dim=2, seed=7, dtype="complex128")
+    hamiltonian = _two_by_two_itf_hamiltonian(onesite)
+    state_vector = np.asarray(peps.to_dense()).reshape(-1)
+    norm = np.vdot(state_vector, state_vector)
+    exact_operator = expm(-beta * hamiltonian)
+    exact_value = np.vdot(state_vector, exact_operator @ state_vector) / norm
+
+    errors = []
+    for order in (1, 2, 3, 4):
+        pepo = build_itf_cluster_expansion_pepo(
+            2,
+            2,
+            beta,
+            J=1.0,
+            field=0.2,
+            order=order,
+        )
+        value = _global_pepo_expectation(pepo, peps)
+        dense_value = (
+            np.vdot(state_vector, np.asarray(pepo.to_dense()) @ state_vector)
+            / norm
+        )
+
+        np.testing.assert_allclose(value, dense_value, atol=1e-11, rtol=1e-11)
+        errors.append(abs(value - exact_value))
+
+    assert errors[0] > errors[1] > errors[2]
+    assert errors[2] < 1e-10
+    assert errors[3] < 1e-10
+
+
+def test_quimb_pepo_layer_composition_matches_operator_product():
+    """The public composition helper retains Quimb's operator ordering."""
+    first = build_itf_cluster_expansion_pepo(2, 2, 0.01, order=2)
+    second = build_itf_cluster_expansion_pepo(2, 2, 0.02, order=2)
+
+    composed = compose_pepo_layers((first, second))
+
+    np.testing.assert_allclose(
+        composed.to_dense(),
+        second.to_dense() @ first.to_dense(),
+        atol=1e-11,
+        rtol=1e-11,
+    )
+    assert next(iter(first.tensor_map.values())).shape == (5, 5, 2, 2)
+    assert next(iter(second.tensor_map.values())).shape == (5, 5, 2, 2)
+
+
+def test_yoshida_pepo_composition_improves_order_three_step():
+    """Signed fractional P=3 layers cancel the leading local error."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+    beta = 0.025
+    twosite = np.kron(x, z)
+    exact_hamiltonian = _two_by_two_product_hamiltonian(x, x, z)
+    exact = expm(-beta * exact_hamiltonian)
+
+    base = build_cluster_expansion_pepo(
+        2,
+        2,
+        beta,
+        twosite,
+        x,
+        order=3,
+    )
+    composed = compose_cluster_expansion_pepo(
+        2,
+        2,
+        beta,
+        twosite,
+        x,
+        order=3,
+    )
+
+    base_error = np.linalg.norm(np.asarray(base.to_dense()) - exact)
+    composed_error = np.linalg.norm(np.asarray(composed.to_dense()) - exact)
+    assert composed_error < 0.5 * base_error
+
+
+def test_yoshida_pepo_composition_requires_order_three():
+    """The fourth-order composition rejects unsupported elementary orders."""
+    twosite, onesite = _itf_terms()
+    with pytest.raises(ValueError, match="requires a plan with order=3"):
+        ClusterExpansionPlan(2, 2, twosite, onesite, order=4).build_composed(0.01)
 
 
 def test_order_four_c4_periodic_plan_handles_rotated_path_orbits():

@@ -73,13 +73,130 @@ assert report.residual_norms["four_site_path"] < 1e-10
 
 For ITF, `build_itf_cluster_expansion_pepo` enables this C4 reduction by
 default. It solves one straight and one corner representative and rotates
-their active blocks to the other orientations.
+their active blocks to the other orientations. The generic P=5/P=6 stage
+also transports tree factorizations across C4-related shapes when the finite
+residual matches the rotated representative; otherwise it falls back to a
+direct dense solve.
 
-This dense implementation supports orders 1–4 with ordinary dense matrices.
-Orders above 4 raise `NotImplementedError` explicitly. For the broader
+This dense implementation supports orders 1–9 with ordinary dense matrices.
+Orders five through nine use a recursive generic support contraction and
+spanning-tree SVD; orders above 9 raise `NotImplementedError` explicitly.
+For the broader
 cluster-expansion design, the reference implementation is the Julia
 [`ClusterExpansions`](https://github.com/sanderdemeyer/ClusterExpansions)
 package.
+
+## Finite model adapters
+
+`ClusterModelAdapter` separates standard dense spin-model definitions from
+the cluster solver:
+
+```python
+from pepsy.operators import (
+    ClusterModelAdapter,
+    build_model_cluster_expansion_pepo,
+)
+
+model = ClusterModelAdapter.heisenberg(J=1.0, field=0.2)
+pepo = build_model_cluster_expansion_pepo(
+    4,
+    4,
+    0.02,
+    model,
+    order=5,
+)
+```
+
+Factories are provided for transverse-field Ising, spin-1/2 Heisenberg, and
+spin-1/2 XXZ models. Custom adapters can be made from dense `twosite_op` and
+`onesite_op` matrices, or recovered from a mapping/object exposing those
+terms. These adapters are finite and dense; fermionic parity, native
+Symmray charge blocks, and infinite/unit-cell evolution are intentionally
+outside this layer.
+
+## Generic cluster geometry
+
+The first higher-order planning surface is independent of PEPO tensor values:
+
+```python
+from pepsy.operators import generate_connected_cluster_shapes
+
+shapes = generate_connected_cluster_shapes(5)
+counts = [sum(s.nsites == n for s in shapes) for n in range(1, 6)]
+assert counts == [1, 2, 6, 19, 63]
+```
+
+Each `ConnectedClusterShape` contains translation-canonical sites, nearest-
+neighbour edges, diagonal-neighbour metadata, and its graph loop number. Use
+`quotient_rotations=True` for a C4 planning inventory. The dense P=5–9
+builders recursively subtract the actual lower-order PEPO on each support and
+then perform a spanning-tree SVD factorization. Set `max_tree_rank` to
+truncate those generic tree bonds. The fixed-channel Pauli builder remains
+limited to orders 1–4.
+
+## Coefficient-dependent real-time exponentials
+
+For numerical, coefficient-dependent evolution, use
+`build_real_time_cluster_expansion_pepo`. It accepts local terms as dense
+matrices or `(coefficient, operator)` pairs and assembles each local
+Hamiltonian before evaluating `exp(-1j * time * H)`. This is the exponential
+of the summed Hamiltonian, not a product of independently exponentiated
+terms:
+
+```python
+from pepsy.operators import build_real_time_cluster_expansion_pepo
+
+pepo, report = build_real_time_cluster_expansion_pepo(
+    4,
+    4,
+    0.01,
+    twosite_terms=[(1.0, zz), (0.25, xx)],
+    onesite_terms=[(0.5, x)],
+    order=5,
+    max_tree_rank=32,
+    max_loop_rank=16,
+    return_report=True,
+)
+```
+
+For generic orders five through nine, `fit_method="quimb"` selects Quimb's
+tree fit for loop-free cluster shapes and complex ALS for cyclic shapes.
+`fit_steps`, `fit_tol`, `fit_solver_maxiter`, and `fit_seed` control that
+numerical fit; `report.relative_residual_norms` is the local factorization
+diagnostic to inspect when a loop rank is capped. The fit is intentionally
+not differentiable with respect to coefficients. Use `PauliPEPOBasis` for
+the existing fixed-channel autodiff route.
+
+BP loop-cluster expansion belongs to the contraction side of the workflow.
+It can correct PEPO/PEPS observables or inform environment-aware truncation,
+but it does not create the connected operator terms in `exp(-beta * H)`.
+
+## Fractional-step fourth-order composition
+
+The latest reference workflow also suggests composing several order-three
+(`P=3`) cluster-expansion PEPOs at signed fractional steps. Pepsy exposes that
+composition through Quimb's native PEPO multiplication:
+
+```python
+from pepsy.operators import compose_cluster_expansion_pepo
+
+pepo = compose_cluster_expansion_pepo(
+    4,
+    4,
+    0.02,
+    twosite_op,
+    onesite_op,
+)
+```
+
+The default Yoshida triple jump uses coefficients `(a, b, a)` with
+`a = 1 / (2 - 2**(1/3))` and `b = -2**(1/3) * a`. The three layers are
+composed with `PEPO.apply`, so no global dense matrix is formed. Uncompressed
+virtual bonds grow multiplicatively; pass `compress=True` and Quimb
+compression options when an intermediate truncation is appropriate. For
+reusable geometry, call `ClusterExpansionPlan.build_composed(beta)` on an
+order-three plan. Arbitrary already-materialized Quimb layers can be composed
+with `compose_pepo_layers`.
 
 The construction follows the cluster-expansion prescription of forming exact
 local cluster exponentials and subtracting the lower-cluster contributions;

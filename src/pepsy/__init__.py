@@ -82,9 +82,17 @@ if TYPE_CHECKING:
     from .fitting import FIT  # noqa: F401
     from .operators import (  # noqa: F401
         ActivePEPOBlocks,
+        ClusterModelAdapter,
+        ConnectedClusterShape,
         ClusterExpansionReport,
         build_cluster_expansion_pepo,
+        build_model_cluster_expansion_pepo,
         build_itf_cluster_expansion_pepo,
+        build_real_time_cluster_expansion_pepo,
+        compose_pepo_layers,
+        compose_cluster_expansion_pepo,
+        generate_connected_cluster_shapes,
+        adapt_cluster_model,
         ClusterExpansionPlan,
         PauliPEPOTerm,
         PauliPEPOBasis,

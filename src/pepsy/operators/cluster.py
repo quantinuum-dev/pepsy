@@ -6,11 +6,12 @@ intentionally separate from the snake-MPO Taylor path: the local residuals
 are factorized into PEPO virtual channels, so the approximation is extensive
 in the lattice size.
 
-The current implementation supports tree and four-site plaquette-loop
-clusters through order four for ordinary dense local operators.  It also has
-a fixed-channel Pauli/autodiff path and an explicit Symmray conversion
-boundary for homogeneous operator-charge sectors; higher orders and mixed
-charge component splitting remain separate extension points.
+The dense implementation supports specialized tree and plaquette-loop
+clusters through order four, followed by a generic connected-cluster path
+through order nine. It also has a fixed-channel Pauli/autodiff path and an
+explicit Symmray conversion boundary for homogeneous operator-charge
+sectors; higher orders, native charge-block solving, and mixed-charge
+component splitting remain separate extension points.
 """
 
 from __future__ import annotations
@@ -24,18 +25,27 @@ import autoray as ar
 import numpy as np
 import quimb
 import quimb.tensor as qtn
+from quimb.tensor.fitting import tensor_network_distance
 
 from .mpo_automaton import _as_backend, _backend_reference
 
 __all__ = [
     "ActivePEPOBlocks",
+    "ConnectedClusterShape",
     "ClusterExpansionReport",
     "ClusterExpansionPlan",
+    "ClusterModelAdapter",
+    "adapt_cluster_model",
     "PauliPEPOTerm",
     "PauliPEPOBasis",
     "CompiledPEPOExp",
+    "compose_pepo_layers",
+    "compose_cluster_expansion_pepo",
+    "generate_connected_cluster_shapes",
     "build_cluster_expansion_pepo",
+    "build_model_cluster_expansion_pepo",
     "build_itf_cluster_expansion_pepo",
+    "build_real_time_cluster_expansion_pepo",
 ]
 
 
@@ -53,6 +63,228 @@ _PAULI_MATRICES = {
     "Z": np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
 }
 _PAULI_BASIS_CACHE = {}
+
+
+@dataclass(frozen=True)
+class ConnectedClusterShape:
+    """Translation-canonical connected square-lattice cluster metadata.
+
+    ``sites`` contains integer ``(x, y)`` coordinates, sorted after removing
+    a common translation. ``edges`` stores the nearest-neighbour graph as
+    ``(source, target, direction)`` entries, where the first two values index
+    ``sites`` and ``direction`` is measured from the source site. ``loops``
+    is the graph cyclomatic number, so it is zero for trees and one for the
+    elementary plaquette.
+
+    The metadata is deliberately independent of tensor values and of BP. It
+    is the geometry inventory needed by a generic connected-cluster residual
+    solver; the dense PEPO builder consumes the five- through nine-site slices
+    of this inventory in its generic higher-order path.
+    """
+
+    sites: tuple[tuple[int, int], ...]
+    edges: tuple[tuple[int, int, str], ...]
+    diagonal_edges: tuple[tuple[int, int], ...]
+    loops: int
+
+    @property
+    def nsites(self):
+        """Return the number of sites in the cluster."""
+        return len(self.sites)
+
+    @property
+    def is_tree(self):
+        """Whether the nearest-neighbour cluster graph is a tree."""
+        return self.loops == 0
+
+
+def _normalize_cluster_sites(sites):
+    """Normalize a finite site set under translations only."""
+    sites = tuple((int(x), int(y)) for x, y in sites)
+    if not sites or len(set(sites)) != len(sites):
+        raise ValueError("a cluster must contain distinct, non-empty sites.")
+    min_x = min(x for x, _ in sites)
+    min_y = min(y for _, y in sites)
+    return tuple(sorted((x - min_x, y - min_y) for x, y in sites))
+
+
+def _rotate_cluster_sites(sites):
+    """Rotate coordinates by 90 degrees around the origin."""
+    return tuple((-y, x) for x, y in sites)
+
+
+def _canonical_cluster_sites(sites, *, quotient_rotations=False):
+    """Canonicalize a site set under translations and optionally C4 rotations."""
+    candidate = _normalize_cluster_sites(sites)
+    if not quotient_rotations:
+        return candidate
+
+    rotations = []
+    for _ in range(4):
+        rotations.append(_normalize_cluster_sites(candidate))
+        candidate = _rotate_cluster_sites(candidate)
+    return min(rotations)
+
+
+def _make_cluster_shape(sites):
+    """Build graph metadata for one already canonical site set."""
+    sites = _normalize_cluster_sites(sites)
+    site_indices = {site: index for index, site in enumerate(sites)}
+    edges = []
+    diagonal_edges = []
+    for source, (x, y) in enumerate(sites):
+        for direction, (dx, dy) in _DIRECTION_VECTORS.items():
+            target = site_indices.get((x + dx, y + dy))
+            if target is not None and source < target:
+                edges.append((source, target, direction))
+        for target in range(source + 1, len(sites)):
+            tx, ty = sites[target]
+            if abs(tx - x) == 1 and abs(ty - y) == 1:
+                diagonal_edges.append((source, target))
+
+    loops = len(edges) - len(sites) + 1
+    return ConnectedClusterShape(
+        sites=sites,
+        edges=tuple(edges),
+        diagonal_edges=tuple(diagonal_edges),
+        loops=loops,
+    )
+
+
+def generate_connected_cluster_shapes(
+    max_sites,
+    *,
+    min_sites=1,
+    quotient_rotations=False,
+):
+    """Enumerate connected square-lattice cluster shapes.
+
+    Shapes are generated recursively by adding a nearest neighbour to a
+    smaller connected shape. They are canonicalized under translations, so
+    the result is finite and independent of the lattice dimensions. By
+    default rotations remain distinct, matching the oriented cluster list
+    used by the reference cluster-expansion construction. Set
+    ``quotient_rotations=True`` to identify the four C4 rotations.
+
+    This function generates geometry only. It does not solve a local
+    exponential, construct a PEPO, or call the BP loop-cluster expansion.
+
+    Parameters
+    ----------
+    max_sites : int
+        Largest cluster size to enumerate.
+    min_sites : int, optional
+        Smallest cluster size returned, defaulting to one.
+    quotient_rotations : bool, optional
+        Whether to quotient the shape inventory by square-lattice rotations.
+
+    Returns
+    -------
+    tuple[ConnectedClusterShape, ...]
+        Shapes ordered first by site count and then by canonical coordinates.
+    """
+    max_sites = _validate_shape(max_sites, "max_sites")
+    min_sites = _validate_shape(min_sites, "min_sites")
+    if min_sites > max_sites:
+        raise ValueError("min_sites must be <= max_sites.")
+    if not isinstance(quotient_rotations, (bool, np.bool_)):
+        raise TypeError("quotient_rotations must be a bool.")
+
+    levels = {1: {((0, 0),)}}
+    for size in range(2, max_sites + 1):
+        candidates = set()
+        for sites in levels[size - 1]:
+            occupied = set(sites)
+            for x, y in sites:
+                for dx, dy in _DIRECTION_VECTORS.values():
+                    neighbour = (x + dx, y + dy)
+                    if neighbour in occupied:
+                        continue
+                    candidates.add(
+                        _canonical_cluster_sites(
+                            (*sites, neighbour),
+                            quotient_rotations=bool(quotient_rotations),
+                        )
+                    )
+        levels[size] = candidates
+
+    return tuple(
+        _make_cluster_shape(sites)
+        for size in range(min_sites, max_sites + 1)
+        for sites in sorted(levels[size])
+    )
+
+
+def compose_pepo_layers(layers, *, compress=False, **compress_opts):
+    """Compose Quimb ``PEPO`` layers without forming a global matrix.
+
+    The layers are supplied in application order. For example,
+    ``compose_pepo_layers((u0, u1))`` returns ``u1 @ u0``. Quimb contracts
+    the physical legs at each site and retains the result as a ``PEPO``. By
+    default no virtual truncation is performed; pass ``compress=True`` and
+    Quimb compression options to truncate after each multiplication.
+
+    Parameters
+    ----------
+    layers : iterable of :class:`quimb.tensor.PEPO`
+        At least one PEPO with matching lattice shape and periodicity.
+    compress : bool, optional
+        Whether to ask Quimb to compress each intermediate product.
+    compress_opts
+        Options forwarded to Quimb's PEPO compression method when
+        ``compress=True``.
+
+    Returns
+    -------
+    quimb.tensor.PEPO
+        The composed operator, with the same physical layout as the input
+        layers.
+    """
+    try:
+        layers = tuple(layers)
+    except TypeError as exc:
+        raise TypeError("layers must be an iterable of Quimb PEPOs.") from exc
+    if not layers:
+        raise ValueError("layers must contain at least one Quimb PEPO.")
+    if not all(isinstance(layer, qtn.PEPO) for layer in layers):
+        raise TypeError("layers must contain only Quimb PEPO objects.")
+
+    reference = layers[0]
+    reference_shape = (
+        reference.Lx,
+        reference.Ly,
+        bool(reference.is_cyclic_x()),
+        bool(reference.is_cyclic_y()),
+    )
+    for layer in layers[1:]:
+        shape = (
+            layer.Lx,
+            layer.Ly,
+            bool(layer.is_cyclic_x()),
+            bool(layer.is_cyclic_y()),
+        )
+        if shape != reference_shape:
+            raise ValueError(
+                "all PEPO layers must have matching lattice shape and periodicity."
+            )
+
+    result = reference.copy()
+    for layer in layers[1:]:
+        result = layer.apply(
+            result,
+            compress=compress,
+            contract=True,
+            **compress_opts,
+        )
+    return result
+
+
+def _yoshida4_coefficients():
+    """Return the symmetric triple-jump coefficients for fourth order."""
+    cube_root_two = 2.0 ** (1.0 / 3.0)
+    first = 1.0 / (2.0 - cube_root_two)
+    middle = -cube_root_two / (2.0 - cube_root_two)
+    return first, middle, first
 
 
 def _validate_shape(value, name):
@@ -974,6 +1206,375 @@ class ClusterExpansionReport:
     def max_relative_residual(self):
         """Return the largest residual relative to its uncompressed target."""
         return max(self.relative_residual_norms.values(), default=0.0)
+
+
+@dataclass(frozen=True)
+class ClusterModelAdapter:
+    """Dense local-term adapter for finite cluster-expansion PEPOs.
+
+    The adapter is deliberately small: it translates a translation-invariant
+    square-lattice model into the two matrices consumed by
+    :class:`ClusterExpansionPlan`.  This mirrors the Julia workflow where a
+    model supplies local and nearest-neighbour terms while the cluster engine
+    owns geometry, residual subtraction, and PEPO factorization.
+
+    Parameters
+    ----------
+    twosite_op, onesite_op : array-like
+        Dense matrices with shapes ``(d**2, d**2)`` and ``(d, d)``.
+    name : str, optional
+        Human-readable model name used in diagnostics.
+    symmetry : {None, "C4"}, optional
+        Finite square-lattice symmetry that is safe for this model.  ``C4``
+        requires a site-symmetric two-site term and enables finite orbit
+        reuse in the generic cluster solver.
+
+    Notes
+    -----
+    This is a dense finite adapter.  It intentionally does not carry
+    fermionic parity data or native Symmray charge sectors.
+    """
+
+    twosite_op: object
+    onesite_op: object
+    name: str = "custom"
+    symmetry: str | None = None
+
+    def __post_init__(self):
+        twosite_op = _as_square_operator(self.twosite_op, "twosite_op")
+        onesite_op = _as_square_operator(self.onesite_op, "onesite_op")
+        if twosite_op.shape != (onesite_op.shape[0] ** 2,) * 2:
+            raise ValueError(
+                "twosite_op must have shape "
+                f"({onesite_op.shape[0] ** 2}, {onesite_op.shape[0] ** 2}) "
+                f"for local dimension {onesite_op.shape[0]}."
+            )
+        if self.symmetry not in (None, "C4"):
+            raise ValueError("symmetry must be None or 'C4'.")
+        if self.symmetry == "C4":
+            swapped = _swap_two_site_operator(twosite_op, onesite_op.shape[0])
+            if not np.allclose(twosite_op, swapped, rtol=1e-10, atol=1e-12):
+                raise ValueError(
+                    "C4 cluster reduction requires a site-symmetric twosite_op."
+                )
+        object.__setattr__(self, "twosite_op", twosite_op)
+        object.__setattr__(self, "onesite_op", onesite_op)
+        object.__setattr__(self, "name", str(self.name))
+
+    @property
+    def local_dim(self):
+        """Return the one-site Hilbert-space dimension."""
+        return self.onesite_op.shape[0]
+
+    @classmethod
+    def custom(cls, twosite_op, onesite_op, *, name="custom", symmetry=None):
+        """Adapt already-assembled dense local and edge matrices."""
+        return cls(twosite_op, onesite_op, name=name, symmetry=symmetry)
+
+    @classmethod
+    def ising(
+        cls,
+        *,
+        J=1.0,
+        field=1.0,
+        field_axis="x",
+        dtype=None,
+        symmetry="C4",
+    ):
+        """Build the transverse-field Ising adapter.
+
+        The convention is ``H = J sum Z_i Z_j + field sum sigma_i`` with
+        ``field_axis="x"`` by default, matching Pepsy's ITF helper.
+        """
+        dtype = _model_dtype(dtype, J, field)
+        paulis = _model_paulis(dtype)
+        axis = _model_axis(field_axis)
+        return cls(
+            J * np.kron(paulis["z"], paulis["z"]),
+            field * paulis[axis],
+            name="ising",
+            symmetry=symmetry,
+        )
+
+    @classmethod
+    def heisenberg(
+        cls,
+        *,
+        J=1.0,
+        field=0.0,
+        field_axis="z",
+        dtype=None,
+        symmetry="C4",
+    ):
+        """Build a spin-1/2 Heisenberg adapter.
+
+        The convention uses ``S^a = sigma^a / 2`` and
+        ``H = J sum_a S^a_i S^a_j + field sum S^axis_i``.
+        """
+        dtype = _model_dtype(dtype, J, field)
+        paulis = _model_paulis(dtype)
+        spin = {axis: matrix / 2 for axis, matrix in paulis.items()}
+        axis = _model_axis(field_axis)
+        twosite = J * sum(
+            (
+                np.kron(spin[component], spin[component])
+                for component in ("x", "y", "z")
+            ),
+            start=np.zeros((4, 4), dtype=dtype),
+        )
+        return cls(
+            twosite,
+            field * spin[axis],
+            name="heisenberg",
+            symmetry=symmetry,
+        )
+
+    @classmethod
+    def xxz(
+        cls,
+        *,
+        Jxy=1.0,
+        Jz=1.0,
+        field=0.0,
+        field_axis="z",
+        dtype=None,
+        symmetry="C4",
+    ):
+        """Build a spin-1/2 XXZ adapter with an optional onsite field."""
+        dtype = _model_dtype(dtype, Jxy, Jz, field)
+        paulis = _model_paulis(dtype)
+        spin = {axis: matrix / 2 for axis, matrix in paulis.items()}
+        axis = _model_axis(field_axis)
+        twosite = (
+            Jxy * (
+                np.kron(spin["x"], spin["x"])
+                + np.kron(spin["y"], spin["y"])
+            )
+            + Jz * np.kron(spin["z"], spin["z"])
+        )
+        return cls(
+            twosite,
+            field * spin[axis],
+            name="xxz",
+            symmetry=symmetry,
+        )
+
+    @classmethod
+    def from_model(cls, model, *, name=None, symmetry=None):
+        """Adapt a mapping or object exposing local cluster terms.
+
+        Accepted mappings use ``twosite_op``/``onesite_op`` or the aliases
+        ``edge_op``/``onsite_op``.  Objects may expose those attributes or a
+        zero-argument ``cluster_terms()`` method returning such a mapping.
+        """
+        if isinstance(model, cls):
+            if name is None and symmetry is None:
+                return model
+            return cls(
+                model.twosite_op,
+                model.onesite_op,
+                name=model.name if name is None else name,
+                symmetry=model.symmetry if symmetry is None else symmetry,
+            )
+        if hasattr(model, "cluster_terms"):
+            model = model.cluster_terms()
+        if isinstance(model, Mapping):
+            twosite_op = model.get("twosite_op", model.get("edge_op"))
+            onesite_op = model.get("onesite_op", model.get("onsite_op"))
+            model_name = model.get("name", "custom")
+            model_symmetry = model.get("symmetry")
+        else:
+            twosite_op = getattr(model, "twosite_op", getattr(model, "edge_op", None))
+            onesite_op = getattr(model, "onesite_op", getattr(model, "onsite_op", None))
+            model_name = getattr(model, "name", "custom")
+            model_symmetry = getattr(model, "symmetry", None)
+        if twosite_op is None or onesite_op is None:
+            raise TypeError(
+                "model must expose twosite_op/onesite_op (or edge_op/onsite_op), "
+                "or return them from cluster_terms()."
+            )
+        return cls(
+            twosite_op,
+            onesite_op,
+            name=model_name if name is None else name,
+            symmetry=model_symmetry if symmetry is None else symmetry,
+        )
+
+    def build(self, lx, ly, beta, **kwargs):
+        """Build a finite PEPO using this adapter's local terms."""
+        kwargs.setdefault("symmetry", self.symmetry)
+        return build_cluster_expansion_pepo(
+            lx,
+            ly,
+            beta,
+            self.twosite_op,
+            self.onesite_op,
+            **kwargs,
+        )
+
+
+def _model_dtype(dtype, *values):
+    """Choose a safe dense dtype for a model factory."""
+    if dtype is None:
+        return np.result_type(*values, np.float64)
+    return np.result_type(np.dtype(dtype), *values)
+
+
+def _model_paulis(dtype):
+    """Return Pauli matrices in the requested model dtype."""
+    return {
+        "x": np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=dtype),
+        "y": np.asarray(
+            [[0.0, -1.0j], [1.0j, 0.0]],
+            dtype=np.result_type(dtype, np.complex128),
+        ),
+        "z": np.asarray(np.diag([1.0, -1.0]), dtype=dtype),
+    }
+
+
+def _model_axis(axis):
+    axis = str(axis).lower()
+    if axis not in {"x", "y", "z"}:
+        raise ValueError("field_axis must be one of 'x', 'y', or 'z'.")
+    return axis
+
+
+def adapt_cluster_model(model, *, name=None, symmetry=None):
+    """Return a :class:`ClusterModelAdapter` for a dense local-term model."""
+    return ClusterModelAdapter.from_model(
+        model,
+        name=name,
+        symmetry=symmetry,
+    )
+
+
+def _assemble_coefficient_terms(terms, name):
+    """Assemble ``[(coefficient, operator), ...]`` into one dense matrix."""
+    if terms is None:
+        raise ValueError(f"{name} must contain at least one local term.")
+    try:
+        candidate = np.asarray(terms)
+    except (TypeError, ValueError):
+        candidate = None
+    if candidate is not None and candidate.ndim == 2:
+        return _as_square_operator(candidate, name)
+
+    if isinstance(terms, Mapping):
+        terms = tuple(terms.values())
+    elif isinstance(terms, (tuple, list)) and len(terms) == 2:
+        try:
+            is_single_pair = (
+                np.asarray(terms[1]).ndim == 2
+                and np.asarray(terms[0]).ndim == 0
+            )
+        except (TypeError, ValueError):
+            is_single_pair = False
+        if is_single_pair:
+            terms = (terms,)
+    else:
+        try:
+            terms = tuple(terms)
+        except TypeError as exc:
+            raise TypeError(
+                f"{name} must be a square matrix or an iterable of "
+                "(coefficient, operator) terms."
+            ) from exc
+
+    parsed = []
+    for term in terms:
+        if isinstance(term, Mapping):
+            coefficient = term.get("coefficient", term.get("coeff"))
+            operator = term.get("operator", term.get("term"))
+        else:
+            try:
+                coefficient, operator = term
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"each {name} entry must be (coefficient, operator)."
+                ) from exc
+        if coefficient is None or operator is None:
+            raise ValueError(
+                f"each {name} entry needs 'coefficient' and 'operator' values."
+            )
+        operator = _as_square_operator(operator, f"{name} operator")
+        parsed.append((coefficient, operator))
+    if not parsed:
+        raise ValueError(f"{name} must contain at least one local term.")
+    shape = parsed[0][1].shape
+    if any(operator.shape != shape for _, operator in parsed[1:]):
+        raise ValueError(f"all {name} operators must have the same shape.")
+    dtype = np.result_type(*(operator.dtype for _, operator in parsed), *(
+        np.asarray(coefficient).dtype for coefficient, _ in parsed
+    ))
+    result = np.zeros(shape, dtype=dtype)
+    for coefficient, operator in parsed:
+        result = result + coefficient * operator
+    return result
+
+
+def build_real_time_cluster_expansion_pepo(
+    lx,
+    ly,
+    time,
+    twosite_terms,
+    onesite_terms,
+    *,
+    order=5,
+    cyclic=False,
+    edge_cutoff=0.0,
+    max_edge_rank=None,
+    max_tree_rank=None,
+    max_loop_rank=None,
+    dtype=None,
+    symmetry=None,
+    fit_method="quimb",
+    fit_steps=100,
+    fit_tol=1e-10,
+    fit_solver_maxiter=8,
+    fit_seed=0,
+    materialize=True,
+    return_report=False,
+):
+    """Build a numerical PEPO for ``exp(-1j * time * H(coefficients))``.
+
+    ``twosite_terms`` and ``onesite_terms`` can each be an already assembled
+    dense matrix or an iterable of ``(coefficient, operator)`` pairs. Mapping
+    entries with ``coefficient``/``operator`` (or ``coeff``/``term``) fields
+    are also accepted. The local coefficient sums are formed before the
+    cluster exponentials are evaluated, so this represents the exponential
+    of the sum rather than a Trotter product of local exponentials.
+
+    This is a dense numerical path. Quimb's tree/ALS fitting is not
+    differentiable with respect to the coefficients; use
+    :class:`PauliPEPOBasis` for the existing fixed-channel autodiff path.
+    """
+    twosite_op = _assemble_coefficient_terms(twosite_terms, "twosite_terms")
+    onesite_op = _assemble_coefficient_terms(onesite_terms, "onesite_terms")
+    if dtype is not None:
+        twosite_op = np.asarray(twosite_op, dtype=dtype)
+        onesite_op = np.asarray(onesite_op, dtype=dtype)
+    return build_cluster_expansion_pepo(
+        lx,
+        ly,
+        1j * time,
+        twosite_op,
+        onesite_op,
+        order=order,
+        cyclic=cyclic,
+        edge_cutoff=edge_cutoff,
+        max_edge_rank=max_edge_rank,
+        max_tree_rank=max_tree_rank,
+        max_loop_rank=max_loop_rank,
+        dtype=dtype,
+        symmetry=symmetry,
+        fit_method=fit_method,
+        fit_steps=fit_steps,
+        fit_tol=fit_tol,
+        fit_solver_maxiter=fit_solver_maxiter,
+        fit_seed=fit_seed,
+        materialize=materialize,
+        return_report=return_report,
+    )
 
 
 @dataclass
@@ -2995,6 +3596,930 @@ def _dense_loop_tensors(coefficients, local_dim):
     return first_corner, second_corner, third_corner, fourth_corner
 
 
+def _cluster_shape_embeddings(shape, lx, ly, cyclic):
+    """Return all valid finite-lattice translations of a cluster shape."""
+    embeddings = []
+    for start_i in range(lx):
+        for start_j in range(ly):
+            mapped = []
+            valid = True
+            for x, y in shape.sites:
+                site = (start_i + x, start_j + y)
+                if cyclic[0]:
+                    site = (site[0] % lx, site[1])
+                if cyclic[1]:
+                    site = (site[0], site[1] % ly)
+                if not (0 <= site[0] < lx and 0 <= site[1] < ly):
+                    valid = False
+                    break
+                mapped.append(site)
+            if not valid or len(set(mapped)) != shape.nsites:
+                continue
+            if any(
+                _site_after(mapped[source], direction, lx, ly, cyclic)
+                != mapped[target]
+                for source, target, direction in shape.edges
+            ):
+                continue
+            embeddings.append(tuple(mapped))
+    return tuple(embeddings)
+
+
+def _contract_tree_factor_coefficients(local_tensors, parent, children, nsites):
+    """Contract coefficient tensors produced by ``_tree_factorize_operator``."""
+    bond_labels = {
+        child: nsites + child
+        for child in range(nsites)
+        if parent[child] is not None
+    }
+    operands = []
+    for site in range(nsites):
+        child_nodes, tensor = local_tensors[site]
+        labels = [bond_labels[child] for child in child_nodes]
+        labels.append(site)
+        if parent[site] is not None:
+            labels.append(bond_labels[site])
+        operands.extend((tensor, labels))
+    return np.einsum(*operands, list(range(nsites)), optimize=True)
+
+
+def _tree_factorize_operator(operator, edges, nsites, local_dim, max_rank):
+    """Factor an operator coefficient tensor over a spanning tree.
+
+    Each edge is split with an SVD after all child subtrees have been
+    collected. This is an exact tree tensor factorization when ``max_rank``
+    is ``None`` and a controlled singular-value truncation otherwise.
+    """
+    operator_tensor = _operator_tensor(operator, nsites, local_dim)
+    operator_rank = local_dim**2
+    adjacency = [[] for _ in range(nsites)]
+    for source, target, direction in edges:
+        adjacency[source].append((target, direction))
+        adjacency[target].append((source, _OPPOSITE_DIRECTION[direction]))
+
+    parent = {0: None}
+    parent_direction = {}
+    traversal = [0]
+    for site in traversal:
+        for neighbour, direction in adjacency[site]:
+            if neighbour in parent:
+                continue
+            parent[neighbour] = site
+            parent_direction[neighbour] = direction
+            traversal.append(neighbour)
+    if len(parent) != nsites:
+        raise ValueError("cluster graph must be connected for tree factorization.")
+
+    children = {site: [] for site in range(nsites)}
+    for site in traversal[1:]:
+        children[parent[site]].append(site)
+
+    current = operator_tensor
+    axes = [("physical", site) for site in range(nsites)]
+    local_tensors = {}
+    ranks = {}
+    for site in reversed(traversal[1:]):
+        child_nodes = tuple(children[site])
+        row_axes = [("bond", child) for child in child_nodes]
+        row_axes.append(("physical", site))
+        column_axes = [axis for axis in axes if axis not in row_axes]
+        permutation = [axes.index(axis) for axis in row_axes + column_axes]
+        matrix = current.transpose(permutation).reshape(
+            int(np.prod([current.shape[index] for index in permutation[:len(row_axes)]])),
+            -1,
+        )
+        left, singular_values, right = np.linalg.svd(matrix, full_matrices=False)
+        if not singular_values.size or singular_values[0] == 0.0:
+            return None, None, None, None, None, 0, 0.0, 0.0
+        threshold = singular_values[0] * np.finfo(singular_values.dtype).eps * max(
+            1,
+            matrix.shape[0],
+            matrix.shape[1],
+        )
+        keep = np.flatnonzero(singular_values > threshold)
+        if max_rank is not None:
+            keep = keep[:max_rank]
+        if not keep.size:
+            keep = np.array([0])
+        rank = int(keep.size)
+        local_tensors[site] = (
+            child_nodes,
+            left[:, keep].reshape(
+                tuple(current.shape[axes.index(("bond", child))] for child in child_nodes)
+                + (operator_rank, rank),
+            ),
+        )
+        ranks[site] = rank
+        current = (singular_values[keep, None] * right[keep, :]).reshape(
+            (rank,) + tuple(current.shape[axes.index(axis)] for axis in column_axes)
+        )
+        axes = [("bond", site)] + column_axes
+
+    root = 0
+    root_axes = [("bond", child) for child in children[root]]
+    root_axes.append(("physical", root))
+    permutation = [axes.index(axis) for axis in root_axes]
+    root_tensor = current.transpose(permutation).reshape(
+        tuple(current.shape[index] for index in permutation)
+    )
+    local_tensors[root] = (tuple(children[root]), root_tensor)
+    reconstructed = _contract_tree_factor_coefficients(
+        local_tensors,
+        parent,
+        children,
+        nsites,
+    )
+    return (
+        local_tensors,
+        parent,
+        parent_direction,
+        children,
+        ranks,
+        max(ranks.values(), default=0),
+        float(np.linalg.norm(operator_tensor - reconstructed)),
+        float(np.linalg.norm(operator_tensor)),
+    )
+
+
+def _spanning_tree_edge_indices(edges, nsites):
+    """Return a breadth-first spanning tree through ``edges``."""
+    adjacency = [[] for _ in range(nsites)]
+    for edge_index, (source, target, direction) in enumerate(edges):
+        adjacency[source].append((target, edge_index, direction))
+        adjacency[target].append((source, edge_index, _OPPOSITE_DIRECTION[direction]))
+
+    visited = {0}
+    queue = [0]
+    tree_edge_indices = []
+    while queue:
+        source = queue.pop(0)
+        for target, edge_index, _ in adjacency[source]:
+            if target in visited:
+                continue
+            visited.add(target)
+            queue.append(target)
+            tree_edge_indices.append(edge_index)
+    if len(visited) != nsites:
+        raise ValueError("cluster graph must be connected for Quimb fitting.")
+    return tuple(tree_edge_indices)
+
+
+def _cluster_incident_edges(edges, nsites):
+    """Return incident edge labels and directions for every cluster site."""
+    incident = {site: [] for site in range(nsites)}
+    for edge_index, (source, target, direction) in enumerate(edges):
+        incident[source].append((edge_index, direction))
+        incident[target].append((edge_index, _OPPOSITE_DIRECTION[direction]))
+    return {
+        site: tuple(sorted(site_edges))
+        for site, site_edges in incident.items()
+    }
+
+
+def _quimb_fit_initial_arrays(
+    operator,
+    edges,
+    nsites,
+    local_dim,
+    *,
+    method,
+    max_tree_rank,
+    max_loop_rank,
+    fit_seed,
+):
+    """Construct a fixed-rank Quimb fitting ansatz for a cluster tensor."""
+    operator_tensor = _operator_tensor(operator, nsites, local_dim)
+    operator_rank = local_dim**2
+    tree_edge_indices = _spanning_tree_edge_indices(edges, nsites)
+    tree_edges = tuple(edges[index] for index in tree_edge_indices)
+    tree_result = _tree_factorize_operator(
+        operator,
+        tree_edges,
+        nsites,
+        local_dim,
+        max_tree_rank,
+    )
+    (
+        tree_tensors,
+        parent,
+        _,
+        children,
+        tree_ranks,
+        tree_rank,
+        _,
+        _,
+    ) = tree_result
+    if tree_tensors is None:
+        return None
+
+    tree_edge_ids = set(tree_edge_indices)
+    incident = _cluster_incident_edges(edges, nsites)
+    edge_ranks = {}
+    for edge_index in tree_edge_indices:
+        source, target, _ = edges[edge_index]
+        if parent.get(target) == source:
+            child = target
+        elif parent.get(source) == target:
+            child = source
+        else:
+            raise ValueError("spanning-tree edge is inconsistent with its parent map.")
+        edge_ranks[edge_index] = tree_ranks[child]
+    if method == "tree":
+        edge_ranks = {
+            edge_index: edge_ranks[edge_index]
+            for edge_index in tree_edge_indices
+        }
+    else:
+        loop_rank = max_loop_rank
+        if loop_rank is None:
+            loop_rank = max(max(tree_ranks.values(), default=1), operator_rank)
+        edge_ranks.update(
+            {
+                edge_index: loop_rank
+                for edge_index in range(len(edges))
+                if edge_index not in edge_ranks
+            }
+        )
+
+    # Convert the tree-SVD initialization to the edge ordering used by the
+    # Quimb ansatz. For a loop, retain the tree factorization in the zero
+    # slice of each additional edge and seed the other slices very lightly so
+    # ALS can activate them.
+    rng = np.random.default_rng(fit_seed)
+    local_arrays = {}
+    tree_edge_lookup = {
+        frozenset((source, target)): edge_index
+        for edge_index, (source, target, _) in zip(tree_edge_indices, tree_edges)
+    }
+    for site in range(nsites):
+        child_nodes, tree_tensor = tree_tensors[site]
+        source_axes = [
+            tree_edge_lookup[frozenset((site, child))]
+            for child in child_nodes
+        ]
+        source_axes.append("physical")
+        if parent[site] is not None:
+            source_axes.append(
+                tree_edge_lookup[frozenset((site, parent[site]))]
+            )
+        source_axes = tuple(source_axes)
+        target_edge_ids = tuple(edge_index for edge_index, _ in incident[site])
+        tree_target_edge_ids = tuple(
+            edge_index for edge_index in target_edge_ids if edge_index in tree_edge_ids
+        )
+        source_axis_positions = {axis: index for index, axis in enumerate(source_axes)}
+        tree_data = np.asarray(tree_tensor).transpose(
+            tuple(source_axis_positions[axis] for axis in tree_target_edge_ids)
+            + (source_axis_positions["physical"],)
+        )
+        target_shape = tuple(edge_ranks[edge_index] for edge_index in target_edge_ids)
+        target_shape += (operator_rank,)
+        data = np.zeros(target_shape, dtype=operator_tensor.dtype)
+        tree_slices = tuple(
+            slice(None) if edge_index in tree_edge_ids else 0
+            for edge_index in target_edge_ids
+        )
+        data[tree_slices + (slice(None),)] = tree_data
+        if method != "tree" and any(edge_index not in tree_edge_ids for edge_index in target_edge_ids):
+            scale = max(float(np.linalg.norm(operator_tensor)), 1.0) ** (1.0 / nsites)
+            noise = rng.normal(size=target_shape) + 1j * rng.normal(size=target_shape)
+            data = data + (1e-6 * scale / max(np.sqrt(data.size), 1.0)) * noise
+        local_arrays[site] = (target_edge_ids, data)
+
+    return local_arrays, edge_ranks, tree_rank
+
+
+def _quimb_factorize_operator(
+    operator,
+    edges,
+    nsites,
+    local_dim,
+    *,
+    method,
+    max_tree_rank,
+    max_loop_rank,
+    fit_steps,
+    fit_tol,
+    fit_solver_maxiter,
+    fit_seed,
+):
+    """Fit a cluster operator tensor with Quimb tree or ALS machinery."""
+    if method not in {"tree", "als"}:
+        raise ValueError("Quimb cluster fitting method must be 'tree' or 'als'.")
+    if method == "tree" and len(edges) != nsites - 1:
+        raise ValueError("Quimb tree fitting requires a loop-free cluster.")
+
+    initial = _quimb_fit_initial_arrays(
+        operator,
+        edges,
+        nsites,
+        local_dim,
+        method=method,
+        max_tree_rank=max_tree_rank,
+        max_loop_rank=max_loop_rank,
+        fit_seed=fit_seed,
+    )
+    if initial is None:
+        return None
+    local_arrays, edge_ranks, tree_rank = initial
+    incident = _cluster_incident_edges(edges, nsites)
+    physical_inds = tuple(f"__pepsy_cluster_phys_{site}" for site in range(nsites))
+    edge_inds = {
+        edge_index: f"__pepsy_cluster_edge_{edge_index}"
+        for edge_index in edge_ranks
+    }
+    target = qtn.Tensor(
+        _operator_tensor(operator, nsites, local_dim),
+        inds=physical_inds,
+    ).as_network()
+    tensors = []
+    site_tags = {}
+    for site, (edge_ids, data) in local_arrays.items():
+        inds = tuple(edge_inds[edge_index] for edge_index in edge_ids)
+        inds += (physical_inds[site],)
+        tag = f"__pepsy_cluster_fit_site_{site}"
+        site_tags[site] = tag
+        tensors.append(qtn.Tensor(data, inds=inds, tags=tag))
+    ansatz = qtn.TensorNetwork(tensors)
+    fit_options = {
+        "method": method,
+        "tags": tuple(site_tags.values()),
+        "steps": fit_steps,
+        "tol": fit_tol,
+        "progbar": False,
+        "inplace": False,
+        # ALS repeatedly reuses the same small cluster environment. Greedy
+        # paths avoid re-running the heavier hyper-optimizer for each local
+        # tensor while preserving the exact overlap objective.
+        "contract_optimize": "greedy",
+    }
+    if method == "als":
+        fit_options["solver_maxiter"] = fit_solver_maxiter
+    fitted = ansatz.fit(target, **fit_options)
+    operator_tensor = _operator_tensor(operator, nsites, local_dim)
+    distance_method = "dense" if operator_tensor.size <= 1_000_000 else "overlap"
+    relative_fit_error = float(
+        tensor_network_distance(
+            fitted,
+            target,
+            method=distance_method,
+            normalized=True,
+        )
+    )
+    target_norm = float(np.linalg.norm(operator_tensor))
+    # Dense distance is exact for small local clusters, while the overlap
+    # distance avoids materializing a d**(2 * nsites) local matrix for larger
+    # clusters.
+    fit_error = relative_fit_error * target_norm
+    fitted_arrays = {}
+    for site, tag in site_tags.items():
+        (fitted_tensor,) = fitted.select_tensors(tag, which="all")
+        expected_inds = tuple(
+            edge_inds[edge_index] for edge_index, _ in incident[site]
+        )
+        expected_inds += (physical_inds[site],)
+        fitted_arrays[site] = (
+            tuple(edge_index for edge_index, _ in incident[site]),
+            np.asarray(fitted_tensor.transpose(*expected_inds).data),
+        )
+    return (
+        fitted_arrays,
+        edge_ranks,
+        max(edge_ranks.values(), default=tree_rank),
+        fit_error,
+        target_norm,
+    )
+
+
+def _rotate_direction(direction, turns):
+    """Rotate one lattice direction by ``turns`` quarter turns."""
+    for _ in range(turns % 4):
+        direction = _C4_ROTATION[direction]
+    return direction
+
+
+def _cluster_shape_c4_orbit(shape):
+    """Return C4-related shapes and site maps from one representative."""
+    orbit = []
+    seen = set()
+    for turns in range(4):
+        rotated_sites = tuple(
+            _rotate_coordinate(site, turns)
+            for site in shape.sites
+        )
+        normalized = _normalize_cluster_sites(rotated_sites)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        min_x = min(x for x, _ in rotated_sites)
+        min_y = min(y for _, y in rotated_sites)
+        target_indices = {
+            site: index for index, site in enumerate(normalized)
+        }
+        source_to_target = tuple(
+            target_indices[(x - min_x, y - min_y)]
+            for x, y in rotated_sites
+        )
+        orbit.append(
+            (
+                _make_cluster_shape(normalized),
+                source_to_target,
+                turns,
+            )
+        )
+    return tuple(orbit)
+
+
+def _shape_rotation_map(source_shape, target_shape):
+    """Return the source-to-target site map for a C4-related shape."""
+    source_sites = source_shape.sites
+    target_sites = target_shape.sites
+    target_indices = {site: index for index, site in enumerate(target_sites)}
+    for turns in range(4):
+        rotated_sites = tuple(
+            _rotate_coordinate(site, turns)
+            for site in source_sites
+        )
+        min_x = min(x for x, _ in rotated_sites)
+        min_y = min(y for _, y in rotated_sites)
+        normalized = tuple(
+            sorted((x - min_x, y - min_y) for x, y in rotated_sites)
+        )
+        if normalized != target_sites:
+            continue
+        return (
+            tuple(
+                target_indices[(x - min_x, y - min_y)]
+                for x, y in rotated_sites
+            ),
+            turns,
+        )
+    raise ValueError("cluster shapes are not related by a C4 rotation.")
+
+
+def _rotate_coordinate(site, turns):
+    """Rotate a coordinate around the origin by ``turns`` quarter turns."""
+    x, y = site
+    for _ in range(turns % 4):
+        x, y = -y, x
+    return x, y
+
+
+def _transform_tree_factorization(
+    local_tensors,
+    parent,
+    parent_direction,
+    children,
+    source_to_target,
+    turns,
+):
+    """Transport a tree factorization to a C4-related site ordering."""
+    target_parent = {}
+    target_direction = {}
+    target_children = {}
+    target_tensors = {}
+    for source, source_parent in parent.items():
+        target = source_to_target[source]
+        target_parent[target] = (
+            None
+            if source_parent is None
+            else source_to_target[source_parent]
+        )
+        if source_parent is not None:
+            target_direction[target] = _rotate_direction(
+                parent_direction[source],
+                turns,
+            )
+        source_children, tensor = local_tensors[source]
+        target_child_nodes = tuple(source_to_target[child] for child in source_children)
+        target_children[target] = target_child_nodes
+        target_tensors[target] = (target_child_nodes, tensor)
+    return target_tensors, target_parent, target_direction, target_children
+
+
+def _add_tree_factor_blocks(
+    blocks,
+    site_directions,
+    embeddings,
+    local_tensors,
+    parent,
+    tree_directions,
+    sectors,
+    local_dim,
+):
+    """Insert a tree-factorized cluster at all valid translations."""
+    matrix_units = np.eye(local_dim**2).reshape(local_dim**2, local_dim, local_dim)
+    root = next(site for site, value in parent.items() if value is None)
+    for embedding in embeddings:
+        for site, (child_nodes, tensor) in local_tensors.items():
+            physical_axis = len(child_nodes)
+            local_blocks = np.tensordot(
+                tensor,
+                matrix_units,
+                axes=([physical_axis], [0]),
+            )
+            lattice_site = embedding[site]
+            directions = site_directions[lattice_site]
+            for active_indices in np.ndindex(local_blocks.shape[:-2]):
+                key = [0] * len(directions)
+                for axis, child in enumerate(child_nodes):
+                    direction = tree_directions[(site, child)]
+                    key[directions.index(direction)] = sectors[child][
+                        active_indices[axis]
+                    ]
+                if site != root:
+                    direction = tree_directions[(site, parent[site])]
+                    key[directions.index(direction)] = sectors[site][
+                        active_indices[-1]
+                    ]
+                key = tuple(key)
+                block = local_blocks[active_indices]
+                if key in blocks[lattice_site]:
+                    blocks[lattice_site][key] = blocks[lattice_site][key] + block
+                else:
+                    blocks[lattice_site][key] = block
+
+
+def _add_graph_factor_blocks(
+    blocks,
+    site_directions,
+    embeddings,
+    edges,
+    local_tensors,
+    sectors,
+    local_dim,
+):
+    """Insert a tree- or loop-fitted cluster factorization into PEPO blocks."""
+    matrix_units = np.eye(local_dim**2).reshape(local_dim**2, local_dim, local_dim)
+    incident = _cluster_incident_edges(edges, len(local_tensors))
+    for embedding in embeddings:
+        for site, (edge_ids, tensor) in local_tensors.items():
+            local_blocks = np.tensordot(
+                tensor,
+                matrix_units,
+                axes=([-1], [0]),
+            )
+            lattice_site = embedding[site]
+            directions = site_directions[lattice_site]
+            edge_directions = dict(incident[site])
+            for active_indices in np.ndindex(local_blocks.shape[:-2]):
+                key = [0] * len(directions)
+                for axis, edge_index in enumerate(edge_ids):
+                    direction = edge_directions[edge_index]
+                    try:
+                        direction_axis = directions.index(direction)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "cluster edge does not map to an available PEPO leg."
+                        ) from exc
+                    key[direction_axis] = sectors[edge_index][
+                        active_indices[axis]
+                    ]
+                key = tuple(key)
+                block = local_blocks[active_indices]
+                if key in blocks[lattice_site]:
+                    blocks[lattice_site][key] = blocks[lattice_site][key] + block
+                else:
+                    blocks[lattice_site][key] = block
+
+
+def _contract_active_support(active, sites, edges):
+    """Contract an active PEPO on a finite support with zero boundary legs."""
+    internal_directions = {site: set() for site in sites}
+    edge_labels = {}
+    for edge_label, (source, target, direction) in enumerate(edges):
+        source_site = sites[source]
+        target_site = sites[target]
+        internal_directions[source_site].add(direction)
+        internal_directions[target_site].add(_OPPOSITE_DIRECTION[direction])
+        edge_labels[(source_site, direction)] = edge_label
+        edge_labels[(target_site, _OPPOSITE_DIRECTION[direction])] = edge_label
+
+    local_dim = active.physical_dim
+    bond_dim = active.bond_dim
+    next_physical_label = len(edges)
+    operands = []
+    row_labels = []
+    column_labels = []
+    for site_index, site in enumerate(sites):
+        directions = active.site_directions[site]
+        role_directions = tuple(
+            direction
+            for direction in directions
+            if direction in internal_directions[site]
+        )
+        labels = [edge_labels[(site, direction)] for direction in role_directions]
+        row_label = next_physical_label
+        column_label = next_physical_label + 1
+        next_physical_label += 2
+        labels.extend((row_label, column_label))
+        row_labels.append(row_label)
+        column_labels.append(column_label)
+        factor = np.zeros(
+            (bond_dim,) * len(role_directions) + (local_dim, local_dim),
+            dtype=next(iter(active.blocks[site].values())).dtype,
+        )
+        directions_to_axis = {direction: axis for axis, direction in enumerate(directions)}
+        for key, block in active.blocks[site].items():
+            if any(
+                key[axis] != 0
+                for direction, axis in directions_to_axis.items()
+                if direction not in internal_directions[site]
+            ):
+                continue
+            sector_indices = tuple(
+                key[directions_to_axis[direction]]
+                for direction in role_directions
+            )
+            factor[sector_indices] += block
+        operands.extend((factor, labels))
+
+    result = np.einsum(
+        *operands,
+        row_labels + column_labels,
+        optimize=True,
+    )
+    return result.reshape(local_dim**len(sites), local_dim**len(sites))
+
+
+def _add_generic_cluster_levels(
+    blocks,
+    allocator,
+    plan,
+    one_site_exp,
+    twosite_op,
+    onesite_op,
+    beta,
+):
+    """Add generic connected-cluster corrections from P=5 through P."""
+    residuals_by_order = {}
+    targets_by_order = {}
+    ranks_by_order = {}
+    counts_by_order = {}
+    for cluster_order in range(5, plan.order + 1):
+        level_residuals = []
+        level_targets = []
+        level_ranks = []
+        cluster_count = 0
+        # Each order subtracts the complete lower-order active PEPO. This is
+        # important once P exceeds five: P=6 must include the P=5 correction
+        # before solving its own residual, rather than jumping from P=4.
+        lower_active = ActivePEPOBlocks(
+            lx=plan.lx,
+            ly=plan.ly,
+            cyclic=plan.cyclic,
+            bond_dim=allocator.next_sector,
+            physical_dim=one_site_exp.shape[0],
+            site_directions=plan.site_directions,
+            blocks={
+                site: dict(site_blocks)
+                for site, site_blocks in blocks.items()
+            },
+        )
+        for shape in generate_connected_cluster_shapes(
+            cluster_order,
+            min_sites=cluster_order,
+            quotient_rotations=plan.symmetry == "C4",
+        ):
+            shape_variants = (
+                _cluster_shape_c4_orbit(shape)
+                if plan.symmetry == "C4"
+                else ((shape, tuple(range(shape.nsites)), 0),)
+            )
+            variant_data = tuple(
+                (
+                    variant,
+                    source_to_target,
+                    turns,
+                    _cluster_shape_embeddings(
+                        variant,
+                        plan.lx,
+                        plan.ly,
+                        plan.cyclic,
+                    ),
+                )
+                for variant, source_to_target, turns in shape_variants
+            )
+            variant_data = tuple(data for data in variant_data if data[3])
+            if not variant_data:
+                continue
+
+            # Pick an orientation that actually embeds in the finite lattice
+            # as the solve representative. On rectangular lattices a rotated
+            # representative may have no embedding, while its partner does.
+            source_shape, _, _, source_embeddings = variant_data[0]
+            source_hamiltonian = _tree_hamiltonian(
+                source_shape.nsites,
+                source_shape.edges,
+                twosite_op,
+                onesite_op,
+            )
+            source_exact = _expm(
+                -beta * source_hamiltonian,
+                np.asarray(one_site_exp).dtype,
+            )
+            source_lower = _contract_active_support(
+                lower_active,
+                source_embeddings[0],
+                source_shape.edges,
+            )
+            source_residual = source_exact - source_lower
+            source_norm = float(np.linalg.norm(source_residual))
+            cluster_count += sum(len(data[3]) for data in variant_data)
+            if source_norm == 0.0:
+                continue
+            factorization_cache = {}
+
+            for variant, _, _, embeddings in variant_data:
+                local_hamiltonian = _tree_hamiltonian(
+                    variant.nsites,
+                    variant.edges,
+                    twosite_op,
+                    onesite_op,
+                )
+                exact = _expm(
+                    -beta * local_hamiltonian,
+                    np.asarray(one_site_exp).dtype,
+                )
+                local_lower = _contract_active_support(
+                    lower_active,
+                    embeddings[0],
+                    variant.edges,
+                )
+                residual = exact - local_lower
+                residual_norm = float(np.linalg.norm(residual))
+                if residual_norm == 0.0:
+                    continue
+
+                if plan.fit_method is not None:
+                    fit_method = (
+                        "als"
+                        if plan.fit_method == "als" or not variant.is_tree
+                        else "tree"
+                    )
+                    fit_seed = plan.fit_seed
+                    if fit_seed is not None:
+                        fit_seed += cluster_order + sum(
+                            (index + 1) * (x + 17 * y)
+                            for index, (x, y) in enumerate(variant.sites)
+                        )
+                    fitted = _quimb_factorize_operator(
+                        residual,
+                        variant.edges,
+                        variant.nsites,
+                        one_site_exp.shape[0],
+                        method=fit_method,
+                        max_tree_rank=plan.max_tree_rank,
+                        max_loop_rank=plan.max_loop_rank,
+                        fit_steps=plan.fit_steps,
+                        fit_tol=plan.fit_tol,
+                        fit_solver_maxiter=plan.fit_solver_maxiter,
+                        fit_seed=fit_seed,
+                    )
+                    if fitted is None:
+                        continue
+                    (
+                        local_tensors,
+                        edge_ranks,
+                        cluster_rank,
+                        factorization_error,
+                        factorization_target,
+                    ) = fitted
+                    sectors = {
+                        edge_index: allocator.allocate(rank)
+                        for edge_index, rank in edge_ranks.items()
+                    }
+                    _add_graph_factor_blocks(
+                        blocks,
+                        plan.site_directions,
+                        embeddings,
+                        variant.edges,
+                        local_tensors,
+                        sectors,
+                        one_site_exp.shape[0],
+                    )
+                    level_residuals.append(float(factorization_error))
+                    level_targets.append(float(factorization_target))
+                    level_ranks.append(cluster_rank)
+                    continue
+
+                source_to_target, turns = _shape_rotation_map(
+                    source_shape,
+                    variant,
+                )
+                site_order = tuple(np.argsort(np.asarray(source_to_target)))
+                transformed = _permute_operator_sites(
+                    source_residual,
+                    site_order,
+                    one_site_exp.shape[0],
+                )
+                use_transformed = np.allclose(
+                    residual,
+                    transformed,
+                    rtol=1e-10,
+                    atol=1e-12,
+                )
+                cache_key = (
+                    source_shape.sites,
+                    plan.max_tree_rank,
+                )
+                if use_transformed and cache_key in factorization_cache:
+                    (
+                        cached_tensors,
+                        cached_parent,
+                        cached_parent_direction,
+                        cached_children,
+                        cached_ranks,
+                        tree_rank,
+                        factorization_error,
+                        factorization_target,
+                    ) = factorization_cache[cache_key]
+                    (
+                        local_tensors,
+                        parent,
+                        parent_direction,
+                        children,
+                    ) = _transform_tree_factorization(
+                        cached_tensors,
+                        cached_parent,
+                        cached_parent_direction,
+                        cached_children,
+                        source_to_target,
+                        turns,
+                    )
+                    ranks = {
+                        source_to_target[source]: rank
+                        for source, rank in cached_ranks.items()
+                    }
+                else:
+                    (
+                        local_tensors,
+                        parent,
+                        parent_direction,
+                        children,
+                        ranks,
+                        tree_rank,
+                        factorization_error,
+                        factorization_target,
+                    ) = _tree_factorize_operator(
+                        residual,
+                        variant.edges,
+                        variant.nsites,
+                        one_site_exp.shape[0],
+                        plan.max_tree_rank,
+                    )
+                    if local_tensors is None:
+                        continue
+                    if use_transformed:
+                        factorization_cache[cache_key] = (
+                            local_tensors,
+                            parent,
+                            parent_direction,
+                            children,
+                            ranks,
+                            tree_rank,
+                            factorization_error,
+                            factorization_target,
+                        )
+                if local_tensors is None:
+                    continue
+                level_residuals.append(float(factorization_error))
+                level_targets.append(float(factorization_target))
+                tree_directions = {}
+                sectors = {}
+                for child, parent_site in parent.items():
+                    if parent_site is None:
+                        continue
+                    direction = parent_direction[child]
+                    tree_directions[(parent_site, child)] = direction
+                    tree_directions[(child, parent_site)] = _OPPOSITE_DIRECTION[
+                        direction
+                    ]
+                    sectors[child] = allocator.allocate(ranks[child])
+                _add_tree_factor_blocks(
+                    blocks,
+                    plan.site_directions,
+                    embeddings,
+                    local_tensors,
+                    parent,
+                    tree_directions,
+                    sectors,
+                    one_site_exp.shape[0],
+                )
+                level_ranks.append(tree_rank)
+
+        residuals_by_order[cluster_order] = level_residuals
+        targets_by_order[cluster_order] = level_targets
+        ranks_by_order[cluster_order] = level_ranks
+        counts_by_order[cluster_order] = cluster_count
+    return (
+        residuals_by_order,
+        targets_by_order,
+        ranks_by_order,
+        counts_by_order,
+    )
+
+
 @dataclass
 class ClusterExpansionPlan:
     """Reusable geometry and symmetry plan for dense cluster-expansion PEPOs.
@@ -3003,8 +4528,15 @@ class ClusterExpansionPlan:
     beta-dependent local exponentials and residual solves are performed by
     :meth:`build`. Set ``materialize=False`` to retain the sparse active-block
     representation instead of immediately creating dense Quimb tensors.
-    Through order four this includes tree clusters and every geometrically
-    present four-site plaquette loop.
+    Through order four this includes the specialized tree and plaquette
+    implementations. Orders five through nine use the generic
+    connected-subcluster residual and topology-aware spanning-tree
+    factorization. With ``symmetry="C4"``, rotated generic shapes reuse a
+    transported factorization when the lower-order residual has the same
+    symmetry. Set ``fit_method="quimb"`` to use Quimb tree fitting for
+    generic tree clusters and complex ALS fitting for generic loop clusters.
+    This is a numerical, non-differentiable path intended for
+    coefficient-dependent real-time or imaginary-time builds.
     """
 
     lx: int
@@ -3016,8 +4548,14 @@ class ClusterExpansionPlan:
     edge_cutoff: float = 0.0
     max_edge_rank: int | None = None
     max_tree_rank: int | None = None
+    max_loop_rank: int | None = None
     symmetry: str | None = None
     dtype: object | None = None
+    fit_method: str | None = None
+    fit_steps: int = 100
+    fit_tol: float = 1e-10
+    fit_solver_maxiter: int = 8
+    fit_seed: int | None = 0
     last_report: ClusterExpansionReport | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
@@ -3029,9 +4567,9 @@ class ClusterExpansionPlan:
         self.order = int(self.order)
         if self.order < 1:
             raise ValueError("order must be >= 1.")
-        if self.order > 4:
+        if self.order > 9:
             raise NotImplementedError(
-                "dense cluster-expansion PEPOs currently support orders 1 through 4; "
+                "dense cluster-expansion PEPOs currently support orders 1 through 9; "
                 "higher-level clusters are not implemented yet."
             )
         if self.edge_cutoff < 0.0:
@@ -3040,8 +4578,25 @@ class ClusterExpansionPlan:
             self.max_edge_rank = _validate_shape(self.max_edge_rank, "max_edge_rank")
         if self.max_tree_rank is not None:
             self.max_tree_rank = _validate_shape(self.max_tree_rank, "max_tree_rank")
+        if self.max_loop_rank is not None:
+            self.max_loop_rank = _validate_shape(self.max_loop_rank, "max_loop_rank")
         if self.symmetry not in (None, "C4"):
             raise ValueError("symmetry must be None or 'C4'.")
+        if self.fit_method not in (None, "quimb", "tree", "als"):
+            raise ValueError(
+                "fit_method must be None, 'quimb', 'tree', or 'als'."
+            )
+        self.fit_steps = _validate_shape(self.fit_steps, "fit_steps")
+        self.fit_solver_maxiter = _validate_shape(
+            self.fit_solver_maxiter,
+            "fit_solver_maxiter",
+        )
+        if self.fit_tol <= 0.0:
+            raise ValueError("fit_tol must be > 0.")
+        if self.fit_seed is not None:
+            if not isinstance(self.fit_seed, Integral) or self.fit_seed < 0:
+                raise ValueError("fit_seed must be a non-negative integer or None.")
+            self.fit_seed = int(self.fit_seed)
 
         self.onesite_op = _as_square_operator(self.onesite_op, "onesite_op", dtype=self.dtype)
         local_dim = self.onesite_op.shape[0]
@@ -3094,6 +4649,19 @@ class ClusterExpansionPlan:
         stars = tuple(representative for representative, _ in self.triple_orbits)
         paths = tuple(representative for representative, _ in self.path_orbits)
         return stars + paths
+
+    @property
+    def connected_cluster_shapes(self):
+        """Return the generic geometry inventory through ``self.order``.
+
+        This is an inspection and planning surface for the generic higher-order
+        residual solver. The specialized order-four orbit metadata remains
+        separate from the generic spanning-tree factorization.
+        """
+        return generate_connected_cluster_shapes(
+            self.order,
+            quotient_rotations=self.symmetry == "C4",
+        )
 
     def build(self, beta, *, materialize=True, return_report=False):
         """Build at ``beta`` using the cached topology and symmetry plan."""
@@ -3447,6 +5015,26 @@ class ClusterExpansionPlan:
                         (upper_bond, left_bond),
                     )
 
+        generic_residuals = {}
+        generic_targets = {}
+        generic_ranks = {}
+        generic_cluster_counts = {}
+        if self.order >= 5:
+            (
+                generic_residuals,
+                generic_targets,
+                generic_ranks,
+                generic_cluster_counts,
+            ) = _add_generic_cluster_levels(
+                blocks,
+                allocator,
+                self,
+                one_site_exp,
+                twosite_op,
+                onesite_op,
+                beta,
+            )
+
         active = ActivePEPOBlocks(
             lx=self.lx,
             ly=self.ly,
@@ -3510,6 +5098,23 @@ class ClusterExpansionPlan:
                     for residual, target in zip(loop_residuals, loop_targets)
                 )
             )
+        for cluster_order, level_residuals in generic_residuals.items():
+            if not level_residuals:
+                continue
+            generic_label = f"generic_order_{cluster_order}"
+            level_targets = generic_targets[cluster_order]
+            residual_norms[generic_label] = float(max(level_residuals))
+            relative_residuals[generic_label] = float(
+                max(
+                    residual / max(target, np.finfo(float).eps)
+                    for residual, target in zip(level_residuals, level_targets)
+                )
+            )
+        generic_ranks_flat = tuple(
+            rank
+            for level_ranks in generic_ranks.values()
+            for rank in level_ranks
+        )
         counts = {
             "edge": sum(
                 direction in _POSITIVE_DIRECTIONS
@@ -3530,6 +5135,11 @@ class ClusterExpansionPlan:
             "four_site_tree_solved": (
                 solved_tree_groups if self.order >= 4 else 0
             ),
+            **{
+                f"generic_order_{cluster_order}": count
+                for cluster_order, count in generic_cluster_counts.items()
+            },
+            "generic_tree_solved": len(generic_ranks_flat),
         }
         if self.order >= 4:
             for _, orbit in self.triple_orbits:
@@ -3547,7 +5157,7 @@ class ClusterExpansionPlan:
             order=self.order,
             local_dim=one_site_exp.shape[0],
             edge_rank=start_factors.shape[0],
-            tree_rank=max(path_ranks, default=0),
+            tree_rank=max((*path_ranks, *generic_ranks_flat), default=0),
             loop_rank=loop_rank,
             cluster_counts=counts,
             residual_norms=residual_norms,
@@ -3559,6 +5169,55 @@ class ClusterExpansionPlan:
         self.last_report = report
         result = active.to_pepo() if materialize else active
         return (result, report) if return_report else result
+
+    def build_composed(
+        self,
+        beta,
+        *,
+        composition="yoshida4",
+        compress=False,
+        **compress_opts,
+    ):
+        """Build a fractional-step composition of elementary PEPOs.
+
+        ``composition="yoshida4"`` uses three order-three cluster-expansion
+        PEPOs with coefficients ``(a, b, a)`` where
+
+        ``a = 1 / (2 - 2**(1/3))`` and ``b = -2**(1/3) * a``.
+
+        The order-three cluster expansion is accurate through second order,
+        so this symmetric triple jump cancels its leading third-order error.
+        The intermediate PEPOs are multiplied with Quimb's native
+        :meth:`PEPO.apply`; no global dense operator is constructed. Virtual
+        bonds grow multiplicatively unless ``compress=True`` is requested.
+
+        Parameters
+        ----------
+        beta : scalar
+            Target exponential convention ``exp(-beta * H)``.
+        composition : {"yoshida4"}, optional
+            Fractional-step composition policy.
+        compress : bool, optional
+            Whether to compress each intermediate Quimb PEPO product.
+        compress_opts
+            Options forwarded to Quimb when ``compress=True``.
+        """
+        if self.order != 3:
+            raise ValueError(
+                "the Yoshida fourth-order composition requires a plan with order=3."
+            )
+        if composition != "yoshida4":
+            raise ValueError("composition must be 'yoshida4'.")
+
+        layers = tuple(
+            self.build(coefficient * beta, materialize=True)
+            for coefficient in _yoshida4_coefficients()
+        )
+        return compose_pepo_layers(
+            layers,
+            compress=compress,
+            **compress_opts,
+        )
 
 
 def build_cluster_expansion_pepo(
@@ -3573,8 +5232,14 @@ def build_cluster_expansion_pepo(
     edge_cutoff=0.0,
     max_edge_rank=None,
     max_tree_rank=None,
+    max_loop_rank=None,
     dtype=None,
     symmetry=None,
+    fit_method=None,
+    fit_steps=100,
+    fit_tol=1e-10,
+    fit_solver_maxiter=8,
+    fit_seed=0,
     materialize=True,
     return_report=False,
 ):
@@ -3588,6 +5253,12 @@ def build_cluster_expansion_pepo(
     three-site path and corner residual, filling the corresponding two-active
     virtual entries of the PEPO tensor. Order four adds four-site T-shaped
     and non-loop path tree residuals plus present plaquette-loop residuals.
+    Orders five through nine add all finite-lattice connected shapes at the
+    requested order using recursive lower-PEPO contraction and an
+    SVD-factorized spanning tree. With ``symmetry="C4"``, rotated shapes
+    reuse a transported factorization when their residuals are symmetry
+    equivalent. Set ``fit_method="quimb"`` to fit generic tree residuals
+    with Quimb's tree solver and generic loop residuals with complex ALS.
     Plaquettes use an exact fixed-rank tensor-ring factorization.
 
     Parameters
@@ -3598,8 +5269,8 @@ def build_cluster_expansion_pepo(
         Real or complex imaginary-time step.
     twosite_op, onesite_op : array-like
         Dense square matrices of shapes ``(d**2, d**2)`` and ``(d, d)``.
-    order : {1, 2, 3, 4}, default=3
-        Largest connected cluster size. Orders above four require higher-level
+    order : {1, 2, 3, 4, 5, 6, 7, 8, 9}, default=3
+        Largest connected cluster size. Orders above nine require higher-level
         cluster construction.
     cyclic : bool or tuple[bool, bool], default=False
         Whether to close both lattice directions, or close x and y
@@ -3609,13 +5280,31 @@ def build_cluster_expansion_pepo(
     max_edge_rank : int | None, default=None
         Optional cap on the number of retained two-site channels.
     max_tree_rank : int | None, default=None
-        Optional cap on the internal SVD rank of four-site path clusters.
+        Optional cap on internal SVD ranks of four-site paths and generic
+        order-five through order-nine spanning-tree clusters.
+    max_loop_rank : int | None, default=None
+        Optional virtual rank for generic loop clusters when Quimb fitting is
+        enabled. If omitted, the local operator rank is used as the loop
+        ansatz rank.
     dtype : numpy dtype | None, default=None
         Optional dense dtype for all local tensors.
     symmetry : {None, "C4"}, default=None
         Reduce equivalent tree orientations using a symmetric virtual
         factorization. This is appropriate for square-lattice ITF and other
         site-symmetric C4 models.
+    fit_method : {None, "quimb", "tree", "als"}, default=None
+        Use Quimb fitting for generic order-five through order-nine clusters.
+        ``"quimb"`` selects ``tree`` for tree shapes and ``als`` for loops.
+        This numerical path is not coefficient-differentiable.
+    fit_steps : int, default=100
+        Maximum Quimb fitting sweeps per generic cluster.
+    fit_tol : float, default=1e-10
+        Quimb fitting stopping tolerance.
+    fit_solver_maxiter : int, default=8
+        Iterative local-solver iterations for Quimb ALS.
+    fit_seed : int | None, default=0
+        Seed for Quimb loop-ansatz initialization, or ``None`` for an
+        unseeded initializer.
     return_report : bool, default=False
         Return ``(pepo_or_active_blocks, ClusterExpansionReport)``.
     materialize : bool, default=True
@@ -3628,9 +5317,126 @@ def build_cluster_expansion_pepo(
 
     Notes
     -----
-    This implementation includes four-site plaquette loops and an active
+    This implementation includes four-site plaquette loops, generic
+    order-five through order-nine residual/factorization paths, and an active
     block/Symmray materialization boundary. Higher clusters and mixed-charge
     component splitting remain separate stages.
+    """
+    plan = ClusterExpansionPlan(
+        lx,
+        ly,
+        twosite_op,
+        onesite_op,
+        order=order,
+        cyclic=cyclic,
+        edge_cutoff=edge_cutoff,
+        max_edge_rank=max_edge_rank,
+        max_tree_rank=max_tree_rank,
+        max_loop_rank=max_loop_rank,
+        symmetry=symmetry,
+        dtype=dtype,
+        fit_method=fit_method,
+        fit_steps=fit_steps,
+        fit_tol=fit_tol,
+        fit_solver_maxiter=fit_solver_maxiter,
+        fit_seed=fit_seed,
+    )
+    return plan.build(
+        beta,
+        materialize=materialize,
+        return_report=return_report,
+    )
+
+
+def build_model_cluster_expansion_pepo(
+    lx,
+    ly,
+    beta,
+    model,
+    *,
+    order=3,
+    cyclic=False,
+    edge_cutoff=0.0,
+    max_edge_rank=None,
+    max_tree_rank=None,
+    max_loop_rank=None,
+    dtype=None,
+    symmetry=None,
+    fit_method=None,
+    fit_steps=100,
+    fit_tol=1e-10,
+    fit_solver_maxiter=8,
+    fit_seed=0,
+    materialize=True,
+    return_report=False,
+):
+    """Build a finite cluster PEPO from a dense model adapter.
+
+    ``model`` may be a :class:`ClusterModelAdapter`, a mapping containing
+    ``twosite_op`` and ``onesite_op`` (or their ``edge_op`` and ``onsite_op``
+    aliases), or an object exposing those attributes.  If ``symmetry`` is
+    omitted, the adapter's finite symmetry metadata is used.
+
+    This convenience layer keeps model definitions separate from the dense
+    cluster solver and is intentionally finite and non-fermionic.
+    """
+    adapter = adapt_cluster_model(model, symmetry=symmetry)
+    if symmetry is None:
+        symmetry = adapter.symmetry
+    return build_cluster_expansion_pepo(
+        lx,
+        ly,
+        beta,
+        adapter.twosite_op,
+        adapter.onesite_op,
+        order=order,
+        cyclic=cyclic,
+        edge_cutoff=edge_cutoff,
+        max_edge_rank=max_edge_rank,
+        max_tree_rank=max_tree_rank,
+        max_loop_rank=max_loop_rank,
+        dtype=dtype,
+        symmetry=symmetry,
+        fit_method=fit_method,
+        fit_steps=fit_steps,
+        fit_tol=fit_tol,
+        fit_solver_maxiter=fit_solver_maxiter,
+        fit_seed=fit_seed,
+        materialize=materialize,
+        return_report=return_report,
+    )
+
+
+def compose_cluster_expansion_pepo(
+    lx,
+    ly,
+    beta,
+    twosite_op,
+    onesite_op,
+    *,
+    order=3,
+    composition="yoshida4",
+    cyclic=False,
+    edge_cutoff=0.0,
+    max_edge_rank=None,
+    max_tree_rank=None,
+    dtype=None,
+    symmetry=None,
+    compress=False,
+    **compress_opts,
+):
+    """Build a higher-order PEPO by composing cluster-expansion layers.
+
+    The default Yoshida composition uses three order-three (second-order
+    accurate) cluster-expansion PEPOs at fractional signed steps. It is a
+    direct Quimb PEPO composition and is useful when a higher-order
+    elementary cluster construction is less attractive than a few
+    multiplicative layers. The resulting uncompressed virtual bond dimension
+    grows with the number of layers; use ``compress=True`` with suitable
+    Quimb compression options when that tradeoff is acceptable.
+
+    ``order`` must be ``3`` because the fourth-order composition is derived
+    for the order-three cluster expansion.
     """
     plan = ClusterExpansionPlan(
         lx,
@@ -3645,10 +5451,11 @@ def build_cluster_expansion_pepo(
         symmetry=symmetry,
         dtype=dtype,
     )
-    return plan.build(
+    return plan.build_composed(
         beta,
-        materialize=materialize,
-        return_report=return_report,
+        composition=composition,
+        compress=compress,
+        **compress_opts,
     )
 
 
@@ -3664,8 +5471,14 @@ def build_itf_cluster_expansion_pepo(
     edge_cutoff=0.0,
     max_edge_rank=None,
     max_tree_rank=None,
+    max_loop_rank=None,
     dtype="float64",
     symmetry="C4",
+    fit_method=None,
+    fit_steps=100,
+    fit_tol=1e-10,
+    fit_solver_maxiter=8,
+    fit_seed=0,
     materialize=True,
     return_report=False,
 ):
@@ -3687,8 +5500,14 @@ def build_itf_cluster_expansion_pepo(
         edge_cutoff=edge_cutoff,
         max_edge_rank=max_edge_rank,
         max_tree_rank=max_tree_rank,
+        max_loop_rank=max_loop_rank,
         symmetry=symmetry,
         dtype=dtype,
+        fit_method=fit_method,
+        fit_steps=fit_steps,
+        fit_tol=fit_tol,
+        fit_solver_maxiter=fit_solver_maxiter,
+        fit_seed=fit_seed,
         materialize=materialize,
         return_report=return_report,
     )

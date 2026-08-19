@@ -20,6 +20,8 @@ builders. The rule is simple:
 | One PEPO exponential | `basis.exp(step, ...)` | `ActivePEPOBlocks` by default |
 | Repeated PEPO exponentials | `basis.compile_exp().exp(step, ...)` | Cached `CompiledPEPOExp` call |
 | Dense PEPO materialization | `active_blocks.to_pepo()` or `materialize=True` | Quimb `PEPO` |
+| Coefficient-dependent real-time PEPO | `build_real_time_cluster_expansion_pepo(...)` | Quimb `PEPO` or active blocks |
+| Fractional-step PEPO composition | `compose_cluster_expansion_pepo(...)` | Quimb `PEPO` |
 
 The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
@@ -173,7 +175,19 @@ pepo = active.to_pepo()
 
 `ClusterExpansionReport` contains local residual and storage diagnostics. Its
 residual norms are local factorization diagnostics, not a global PEPO error
-bound. The dense implementation also stops at tree order four.
+bound. The dense implementation includes recursive generic order-five
+through order-nine tree paths; higher orders remain unsupported. Finite dense
+model adapters are available through `ClusterModelAdapter` and
+`build_model_cluster_expansion_pepo`.
+
+For local coefficient lists and real-time evolution, use
+`build_real_time_cluster_expansion_pepo`. It assembles the coefficient-weighted
+one- and two-site terms first, then uses the cluster convention with
+`beta=1j * time`, targeting `exp(-1j * time * H)` for the summed `H`.
+With `fit_method="quimb"`, generic tree residuals use Quimb tree fitting and
+generic loop residuals use complex ALS. This numerical path is not
+coefficient-differentiable; its local fit diagnostics are returned in
+`ClusterExpansionReport`.
 
 ## Caching and autodiff contract
 

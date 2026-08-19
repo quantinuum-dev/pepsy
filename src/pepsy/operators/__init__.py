@@ -55,11 +55,19 @@ _GATE_EXPORTS = [
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
 _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
 _SYMBOL_MODULES["build_cluster_expansion_pepo"] = ".cluster"
+_SYMBOL_MODULES["build_model_cluster_expansion_pepo"] = ".cluster"
 _SYMBOL_MODULES["build_itf_cluster_expansion_pepo"] = ".cluster"
+_SYMBOL_MODULES["build_real_time_cluster_expansion_pepo"] = ".cluster"
+_SYMBOL_MODULES["compose_pepo_layers"] = ".cluster"
+_SYMBOL_MODULES["compose_cluster_expansion_pepo"] = ".cluster"
+_SYMBOL_MODULES["generate_connected_cluster_shapes"] = ".cluster"
 _CLUSTER_EXPORTS = [
     "ActivePEPOBlocks",
+    "ConnectedClusterShape",
     "ClusterExpansionReport",
     "ClusterExpansionPlan",
+    "ClusterModelAdapter",
+    "adapt_cluster_model",
     "PauliPEPOTerm",
     "PauliPEPOBasis",
     "CompiledPEPOExp",
@@ -97,7 +105,12 @@ _SUBMODULES = (
 __all__ = [
     *_GATE_EXPORTS,
     "build_cluster_expansion_pepo",
+    "build_model_cluster_expansion_pepo",
     "build_itf_cluster_expansion_pepo",
+    "build_real_time_cluster_expansion_pepo",
+    "compose_pepo_layers",
+    "compose_cluster_expansion_pepo",
+    "generate_connected_cluster_shapes",
     *_CLUSTER_EXPORTS,
     "ham_tn",
     *_AUTOMATON_EXPORTS,
