@@ -7865,6 +7865,16 @@ def _fermion_backend_anchor(*values):
     return np.asarray(0.0j)
 
 
+def _fermion_scalar_anchor(value, dtype):
+    """Represent a plain scalar in the requested native fermion dtype."""
+    if hasattr(value, "shape") and not isinstance(value, (str, bytes)):
+        return value
+    dtype = np.dtype(dtype)
+    if dtype not in {np.dtype("complex64"), np.dtype("float32")}:
+        return value
+    return np.asarray(value, dtype=dtype)
+
+
 def _fermion_complex_like(value):
     """Return a complex scalar on ``value``'s backend for local builders."""
     if isinstance(value, np.ndarray):
@@ -8790,6 +8800,9 @@ class Fermion:
         if not entries:
             raise ValueError("terms must contain at least one local term.")
 
+        if like is None:
+            like = _fermion_scalar_anchor(0.0, self.dtype)
+
         inferred_sites = []
         normalized = []
         for entry in entries:
@@ -9426,7 +9439,13 @@ class Fermion:
                     "operator_gate requires a charge-neutral operator; "
                     f"got charge {charge!r} for symmetry {self.symmetry!r}."
                 )
-            gate = _gate_from_term(term, theta, imaginary=imaginary)
+            gate = _gate_from_term(
+                term,
+                _fermion_scalar_anchor(theta, self.dtype)
+                if self.to_backend is None
+                else theta,
+                imaginary=imaginary,
+            )
             return _apply_to_array_blocks(gate, self.to_backend)
 
         if operator_key[1] is None:
@@ -9505,7 +9524,7 @@ class Fermion:
         if U is None:
             raise TypeError("interaction_gate requires explicit U=... .")
         U = U if site is None else _node_parameter(U, site)
-        theta = dt * U
+        theta = _fermion_scalar_anchor(dt * U, self.dtype)
 
         def build():
             gate = fermion_interaction_param_gen(
@@ -9533,6 +9552,8 @@ class Fermion:
         if site is not None:
             U = _node_parameter(U, site)
             mu = _node_parameter(mu, site)
+
+        dt = _fermion_scalar_anchor(dt, self.dtype)
 
         if self.spinful:
             if U is None:
@@ -9566,6 +9587,8 @@ class Fermion:
         if t is None:
             raise TypeError("hopping_gate requires explicit t=... .")
 
+        dt = _fermion_scalar_anchor(dt, self.dtype)
+
         def build():
             if not self.spinful:
                 gate = _spinless_hopping_gate(
@@ -9595,7 +9618,7 @@ class Fermion:
         """
         if V is None:
             raise TypeError("density_gate requires explicit V=... .")
-        theta = dt * V
+        theta = _fermion_scalar_anchor(dt * V, self.dtype)
 
         def build():
             if self.spinful:
@@ -9620,6 +9643,8 @@ class Fermion:
             diagonal = (0.0, -mu_up, -mu_down, -mu_up - mu_down)
         else:
             diagonal = (0.0, -mu)
+
+        dt = _fermion_scalar_anchor(dt, self.dtype)
 
         def build():
             gate = _fermion_diagonal_gate_param_gen(
@@ -9762,6 +9787,12 @@ class Fermion:
     def param_gate(self, name, params, *, imaginary=False, **kwargs):
         """Build a gate from a Quimb-style parameter sequence."""
         name = str(name).lower().replace("-", "_")
+        params = tuple(params)
+        if params:
+            params = (
+                _fermion_scalar_anchor(params[0], self.dtype),
+                *params[1:],
+            )
 
         def finish(gate):
             if kwargs:
@@ -9829,6 +9860,9 @@ class Fermion:
         entries = tuple(terms)
         if not entries:
             raise ValueError("terms must contain at least one local term.")
+
+        if like is None:
+            like = _fermion_scalar_anchor(0.0, self.dtype)
 
         if bases is not None:
             bases = tuple(tuple(basis) for basis in bases)
@@ -9899,7 +9933,11 @@ class Fermion:
             bases,
             self.physical_sectors,
             symmetry=self.symmetry,
-            dt=dt,
+            dt=(
+                _fermion_scalar_anchor(dt, self.dtype)
+                if like is None
+                else dt
+            ),
             imaginary=imaginary,
             like=like,
         )

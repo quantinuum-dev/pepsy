@@ -1437,6 +1437,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._mix_dmrg_failed_sweep = None
         self._last_dmrg_fit_diagnostics = None
         self._dmrg1_one_site_locked = False
+        # Native Symmray one-site writeback can retain duplicate fermionic
+        # dummy modes when a product-state DMRG1 warm-up has just saturated
+        # its bonds. Keep that narrow initialization case on two-site FIT;
+        # non-product native states retain the documented DMRG1 schedule.
+        self._dmrg1_native_product_two_site = (
+            self._dmrg_mode_alias == "dmrg1"
+            and self._is_native_fermionic_product_state(self.p)
+        )
         self.measurements = []
         self._rng = np.random.default_rng()
         self._unitary_previous_norm = None
@@ -1528,6 +1536,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cls._is_symmray_array(tensor.data)
             for tensor in getattr(tn, "tensors", ())
         )
+
+    @classmethod
+    def _is_native_fermionic_product_state(cls, p):
+        """Return whether ``p`` is a native Symmray fermionic product MPS."""
+        if not cls._has_symmray_data(p):
+            return False
+        is_fermionic = getattr(p, "isfermionic", None)
+        if not callable(is_fermionic) or not is_fermionic():
+            return False
+        try:
+            return cls._effective_max_bond(p) <= 1
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _mps_data_is_finite(p):
@@ -1648,6 +1669,133 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # zero and silently disable structural-zero pruning.
         return structural_cutoff, "abs"
 
+    @staticmethod
+    def _native_needs_safe_qr(p):
+        """Return whether native QR needs the low-precision phase guard."""
+        dtype_name = str(getattr(p, "dtype", "")).lower()
+        return "complex64" in dtype_name or "float32" in dtype_name
+
+    @staticmethod
+    def _native_canonize_bond(p, left, right):
+        """Canonize one native bond without phase-normalizing QR diagonals."""
+        qtn.tensor_canonize_bond(
+            p[left],
+            p[right],
+            stabilized=False,
+        )
+
+    def _native_canonicalize_pair(self, p, where, *, info=None):
+        """Safely move a native MPS center around a target pair."""
+        if info is None:
+            info = {}
+        i, j = min(where), max(where)
+        current = info.get("cur_orthog")
+        if current == "calc":
+            current = None
+
+        if current is None:
+            current = p.calc_current_orthog_center()
+
+        if current is None:
+            for site in range(0, i):
+                self._native_canonize_bond(p, site, site + 1)
+            for site in range(p.L - 1, j, -1):
+                self._native_canonize_bond(p, site, site - 1)
+            info["cur_orthog"] = (i, j)
+            return
+
+        if isinstance(current, Integral):
+            cmin = cmax = int(current)
+        else:
+            cmin, cmax = min(current), max(current)
+
+        if i > cmin:
+            for site in range(cmin, i):
+                self._native_canonize_bond(p, site, site + 1)
+        else:
+            i = min(j, cmin)
+
+        if j < cmax:
+            for site in range(cmax, j, -1):
+                self._native_canonize_bond(p, site, site - 1)
+        else:
+            j = max(i, cmax)
+
+        info["cur_orthog"] = (i, j)
+
+    def _native_swap_site_to(self, p, site, target, *, info, compress_opts):
+        """Move one native site with safe per-bond canonicalization."""
+        if site == target:
+            return
+        if site < target:
+            sites = range(site, target)
+            absorb = "right"
+        else:
+            sites = range(site - 1, target - 1, -1)
+            absorb = "left"
+        swap_opts = dict(compress_opts)
+        swap_opts.setdefault("absorb", absorb)
+        for left in sites:
+            right = left + 1
+            self._native_canonicalize_pair(
+                p,
+                (left, right),
+                info=info,
+            )
+            p.swap_sites_with_compress_(
+                left,
+                right,
+                info=info,
+                **swap_opts,
+            )
+
+    def _native_gate_with_auto_swap(
+        self,
+        p,
+        gate,
+        where,
+        *,
+        info,
+        swap_back,
+        **compress_opts,
+    ):
+        """Apply a native gate while avoiding unsafe complex64 QR phases."""
+        i, j = where
+        if i > j:
+            i, j = j, i
+            final_gate_where = (i + 1, i)
+            absorb = "left"
+        else:
+            final_gate_where = (i, i + 1)
+            absorb = "right"
+
+        gate_opts = dict(compress_opts)
+        gate_opts.setdefault("absorb", absorb)
+        need_to_swap = i + 1 != j
+        if need_to_swap:
+            self._native_swap_site_to(
+                p,
+                j,
+                i + 1,
+                info=info,
+                compress_opts=compress_opts,
+            )
+
+        self._native_canonicalize_pair(p, (i, i + 1), info=info)
+        p.gate_split_(gate, where=final_gate_where, **gate_opts)
+        info["cur_orthog"] = (i + 1, i + 1)
+
+        if need_to_swap and swap_back:
+            self._native_swap_site_to(
+                p,
+                i + 1,
+                j,
+                info=info,
+                compress_opts=compress_opts,
+            )
+
+        return p
+
     def _apply_symmray_auto_swap_gate(
         self,
         p,
@@ -1658,6 +1806,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode,
         max_bond=None,
         info=None,
+        swap_back=True,
     ):
         """Apply a Symmray two-site gate through quimb's block-aware swaps."""
         cutoff, cutoff_mode = self._symmray_structural_zero_cutoff(
@@ -1671,14 +1820,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         }
         if max_bond is not None:
             compress_opts["max_bond"] = max_bond
-        p.gate_with_auto_swap_(
+        if info is None:
+            info = self.info_c
+        if not self._native_needs_safe_qr(p):
+            p.gate_with_auto_swap_(
+                gate,
+                where,
+                info=info,
+                swap_back=swap_back,
+                **compress_opts,
+            )
+            return p
+        return self._native_gate_with_auto_swap(
+            p,
             gate,
             where,
-            info=self.info_c if info is None else info,
-            swap_back=True,
+            info=info,
+            swap_back=swap_back,
             **compress_opts,
         )
-        return p
 
     def _warm_start_native_fermionic_fit(
         self,
@@ -1959,6 +2119,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             xmax - xmin + 1,
         )
         if self._dmrg_mode_alias == "dmrg1" and active_block_size == 2:
+            if self._dmrg1_native_product_two_site:
+                return active_block_size
             if self._dmrg1_one_site_locked:
                 return 1
             if (
@@ -2034,6 +2196,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.norm_events = []
         self._norm_log_survival = 0.0
         self._dmrg1_one_site_locked = False
+        self._dmrg1_native_product_two_site = (
+            self._dmrg_mode_alias == "dmrg1"
+            and self._is_native_fermionic_product_state(self.p)
+        )
         self.qubits = list(range(int(getattr(self.p, "L", 0))))
         self.logical_order = list(self.qubits)
         self._persistent_layout_plan = None
@@ -2139,6 +2305,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
+        copied._dmrg1_native_product_two_site = (
+            self._dmrg1_native_product_two_site
+        )
         # ``MatrixProductState.copy()`` does not promise to preserve the
         # physical orthogonality centre. The constructor canonicalizes the
         # copied state, so its freshly initialized ``info_c`` is authoritative
@@ -2260,6 +2429,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.mode = new_mode
         self._dmrg_mode_alias = new_dmrg_alias
         self._dmrg_mode_block_size = new_dmrg_block_size
+        self._dmrg1_native_product_two_site = (
+            self._dmrg_mode_alias == "dmrg1"
+            and self._is_native_fermionic_product_state(self.p)
+        )
         if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
             self._dmrg1_one_site_locked = False
         if self.mode == "su":
@@ -2924,14 +3097,27 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             current_pos = current.index(logical_site)
             if current_pos == target_pos:
                 continue
-            self.p.swap_site_to_(
-                current_pos,
-                target_pos,
-                info=self.info_c,
-                method="svd",
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-            )
+            if self._has_symmray_data(self.p) and self._native_needs_safe_qr(self.p):
+                self._native_swap_site_to(
+                    self.p,
+                    current_pos,
+                    target_pos,
+                    info=self.info_c,
+                    compress_opts={
+                        "method": "svd",
+                        "cutoff": cutoff,
+                        "cutoff_mode": cutoff_mode,
+                    },
+                )
+            else:
+                self.p.swap_site_to_(
+                    current_pos,
+                    target_pos,
+                    info=self.info_c,
+                    method="svd",
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
             moved = current.pop(current_pos)
             current.insert(target_pos, moved)
 
@@ -7735,14 +7921,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.canonize_mps(p, (xmin, xmax))
 
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
-                p.gate_with_auto_swap_(
-                    gate,
-                    where,
-                    info=self.info_c,
-                    max_bond=self.chi,
-                    swap_back=swap_back,
-                    **compress_opts,
-                )
+                if self._has_symmray_data(p) and self._native_needs_safe_qr(p):
+                    self._apply_symmray_auto_swap_gate(
+                        p,
+                        gate,
+                        where,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        max_bond=self.chi,
+                        info=self.info_c,
+                        swap_back=swap_back,
+                    )
+                else:
+                    p.gate_with_auto_swap_(
+                        gate,
+                        where,
+                        info=self.info_c,
+                        max_bond=self.chi,
+                        swap_back=swap_back,
+                        **compress_opts,
+                    )
                 if not swap_back:
                     self._record_permutation_move(where)
 
