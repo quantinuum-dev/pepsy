@@ -395,6 +395,13 @@ execution additionally requires the backend's trajectory-copy contract; the
 current coalesced backends are `MpsOptimizer`, `MpsStabOptimizer`, and
 `TreeOptimizer`. Use independent MPI execution for `TreeStabOptimizer`.
 
+The same orchestration is available directly from `MpsOptimizer.run`,
+`MpsStabOptimizer.run`, `TreeOptimizer.run`, and `TreeStabOptimizer.run` by
+passing `shots=...` and `mpi=...`. Direct calls create fresh per-shot copies
+from the current optimizer state and leave the caller's state and queued
+stream unchanged. Use `MPIShotRunner` when the factory/stream needs to be
+shared across optimizer types or when constructing a reusable runner.
+
 ```python
 def observable(optimizer):
     # Define this for the optimizer backend you are using.

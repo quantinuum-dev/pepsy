@@ -146,6 +146,46 @@ def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
     assert optimizer.measurements == []
 
 
+def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
+    flip = np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    optimizer = pepsy.TreeOptimizer(
+        [(flip, 0)],
+        n=1,
+        chi=4,
+        run=False,
+    )
+    result = optimizer.run(
+        shots=3,
+        seed=47,
+        mpi=_FakeComm(),
+        workers=1,
+        progress=False,
+        retain="final",
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert result.local_shots == 3
+    assert len(result.local_result.optimizers) == 3
+    assert len(optimizer.G) == 1
+
+
+def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
+    optimizer = pepsy.TreeStabOptimizer(1, gates=[("x", 0)])
+    result = optimizer.run(
+        shots=3,
+        seed=48,
+        mpi=_FakeComm(),
+        workers=1,
+        progress=False,
+        retain="final",
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert result.local_shots == 3
+    assert len(result.local_result.optimizers) == 3
+    assert len(optimizer._queue) == 1
+
+
 def test_mps_run_auto_workers_is_available_without_mpi():
     optimizer = pepsy.MpsOptimizer(
         qtn.MPS_computational_state("0", dtype="complex128"),

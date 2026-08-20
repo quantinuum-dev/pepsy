@@ -261,6 +261,58 @@ def test_real_mpi_mps_optimizer_run_keyword():
 
 
 @pytest.mark.integration
+def test_real_mpi_tree_optimizer_run_keyword():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    flip = np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    optimizer = pepsy.TreeOptimizer(
+        [(flip, 0)],
+        n=1,
+        chi=4,
+        run=False,
+    )
+    result = optimizer.run(
+        shots=9,
+        seed=64,
+        mpi=comm,
+        workers="auto",
+        progress=False,
+        retain="final",
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert result.world_size == comm.Get_size()
+    assert result.reduce_sum(result.local_shots) == 9
+    assert len(result.local_result.optimizers) == result.local_shots
+    assert len(optimizer.G) == 1
+
+
+@pytest.mark.integration
+def test_real_mpi_tree_stabilizer_run_keyword():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+
+    optimizer = pepsy.TreeStabOptimizer(1, gates=[("x", 0)])
+    result = optimizer.run(
+        shots=9,
+        seed=65,
+        mpi=comm,
+        workers="auto",
+        progress=False,
+        retain="final",
+    )
+
+    assert isinstance(result, pepsy.MPIShotResult)
+    assert result.world_size == comm.Get_size()
+    assert result.reduce_sum(result.local_shots) == 9
+    assert len(result.local_result.optimizers) == result.local_shots
+    assert len(optimizer._queue) == 1
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "mode",
     (

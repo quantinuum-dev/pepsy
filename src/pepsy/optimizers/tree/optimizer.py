@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 from copy import deepcopy
+from collections.abc import Mapping
 import heapq
 import inspect
 from numbers import Integral
@@ -2496,9 +2497,228 @@ class TreeOptimizer:
                 )
         return self
 
-    def run(self, gates=None, *, progbar=False, mode=None, non_unitary=False,
-            normalize_every=False, normalize_final=False,
-            normalize_eps=1e-15, seed=None, track_infidelity=None):
+    def _trajectory_gate_stream(self):
+        """Return the normalized queued stream in public replay form.
+
+        ``self.G`` stores control events in split payload/support arrays so
+        the live TTN replay loop can avoid reparsing them.  The trajectory and
+        MPI runners consume the public bundled stream instead, so rebuild the
+        entries without using ``_layout_gate_stream``: layout discovery is
+        deliberately allowed to replace conditional actions with placeholders,
+        whereas shot replay must preserve the actual action.
+        """
+        stream = []
+        for payload, where, event_type in zip(
+            self.G, self.where, self.event_types
+        ):
+            support = _normalize_where(where)
+            if event_type == "gate":
+                stream.append((payload, support))
+            elif event_type == "submpo":
+                stream.append(self.submpo_event(payload, support))
+            elif event_type == "measure":
+                stream.append({
+                    "kind": "measure",
+                    "pauli": payload["pauli"],
+                    "where": support,
+                    "outcome": payload.get("outcome"),
+                })
+            elif event_type == "reset":
+                stream.append({
+                    "kind": "reset",
+                    "where": support,
+                    "basis": "".join(payload["axes"]),
+                })
+            elif event_type == "measure_reset":
+                stream.append({
+                    "kind": "measure_reset",
+                    "where": support,
+                    "basis": "".join(payload["axes"]),
+                    "outcome": payload.get("outcomes"),
+                })
+            elif event_type == "cap":
+                stream.append({
+                    "kind": "cap",
+                    "where": support[0],
+                    "vec": payload["vec"],
+                    "absorb": payload.get("absorb", "left"),
+                    "compact_labels": payload.get("compact_labels", True),
+                })
+            elif event_type == "conditional":
+                stream.append({
+                    "kind": "conditional",
+                    "record": payload["record"],
+                    "bit": payload["bit"],
+                    "action": payload["action"],
+                })
+            else:  # pragma: no cover - normalized streams are exhaustive
+                raise ValueError(f"unknown tree trajectory event {event_type!r}.")
+        return tuple(stream)
+
+    def _run_shots(
+        self,
+        gates,
+        shots,
+        *,
+        error_model=None,
+        seed=None,
+        run_kwargs=None,
+        strategy="auto",
+        max_branches=128,
+        auto_max_expected_faults=0.1,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
+    ):
+        """Replay a tree stream through local or MPI shot orchestration."""
+        if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+            raise ValueError("shots must be a nonnegative integer.")
+        mpi_enabled = mpi is not None and mpi is not False
+        if not mpi_enabled and any(
+            value is not None for value in (observable, checkpoint_path)
+        ):
+            raise ValueError(
+                "observable and checkpoint options require mpi=True or an "
+                "MPI communicator."
+            )
+        if not mpi_enabled and (
+            resume
+            or checkpoint_keep != 2
+            or checkpoint_sync is not True
+            or collect_diagnostics is not True
+            or checkpoint_id is not None
+        ):
+            raise ValueError(
+                "MPI checkpoint options require mpi=True or an MPI communicator."
+            )
+        if workers in {None, "auto"} and parallel_workers != 1:
+            workers = parallel_workers
+        if mpi_enabled:
+            from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
+
+            child_kwargs = dict(run_kwargs or {})
+            if progress not in {False, "never"}:
+                child_kwargs["progbar"] = False
+            parent_rng_state = deepcopy(self.rng.bit_generator.state)
+            template = self.copy()
+            self.rng.bit_generator.state = parent_rng_state
+            communicator = None if mpi is True else mpi
+            runner = MPIShotRunner(
+                lambda: template.copy(),
+                gates,
+                comm=communicator,
+            )
+            return runner.run(
+                shots,
+                seed=seed,
+                error_model=error_model,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                retain=retain,
+                local_workers=workers,
+                local_backend="auto",
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+                progress=progress,
+            )
+
+        from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            NoisyResult,
+            run_noisy_shots,
+            run_trajectory_shots,
+        )
+
+        workers = _resolve_local_workers(workers, shots=shots)
+        child_kwargs = dict(run_kwargs or {})
+        if workers > 1 and progress not in {False, "never"}:
+            child_kwargs["progbar"] = False
+        parent_rng_state = deepcopy(self.rng.bit_generator.state)
+        template = self.copy()
+        self.rng.bit_generator.state = parent_rng_state
+        factory = lambda: template.copy()
+        common = {
+            "seed": seed,
+            "run_kwargs": child_kwargs,
+            "strategy": strategy,
+            "max_branches": max_branches,
+            "importance_sampling": importance_sampling,
+            "max_branch_factor": max_branch_factor,
+            "parallel_workers": workers,
+            "parallel_backend": parallel_backend,
+            "retain": retain,
+        }
+        if error_model is None:
+            raw = run_trajectory_shots(factory, gates, shots, **common)
+        else:
+            raw = run_noisy_shots(
+                factory,
+                gates,
+                error_model,
+                shots,
+                auto_max_expected_faults=auto_max_expected_faults,
+                **common,
+            )
+        return NoisyResult(raw)
+
+    def run(
+        self,
+        gates=None,
+        *,
+        progbar=False,
+        mode=None,
+        non_unitary=False,
+        normalize_every=False,
+        normalize_final=False,
+        normalize_eps=1e-15,
+        seed=None,
+        track_infidelity=None,
+        shots=1,
+        error_model=None,
+        strategy="auto",
+        run_kwargs=None,
+        max_branches=128,
+        auto_max_expected_faults=0.1,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
+        retain="all",
+    ):
         """Replay ``gates`` (or the construction stream) on the tree.
 
         Parameters
@@ -2542,6 +2762,11 @@ class TreeOptimizer:
         track_truncation remains False by default. Enabling it is a
         diagnostic mode: complete singular spectra require additional
         factorization work and can substantially slow replay.
+
+        ``shots`` and ``mpi`` use the shared trajectory/MPI runner while
+        keeping the parent optimizer unchanged.  The shot factory starts from
+        the current tree state, so an already prepared tree can be sampled
+        without replaying or consuming the caller's optimizer.
         """
         self._warn_track_truncation_slow()
         if mode is not None:
@@ -2567,6 +2792,65 @@ class TreeOptimizer:
         normalize_eps = float(normalize_eps)
         if normalize_eps < 0.0:
             raise ValueError("normalize_eps must be non-negative.")
+
+        shot_requested = bool(
+            error_model is not None
+            or shots != 1
+            or run_kwargs is not None
+            or strategy != "auto"
+            or max_branches != 128
+            or importance_sampling is not None
+            or max_branch_factor is not None
+            or parallel_workers != 1
+            or parallel_backend != "thread"
+            or retain != "all"
+            or (mpi is not None and mpi is not False)
+            or (workers is not None and workers != "auto")
+            or observable is not None
+            or checkpoint_path is not None
+        )
+        if shot_requested:
+            if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
+                raise TypeError("run_kwargs must be a mapping or None.")
+            if non_unitary:
+                child_kwargs = dict(run_kwargs or {})
+                child_kwargs.setdefault("non_unitary", True)
+                child_kwargs.setdefault("normalize_every", normalize_every)
+                child_kwargs.setdefault("normalize_final", normalize_final)
+                child_kwargs.setdefault("normalize_eps", normalize_eps)
+            else:
+                child_kwargs = dict(run_kwargs or {})
+            if mode is not None:
+                child_kwargs.setdefault("mode", mode)
+            child_kwargs.setdefault("track_infidelity", track_infidelity)
+            child_kwargs.setdefault("progbar", progbar)
+            stream = self._trajectory_gate_stream() if gates is None else gates
+            return self._run_shots(
+                stream,
+                shots,
+                error_model=error_model,
+                seed=seed,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                auto_max_expected_faults=auto_max_expected_faults,
+                importance_sampling=importance_sampling,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
+                retain=retain,
+                mpi=mpi,
+                workers=workers,
+                progress=progress,
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+            )
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         if gates is not None:
