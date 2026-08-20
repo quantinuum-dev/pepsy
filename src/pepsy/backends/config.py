@@ -65,9 +65,10 @@ class TorchLinalgConfig:
     allow_approximate : bool, default=False
         Safety acknowledgement required for CUDA's approximate ``gesvda``.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
-        Rank-deficiency response for the stabilized real QR VJP. ``"warn"``
-        reports a potentially ill-conditioned native fallback, ``"native"``
-        accepts it silently, and ``"error"`` stops the optimization.
+        Rank-deficiency response for stabilized QR VJPs. ``"warn"`` reports
+        the condition and uses the finite regularized rule, ``"native"``
+        accepts Torch's native fallback silently, and ``"error"`` stops the
+        optimization.
     qr_rank_tol_factor : float, default=1.0
         Scale-relative multiplier used by the stabilized real QR rule.
     quimb_split_drivers : bool, default=False
@@ -554,6 +555,13 @@ def _install_torch_linalg_config(config):
     # or tiny singular values. ``svd_driver`` and ``cpu_svd`` only select the
     # forward decomposition; they do not silently change the tensor dtype.
     fallback = config.resolved_svd_fallback
+    # Keep the ordinary and raw-block QR paths on the same rank policy. The
+    # native complex path does not need the policy itself, but its stabilized
+    # Quimb counterpart does.
+    lr._configure_qr_rank_policy(  # pylint: disable=protected-access
+        config.qr_rank_policy,
+        config.qr_rank_tol_factor,
+    )
     if config.stabilized:
         if config.mode == "complex":
             lr.reg_rel_svd_torch(
@@ -567,17 +575,20 @@ def _install_torch_linalg_config(config):
                 cpu_svd=config.cpu_svd,
                 svd_fallback=fallback,
             )
-        # QR registration: the real rule adds rank diagnostics and a finite
-        # VJP for singular pivots. Complex ordinary Autoray QR stays native
-        # for speed; its safe complex rule is used by the Quimb raw-block
-        # split path below when that path is enabled.
+        # QR registration: both real and complex stabilized rules use finite
+        # rank-deficient VJPs. Native Torch remains the fast default when
+        # stabilization is disabled.
         if config.mode == "real":
             lr.reg_real_qr_torch(
                 rank_policy=config.qr_rank_policy,
                 rank_tol_factor=config.qr_rank_tol_factor,
             )
         else:
-            lr.reg_complex_qr_torch()
+            lr.reg_complex_qr_torch(
+                stabilized=True,
+                rank_policy=config.qr_rank_policy,
+                rank_tol_factor=config.qr_rank_tol_factor,
+            )
     else:
         lr.reg_native_svd_torch(
             svd_driver=config.svd_driver,
@@ -596,6 +607,8 @@ def _install_torch_linalg_config(config):
             # Quimb's optional raw-block driver is the stabilized custom
             # split path even when the ordinary Autoray path is native.
             svd_fallback=fallback if config.stabilized else "scipy_gesvd",
+            qr_rank_policy=config.qr_rank_policy,
+            qr_rank_tol_factor=config.qr_rank_tol_factor,
         )
 
     global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
@@ -639,7 +652,7 @@ def register_torch_linalg(
     allow_approximate : bool, default=False
         Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
-        Response to rank-deficient inputs when stabilized real QR is active.
+        Response to rank-deficient inputs when stabilized QR is active.
     qr_rank_tol_factor : float, default=1.0
         Multiplier for the scale-aware real-QR rank threshold.
     quimb_split_drivers : bool, default=False

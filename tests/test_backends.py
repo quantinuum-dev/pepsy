@@ -109,15 +109,38 @@ def test_register_torch_svd_for_autoray():
 
     pepsy.reg_rel_svd_torch()
     svd_fn = ar.get_lib_fn("torch", "linalg.svd")
-    assert getattr(svd_fn, "__self__", None).__module__ == (
-        "pepsy.backends.linalg_torch"
-    )
+    assert svd_fn.__module__ == "pepsy.backends.linalg_torch"
 
     matrix = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float64)
     u, s, vh = ar.do("linalg.svd", matrix)
     assert u.shape == (2, 2)
     assert s.shape == (2,)
     assert vh.shape == (2, 2)
+
+
+def test_stabilized_svd_autoray_accepts_thin_keyword_and_rejects_full():
+    """The custom SVD adapter accepts normal thin-SVD Autoray calls."""
+    torch = pytest.importorskip("torch")
+    import autoray as ar
+
+    try:
+        pepsy.TorchLinalgConfig(stabilized=True).register()
+        matrix = torch.randn(4, 3, dtype=torch.float64)
+        u, s, vh = ar.do("linalg.svd", matrix, full_matrices=False)
+        assert u.shape == (4, 3)
+        assert s.shape == (3,)
+        assert vh.shape == (3, 3)
+        with pytest.raises(NotImplementedError, match="thin SVD"):
+            ar.do("linalg.svd", matrix, full_matrices=True)
+        pepsy.TorchLinalgConfig(mode="real", stabilized=True).register()
+        with pytest.raises(TypeError, match="real Torch tensor"):
+            ar.do(
+                "linalg.svd",
+                torch.randn(4, 3, dtype=torch.complex128),
+                full_matrices=False,
+            )
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
 
 
 def test_torch_linalg_config_is_public_and_reports_runtime():
@@ -388,8 +411,8 @@ def test_torch_complex_qr_wrapper_passes_gradcheck():
     )
 
 
-def test_torch_real_qr_rank_deficient_falls_back_to_native():
-    """Rank-deficient real QR warns and follows native Torch backward."""
+def test_torch_real_qr_rank_deficient_uses_regularized_backward():
+    """Rank-deficient real QR warns and keeps a finite useful VJP."""
     torch = pytest.importorskip("torch")
     from pepsy.backends.linalg_torch import QR_real
 
@@ -403,16 +426,54 @@ def test_torch_real_qr_rank_deficient_falls_back_to_native():
         dq = torch.randn_like(q)
         dr = torch.randn_like(r)
         actual = torch.autograd.grad((q * dq).sum() + (r * dr).sum(), matrix)[0]
-
-    native_matrix = matrix.detach().clone().requires_grad_()
-    native_q, native_r = torch.linalg.qr(native_matrix)
-    expected = torch.autograd.grad(
-        (native_q * dq).sum() + (native_r * dr).sum(),
-        native_matrix,
-    )[0]
-
-    torch.testing.assert_close(actual, expected, rtol=1e-9, atol=1e-10)
     assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual) > 0
+
+
+def test_stabilized_qr_autoray_accepts_reduced_keyword_and_guards_dtype():
+    """The custom QR adapter accepts reduced mode and rejects complex inputs."""
+    torch = pytest.importorskip("torch")
+    import autoray as ar
+
+    try:
+        pepsy.TorchLinalgConfig(mode="real", stabilized=True).register()
+        matrix = torch.randn(4, 3, dtype=torch.float64)
+        q, r = ar.do("linalg.qr", matrix, mode="reduced")
+        assert q.shape == (4, 3)
+        assert r.shape == (3, 3)
+        with pytest.raises(TypeError, match="real Torch tensor"):
+            ar.do(
+                "linalg.qr",
+                torch.randn(4, 3, dtype=torch.complex128),
+                mode="reduced",
+            )
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
+
+
+def test_stabilized_complex_qr_autoray_regularizes_rank_deficiency():
+    """The stabilized complex Autoray QR path uses a finite safe VJP."""
+    torch = pytest.importorskip("torch")
+    import autoray as ar
+
+    try:
+        pepsy.TorchLinalgConfig(mode="complex", stabilized=True).register()
+        matrix = torch.tensor(
+            ((1.0, 1.0, 1.0), (0.0, 0.0, 1.0)),
+            dtype=torch.complex128,
+            requires_grad=True,
+        )
+        with pytest.warns(RuntimeWarning, match="rank-deficient"):
+            q, r = ar.do("linalg.qr", matrix, mode="reduced")
+        gradient = torch.autograd.grad(
+            (q.conj() * torch.ones_like(q)).real.sum()
+            + (r.conj() * torch.ones_like(r)).real.sum(),
+            matrix,
+        )[0]
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
 
 
 def test_torch_real_qr_safe_regularizes_rank_deficient_gauge():
@@ -752,14 +813,10 @@ def test_register_torch_linalg_stabilized_real_is_opt_in(monkeypatch):
             qr_rank_tol_factor=2.0,
         )
         registered = {args[1]: args[2] for args, _kwargs in calls}
-        assert linalg_torch._same_callable(
-            registered["linalg.svd"],
-            linalg_torch.SVD_real.apply,
+        assert registered["linalg.svd"].__name__.startswith(
+            "SVD_real_stabilized_svd"
         )
-        assert linalg_torch._same_callable(
-            registered["linalg.qr"],
-            linalg_torch.QR_real.apply,
-        )
+        assert registered["linalg.qr"].__name__ == "QR_real_stabilized_qr"
         assert linalg_torch._QR_RANK_POLICY == "error"
         assert linalg_torch._QR_RANK_TOL_FACTOR == 2.0
     finally:
@@ -786,6 +843,33 @@ def test_register_torch_linalg_leaves_quimb_drivers_untouched_without_opt_in(
     config.register_torch_linalg(mode="real", stabilized=True)
 
     assert calls == []
+
+
+def test_register_torch_linalg_passes_qr_policy_to_quimb(monkeypatch):
+    """Raw-block Quimb drivers receive the configured QR policy and tolerance."""
+    pytest.importorskip("torch")
+    from pepsy.backends import config, linalg_torch
+
+    calls = []
+    monkeypatch.setattr(
+        linalg_torch,
+        "reg_quimb_torch_split_drivers",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    try:
+        config.register_torch_linalg(
+            mode="real",
+            stabilized=True,
+            qr_rank_policy="error",
+            qr_rank_tol_factor=3.0,
+            quimb_split_drivers=True,
+        )
+
+        assert calls[0]["qr_rank_policy"] == "error"
+        assert calls[0]["qr_rank_tol_factor"] == 3.0
+    finally:
+        config.reset_linalg_registrations(backend="torch")
 
 
 def test_reset_linalg_registrations_restores_native_torch(monkeypatch):
