@@ -94,7 +94,7 @@ from .records import (
     StreamAnalysisRecord,
 )
 from .settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
-from .stn_state import STNState, _validate_bits
+from .stn_state import STNState, _tableau_gate_stream, _validate_bits
 
 __all__ = [
     "DeferredInjectionRecord",
@@ -2874,17 +2874,148 @@ class MpsStabOptimizer:
         """Return the most recent replay timing record."""
         return deepcopy(self._last_run_timing)
 
-    def to_statevector(self) -> np.ndarray:
-        """Dense statevector ``|psi> = C|nu>`` (small ``n`` only)."""
-        if self._layout_is_identity():
-            return self.state.to_statevector()
+    def to_basis_statevector(self, logical_order=True) -> np.ndarray:
+        """Return dense ``|nu>`` coefficients, optionally in logical order."""
         from autoray import to_numpy  # pylint: disable=import-outside-toplevel
 
         p_dense = np.asarray(to_numpy(self.state.p.to_dense()), dtype=self.dtype)
+        if not logical_order or self._layout_is_identity():
+            return p_dense.reshape(-1)
         p_dense = p_dense.reshape([2] * self.n)
         axes = [self._mps_site(logical) for logical in range(self.n)]
-        p_logical = p_dense.transpose(axes).reshape(-1)
-        return self.state.clifford_unitary() @ p_logical
+        return p_dense.transpose(axes).reshape(-1)
+
+    def to_statevector(self) -> np.ndarray:
+        """Dense physical statevector ``|psi> = C|nu>`` (small ``n`` only)."""
+        return self.state._statevector_from_basis(  # pylint: disable=protected-access
+            self.to_basis_statevector(logical_order=True)
+        )
+
+    def to_physical_mps(
+        self,
+        *,
+        mode="exact",
+        chi=None,
+        cutoff=0.0,
+        cutoff_mode="rsum2",
+        n_iter=5,
+        logical_order=True,
+        progbar=False,
+        **run_kwargs,
+    ):
+        """Return an ordinary MPS for the physical state ``|psi> = C|nu>``.
+
+        The tableau is lowered with :meth:`stim.Tableau.to_circuit` and
+        replayed as local gates. This keeps the conversion matrix-free: no
+        ``2**n`` by ``2**n`` Clifford matrix is formed.
+
+        Parameters
+        ----------
+        mode : {"exact", "mpo", "dmrg"}, default="exact"
+            ``"exact"`` applies the tableau circuit with unlimited bond and
+            zero cutoff. ``"mpo"`` applies it with ordinary MPS gate
+            compression, while ``"dmrg"`` uses the ordinary MPS variational
+            replay path. The latter two require ``chi``.
+        chi : int or None
+            Maximum bond dimension for the approximate modes.
+        cutoff : float, default=0.0
+            Singular-value cutoff for ``"mpo"`` and ``"dmrg"``. It is
+            intentionally ignored by the lossless ``"exact"`` path.
+        cutoff_mode : str, default="rsum2"
+            Cutoff convention for the approximate modes.
+        n_iter : int, default=5
+            DMRG replay sweeps. Ignored by ``"exact"`` and ``"mpo"``.
+        logical_order : bool, default=True
+            Return sites in logical qubit order. If false, preserve the
+            coefficient MPS's current physical layout and map tableau gates
+            into that layout.
+        progbar : bool, default=False
+            Show the ordinary MPS progress bar for approximate modes.
+        **run_kwargs
+            Additional keyword arguments forwarded to
+            :meth:`pepsy.MpsOptimizer.run` in ``"mpo"`` and ``"dmrg"`` mode.
+
+        Returns
+        -------
+        quimb.tensor.MatrixProductState
+            A new ordinary MPS. The STN optimizer is never mutated.
+        """
+        mode = str(mode).strip().lower()
+        if mode not in {"exact", "mpo", "dmrg"}:
+            raise ValueError("mode must be one of 'exact', 'mpo', or 'dmrg'.")
+        if not isinstance(logical_order, (bool, np.bool_)):
+            raise TypeError("logical_order must be a boolean.")
+        cutoff = float(cutoff)
+        if not np.isfinite(cutoff) or cutoff < 0.0:
+            raise ValueError("cutoff must be finite and nonnegative.")
+        if mode != "exact":
+            if isinstance(chi, (bool, np.bool_)) or not isinstance(chi, Integral):
+                raise TypeError("chi must be a positive integer for approximate modes.")
+            chi = int(chi)
+            if chi < 1:
+                raise ValueError("chi must be a positive integer for approximate modes.")
+
+        p = self.state.p.copy()
+        current_order = list(self.logical_order)
+        if logical_order and current_order != list(range(self.n)):
+            if getattr(p, "cyclic", False):
+                raise ValueError(
+                    "to_physical_mps(logical_order=True) requires an open-boundary MPS."
+                )
+            for target_pos, logical_site in enumerate(range(self.n)):
+                current_pos = current_order.index(logical_site)
+                if current_pos == target_pos:
+                    continue
+                p.swap_site_to_(
+                    current_pos,
+                    target_pos,
+                    method="svd",
+                    cutoff=0.0,
+                    cutoff_mode="abs",
+                )
+                moved = current_order.pop(current_pos)
+                current_order.insert(target_pos, moved)
+
+        tableau = self.state._sim.current_inverse_tableau().inverse()  # noqa: SLF001
+        gate_stream = []
+        for gate, where in _tableau_gate_stream(tableau.to_circuit()):
+            if not logical_order:
+                where = tuple(self._mps_site(site) for site in where)
+            gate_stream.append((self._bk(gate), where))
+
+        if mode == "exact":
+            for gate, where in gate_stream:
+                if len(where) == 1:
+                    p.gate_(gate, where[0], contract=True)
+                else:
+                    p.gate_(
+                        gate,
+                        where,
+                        contract="swap+split",
+                        max_bond=None,
+                        cutoff=0.0,
+                        cutoff_mode="abs",
+                    )
+            return p
+
+        from ..mps.optimizer import MpsOptimizer  # pylint: disable=import-outside-toplevel
+
+        options = dict(run_kwargs)
+        options.setdefault("n_iter", n_iter)
+        options.setdefault("progbar", progbar)
+        options.setdefault("cutoff", cutoff)
+        options.setdefault("cutoff_mode", cutoff_mode)
+        options.setdefault("normalize_final", False)
+        options.setdefault("stabilize_unitary", False)
+        optimizer = MpsOptimizer(
+            p,
+            gates=gate_stream,
+            chi=chi,
+            mode=mode,
+            inplace=True,
+        )
+        optimizer.run(**options)
+        return optimizer.p
 
     def amplitude(self, bits) -> complex:
         """Amplitude ``<bits|psi>`` for a bitstring (str ``'010'`` or 0/1 seq).
