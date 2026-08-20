@@ -577,6 +577,25 @@ basis-updating, immediate, and deferred magic-injection
 Clifford/rotation/measurement paths, bounded dense matrix dispatch, and the
 safe MPS naming-compatibility surface.
 
+`TreeOptimizer.run` also exposes the shared shot and MPI entry point. It
+creates independent copies from the current tree state, so the parent state
+and queued stream remain unchanged:
+
+```python
+result = optimizer.run(
+    shots=1_000_000,
+    seed=7,
+    mpi=True,
+    workers="auto",
+    progress="auto",
+    retain="none",
+)
+```
+
+The `strategy="independent"` and `strategy="coalesced"` options follow the
+shared runner semantics. `TreeStabOptimizer.run` provides the corresponding
+API and intentionally supports independent shot distribution only.
+
 ## Tree state class
 
 `TreeTensorNetwork` is the tree analogue of Quimb's `MatrixProductState`: a

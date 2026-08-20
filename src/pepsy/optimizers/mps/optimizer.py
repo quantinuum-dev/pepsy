@@ -129,6 +129,16 @@ class _MpsStreamPlan:
         repr=False,
     )
 
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_backend_cache"] = {}
+        state.pop("_backend_cache_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        object.__setattr__(self, "_backend_cache_lock", threading.RLock())
+
     def get_or_create_backend_payload(self, key, source, factory):
         """Return a cached backend payload, creating it exactly once."""
         with self._backend_cache_lock:
@@ -1437,6 +1447,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._mix_dmrg_failed_sweep = None
         self._last_dmrg_fit_diagnostics = None
         self._dmrg1_one_site_locked = False
+        # Native Symmray one-site writeback can retain duplicate fermionic
+        # dummy modes when a product-state DMRG1 warm-up has just saturated
+        # its bonds. Keep that narrow initialization case on two-site FIT;
+        # non-product native states retain the documented DMRG1 schedule.
+        self._dmrg1_native_product_two_site = (
+            self._dmrg_mode_alias == "dmrg1"
+            and self._is_native_fermionic_product_state(self.p)
+        )
         self.measurements = []
         self._rng = np.random.default_rng()
         self._unitary_previous_norm = None
@@ -1528,6 +1546,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cls._is_symmray_array(tensor.data)
             for tensor in getattr(tn, "tensors", ())
         )
+
+    @classmethod
+    def _is_native_fermionic_product_state(cls, p):
+        """Return whether ``p`` is a native Symmray fermionic product MPS."""
+        if not cls._has_symmray_data(p):
+            return False
+        is_fermionic = getattr(p, "isfermionic", None)
+        if not callable(is_fermionic) or not is_fermionic():
+            return False
+        try:
+            return cls._effective_max_bond(p) <= 1
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _mps_data_is_finite(p):
@@ -1648,6 +1679,133 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # zero and silently disable structural-zero pruning.
         return structural_cutoff, "abs"
 
+    @staticmethod
+    def _native_needs_safe_qr(p):
+        """Return whether native QR needs the low-precision phase guard."""
+        dtype_name = str(getattr(p, "dtype", "")).lower()
+        return "complex64" in dtype_name or "float32" in dtype_name
+
+    @staticmethod
+    def _native_canonize_bond(p, left, right):
+        """Canonize one native bond without phase-normalizing QR diagonals."""
+        qtn.tensor_canonize_bond(
+            p[left],
+            p[right],
+            stabilized=False,
+        )
+
+    def _native_canonicalize_pair(self, p, where, *, info=None):
+        """Safely move a native MPS center around a target pair."""
+        if info is None:
+            info = {}
+        i, j = min(where), max(where)
+        current = info.get("cur_orthog")
+        if current == "calc":
+            current = None
+
+        if current is None:
+            current = p.calc_current_orthog_center()
+
+        if current is None:
+            for site in range(0, i):
+                self._native_canonize_bond(p, site, site + 1)
+            for site in range(p.L - 1, j, -1):
+                self._native_canonize_bond(p, site, site - 1)
+            info["cur_orthog"] = (i, j)
+            return
+
+        if isinstance(current, Integral):
+            cmin = cmax = int(current)
+        else:
+            cmin, cmax = min(current), max(current)
+
+        if i > cmin:
+            for site in range(cmin, i):
+                self._native_canonize_bond(p, site, site + 1)
+        else:
+            i = min(j, cmin)
+
+        if j < cmax:
+            for site in range(cmax, j, -1):
+                self._native_canonize_bond(p, site, site - 1)
+        else:
+            j = max(i, cmax)
+
+        info["cur_orthog"] = (i, j)
+
+    def _native_swap_site_to(self, p, site, target, *, info, compress_opts):
+        """Move one native site with safe per-bond canonicalization."""
+        if site == target:
+            return
+        if site < target:
+            sites = range(site, target)
+            absorb = "right"
+        else:
+            sites = range(site - 1, target - 1, -1)
+            absorb = "left"
+        swap_opts = dict(compress_opts)
+        swap_opts.setdefault("absorb", absorb)
+        for left in sites:
+            right = left + 1
+            self._native_canonicalize_pair(
+                p,
+                (left, right),
+                info=info,
+            )
+            p.swap_sites_with_compress_(
+                left,
+                right,
+                info=info,
+                **swap_opts,
+            )
+
+    def _native_gate_with_auto_swap(
+        self,
+        p,
+        gate,
+        where,
+        *,
+        info,
+        swap_back,
+        **compress_opts,
+    ):
+        """Apply a native gate while avoiding unsafe complex64 QR phases."""
+        i, j = where
+        if i > j:
+            i, j = j, i
+            final_gate_where = (i + 1, i)
+            absorb = "left"
+        else:
+            final_gate_where = (i, i + 1)
+            absorb = "right"
+
+        gate_opts = dict(compress_opts)
+        gate_opts.setdefault("absorb", absorb)
+        need_to_swap = i + 1 != j
+        if need_to_swap:
+            self._native_swap_site_to(
+                p,
+                j,
+                i + 1,
+                info=info,
+                compress_opts=compress_opts,
+            )
+
+        self._native_canonicalize_pair(p, (i, i + 1), info=info)
+        p.gate_split_(gate, where=final_gate_where, **gate_opts)
+        info["cur_orthog"] = (i + 1, i + 1)
+
+        if need_to_swap and swap_back:
+            self._native_swap_site_to(
+                p,
+                i + 1,
+                j,
+                info=info,
+                compress_opts=compress_opts,
+            )
+
+        return p
+
     def _apply_symmray_auto_swap_gate(
         self,
         p,
@@ -1658,6 +1816,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode,
         max_bond=None,
         info=None,
+        swap_back=True,
     ):
         """Apply a Symmray two-site gate through quimb's block-aware swaps."""
         cutoff, cutoff_mode = self._symmray_structural_zero_cutoff(
@@ -1671,14 +1830,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         }
         if max_bond is not None:
             compress_opts["max_bond"] = max_bond
-        p.gate_with_auto_swap_(
+        if info is None:
+            info = self.info_c
+        if not self._native_needs_safe_qr(p):
+            p.gate_with_auto_swap_(
+                gate,
+                where,
+                info=info,
+                swap_back=swap_back,
+                **compress_opts,
+            )
+            return p
+        return self._native_gate_with_auto_swap(
+            p,
             gate,
             where,
-            info=self.info_c if info is None else info,
-            swap_back=True,
+            info=info,
+            swap_back=swap_back,
             **compress_opts,
         )
-        return p
 
     def _warm_start_native_fermionic_fit(
         self,
@@ -1959,6 +2129,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             xmax - xmin + 1,
         )
         if self._dmrg_mode_alias == "dmrg1" and active_block_size == 2:
+            if self._dmrg1_native_product_two_site:
+                return active_block_size
             if self._dmrg1_one_site_locked:
                 return 1
             if (
@@ -2034,6 +2206,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.norm_events = []
         self._norm_log_survival = 0.0
         self._dmrg1_one_site_locked = False
+        self._dmrg1_native_product_two_site = (
+            self._dmrg_mode_alias == "dmrg1"
+            and self._is_native_fermionic_product_state(self.p)
+        )
         self.qubits = list(range(int(getattr(self.p, "L", 0))))
         self.logical_order = list(self.qubits)
         self._persistent_layout_plan = None
@@ -2139,6 +2315,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
+        copied._dmrg1_native_product_two_site = (
+            self._dmrg1_native_product_two_site
+        )
         # ``MatrixProductState.copy()`` does not promise to preserve the
         # physical orthogonality centre. The constructor canonicalizes the
         # copied state, so its freshly initialized ``info_c`` is authoritative
@@ -2260,6 +2439,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.mode = new_mode
         self._dmrg_mode_alias = new_dmrg_alias
         self._dmrg_mode_block_size = new_dmrg_block_size
+        self._dmrg1_native_product_two_site = (
+            self._dmrg_mode_alias == "dmrg1"
+            and self._is_native_fermionic_product_state(self.p)
+        )
         if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
             self._dmrg1_one_site_locked = False
         if self.mode == "su":
@@ -2488,13 +2671,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         parallel_backend,
         auto_max_expected_faults,
         retain,
+        mpi=None,
+        workers="auto",
+        checkpoint_path=None,
+        observable=None,
     ):
         """Return whether ``run`` needs the multi-shot trajectory machinery."""
+        if mpi is not None and mpi is not False:
+            return True
+        if checkpoint_path is not None or observable is not None:
+            return True
         if has_trajectory_events or error_model is not None:
             return True
         if isinstance(shots, bool) or not isinstance(shots, Integral):
             return True
         if int(shots) != 1:
+            return True
+        if workers not in {None, "auto"}:
             return True
         return any(
             (
@@ -2559,9 +2752,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         parallel_workers=1,
         parallel_backend="thread",
         retain="all",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
     ):
         """Replay this stream as an independent or coalesced shot ensemble."""
         self._validate_shot_compatibility(error_model=error_model)
+        if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+            raise ValueError("shots must be a nonnegative integer.")
         if self.mode == "perm" and self.logical_order != list(
             range(int(getattr(self.p, "L", 0)))
         ):
@@ -2581,33 +2787,150 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             run_trajectory_shots,
         )
 
+        mpi_enabled = mpi is not None and mpi is not False
+        if not mpi_enabled and any(
+            value is not None
+            for value in (observable, checkpoint_path)
+        ):
+            raise ValueError(
+                "observable and checkpoint options require mpi=True or an MPI communicator."
+            )
+        if not mpi_enabled and (
+            resume
+            or checkpoint_keep != 2
+            or checkpoint_sync is not True
+            or collect_diagnostics is not True
+            or checkpoint_id is not None
+        ):
+            raise ValueError(
+                "MPI checkpoint options require mpi=True or an MPI communicator."
+            )
+
+        if workers not in {None, "auto"}:
+            if (
+                isinstance(workers, bool)
+                or not isinstance(workers, Integral)
+                or workers < 1
+            ):
+                raise ValueError("workers must be a positive integer or 'auto'.")
+        if workers in {None, "auto"} and parallel_workers != 1:
+            workers = parallel_workers
+        if mpi_enabled:
+            from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
+
+            if strategy == "auto":
+                strategy = "independent"
+            child_kwargs = dict(run_kwargs or {})
+            if progress not in {False, "never"}:
+                child_kwargs["progbar"] = False
+            communicator = None if mpi is True else mpi
+            mpi_gates = (
+                self._stream_plan.trajectory_plan
+                if self._has_trajectory_events
+                else self._gate_stream
+            )
+            runner = MPIShotRunner(
+                self._shot_factory(),
+                mpi_gates,
+                comm=communicator,
+            )
+            return runner.run(
+                shots,
+                seed=seed,
+                error_model=error_model,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                retain=retain,
+                local_workers=workers,
+                local_backend="auto",
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+                progress=progress,
+            )
+
+        if workers in {None, "auto"}:
+            from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+
+            workers = _resolve_local_workers(workers, shots=shots)
+        from ..mpi import (  # pylint: disable=import-outside-toplevel
+            _make_progress_bar,
+            _validate_progress,
+        )
+        progress_strategy = strategy
+        if workers > 1 and strategy == "auto":
+            from ..noise import _resolve_auto_parallel_strategy
+
+            progress_strategy = _resolve_auto_parallel_strategy(
+                self._stream_plan.entries,
+                shots,
+                error_model=error_model,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                auto_max_expected_faults=auto_max_expected_faults,
+            )
+
+        progress_mode = _validate_progress(progress)
+        progress_bar = _make_progress_bar(
+            progress_mode,
+            shots,
+            desc="shots",
+        ) if workers > 1 and progress_strategy == "independent" else None
+        child_kwargs = dict(run_kwargs or {})
+        if workers > 1 and progress_mode != "never":
+            child_kwargs["progbar"] = False
+
+        def update_progress(delta):
+            if progress_bar is not None:
+                progress_bar.update(int(delta))
+
         common = {
             "seed": seed,
-            "run_kwargs": run_kwargs,
+            "run_kwargs": child_kwargs,
             "strategy": strategy,
             "max_branches": max_branches,
             "importance_sampling": importance_sampling,
             "max_branch_factor": max_branch_factor,
-            "parallel_workers": parallel_workers,
+            "parallel_workers": workers,
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        if error_model is None:
-            raw = run_trajectory_shots(
-                self._shot_factory(),
-                self._stream_plan.trajectory_plan,
-                shots,
-                **common,
-            )
-        else:
-            raw = run_noisy_shots(
-                self._shot_factory(),
-                self._gate_stream,
-                error_model,
-                shots,
-                auto_max_expected_faults=auto_max_expected_faults,
-                **common,
-            )
+        try:
+            if error_model is None:
+                shot_gates = (
+                    self._stream_plan.entries
+                    if workers > 1
+                    else self._stream_plan.trajectory_plan
+                )
+                raw = run_trajectory_shots(
+                    self._shot_factory(),
+                    shot_gates,
+                    shots,
+                    _progress=update_progress if progress_bar is not None else None,
+                    **common,
+                )
+            else:
+                raw = run_noisy_shots(
+                    self._shot_factory(),
+                    self._gate_stream,
+                    error_model,
+                    shots,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    _progress=update_progress if progress_bar is not None else None,
+                    **common,
+                )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         return NoisyResult(raw)
 
     def set_gates(self, gates):
@@ -2924,14 +3247,27 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             current_pos = current.index(logical_site)
             if current_pos == target_pos:
                 continue
-            self.p.swap_site_to_(
-                current_pos,
-                target_pos,
-                info=self.info_c,
-                method="svd",
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-            )
+            if self._has_symmray_data(self.p) and self._native_needs_safe_qr(self.p):
+                self._native_swap_site_to(
+                    self.p,
+                    current_pos,
+                    target_pos,
+                    info=self.info_c,
+                    compress_opts={
+                        "method": "svd",
+                        "cutoff": cutoff,
+                        "cutoff_mode": cutoff_mode,
+                    },
+                )
+            else:
+                self.p.swap_site_to_(
+                    current_pos,
+                    target_pos,
+                    info=self.info_c,
+                    method="svd",
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
             moved = current.pop(current_pos)
             current.insert(target_pos, moved)
 
@@ -3171,6 +3507,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         max_branch_factor=None,
         parallel_workers=1,
         parallel_backend="thread",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
         retain="all",
     ):
         """Run the currently queued gates.
@@ -3298,9 +3645,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             three-site sweeps used to adapt the active bond spaces. Generic
             rank-adaptive DMRG continues block sweeps until every active bond
             reaches its physical ceiling; rank stagnation never triggers the
-            transition. If a ceiling is not reached, the block phase uses all
-            requested sweeps, and remaining sweeps use fixed-rank one-site
-            FIT. For named ``mode="dmrg1"``, the two-site phase is fixed at
+            transition. Long-range windows use the corresponding fixed block
+            handoff so their terminal canonical center remains authoritative
+            for unitary norm tracking. Otherwise, if a ceiling is not reached,
+            the block phase uses all requested sweeps, and remaining sweeps use
+            fixed-rank one-site FIT. For named ``mode="dmrg1"``, the two-site phase is fixed at
             two sweeps and this value does not extend it; after that, remaining
             sweeps use one-site FIT and the phase latches once all full-chain
             attainable ceilings are reached. For ``mode="dmrg2"`` and
@@ -3402,6 +3751,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Number of workers for explicit parallel shot execution.
         parallel_backend : {"thread", "gpu", "serial"}, default="thread"
             Backend used for explicit parallel shot execution.
+        mpi : bool | MPI communicator | None, default=None
+            Run the shot ensemble collectively over MPI. ``True`` uses
+            ``MPI.COMM_WORLD``; an explicit communicator can be supplied.
+        workers : int | "auto" | None, default="auto"
+            Local shot workers. ``"auto"`` uses the process CPU allowance and
+            divides it across MPI ranks sharing a host. Use ``1`` to force
+            serial local execution.
+        progress : {"auto", True, False}, default="auto"
+            Show one aggregate rank-zero shot progress bar for MPI runs.
+        observable, chunk_size, checkpoint_path, resume, checkpoint_keep,
+        checkpoint_sync, collect_diagnostics, checkpoint_id
+            MPI checkpointing and bounded-memory reduction options. These
+            require ``mpi=True`` or an explicit MPI communicator.
         retain : {"all", "final", "none"}, default="all"
             Result retention policy for shot replay. ``"all"`` retains final
             states and replay metadata, ``"final"`` retains final states only,
@@ -3409,9 +3771,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         Returns
         -------
-        qtn.TensorNetwork | NoisyResult
+        qtn.TensorNetwork | NoisyResult | MPIShotResult
             The updated ``self.p`` state for a single ordinary replay, or a
-            stable noisy result facade when shot replay is selected.
+            stable noisy/MPI result facade when shot replay is selected.
         """
         if self._shot_runner_requested(
             shots,
@@ -3426,6 +3788,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             parallel_backend=parallel_backend,
             auto_max_expected_faults=auto_max_expected_faults,
             retain=retain,
+            mpi=mpi,
+            workers=workers,
+            checkpoint_path=checkpoint_path,
+            observable=observable,
         ):
             if mode is not None:
                 self.set_mode(mode)
@@ -3442,6 +3808,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
                 retain=retain,
+                mpi=mpi,
+                workers=workers,
+                progress=progress,
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
             )
 
         timing = bool(timing)
@@ -4967,6 +5344,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         raw = (observed_norm / expected_norm) ** 2
         return raw, min(1.0, max(0.0, raw))
 
+    def _unitary_norm_overshoot_tolerance(self):
+        """Return the dtype-aware tolerance for small norm overshoots.
+
+        The norm ratio is evaluated from the retained canonical-center tensor.
+        For ``float32``/``complex64`` data, the SVD and canonicalization
+        roundoff can accumulate over a gate stream even when the projection is
+        otherwise healthy. Keep the historical tolerance for higher precision,
+        while allowing a bounded multiple of float32 machine epsilon for the
+        low-precision path. The raw ratio is still retained in the event and
+        the fidelity contribution remains clipped at one.
+        """
+        dtype = str(self.backend_dtype).lower()
+        if "32" in dtype or "complex64" in dtype:
+            return max(1.0e-6, 128.0 * np.finfo(np.float32).eps)
+        return 1.0e-6
+
     def _record_norm_event(
         self,
         kind,
@@ -4990,13 +5383,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if (
             kind == "unitary_compression"
             and raw is not None
-            and raw > 1.0 + 1.0e-6
         ):
-            raise FloatingPointError(
-                "Retained unitary-compression norm exceeds its expected norm "
-                f"(squared ratio={raw:.6g}); canonical projection metadata "
-                "is inconsistent."
-            )
+            overshoot_tolerance = self._unitary_norm_overshoot_tolerance()
+            if raw > 1.0 + overshoot_tolerance:
+                raise FloatingPointError(
+                    "Retained unitary-compression norm exceeds its expected norm "
+                    f"(squared ratio={raw:.6g}, "
+                    f"tolerance={overshoot_tolerance:.3g}); "
+                    "canonical projection metadata is inconsistent."
+                )
         event = {
             "kind": str(kind),
             "where": tuple(int(site) for site in where),
@@ -5831,14 +6226,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise FloatingPointError("MPO batch produced non-finite MPS tensor data.")
 
     def _run_mix_dmrg(self, *args, fit_block_size, **kwargs):
-        """Run mixed DMRG, promoting fixed-rank handoff to DMRG2."""
-        dmrg2_handoff = int(fit_block_size) == 1
+        """Run mixed DMRG with a stable named FIT schedule when available.
+
+        Mixed mode may enter DMRG after an MPO warm-up with a two- or
+        three-site FIT window.  Keep that transaction on the corresponding
+        fixed schedule: the generic rank-adaptive schedule can leave a
+        long-range window with a stale represented norm after a short sweep
+        budget, which the unitary invariant must (correctly) reject.
+        """
+        requested_block_size = int(fit_block_size)
+        schedule_alias = {
+            1: ("dmrg2", 2),
+            2: ("dmrg2", 2),
+            3: ("dmrg3", 3),
+        }.get(requested_block_size)
         old_dmrg_alias = self._dmrg_mode_alias
         old_dmrg_block_size = self._dmrg_mode_block_size
-        if dmrg2_handoff:
-            self._dmrg_mode_alias = "dmrg2"
-            self._dmrg_mode_block_size = 2
-            fit_block_size = 2
+        if schedule_alias is not None:
+            self._dmrg_mode_alias, fit_block_size = schedule_alias
+            self._dmrg_mode_block_size = fit_block_size
         kwargs["fit_block_size"] = fit_block_size
         try:
             return self._run_dmrg(*args, **kwargs)
@@ -6801,7 +7207,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # under-capacity window, then one-site refinement. It latches into the
         # one-site phase once every full-chain bond reaches its attainable
         # physical/chi ceiling. ``dmrg2`` and ``dmrg3`` retain their configured
-        # fixed warm-ups, while generic ``dmrg`` remains rank-adaptive.
+        # fixed warm-ups. Generic ``dmrg`` remains rank-adaptive for local
+        # windows and uses the fixed canonical handoff for long-range windows.
         adaptive_rank_schedule = self._dmrg_mode_alias not in {
             "dmrg1",
             "dmrg2",
@@ -6963,7 +7370,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         )
                     )
                     active_adaptive_sweeps = adaptive_sweeps
-                    active_adaptive_rank_schedule = adaptive_rank_schedule
+                    # A rank-adaptive sweep can finish a long-range window
+                    # before its terminal one-site canonicalization has
+                    # completed.  The local FIT norm then no longer describes
+                    # the whole represented state, and the unitary norm guard
+                    # correctly rejects the next gate.  Use the fixed
+                    # block schedule for that window; it retains the same
+                    # target-support enrichment while guaranteeing the
+                    # canonical handoff.  Named modes already use this path.
+                    active_adaptive_rank_schedule = (
+                        adaptive_rank_schedule
+                        and not (
+                            self._dmrg_mode_alias is None
+                            and active_fit_block_size in {2, 3}
+                            and xmax - xmin + 1 > active_fit_block_size
+                        )
+                    )
                     fit = FIT(
                         p_g,
                         p=fit_guess,
@@ -7192,7 +7614,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                     )
                     active_adaptive_sweeps = adaptive_sweeps
-                    active_adaptive_rank_schedule = adaptive_rank_schedule
+                    active_adaptive_rank_schedule = (
+                        adaptive_rank_schedule
+                        and not (
+                            self._dmrg_mode_alias is None
+                            and active_fit_block_size in {2, 3}
+                            and xmax - xmin + 1 > active_fit_block_size
+                        )
+                    )
                     fit = FIT(
                         p_g,
                         p=p,
@@ -7735,14 +8164,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.canonize_mps(p, (xmin, xmax))
 
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
-                p.gate_with_auto_swap_(
-                    gate,
-                    where,
-                    info=self.info_c,
-                    max_bond=self.chi,
-                    swap_back=swap_back,
-                    **compress_opts,
-                )
+                if self._has_symmray_data(p) and self._native_needs_safe_qr(p):
+                    self._apply_symmray_auto_swap_gate(
+                        p,
+                        gate,
+                        where,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        max_bond=self.chi,
+                        info=self.info_c,
+                        swap_back=swap_back,
+                    )
+                else:
+                    p.gate_with_auto_swap_(
+                        gate,
+                        where,
+                        info=self.info_c,
+                        max_bond=self.chi,
+                        swap_back=swap_back,
+                        **compress_opts,
+                    )
                 if not swap_back:
                     self._record_permutation_move(where)
 

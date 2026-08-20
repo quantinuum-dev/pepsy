@@ -1,7 +1,7 @@
 """Semantic finite-chain MPOs for higher-order operator construction.
 
 This module is the first layer above ordinary Quimb MPO tensors needed by the
-higher-order time-evolution construction of Van Damme et al.  It deliberately
+higher-order exponential construction of Van Damme et al. It deliberately
 keeps the virtual-level history separate from the tensor data.  Ordinary
 Quimb MPOs remain the compiled interchange format, while :class:`FirstDegreeMPO`
 retains enough structure for exact algebra and history compression.
@@ -21,7 +21,7 @@ contraction and MPS-application code, while retaining a copy of the semantic
 object on the compiled MPO.
 
 The exact paths only use local tensor operations and exact equality checks.
-``approximate=True`` is deliberately separate because Algorithm 4 changes the
+``mode="algorithm4"`` is deliberately separate because Algorithm 4 changes the
 analytical history representation even though it does not use an SVD cutoff.
 This module currently targets ordinary NumPy/Autoray-compatible tensors and
 finite open chains; fermionic/Symmray compilation is a future backend layer.
@@ -56,8 +56,24 @@ __all__ = [
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
     "FirstDegreeMPO",
+    "CompiledMPOExp",
+    "CompiledMPOEvolution",
     "MPOBasis",
 ]
+
+
+# Dense virtual transfer maps are much cheaper than repeated backend scatter
+# updates for the small-to-medium history bonds normally produced by Taylor
+# orders two through five.  Keep a conservative escape hatch for very large
+# bonds, where a dense ``new_bond x old_bond`` map would use more memory than
+# the original gather/scatter implementation.
+_MAX_HISTORY_TRANSFER_ELEMENTS = 4_000_000
+
+# Keep the fused coefficient bank bounded.  Very long-range or high-rank
+# bases can have many terms relative to their small sparse slot count; those
+# cases retain the exact grouped scatter fallback rather than allocating a
+# mostly-zero ``num_terms x left x right x phys x phys`` bank.
+_MAX_FUSED_SLOT_BANK_ELEMENTS = 4_000_000
 
 
 @dataclass(frozen=True)
@@ -231,6 +247,23 @@ def _check_scalar(value, *, name):
         raise TypeError(f"{name} must be scalar, got ndim={ndim}.")
 
 
+def _resolve_exp_step(step, dt):
+    """Resolve the canonical ``step`` and legacy ``dt`` spellings.
+
+    Public exponential methods use ``step`` in their documentation.  The
+    optional ``dt`` keyword is accepted only as a compatibility spelling so
+    existing callers can migrate without changing numerical semantics.
+    """
+    if step is not None and dt is not None:
+        raise TypeError("pass either step or dt, not both.")
+    if step is None:
+        if dt is None:
+            raise TypeError("exp requires a scalar step.")
+        step = dt
+    _check_scalar(step, name="step")
+    return step
+
+
 def _fixed_rank_svd(matrix):
     """Run the configured thin SVD, enabling the safe Torch VJP when needed."""
     if _backend_name(matrix) != "torch":
@@ -393,7 +426,7 @@ def _concat(blocks, *, axis):
 
 
 def _drop_axis(array, axis, position):
-    """Remove one virtual channel without rebuilding every remaining block."""
+    """Remove one virtual channel for the sequential reference primitive."""
     size = int(array.shape[axis])
     if size <= 1:
         raise ValueError("cannot remove the last virtual channel.")
@@ -469,6 +502,127 @@ def _scatter_add_2d(array, rows, columns, values):
         current = delta[row, column]
         delta = _setitem(delta, (row, column), current + value)
     return array + delta
+
+
+def _scatter_set_2d(array, rows, columns, values):
+    """Scatter unique paired virtual blocks without allocating a delta tensor."""
+    backend = ar.infer_backend(array)
+    rows_np = np.asarray(rows, dtype=int)
+    columns_np = np.asarray(columns, dtype=int)
+    if backend == "numpy":
+        array[rows_np, columns_np] = values
+        return array
+    if backend == "torch":
+        rows_backend = _as_backend(rows_np, like=array)
+        columns_backend = _as_backend(columns_np, like=array)
+        return array.index_put(
+            (rows_backend, columns_backend),
+            values,
+            accumulate=False,
+        )
+    if backend == "jax":
+        rows_backend = _as_backend(rows_np, like=array)
+        columns_backend = _as_backend(columns_np, like=array)
+        return array.at[(rows_backend, columns_backend)].set(values)
+    if backend == "cupy":
+        array[rows_np, columns_np] = values
+        return array
+
+    updated = array
+    for row, column, value in zip(rows_np, columns_np, values):
+        updated = _setitem(updated, (row, column), value)
+    return updated
+
+
+def _scatter_add_into_2d(array, rows, columns, values):
+    """Scatter-add into a fresh array without creating a second full tensor."""
+    backend = ar.infer_backend(array)
+    rows_np = np.asarray(rows, dtype=int)
+    columns_np = np.asarray(columns, dtype=int)
+    if backend == "numpy":
+        np.add.at(array, (rows_np, columns_np), values)
+        return array
+    if backend == "torch":
+        rows_backend = _as_backend(rows_np, like=array)
+        columns_backend = _as_backend(columns_np, like=array)
+        return array.index_put(
+            (rows_backend, columns_backend),
+            values,
+            accumulate=True,
+        )
+    if backend == "jax":
+        rows_backend = _as_backend(rows_np, like=array)
+        columns_backend = _as_backend(columns_np, like=array)
+        return array.at[(rows_backend, columns_backend)].add(values)
+    if backend == "cupy":
+        import cupy as cp  # pylint: disable=import-outside-toplevel
+
+        cp.add.at(array, (rows_np, columns_np), values)
+        return array
+
+    updated = array
+    for row, column, value in zip(rows_np, columns_np, values):
+        updated = _setitem(updated, (row, column), updated[row, column] + value)
+    return updated
+
+
+def _history_transfer_matrix(groups, old_size):
+    """Compile ordered virtual-channel groups into a dense transfer map.
+
+    ``groups`` is the symbolic representation used by the history
+    compression planners: each output channel maps to a weighted collection
+    of original input channels.  The returned matrix is structural NumPy
+    data, so it is safe to cache and later move to Torch/JAX/CuPy alongside
+    the numerical tensor being transformed.
+    """
+    new_size = len(groups)
+    if new_size * old_size > _MAX_HISTORY_TRANSFER_ELEMENTS:
+        return None
+    transfer = np.zeros((new_size, old_size), dtype=float)
+    for target, group in enumerate(groups):
+        for source, weight in group.items():
+            transfer[target, int(source)] += float(weight)
+    return transfer
+
+
+def _apply_history_transfer(array, transfer, *, axis):
+    """Apply a cached virtual transfer map with one backend contraction."""
+    transfer = _as_backend(transfer, like=array)
+    if getattr(transfer, "dtype", None) != getattr(array, "dtype", None):
+        transfer = ar.do("astype", transfer, array.dtype)
+    mapped = ar.do(
+        "tensordot",
+        transfer,
+        array,
+        axes=([1], [axis]),
+    )
+    if axis == 1:
+        # tensordot puts the new right-channel axis first.
+        mapped = ar.do("transpose", mapped, (1, 0, 2, 3))
+    return mapped
+
+
+def _complex_dtype(dtype):
+    """Return whether a backend dtype is complex without importing it."""
+    if bool(getattr(dtype, "is_complex", False)):
+        return True
+    try:
+        return bool(np.issubdtype(np.dtype(dtype), np.complexfloating))
+    except (TypeError, ValueError):
+        return False
+
+
+def _align_tensordot_dtypes(left, right):
+    """Align contraction operands where Torch requires identical dtypes."""
+    left_dtype = getattr(left, "dtype", None)
+    right_dtype = getattr(right, "dtype", None)
+    if left_dtype == right_dtype:
+        return left, right
+    if _complex_dtype(left_dtype) and not _complex_dtype(right_dtype):
+        right = ar.do("astype", right, left_dtype)
+    else:
+        left = ar.do("astype", left, right_dtype)
+    return left, right
 
 
 def _array_equal(left, right):
@@ -658,6 +812,7 @@ class FirstDegreeMPO:
         self._history_extension_plan_cache = {}
         self._history_compression_plan_cache = {}
         self._history_approximation_plan_cache = {}
+        self._history_tensor_plan_cache = {}
         self._base_level_position_cache = None
         self._levels = self._normalize_levels(levels)
         self._validate()
@@ -770,7 +925,46 @@ class FirstDegreeMPO:
         out._history_approximation_plan_cache = (
             self._history_approximation_plan_cache
         )
+        out._history_tensor_plan_cache = self._history_tensor_plan_cache
         out._base_level_position_cache = self._base_level_position_cache
+        return out
+
+    def _bind_arrays(self, arrays):
+        """Make a lightweight view with new local tensors and shared plans.
+
+        ``MPOBasis`` uses this private primitive for its value-only compiled
+        evaluator.  Reconstructing a semantic MPO through ``__init__`` would
+        repeat validation and level normalization on every optimizer step;
+        the structural metadata and history plans are immutable for this
+        purpose, while the backend arrays must remain fresh so their current
+        autodiff graph is never cached.
+        """
+        arrays = tuple(arrays)
+        if len(arrays) != self.L:
+            raise ValueError(f"arrays must have length {self.L}.")
+        out = object.__new__(type(self))
+        out.L = self.L
+        out._arrays = tuple(
+            _as_4d(array, site=site, length=self.L)
+            for site, array in enumerate(arrays)
+        )
+        out.degree = self.degree
+        out.upper_ind_id = self.upper_ind_id
+        out.lower_ind_id = self.lower_ind_id
+        out.site_tag_id = self.site_tag_id
+        out.metadata = {}
+        out.compression_report = None
+        out._structural_transitions = self._structural_transitions
+        out._history_topology_cache = self._history_topology_cache
+        out._history_symbolic_cache = self._history_symbolic_cache
+        out._history_extension_plan_cache = self._history_extension_plan_cache
+        out._history_compression_plan_cache = self._history_compression_plan_cache
+        out._history_approximation_plan_cache = (
+            self._history_approximation_plan_cache
+        )
+        out._history_tensor_plan_cache = self._history_tensor_plan_cache
+        out._base_level_position_cache = self._base_level_position_cache
+        out._levels = self._levels
         return out
 
     @staticmethod
@@ -1155,6 +1349,311 @@ class FirstDegreeMPO:
         output.compression_report = report
         return (output, report) if return_report else output
 
+    def compress_to_bond(
+        self,
+        chi,
+        *,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+        **compress_opts,
+    ):
+        """Compress to a requested MPO bond dimension.
+
+        ``chi`` is the final MPO bond cap. It is deliberately separate from
+        ``extensive_exponential(max_bond=...)``, whose guard applies only to
+        the temporary paper-history representation. The default compression
+        is Quimb's cutoff-based sweep for ordinary numerical execution and a
+        fixed-rank TT-SVD sweep when ``differentiable=True``.
+
+        The fixed-rank path returns a :class:`FirstDegreeMPO` with invalidated
+        analytical histories, while the Quimb path returns an ordinary
+        ``MatrixProductOperator``. Numerical compression cannot preserve the
+        pre-compression history table.
+        """
+        if not isinstance(chi, Integral) or int(chi) < 1:
+            raise ValueError("chi must be a positive integer.")
+        chi = int(chi)
+        if compression is None:
+            compression = "fixed_rank" if differentiable else "quimb"
+        if compression not in {"quimb", "fixed_rank"}:
+            raise ValueError(
+                "compression must be 'quimb' or 'fixed_rank'."
+            )
+        if differentiable and compression != "fixed_rank":
+            raise ValueError(
+                "differentiable=True requires compression='fixed_rank'."
+            )
+        if compression == "fixed_rank":
+            if compress_opts:
+                unexpected = ", ".join(sorted(compress_opts))
+                raise TypeError(
+                    "fixed-rank compression does not accept Quimb options: "
+                    f"{unexpected}."
+                )
+            return self.compress_fixed_rank(chi, return_report=return_report)
+        return self.compress_numerical(
+            max_bond=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            return_report=return_report,
+            **compress_opts,
+        )
+
+    def _exp_with_compression(
+        self,
+        step,
+        *,
+        metadata_dt,
+        metadata_operation,
+        order=1,
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+        **kwargs,
+    ):
+        """Build ``exp(step * self)`` and optionally compress the result."""
+        if chi is None:
+            if compression is not None:
+                raise ValueError(
+                    "compression requires chi; omit it for an uncompressed MPO."
+                )
+            if return_report:
+                raise ValueError("return_report requires chi compression.")
+            result = self.extensive_exponential(
+                step,
+                order=order,
+                **kwargs,
+            )
+            result.metadata.update({
+                "operation": metadata_operation,
+                "dt": metadata_dt,
+                "exponent": step,
+            })
+            return result
+
+        output = self.extensive_exponential(
+            step,
+            order=order,
+            **kwargs,
+        )
+        compressed = output.compress_to_bond(
+            chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
+        )
+        if return_report:
+            result, report = compressed
+        else:
+            result, report = compressed, None
+        exponential_metadata = {
+            "operation": metadata_operation,
+            "dt": metadata_dt,
+            "exponent": step,
+            "order": order,
+            "chi": int(chi),
+            "compression": (
+                "fixed_rank" if differentiable and compression is None
+                else compression or "quimb"
+            ),
+            "differentiable": bool(differentiable),
+        }
+        for key in (
+            "mode",
+            "history_storage",
+            "history_cache_hit",
+            "tensor_plan_cache_hit",
+            "compression_plan_cache_hit",
+            "extension_plan_cache_hit",
+            "approximation_plan_cache_hit",
+        ):
+            if key in output.metadata:
+                exponential_metadata[key] = output.metadata[key]
+        if output.compression_report is not None:
+            exponential_metadata["analytical_compression_report"] = (
+                output.compression_report
+            )
+        if isinstance(result, FirstDegreeMPO):
+            result.metadata.update(exponential_metadata)
+        else:
+            setattr(result, "pepsy_exp_metadata", exponential_metadata)
+            if metadata_operation == "time_evolution":
+                # Keep the attribute used by the original real-time API.
+                result.pepsy_evolution_metadata = exponential_metadata
+        return (result, report) if return_report else result
+
+    def exp(
+        self,
+        step=None,
+        *,
+        dt=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+    ):
+        """Build ``exp(step * self)`` with optional final compression.
+
+        Parameters
+        ----------
+        step : scalar
+            Actual scalar in the exponential. Use ``-1j * tau`` for
+            real-time evolution and ``-beta`` for imaginary time.
+        dt : scalar, optional
+            Compatibility spelling for ``step``. Supplying both raises.
+        order, mode, max_bond, on_exceed, cache_history, history_storage
+            Controls for the analytical higher-order history construction.
+        chi : int, optional
+            Separate final numerical MPO bond cap. It is not the temporary
+            history-bond guard ``max_bond``.
+        differentiable : bool, optional
+            With ``chi``, select fixed-rank autodiff compression instead of a
+            value-dependent numerical cutoff.
+        """
+        step = _resolve_exp_step(step, dt)
+        return self._exp_with_compression(
+            step,
+            metadata_dt=step,
+            metadata_operation="exp",
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
+        )
+
+    def time_evolution(
+        self,
+        dt,
+        *,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+    ):
+        """Build real-time ``exp(-1j * dt * self)``.
+
+        This is a convenience wrapper around :meth:`exp`; use :meth:`exp`
+        directly when the exponential step should be explicit.
+        """
+        _check_scalar(dt, name="dt")
+        return self._exp_with_compression(
+            -1j * dt,
+            metadata_dt=dt,
+            metadata_operation="time_evolution",
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
+        )
+
+    def exp_arrays(
+        self,
+        step=None,
+        *,
+        dt=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+    ):
+        """Return ``exp(step * self)`` tensors without a Quimb wrapper.
+
+        This is the low-level numerical interface for compiled optimization
+        loops. It returns the normalized ``(left, right, up, down)`` tensor
+        tuple directly. The backend values remain connected to ``step`` and
+        the Hamiltonian coefficients for autodiff.
+        """
+        step = _resolve_exp_step(step, dt)
+        return self.exp(
+            step,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+        ).arrays
+
+    def time_evolution_arrays(
+        self,
+        dt,
+        *,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+    ):
+        """Return real-time evolution tensors without a semantic wrapper."""
+        return self.time_evolution(
+            dt,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+        ).arrays
+
     def expectation(self, mps, *, contraction_opt=None):
         """Evaluate ``<mps|self|mps>`` through Pepsy's MPS contraction API."""
         from pepsy.tensors import expec_mpo  # pylint: disable=import-outside-toplevel
@@ -1526,9 +2025,9 @@ class FirstDegreeMPO:
 
             # The finite Hamiltonian's last tensor is right-boundary
             # contracted onto level 3, while the transformed evolution MPO
-            # uses an all-one right boundary. ``_base_local_block`` supplies
-            # this synthetic identity edge, so include it in the structural
-            # graph as well.
+            # uses an all-one right boundary. The batched local-product
+            # executor supplies this synthetic identity edge, so include it
+            # in the structural graph as well.
             if site == self.L - 1:
                 start_level = next(
                     level
@@ -1648,15 +2147,23 @@ class FirstDegreeMPO:
             else None
         )
         cache_hit = state_lists is not None
+        guarded_generation = False
         if state_lists is None:
+            guarded_generation = max_bond is not None and on_exceed != "ignore"
             state_lists = self._reachable_history_states(
                 self._history_schemas(),
                 exponent,
-                max_bond=None,
-                on_exceed="ignore",
+                max_bond=max_bond if guarded_generation else None,
+                on_exceed=on_exceed if guarded_generation else "ignore",
             )
         if cache_history and not cache_hit:
             self._history_topology_cache[exponent] = state_lists
+
+        # A first-time guarded generation already enforced the policy while
+        # walking the graph. Rechecking it would duplicate warnings; cached
+        # topologies still need the caller's per-request policy applied here.
+        if guarded_generation:
+            return state_lists, cache_hit
 
         warned = False
         if max_bond is not None and on_exceed != "ignore":
@@ -1761,6 +2268,286 @@ class FirstDegreeMPO:
             for left_level, right_level in zip(left_state, right_state)
         )
 
+    def _history_local_position_arrays(self, site, left_states, right_states):
+        """Resolve all base virtual positions for one local history batch.
+
+        The old history builder resolved a base block independently for every
+        pair of compound histories.  The lookup is structural, so resolve it
+        once per factor and gather all physical blocks in one backend call.
+        ``-1`` denotes the edge padding handled by
+        :meth:`_history_local_product_batch_values`.
+        """
+        base_positions = self._base_level_positions()
+
+        def resolve(bond, level):
+            positions = base_positions[bond]
+            position = positions["label"].get(level.label)
+            if position is None:
+                position = positions["history"].get(level.history)
+            return -1 if position is None else position
+
+        order = len(left_states[0])
+        left_positions = tuple(
+            np.asarray(
+                [resolve(site, state[factor]) for state in left_states],
+                dtype=int,
+            )
+            for factor in range(order)
+        )
+        right_positions = tuple(
+            np.asarray(
+                [resolve(site + 1, state[factor]) for state in right_states],
+                dtype=int,
+            )
+            for factor in range(order)
+        )
+        left_numbers = tuple(
+            np.asarray(
+                [
+                    _level_number(state[factor].history[0])
+                    for state in left_states
+                ],
+                dtype=int,
+            )
+            for factor in range(order)
+        )
+        right_numbers = tuple(
+            np.asarray(
+                [
+                    _level_number(state[factor].history[0])
+                    for state in right_states
+                ],
+                dtype=int,
+            )
+            for factor in range(order)
+        )
+        return (
+            left_positions,
+            right_positions,
+            left_numbers,
+            right_numbers,
+        )
+
+    def _history_allowed_pairs(self, site, left_states, right_states, *, sparse):
+        """Return virtual pairs with a nonzero structural local product."""
+        if not sparse or self._structural_transitions is None:
+            left = np.repeat(
+                np.arange(len(left_states), dtype=int),
+                len(right_states),
+            )
+            right = np.tile(
+                np.arange(len(right_states), dtype=int),
+                len(left_states),
+            )
+            return left, right
+
+        left = []
+        right = []
+        for left_pos, left_state in enumerate(left_states):
+            for right_pos, right_state in enumerate(right_states):
+                if self._history_transition_allowed(
+                    site, left_state, right_state,
+                ):
+                    left.append(left_pos)
+                    right.append(right_pos)
+        return np.asarray(left, dtype=int), np.asarray(right, dtype=int)
+
+    def _history_tensor_execution_plan(
+        self,
+        exponent,
+        state_lists,
+        *,
+        sparse,
+        cache_history,
+    ):
+        """Compile local gather metadata for one raw-history order.
+
+        History topology caching used to leave one structural cost on every
+        numerical evaluation: each site recomputed allowed pairs, base-level
+        positions, and identity-rail metadata before doing the actual local
+        products.  This plan contains only NumPy integer/boolean arrays and
+        can therefore be shared safely by parameterized Torch and JAX calls.
+        """
+        key = (int(exponent), bool(sparse))
+        if cache_history:
+            cached = self._history_tensor_plan_cache.get(key)
+            if cached is not None:
+                return cached, True
+
+        sites = []
+        for site in range(self.L):
+            left_states = state_lists[site]
+            right_states = state_lists[site + 1]
+            left_indices, right_indices = self._history_allowed_pairs(
+                site,
+                left_states,
+                right_states,
+                sparse=sparse,
+            )
+            sites.append({
+                "left_indices": left_indices,
+                "right_indices": right_indices,
+                "positions": self._history_local_position_arrays(
+                    site,
+                    left_states,
+                    right_states,
+                ),
+                "total_blocks": len(left_states) * len(right_states),
+            })
+
+        plan = tuple(sites)
+        if cache_history:
+            self._history_tensor_plan_cache[key] = plan
+        return plan, False
+
+    def _history_local_product_batch_values(
+        self,
+        site,
+        positions,
+        left_indices,
+        right_indices,
+    ):
+        """Evaluate many history products with batched physical matmuls."""
+        array = self._arrays[site]
+        left_positions, right_positions, left_numbers, right_numbers = positions
+        reference = array[0, 0]
+        product_block = None
+        for factor in range(len(left_positions)):
+            local_left = left_positions[factor][left_indices]
+            local_right = right_positions[factor][right_indices]
+            left_valid = local_left >= 0
+            right_valid = local_right >= 0
+            safe_left = np.where(left_valid, local_left, 0)
+            safe_right = np.where(right_valid, local_right, 0)
+            local = _backend_index_pairs(array, safe_left, safe_right)
+            valid = _as_backend(left_valid & right_valid, like=local)
+            local = ar.do(
+                "where",
+                valid[..., None, None],
+                local,
+                ar.do("zeros_like", local),
+            )
+
+            # The finite Hamiltonian's final tensor is contracted onto the
+            # level-3 rail.  History products use the all-one boundary, so the
+            # missing (1 -> 1) edge is the identity rather than zero.
+            synthetic = (
+                left_numbers[factor][left_indices] == 1
+            ) & (
+                right_numbers[factor][right_indices] == 1
+            ) & ~right_valid if site == self.L - 1 else np.zeros(
+                len(left_indices),
+                dtype=bool,
+            )
+            if np.any(synthetic):
+                synthetic = _as_backend(synthetic, like=local)
+                local = ar.do(
+                    "where",
+                    synthetic[..., None, None],
+                    ar.do("eye", self.phys_dim, like=reference),
+                    local,
+                )
+            product_block = (
+                local
+                if product_block is None
+                else ar.do("matmul", product_block, local)
+            )
+        return product_block
+
+    def _history_tensor_batch(
+        self,
+        site,
+        left_states,
+        right_states,
+        *,
+        sparse,
+        chunk_size=65536,
+        execution_plan=None,
+    ):
+        """Build one history tensor without dispatching per virtual pair."""
+        if execution_plan is None:
+            left_indices, right_indices = self._history_allowed_pairs(
+                site,
+                left_states,
+                right_states,
+                sparse=sparse,
+            )
+            positions = self._history_local_position_arrays(
+                site,
+                left_states,
+                right_states,
+            )
+        else:
+            left_indices = execution_plan["left_indices"]
+            right_indices = execution_plan["right_indices"]
+            positions = execution_plan["positions"]
+        reference = self._arrays[site]
+        result = _zeros(
+            (
+                len(left_states),
+                len(right_states),
+                *reference.shape[-2:],
+            ),
+            like=reference,
+        )
+        if not len(left_indices):
+            return result, 0, len(left_states) * len(right_states)
+
+        for start in range(0, len(left_indices), chunk_size):
+            stop = start + chunk_size
+            values = self._history_local_product_batch_values(
+                site,
+                positions,
+                left_indices[start:stop],
+                right_indices[start:stop],
+            )
+            result = _scatter_set_2d(
+                result,
+                left_indices[start:stop],
+                right_indices[start:stop],
+                values,
+            )
+        return result, len(left_indices), len(left_states) * len(right_states)
+
+    def _batched_history_power_data(
+        self,
+        exponent,
+        *,
+        state_lists,
+        storage_mode,
+        cache_hit,
+        execution_plan=None,
+        tensor_plan_cache_hit=False,
+    ):
+        """Build raw history tensors using batched local block products."""
+        levels = self._history_levels_for_states(state_lists, exponent)
+        arrays = []
+        total_blocks = 0
+        stored_blocks = 0
+        sparse = storage_mode == "sparse"
+        for site in range(self.L):
+            array, stored, total = self._history_tensor_batch(
+                site,
+                state_lists[site],
+                state_lists[site + 1],
+                sparse=sparse,
+                execution_plan=(
+                    None
+                    if execution_plan is None
+                    else execution_plan[site]
+                ),
+            )
+            arrays.append(array)
+            stored_blocks += stored
+            total_blocks += total
+        storage_info = {
+            "mode": storage_mode,
+            "stored_blocks": stored_blocks,
+            "total_blocks": total_blocks,
+            "tensor_plan_cache_hit": bool(tensor_plan_cache_hit),
+        }
+        return arrays, levels, cache_hit, storage_info
+
     def _stream_history_power_data(
         self,
         exponent,
@@ -1770,78 +2557,26 @@ class FirstDegreeMPO:
         on_exceed,
         sparse,
     ):
-        """Build history tensors while retaining only two adjacent cuts.
+        """Build non-cached history tensors with batched local products.
 
         The final MPO tensors still have to be materialized for Algorithms
-        1--4, but this path does not retain a complete topology table. Its
-        sparse variant also avoids structurally impossible local block
-        products. It is the memory-bounded path used by
-        ``cache_history=False`` together with ``history_storage='sparse'`` or
-        ``'streaming'``.
+        1--4, but this path does not retain the topology cache. Its sparse
+        variant also avoids structurally impossible local block products.
+        The resulting virtual arrays are still dense because Algorithms 1--4
+        operate on those arrays.
         """
-        start_levels = tuple(
-            level
-            for level in schemas[0]
-            if _level_number(level.history[0]) == 1
+        state_lists = self._reachable_history_states(
+            schemas,
+            exponent,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
         )
-        if len(start_levels) != 1:
-            raise ValueError(
-                "history construction requires one level-1 starting channel."
-            )
-        left_states = (tuple(start_levels[0] for _ in range(exponent)),)
-        levels = [
-            self._history_levels_for_states((left_states,), exponent)[0]
-        ]
-        arrays = []
-        total_blocks = 0
-        stored_blocks = 0
-        warned = [False]
-
-        for site in range(self.L):
-            right_states = self._history_state_step(
-                schemas,
-                left_states,
-                site,
-                max_bond=max_bond,
-                on_exceed=on_exceed,
-                warned=warned,
-            )
-            rows = []
-            reference = self._arrays[site][0, 0]
-            zero_block = None
-            for left_state in left_states:
-                blocks = []
-                for right_state in right_states:
-                    total_blocks += 1
-                    allowed = (
-                        not sparse
-                        or self._history_transition_allowed(
-                            site, left_state, right_state,
-                        )
-                    )
-                    if allowed:
-                        block = self._history_local_product(
-                            site, left_state, right_state,
-                        )
-                        stored_blocks += 1
-                    else:
-                        if zero_block is None:
-                            zero_block = ar.do("zeros_like", reference)
-                        block = zero_block
-                    blocks.append(block)
-                rows.append(_stack(blocks, axis=0))
-            arrays.append(_stack(rows, axis=0))
-            left_states = right_states
-            levels.append(
-                self._history_levels_for_states((left_states,), exponent)[0]
-            )
-
-        storage_info = {
-            "mode": "sparse" if sparse else "streaming",
-            "stored_blocks": stored_blocks,
-            "total_blocks": total_blocks,
-        }
-        return arrays, levels, False, storage_info
+        return self._batched_history_power_data(
+            exponent,
+            state_lists=state_lists,
+            storage_mode="sparse" if sparse else "streaming",
+            cache_hit=False,
+        )
 
     @property
     def history_cache_info(self):
@@ -1858,6 +2593,9 @@ class FirstDegreeMPO:
             "approximation_plan_orders": tuple(
                 sorted(self._history_approximation_plan_cache),
             ),
+            "tensor_plan_orders": tuple(
+                sorted({order for order, _sparse in self._history_tensor_plan_cache}),
+            ),
             "extension_plan_orders": tuple(
                 sorted(self._history_extension_plan_cache),
             ),
@@ -1866,6 +2604,22 @@ class FirstDegreeMPO:
                 for order, plan in self._history_extension_plan_cache.items()
             },
         }
+
+    def clear_history_cache(self):
+        """Release cached history topologies and symbolic execution plans.
+
+        The first-degree MPO itself remains usable.  This only clears the
+        reusable structural data used by higher-order exponential calls; it
+        never changes the current local tensors or their autodiff graph.
+        Shared :class:`MPOBasis` templates observe the same clear operation.
+        """
+        self._history_topology_cache.clear()
+        self._history_extension_plan_cache.clear()
+        self._history_compression_plan_cache.clear()
+        self._history_approximation_plan_cache.clear()
+        self._history_tensor_plan_cache.clear()
+        self._history_symbolic_cache = None
+        return self
 
     def _history_power_data(
         self,
@@ -1909,9 +2663,39 @@ class FirstDegreeMPO:
                 "use history_storage='auto' for cached construction."
             )
         if history_storage == "auto":
-            history_storage = "streaming" if not cache_history else "dense"
+            # A local-term automaton supplies exact structural transitions.
+            # Preserve only those nonzero history blocks by default; MPSKit's
+            # corresponding path is sparse as well.  Directly constructed
+            # MPOs have no safe structural filter and retain the dense path.
+            if self._structural_transitions is not None and cache_history:
+                history_storage = "sparse"
+            else:
+                history_storage = "streaming" if not cache_history else "dense"
         schemas = self._history_schemas()
-        if history_storage in {"sparse", "streaming"} and not cache_history:
+        if history_storage in {"sparse", "streaming"}:
+            if cache_history:
+                state_lists, cache_hit = self._history_topology(
+                    exponent,
+                    max_bond=max_bond,
+                    on_exceed=on_exceed,
+                    cache_history=True,
+                )
+                tensor_plan, tensor_plan_cache_hit = (
+                    self._history_tensor_execution_plan(
+                        exponent,
+                        state_lists,
+                        sparse=history_storage == "sparse",
+                        cache_history=True,
+                    )
+                )
+                return self._batched_history_power_data(
+                    exponent,
+                    state_lists=state_lists,
+                    storage_mode=history_storage,
+                    cache_hit=cache_hit,
+                    execution_plan=tensor_plan,
+                    tensor_plan_cache_hit=tensor_plan_cache_hit,
+                )
             return self._stream_history_power_data(
                 exponent,
                 schemas=schemas,
@@ -1926,95 +2710,22 @@ class FirstDegreeMPO:
             on_exceed=on_exceed,
             cache_history=cache_history,
         )
-        levels = self._history_levels_for_states(state_lists, exponent)
-
-        arrays = []
-        total_blocks = 0
-        stored_blocks = 0
-        for site in range(self.L):
-            rows = []
-            reference = self._arrays[site][0, 0]
-            zero_block = None
-            for left_state in state_lists[site]:
-                blocks = []
-                for right_state in state_lists[site + 1]:
-                    total_blocks += 1
-                    allowed = (
-                        history_storage == "dense"
-                        or self._history_transition_allowed(
-                            site, left_state, right_state,
-                        )
-                    )
-                    if allowed:
-                        block = self._history_local_product(
-                            site, left_state, right_state,
-                        )
-                        stored_blocks += 1
-                    else:
-                        if zero_block is None:
-                            zero_block = ar.do("zeros_like", reference)
-                        block = zero_block
-                    blocks.append(block)
-                rows.append(_stack(blocks, axis=0))
-            arrays.append(_stack(rows, axis=0))
-        storage_info = {
-            "mode": history_storage,
-            "stored_blocks": stored_blocks,
-            "total_blocks": total_blocks,
-        }
-        return arrays, levels, cache_hit, storage_info
-
-    def _level_position(self, levels, wanted):
-        """Find a base-level position by label or symbolic token."""
-        for pos, level in enumerate(levels):
-            if level.label == wanted.label or level.history == wanted.history:
-                return pos
-        wanted_number = _level_number(wanted.history[0])
-        if wanted_number in (1, 3):
-            for pos, level in enumerate(levels):
-                if _level_number(level.history[0]) == wanted_number:
-                    return pos
-        return None
-
-    def _base_local_block(self, site, left_level, right_level):
-        """Read a first-degree local block, returning zero for edge padding."""
-        array = self._arrays[site]
-        positions = self._base_level_positions()
-        left_map = positions[site]
-        right_map = positions[site + 1]
-        if left_level.label in left_map["label"]:
-            left_pos = left_map["label"][left_level.label]
-        else:
-            left_pos = left_map["history"].get(left_level.history)
-        if right_level.label in right_map["label"]:
-            right_pos = right_map["label"][right_level.label]
-        else:
-            right_pos = right_map["history"].get(right_level.history)
-        reference = array[0, 0]
-        left_number = _level_number(left_level.history[0])
-        right_number = _level_number(right_level.history[0])
-        # The finite Hamiltonian's last tensor is right-boundary contracted
-        # onto level 3.  The transformed evolution MPO instead selects the
-        # all-one right boundary, so restore the identity rail explicitly at
-        # that edge. Other unfinished paths remain unreachable at the edge.
-        if (
-            site == self.L - 1
-            and right_pos is None
-            and right_number == 1
-            and left_number == 1
-        ):
-            return ar.do("eye", self.phys_dim, like=reference)
-        if left_pos is None or right_pos is None:
-            return ar.do("zeros_like", reference)
-        return array[left_pos, right_pos]
-
-    def _history_local_product(self, site, left_state, right_state):
-        """Multiply local first-degree blocks for one pair of histories."""
-        block = None
-        for left_level, right_level in zip(left_state, right_state):
-            local = self._base_local_block(site, left_level, right_level)
-            block = local if block is None else ar.do("matmul", block, local)
-        return block
+        tensor_plan, tensor_plan_cache_hit = (
+            self._history_tensor_execution_plan(
+                exponent,
+                state_lists,
+                sparse=history_storage == "sparse",
+                cache_history=cache_history,
+            )
+        )
+        return self._batched_history_power_data(
+            exponent,
+            state_lists=state_lists,
+            storage_mode=history_storage,
+            cache_hit=cache_hit,
+            execution_plan=tensor_plan,
+            tensor_plan_cache_hit=tensor_plan_cache_hit,
+        )
 
     def _history_levels_from_tokens(self, schemas, bond, history):
         """Resolve flattened history tokens to base levels at one cut."""
@@ -2064,21 +2775,12 @@ class FirstDegreeMPO:
         return factor_levels
 
     @staticmethod
-    def _find_history(levels, history):
-        """Return the position of ``history`` in a virtual bond, if present."""
-        for pos, level in enumerate(levels):
-            if level.history == history:
-                return pos
-        return None
-
-    @staticmethod
     def _remove_history_column(arrays, levels, bond, source, target, coefficient):
-        """Apply an Algorithm-1/column-gauge elimination at one cut.
+        """Apply one sequential Algorithm-1/4 column elimination.
 
-        The helper mutates the working arrays and level list in place.  All
-        callers operate on freshly built history data.  Slicing and
-        concatenating the virtual axis avoids Python-level reconstruction of
-        every remaining block on large history bonds.
+        The production executor uses fused transfer maps. This small
+        primitive remains available for deterministic reference tests and for
+        debugging a compiled elimination schedule.
         """
         left = arrays[bond - 1]
         left = _setitem(
@@ -2088,34 +2790,250 @@ class FirstDegreeMPO:
             + _multiply_scalar(coefficient, left[:, source]),
         )
         arrays[bond - 1] = _drop_axis(left, axis=1, position=source)
-
         if bond < len(arrays):
             arrays[bond] = _drop_axis(arrays[bond], axis=0, position=source)
         levels[bond].pop(source)
 
     @staticmethod
-    def _remove_history_row(arrays, levels, bond, source, target):
-        """Apply the Algorithm-2 row-gauge elimination at one cut.
+    def _history_axis_groups(size, operations):
+        """Compile ordered channel merges into original-index contributions."""
+        groups = [{position: 1.0} for position in range(size)]
+        for source, target, merge in operations:
+            if merge:
+                for original, weight in groups[source].items():
+                    groups[target][original] = (
+                        groups[target].get(original, 0.0) + weight
+                    )
+            groups.pop(source)
+        return groups
 
-        Row and column eliminations are kept as separate helpers because the
-        paper assigns different coefficients and equality directions to them.
-        A future sparse implementation should preserve these two operations as
-        its primitive virtual-channel updates.
-        """
-        if bond >= len(arrays):
-            return False
-        right = arrays[bond]
-        right = _setitem(
-            right,
-            (target, slice(None)),
-            right[target] + right[source],
+    @staticmethod
+    def _apply_history_axis_groups(array, groups, *, axis):
+        """Apply all channel deletions on one virtual axis in one scatter."""
+        transfer = _history_transfer_matrix(groups, int(array.shape[axis]))
+        if transfer is not None:
+            return _apply_history_transfer(array, transfer, axis=axis)
+
+        sources = []
+        targets = []
+        weights = []
+        for target, group in enumerate(groups):
+            for source, weight in group.items():
+                sources.append(source)
+                targets.append(target)
+                weights.append(weight)
+
+        output_shape = list(array.shape)
+        output_shape[axis] = len(groups)
+        result = _zeros(output_shape, like=array)
+        if not sources:
+            return result
+
+        source_indices = np.asarray(sources, dtype=int)
+        target_indices = np.asarray(targets, dtype=int)
+        if axis == 1:
+            source_backend = _as_backend(source_indices, like=array)
+            values = array[:, source_backend]
+            rows = np.repeat(
+                np.arange(array.shape[0], dtype=int),
+                len(source_indices),
+            )
+            columns = np.tile(target_indices, array.shape[0])
+        else:
+            source_backend = _as_backend(source_indices, like=array)
+            values = array[source_backend, :]
+            rows = np.repeat(target_indices, array.shape[1])
+            columns = np.tile(
+                np.arange(array.shape[1], dtype=int),
+                len(source_indices),
+            )
+        coefficient = _as_backend(np.asarray(weights), like=values)
+        weight_shape = (
+            (1, len(coefficient), 1, 1)
+            if axis == 1
+            else (len(coefficient), 1, 1, 1)
         )
-        arrays[bond] = _drop_axis(right, axis=0, position=source)
+        values = ar.do(
+            "multiply",
+            values,
+            ar.do("reshape", coefficient, weight_shape),
+        )
+        return _scatter_add_2d(
+            result,
+            rows,
+            columns,
+            values.reshape((-1, *array.shape[-2:])),
+        )
 
-        left = arrays[bond - 1]
-        arrays[bond - 1] = _drop_axis(left, axis=1, position=source)
-        levels[bond].pop(source)
-        return True
+    @staticmethod
+    def _history_axis_polynomial_groups(size, operations):
+        """Compile channel merges whose weights are polynomials in ``dt``."""
+        groups = [
+            {position: [(0, 1.0)]}
+            for position in range(size)
+        ]
+        for source, target, merge, power, coefficient in operations:
+            if merge and coefficient != 0.0:
+                for original, terms in groups[source].items():
+                    shifted = [
+                        (old_power + power, old_coefficient * coefficient)
+                        for old_power, old_coefficient in terms
+                    ]
+                    groups[target].setdefault(original, []).extend(shifted)
+            groups.pop(source)
+        return groups
+
+    @staticmethod
+    def _apply_history_polynomial_groups(array, groups, dt, *, axis):
+        """Apply a parameterized channel schedule in one backend scatter."""
+        old_size = int(array.shape[axis])
+        power_maps = {}
+        for target, group in enumerate(groups):
+            for source, terms in group.items():
+                for power, coefficient in terms:
+                    power_maps.setdefault(int(power), []).append(
+                        (target, source, coefficient),
+                    )
+        if (
+            len(groups) * old_size <= _MAX_HISTORY_TRANSFER_ELEMENTS
+            and power_maps
+        ):
+            transfer = None
+            for power, entries in power_maps.items():
+                structural = np.zeros((len(groups), old_size), dtype=float)
+                for target, source, coefficient in entries:
+                    structural[target, source] += float(coefficient)
+                structural = _as_backend(structural, like=array)
+                weighted = _multiply_scalar(dt ** power, structural)
+                transfer = weighted if transfer is None else ar.do(
+                    "add",
+                    transfer,
+                    weighted,
+                )
+            return _apply_history_transfer(array, transfer, axis=axis)
+
+        sources = []
+        targets = []
+        powers = []
+        coefficients = []
+        for target, group in enumerate(groups):
+            for source, terms in group.items():
+                for power, coefficient in terms:
+                    sources.append(source)
+                    targets.append(target)
+                    powers.append(power)
+                    coefficients.append(coefficient)
+
+        output_shape = list(array.shape)
+        output_shape[axis] = len(groups)
+        result = _zeros(output_shape, like=array)
+        if not sources:
+            return result
+
+        source_indices = np.asarray(sources, dtype=int)
+        target_indices = np.asarray(targets, dtype=int)
+        if axis == 1:
+            source_backend = _as_backend(source_indices, like=array)
+            values = array[:, source_backend]
+            rows = np.repeat(
+                np.arange(array.shape[0], dtype=int),
+                len(source_indices),
+            )
+            columns = np.tile(target_indices, array.shape[0])
+        else:
+            source_backend = _as_backend(source_indices, like=array)
+            values = array[source_backend, :]
+            rows = np.repeat(target_indices, array.shape[1])
+            columns = np.tile(
+                np.arange(array.shape[1], dtype=int),
+                len(source_indices),
+            )
+
+        powers = tuple(int(power) for power in powers)
+        power_values = {
+            power: dt ** power
+            for power in set(powers)
+        }
+        weights = tuple(
+            _multiply_scalar(power_values[power], coefficient)
+            for power, coefficient in zip(powers, coefficients)
+        )
+        if any(
+            _backend_name(value) not in {"builtins", "numpy"}
+            for value in weights
+        ):
+            weights = ar.do("stack", weights)
+        else:
+            weights = np.asarray(weights)
+            weights = _as_backend(weights, like=values)
+        weight_shape = (
+            (1, len(weights), 1, 1)
+            if axis == 1
+            else (len(weights), 1, 1, 1)
+        )
+        values = ar.do(
+            "multiply",
+            values,
+            ar.do("reshape", weights, weight_shape),
+        )
+        return _scatter_add_into_2d(
+            result,
+            rows,
+            columns,
+            values.reshape((-1, *array.shape[-2:])),
+        )
+
+    def _algorithm_two_bond(self, arrays, levels, bond, actions):
+        """Apply one bond's Algorithm-2 schedule as two fused transforms."""
+        current = list(levels[bond])
+        row_operations = []
+        column_operations = []
+        merges = []
+        for source_history, canonical, mode, source_label in actions:
+            positions = self._history_level_positions(current)
+            source = positions.get(source_history)
+            target = positions.get(canonical)
+            if source is None or target is None or target == source:
+                continue
+            if mode == "row":
+                if bond >= len(arrays):
+                    continue
+                row_operations.append((source, target, True))
+                column_operations.append((source, target, False))
+            else:
+                column_operations.append((source, target, True))
+                row_operations.append((source, target, False))
+            current.pop(source)
+            merges.append({
+                "bond": bond - 1,
+                "source": source_label,
+                "target": canonical,
+                "mode": mode,
+                "history": source_history,
+            })
+
+        if not merges:
+            return merges
+        if column_operations:
+            arrays[bond - 1] = self._apply_history_axis_groups(
+                arrays[bond - 1],
+                self._history_axis_groups(
+                    arrays[bond - 1].shape[1],
+                    column_operations,
+                ),
+                axis=1,
+            )
+        if row_operations and bond < len(arrays):
+            arrays[bond] = self._apply_history_axis_groups(
+                arrays[bond],
+                self._history_axis_groups(
+                    arrays[bond].shape[0],
+                    row_operations,
+                ),
+                axis=0,
+            )
+        levels[bond] = current
+        return merges
 
     def _history_compression_plan(self, levels, order, *, cache_history):
         """Compile Algorithms 1--2 as a topology-only elimination plan.
@@ -2222,26 +3140,66 @@ class FirstDegreeMPO:
                 levels, order, cache_history=False,
             )
         coefficient_denominator = factorial(order)
-        for bond, source_history, target_history, number_of_threes in plan[
-            "algorithm_one"
-        ]:
-            positions = self._history_level_positions(levels[bond])
-            source = positions.get(source_history)
-            target = positions.get(target_history)
-            if source is None:
+        actions_by_bond = [[] for _ in range(self.L + 1)]
+        for action in plan["algorithm_one"]:
+            actions_by_bond[action[0]].append(action[1:])
+
+        # Compile one polynomial virtual transfer per bond.  This is
+        # algebraically identical to the ordered column eliminations, but it
+        # replaces one full tensor copy per history channel by one backend
+        # contraction per side of the cut.
+        for bond, actions in enumerate(actions_by_bond):
+            if not actions:
                 continue
-            if target is None or target == source:
-                raise ValueError(
-                    "history power lost its all-one Algorithm-1 target."
+            current = list(levels[bond])
+            polynomial_operations = []
+            removal_operations = []
+            for (
+                source_history,
+                target_history,
+                number_of_threes,
+            ) in actions:
+                positions = self._history_level_positions(current)
+                source = positions.get(source_history)
+                target = positions.get(target_history)
+                if source is None:
+                    continue
+                if target is None or target == source:
+                    raise ValueError(
+                        "history power lost its all-one Algorithm-1 target."
+                    )
+                polynomial_operations.append((
+                    source,
+                    target,
+                    True,
+                    number_of_threes,
+                    factorial(order - number_of_threes)
+                    / coefficient_denominator,
+                ))
+                removal_operations.append((source, target, False))
+                current.pop(source)
+
+            if not polynomial_operations:
+                continue
+            arrays[bond - 1] = self._apply_history_polynomial_groups(
+                arrays[bond - 1],
+                self._history_axis_polynomial_groups(
+                    arrays[bond - 1].shape[1],
+                    polynomial_operations,
+                ),
+                dt,
+                axis=1,
+            )
+            if bond < len(arrays):
+                arrays[bond] = self._apply_history_axis_groups(
+                    arrays[bond],
+                    self._history_axis_groups(
+                        arrays[bond].shape[0],
+                        removal_operations,
+                    ),
+                    axis=0,
                 )
-            coefficient = (
-                dt ** number_of_threes
-                * factorial(order - number_of_threes)
-                / coefficient_denominator
-            )
-            self._remove_history_column(
-                arrays, levels, bond, source, target, coefficient,
-            )
+            levels[bond] = current
 
     def _algorithm_two(self, arrays, levels, *, plan=None):
         """Apply the paper's exact history-only compression transformations.
@@ -2255,32 +3213,20 @@ class FirstDegreeMPO:
             plan, _ = self._history_compression_plan(
                 levels, len(levels[0][0].history), cache_history=False,
             )
-        merges = []
+        actions_by_bond = [[] for _ in range(self.L + 1)]
         for bond, source_history, canonical, mode, source_label in plan[
             "algorithm_two"
         ]:
-            positions = self._history_level_positions(levels[bond])
-            source = positions.get(source_history)
-            target = positions.get(canonical)
-            if source is None or target is None or target == source:
-                continue
-            if mode == "row":
-                applied = self._remove_history_row(
-                    arrays, levels, bond, source, target,
+            actions_by_bond[bond].append(
+                (source_history, canonical, mode, source_label),
+            )
+
+        merges = []
+        for bond, actions in enumerate(actions_by_bond):
+            if actions:
+                merges.extend(
+                    self._algorithm_two_bond(arrays, levels, bond, actions),
                 )
-            else:
-                self._remove_history_column(
-                    arrays, levels, bond, source, target, 1.0,
-                )
-                applied = True
-            if applied:
-                merges.append({
-                    "bond": bond - 1,
-                    "source": source_label,
-                    "target": canonical,
-                    "mode": mode,
-                    "history": source_history,
-                })
         return merges
 
     def _base_level_position(self, bond, level):
@@ -2298,10 +3244,12 @@ class FirstDegreeMPO:
         The selected contribution is separable at the virtual level: for a
         fixed insertion position, one only needs the valid left state list,
         the valid right state list, and the local base-block positions for
-        each factor.  Store those short lists and let execution perform one
-        batched physical-matrix product per insertion pair.  This keeps the
-        plan ``O(L N D)`` instead of materializing ``O(L N^2 D^2)`` scalar
-        transition records.
+        each factor. Store those short lists and let execution perform one
+        batched physical-matrix product per site. The plan avoids Python
+        objects for every scalar transition, but its flattened site plans
+        still materialize every selected left/right pair; their memory scales
+        with the selected pair count. A future blockwise executor can remove
+        that remaining materialization without changing the symbolic plan.
         """
         if cache_history:
             cached = self._history_extension_plan_cache.get(order)
@@ -2759,21 +3707,70 @@ class FirstDegreeMPO:
             order,
             cache_history=cache_history,
         )
-        removed = 0
+        actions_by_bond = [[] for _ in range(self.L + 1)]
         for bond, source, target, number_of_threes in plan["actions"]:
-            if source >= len(levels[bond]) or target >= len(levels[bond]):
+            actions_by_bond[bond].append(
+                (source, target, number_of_threes),
+            )
+
+        removed = 0
+        for bond, actions in enumerate(actions_by_bond):
+            current = list(levels[bond])
+            operations = []
+            for source, target, number_of_threes in actions:
+                # The approximation plan stores positions in the working
+                # level list at the point where each action was compiled.
+                # They therefore remain valid as long as we replay the
+                # actions in their original order, just like the sequential
+                # implementation did.
+                if (
+                    source >= len(current)
+                    or target >= len(current)
+                    or source == target
+                ):
+                    continue
+                if number_of_threes <= order:
+                    coefficient = (
+                        factorial(order - number_of_threes)
+                        / factorial(order)
+                    )
+                    power = number_of_threes
+                else:
+                    coefficient = 0.0
+                    power = 0
+                operations.append((source, target, True, power, coefficient))
+                current.pop(source)
+
+            if not operations:
                 continue
-            coefficient = (
-                dt ** number_of_threes
-                * factorial(order - number_of_threes)
-                / factorial(order)
-                if number_of_threes <= order
-                else 0.0
+            arrays[bond - 1] = self._apply_history_polynomial_groups(
+                arrays[bond - 1],
+                self._history_axis_polynomial_groups(
+                    arrays[bond - 1].shape[1],
+                    operations,
+                ),
+                dt,
+                axis=1,
             )
-            self._remove_history_column(
-                arrays, levels, bond, source, target, coefficient,
-            )
-            removed += 1
+            if bond < len(arrays):
+                # A column elimination also removes the matching row from
+                # the tensor on the right of the cut.  Keep this as a fused
+                # gather so Algorithm 4 does not fall back to one full-tensor
+                # copy per merge.
+                arrays[bond] = self._apply_history_axis_groups(
+                    arrays[bond],
+                    self._history_axis_groups(
+                        arrays[bond].shape[0],
+                        [
+                            (source, target, False)
+                            for source, target, _merge, _power, _coefficient
+                            in operations
+                        ],
+                    ),
+                    axis=0,
+                )
+            levels[bond] = current
+            removed += len(operations)
         return removed, cache_hit
 
     def _contract_history_boundaries(self, arrays, levels, order):
@@ -2891,6 +3888,10 @@ class FirstDegreeMPO:
             "history_storage": storage_info["mode"],
             "history_storage_requested": history_storage,
             "history_storage_blocks": storage_info,
+            "tensor_plan_cache_hit": storage_info.get(
+                "tensor_plan_cache_hit",
+                False,
+            ),
             "initial_bond_dimensions": initial_bond_dimensions,
             "history_generation": (
                 "reachable" if self._structural_transitions is not None else "cartesian"
@@ -2932,6 +3933,8 @@ class FirstDegreeMPO:
             self._history_extension_plan_cache.pop(order, None)
             self._history_compression_plan_cache.pop(order, None)
             self._history_approximation_plan_cache.pop(order, None)
+            self._history_tensor_plan_cache.pop((order, True), None)
+            self._history_tensor_plan_cache.pop((order, False), None)
         return output
 
     def _first_degree_structure(self):
@@ -2989,12 +3992,16 @@ class FirstDegreeMPO:
         approximate : bool, default=False
             Apply Algorithm 4's order-controlled analytical compression after
             exact history compression. This is not a numerical cutoff.
-        mode : {None, "base", "optimal", "approximate"}, optional
+        mode : {None, "base", "algorithm4", "optimal", "approximate"}, optional
             Named construction policy. ``"base"`` selects Algorithms 1--2,
+            ``"algorithm4"`` selects Algorithms 1, 2, and 4,
             ``"optimal"`` selects the paper's exact extended construction
             (Algorithms 1--3), and ``"approximate"`` selects the extended
             construction followed by Algorithm 4. When omitted, the legacy
-            ``extend`` and ``approximate`` flags are used unchanged.
+            ``extend`` and ``approximate`` flags are used unchanged. The
+            compatibility spellings ``"paper_algorithm4"``,
+            ``"paper_optimal"``, and ``"paper_approximate"`` are accepted but
+            normalized to the canonical names in metadata.
         max_bond : int, optional
             Maximum temporary history bond dimension allowed during
             construction. This guard applies before exact history compression
@@ -3013,12 +4020,15 @@ class FirstDegreeMPO:
             streaming local-history builder.
         history_storage : {"auto", "dense", "sparse", "streaming"}, default="auto"
             Storage policy for temporary raw-history tensors. ``"dense"``
-            retains the reference implementation. ``"sparse"`` skips
-            structurally impossible local transition products and
-            ``"streaming"`` retains only adjacent history cuts while building
-            the current MPO. ``"auto"`` selects ``"dense"`` when the topology
-            cache is enabled and ``"streaming"`` otherwise. The final MPO
-            tensors are necessarily materialized for Algorithms 1--4.
+            retains all structural local pairs. ``"sparse"`` skips
+            structurally impossible local transition products and batches the
+            remaining physical block products. ``"streaming"`` keeps the
+            topology ephemeral when ``cache_history=False``. For an
+            automaton-built MPO, ``"auto"`` selects the structural sparse path
+            for cached builds and the compatibility streaming path otherwise;
+            direct MPO construction retains the dense/streaming policy. The
+            final MPO tensors are still dense virtual arrays for Algorithms
+            1--4.
 
         Notes
         -----
@@ -3057,6 +4067,8 @@ class FirstDegreeMPO:
                 raise TypeError("mode must be a string or None.")
             mode_aliases = {
                 "base": (False, False, "base"),
+                "algorithm4": (False, True, "algorithm4"),
+                "paper_algorithm4": (False, True, "algorithm4"),
                 "optimal": (True, False, "optimal"),
                 "paper_optimal": (True, False, "optimal"),
                 "approximate": (True, True, "approximate"),
@@ -3078,7 +4090,7 @@ class FirstDegreeMPO:
         else:
             canonical_mode = (
                 "approximate" if approximate and extend
-                else "extended" if extend
+                else "optimal" if extend
                 else "algorithm4" if approximate
                 else "base"
             )
@@ -3274,6 +4286,462 @@ class FirstDegreeMPO:
         return self.scale(coefficient)
 
 
+class CompiledMPOExp:
+    """Value-only higher-order exponential evaluator for an :class:`MPOBasis`.
+
+    The object owns the structural pieces of a parameterized exponential step:
+    the unit-coefficient MPO tensors, coefficient-slot indices, static local
+    operator banks, and the history execution plans. Calls assemble fresh
+    backend tensors and then execute the same Algorithms 1--4 as
+    :meth:`FirstDegreeMPO.extensive_exponential`, so coefficients and the
+    exponential step remain in the current Torch/JAX autodiff graph.
+
+    ``CompiledMPOExp`` is intentionally a numerical boundary.  Its
+    primary methods return raw ``(left, right, up, down)`` tensor tuples;
+    :meth:`evaluate` is available when a semantic :class:`FirstDegreeMPO`
+    wrapper is needed outside a compiled optimizer loop.
+    """
+
+    _MODE_ALIASES = {
+        "base": (False, False, "base"),
+        "algorithm4": (False, True, "algorithm4"),
+        "paper_algorithm4": (False, True, "algorithm4"),
+        "optimal": (True, False, "optimal"),
+        "paper_optimal": (True, False, "optimal"),
+        "approximate": (True, True, "approximate"),
+        "paper_approximate": (True, True, "approximate"),
+    }
+
+    def __init__(
+        self,
+        basis,
+        *,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        history_storage="auto",
+    ):
+        if not isinstance(basis, MPOBasis):
+            raise TypeError("basis must be an MPOBasis.")
+        if mode is not None:
+            if not isinstance(mode, str):
+                raise TypeError("mode must be a string or None.")
+            try:
+                mode_extend, mode_approximate, canonical_mode = (
+                    self._MODE_ALIASES[mode]
+                )
+            except KeyError as exc:
+                allowed = ", ".join(sorted(self._MODE_ALIASES))
+                raise ValueError(
+                    f"unknown mode {mode!r}; expected one of {allowed}."
+                ) from exc
+            if extend or approximate:
+                raise ValueError(
+                    "mode cannot be combined with extend or approximate flags."
+                )
+            extend = mode_extend
+            approximate = mode_approximate
+        else:
+            canonical_mode = (
+                "approximate" if approximate and extend
+                else "optimal" if extend
+                else "algorithm4" if approximate
+                else "base"
+            )
+
+        if history_storage == "streaming":
+            raise ValueError(
+                "compiled evolution requires cached history; use "
+                "history_storage='auto', 'sparse', or 'dense'."
+            )
+
+        self.basis = basis
+        self.order = order
+        self.mode = canonical_mode
+        self.extend = bool(extend)
+        self.approximate = bool(approximate)
+        self.max_bond = max_bond
+        self.on_exceed = on_exceed
+        self.history_storage = history_storage
+
+        # This validates the complete option set and fills every symbolic
+        # history/tensor plan once.  The unit-coefficient numerical result is
+        # discarded; only its structural caches are retained.
+        basis._template.extensive_exponential(  # pylint: disable=protected-access
+            0.0,
+            order=order,
+            mode=canonical_mode,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=True,
+            history_storage=history_storage,
+        )
+
+        self._base_arrays = tuple(basis._template.arrays)  # pylint: disable=protected-access
+        self._site_records = self._compile_slot_records(basis)
+        self._fused_site_banks = self._compile_fused_site_banks(basis)
+
+    @staticmethod
+    def _compile_slot_records(basis):
+        """Resolve coefficient slots to dense virtual tensor positions."""
+        automaton = basis._automaton  # pylint: disable=protected-access
+        records_by_site = [[] for _ in range(basis.L)]
+
+        def position(site, state, *, left):
+            if basis.L == 1:
+                return 0
+            if left and site == 0:
+                return 0
+            if not left and site == basis.L - 1:
+                return 0
+            cut = site - 1 if left else site
+            return {
+                channel.state: index
+                for index, channel in enumerate(automaton.channels[cut])
+            }[state]
+
+        for site, transition_index, contributions in basis._slot_groups:
+            transition = automaton.transitions[site][transition_index]
+            row = position(site, transition.left_state, left=True)
+            column = position(site, transition.right_state, left=False)
+            term_indices = np.asarray(
+                [term_index for term_index, _operator in contributions],
+                dtype=int,
+            )
+            operators = tuple(operator for _term_index, operator in contributions)
+            if all(
+                _backend_name(operator) in {"builtins", "numpy"}
+                for operator in operators
+            ):
+                operator_bank = np.stack(
+                    [np.asarray(operator) for operator in operators],
+                    axis=0,
+                )
+            else:
+                operator_bank = None
+            records_by_site[site].append(
+                (
+                    term_indices,
+                    row,
+                    column,
+                    operators,
+                    transition.operator,
+                    operator_bank,
+                ),
+            )
+
+        compiled = []
+        for records in records_by_site:
+            if not records:
+                compiled.append(None)
+                continue
+            compiled.append(tuple(records))
+        return tuple(compiled)
+
+    def _compile_fused_site_banks(self, basis):
+        """Build optional dense affine coefficient banks per MPO site.
+
+        A unit-coefficient template contains the structural rails and one
+        copy of every slot edge.  Subtracting those unit edge blocks from a
+        static bias leaves an affine representation
+
+        ``local_tensor = bias + sum(term_coefficient * operator_bank[term])``.
+
+        The bank turns coefficient assembly into one backend contraction per
+        site.  It is used only for ordinary host-backed static operators and
+        only below a memory bound; backend-native operator arrays and large
+        sparse layouts use the grouped autodiff-safe fallback.
+        """
+        fused = []
+        for base, records in zip(self._base_arrays, self._site_records):
+            if records is None or _backend_name(base) not in {"builtins", "numpy"}:
+                fused.append(None)
+                continue
+            if any(
+                _backend_name(operator) not in {"builtins", "numpy"}
+                for record in records
+                for operator in (*record[3], record[4])
+            ):
+                fused.append(None)
+                continue
+            try:
+                bank_elements = basis.num_terms * int(np.prod(base.shape))
+                if bank_elements > _MAX_FUSED_SLOT_BANK_ELEMENTS:
+                    fused.append(None)
+                    continue
+                operators = [
+                    np.asarray(operator)
+                    for record in records
+                    for operator in record[3]
+                ]
+                unit_operators = [
+                    np.asarray(record[4])
+                    for record in records
+                ]
+                dtype = np.result_type(
+                    np.asarray(base).dtype,
+                    *(operator.dtype for operator in operators),
+                    *(operator.dtype for operator in unit_operators),
+                    np.float32,
+                )
+                bias = np.asarray(base, dtype=dtype).copy()
+                bank = np.zeros(
+                    (basis.num_terms, *tuple(int(size) for size in base.shape)),
+                    dtype=dtype,
+                )
+                for record in records:
+                    term_indices, row, column, operators, unit_operator, _bank = (
+                        record
+                    )
+                    bias[row, column] -= np.asarray(unit_operator, dtype=dtype)
+                    for term_index, operator in zip(term_indices, operators):
+                        bank[int(term_index), row, column] += np.asarray(
+                            operator,
+                            dtype=dtype,
+                        )
+            except (TypeError, ValueError):
+                fused.append(None)
+                continue
+            fused.append((bias, bank))
+        return tuple(fused)
+
+    @property
+    def cache_info(self):
+        """Return the shared structural cache diagnostics."""
+        info = dict(self.basis.cache_info)
+        info.update({
+            "fused_slot_sites": sum(
+                bank is not None for bank in self._fused_site_banks
+            ),
+            "fused_slot_bank_elements": sum(
+                int(np.prod(bank[1].shape))
+                for bank in self._fused_site_banks
+                if bank is not None
+            ),
+        })
+        return info
+
+    def _assemble_arrays(self, dt, parameters, coefficients):
+        coefficient_values = self.basis._coefficient_values(  # pylint: disable=protected-access
+            parameters,
+            coefficients,
+        )
+        coefficient_batch = _stack(coefficient_values, axis=0)
+        reference = _backend_reference((dt, *coefficient_values, *self._base_arrays))
+        step = _as_backend(dt, like=reference)
+        arrays = []
+
+        for base, records, fused in zip(
+            self._base_arrays,
+            self._site_records,
+            self._fused_site_banks,
+        ):
+            if fused is not None:
+                bias, bank = fused
+                array = _as_backend(bias, like=reference)
+                if _complex_dtype(getattr(step, "dtype", None)) and not _complex_dtype(
+                    getattr(array, "dtype", None)
+                ):
+                    array = ar.do(
+                        "multiply",
+                        array,
+                        _as_backend(1.0 + 0.0j, like=step),
+                    )
+                bank = _as_backend(bank, like=coefficient_batch)
+                coefficients_backend, bank = _align_tensordot_dtypes(
+                    coefficient_batch,
+                    bank,
+                )
+                weighted = ar.do(
+                    "tensordot",
+                    coefficients_backend,
+                    bank,
+                    axes=([0], [0]),
+                )
+                array, weighted = _align_tensordot_dtypes(array, weighted)
+                arrays.append(ar.do("add", array, weighted))
+                continue
+            array = _as_backend(base, like=reference)
+            if _complex_dtype(getattr(step, "dtype", None)) and not _complex_dtype(
+                getattr(array, "dtype", None)
+            ):
+                # Higher-order prefactors can be complex even when H and its
+                # coefficients are real. Promote the fresh local view before
+                # any history transfer so no imaginary component is lost.
+                array = ar.do(
+                    "multiply",
+                    array,
+                    _as_backend(1.0 + 0.0j, like=step),
+                )
+            if records is not None:
+                corrections = []
+                rows = []
+                columns = []
+                for (
+                    term_indices,
+                    row,
+                    column,
+                    operators,
+                    unit_operator,
+                    operator_bank,
+                ) in records:
+                    if operator_bank is not None:
+                        indices = _as_backend(
+                            term_indices,
+                            like=coefficient_batch,
+                        )
+                        selected = coefficient_batch[indices]
+                        operator_values = _as_backend(
+                            operator_bank,
+                            like=selected,
+                        )
+                        selected, operator_values = _align_tensordot_dtypes(
+                            selected,
+                            operator_values,
+                        )
+                        weighted = ar.do(
+                            "tensordot",
+                            selected,
+                            operator_values,
+                            axes=([0], [0]),
+                        )
+                    else:
+                        weighted = None
+                        for term_index, operator in zip(
+                            term_indices,
+                            operators,
+                        ):
+                            contribution = _multiply_scalar(
+                                coefficient_values[term_index],
+                                operator,
+                            )
+                            if weighted is None:
+                                weighted = contribution
+                                continue
+                            reference = _backend_reference(
+                                (weighted, contribution),
+                            )
+                            weighted = ar.do(
+                                "add",
+                                _as_backend(weighted, like=reference),
+                                _as_backend(contribution, like=reference),
+                            )
+                    unit_operator = _as_backend(unit_operator, like=weighted)
+                    weighted, unit_operator = _align_tensordot_dtypes(
+                        weighted,
+                        unit_operator,
+                    )
+                    corrections.append(
+                        ar.do("subtract", weighted, unit_operator),
+                    )
+                    rows.append(row)
+                    columns.append(column)
+                values = _stack(corrections, axis=0)
+                array, values = _align_tensordot_dtypes(array, values)
+                delta = _zeros(array.shape, like=array)
+                delta = _scatter_add_into_2d(
+                    delta,
+                    rows,
+                    columns,
+                    values,
+                )
+                array = ar.do("add", array, delta)
+            arrays.append(array)
+        return tuple(arrays)
+
+    def evaluate_arrays(self, dt, parameters=None, *, coefficients=None):
+        """Compatibility wrapper for :meth:`exp_arrays`."""
+        return self.exp_arrays(dt, parameters, coefficients=coefficients)
+
+    def exp_arrays(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        dt=None,
+    ):
+        """Evaluate ``exp(step * H)`` as fresh backend-native tensor tuples.
+
+        ``dt`` is accepted as a compatibility keyword for ``step``. The
+        returned tuple is suitable for a backend contraction kernel and does
+        not create a semantic MPO wrapper.
+        """
+        step = _resolve_exp_step(step, dt)
+        arrays = self._assemble_arrays(step, parameters, coefficients)
+        bound = self.basis._template._bind_arrays(arrays)  # pylint: disable=protected-access
+        return bound.extensive_exponential(
+            step,
+            order=self.order,
+            mode=self.mode,
+            max_bond=self.max_bond,
+            on_exceed=self.on_exceed,
+            cache_history=True,
+            history_storage=self.history_storage,
+        ).arrays
+
+    def evaluate(self, dt, parameters=None, *, coefficients=None):
+        """Compatibility wrapper for :meth:`exp`."""
+        return self.exp(dt, parameters, coefficients=coefficients)
+
+    def exp(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        dt=None,
+    ):
+        """Evaluate ``exp(step * H)`` as a semantic :class:`FirstDegreeMPO`.
+
+        Use this form when downstream code needs MPO metadata or methods such
+        as ``to_mpo()``. Use :meth:`exp_arrays` when it only needs raw tensors.
+        """
+        step = _resolve_exp_step(step, dt)
+        arrays = self._assemble_arrays(step, parameters, coefficients)
+        bound = self.basis._template._bind_arrays(arrays)  # pylint: disable=protected-access
+        result = bound.extensive_exponential(
+            step,
+            order=self.order,
+            mode=self.mode,
+            max_bond=self.max_bond,
+            on_exceed=self.on_exceed,
+            cache_history=True,
+            history_storage=self.history_storage,
+        )
+        result.metadata["compiled_exp"] = True
+        # Retain the historical metadata key for callers that inspect it.
+        result.metadata["compiled_evolution"] = True
+        return result
+
+    def time_evolution_arrays(self, dt, parameters=None, *, coefficients=None):
+        """Evaluate ``exp(-1j * dt * H)`` as backend-native tensors."""
+        return self.evaluate_arrays(
+            -1j * dt,
+            parameters,
+            coefficients=coefficients,
+        )
+
+    def time_evolution(self, dt, parameters=None, *, coefficients=None):
+        """Evaluate real-time evolution and return a semantic MPO."""
+        return self.evaluate(
+            -1j * dt,
+            parameters,
+            coefficients=coefficients,
+        )
+
+    __call__ = exp_arrays
+
+
+# Compatibility name for callers of the original evolution-oriented API.
+# Keep it as an exact alias so existing isinstance checks remain valid while
+# ``CompiledMPOExp`` remains the canonical class name.
+CompiledMPOEvolution = CompiledMPOExp
+
+
 class MPOBasis:
     """Reusable coefficient basis for parameterized first-degree MPOs.
 
@@ -3361,6 +4829,27 @@ class MPOBasis:
             (site, transition_index, tuple(contributions))
             for (site, transition_index), contributions in slot_groups.items()
         )
+        self._vectorized_slot_groups = tuple(
+            (
+                site,
+                transition_index,
+                np.asarray([term_index for term_index, _ in contributions], dtype=int),
+                np.stack(
+                    [np.asarray(operator) for _, operator in contributions],
+                    axis=0,
+                ),
+            )
+            for site, transition_index, contributions in self._slot_groups
+            if all(
+                _backend_name(operator) in {"builtins", "numpy"}
+                for _, operator in contributions
+            )
+        )
+        self._vectorized_slot_keys = frozenset(
+            (site, transition_index)
+            for site, transition_index, _indices, _operators
+            in self._vectorized_slot_groups
+        )
         self._automaton = automaton
         self._template = FirstDegreeMPO.from_automaton(
             automaton,
@@ -3369,6 +4858,7 @@ class MPOBasis:
             site_tag_id=site_tag_id,
         )
         self._build_count = 0
+        self._compiled_evolution_cache = {}
 
     @classmethod
     def from_local_terms(
@@ -3419,9 +4909,81 @@ class MPOBasis:
             "compiled": True,
             "compiled_terms": self.num_terms,
             "builds": self._build_count,
+            "compiled_exp_variants": len(self._compiled_evolution_cache),
+            # Compatibility diagnostic name.
+            "compiled_evolution_variants": len(self._compiled_evolution_cache),
             "topology_bond_dimensions": self.bond_dimensions,
+            "vectorized_slot_groups": len(self._vectorized_slot_groups),
             "history": self._template.history_cache_info,
         }
+
+    def clear_history_cache(self):
+        """Release cached higher-order plans while retaining the basis graph."""
+        self._template.clear_history_cache()
+        self._compiled_evolution_cache.clear()
+        return self
+
+    def compile_evolution(
+        self,
+        *,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        history_storage="auto",
+    ):
+        """Compatibility wrapper for :meth:`compile_exp`.
+
+        New code should call ``compile_exp``. This historical name remains
+        available for existing programs and returns the same cached
+        :class:`CompiledMPOExp` object.
+        """
+        key = (
+            order,
+            mode,
+            extend,
+            approximate,
+            max_bond,
+            on_exceed,
+            history_storage,
+        )
+        try:
+            compiled = self._compiled_evolution_cache.get(key)
+        except TypeError:
+            compiled = None
+        if compiled is None:
+            compiled = CompiledMPOExp(
+                self,
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            )
+            try:
+                self._compiled_evolution_cache[key] = compiled
+            except TypeError:
+                pass
+        return compiled
+
+    def compile_exp(self, **kwargs):
+        """Compile a reusable value-only exponential evaluator.
+
+        The returned :class:`CompiledMPOExp` stores only reusable structure:
+        history topology, virtual transfer plans, coefficient-slot indices,
+        and static operator banks. Each ``exp`` or ``exp_arrays`` call creates
+        fresh backend values, keeping Torch/JAX autodiff graphs current.
+
+        Parameters are the same as :meth:`MPOBasis.exp`, except that the
+        ``step`` and coefficient values are supplied when the compiled object
+        is called. Use ``compiled.exp`` for a semantic MPO and
+        ``compiled.exp_arrays`` for raw backend tensor tuples.
+        """
+        return self.compile_evolution(**kwargs)
 
     def _resolve_coefficient(self, coefficient, parameters):
         if isinstance(coefficient, MPOParameter):
@@ -3522,7 +5084,33 @@ class MPOBasis:
         """
         transitions = [list(site_transitions) for site_transitions in self._automaton.transitions]
         coefficient_values = self._coefficient_values(parameters, coefficients)
+        coefficient_batch = _stack(coefficient_values, axis=0)
+        vectorized_keys = self._vectorized_slot_keys
+        for site, transition_index, term_indices, operators in (
+            self._vectorized_slot_groups
+        ):
+            index = _as_backend(term_indices, like=coefficient_batch)
+            selected = coefficient_batch[index]
+            operator_batch = _as_backend(operators, like=selected)
+            selected, operator_batch = _align_tensordot_dtypes(
+                selected,
+                operator_batch,
+            )
+            weighted = ar.do(
+                "tensordot",
+                selected,
+                operator_batch,
+                axes=([0], [0]),
+            )
+            transition = transitions[site][transition_index]
+            transitions[site][transition_index] = type(transition)(
+                transition.left_state,
+                transition.right_state,
+                weighted,
+            )
         for site, transition_index, contributions in self._slot_groups:
+            if (site, transition_index) in vectorized_keys:
+                continue
             weighted = None
             for term_index, operator in contributions:
                 contribution = _multiply_scalar(
@@ -3571,6 +5159,7 @@ class MPOBasis:
         result._history_approximation_plan_cache = (
             self._template._history_approximation_plan_cache
         )
+        result._history_tensor_plan_cache = self._template._history_tensor_plan_cache
         result.metadata.update({
             "operation": "mpo_basis_build",
             "basis_terms": self.num_terms,
@@ -3583,31 +5172,406 @@ class MPOBasis:
     __call__ = build
 
     def extensive_exponential(
-        self, dt, parameters=None, *, coefficients=None, **kwargs,
+        self,
+        dt,
+        parameters=None,
+        *,
+        coefficients=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
     ):
         """Build ``exp(dt * H(parameters))`` with the higher-order MPO path."""
-        return self.build(parameters, coefficients=coefficients).extensive_exponential(
-            dt, **kwargs,
+        return self.build(
+            parameters,
+            coefficients=coefficients,
+        ).extensive_exponential(
+            dt,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+        )
+
+    def exp(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        dt=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+    ):
+        """Build ``exp(step * H(parameters))`` with optional compression.
+
+        ``step`` is the actual scalar multiplying the Hamiltonian. For
+        real-time evolution, pass ``step=-1j * tau``; ``dt=...`` remains a
+        compatibility keyword. ``chi`` is the final MPO bond cap, while
+        ``max_bond`` only guards the temporary higher-order history.
+        """
+        step = _resolve_exp_step(step, dt)
+        return self.build(parameters, coefficients=coefficients).exp(
+            step,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
         )
 
     def time_evolution(
-        self, dt, parameters=None, *, coefficients=None, **kwargs,
+        self,
+        dt,
+        parameters=None,
+        *,
+        coefficients=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
     ):
         """Build the real-time MPO ``exp(-1j * dt * H(parameters))``."""
-        return self.extensive_exponential(
-            -1j * dt,
+        return self.build(parameters, coefficients=coefficients).time_evolution(
+            dt,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
+        )
+
+    def exp_arrays(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        dt=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+    ):
+        """Evaluate ``exp(step * H)`` as backend-native tensor tuples.
+
+        This method is intended for JAX/Torch compiled numerical kernels:
+        the reusable basis remains a Python-side structural object, while
+        the returned tensors are the only values captured by the optimizer's
+        autodiff graph.
+        """
+        step = _resolve_exp_step(step, dt)
+        if cache_history:
+            return self.compile_exp(
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            ).exp_arrays(
+                step,
+                parameters,
+                coefficients=coefficients,
+            )
+        return self.build(
             parameters,
             coefficients=coefficients,
-            **kwargs,
+        ).exp_arrays(
+            step,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+        )
+
+    def time_evolution_arrays(
+        self,
+        dt,
+        parameters=None,
+        *,
+        coefficients=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+    ):
+        """Evaluate real-time evolution as backend-native tensor tuples."""
+        if cache_history:
+            return self.compile_evolution(
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            ).time_evolution_arrays(
+                dt,
+                parameters,
+                coefficients=coefficients,
+            )
+        return self.build(
+            parameters,
+            coefficients=coefficients,
+        ).time_evolution_arrays(
+            dt,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+        )
+
+    def exp_batch(
+        self,
+        step=None,
+        coefficients=None,
+        *,
+        dt=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+    ):
+        """Evaluate ``exp(step * H)`` for a batch of coefficient vectors.
+
+        The structural plan is compiled once and every row is evaluated with
+        fresh backend tensors, preserving gradients with respect to both the
+        coefficient batch and ``step``. JAX and current Torch releases use
+        native ``vmap``; NumPy and unsupported backend operations use a small
+        autodiff-safe assembly loop.
+        """
+        step = _resolve_exp_step(step, dt)
+        if coefficients is None:
+            raise TypeError("exp_batch requires a coefficient batch.")
+        shape = getattr(coefficients, "shape", None)
+        if shape is None or len(tuple(shape)) != 2:
+            raise ValueError(
+                "coefficients must have shape (batch, number_of_terms)."
+            )
+        if int(shape[1]) != self.num_terms:
+            raise ValueError(
+                f"coefficients must have {self.num_terms} columns, got {shape[1]}."
+            )
+        options = {
+            "order": order,
+            "mode": mode,
+            "extend": extend,
+            "approximate": approximate,
+            "max_bond": max_bond,
+            "on_exceed": on_exceed,
+            "cache_history": cache_history,
+            "history_storage": history_storage,
+        }
+        if cache_history:
+            compiled = self.compile_exp(
+                order=order,
+                mode=mode,
+                extend=extend,
+                approximate=approximate,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                history_storage=history_storage,
+            )
+            if _backend_name(coefficients) == "jax":
+                import jax  # pylint: disable=import-outside-toplevel
+
+                return jax.vmap(
+                    lambda row: compiled.exp_arrays(
+                        step,
+                        coefficients=row,
+                    )
+                )(coefficients)
+            if _backend_name(coefficients) == "torch":
+                try:
+                    import torch  # pylint: disable=import-outside-toplevel
+
+                    vmap = getattr(torch, "vmap", None)
+                    if vmap is None:
+                        from torch.func import vmap  # pylint: disable=import-outside-toplevel
+                    return vmap(
+                        lambda row: compiled.exp_arrays(
+                            step,
+                            coefficients=row,
+                        )
+                    )(coefficients)
+                except (ImportError, RuntimeError, TypeError):
+                    pass
+            rows = [
+                compiled.exp_arrays(
+                    step,
+                    coefficients=coefficients[index],
+                )
+                for index in range(int(shape[0]))
+            ]
+            if not rows:
+                return tuple()
+            return tuple(
+                ar.do("stack", tuple(row[site] for row in rows), axis=0)
+                for site in range(self.L)
+            )
+        backend = _backend_name(coefficients)
+        if backend == "jax":
+            import jax  # pylint: disable=import-outside-toplevel
+
+            return jax.vmap(
+                lambda row: self.exp_arrays(
+                    step,
+                    coefficients=row,
+                    **options,
+                )
+            )(coefficients)
+        if backend == "torch":
+            try:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                vmap = getattr(torch, "vmap", None)
+                if vmap is None:
+                    from torch.func import vmap  # pylint: disable=import-outside-toplevel
+                return vmap(
+                    lambda row: self.exp_arrays(
+                        step,
+                        coefficients=row,
+                        **options,
+                    )
+                )(coefficients)
+            except (ImportError, RuntimeError, TypeError):
+                # Some older Torch releases cannot batch one of the backend
+                # scatter primitives. The ordinary loop remains fully
+                # differentiable and is a safe compatibility fallback.
+                pass
+        rows = [
+            self.exp_arrays(
+                step,
+                coefficients=coefficients[index],
+                **options,
+            )
+            for index in range(int(shape[0]))
+        ]
+        if not rows:
+            return tuple()
+        return tuple(
+            ar.do("stack", tuple(row[site] for row in rows), axis=0)
+            for site in range(self.L)
         )
 
     def evolution_mpo(
-        self, parameters=None, *, dt, coefficients=None, **kwargs,
+        self,
+        parameters=None,
+        *,
+        dt,
+        coefficients=None,
+        order=1,
+        mode=None,
+        extend=False,
+        approximate=False,
+        max_bond=None,
+        on_exceed="raise",
+        cache_history=True,
+        history_storage="auto",
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
     ):
-        """Named convenience wrapper for ``exp(-1j * dt * H(parameters))``."""
+        """Build ``exp(-1j * dt * H(parameters))`` with optional compression.
+
+        ``chi`` is the final MPO bond cap. It is separate from the
+        ``max_bond`` keyword accepted by the higher-order builder, which only
+        protects the temporary history representation. With ``chi=None`` the
+        method returns the existing semantic :class:`FirstDegreeMPO`. When
+        ``chi`` is set, the default numerical path returns a Quimb MPO; set
+        ``differentiable=True`` for a fixed-rank autodiff-compatible semantic
+        MPO instead.
+        """
         return self.time_evolution(
             dt,
             parameters,
             coefficients=coefficients,
-            **kwargs,
+            order=order,
+            mode=mode,
+            extend=extend,
+            approximate=approximate,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+            history_storage=history_storage,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
         )

@@ -166,6 +166,29 @@ replay uses a frozen persistent-layout template when one is installed, but
 still requires a fresh identity-order optimizer for an already-permuted `perm`
 state.
 
+For MPI, use the same optimizer-level API by passing `mpi=True` (or an
+explicit communicator). `workers="auto"` divides the available CPU allowance
+across local MPI ranks, while `workers=1` forces serial execution inside each
+rank. `progress="auto"` shows one aggregate rank-zero shot bar only in an
+interactive terminal; child optimizer bars are suppressed during distributed
+execution:
+
+```python
+result = simulator.run(
+    shots=1_000_000,
+    mpi=True,
+    workers="auto",
+    progress="auto",
+    seed=7,
+    retain="none",
+)
+```
+
+Launch the program with `mpiexec -n 4 ...`; `mpi=True` uses the already-launched
+communicator and does not create MPI processes itself. Each shot is initialized
+from the optimizer's constructor snapshot, so repeated seeded ensembles are
+stable and do not mutate the template optimizer.
+
 The practical shot-mode matrix is:
 
 | mode | trajectory status |
@@ -194,7 +217,11 @@ fermionic states retain their native warm-start path. This is controlled by
 the `fit_mpo_guess` run option, which defaults to `True`; setting it to `False`
 restores the direct current-MPS FIT initial guess.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
-schedule. `mode="mix"` is the transactional unitary variant.
+schedule for local windows. For a long-range window that is wider than the
+selected FIT block, it uses the corresponding fixed block handoff so the
+terminal canonical center remains authoritative for unitary norm tracking;
+the target-support enrichment is unchanged. `mode="mix"` is the
+transactional unitary variant.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
 to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
 not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
@@ -207,10 +234,14 @@ only bonds visited by the native splits can grow. `fit_block_size=1` retains
 the fixed-rank compatibility algorithm, for which mixed mode still warms short
 active bonds through MPO. After that warm-up, mixed mode hands off to the
 `dmrg2` schedule: two two-site sweeps followed by one-site refinement.
+Mixed two-site and three-site FIT transactions likewise use the named
+`dmrg2` and `dmrg3` schedules, respectively, so every mixed transaction has
+the same canonical handoff.
 Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
-the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive,
-but named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
+the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive
+on local windows and uses the fixed canonical handoff for long-range windows,
+while named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
 one-site FIT for the remaining requested sweeps. The named mode does not
 extend the two-site phase because of rank stagnation. Once all full-chain
 ceilings are reached, it latches one-site updates for later gate windows.
@@ -224,7 +255,8 @@ remains the fixed-rank one-site compatibility path. `fit_layer_size` is the
 clear name for
 `k_2q_batch`; it counts two-site gates in a contiguous paper-style target
 block. For `fit_block_size=2`, an active window spanning at least three sites
-uses the same adaptive-to-one-site schedule; an ordinary two-site gate window
+uses the generic adaptive schedule for local windows and the fixed canonical
+handoff described above for long-range windows; an ordinary two-site gate window
 uses exactly one two-site update because that effective tensor already solves
 the complete local problem. In particular, `dmrg1`, `dmrg2`, and `dmrg3`
 immediately advance to the next gate after that update: they do not repeat
@@ -368,6 +400,13 @@ current raw-norm baseline but does not erase the cumulative compression ledger.
 This same contract is used by the DMRG1/2/3 schedules and the MPO, SVD,
 swap/perm, and mixed backends. The metric is a norm-survival proxy: it does
 not replace a directional state fidelity check.
+
+Unitary compression also validates that the retained canonical-center norm
+does not materially exceed its pre-compression norm. The raw overshoot remains
+visible in `norm_fidelity_raw`; only small dtype-scaled roundoff is accepted
+for low-precision data (for example, `complex64` uses a bounded multiple of
+float32 machine epsilon). A larger overshoot still raises because it indicates
+broken canonical projection metadata rather than ordinary truncation loss.
 
 `cutoff="auto"` selects `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
 data, and `1e-12` for 64-bit data. Explicit numeric cutoffs are unchanged.

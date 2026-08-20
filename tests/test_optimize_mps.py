@@ -2983,6 +2983,54 @@ def test_dmrg_complex64_deep_unitary_stream_keeps_working_norm_stable():
     assert float(np.real(raw.norm())) == pytest.approx(1.0, abs=2.0e-5)
 
 
+def test_unitary_norm_overshoot_tolerance_is_dtype_aware():
+    """Float32 roundoff is tolerated without hiding larger overshoots."""
+    complex64 = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex64"),
+        gates=[],
+        chi=2,
+        mode="mpo",
+    )
+    complex128 = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="mpo",
+    )
+
+    assert complex64._unitary_norm_overshoot_tolerance() == pytest.approx(
+        128.0 * np.finfo(np.float32).eps
+    )
+    assert complex128._unitary_norm_overshoot_tolerance() == pytest.approx(
+        1.0e-6
+    )
+
+    event = complex64._record_norm_event(
+        "unitary_compression",
+        expected_norm=1.0,
+        observed_norm=np.sqrt(1.0 + 1.0e-5),
+        where=(0, 1),
+    )
+    assert event["norm_fidelity_raw"] == pytest.approx(1.0 + 1.0e-5)
+    assert event["norm_fidelity"] == pytest.approx(1.0)
+
+    with pytest.raises(FloatingPointError, match="squared ratio"):
+        complex64._record_norm_event(
+            "unitary_compression",
+            expected_norm=1.0,
+            observed_norm=np.sqrt(1.0 + 2.0e-5),
+            where=(0, 1),
+        )
+
+    with pytest.raises(FloatingPointError, match="squared ratio"):
+        complex128._record_norm_event(
+            "unitary_compression",
+            expected_norm=1.0,
+            observed_norm=np.sqrt(1.0 + 2.0e-6),
+            where=(0, 1),
+        )
+
+
 def test_dmrg_torch_complex64_two_site_fit_grows_native_dense_bond():
     """Torch complex64 FIT should retain dtype while using two-site SVD."""
     torch = pytest.importorskip("torch")
@@ -3861,6 +3909,552 @@ def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
     ) == pytest.approx(1.0, abs=1.0e-9)
 
 
+@pytest.mark.parametrize(
+    "symmetry",
+    ["U1", "U1U1"],
+)
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "fit",
+        "dmrg",
+        "dmrg1",
+        "dmrg2",
+        "dmrg3",
+        "mpo",
+        "svd",
+        "swap",
+        "perm",
+        "mix",
+        "su",
+        "exact",
+    ],
+)
+def test_mps_optimizer_spinful_fermion_symmetry_mode_matrix_matches_mpo(
+    symmetry,
+    mode,
+):
+    """All supported MPS modes preserve native spinful U1 charge sectors."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        4,
+        fermion=fermion,
+        occupations=fermion.half_filled_occupations(4),
+        seed=41,
+        dtype="complex128",
+    )
+    gate_stream = [(fermion.hopping_gate(0.02, t=1.0), (0, 3))]
+    reference = py.MpsOptimizer(
+        state.copy(deep=True),
+        gate_stream,
+        chi=16,
+        mode="mpo",
+    ).run(
+        progbar=False,
+        cutoff=0.0,
+        target_cutoff=0.0,
+        n_iter=3,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    optimizer = py.MpsOptimizer(
+        state.copy(deep=True),
+        gate_stream,
+        chi=16,
+        mode=mode,
+    )
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        target_cutoff=0.0,
+        n_iter=3,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    if mode == "perm":
+        optimizer.restore_qubit_order()
+        compared = optimizer.p
+    elif mode == "su":
+        # SU evolves an ungauged core and exposes the physical state through
+        # the separately stored bond gauges.
+        compared = optimizer.p_ungauged
+        assert compared is not None
+    else:
+        compared = out
+
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in compared.tensors
+    )
+    assert float(
+        np.real(py.tn_fidelity(compared, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-9)
+
+
+@pytest.mark.parametrize(
+    ("spinful", "symmetry"),
+    [
+        (False, "U1"),
+        (True, "U1"),
+        (True, "U1U1"),
+        (False, "Z2"),
+        (True, "Z2"),
+    ],
+)
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "fit",
+        "dmrg",
+        "dmrg1",
+        "dmrg2",
+        "dmrg3",
+        "mpo",
+        "svd",
+        "swap",
+        "perm",
+        "mix",
+        "su",
+        "exact",
+    ],
+)
+def test_mps_optimizer_fermion_gate_stream_ps_to_mps_all_modes_native(
+    spinful,
+    symmetry,
+    mode,
+):
+    """Fermion gate streams remain native and exact across all MPS modes."""
+    pytest.importorskip("symmray")
+
+    def build_case():
+        fermion = py.Fermion(
+            spinful=spinful,
+            symmetry=symmetry,
+            dtype="complex128",
+        )
+        params = {"t": 0.7, "mu": 0.13}
+        if spinful:
+            params["U"] = 1.2
+        else:
+            params["V"] = 0.2
+        stream = list(
+            fermion.gate_stream(
+                ((0, 1), (1, 2), (2, 3)),
+                0.01,
+                sites=range(4),
+                order=1,
+                **params,
+            )
+        )
+        state = py.ps_to_mps(
+            4,
+            fermion=fermion,
+            occupations=fermion.half_filled_occupations(4),
+            seed=7,
+            dtype="complex128",
+        )
+        return state, stream
+
+    reference_state, reference_stream = build_case()
+    reference = py.MpsOptimizer(
+        reference_state,
+        reference_stream,
+        chi=16,
+        mode="exact",
+    ).run(
+        progbar=False,
+        cutoff=0.0,
+        target_cutoff=0.0,
+        stabilize_unitary=False,
+    )
+
+    state, stream = build_case()
+    assert all(
+        type(gate).__module__.split(".", 1)[0] == "symmray"
+        and type(gate).__name__.endswith("FermionicArray")
+        for gate, _ in stream
+    )
+    optimizer = py.MpsOptimizer(
+        state,
+        stream,
+        chi=16,
+        mode=mode,
+    )
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        target_cutoff=0.0,
+        n_iter=3,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    if mode == "perm":
+        optimizer.restore_qubit_order()
+        compared = optimizer.p
+    elif mode == "su":
+        compared = optimizer.p_ungauged
+        assert compared is not None
+    else:
+        compared = out
+
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in compared.tensors
+    )
+    assert float(
+        np.real(py.tn_fidelity(compared, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=1.0e-9)
+
+
+@pytest.mark.parametrize(
+    ("spinful", "symmetry"),
+    [
+        (False, "U1"),
+        (False, "Z2"),
+        (True, "U1"),
+        (True, "U1U1"),
+        (True, "Z2"),
+    ],
+)
+@pytest.mark.parametrize("occupation_kind", ["vacuum", "full"])
+def test_mps_optimizer_complex64_native_fit_short_sector_edges(
+    spinful,
+    symmetry,
+    occupation_kind,
+):
+    """FIT handles short native sectors at complex64 precision."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype="complex64",
+    )
+    if spinful:
+        occupation = (0, 0) if occupation_kind == "vacuum" else (1, 1)
+    else:
+        occupation = 0 if occupation_kind == "vacuum" else 1
+    occupations = (occupation, occupation)
+    params = {"t": 0.3, "mu": 0.1, "V": 0.2}
+    if spinful:
+        params["U"] = 0.8
+    stream = list(
+        fermion.gate_stream(
+            ((0, 1),),
+            0.01,
+            sites=(0, 1),
+            order=2,
+            **params,
+        )
+    )
+    state = py.ps_to_mps(
+        2,
+        fermion=fermion,
+        occupations=occupations,
+        seed=13,
+        dtype="complex64",
+    )
+    reference = py.MpsOptimizer(
+        state.copy(deep=True),
+        stream,
+        chi=4,
+        mode="exact",
+    ).run(
+        progbar=False,
+        cutoff=0.0,
+        target_cutoff=0.0,
+        stabilize_unitary=False,
+    )
+    optimizer = py.MpsOptimizer(state, stream, chi=4, mode="fit")
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-6,
+        target_cutoff=0.0,
+        n_iter=2,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    assert py.MpsOptimizer._mps_data_is_finite(out)
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        and all(
+            np.dtype(block.dtype) == np.dtype("complex64")
+            for block in tensor.data.blocks.values()
+        )
+        for tensor in out.tensors
+    )
+    assert float(
+        np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
+    ) == pytest.approx(1.0, abs=2.0e-5)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1", "Z2"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "fit",
+        "dmrg",
+        "dmrg1",
+        "dmrg2",
+        "dmrg3",
+        "mpo",
+        "svd",
+        "swap",
+        "perm",
+        "mix",
+        "su",
+        "exact",
+    ],
+)
+def test_mps_optimizer_3x4_pbc_hubbard_long_range_modes_native(
+    symmetry,
+    mode,
+):
+    """Stress native Hubbard modes on a periodic 3x4 lattice."""
+    pytest.importorskip("symmray")
+    Lx, Ly = 3, 4
+    mapper = py.OneDMap(Lx, Ly, mode="snake")
+    idx2coo, coo2idx = mapper.build()
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    setup = fermion.lattice_half_filling(Lx, Ly, cyclic=True)
+    occupations = tuple(
+        setup.occupations[idx2coo[index]] for index in range(Lx * Ly)
+    )
+    mapped_edges = tuple(
+        tuple(coo2idx[site] for site in edge) for edge in setup.edges
+    )
+    stream = list(
+        fermion.gate_stream(
+            mapped_edges,
+            0.002,
+            sites=range(Lx * Ly),
+            order=1,
+            t=0.8,
+            U=2.0,
+            mu=0.1,
+        )
+    )
+    long_range_gate = fermion.hopping_gate(0.003, t=0.4)
+    stream.extend(
+        [
+            (
+                long_range_gate,
+                (coo2idx[(0, 0)], coo2idx[(2, 2)]),
+            ),
+            (
+                long_range_gate,
+                (coo2idx[(0, 3)], coo2idx[(2, 0)]),
+            ),
+        ]
+    )
+    assert len(set(setup.edges)) == 24
+    assert len(stream) == 38
+    assert all(
+        type(gate).__module__.split(".", 1)[0] == "symmray"
+        and type(gate).__name__.endswith("FermionicArray")
+        for gate, _ in stream
+    )
+
+    state = py.ps_to_mps(
+        Lx * Ly,
+        fermion=fermion,
+        occupations=occupations,
+        seed=12,
+        dtype="complex128",
+    )
+    optimizer = py.MpsOptimizer(
+        state,
+        stream,
+        chi=8 if mode == "exact" else 16,
+        mode=mode,
+    )
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-8 if mode == "exact" else 1.0e-10,
+        target_cutoff=0.0,
+        n_iter=3,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    compared = out
+    if mode == "perm":
+        optimizer.restore_qubit_order()
+        compared = optimizer.p
+    elif mode == "su":
+        compared = optimizer.p_ungauged
+        assert compared is not None
+
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in compared.tensors
+    )
+    if mode == "exact":
+        assert len(compared.tensors) == 1
+        assert float(np.real(py.to_float(compared.norm()))) == pytest.approx(
+            1.0,
+            abs=1.0e-8,
+        )
+    else:
+        reference_state = py.ps_to_mps(
+            Lx * Ly,
+            fermion=py.Fermion(
+                spinful=True,
+                symmetry=symmetry,
+                dtype="complex128",
+            ),
+            occupations=occupations,
+            seed=12,
+            dtype="complex128",
+        )
+        reference = py.MpsOptimizer(
+            reference_state,
+            stream,
+            chi=16,
+            mode="mpo",
+        ).run(
+            progbar=False,
+            cutoff=0.0,
+            target_cutoff=0.0,
+            stabilize_unitary=False,
+        )
+        assert float(
+            np.real(
+                py.tn_fidelity(
+                    compared,
+                    reference,
+                    contraction_opt="greedy",
+                )
+            )
+        ) == pytest.approx(1.0, abs=5.0e-8)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1", "Z2"])
+def test_mps_optimizer_complex64_3x4_pbc_perm_stays_finite_native(symmetry):
+    """Native complex64 lazy swaps remain finite on the hard lattice case."""
+    pytest.importorskip("symmray")
+    Lx, Ly = 3, 4
+    mapper = py.OneDMap(Lx, Ly, mode="snake")
+    idx2coo, coo2idx = mapper.build()
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry=symmetry,
+        dtype="complex64",
+    )
+    setup = fermion.lattice_half_filling(Lx, Ly, cyclic=True)
+    occupations = tuple(
+        setup.occupations[idx2coo[index]] for index in range(Lx * Ly)
+    )
+    mapped_edges = tuple(
+        tuple(coo2idx[site] for site in edge) for edge in setup.edges
+    )
+    stream = list(
+        fermion.gate_stream(
+            mapped_edges,
+            0.002,
+            sites=range(Lx * Ly),
+            order=1,
+            t=0.8,
+            U=2.0,
+            mu=0.1,
+        )
+    )
+    long_range_gate = fermion.hopping_gate(0.003, t=0.4)
+    stream.extend(
+        [
+            (
+                long_range_gate,
+                (coo2idx[(0, 0)], coo2idx[(2, 2)]),
+            ),
+            (
+                long_range_gate,
+                (coo2idx[(0, 3)], coo2idx[(2, 0)]),
+            ),
+        ]
+    )
+    assert {
+        np.dtype(block.dtype)
+        for gate, _where in stream
+        for block in gate.blocks.values()
+    } == {np.dtype("complex64")}
+    state = py.ps_to_mps(
+        Lx * Ly,
+        fermion=fermion,
+        occupations=occupations,
+        seed=12,
+        dtype="complex64",
+    )
+    reference_state = py.ps_to_mps(
+        Lx * Ly,
+        fermion=py.Fermion(
+            spinful=True,
+            symmetry=symmetry,
+            dtype="complex64",
+        ),
+        occupations=occupations,
+        seed=12,
+        dtype="complex64",
+    )
+    reference = py.MpsOptimizer(
+        reference_state,
+        stream,
+        chi=16,
+        mode="mpo",
+    ).run(
+        progbar=False,
+        cutoff=1.0e-6,
+        target_cutoff=0.0,
+        stabilize_unitary=False,
+    )
+    optimizer = py.MpsOptimizer(state, stream, chi=16, mode="perm")
+    optimizer.run(
+        progbar=False,
+        cutoff=1.0e-6,
+        target_cutoff=0.0,
+        stabilize_unitary=False,
+    )
+    optimizer.restore_qubit_order()
+
+    compared = optimizer.p
+    assert py.MpsOptimizer._mps_data_is_finite(compared)
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        and all(
+            np.dtype(block.dtype) == np.dtype("complex64")
+            for block in tensor.data.blocks.values()
+        )
+        for tensor in compared.tensors
+    )
+    assert float(
+        np.real(
+            py.tn_fidelity(
+                compared,
+                reference,
+                contraction_opt="greedy",
+            )
+        )
+    ) == pytest.approx(1.0, abs=3.0e-4)
+
+
 def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
     """MpsOptimizer should use three-site FIT and shorten adjacent windows."""
     optimizer = py.MpsOptimizer(
@@ -3907,6 +4501,74 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         record["block_size"]
         for record in adjacent.get_run_timing()["fit_steps"]
     ] == [2]
+
+
+@pytest.mark.parametrize(
+    ("where", "block_size"),
+    [((0, 2), 2), ((0, 3), 3)],
+)
+def test_mps_optimizer_boundary_long_range_uses_fixed_handoff(
+    where,
+    block_size,
+    monkeypatch,
+):
+    """A window one site wider than its FIT block is not rank-adaptive."""
+    adaptive_rank_flags = []
+    original_run_fit_gate = py.MpsOptimizer._run_fit_gate
+
+    def record_schedule(self, fit, **kwargs):
+        adaptive_rank_flags.append(bool(kwargs["adaptive_until_rank"]))
+        return original_run_fit_gate(self, fit, **kwargs)
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_fit_gate", record_schedule)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state(
+            "0" * (max(where) + 1),
+            dtype="complex128",
+        ),
+        gates=[(qu.CNOT(), where)],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        fit_block_size=block_size,
+    )
+
+    assert adaptive_rank_flags == [False]
+
+
+def test_mps_optimizer_batched_boundary_long_range_uses_fixed_handoff(
+    monkeypatch,
+):
+    """The batched DMRG path applies the same inclusive-span rule."""
+    adaptive_rank_flags = []
+    original_run_fit_gate = py.MpsOptimizer._run_fit_gate
+
+    def record_schedule(self, fit, **kwargs):
+        adaptive_rank_flags.append(bool(kwargs["adaptive_until_rank"]))
+        return original_run_fit_gate(self, fit, **kwargs)
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_fit_gate", record_schedule)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1)), (qu.CNOT(), (1, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        fit_block_size=2,
+        fit_layer_size=2,
+    )
+
+    assert adaptive_rank_flags == [False]
 
 
 @pytest.mark.parametrize("mode", ("dmrg", "mix"))

@@ -1,6 +1,6 @@
 # Public API surface
 
-Baseline recorded: 2026-08-18
+Baseline recorded: 2026-08-19
 
 This document separates Pepsy's canonical API from its compatibility facade.
 The machine-readable root compatibility manifest is
@@ -10,8 +10,8 @@ The machine-readable root compatibility manifest is
 
 The current package exposes:
 
-- 260 lazy symbols from the top-level `pepsy` compatibility facade;
-- 273 entries in `pepsy.__all__`, including version and namespace exports;
+- 271 lazy symbols from the top-level `pepsy` compatibility facade;
+- 284 entries in `pepsy.__all__`, including version and namespace exports;
 - canonical responsibility-based namespaces for those symbols;
 - lazy advanced-domain discovery through `pepsy.experimental`.
 

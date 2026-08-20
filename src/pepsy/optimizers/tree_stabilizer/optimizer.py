@@ -1502,15 +1502,256 @@ class TreeStabOptimizer:
         kwargs.setdefault("n_qubits", self.n)
         return type(self).analyze_stream(self._queue, **kwargs)
 
+    def _run_shots(
+        self,
+        shots,
+        *,
+        error_model=None,
+        seed=None,
+        run_kwargs=None,
+        strategy="independent",
+        max_branches=128,
+        auto_max_expected_faults=0.1,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
+    ):
+        """Replay the queued stabilizer-tree stream through shot orchestration."""
+        if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+            raise ValueError("shots must be a nonnegative integer.")
+        strategy = str(strategy).strip().lower()
+        if strategy == "auto":
+            strategy = "independent"
+        if strategy != "independent":
+            raise ValueError(
+                "TreeStabOptimizer shot replay supports strategy='independent' only."
+            )
+        mpi_enabled = mpi is not None and mpi is not False
+        if not mpi_enabled and any(
+            value is not None for value in (observable, checkpoint_path)
+        ):
+            raise ValueError(
+                "observable and checkpoint options require mpi=True or an "
+                "MPI communicator."
+            )
+        if not mpi_enabled and (
+            resume
+            or checkpoint_keep != 2
+            or checkpoint_sync is not True
+            or collect_diagnostics is not True
+            or checkpoint_id is not None
+        ):
+            raise ValueError(
+                "MPI checkpoint options require mpi=True or an MPI communicator."
+            )
+        if workers in {None, "auto"} and parallel_workers != 1:
+            workers = parallel_workers
+        template = self.copy()
+        child_kwargs = dict(run_kwargs or {})
+        if progress not in {False, "never"} and (
+            mpi_enabled or parallel_workers != 1
+        ):
+            child_kwargs["progbar"] = False
+        stream = tuple(self._queue)
+
+        if mpi_enabled:
+            from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
+
+            communicator = None if mpi is True else mpi
+            runner = MPIShotRunner(
+                lambda: template.copy(),
+                stream,
+                comm=communicator,
+            )
+            return runner.run(
+                shots,
+                seed=seed,
+                error_model=error_model,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=importance_sampling,
+                auto_max_expected_faults=auto_max_expected_faults,
+                retain=retain,
+                local_workers=workers,
+                local_backend="auto",
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+                progress=progress,
+            )
+
+        from ..mpi import (  # pylint: disable=import-outside-toplevel
+            _make_progress_bar,
+            _resolve_local_workers,
+            _validate_progress,
+        )
+        from ..noise import (  # pylint: disable=import-outside-toplevel
+            NoisyResult,
+            run_noisy_shots,
+            run_trajectory_shots,
+        )
+
+        workers = _resolve_local_workers(workers, shots=shots)
+        progress_mode = _validate_progress(progress)
+        progress_bar = (
+            _make_progress_bar(progress_mode, shots, desc="shots")
+            if workers > 1
+            else None
+        )
+        if workers > 1 and progress_mode != "never":
+            child_kwargs["progbar"] = False
+        factory = lambda: template.copy()
+        common = {
+            "seed": seed,
+            "run_kwargs": child_kwargs,
+            "strategy": strategy,
+            "max_branches": max_branches,
+            "importance_sampling": importance_sampling,
+            "max_branch_factor": max_branch_factor,
+            "parallel_workers": workers,
+            "parallel_backend": parallel_backend,
+            "retain": retain,
+        }
+        def update_progress(delta):
+            if progress_bar is not None:
+                progress_bar.update(int(delta))
+
+        try:
+            if error_model is None:
+                raw = run_trajectory_shots(
+                    factory,
+                    stream,
+                    shots,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+            else:
+                raw = run_noisy_shots(
+                    factory,
+                    stream,
+                    error_model,
+                    shots,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+        return NoisyResult(raw)
+
     # ------------------------------------------------------------------
     # Replay and event dispatch
     # ------------------------------------------------------------------
-    def run(self, *, progbar=False):
+    def run(
+        self,
+        *,
+        progbar=False,
+        shots=1,
+        error_model=None,
+        seed=None,
+        run_kwargs=None,
+        strategy="auto",
+        max_branches=128,
+        auto_max_expected_faults=0.1,
+        importance_sampling=None,
+        max_branch_factor=None,
+        parallel_workers=1,
+        parallel_backend="thread",
+        retain="all",
+        mpi=None,
+        workers="auto",
+        progress="auto",
+        observable=None,
+        chunk_size=None,
+        checkpoint_path=None,
+        resume=False,
+        checkpoint_keep=2,
+        checkpoint_sync=True,
+        collect_diagnostics=True,
+        checkpoint_id=None,
+    ):
         """Replay queued entries, leaving a failed entry queued for retry.
 
         ``progbar`` is accepted for parity with ``MpsStabOptimizer``. The
         displayed infidelity is the tree truncation proxy, when tracked.
+        ``shots`` and ``mpi`` use the shared independent trajectory/MPI runner
+        and leave this optimizer's tableau, coefficient tree, and queue
+        unchanged.
         """
+        shot_requested = bool(
+            error_model is not None
+            or isinstance(shots, bool)
+            or not isinstance(shots, Integral)
+            or int(shots) != 1
+            or run_kwargs is not None
+            or strategy != "auto"
+            or max_branches != 128
+            or auto_max_expected_faults != 0.1
+            or importance_sampling is not None
+            or max_branch_factor is not None
+            or parallel_workers != 1
+            or parallel_backend != "thread"
+            or retain != "all"
+            or (mpi is not None and mpi is not False)
+            or (workers is not None and workers != "auto")
+            or observable is not None
+            or checkpoint_path is not None
+        )
+        if shot_requested:
+            if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
+                raise TypeError("run_kwargs must be a mapping or None.")
+            child_kwargs = dict(run_kwargs or {})
+            child_kwargs.setdefault("progbar", progbar)
+            return self._run_shots(
+                shots,
+                error_model=error_model,
+                seed=seed,
+                run_kwargs=child_kwargs,
+                strategy=strategy,
+                max_branches=max_branches,
+                auto_max_expected_faults=auto_max_expected_faults,
+                importance_sampling=importance_sampling,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
+                retain=retain,
+                mpi=mpi,
+                workers=workers,
+                progress=progress,
+                observable=observable,
+                chunk_size=chunk_size,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                checkpoint_keep=checkpoint_keep,
+                checkpoint_sync=checkpoint_sync,
+                collect_diagnostics=collect_diagnostics,
+                checkpoint_id=checkpoint_id,
+            )
         queue = tuple(self._queue)
         completed = 0
         pbar = None

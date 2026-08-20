@@ -162,6 +162,57 @@ def test_unified_fermion_helper_supports_spinless_native_workflow(symmetry):
     )) == {(0, 1), (1, 2)}
 
 
+@pytest.mark.parametrize(
+    ("spinful", "symmetry"),
+    [
+        (False, "U1"),
+        (False, "Z2"),
+        (True, "U1"),
+        (True, "U1U1"),
+        (True, "Z2"),
+    ],
+)
+def test_unified_fermion_complex64_gates_preserve_native_dtype(
+    spinful, symmetry
+):
+    """Native complex64 gate streams must not rely on optimizer downcasts."""
+    fermion = Fermion(spinful=spinful, symmetry=symmetry, dtype="complex64")
+    params = {"t": 0.7, "mu": 0.13, "V": 0.2}
+    if spinful:
+        params["U"] = 1.2
+    stream = list(
+        fermion.gate_stream(
+            ((0, 1), (1, 2)),
+            0.01,
+            sites=range(3),
+            order=2,
+            **params,
+        )
+    )
+    direct = (
+        fermion.onsite_gate(
+            0.01,
+            U=1.2 if spinful else None,
+            mu=0.13,
+        ),
+        fermion.hopping_gate(0.01, t=0.7),
+        fermion.density_gate(0.01, V=0.2),
+    )
+
+    for stream_gate, _where in stream:
+        assert {
+            np.dtype(block.dtype) for block in stream_gate.blocks.values()
+        } == {
+            np.dtype("complex64")
+        }
+    for direct_gate in direct:
+        assert {
+            np.dtype(block.dtype) for block in direct_gate.blocks.values()
+        } == {
+            np.dtype("complex64")
+        }
+
+
 def test_spinless_fermion_rejects_ignored_hubbard_couplings():
     """A spinless t-V model must never silently discard a Hubbard U."""
     fermion = Fermion(spinful=False, symmetry="U1")

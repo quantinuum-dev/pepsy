@@ -46,6 +46,7 @@ pip install -U -e .
 # pip install -e .[vmc-torch]
 # pip install -e .[vmc-netket]
 # pip install -e .[layout]
+# pip install -e .[mpi]       # MPI shot ensembles
 # Optional plotting helpers:
 # pip install -e .[viz]
 ```

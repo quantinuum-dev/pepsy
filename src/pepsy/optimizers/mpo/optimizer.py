@@ -1642,6 +1642,20 @@ class MpoOptimizer:
         except (TypeError, ValueError, np.linalg.LinAlgError):
             return False
 
+    @classmethod
+    def _is_unitary_gate_pair(cls, gate, bra_gate):
+        """Return whether a ket/bra gate pair preserves the MPO norm.
+
+        Left or right multiplication by a unitary preserves the
+        Hilbert--Schmidt norm, as does the usual ``U O U†`` pair.  In
+        particular, an explicit ket-only ``(U, None)`` entry should not force
+        construction and contraction of a disposable target MPO merely for
+        norm diagnostics.
+        """
+        ket_unitary = gate is None or cls._is_unitary_gate(gate)
+        bra_unitary = bra_gate is None or cls._is_unitary_gate(bra_gate)
+        return ket_unitary and bra_unitary
+
     def _expected_target_norm(
         self,
         p,
@@ -1662,7 +1676,7 @@ class MpoOptimizer:
         and non-unitary gates use the materialized target, so physical norm
         changes are still separated from truncation loss.
         """
-        if bra_gate is gate and self._is_unitary_gate(gate):
+        if self._is_unitary_gate_pair(gate, bra_gate):
             return self._canonical_norm_value(p)
         if target is None:
             target = self._build_dmrg_target(
@@ -1690,7 +1704,7 @@ class MpoOptimizer:
         all_unitary = True
         for G_i, where_i in zip(batch_G, batch_where):
             gate, bra_gate, _ = self._parse_gate_entry(G_i, where_i)
-            if bra_gate is not gate or not self._is_unitary_gate(gate):
+            if not self._is_unitary_gate_pair(gate, bra_gate):
                 all_unitary = False
                 break
         if all_unitary:
@@ -2604,7 +2618,7 @@ class MpoOptimizer:
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
                 target = None
-                if bra_gate is not gate or not self._is_unitary_gate(gate):
+                if not self._is_unitary_gate_pair(gate, bra_gate):
                     target = self._build_dmrg_target(
                         p,
                         gate,
@@ -2774,7 +2788,7 @@ class MpoOptimizer:
                 target = None
                 expected_norm = None
                 if n_sites == 2 and (
-                    bra_gate is not gate or not self._is_unitary_gate(gate)
+                    not self._is_unitary_gate_pair(gate, bra_gate)
                 ):
                     target = self._build_dmrg_target(
                         p,

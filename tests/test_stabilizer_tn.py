@@ -71,6 +71,101 @@ def test_bell_state_ground_truth():
     # Clifford gates do not touch the coefficient MPS p.
     assert st.max_bond() == 1
     np.testing.assert_allclose(st.p_dense(), np.eye(4)[0])
+    np.testing.assert_allclose(st.to_basis_statevector(), st.p_dense())
+    np.testing.assert_allclose(st.to_physical_statevector(), st.to_statevector())
+
+
+def test_mps_stab_statevector_readout_does_not_build_dense_tableau(monkeypatch):
+    """Physical readout applies the tableau circuit, not its huge matrix."""
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(17).apply([("h", 0), ("cnot", 0, 16)])
+    monkeypatch.setattr(
+        sim.state,
+        "clifford_unitary",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("dense tableau unitary must not be constructed")
+        ),
+    )
+
+    coefficients = sim.to_basis_statevector()
+    statevector = sim.to_statevector()
+
+    assert coefficients.shape == (2**17,)
+    assert statevector.shape == (2**17,)
+    assert np.count_nonzero(np.abs(statevector) > 1e-12) == 2
+    assert np.linalg.norm(statevector) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("mode", ["exact", "mpo", "dmrg"])
+def test_mps_stab_physical_mps_replay_matches_matrix_free_readout(mode, monkeypatch):
+    """Physical-MPS conversion replays the tableau circuit without a dense C."""
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(5).apply(
+        [("h", 0), ("cnot", 0, 4), ("s", 2), ("cnot", 4, 1)]
+    )
+    basis_before = sim.to_basis_statevector()
+    monkeypatch.setattr(
+        sim.state,
+        "clifford_unitary",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("dense tableau unitary must not be constructed")
+        ),
+    )
+    physical = sim.to_mps(
+        mode=mode,
+        chi=8 if mode != "exact" else None,
+        n_iter=3,
+    )
+    actual = np.asarray(physical.to_dense()).reshape(-1)
+    np.testing.assert_allclose(actual, sim.to_statevector(), atol=1e-10)
+    np.testing.assert_allclose(sim.to_basis_statevector(), basis_before)
+    assert physical.L == sim.n
+
+
+def test_mps_stab_physical_mps_restores_logical_order_from_static_layout():
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(
+        4,
+        layout=[3, 1, 2, 0],
+        layout_report=False,
+    ).apply([("h", 0), ("cnot", 0, 3)])
+    physical = sim.to_mps()
+    np.testing.assert_allclose(
+        np.asarray(physical.to_dense()).reshape(-1),
+        sim.to_statevector(),
+        atol=1e-10,
+    )
+
+
+def test_mps_stab_dense_physical_order_matches_physical_mps_order():
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(
+        4,
+        layout=[3, 1, 2, 0],
+        layout_report=False,
+    ).apply([("h", 0), ("cnot", 0, 3), ("t", 1)])
+    np.testing.assert_allclose(
+        sim.to_physical_statevector(logical_order=False),
+        np.asarray(sim.to_mps(logical_order=False).to_dense()).reshape(-1),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        sim.to_physical_statevector(), sim.to_statevector(), atol=1e-10
+    )
+
+
+def test_mps_stab_to_physical_mps_is_to_mps_compatibility_alias():
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 2)])
+    np.testing.assert_allclose(
+        np.asarray(sim.to_mps().to_dense()).reshape(-1),
+        np.asarray(sim.to_physical_mps().to_dense()).reshape(-1),
+    )
 
 
 def test_ghz_state_ground_truth():

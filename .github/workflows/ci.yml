@@ -72,6 +72,45 @@ jobs:
       - name: Run focused type checks
         run: python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
 
+  mpi:
+    name: MPI (${{ matrix.ranks }} ranks)
+    strategy:
+      fail-fast: false
+      matrix:
+        ranks: [2, 3]
+    runs-on: ubuntu-latest
+    env:
+      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
+      NUMBA_DISABLE_CACHING: "1"
+      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
+      MPLCONFIGDIR: /tmp/mplconfig_pepsy
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install MPI runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openmpi-bin libopenmpi-dev
+      - name: Install MPI test profile
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mpi]"
+      - name: Run MPI unit-contract tests
+        run: pytest -q -o addopts="" tests/test_mpi.py
+      - name: Run multi-process MPI integration tests
+        run: |
+          mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
+            python -m pytest -q -o addopts="" \
+            tests/test_mpi_integration.py
+      - name: Run MPI benchmark smoke test
+        run: |
+          mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
+            python benchmarks/mpi_shots.py \
+            --shots 8 --qubits 2 --depth 1 --chi 4 --workers auto
+
   package:
     runs-on: ubuntu-latest
     steps:

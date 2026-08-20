@@ -103,6 +103,40 @@ With `progbar=True`, the STN progress bar reports the current stream
 MPS-compatible diagnostic field `infidelity`. The legacy
 `norm_infidelity` field is emitted with the same value.
 
+For physical readout, keep the two representations explicit:
+`sim.to_basis_statevector()` returns the dense coefficient vector `|nu>` in
+tableau order, while `sim.to_statevector()` returns the
+computational-basis vector `|psi> = C|nu>`. Both materialize only a length
+`2**n` vector; physical readout applies `stim.Tableau.to_circuit()` and never
+constructs a dense `2**n`-by-`2**n` Clifford matrix. `to_physical_statevector()`
+remains a compatibility alias for `to_statevector()`. For a non-dense physical
+representation, use `sim.to_mps(mode="exact")`. This replays the tableau gate
+stream into a new ordinary MPS with unlimited bond and zero cutoff. For
+controlled approximation, use `mode="mpo"` or `mode="dmrg"` with `chi=...`
+and `cutoff=...`; `logical_order=True` (the default) returns sites in logical
+qubit order, even when a static STN coefficient layout is installed.
+`to_physical_mps()` remains a compatibility alias for `to_mps()`.
+
+Shot ensembles can use the same optimizer-level MPI API as ordinary MPS
+optimization:
+
+```python
+result = sim.run(
+    shots=1_000_000,
+    mpi=True,
+    workers="auto",
+    progress="auto",
+    seed=7,
+    retain="none",
+)
+```
+
+`mpi=True` uses the communicator created by `mpiexec`; it does not launch MPI
+processes. Each shot is rebuilt from the simulator's initial snapshot, and
+`workers="auto"` divides the available CPU allowance among ranks on the same
+host. `progress="auto"` emits one rank-zero aggregate bar only in interactive
+terminals.
+
 `exact_cooling=True` is the default constructive pre-check for multi-site
 non-Clifford Pauli rotations. If the frame image has an isolated product
 stabilizer pivot, the optimizer performs one local coefficient rotation and
@@ -311,10 +345,14 @@ applied to it are then placed on that backend, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on that array backend.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
 cached per backend; expectation/fidelity scalars are converted back to Python
-floats.  `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
-small-`n` validation only. The focused STN tests exercise NumPy, Torch, JAX, and
-CuPy paths; optional JAX/CuPy tests skip only when the dependency or CUDA runtime
-is unavailable.
+floats.  `to_basis_statevector()` returns the coefficient vector `|nu>` in
+tableau-basis order without applying the tableau. `to_statevector()` returns
+the physical computational-basis vector `C|nu>` and applies a tableau circuit
+without constructing a dense `2**n x 2**n` Clifford matrix.
+`to_physical_statevector()` is its compatibility alias. Both methods still materialize
+a length-`2**n` vector and are for small-`n` validation only. The focused STN
+tests exercise NumPy, Torch, JAX, and CuPy paths; optional JAX/CuPy tests skip
+only when the dependency or CUDA runtime is unavailable.
 
 When an existing coefficient MPS is supplied, the stabilizer optimizer infers
 its common `backend`, `dtype`, and `device` automatically, even when

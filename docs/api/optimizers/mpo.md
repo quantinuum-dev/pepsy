@@ -261,29 +261,51 @@ basis = MPOBasis.from_pauli_terms(
     [((i, i + 1), "ZZ", MPOParameter("J")) for i in range(L - 1)]
     + [((i,), "X", MPOParameter("hx")) for i in range(L)],
 )
-U = basis.extensive_exponential(
+U = basis.exp(
     -1j * dt,
     {"J": J, "hx": hx},
     order=2,
     mode="optimal",
 )
+# Fast analytical approximation: Algorithms 1, 2, and 4.
+U_fast = basis.exp(
+    -1j * dt,
+    {"J": J, "hx": hx},
+    order=2,
+    mode="algorithm4",
+)
 ```
 
-`mode="base"` applies Algorithms 1--2. `mode="optimal"` applies Algorithms
-1--3, where Algorithm 3 adds selected order-`N + 1` terms without increasing
-the analytical history bond dimension. `mode="approximate"` additionally
-enables the paper's Algorithm 4. `MPOProductTerm` also accepts arbitrary
+`mode="base"` applies Algorithms 1--2. `mode="algorithm4"` applies Algorithms
+1, 2, and 4 without the selected next-order replay. `mode="optimal"` applies
+Algorithms 1--3, where Algorithm 3 adds selected order-`N + 1` terms without
+increasing the analytical history bond dimension. `mode="approximate"`
+additionally enables Algorithm 4 after that extension. These modes, together
+with `order`, `max_bond`, `on_exceed`, `cache_history`, and `history_storage`,
+are shared by `basis.exp()` and `basis.compile_exp()`. The names
+`basis.time_evolution()` and `basis.evolution_mpo()` remain compatibility
+aliases. `MPOProductTerm` also accepts arbitrary
 one-dimensional supports, for example `(0, 1, 3)` with operators `"XYZ"`.
 
 The first build compiles the first-degree MPO topology and symbolic history
-plans. Later calls reuse only level indices, reachability information, and
-merge/insertion plans; local tensors are rebuilt from the supplied numerical
-parameters. This separation keeps Torch and JAX autodiff graphs correct. The
-plan state is visible through `basis.cache_info["history"]`, including
-`compression_plan_orders`, `extension_plan_orders`, and
-`extension_plan_batches`. `cache_history=False` avoids retaining a new raw
-history topology for one-off large builds, while `history_storage="streaming"`
-retains only adjacent history cuts during generation before assembling the
-current MPO needed by Algorithms 1--3.
+plans. Later calls reuse level indices, reachability information, local
+gather/index metadata, and merge/insertion plans; local tensors are rebuilt
+from the supplied numerical parameters. This separation keeps Torch and JAX
+autodiff graphs correct. The plan state is visible through
+`basis.cache_info["history"]`, including `compression_plan_orders`,
+`tensor_plan_orders`, `extension_plan_orders`, and `extension_plan_batches`.
+`cache_history=False` avoids retaining a new raw
+history topology for one-off large builds; the streaming compatibility mode
+also keeps that topology ephemeral during generation before assembling the
+current MPO needed by Algorithms 1--3. Use `basis.clear_history_cache()` to
+release cached history orders while retaining the compiled coefficient basis.
+
+For compiled numerical kernels, `MPOBasis.exp_arrays()` returns backend-native
+tensor tuples without crossing the Quimb wrapper boundary. Use
+`MPOBasis.exp_batch()` for coefficient arrays with shape
+`(batch, number_of_terms)`; current JAX and Torch backends use native `vmap`
+when available and retain an autodiff-safe fallback loop otherwise. These
+interfaces share structural caches but never cache parameter-dependent tensor
+values.
 
 > API details are maintained as handwritten Markdown in this page.

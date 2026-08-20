@@ -135,6 +135,24 @@ The safe MPS naming compatibility surface includes `from_mps`,
 projections and is not bounded by `max_dense_sample_qubits`; that constructor
 argument remains accepted for compatibility with older callers.
 
+`TreeStabOptimizer.run` also accepts the shared shot and MPI options:
+
+```python
+result = sim.run(
+    shots=1_000_000,
+    seed=7,
+    mpi=True,
+    workers="auto",
+    progress="auto",
+    retain="none",
+)
+```
+
+Each shot starts from an independent copy of the current tableau and
+coefficient tree; the caller's state and queued stream are not consumed.
+The tree stabilizer path intentionally uses `strategy="independent"` for
+local and MPI execution.
+
 `cap(where, vec)` contracts one physical qubit with a length-two vector and
 compacts the remaining labels, matching the MPS physical-cap semantics. It is
 a correctness-first dense-state fallback with hierarchical TTN factorization,
