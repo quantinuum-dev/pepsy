@@ -186,6 +186,101 @@ def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
     assert len(optimizer._queue) == 1
 
 
+@pytest.mark.parametrize("shots", [True, 1.0])
+def test_tree_optimizer_run_validates_non_integral_shots(shots):
+    optimizer = pepsy.TreeOptimizer(n=1, chi=4, run=False)
+
+    with pytest.raises(ValueError, match="shots must be a nonnegative integer"):
+        optimizer.run(shots=shots, progress=False)
+
+
+@pytest.mark.parametrize("shots", [True, 1.0])
+def test_tree_stabilizer_run_validates_non_integral_shots(shots):
+    optimizer = pepsy.TreeStabOptimizer(1)
+
+    with pytest.raises(ValueError, match="shots must be a nonnegative integer"):
+        optimizer.run(shots=shots, progress=False)
+
+
+def test_tree_run_auto_fault_threshold_dispatches_shots():
+    optimizer = pepsy.TreeOptimizer(n=1, chi=4, run=False)
+
+    result = optimizer.run(
+        auto_max_expected_faults=0.2,
+        progress=False,
+        retain="none",
+    )
+
+    assert isinstance(result, pepsy.NoisyResult)
+
+
+def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
+    optimizer = pepsy.TreeStabOptimizer(1)
+
+    result = optimizer.run(
+        auto_max_expected_faults=0.2,
+        progress=False,
+        retain="none",
+    )
+
+    assert isinstance(result, pepsy.NoisyResult)
+
+
+@pytest.mark.parametrize("optimizer_factory", [
+    lambda: pepsy.TreeOptimizer(
+        [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
+        n=1,
+        chi=4,
+        run=False,
+    ),
+    lambda: pepsy.TreeStabOptimizer(1, gates=[("x", 0)]),
+])
+def test_tree_run_local_progress_is_aggregate(monkeypatch, optimizer_factory):
+    import importlib
+
+    mpi_module = importlib.import_module("pepsy.optimizers.mpi")
+    events = []
+
+    class _Progress:
+        def update(self, amount):
+            events.append(("update", amount))
+
+        def close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr(
+        mpi_module,
+        "_make_progress_bar",
+        lambda mode, total, **kwargs: _Progress(),
+    )
+    optimizer_factory().run(
+        shots=4,
+        seed=49,
+        strategy="independent",
+        workers=2,
+        progress=True,
+        retain="none",
+    )
+
+    assert sum(event[1] for event in events if event[0] == "update") == 4
+    assert events[-1] == ("close",)
+
+
+def test_tree_run_local_materializes_generator_stream():
+    flip = np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    optimizer = pepsy.TreeOptimizer(n=1, chi=4, run=False)
+    result = optimizer.run(
+        gates=(entry for entry in [(flip, 0)]),
+        shots=2,
+        strategy="independent",
+        workers=2,
+        progress=False,
+        retain="final",
+    )
+
+    assert len(result.optimizers) == 2
+
+
 def test_mps_run_auto_workers_is_available_without_mpi():
     optimizer = pepsy.MpsOptimizer(
         qtn.MPS_computational_state("0", dtype="complex128"),

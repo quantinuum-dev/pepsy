@@ -1600,7 +1600,11 @@ class TreeStabOptimizer:
                 progress=progress,
             )
 
-        from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+        from ..mpi import (  # pylint: disable=import-outside-toplevel
+            _make_progress_bar,
+            _resolve_local_workers,
+            _validate_progress,
+        )
         from ..noise import (  # pylint: disable=import-outside-toplevel
             NoisyResult,
             run_noisy_shots,
@@ -1608,7 +1612,13 @@ class TreeStabOptimizer:
         )
 
         workers = _resolve_local_workers(workers, shots=shots)
-        if workers > 1 and progress not in {False, "never"}:
+        progress_mode = _validate_progress(progress)
+        progress_bar = (
+            _make_progress_bar(progress_mode, shots, desc="shots")
+            if workers > 1
+            else None
+        )
+        if workers > 1 and progress_mode != "never":
             child_kwargs["progbar"] = False
         factory = lambda: template.copy()
         common = {
@@ -1622,17 +1632,36 @@ class TreeStabOptimizer:
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        if error_model is None:
-            raw = run_trajectory_shots(factory, stream, shots, **common)
-        else:
-            raw = run_noisy_shots(
-                factory,
-                stream,
-                error_model,
-                shots,
-                auto_max_expected_faults=auto_max_expected_faults,
-                **common,
-            )
+        def update_progress(delta):
+            if progress_bar is not None:
+                progress_bar.update(int(delta))
+
+        try:
+            if error_model is None:
+                raw = run_trajectory_shots(
+                    factory,
+                    stream,
+                    shots,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+            else:
+                raw = run_noisy_shots(
+                    factory,
+                    stream,
+                    error_model,
+                    shots,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         return NoisyResult(raw)
 
     # ------------------------------------------------------------------
@@ -1676,10 +1705,13 @@ class TreeStabOptimizer:
         """
         shot_requested = bool(
             error_model is not None
-            or shots != 1
+            or isinstance(shots, bool)
+            or not isinstance(shots, Integral)
+            or int(shots) != 1
             or run_kwargs is not None
             or strategy != "auto"
             or max_branches != 128
+            or auto_max_expected_faults != 0.1
             or importance_sampling is not None
             or max_branch_factor is not None
             or parallel_workers != 1

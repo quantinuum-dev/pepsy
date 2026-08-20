@@ -2645,16 +2645,40 @@ class TreeOptimizer:
                 progress=progress,
             )
 
-        from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+        from ..mpi import (  # pylint: disable=import-outside-toplevel
+            _make_progress_bar,
+            _resolve_local_workers,
+            _validate_progress,
+        )
         from ..noise import (  # pylint: disable=import-outside-toplevel
             NoisyResult,
+            _as_entries,
             run_noisy_shots,
             run_trajectory_shots,
         )
 
         workers = _resolve_local_workers(workers, shots=shots)
+        gates = tuple(_as_entries(gates))
+        progress_strategy = strategy
+        if workers > 1 and strategy == "auto":
+            from ..noise import _resolve_auto_parallel_strategy
+
+            progress_strategy = _resolve_auto_parallel_strategy(
+                gates,
+                shots,
+                error_model=error_model,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                auto_max_expected_faults=auto_max_expected_faults,
+            )
+        progress_mode = _validate_progress(progress)
+        progress_bar = (
+            _make_progress_bar(progress_mode, shots, desc="shots")
+            if workers > 1 and progress_strategy == "independent"
+            else None
+        )
         child_kwargs = dict(run_kwargs or {})
-        if workers > 1 and progress not in {False, "never"}:
+        if workers > 1 and progress_mode != "never":
             child_kwargs["progbar"] = False
         parent_rng_state = deepcopy(self.rng.bit_generator.state)
         template = self.copy()
@@ -2671,17 +2695,36 @@ class TreeOptimizer:
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        if error_model is None:
-            raw = run_trajectory_shots(factory, gates, shots, **common)
-        else:
-            raw = run_noisy_shots(
-                factory,
-                gates,
-                error_model,
-                shots,
-                auto_max_expected_faults=auto_max_expected_faults,
-                **common,
-            )
+        def update_progress(delta):
+            if progress_bar is not None:
+                progress_bar.update(int(delta))
+
+        try:
+            if error_model is None:
+                raw = run_trajectory_shots(
+                    factory,
+                    gates,
+                    shots,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+            else:
+                raw = run_noisy_shots(
+                    factory,
+                    gates,
+                    error_model,
+                    shots,
+                    auto_max_expected_faults=auto_max_expected_faults,
+                    _progress=(
+                        update_progress if progress_bar is not None else None
+                    ),
+                    **common,
+                )
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         return NoisyResult(raw)
 
     def run(
@@ -2795,10 +2838,13 @@ class TreeOptimizer:
 
         shot_requested = bool(
             error_model is not None
-            or shots != 1
+            or isinstance(shots, bool)
+            or not isinstance(shots, Integral)
+            or int(shots) != 1
             or run_kwargs is not None
             or strategy != "auto"
             or max_branches != 128
+            or auto_max_expected_faults != 0.1
             or importance_sampling is not None
             or max_branch_factor is not None
             or parallel_workers != 1
