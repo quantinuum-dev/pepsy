@@ -2885,13 +2885,22 @@ class MpsStabOptimizer:
         axes = [self._mps_site(logical) for logical in range(self.n)]
         return p_dense.transpose(axes).reshape(-1)
 
-    def to_statevector(self) -> np.ndarray:
-        """Dense physical statevector ``|psi> = C|nu>`` (small ``n`` only)."""
+    def to_statevector(self, logical_order=True) -> np.ndarray:
+        """Return the dense physical statevector ``|psi> = C|nu>``."""
+        if not isinstance(logical_order, (bool, np.bool_)):
+            raise TypeError("logical_order must be a boolean.")
+        basis = self.to_basis_statevector(logical_order=logical_order)
+        site_order = None if logical_order else self.logical_order
         return self.state._statevector_from_basis(  # pylint: disable=protected-access
-            self.to_basis_statevector(logical_order=True)
+            basis,
+            site_order=site_order,
         )
 
-    def to_physical_mps(
+    def to_physical_statevector(self, logical_order=True) -> np.ndarray:
+        """Compatibility alias for :meth:`to_statevector`."""
+        return self.to_statevector(logical_order=logical_order)
+
+    def to_mps(
         self,
         *,
         mode="exact",
@@ -2960,7 +2969,7 @@ class MpsStabOptimizer:
         if logical_order and current_order != list(range(self.n)):
             if getattr(p, "cyclic", False):
                 raise ValueError(
-                    "to_physical_mps(logical_order=True) requires an open-boundary MPS."
+                    "to_mps(logical_order=True) requires an open-boundary MPS."
                 )
             for target_pos, logical_site in enumerate(range(self.n)):
                 current_pos = current_order.index(logical_site)
@@ -3016,6 +3025,10 @@ class MpsStabOptimizer:
         )
         optimizer.run(**options)
         return optimizer.p
+
+    def to_physical_mps(self, *args, **kwargs):
+        """Compatibility alias for :meth:`to_mps`."""
+        return self.to_mps(*args, **kwargs)
 
     def amplitude(self, bits) -> complex:
         """Amplitude ``<bits|psi>`` for a bitstring (str ``'010'`` or 0/1 seq).

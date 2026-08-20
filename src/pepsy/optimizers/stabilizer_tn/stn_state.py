@@ -166,11 +166,21 @@ def _tableau_gate_stream(circuit):
     return tuple(gates)
 
 
-def _apply_tableau_circuit_to_statevector(state, circuit, n):
+def _apply_tableau_circuit_to_statevector(state, circuit, n, *, site_order=None):
     """Apply a Stim tableau circuit without materializing its unitary matrix."""
     dtype = np.asarray(state).dtype
     out = np.asarray(state, dtype=dtype).reshape(-1)
+    logical_to_position = None
+    if site_order is not None:
+        site_order = tuple(int(site) for site in site_order)
+        if set(site_order) != set(range(int(n))) or len(site_order) != int(n):
+            raise ValueError("site_order must be a permutation of the logical sites.")
+        logical_to_position = {
+            logical: position for position, logical in enumerate(site_order)
+        }
     for gate, where in _tableau_gate_stream(circuit):
+        if logical_to_position is not None:
+            where = tuple(logical_to_position[site] for site in where)
         out = _apply_dense_local_gate(out, np.asarray(gate, dtype=dtype), where, n)
     return out
 
@@ -481,7 +491,7 @@ class STNState:
         """Return the dense coefficient vector ``|nu>`` in tableau order."""
         return self.p_dense()
 
-    def _statevector_from_basis(self, p_dense) -> np.ndarray:
+    def _statevector_from_basis(self, p_dense, *, site_order=None) -> np.ndarray:
         """Apply the tableau Clifford to a dense coefficient vector."""
         p_dense = np.asarray(p_dense, dtype=self.dtype).reshape(-1)
         expected_size = 2**self.n
@@ -497,10 +507,11 @@ class STNState:
             p_dense,
             tableau.to_circuit(),
             self.n,
+            site_order=site_order,
         )
 
     def to_statevector(self) -> np.ndarray:
-        """Reconstruct the physical statevector ``|psi> = C|nu>``.
+        """Return the physical statevector ``|psi> = C|nu>``.
 
         This materializes only the final length-``2**n`` vector. It applies a
         circuit decomposition of the tableau instead of constructing the
@@ -508,6 +519,10 @@ class STNState:
         to a global phase because tableaus do not track global phase.
         """
         return self._statevector_from_basis(self.to_basis_statevector())
+
+    def to_physical_statevector(self) -> np.ndarray:
+        """Compatibility alias for :meth:`to_statevector`."""
+        return self.to_statevector()
 
     def _bits_to_index(self, bits) -> int:
         """Map a bitstring (str ``'010'`` or 0/1 sequence) to a big-endian index."""

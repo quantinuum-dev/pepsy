@@ -72,6 +72,7 @@ def test_bell_state_ground_truth():
     assert st.max_bond() == 1
     np.testing.assert_allclose(st.p_dense(), np.eye(4)[0])
     np.testing.assert_allclose(st.to_basis_statevector(), st.p_dense())
+    np.testing.assert_allclose(st.to_physical_statevector(), st.to_statevector())
 
 
 def test_mps_stab_statevector_readout_does_not_build_dense_tableau(monkeypatch):
@@ -112,7 +113,7 @@ def test_mps_stab_physical_mps_replay_matches_matrix_free_readout(mode, monkeypa
             AssertionError("dense tableau unitary must not be constructed")
         ),
     )
-    physical = sim.to_physical_mps(
+    physical = sim.to_mps(
         mode=mode,
         chi=8 if mode != "exact" else None,
         n_iter=3,
@@ -131,11 +132,39 @@ def test_mps_stab_physical_mps_restores_logical_order_from_static_layout():
         layout=[3, 1, 2, 0],
         layout_report=False,
     ).apply([("h", 0), ("cnot", 0, 3)])
-    physical = sim.to_physical_mps()
+    physical = sim.to_mps()
     np.testing.assert_allclose(
         np.asarray(physical.to_dense()).reshape(-1),
         sim.to_statevector(),
         atol=1e-10,
+    )
+
+
+def test_mps_stab_dense_physical_order_matches_physical_mps_order():
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(
+        4,
+        layout=[3, 1, 2, 0],
+        layout_report=False,
+    ).apply([("h", 0), ("cnot", 0, 3), ("t", 1)])
+    np.testing.assert_allclose(
+        sim.to_physical_statevector(logical_order=False),
+        np.asarray(sim.to_mps(logical_order=False).to_dense()).reshape(-1),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        sim.to_physical_statevector(), sim.to_statevector(), atol=1e-10
+    )
+
+
+def test_mps_stab_to_physical_mps_is_to_mps_compatibility_alias():
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 2)])
+    np.testing.assert_allclose(
+        np.asarray(sim.to_mps().to_dense()).reshape(-1),
+        np.asarray(sim.to_physical_mps().to_dense()).reshape(-1),
     )
 
 
