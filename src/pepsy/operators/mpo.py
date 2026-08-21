@@ -41,11 +41,13 @@ import warnings
 import autoray as ar
 import numpy as np
 
+from .._internal.validation import is_strict_integer, normalize_integer_tuple
 from .mpo_automaton import (
     MPOAutomaton,
     _as_backend,
     _backend_reference,
     _backend_name,
+    _matmul,
     _multiply_scalar,
 )
 from ._mpo_sparse import (
@@ -53,12 +55,16 @@ from ._mpo_sparse import (
     normalize_charge,
     symmray_arrays_from_sparse,
 )
+from .mpo_space import MPOBraiding, MPOPhysicalSpace
 
 __all__ = [
     "MPOParameter",
     "MPOLevelToken",
     "MPOLevel",
     "MPOProductTerm",
+    "MPOLocalOperatorTerm",
+    "MPOBraiding",
+    "MPOPhysicalSpace",
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
@@ -141,6 +147,8 @@ class MPOProductTerm:
     coefficient: object = 1.0
     string_operators: tuple[object, ...] | None = None
     charge: object = None
+    parities: tuple[int, ...] | None = None
+    braiding: MPOBraiding | str | None = None
 
     @classmethod
     def from_pauli(
@@ -151,6 +159,8 @@ class MPOProductTerm:
         coefficient=1.0,
         string_paulis=None,
         charge=None,
+        parities=None,
+        braiding=None,
     ):
         """Construct a product term from labels such as ``"ZXY"``.
 
@@ -163,17 +173,52 @@ class MPOProductTerm:
             coefficient=coefficient,
             string_operators=string_paulis,
             charge=charge,
+            parities=parities,
+            braiding=braiding,
         )
 
     def __post_init__(self):
-        sites = tuple(int(site) for site in self.sites)
+        sites = normalize_integer_tuple(self.sites, name="sites", allow_scalar=False)
         operators = _normalize_operator_sequence(self.operators, name="operators")
         if not sites or len(sites) != len(operators):
             raise ValueError("sites and operators must be non-empty and aligned.")
-        if any(left >= right for left, right in zip(sites, sites[1:])):
-            raise ValueError("term sites must be strictly increasing.")
+        braiding = MPOBraiding.resolve(self.braiding)
+        order, ordered_parities, phase = braiding.canonical_order(
+            sites,
+            self.parities,
+        )
+        ordered = tuple((sites[index], operators[index]) for index in order)
+        if (
+            (self.charge is not None or self.string_operators is not None)
+            and tuple(site for site, _operator in ordered) != sites
+        ):
+            raise ValueError(
+                "terms with charge or string_operators metadata must list "
+                "sites in increasing order."
+            )
+        combined_sites = []
+        combined_operators = []
+        combined_parities = []
+        for (site, operator), parity in zip(ordered, ordered_parities):
+            if combined_sites and site == combined_sites[-1]:
+                if self.charge is not None or self.string_operators is not None:
+                    raise ValueError(
+                        "terms with charge or string_operators metadata cannot "
+                        "repeat a site."
+                    )
+                combined_operators[-1] = _matmul(combined_operators[-1], operator)
+                combined_parities[-1] = (combined_parities[-1] + parity) % 2
+            else:
+                combined_sites.append(site)
+                combined_operators.append(operator)
+                combined_parities.append(parity)
+        sites = tuple(combined_sites)
+        operators = tuple(combined_operators)
         object.__setattr__(self, "sites", sites)
         object.__setattr__(self, "operators", operators)
+        object.__setattr__(self, "coefficient", _scale_term_coefficient(self.coefficient, phase))
+        object.__setattr__(self, "parities", tuple(combined_parities))
+        object.__setattr__(self, "braiding", braiding)
         if self.string_operators is not None:
             object.__setattr__(
                 self,
@@ -183,6 +228,87 @@ class MPOProductTerm:
                     name="string_operators",
                 ),
             )
+
+
+@dataclass(frozen=True)
+class MPOLocalOperatorTerm:
+    """A general dense operator acting on an ordered collection of sites.
+
+    Unlike :class:`MPOProductTerm`, ``operator`` need not factor across its
+    support. Pepsy performs an exact fixed-rank operator-Schmidt decomposition
+    and inserts the resulting local MPO segment directly into the automaton.
+    """
+
+    sites: tuple[int, ...]
+    operator: object
+    coefficient: object = 1.0
+    phys_dim: int | None = None
+    charge: object = None
+
+    def __post_init__(self):
+        sites = normalize_integer_tuple(self.sites, name="sites", allow_scalar=False)
+        if not sites:
+            raise ValueError("sites must not be empty.")
+        if len(set(sites)) != len(sites):
+            raise ValueError("a general local operator cannot repeat a site.")
+        if self.charge is not None and len(sites) > 1:
+            raise ValueError(
+                "charged general local operators require a sector-aware "
+                "Schmidt decomposition and are not yet accepted."
+            )
+
+        operator = self.operator
+        shape = tuple(getattr(operator, "shape", ()))
+        if not shape:
+            try:
+                operator = np.asarray(operator)
+                shape = tuple(operator.shape)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("operator must be an array-like square matrix.") from exc
+        if len(shape) != 2 or shape[0] != shape[1]:
+            raise ValueError("operator must be a square matrix.")
+
+        if self.phys_dim is None:
+            dimension = int(shape[0])
+            phys_dim = int(round(dimension ** (1.0 / len(sites))))
+            if phys_dim ** len(sites) != dimension:
+                raise ValueError(
+                    f"operator dimension {dimension} is not d**{len(sites)} for "
+                    "an integer local physical dimension d."
+                )
+        else:
+            if not is_strict_integer(self.phys_dim) or int(self.phys_dim) < 1:
+                raise TypeError("phys_dim must be a positive integer.")
+            phys_dim = int(self.phys_dim)
+            expected = phys_dim ** len(sites)
+            if shape != (expected, expected):
+                raise ValueError(
+                    f"operator has shape {shape}, expected ({expected}, {expected})."
+                )
+
+        order = tuple(sorted(range(len(sites)), key=sites.__getitem__))
+        if order != tuple(range(len(sites))):
+            if self.charge is not None:
+                raise ValueError(
+                    "charged general operators must list sites in increasing order."
+                )
+            tensor = ar.do(
+                "reshape",
+                operator,
+                (phys_dim,) * (2 * len(sites)),
+            )
+            axes = order + tuple(len(sites) + index for index in order)
+            operator = ar.do(
+                "reshape",
+                ar.do("transpose", tensor, axes),
+                shape,
+            )
+            sites = tuple(sites[index] for index in order)
+
+        _check_scalar(self.coefficient, name="MPO coefficient")
+        object.__setattr__(self, "sites", sites)
+        object.__setattr__(self, "operator", operator)
+        object.__setattr__(self, "phys_dim", phys_dim)
 
 
 @dataclass(frozen=True)
@@ -304,6 +430,11 @@ def _normalize_mpo_physical_charges(charges, phys_dim, symmetry):
     return tuple(normalize_charge(charge, symmetry) for charge in charges)
 
 
+def _is_integral_value(value):
+    """Compatibility spelling for strict integer coordinate validation."""
+    return is_strict_integer(value)
+
+
 def _resolve_exp_step(step, dt):
     """Resolve the canonical ``step`` and legacy ``dt`` spellings.
 
@@ -404,6 +535,24 @@ class MPOParameter:
         return value
 
 
+def _scale_term_coefficient(coefficient, phase):
+    """Apply a canonicalization phase without disconnecting parameter values."""
+
+    if phase == 1:
+        return coefficient
+    if isinstance(coefficient, MPOParameter):
+        return lambda parameters, reference=coefficient: _multiply_scalar(
+            phase,
+            reference.resolve(parameters),
+        )
+    if callable(coefficient):
+        return lambda parameters, reference=coefficient: _multiply_scalar(
+            phase,
+            reference(parameters),
+        )
+    return _multiply_scalar(phase, coefficient)
+
+
 def _as_4d(data, *, site, length):
     """Normalize a Quimb MPO tensor to ``(left, right, up, down)``."""
     shape = tuple(getattr(data, "shape", ()))
@@ -492,6 +641,83 @@ def _normalize_operator_sequence(operators, *, name):
         else:
             normalized.append(operator)
     return tuple(normalized)
+
+
+def _as_square_operator(value):
+    """Return a square matrix payload without coercing backend arrays."""
+
+    if isinstance(value, str):
+        return None
+    shape = tuple(getattr(value, "shape", ()))
+    if shape:
+        return value if len(shape) == 2 and shape[0] == shape[1] else None
+    array = _as_array_like_matrix(value)
+    if array is None or array.shape[0] != array.shape[1]:
+        return None
+    return array
+
+
+def _local_operator_mpo_cores(term):
+    """Decompose one general local operator into exact fixed-rank MPO cores."""
+
+    if not isinstance(term, MPOLocalOperatorTerm):
+        raise TypeError("term must be an MPOLocalOperatorTerm.")
+    nsites = len(term.sites)
+    phys_dim = term.phys_dim
+    if nsites == 1:
+        return (ar.do("reshape", term.operator, (1, 1, phys_dim, phys_dim)),)
+
+    tensor = ar.do(
+        "reshape",
+        term.operator,
+        (phys_dim,) * (2 * nsites),
+    )
+    interleaved = tuple(
+        axis
+        for site in range(nsites)
+        for axis in (site, nsites + site)
+    )
+    remainder = ar.do("transpose", tensor, interleaved)
+    left_rank = 1
+    cores = []
+    local_size = phys_dim * phys_dim
+    for site in range(nsites - 1):
+        matrix = ar.do(
+            "reshape",
+            remainder,
+            (left_rank * local_size, -1),
+        )
+        u, singular_values, vh = _fixed_rank_svd(matrix)
+        rank = min(int(matrix.shape[0]), int(matrix.shape[1]))
+        u = u[:, :rank]
+        singular_values = singular_values[:rank]
+        vh = vh[:rank]
+        core = ar.do(
+            "reshape",
+            u,
+            (left_rank, phys_dim, phys_dim, rank),
+        )
+        cores.append(ar.do("transpose", core, (0, 3, 1, 2)))
+        remainder = ar.do(
+            "multiply",
+            singular_values[:, None],
+            vh,
+        )
+        left_rank = rank
+        remaining_sites = nsites - site - 1
+        remainder = ar.do(
+            "reshape",
+            remainder,
+            (left_rank,) + (local_size,) * remaining_sites,
+        )
+
+    last = ar.do(
+        "reshape",
+        remainder,
+        (left_rank, phys_dim, phys_dim, 1),
+    )
+    cores.append(ar.do("transpose", last, (0, 3, 1, 2)))
+    return tuple(cores)
 
 
 def _zeros(shape, *, like):
@@ -791,11 +1017,14 @@ def _sort_history_front(history, level):
 
 
 def _term_from_input(term):
-    if isinstance(term, MPOProductTerm):
+    if isinstance(term, (MPOProductTerm, MPOLocalOperatorTerm)):
         return term
     if isinstance(term, Mapping):
         sites = term.get("sites", term.get("locations"))
-        operators = term.get("operators", term.get("paulis"))
+        operators = term.get(
+            "operators",
+            term.get("paulis", term.get("operator")),
+        )
         if sites is None or operators is None:
             raise ValueError("each product term needs sites and operators.")
         coefficient = term.get("coefficient", _UNSET)
@@ -807,6 +1036,25 @@ def _term_from_input(term):
                 )
             else:
                 coefficient = 1.0
+        coefficient = coefficient
+        matrix = _as_square_operator(operators)
+        normalized_sites = normalize_integer_tuple(
+            sites,
+            name="sites",
+            allow_scalar=True,
+        )
+        if matrix is not None and len(normalized_sites) > 1:
+            if term.get("string_operators", term.get("string_paulis")) is not None:
+                raise ValueError(
+                    "general local operators cannot use string_operators."
+                )
+            return MPOLocalOperatorTerm(
+                sites=normalized_sites,
+                operator=matrix,
+                coefficient=coefficient,
+                phys_dim=term.get("phys_dim"),
+                charge=term.get("charge"),
+            )
         return MPOProductTerm(
             sites=sites,
             operators=operators,
@@ -816,8 +1064,18 @@ def _term_from_input(term):
                 term.get("string_paulis"),
             ),
             charge=term.get("charge"),
+            parities=term.get("parities"),
+            braiding=term.get("braiding"),
         )
     if isinstance(term, (tuple, list)) and len(term) in (2, 3):
+        matrix = _as_square_operator(term[1])
+        sites = normalize_integer_tuple(term[0], name="sites", allow_scalar=True)
+        if matrix is not None and len(sites) > 1:
+            return MPOLocalOperatorTerm(
+                sites=sites,
+                operator=matrix,
+                coefficient=term[2] if len(term) == 3 else 1.0,
+            )
         return MPOProductTerm(
             sites=term[0],
             operators=term[1],
@@ -892,7 +1150,7 @@ def _square_lattice_pauli_term(term, lattice_to_chain):
 
     mapped = []
     for location in locations:
-        if isinstance(location, Integral):
+        if _is_integral_value(location):
             chain_site = int(location)
             if not 0 <= chain_site < len(lattice_to_chain):
                 raise ValueError(
@@ -900,11 +1158,16 @@ def _square_lattice_pauli_term(term, lattice_to_chain):
                 )
         else:
             try:
-                coordinate = tuple(int(value) for value in location)
+                coordinate_values = tuple(location)
             except (TypeError, ValueError) as exc:
                 raise TypeError(
                     f"lattice locations must be 2D coordinates, got {location!r}."
                 ) from exc
+            if not all(_is_integral_value(value) for value in coordinate_values):
+                raise TypeError(
+                    f"lattice locations must be 2D integer coordinates, got {location!r}."
+                )
+            coordinate = tuple(int(value) for value in coordinate_values)
             if len(coordinate) != 2:
                 raise ValueError(
                     f"lattice locations must be 2D coordinates, got {location!r}."
@@ -919,6 +1182,11 @@ def _square_lattice_pauli_term(term, lattice_to_chain):
 
     if len(set(mapped)) != len(mapped):
         raise ValueError("a Pauli term cannot contain the same lattice site twice.")
+    if charge is not None and tuple(mapped) != tuple(sorted(mapped)):
+        raise ValueError(
+            "square-lattice terms with charge metadata must list locations "
+            "in increasing chain order."
+        )
 
     # Operators on distinct sites commute, so sorting location/Pauli pairs
     # gives one canonical word for reversed coordinate descriptions. This
@@ -947,6 +1215,15 @@ def _looks_like_operator_payload(value):
     )
 
 
+def _as_array_like_matrix(value):
+    """Return a NumPy view for a 2D array-like value, or ``None``."""
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError):
+        return None
+    return array if array.ndim == 2 else None
+
+
 def _generic_term_parts(term):
     """Split a user-facing term into operator, locations, coefficient, metadata."""
     if isinstance(term, MPOProductTerm):
@@ -956,6 +1233,18 @@ def _generic_term_parts(term):
             "coefficient": term.coefficient,
             "string_operators": term.string_operators,
             "charge": term.charge,
+            "parities": term.parities,
+            "braiding": term.braiding,
+        }
+    if isinstance(term, MPOLocalOperatorTerm):
+        return {
+            "operator": term.operator,
+            "location": term.sites,
+            "coefficient": term.coefficient,
+            "string_operators": None,
+            "charge": term.charge,
+            "parities": None,
+            "braiding": None,
         }
 
     if isinstance(term, Mapping):
@@ -993,12 +1282,36 @@ def _generic_term_parts(term):
                 term.get("string_paulis"),
             ),
             "charge": term.get("charge"),
+            "parities": term.get("parities"),
+            "braiding": term.get("braiding"),
         }
 
     if isinstance(term, (tuple, list)) and len(term) in (2, 3):
         first, second = term[:2]
-        if _looks_like_operator_payload(first) and not _looks_like_operator_payload(second):
+        first_is_operator = _looks_like_operator_payload(first)
+        second_is_operator = _looks_like_operator_payload(second)
+        # Nested Python lists are useful array-like matrices but are
+        # structurally indistinguishable from a 2D coordinate list in the
+        # fully nested case. Resolve the common scalar/flat-site forms here;
+        # callers with two nested numeric payloads can use mapping syntax.
+        if (
+            not first_is_operator
+            and _as_array_like_matrix(first) is not None
+            and _looks_like_location_sequence(second)
+            and _as_array_like_matrix(second) is None
+        ):
+            first_is_operator = True
+        if (
+            not second_is_operator
+            and _as_array_like_matrix(second) is not None
+            and _looks_like_location_sequence(first)
+            and _as_array_like_matrix(first) is None
+        ):
+            second_is_operator = True
+        if first_is_operator and not second_is_operator:
             operator, location = first, second
+        elif second_is_operator and not first_is_operator:
+            location, operator = first, second
         else:
             location, operator = first, second
         return {
@@ -1007,6 +1320,8 @@ def _generic_term_parts(term):
             "coefficient": term[2] if len(term) == 3 else 1.0,
             "string_operators": None,
             "charge": None,
+            "parities": None,
+            "braiding": None,
         }
 
     raise TypeError(
@@ -1022,6 +1337,9 @@ def _operator_factors(operator):
         return tuple(operator)
     if hasattr(operator, "shape"):
         return (operator,)
+    array = _as_array_like_matrix(operator)
+    if array is not None and array.ndim == 2:
+        return (array,)
     try:
         factors = tuple(operator)
     except TypeError as exc:
@@ -1033,7 +1351,7 @@ def _operator_factors(operator):
 
 def _looks_like_location_sequence(value):
     """Return whether a shorthand value is a site or coordinate sequence."""
-    if isinstance(value, Integral):
+    if _is_integral_value(value):
         return True
     try:
         values = tuple(value)
@@ -1041,10 +1359,10 @@ def _looks_like_location_sequence(value):
         return False
     if not values:
         return False
-    if all(isinstance(item, Integral) for item in values):
+    if all(_is_integral_value(item) for item in values):
         return True
     return all(
-        not isinstance(item, (str, bytes))
+        not isinstance(item, (str, bytes, Integral))
         and _looks_like_location_sequence(item)
         for item in values
     )
@@ -1102,7 +1420,7 @@ def _expand_term_collection(terms):
 
 def _location_dimensions(location, num_factors, expected_ndim=None):
     """Normalize locations and identify whether they are chain or lattice sites."""
-    if isinstance(location, Integral):
+    if _is_integral_value(location):
         return 1, (int(location),)
 
     try:
@@ -1112,7 +1430,7 @@ def _location_dimensions(location, num_factors, expected_ndim=None):
     if not values:
         raise ValueError("term locations must be non-empty.")
 
-    if all(isinstance(value, Integral) for value in values):
+    if all(_is_integral_value(value) for value in values):
         # A single local operator at (x, y) or (x, y, z) is one lattice site.
         # Multiple factors at flat integer locations are the conventional 1D form.
         if num_factors == 1 and expected_ndim in (2, 3):
@@ -1124,29 +1442,37 @@ def _location_dimensions(location, num_factors, expected_ndim=None):
     coordinates = []
     for value in values:
         try:
-            coordinate = tuple(int(item) for item in value)
+            coordinate_values = tuple(value)
         except (TypeError, ValueError) as exc:
             raise TypeError(
                 "lattice locations must be integer coordinates."
             ) from exc
+        if not all(_is_integral_value(item) for item in coordinate_values):
+            raise TypeError("lattice locations must be integer coordinates.")
+        coordinate = tuple(int(item) for item in coordinate_values)
         if not coordinate:
             raise ValueError("lattice coordinates must be non-empty.")
         coordinates.append(coordinate)
     ndim = len(coordinates[0])
     if any(len(coordinate) != ndim for coordinate in coordinates):
         raise ValueError("all lattice coordinates in a term must have the same dimension.")
+    if ndim == 1:
+        return 1, tuple(coordinate[0] for coordinate in coordinates)
     return ndim, tuple(coordinates)
 
 
 def _normalize_term_shape(shape):
     """Normalize a public ``shape`` argument to a tuple."""
-    if isinstance(shape, Integral):
+    if _is_integral_value(shape):
         shape = (int(shape),)
     else:
         try:
-            shape = tuple(int(value) for value in shape)
+            values = tuple(shape)
         except (TypeError, ValueError) as exc:
             raise TypeError("shape must be an integer or a 2D/3D shape tuple.") from exc
+        if not all(_is_integral_value(value) for value in values):
+            raise TypeError("shape must contain only integer dimensions.")
+        shape = tuple(int(value) for value in values)
     if len(shape) not in (1, 2, 3) or any(value < 1 for value in shape):
         raise ValueError("shape must contain one, two, or three positive dimensions.")
     return shape
@@ -1182,10 +1508,26 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
     located_terms = []
     inferred_shape = []
     for raw in raw_terms:
-        factors = _operator_factors(raw["operator"])
+        local_operator = _as_square_operator(raw["operator"])
+        if local_operator is None:
+            factors = _operator_factors(raw["operator"])
+            num_factors = len(factors)
+        else:
+            try:
+                raw_locations = tuple(raw["location"])
+            except TypeError:
+                raw_locations = None
+            if raw_locations is None or (
+                expected_ndim in (2, 3)
+                and all(_is_integral_value(value) for value in raw_locations)
+            ):
+                num_factors = 1
+            else:
+                num_factors = len(raw_locations)
+            factors = None
         ndim, locations = _location_dimensions(
             raw["location"],
-            len(factors),
+            num_factors,
             expected_ndim=expected_ndim,
         )
         if expected_ndim is not None and ndim != expected_ndim:
@@ -1193,14 +1535,19 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
                 f"locations have dimension {ndim}, but configured shape is "
                 f"{shape_tuple}."
             )
+        if ndim not in (1, 2, 3):
+            raise ValueError("locations must be one-dimensional, 2D, or 3D.")
         if located_terms and ndim != located_terms[0][0]:
             raise ValueError("all terms must use the same location dimension.")
-        if len(locations) != len(factors):
+        if factors is not None and len(locations) != len(factors):
             raise ValueError(
                 "each term must provide one local operator per location; "
                 f"got {len(factors)} operators for {len(locations)} locations."
             )
-        located_terms.append((ndim, locations, factors, raw))
+        if local_operator is not None and len(locations) == 1:
+            factors = (local_operator,)
+            local_operator = None
+        located_terms.append((ndim, locations, factors, local_operator, raw))
         if shape_tuple is None:
             if not inferred_shape:
                 inferred_shape = [0] * ndim
@@ -1231,7 +1578,7 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
         chain_length = int(np.prod(shape_tuple))
 
     compiled = []
-    for ndim, locations, factors, raw in located_terms:
+    for ndim, locations, factors, local_operator, raw in located_terms:
         if ndim == 1:
             mapped = tuple(int(location) for location in locations)
             if any(location < 0 or location >= chain_length for location in mapped):
@@ -1244,8 +1591,33 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
                 raise ValueError(
                     f"lattice location {exc.args[0]!r} is outside shape {shape_tuple}."
                 ) from exc
-        if len(set(mapped)) != len(mapped):
-            raise ValueError("a product term cannot contain the same site twice.")
+        if local_operator is not None:
+            if raw["parities"] is not None or raw["braiding"] is not None:
+                raise ValueError(
+                    "general local operators carry their complete ordering; "
+                    "factor parities/braiding apply only to product terms."
+                )
+            if raw["string_operators"] is not None:
+                raise ValueError(
+                    "general local operators cannot use string_operators."
+                )
+            compiled.append(
+                MPOLocalOperatorTerm(
+                    sites=mapped,
+                    operator=local_operator,
+                    coefficient=raw["coefficient"],
+                    charge=raw["charge"],
+                )
+            )
+            continue
+        if (
+            (raw["charge"] is not None or raw["string_operators"] is not None)
+            and tuple(mapped) != tuple(sorted(mapped))
+        ):
+            raise ValueError(
+                "terms with charge or string_operators metadata must list "
+                "locations in increasing order."
+            )
         ordered = sorted(zip(mapped, factors), key=lambda item: item[0])
         sites, ordered_factors = zip(*ordered)
         compiled.append(
@@ -1255,6 +1627,8 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
                 coefficient=raw["coefficient"],
                 string_operators=raw["string_operators"],
                 charge=raw["charge"],
+                parities=raw["parities"],
+                braiding=raw["braiding"],
             )
         )
 
@@ -1265,6 +1639,40 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
         "lattice_to_chain": None if chain_maps is None else dict(chain_maps[1]),
     }
     return chain_length, tuple(compiled), metadata
+
+
+def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients):
+    """Compile product and general local terms into one exact automaton."""
+
+    automaton = MPOAutomaton(L, phys_dim=int(phys_dim))
+    term_slots = []
+    for term_index, term in enumerate(terms):
+        coefficient = 1.0 if unit_coefficients else term.coefficient
+        if isinstance(term, MPOProductTerm):
+            first_site = term.sites[0]
+            transition_index = len(automaton.transitions[first_site])
+            automaton.add_product_term(
+                term.sites,
+                term.operators,
+                coefficient=coefficient,
+                string_operators=term.string_operators,
+                channel_id=("basis-product", term_index),
+                charge=term.charge,
+            )
+            term_slots.append(((first_site, transition_index, term.operators[0]),))
+            continue
+
+        cores = _local_operator_mpo_cores(term)
+        slots = automaton.add_local_mpo_term(
+            term.sites,
+            cores,
+            coefficient=coefficient,
+            channel_id=("basis-local-mpo", term_index),
+            charge=term.charge,
+            return_slots=True,
+        )
+        term_slots.append(tuple(slots))
+    return automaton, tuple(term_slots)
 
 
 class FirstDegreeMPO:
@@ -1318,6 +1726,7 @@ class FirstDegreeMPO:
         symmetry=None,
         physical_charges=None,
         fermionic=False,
+        physical_space=None,
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         site_tag_id="I{}",
@@ -1338,11 +1747,34 @@ class FirstDegreeMPO:
         self.lower_ind_id = lower_ind_id
         self.site_tag_id = site_tag_id
         self.metadata = dict(metadata or {})
-        self.symmetry = (
-            None if symmetry is None else _normalize_mpo_symmetry(symmetry)
+        if physical_space is not None and not isinstance(
+            physical_space, MPOPhysicalSpace
+        ):
+            raise TypeError("physical_space must be an MPOPhysicalSpace or None.")
+        if physical_space is not None and (
+            symmetry is not None or physical_charges is not None or fermionic
+        ):
+            raise ValueError(
+                "physical_space cannot be combined with symmetry, "
+                "physical_charges, or fermionic metadata."
+            )
+        self.physical_space = physical_space
+        selected_symmetry = (
+            physical_space.symmetry if physical_space is not None else symmetry
         )
-        self.physical_charges = physical_charges
-        self.fermionic = bool(fermionic)
+        self.symmetry = (
+            None
+            if selected_symmetry is None
+            else _normalize_mpo_symmetry(selected_symmetry)
+        )
+        self.physical_charges = (
+            physical_space.physical_charges
+            if physical_space is not None
+            else physical_charges
+        )
+        self.fermionic = (
+            physical_space.fermionic if physical_space is not None else bool(fermionic)
+        )
         # Keep this attribute present on every instance so callers do not
         # need to probe for it after an optional compression stage. It is
         # populated by ``compress_exact`` or ``extensive_exponential``.
@@ -1364,6 +1796,7 @@ class FirstDegreeMPO:
         self._history_compression_plan_cache = {}
         self._history_approximation_plan_cache = {}
         self._history_tensor_plan_cache = {}
+        self._history_reduced_plan_cache = {}
         self._base_level_position_cache = None
         self._levels = self._normalize_levels(levels)
         self._validate()
@@ -1371,11 +1804,17 @@ class FirstDegreeMPO:
 
     def _validate_symmetry(self):
         """Validate optional native block-sparse compilation metadata."""
+        if self.physical_space is not None and self.physical_space.phys_dim != self.phys_dim:
+            raise ValueError(
+                f"physical_space has phys_dim={self.physical_space.phys_dim}, "
+                f"but MPO tensors use phys_dim={self.phys_dim}."
+            )
         if self.symmetry is None:
             if self.physical_charges is not None:
                 raise ValueError("physical_charges requires symmetry metadata.")
             if self.fermionic:
                 raise ValueError("fermionic=True requires symmetry metadata.")
+            self.physical_space = MPOPhysicalSpace(self.phys_dim)
             return
         if self.physical_charges is None:
             raise ValueError("symmetry requires physical_charges.")
@@ -1397,13 +1836,22 @@ class FirstDegreeMPO:
                 if previous is not sentinel:
                     closed_sectors.add(previous)
                 previous = charge
+        self.physical_space = MPOPhysicalSpace(
+            self.phys_dim,
+            symmetry=self.symmetry,
+            physical_charges=tuple(self.physical_charges),
+            fermionic=self.fermionic,
+            braiding=(
+                None
+                if self.physical_space is None
+                else self.physical_space.braiding
+            ),
+        )
 
     def _symmetry_options(self):
         """Return constructor options that preserve native symmetry metadata."""
         return {
-            "symmetry": self.symmetry,
-            "physical_charges": self.physical_charges,
-            "fermionic": self.fermionic,
+            "physical_space": self.physical_space,
         }
 
     def _normalize_levels(self, levels):
@@ -1539,6 +1987,7 @@ class FirstDegreeMPO:
             self._history_approximation_plan_cache
         )
         out._history_tensor_plan_cache = self._history_tensor_plan_cache
+        out._history_reduced_plan_cache = self._history_reduced_plan_cache
         out._base_level_position_cache = self._base_level_position_cache
         return out
 
@@ -1568,6 +2017,7 @@ class FirstDegreeMPO:
         out.symmetry = self.symmetry
         out.physical_charges = self.physical_charges
         out.fermionic = self.fermionic
+        out.physical_space = self.physical_space
         out.metadata = {}
         out.compression_report = None
         out._structural_transitions = self._structural_transitions
@@ -1579,6 +2029,7 @@ class FirstDegreeMPO:
             self._history_approximation_plan_cache
         )
         out._history_tensor_plan_cache = self._history_tensor_plan_cache
+        out._history_reduced_plan_cache = self._history_reduced_plan_cache
         out._base_level_position_cache = self._base_level_position_cache
         out._levels = self._levels
         return out
@@ -1662,8 +2113,20 @@ class FirstDegreeMPO:
         if not terms:
             raise ValueError("terms must contain at least one product term.")
         if phys_dim is None:
-            first_operator = terms[0].operators[0]
-            phys_dim = int(first_operator.shape[0])
+            first_term = terms[0]
+            phys_dim = (
+                first_term.phys_dim
+                if isinstance(first_term, MPOLocalOperatorTerm)
+                else int(first_term.operators[0].shape[0])
+            )
+        if any(isinstance(term, MPOLocalOperatorTerm) for term in terms):
+            automaton, _term_slots = _mixed_term_automaton(
+                L,
+                terms,
+                phys_dim=phys_dim,
+                unit_coefficients=False,
+            )
+            return cls.from_automaton(automaton, degree=degree, **kwargs)
         automaton = MPOAutomaton.from_product_terms(
             L,
             terms,
@@ -3325,6 +3788,9 @@ class FirstDegreeMPO:
             "extension_plan_orders": tuple(
                 sorted(self._history_extension_plan_cache),
             ),
+            "reduced_plan_orders": tuple(
+                sorted(self._history_reduced_plan_cache),
+            ),
             "extension_plan_batches": {
                 order: len(plan["batches"])
                 for order, plan in self._history_extension_plan_cache.items()
@@ -3344,6 +3810,7 @@ class FirstDegreeMPO:
         self._history_compression_plan_cache.clear()
         self._history_approximation_plan_cache.clear()
         self._history_tensor_plan_cache.clear()
+        self._history_reduced_plan_cache.clear()
         self._history_symbolic_cache = None
         return self
 
@@ -3892,6 +4359,470 @@ class FirstDegreeMPO:
         if cache_history:
             self._history_compression_plan_cache[order] = plan
         return plan, False
+
+    @staticmethod
+    def _history_add_polynomial_vector(target, source, *, power=0, coefficient=1.0):
+        """Add one sparse raw-axis polynomial vector into another."""
+
+        output = {
+            raw: dict(polynomial)
+            for raw, polynomial in target.items()
+        }
+        for raw, polynomial in source.items():
+            destination = output.setdefault(raw, {})
+            for source_power, source_coefficient in polynomial.items():
+                total_power = int(source_power) + int(power)
+                destination[total_power] = (
+                    destination.get(total_power, 0.0)
+                    + coefficient * source_coefficient
+                )
+        return output
+
+    def _history_reduction_map(self, levels, order):
+        """Compile Algorithms 1--2 into raw-to-reduced axis maps.
+
+        The ordinary executor first creates every raw operator-valued tensor
+        block and then applies row/column eliminations. This symbolic variant
+        applies those eliminations to sparse basis vectors instead. Every raw
+        axis entry consequently knows its final reduced target and the small
+        polynomial weight it carries, allowing numerical blocks to be
+        scattered directly into the reduced MPO.
+        """
+
+        current = list(levels)
+        row_vectors = [{index: {0: 1.0}} for index in range(len(current))]
+        column_vectors = [{index: {0: 1.0}} for index in range(len(current))]
+        target_history = tuple(MPOLevelToken(1) for _ in range(order))
+        coefficient_denominator = factorial(order)
+
+        algorithm_one = 0
+        for number_of_threes in range(1, order + 1):
+            for level in tuple(current):
+                history = level.history
+                if not (
+                    all(_level_number(token) in (1, 3) for token in history)
+                    and sum(_level_number(token) == 3 for token in history)
+                    == number_of_threes
+                ):
+                    continue
+                positions = self._history_level_positions(current)
+                source = positions.get(history)
+                target = positions.get(target_history)
+                if source is None or target is None or source == target:
+                    raise ValueError(
+                        "history power lost its all-one Algorithm-1 target."
+                    )
+                column_vectors[target] = self._history_add_polynomial_vector(
+                    column_vectors[target],
+                    column_vectors[source],
+                    power=number_of_threes,
+                    coefficient=(
+                        factorial(order - number_of_threes)
+                        / coefficient_denominator
+                    ),
+                )
+                current.pop(source)
+                row_vectors.pop(source)
+                column_vectors.pop(source)
+                algorithm_one += 1
+
+        algorithm_two = 0
+        changed = True
+        while changed:
+            changed = False
+            for level in tuple(current):
+                history = level.history
+                number_of_ones = sum(
+                    _level_number(token) == 1 for token in history
+                )
+                number_of_threes = sum(
+                    _level_number(token) == 3 for token in history
+                )
+                if number_of_threes <= number_of_ones:
+                    canonical = _sort_history_front(history, 1)
+                    mode = "row"
+                else:
+                    canonical = _sort_history_front(history, 3)
+                    mode = "column"
+                if canonical == history:
+                    continue
+                positions = self._history_level_positions(current)
+                source = positions.get(history)
+                target = positions.get(canonical)
+                if source is None or target is None or source == target:
+                    continue
+                if mode == "row":
+                    row_vectors[target] = self._history_add_polynomial_vector(
+                        row_vectors[target],
+                        row_vectors[source],
+                    )
+                else:
+                    column_vectors[target] = self._history_add_polynomial_vector(
+                        column_vectors[target],
+                        column_vectors[source],
+                    )
+                current.pop(source)
+                row_vectors.pop(source)
+                column_vectors.pop(source)
+                algorithm_two += 1
+                changed = True
+                break
+
+        def invert(vectors):
+            targets = np.full(len(levels), -1, dtype=int)
+            powers = np.zeros(len(levels), dtype=int)
+            coefficients = np.zeros(len(levels), dtype=float)
+            for target, vector in enumerate(vectors):
+                for raw, polynomial in vector.items():
+                    if len(polynomial) != 1:
+                        raise ValueError(
+                            "history reduction produced a non-monomial raw-axis map."
+                        )
+                    ((power, coefficient),) = polynomial.items()
+                    targets[raw] = target
+                    powers[raw] = int(power)
+                    coefficients[raw] = coefficient
+            return targets, powers, coefficients
+
+        row_targets, row_powers, row_coefficients = invert(row_vectors)
+        column_targets, column_powers, column_coefficients = invert(column_vectors)
+        return {
+            "levels": tuple(current),
+            "row_targets": row_targets,
+            "row_powers": row_powers,
+            "row_coefficients": row_coefficients,
+            "column_targets": column_targets,
+            "column_powers": column_powers,
+            "column_coefficients": column_coefficients,
+            "algorithm_one": algorithm_one,
+            "algorithm_two": algorithm_two,
+        }
+
+    def _history_reduced_plan(
+        self,
+        order,
+        *,
+        max_bond,
+        on_exceed,
+        cache_history,
+    ):
+        """Stream raw histories into a reusable direct-reduced execution plan."""
+
+        if cache_history:
+            cached = self._history_reduced_plan_cache.get(order)
+            if cached is not None:
+                self._check_history_bond_dimensions(
+                    cached["raw_bond_dimensions"],
+                    max_bond=max_bond,
+                    on_exceed=on_exceed,
+                )
+                return cached, True
+
+        schemas = self._history_schemas()
+        start_levels = tuple(
+            level
+            for level in schemas[0]
+            if _level_number(level.history[0]) == 1
+        )
+        if len(start_levels) != 1:
+            raise ValueError(
+                "history construction requires one level-1 starting channel."
+            )
+        raw_left = (tuple(start_levels[0] for _ in range(order)),)
+        warned = [False]
+
+        def levels_for(states, bond):
+            return tuple(
+                MPOLevel(
+                    ("raw-history", order, bond, position),
+                    tuple(
+                        token
+                        for factor in state
+                        for token in factor.history
+                    ),
+                    charge=tuple(factor.charge for factor in state),
+                )
+                for position, state in enumerate(states)
+            )
+
+        raw_levels_left = levels_for(raw_left, 0)
+        reduction_left = self._history_reduction_map(raw_levels_left, order)
+        reduced_levels = [reduction_left["levels"]]
+        raw_dimensions = [len(raw_left)]
+        site_plans = []
+        extension_terms = 0
+        algorithm_one = reduction_left["algorithm_one"]
+        algorithm_two = reduction_left["algorithm_two"]
+
+        for site in range(self.L):
+            raw_right = self._history_state_step(
+                schemas,
+                raw_left,
+                site,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                warned=warned,
+            )
+            raw_levels_right = levels_for(raw_right, site + 1)
+            reduction_right = self._history_reduction_map(
+                raw_levels_right,
+                order,
+            )
+
+            left_indices, right_indices = self._history_allowed_pairs(
+                site,
+                raw_left,
+                raw_right,
+                sparse=True,
+            )
+            positions = self._history_local_position_arrays(
+                site,
+                raw_left,
+                raw_right,
+            )
+            keep = (
+                reduction_left["row_targets"][left_indices] >= 0
+            ) & (
+                reduction_right["column_targets"][right_indices] >= 0
+            )
+            left_indices = left_indices[keep]
+            right_indices = right_indices[keep]
+            output_left = reduction_left["row_targets"][left_indices]
+            output_right = reduction_right["column_targets"][right_indices]
+            powers = (
+                reduction_left["row_powers"][left_indices]
+                + reduction_right["column_powers"][right_indices]
+            )
+            coefficients = (
+                reduction_left["row_coefficients"][left_indices]
+                * reduction_right["column_coefficients"][right_indices]
+            )
+
+            fake_levels = [()] * (self.L + 1)
+            fake_levels[site] = raw_levels_left
+            fake_levels[site + 1] = raw_levels_right
+            extension_plan, _ = self._history_extension_plan(
+                fake_levels,
+                order,
+                cache_history=False,
+            )
+            raw_extension = extension_plan["site_plans"][site]
+            extension_terms += extension_plan["selected_terms"]
+            reduced_extension = None
+            if raw_extension is not None:
+                extension_keep = (
+                    reduction_left["row_targets"][raw_extension["left_targets"]] >= 0
+                ) & (
+                    reduction_right["column_targets"][raw_extension["right_targets"]]
+                    >= 0
+                )
+                if np.any(extension_keep):
+                    extension_left = raw_extension["left_targets"][extension_keep]
+                    extension_right = raw_extension["right_targets"][extension_keep]
+                    reduced_extension = {
+                        "site": site,
+                        "left_targets": raw_extension["left_targets"][extension_keep],
+                        "right_targets": raw_extension["right_targets"][extension_keep],
+                        "left_positions": tuple(
+                            values[extension_keep]
+                            for values in raw_extension["left_positions"]
+                        ),
+                        "right_positions": tuple(
+                            values[extension_keep]
+                            for values in raw_extension["right_positions"]
+                        ),
+                        "left_identity": tuple(
+                            values[extension_keep]
+                            for values in raw_extension["left_identity"]
+                        ),
+                        "right_identity": tuple(
+                            values[extension_keep]
+                            for values in raw_extension["right_identity"]
+                        ),
+                        "weights": raw_extension["weights"][extension_keep],
+                        "output_left": reduction_left["row_targets"][extension_left],
+                        "output_right": reduction_right["column_targets"][extension_right],
+                        "powers": (
+                            reduction_left["row_powers"][extension_left]
+                            + reduction_right["column_powers"][extension_right]
+                            + 1
+                        ),
+                        "coefficients": (
+                            reduction_left["row_coefficients"][extension_left]
+                            * reduction_right["column_coefficients"][extension_right]
+                        ),
+                    }
+
+            site_plans.append({
+                "site": site,
+                "positions": positions,
+                "left_indices": left_indices,
+                "right_indices": right_indices,
+                "output_left": output_left,
+                "output_right": output_right,
+                "powers": powers,
+                "coefficients": coefficients,
+                "extension": reduced_extension,
+                "raw_total_blocks": len(raw_left) * len(raw_right),
+            })
+            raw_dimensions.append(len(raw_right))
+            reduced_levels.append(reduction_right["levels"])
+            algorithm_one += reduction_right["algorithm_one"]
+            algorithm_two += reduction_right["algorithm_two"]
+            raw_left = raw_right
+            raw_levels_left = raw_levels_right
+            reduction_left = reduction_right
+
+        plan = {
+            "sites": tuple(site_plans),
+            "levels": tuple(reduced_levels),
+            "raw_bond_dimensions": tuple(raw_dimensions),
+            "reduced_bond_dimensions": tuple(len(levels) for levels in reduced_levels),
+            "extension_terms": extension_terms,
+            "algorithm_one": algorithm_one,
+            "algorithm_two": algorithm_two,
+        }
+        if cache_history:
+            self._history_reduced_plan_cache[order] = plan
+        return plan, False
+
+    @staticmethod
+    def _check_history_bond_dimensions(dimensions, *, max_bond, on_exceed):
+        """Apply the public temporary-bond policy to known dimensions."""
+
+        if max_bond is None or on_exceed == "ignore":
+            return
+        warned = False
+        for site, dimension in enumerate(dimensions[1:]):
+            if dimension <= max_bond:
+                continue
+            message = (
+                "extensive_exponential history bond dimension "
+                f"{dimension} exceeds max_bond={max_bond} after site {site}."
+            )
+            if on_exceed == "raise":
+                raise MemoryError(message)
+            if not warned:
+                warnings.warn(message, RuntimeWarning, stacklevel=3)
+                warned = True
+
+    @staticmethod
+    def _history_polynomial_weights(powers, coefficients, dt, *, like):
+        """Evaluate monomial execution weights on the active backend."""
+
+        values = tuple(
+            _multiply_scalar(coefficient, dt ** int(power))
+            for power, coefficient in zip(powers, coefficients)
+        )
+        if not values:
+            return None
+        if any(_backend_name(value) not in {"builtins", "numpy"} for value in values):
+            return ar.do("stack", values)
+        return _as_backend(np.asarray(values), like=like)
+
+    def _reduced_history_power_data(
+        self,
+        dt,
+        *,
+        order,
+        extend,
+        max_bond,
+        on_exceed,
+        cache_history,
+        chunk_size=65536,
+    ):
+        """Build final Algorithms-1/2 tensors without raw virtual tensors."""
+
+        plan, cache_hit = self._history_reduced_plan(
+            order,
+            max_bond=max_bond,
+            on_exceed=on_exceed,
+            cache_history=cache_history,
+        )
+        arrays = []
+        stored_blocks = 0
+        raw_stored_blocks = 0
+        for site_plan in plan["sites"]:
+            site = site_plan["site"]
+            tensor = SparseVirtualTensor((
+                len(plan["levels"][site]),
+                len(plan["levels"][site + 1]),
+                self.phys_dim,
+                self.phys_dim,
+            ))
+            left_indices = site_plan["left_indices"]
+            right_indices = site_plan["right_indices"]
+            raw_stored_blocks += len(left_indices)
+            for start in range(0, len(left_indices), chunk_size):
+                stop = start + chunk_size
+                values = self._history_local_product_batch_values(
+                    site,
+                    site_plan["positions"],
+                    left_indices[start:stop],
+                    right_indices[start:stop],
+                )
+                weights = self._history_polynomial_weights(
+                    site_plan["powers"][start:stop],
+                    site_plan["coefficients"][start:stop],
+                    dt,
+                    like=values,
+                )
+                if weights is not None:
+                    values = ar.do(
+                        "multiply",
+                        values,
+                        weights[..., None, None],
+                    )
+                tensor = tensor.scatter_add(
+                    site_plan["output_left"][start:stop],
+                    site_plan["output_right"][start:stop],
+                    values,
+                )
+
+            extension = site_plan["extension"] if extend else None
+            if extension is not None:
+                values = self._history_local_product_site_batch(extension, order)
+                combinatorial = _as_backend(extension["weights"], like=values)
+                reduction = self._history_polynomial_weights(
+                    extension["powers"],
+                    extension["coefficients"],
+                    dt,
+                    like=values,
+                )
+                weights = ar.do("multiply", combinatorial, reduction)
+                values = ar.do("multiply", values, weights[..., None, None])
+                tensor = tensor.scatter_add(
+                    extension["output_left"],
+                    extension["output_right"],
+                    values,
+                )
+            arrays.append(tensor)
+            stored_blocks += tensor.stored_blocks
+
+        storage_info = {
+            "mode": "reduced",
+            "stored_blocks": stored_blocks,
+            "total_blocks": sum(
+                len(plan["levels"][site]) * len(plan["levels"][site + 1])
+                for site in range(self.L)
+            ),
+            "raw_stored_blocks": raw_stored_blocks,
+            "raw_total_blocks": sum(
+                site_plan["raw_total_blocks"] for site_plan in plan["sites"]
+            ),
+            "materialized_raw_virtual_tensors": False,
+            "tensor_plan_cache_hit": cache_hit,
+            "initial_bond_dimensions": tuple(plan["raw_bond_dimensions"][1:-1]),
+            "exact_history_merges": plan["algorithm_two"],
+            "algorithm_one_eliminations": plan["algorithm_one"],
+            "extension_terms": plan["extension_terms"] if extend else 0,
+        }
+        return (
+            arrays,
+            [list(levels) for levels in plan["levels"]],
+            cache_hit,
+            storage_info,
+        )
 
     def _algorithm_one(self, arrays, levels, order, dt, *, plan=None):
         """Apply the paper's extensive prefactor transformation.
@@ -4599,47 +5530,68 @@ class FirstDegreeMPO:
         prefactors, Algorithm 2 performs exact compression, and optional
         Algorithm 4 applies the analytical approximation.
         """
-        arrays, levels, history_cache_hit, storage_info = self._history_power_data(
-            order,
-            max_bond=max_bond,
-            on_exceed=on_exceed,
-            cache_history=cache_history,
-            history_storage=history_storage,
-        )
-        initial_bond_dimensions = tuple(
-            len(bond_levels) for bond_levels in levels[1:-1]
-        )
-        compression_plan, compression_plan_cache_hit = (
-            self._history_compression_plan(
-                levels,
-                order,
-                cache_history=cache_history,
-            )
-        )
-        extension_terms = 0
-        extension_plan_cache_hit = False
-        if extend:
-            extension_terms, extension_plan_cache_hit = (
-                self._algorithm_three_extension(
-                    arrays,
-                    levels,
-                    order,
+        direct_reduced = history_storage == "reduced"
+        if direct_reduced:
+            arrays, levels, history_cache_hit, storage_info = (
+                self._reduced_history_power_data(
                     dt,
+                    order=order,
+                    extend=extend,
+                    max_bond=max_bond,
+                    on_exceed=on_exceed,
                     cache_history=cache_history,
                 )
             )
-        self._algorithm_one(
-            arrays,
-            levels,
-            order,
-            dt,
-            plan=compression_plan,
-        )
-        exact_merges = self._algorithm_two(
-            arrays,
-            levels,
-            plan=compression_plan,
-        )
+            initial_bond_dimensions = storage_info["initial_bond_dimensions"]
+            compression_plan_cache_hit = history_cache_hit
+            extension_plan_cache_hit = history_cache_hit if extend else False
+            extension_terms = storage_info["extension_terms"]
+            exact_merges = tuple(
+                {"mode": "direct-reduced"}
+                for _ in range(storage_info["exact_history_merges"])
+            )
+        else:
+            arrays, levels, history_cache_hit, storage_info = self._history_power_data(
+                order,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                cache_history=cache_history,
+                history_storage=history_storage,
+            )
+            initial_bond_dimensions = tuple(
+                len(bond_levels) for bond_levels in levels[1:-1]
+            )
+            compression_plan, compression_plan_cache_hit = (
+                self._history_compression_plan(
+                    levels,
+                    order,
+                    cache_history=cache_history,
+                )
+            )
+            extension_terms = 0
+            extension_plan_cache_hit = False
+            if extend:
+                extension_terms, extension_plan_cache_hit = (
+                    self._algorithm_three_extension(
+                        arrays,
+                        levels,
+                        order,
+                        dt,
+                        cache_history=cache_history,
+                    )
+                )
+            self._algorithm_one(
+                arrays,
+                levels,
+                order,
+                dt,
+                plan=compression_plan,
+            )
+            exact_merges = self._algorithm_two(
+                arrays,
+                levels,
+                plan=compression_plan,
+            )
         approximate_merges = 0
         approximation_plan_cache_hit = False
         if approximate:
@@ -4725,6 +5677,7 @@ class FirstDegreeMPO:
             self._history_approximation_plan_cache.pop(order, None)
             self._history_tensor_plan_cache.pop((order, True), None)
             self._history_tensor_plan_cache.pop((order, False), None)
+            self._history_reduced_plan_cache.pop(order, None)
         return output
 
     def _first_degree_structure(self):
@@ -4808,7 +5761,7 @@ class FirstDegreeMPO:
             topology is released after the current MPO is assembled. With the
             default ``history_storage="auto"``, this also selects the
             streaming local-history builder.
-        history_storage : {"auto", "dense", "sparse", "streaming", "block_sparse"}, default="auto"
+        history_storage : {"auto", "dense", "sparse", "streaming", "block_sparse", "reduced"}, default="auto"
             Storage policy for temporary raw-history tensors. ``"dense"``
             retains all structural local pairs. ``"sparse"`` skips
             structurally impossible local transition products and batches the
@@ -4821,6 +5774,8 @@ class FirstDegreeMPO:
             virtual blocks through Algorithms 1--4. With configured symmetry
             metadata, ``"auto"`` selects this path and :meth:`to_mpo` compiles
             the result directly into native Symmray charge blocks.
+            ``"reduced"`` streams raw history products directly into the
+            Algorithms-1/2 quotient and never allocates raw virtual tensors.
 
         Notes
         -----
@@ -4847,11 +5802,11 @@ class FirstDegreeMPO:
         if history_storage == "blocks":
             history_storage = "block_sparse"
         if history_storage not in {
-            "auto", "dense", "sparse", "streaming", "block_sparse",
+            "auto", "dense", "sparse", "streaming", "block_sparse", "reduced",
         }:
             raise ValueError(
                 "history_storage must be one of 'auto', 'dense', 'sparse', "
-                "'streaming', or 'block_sparse'."
+                "'streaming', 'block_sparse', or 'reduced'."
             )
         if history_storage == "streaming" and cache_history:
             raise ValueError(
@@ -5600,6 +6555,7 @@ class MPOBasis:
         symmetry=None,
         physical_charges=None,
         fermionic=False,
+        physical_space=None,
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         site_tag_id="I{}",
@@ -5613,36 +6569,68 @@ class MPOBasis:
         if not terms:
             raise ValueError("terms must contain at least one product term.")
         if phys_dim is None:
-            shape = tuple(getattr(terms[0].operators[0], "shape", ()))
-            if len(shape) != 2 or shape[0] != shape[1]:
-                raise ValueError("cannot infer phys_dim from the first operator.")
-            phys_dim = int(shape[0])
+            first_term = terms[0]
+            if isinstance(first_term, MPOLocalOperatorTerm):
+                phys_dim = first_term.phys_dim
+            else:
+                shape = tuple(getattr(first_term.operators[0], "shape", ()))
+                if len(shape) != 2 or shape[0] != shape[1]:
+                    raise ValueError("cannot infer phys_dim from the first operator.")
+                phys_dim = int(shape[0])
+
+        for term in terms:
+            term_phys_dim = (
+                term.phys_dim
+                if isinstance(term, MPOLocalOperatorTerm)
+                else int(term.operators[0].shape[0])
+            )
+            if term_phys_dim != int(phys_dim):
+                raise ValueError(
+                    f"term physical dimension {term_phys_dim} does not match "
+                    f"phys_dim={phys_dim}."
+                )
 
         # Compile the topology with unit coefficients once.  The shared
         # builder returns independent path coefficient slots, so common
         # prefixes and suffixes remain compressed without coupling terms'
         # autodiff values.
         unit_terms = tuple(replace(term, coefficient=1.0) for term in terms)
-        automaton, slots = MPOAutomaton.from_product_terms(
-            L,
-            unit_terms,
-            share_channels=True,
-            return_slots=True,
-            phys_dim=int(phys_dim),
+        has_local_operators = any(
+            isinstance(term, MPOLocalOperatorTerm) for term in unit_terms
         )
+        if has_local_operators:
+            automaton, term_slots = _mixed_term_automaton(
+                L,
+                unit_terms,
+                phys_dim=phys_dim,
+                unit_coefficients=True,
+            )
+        else:
+            automaton, slots = MPOAutomaton.from_product_terms(
+                L,
+                unit_terms,
+                share_channels=True,
+                return_slots=True,
+                phys_dim=int(phys_dim),
+            )
+            term_slots = tuple(
+                ((site, transition_index, self._local_operator(term, site)),)
+                for term, (site, transition_index) in zip(terms, slots)
+            )
 
         self.L = L
         self.phys_dim = int(phys_dim)
         self._terms = terms
-        self._slots = tuple(slots)
+        self._slots = tuple(
+            tuple((site, transition_index) for site, transition_index, _ in slots)
+            for slots in term_slots
+        )
         slot_groups = {}
-        for term_index, (site, transition_index) in enumerate(self._slots):
-            slot_groups.setdefault((site, transition_index), []).append(
-                (
-                    term_index,
-                    self._local_operator(self._terms[term_index], site),
+        for term_index, slots in enumerate(term_slots):
+            for site, transition_index, operator in slots:
+                slot_groups.setdefault((site, transition_index), []).append(
+                    (term_index, operator)
                 )
-            )
         self._slot_groups = tuple(
             (site, transition_index, tuple(contributions))
             for (site, transition_index), contributions in slot_groups.items()
@@ -5674,6 +6662,7 @@ class MPOBasis:
             symmetry=symmetry,
             physical_charges=physical_charges,
             fermionic=fermionic,
+            physical_space=physical_space,
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             site_tag_id=site_tag_id,
@@ -5773,14 +6762,17 @@ class MPOBasis:
         """
         from pepsy.tensors import OneDMap  # pylint: disable=import-outside-toplevel
 
+        if not _is_integral_value(lx) or not _is_integral_value(ly):
+            raise TypeError("lx and ly must be positive integer dimensions.")
+        lx, ly = int(lx), int(ly)
         if mapper is None:
             mapper = OneDMap(lx, ly, mode=map_mode)
         elif not isinstance(mapper, OneDMap):
             raise TypeError("mapper must be a pepsy.tensors.OneDMap or None.")
-        if mapper.shape != (int(lx), int(ly)):
+        if mapper.shape != (lx, ly):
             raise ValueError(
                 f"mapper shape {mapper.shape} does not match lattice shape "
-                f"{(int(lx), int(ly))}."
+                f"{(lx, ly)}."
             )
         chain_to_lattice, lattice_to_chain = mapper.build()
         normalized_terms = tuple(
@@ -5791,11 +6783,11 @@ class MPOBasis:
             raise ValueError("terms must contain at least one Pauli term.")
 
         basis = cls.from_pauli_terms(
-            int(lx) * int(ly),
+            lx * ly,
             normalized_terms,
             **kwargs,
         )
-        basis._lattice_shape = (int(lx), int(ly))
+        basis._lattice_shape = (lx, ly)
         basis._lattice_mapper = mapper
         basis._lattice_to_chain = dict(lattice_to_chain)
         basis._chain_to_lattice = dict(chain_to_lattice)
@@ -6099,6 +7091,7 @@ class MPOBasis:
             self._template._history_approximation_plan_cache
         )
         result._history_tensor_plan_cache = self._template._history_tensor_plan_cache
+        result._history_reduced_plan_cache = self._template._history_reduced_plan_cache
         result.metadata.update({
             "operation": "mpo_basis_build",
             "basis_terms": self.num_terms,
@@ -6543,6 +7536,7 @@ def exp_mpo(
     symmetry=None,
     physical_charges=None,
     fermionic=False,
+    physical_space=None,
     return_semantic=False,
     return_report=False,
 ):
@@ -6563,6 +7557,16 @@ def exp_mpo(
     ``to_mpo()`` boundary are needed. Pass ``symmetry`` and
     ``physical_charges`` to select the native bosonic block-sparse compiler.
     """
+    if (
+        return_semantic
+        and chi is not None
+        and not differentiable
+        and compression != "fixed_rank"
+    ):
+        raise ValueError(
+            "return_semantic=True with chi requires compression='fixed_rank' "
+            "or differentiable=True; Quimb compression returns an ordinary MPO."
+        )
     basis = MPOBasis.from_terms(
         terms,
         shape=shape,
@@ -6572,6 +7576,7 @@ def exp_mpo(
         symmetry=symmetry,
         physical_charges=physical_charges,
         fermionic=fermionic,
+        physical_space=physical_space,
     )
     result = basis.exp(
         step,

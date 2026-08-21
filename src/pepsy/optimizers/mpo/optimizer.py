@@ -44,6 +44,7 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
+from ..._internal.validation import normalize_integer_tuple
 from ...tensors.core import tn_norm
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
@@ -71,13 +72,13 @@ class MpoChannelEvent:
 
     def __post_init__(self):
         kraus = tuple(self.kraus)
-        where = (int(self.where),) if isinstance(self.where, Integral) else tuple(
-            int(site) for site in self.where
-        )
+        where = normalize_integer_tuple(self.where, name="where")
         if not kraus:
             raise ValueError("MpoChannelEvent needs at least one Kraus operator.")
         if len(where) not in {1, 2}:
             raise ValueError("MpoChannelEvent supports one- or two-site channels.")
+        if len(set(where)) != len(where):
+            raise ValueError("MpoChannelEvent support sites must be distinct.")
         matrices = []
         for operator in kraus:
             matrix = np.asarray(ar.to_numpy(operator))

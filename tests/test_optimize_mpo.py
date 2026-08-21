@@ -16,6 +16,14 @@ def test_mpo_optimizer_exported():
     assert py.optimizers.mpo is not None
 
 
+@pytest.mark.parametrize("where", [(0.9,), (True,), (0, 0)])
+def test_mpo_channel_event_rejects_invalid_support_sites(where):
+    """Channel replay must not truncate or alias malformed support indices."""
+    error = TypeError if where != (0, 0) else ValueError
+    with pytest.raises(error):
+        py.MpoChannelEvent((np.eye(2),), where)
+
+
 def test_mpo_optimizer_accepts_svd_mode():
     """SVD mode should be accepted by ``MpoOptimizer`` mode validation."""
     mpo0 = qtn.MPO_identity(4, dtype="complex128")

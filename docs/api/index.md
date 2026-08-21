@@ -19,6 +19,7 @@ the detailed functions and classes for each area.
 - [Operators](operators/gates.md)
 - [Explicit MPO automata](operators/automaton.md)
 - [Higher-order MPO foundation](operators/higher_order_mpo.md)
+- [Infinite and unit-cell MPOs](operators/infinite_mpo.md)
 - [Pauli-basis MPO](operators/pauli_mpo.md)
 - [PEPO cluster expansion](operators/cluster_expansion.md)
 - [Unified MPO/PEPO exponential API](operators/exponentials.md)

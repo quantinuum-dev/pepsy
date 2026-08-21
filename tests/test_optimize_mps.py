@@ -798,6 +798,56 @@ def test_mps_optimizer_quimb_mode_aliases(mode, method):
 
 
 @pytest.mark.parametrize(
+    "mode, expected_desc",
+    [
+        ("quimb", "quimb-direct"),
+        ("quimb-src", "quimb-src"),
+        ("mpo", "mpo-direct"),
+        ("mpo-src", "mpo-src"),
+    ],
+)
+def test_mps_optimizer_progress_bar_uses_mode_name(
+    monkeypatch,
+    mode,
+    expected_desc,
+):
+    """MPO-family progress bars identify the selected replay mode."""
+    import tqdm as tqdm_module
+
+    descriptors = []
+
+    class FakeProgress:
+        def __init__(self, *args, **kwargs):
+            del args
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, _postfix):
+            pass
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tqdm_module, "tqdm", FakeProgress)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    optimizer.run(
+        progbar=True,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert descriptors == [expected_desc]
+
+
+@pytest.mark.parametrize(
     "method",
     [
         "direct",

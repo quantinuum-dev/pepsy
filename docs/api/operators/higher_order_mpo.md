@@ -39,7 +39,7 @@ the block-sparse execution path uses the same semantic histories.
 
 ```python
 import numpy as np
-from pepsy.operators import FirstDegreeMPO, MPOProductTerm
+from pepsy.operators import FirstDegreeMPO, MPOLocalOperatorTerm, MPOProductTerm
 
 x = np.array([[0.0, 1.0], [1.0, 0.0]])
 z = np.diag([1.0, -1.0])
@@ -57,6 +57,15 @@ H2_exact = H2.compress_exact()
 mpo = H2_exact.to_mpo()
 print(H2_exact.compression_report)
 ```
+
+`MPOLocalOperatorTerm` is the non-factorized counterpart to
+`MPOProductTerm`. A square `d**k` by `d**k` matrix on `k` distinct sites is
+decomposed into an exact local MPO segment by fixed-rank operator-Schmidt
+SVD. The scalar coefficient stays outside that decomposition, so parameter
+gradients are preserved. Product terms may repeat a bosonic site; factors at
+that site are multiplied in their supplied order before the stable site sort.
+Charged/string-decorated product terms reject reordering or repeated support,
+where those operations would make the virtual convention ambiguous.
 
 For optimization loops, use `MPOBasis` to compile the term topology once and
 bind fresh scalar coefficients on every evaluation. `MPOParameter` references
@@ -296,7 +305,7 @@ history bonds before exact compression; `on_exceed="raise"` stops safely, while
 `on_exceed="warn"` continues with a warning.
 
 History storage is controlled independently with
-`history_storage="auto"|"dense"|"sparse"|"streaming"|"block_sparse"`. The
+`history_storage="auto"|"dense"|"sparse"|"streaming"|"block_sparse"|"reduced"`. The
 default uses the cached structural-sparse path for ordinary automaton-built
 MPOs and switches to the compatibility streaming path when
 `cache_history=False`. `"sparse"` avoids evaluating structurally impossible
@@ -307,6 +316,16 @@ Algorithms 1--4.
 When symmetry metadata is configured, `"auto"` selects this MPSKit-style
 operator-block path.
 
+`"reduced"` is the explicit direct-reduced executor. It symbolically compiles
+the raw-to-reduced maps and Algorithm 3 insertion plan, then streams reachable
+local products into the final sparse virtual tensors. It never allocates the
+raw order-`N` virtual tensors. The structural plan is cacheable, while all
+backend values and polynomial weights are rebuilt for each call. Metadata
+reports raw/reduced block counts and
+`materialized_raw_virtual_tensors=False`. It is explicit rather than the
+`"auto"` default while larger external timing studies establish crossover
+points.
+
 Metadata reports the selected mode. `history_storage_blocks` gives the stored
 versus dense virtual-block counts before and after the history rewrites, and
 `is_block_sparse` plus `sparse_block_counts` expose the final semantic storage
@@ -316,7 +335,10 @@ symmetry is configured, assembles native Symmray sectors directly.
 
 ## Native Abelian symmetry
 
-The higher-order path supports neutral bosonic `U1`, `Z2`, `U1U1`, and
+`MPOPhysicalSpace` keeps local dimension, charge sectors, fermionic intent,
+and `MPOBraiding` together as intrinsic metadata carried by copies, bound
+bases, and finite windows. The higher-order path supports neutral bosonic
+`U1`, `Z2`, `U1U1`, and
 `Z2Z2` operators with NumPy local blocks. Supply one charge per local dense
 basis state, or use a charge-to-multiplicity mapping when the basis contains
 degenerate sectors. Mapping insertion order defines the dense basis sector
@@ -354,9 +376,12 @@ interactions. For a more general charge trajectory, construct an `MPOAutomaton`
 with charge metadata on each channel and call `FirstDegreeMPO.from_automaton`.
 
 The compiler validates every nonzero local sector and raises on inconsistent
-charge metadata instead of dropping a block. Graded `fermionic=True` output is
-deliberately rejected: correct fermionic higher-order histories require a
-sign-preserving semantic input, not a bosonic tensor relabeled after the fact.
+charge metadata instead of dropping a block. At term canonicalization time,
+`MPOBraiding("fermionic")` and explicit factor parities apply the odd-odd
+exchange phase without ad hoc Jordan--Wigner signs. Graded
+`fermionic=True` higher-order output is deliberately rejected: correct
+fermionic histories still require a native sign-preserving execution path,
+not a bosonic tensor relabeled after the fact.
 
 The numerical history pass gathers local products in backend batches. Its
 virtual-channel rewiring uses fused transfer contractions for moderate

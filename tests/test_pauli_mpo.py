@@ -64,6 +64,20 @@ def test_pauli_mpo_supports_periodic_translation_and_explicit_sites():
     assert explicit.terms == ((2.0, "YIIX"),)
 
 
+def test_pauli_mpo_explicit_support_preserves_site_label_pairs_and_products():
+    """Explicit supports are canonicalized as paired ordered products."""
+    reordered = PauliMPO.from_terms(2, [(1.0, (1, 0), "XY")])
+    assert reordered.terms == ((1.0, "YX"),)
+
+    repeated = PauliMPO.from_terms(2, [(2.0, (0, 0), "XY")])
+    assert repeated.terms == ((2.0j, "ZI"),)
+
+    with pytest.raises(TypeError, match="sites.*integers"):
+        PauliMPO.from_terms(2, [(1.0, (0.9,), "X")])
+    with pytest.raises(TypeError, match="sites.*integers"):
+        PauliMPO.from_terms(2, [(1.0, (True,), "X")])
+
+
 def test_pauli_mpo_algebra_uses_ixyz_phase_rules():
     x = PauliMPO.from_terms(1, [(1.0, "X")])
     y = PauliMPO.from_terms(1, [(1.0, "Y")])

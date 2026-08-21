@@ -33,6 +33,16 @@ Changes for the next release should be added here before the version is bumped.
 - Accelerated contraction search is now optional through the `contraction`
   extra. Without it, reusable contraction optimizers fall back to Cotengra's
   built-in `sbplx` search and native Python pathfinders.
+- General `MPOLocalOperatorTerm` inputs compile arbitrary dense multi-site
+  operators through an exact operator-Schmidt MPO decomposition while keeping
+  coefficient slots differentiable.
+- `MPOPhysicalSpace` and `MPOBraiding` make local dimensions, Abelian sectors,
+  grading, and odd-factor exchange signs explicit MPO construction metadata.
+- `history_storage="reduced"` streams reachable products directly into the
+  Algorithms 1--2 reduced history space without materializing raw virtual
+  tensors, including the Algorithm 3 and 4 policies.
+- `InfiniteMPO` represents cyclic unit cells independently from explicitly
+  bounded finite windows.
 - MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
   `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
   and `stabilize_unitary` now covers DMRG, mixed MPO warm-up/fallback, and the
@@ -65,6 +75,14 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Term-centric MPO parsing now accepts integer coefficients without confusing
+  them with lattice sites, rejects fractional shapes and coordinates instead
+  of truncating them, and reports when semantic history cannot survive Quimb
+  compression.
+- MPO and Pauli supports now preserve site/operator pairing while sorting,
+  multiply repeated-site factors in supplied local order, retain the Pauli
+  phase, and reject Boolean or fractional site labels instead of coercing
+  them to integers.
 - Stabilizer planner diagnostics now explicitly describe when a cap changes
   the logical MPS width, preserving the warning contract for unavailable
   static-frame candidates.

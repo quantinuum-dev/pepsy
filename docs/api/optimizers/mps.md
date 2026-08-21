@@ -466,6 +466,9 @@ convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
 MPO/DMRG/fallback counts, `~F` (the cumulative norm fidelity), and
 `bond=current/chi`. `~F` is converted from the log-survival ledger only for
 display; accumulation remains logarithmic and numerically stable.
+The progress-bar descriptor is mode-qualified: for example, `quimb-src` and
+`mpo-src` are shown directly, while the `quimb` and `mpo` aliases display as
+`quimb-direct` and `mpo-direct`.
 
 Replay timing is opt-in and does not print by itself:
 

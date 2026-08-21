@@ -54,8 +54,11 @@ The benchmark records Frobenius errors for `order=1, 2, 3` and checks the
 expected Taylor and first-order Trotter convergence. It does not assert that
 Trotter or the cluster expansion must have a particular error ordering: they
 are independent baselines with different approximation structures. Larger
-timing and memory studies should run outside the package repository so normal
-test execution remains deterministic and lightweight.
+timing and memory studies run through the maintained external harness
+`../pepsy_examples/higher_order_mpo/benchmark.py`, so normal package test
+execution remains deterministic and lightweight. It records cold and cached
+timings, Python allocation peaks, process RSS, raw/reduced stored-block counts,
+and final bond dimensions for each order, mode, and storage policy.
 
 ## History-plan implementation
 

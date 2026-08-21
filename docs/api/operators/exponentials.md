@@ -56,6 +56,31 @@ path is shared. Pass a configured `OneDMap` with `mapper=` when a custom
 ordering is needed. Pass `symmetry=` and `physical_charges=` to enable the
 native bosonic block-sparse compilation. Set `return_semantic=True` to keep
 the history-aware `FirstDegreeMPO` instead of materializing the Quimb MPO.
+When `chi` is requested, use `compression="fixed_rank"` (or
+`differentiable=True`) with `return_semantic=True`; ordinary Quimb compression
+cannot preserve the higher-order history metadata.
+Terms carrying charge or string-operator metadata must list their support
+sites in increasing chain order so canonicalization cannot change their
+virtual path convention.
+
+An operator string or operator sequence describes a factorized product. To
+compile a genuinely entangled local operator, pass its full square matrix on
+two or more sites; Pepsy performs an exact operator-Schmidt decomposition and
+inserts the resulting local MPO segment without densifying the full chain:
+
+```python
+from pepsy.operators import MPOLocalOperatorTerm, MPOBasis
+
+basis = MPOBasis.from_local_terms(
+    6,
+    [MPOLocalOperatorTerm((1, 2, 4), local_eight_by_eight, coefficient=g)],
+)
+```
+
+Site labels are strict integers: Boolean and fractional values are rejected.
+For bosonic product terms, repeated sites are multiplied in the supplied local
+order before site sorting. Compact Pauli input keeps the corresponding phase,
+for example `X @ Y = 1j * Z`.
 
 The compact Pauli mapping used elsewhere in Pepsy is accepted directly:
 
@@ -183,6 +208,20 @@ custom operator: step = any backend scalar
 final numerical MPO compression cap. With `chi=None`, the result remains a
 semantic `FirstDegreeMPO`; with `chi` set, the default result is a Quimb MPO.
 Use `differentiable=True` with `chi` for fixed-rank autodiff compression.
+
+Set `history_storage="reduced"` to stream local products directly into the
+post-Algorithms-1/2 virtual space. This route supports all four modes,
+preserves Torch/JAX coefficient and step gradients, and reports
+`materialized_raw_virtual_tensors=False` in
+`result.metadata["history_storage_blocks"]`. The default `"auto"` policy
+remains unchanged so storage selection does not change silently.
+
+Use one `MPOPhysicalSpace` when dimension, Abelian charges, and braiding need
+to travel together. `MPOProductTerm(..., braiding="fermionic", parities=...)`
+applies one minus sign for each odd-odd crossing during canonical site order.
+This is construction-time graded ordering; native fermionic higher-order
+history execution remains intentionally unsupported until its sector-aware
+sign path is complete.
 
 ## PEPO: fixed Pauli channels on a square lattice
 

@@ -86,6 +86,9 @@ _MPO_EXPORTS = [
     "MPOLevelToken",
     "MPOLevel",
     "MPOProductTerm",
+    "MPOLocalOperatorTerm",
+    "MPOBraiding",
+    "MPOPhysicalSpace",
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
@@ -96,6 +99,9 @@ _MPO_EXPORTS = [
     "exp_mpo",
 ]
 _SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_EXPORTS})
+_SYMBOL_MODULES["MPOBraiding"] = ".mpo_space"
+_SYMBOL_MODULES["MPOPhysicalSpace"] = ".mpo_space"
+_SYMBOL_MODULES["InfiniteMPO"] = ".infinite_mpo"
 _SYMBOL_MODULES["PauliMPO"] = ".pauli_mpo"
 _SYMBOL_MODULES["decompose_pauli"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
@@ -127,6 +133,7 @@ __all__ = [
     "decompose_pauli",
     "PauliCompressionReport",
     "PauliBondCompressionReport",
+    "InfiniteMPO",
     *_SUBMODULES,
 ]
 

@@ -1280,6 +1280,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
 
     @classmethod
+    def _progress_mode_name(cls, mode):
+        """Return the mode-qualified name shown by a replay progress bar."""
+        mode_norm = str(mode).strip().lower()
+        if mode_norm in {"mpo", "quimb"}:
+            return f"{mode_norm}-direct"
+        return mode_norm
+
+    @classmethod
     def _mode_mpo_method(cls, mode):
         """Return the compression method encoded by a Quimb mode name."""
         mode_norm = str(mode).strip().lower()
@@ -8659,13 +8667,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
+            progress_mode = self._progress_mode_name(self.mode)
             pbar = tqdm(
                 total=len(G_seq),
-                desc="mpo",
+                desc=progress_mode,
                 leave=True,
                 position=0,
                 ascii=True,
-                colour=self._PROGBAR_COLORS["mpo"],
+                colour=self._PROGBAR_COLORS.get(
+                    progress_mode,
+                    self._PROGBAR_COLORS["mpo"],
+                ),
             )
 
         idx = 0

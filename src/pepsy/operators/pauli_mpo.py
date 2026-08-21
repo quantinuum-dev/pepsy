@@ -25,6 +25,7 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
+from .._internal.validation import is_strict_integer, normalize_integer_tuple
 from .mpo import FirstDegreeMPO, MPOProductTerm
 
 __all__ = [
@@ -292,21 +293,15 @@ def _normalize_boundary(boundary):
     return boundary
 
 
-def _normalize_sites(sites, nsites):
-    if isinstance(sites, Integral):
-        sites = (int(sites),)
-    else:
-        try:
-            sites = tuple(int(site) for site in sites)
-        except TypeError as exc:
-            raise TypeError("sites must be an integer or an iterable of integers.") from exc
+def _normalize_sites(sites, nsites, *, sort=True, distinct=True):
+    sites = normalize_integer_tuple(sites, name="sites")
     if not sites:
         raise ValueError("sites must not be empty.")
-    if len(set(sites)) != len(sites):
+    if distinct and len(set(sites)) != len(sites):
         raise ValueError("sites must be distinct.")
     if any(site < 0 or site >= nsites for site in sites):
         raise ValueError(f"sites must lie in the range 0..{nsites - 1}.")
-    return tuple(sorted(sites))
+    return tuple(sorted(sites)) if sort else sites
 
 
 def _normalize_where(where, nsites):
@@ -1200,15 +1195,17 @@ def _parse_term(term):
 
 def _embed_word(word, sites, nsites):
     word = _normalize_word(word)
-    sites = _normalize_sites(sites, nsites)
+    sites = _normalize_sites(sites, nsites, sort=False, distinct=False)
     if len(word) != len(sites):
         raise ValueError(
             f"word length {len(word)} does not match sites length {len(sites)}."
         )
     result = ["I"] * nsites
+    phase = 1
     for site, label in zip(sites, word):
-        result[site] = label
-    return "".join(result)
+        result[site], local_phase = _PAULI_PRODUCT[(result[site], label)]
+        phase *= local_phase
+    return "".join(result), phase
 
 
 def _canonical_terms(terms, nsites):
@@ -1261,7 +1258,7 @@ class PauliMPO:
     """
 
     def __init__(self, nsites, terms=(), *, boundary="open"):
-        if not isinstance(nsites, Integral) or int(nsites) < 1:
+        if not is_strict_integer(nsites) or int(nsites) < 1:
             raise ValueError("nsites must be a positive integer.")
         self.nsites = int(nsites)
         self.boundary = _normalize_boundary(boundary)
@@ -1300,7 +1297,7 @@ class PauliMPO:
         ``coefficient``, ``sites``, and ``paulis``/``word``.
         """
 
-        if not isinstance(nsites, Integral) or int(nsites) < 1:
+        if not is_strict_integer(nsites) or int(nsites) < 1:
             raise ValueError("nsites must be a positive integer.")
         nsites = int(nsites)
         boundary = _normalize_boundary(boundary)
@@ -1313,7 +1310,8 @@ class PauliMPO:
             _check_scalar(coefficient)
             word = _normalize_word(raw_word)
             if sites is not None:
-                expanded.append((coefficient, _embed_word(word, sites, nsites)))
+                full_word, phase = _embed_word(word, sites, nsites)
+                expanded.append((_multiply(coefficient, phase), full_word))
                 continue
             if len(word) == nsites:
                 expanded.append((coefficient, word))
