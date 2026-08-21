@@ -176,7 +176,7 @@ pepo = active.to_pepo()
 `ClusterExpansionReport` contains local residual and storage diagnostics. Its
 residual norms are local factorization diagnostics, not a global PEPO error
 bound. The dense implementation includes recursive generic order-five
-through order-nine tree paths; higher orders remain unsupported. Finite dense
+through order-nine tree paths; orders above nine remain unsupported. Finite dense
 model adapters are available through `ClusterModelAdapter` and
 `build_model_cluster_expansion_pepo`.
 

@@ -7,11 +7,16 @@ from scipy.linalg import expm
 import pepsy
 from pepsy.operators import (
     ActivePEPOBlocks,
+    ClusterInternalSymmetry,
+    ClusterLattice,
     ConnectedClusterShape,
     ClusterExpansionReport,
     ClusterExpansionPlan,
     ClusterModelAdapter,
     CompiledPEPOExp,
+    GraphActivePEPOBlocks,
+    GraphClusterExpansionPlan,
+    GraphConnectedClusterShape,
     MPOParameter,
     PauliPEPOBasis,
     PauliPEPOTerm,
@@ -20,6 +25,7 @@ from pepsy.operators import (
     build_model_cluster_expansion_pepo,
     build_itf_cluster_expansion_pepo,
     build_real_time_cluster_expansion_pepo,
+    build_graph_cluster_expansion_pepo,
     compose_cluster_expansion_pepo,
     compose_pepo_layers,
     generate_connected_cluster_shapes,
@@ -151,6 +157,10 @@ def test_cluster_expansion_builder_is_public():
     assert ClusterExpansionPlan is pepsy.ClusterExpansionPlan
     assert ClusterExpansionReport is pepsy.ClusterExpansionReport
     assert ActivePEPOBlocks is pepsy.ActivePEPOBlocks
+    assert GraphActivePEPOBlocks is pepsy.GraphActivePEPOBlocks
+    assert GraphClusterExpansionPlan is pepsy.GraphClusterExpansionPlan
+    assert ClusterLattice is pepsy.ClusterLattice
+    assert ClusterInternalSymmetry is pepsy.ClusterInternalSymmetry
     assert PauliPEPOBasis is pepsy.PauliPEPOBasis
     assert PauliPEPOTerm is pepsy.PauliPEPOTerm
     assert CompiledPEPOExp is pepsy.CompiledPEPOExp
@@ -160,6 +170,7 @@ def test_cluster_expansion_builder_is_public():
     assert build_model_cluster_expansion_pepo is pepsy.build_model_cluster_expansion_pepo
     assert build_real_time_cluster_expansion_pepo is pepsy.build_real_time_cluster_expansion_pepo
     assert generate_connected_cluster_shapes is pepsy.generate_connected_cluster_shapes
+    assert build_graph_cluster_expansion_pepo is pepsy.build_graph_cluster_expansion_pepo
     assert "build_cluster_expansion_pepo" in pepsy.operators.__all__
 
 
@@ -227,6 +238,114 @@ def test_connected_cluster_geometry_can_quotient_c4_rotations():
     assert len(fixed) == 19
     assert len(rotated) == 7
     assert len({shape.sites for shape in rotated}) == 7
+
+
+def test_general_graph_geometry_keeps_loop_topology():
+    """Arbitrary graph clusters do not rely on square coordinates."""
+    lattice = ClusterLattice.from_edges(
+        ("a", "b", "c"),
+        (("a", "b"), ("b", "c"), ("c", "a")),
+        name="triangle",
+    )
+    shapes = lattice.connected_cluster_shapes(3)
+    triangles = [shape for shape in shapes if shape.nsites == 3]
+    assert len(triangles) == 1
+    assert isinstance(triangles[0], GraphConnectedClusterShape)
+    assert triangles[0].loops == 1
+    assert not triangles[0].is_tree
+
+
+def test_general_graph_cluster_builder_is_exact_on_a_triangle():
+    """The graph-native order-three residual closes an arbitrary loop."""
+    z = np.diag([1.0, -1.0])
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    twosite = np.kron(z, z)
+    onesite = 0.2 * x
+    lattice = ClusterLattice.from_edges(
+        (0, 1, 2),
+        ((0, 1), (1, 2), (2, 0)),
+    )
+    active, report = build_graph_cluster_expansion_pepo(
+        lattice,
+        0.03,
+        twosite,
+        onesite,
+        order=3,
+        materialize=False,
+        return_report=True,
+    )
+
+    identity = np.eye(2)
+    hamiltonian = np.zeros((8, 8))
+    for site in range(3):
+        factors = [identity] * 3
+        factors[site] = onesite
+        hamiltonian += _kron_all(factors)
+    for first, second in lattice.edges:
+        factors = [identity] * 3
+        factors[first] = factors[second] = z
+        hamiltonian += _kron_all(factors)
+
+    np.testing.assert_allclose(
+        active.to_dense(),
+        expm(-0.03 * hamiltonian),
+        atol=1e-12,
+    )
+    assert report.cluster_counts["order_3"] == 1
+    assert active.to_tensor_network().tensors
+
+
+def test_graph_materialization_accepts_nonstring_site_labels():
+    """Graph tensor tags remain safe for tuple-valued site labels."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    lattice = ClusterLattice.from_edges(
+        ((0, "a"), (1, "b")),
+        (((0, "a"), (1, "b")),),
+    )
+    active = build_graph_cluster_expansion_pepo(
+        lattice,
+        0.01,
+        np.zeros((4, 4)),
+        x,
+        order=1,
+        materialize=False,
+    )
+    assert active.to_tensor_network().tensors
+
+
+def test_cluster_internal_symmetry_validates_u1_and_generator_forms():
+    """Charge checks cover both sector-ordered and arbitrary dense bases."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+    z = np.diag([1.0, -1.0])
+    u1 = ClusterInternalSymmetry("U1", physical_sectors={0: 1, 1: 1})
+    u1.validate(np.kron(x, x) + np.kron(y, y), z)
+    with pytest.raises(ValueError, match="onesite_op changes"):
+        u1.validate(np.kron(x, x), x)
+
+    z2 = ClusterInternalSymmetry("Z2", generators=(x,))
+    z2.validate(np.kron(z, z), x)
+
+
+def test_internal_symmetry_metadata_reaches_square_active_blocks():
+    """The square builder records the validated native-conversion contract."""
+    twosite, onesite = _itf_terms()
+    symmetry = ClusterInternalSymmetry("Z2", generators=(
+        np.array([[0.0, 1.0], [1.0, 0.0]]),
+    ))
+    active = build_cluster_expansion_pepo(
+        1,
+        2,
+        0.01,
+        twosite,
+        onesite,
+        order=2,
+        internal_symmetry=symmetry,
+        materialize=False,
+    )
+    assert active.charge_symmetry == "Z2"
+    with pytest.raises(ValueError, match="dense basis without"):
+        active.to_symmray_pepo()
 
 
 def test_cluster_plan_exposes_geometry_through_order_six():
@@ -495,6 +614,28 @@ def test_order_seven_recurses_through_all_lower_generic_levels():
     assert report.cluster_counts["generic_tree_solved"] == 3
     for order in (5, 6, 7):
         assert report.residual_norms[f"generic_order_{order}"] < 1e-12
+
+
+@pytest.mark.parametrize("order, nsites", ((8, 8), (9, 9)))
+def test_upper_generic_orders_stay_finite_through_order_nine(order, nsites):
+    """The generic PEPO recursion remains valid through its order-nine cap."""
+    active, report = build_itf_cluster_expansion_pepo(
+        1,
+        nsites,
+        0.001,
+        order=order,
+        materialize=False,
+        return_report=True,
+    )
+
+    assert report.cluster_counts[f"generic_order_{order}"] == 1
+    assert report.residual_norms[f"generic_order_{order}"] < 1e-12
+    assert active.active_block_count > 0
+    assert all(
+        np.isfinite(block).all()
+        for site_blocks in active.blocks.values()
+        for block in site_blocks.values()
+    )
 
 
 def test_dense_model_adapter_builds_standard_spin_models():

@@ -1,5 +1,7 @@
 # One symbol per line: frozen top-level compatibility aliases.
 ActivePEPOBlocks
+ClusterInternalSymmetry
+ClusterLattice
 BdyMPS
 BoundaryContractResult
 BoundaryFitDiagnostic
@@ -7,6 +9,9 @@ ClusterExpansionPlan
 ClusterExpansionReport
 ClusterModelAdapter
 ConnectedClusterShape
+GraphActivePEPOBlocks
+GraphClusterExpansionPlan
+GraphConnectedClusterShape
 CoalescedMeasurementRecord
 CoalescedSampleResult
 CoalescedTrajectoryLeaf
@@ -121,6 +126,7 @@ boundary_norm
 build_backend
 build_bra_ket
 build_cluster_expansion_pepo
+build_graph_cluster_expansion_pepo
 build_model_cluster_expansion_pepo
 build_compressed_optimizer
 compose_cluster_expansion_pepo

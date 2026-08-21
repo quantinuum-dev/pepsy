@@ -61,9 +61,15 @@ _SYMBOL_MODULES["build_real_time_cluster_expansion_pepo"] = ".cluster"
 _SYMBOL_MODULES["compose_pepo_layers"] = ".cluster"
 _SYMBOL_MODULES["compose_cluster_expansion_pepo"] = ".cluster"
 _SYMBOL_MODULES["generate_connected_cluster_shapes"] = ".cluster"
+_SYMBOL_MODULES["build_graph_cluster_expansion_pepo"] = ".cluster"
 _CLUSTER_EXPORTS = [
     "ActivePEPOBlocks",
+    "GraphActivePEPOBlocks",
+    "GraphClusterExpansionPlan",
+    "ClusterInternalSymmetry",
+    "ClusterLattice",
     "ConnectedClusterShape",
+    "GraphConnectedClusterShape",
     "ClusterExpansionReport",
     "ClusterExpansionPlan",
     "ClusterModelAdapter",
@@ -111,6 +117,7 @@ __all__ = [
     "compose_pepo_layers",
     "compose_cluster_expansion_pepo",
     "generate_connected_cluster_shapes",
+    "build_graph_cluster_expansion_pepo",
     *_CLUSTER_EXPORTS,
     "ham_tn",
     *_AUTOMATON_EXPORTS,
