@@ -243,6 +243,43 @@ def test_pauli_mpo_native_cores_canonicalize_and_compress_without_leaving_basis(
     assert max(default_compressed.pauli_bond_dimensions) <= 8
 
 
+def test_pauli_mpo_native_product_grows_then_compresses_pauli_bonds():
+    left = PauliMPO.from_terms(
+        4,
+        [(1.0, "XX"), (0.5, "Z"), (0.25j, "YXY")],
+    ).compress_pauli(max_bond=3)
+    right = PauliMPO.from_terms(
+        4,
+        [(2.0, "ZZ"), (-0.75, "X"), (0.5j, "YZY")],
+    ).compress_pauli(max_bond=2)
+
+    product = left @ right
+    expected_bonds = tuple(
+        left_bond * right_bond
+        for left_bond, right_bond in zip(
+            left.pauli_bond_dimensions,
+            right.pauli_bond_dimensions,
+        )
+    )
+    assert product.pauli_bond_dimensions == expected_bonds
+    assert all(core.shape[2] == 4 for core in product.to_pauli_cores())
+    np.testing.assert_allclose(
+        product.to_dense(),
+        left.to_dense() @ right.to_dense(),
+        atol=1.0e-11,
+    )
+
+    compressed, report = product.compress(
+        max_bond=3,
+        cutoff=1.0e-12,
+        return_report=True,
+    )
+    assert isinstance(compressed, PauliMPO)
+    assert max(compressed.pauli_bond_dimensions) <= 3
+    assert compressed.compression_report is report
+    assert not report.exact
+
+
 def test_pauli_mpo_native_core_constructor_round_trips_small_expansion():
     operator = PauliMPO.from_terms(3, [(1.25, "XII"), (-0.5j, "IZZ")])
     reconstructed = PauliMPO.from_pauli_cores(operator.to_pauli_cores())

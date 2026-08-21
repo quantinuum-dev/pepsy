@@ -29,7 +29,11 @@ tests before editing.
   remaining `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
-- `mpo`: direct non-local gate/MPO replay with bond truncation.
+- `mpo-<method>`: native Quimb non-local gate/MPO replay with the selected
+  compression method; `mpo-direct` is explicit and `mpo` remains its alias.
+  Supported methods include `direct`, `dm`, `zipup`, the zipup/SDC/SRC/SRCMPS
+  oversampling variants, `fit`, `fit-zipup`, `fit-projector`, and
+  `fit-oversample`.
 - `svd`: local SVD compression; `swap`: swap-and-split with swap-back.
 - `perm`: swap-and-split with lazy logical-to-physical tracking.
 - `mix`: transactional FIT with per-step MPO fallback. Two-site FIT grows
@@ -147,9 +151,16 @@ Native FIT never replaces the current MPS with a target copy. Its graded local
 SVD and chi-capped auto-swap algebra are responsible for opening compatible
 charge sectors; if the current sectors and target are disconnected, raise a
 clear disconnected-sector error rather than hiding the failure behind a dense
-conversion or global warm start. Dense FIT may receive a separate
-`target_support` MPS, consumed only by local two-/three-site subspace
-expansion; this support source is never installed as `fit.p`.
+conversion or global warm start. Dense two-/three-site growth windows select
+their disposable FIT `p` with `fit_init_strategy`: direct current MPS,
+fixed-rank deterministic random perturbation, active-bond random expansion,
+or isolated `guess_<method>` replay (default `guess_zipup`). In `auto`, only active bonds below their attainable
+physical/`chi` rank are expanded, and the exact gate target remains separate as
+`p_g`. Native Symmray/fermionic paths keep their graded sector-growth route and
+do not use dense random padding. If `run()` omits `cutoff_mode`, ordinary paths
+use `rsum2` while MPO `dm` preserves Quimb's native `rsum1` default; an
+explicit mode overrides it. Interior oversampled zipup and `fit-*` replay keep
+the local sub-MPO partition and disable nested full-chain array permutation.
 
 ## Profiling contract
 

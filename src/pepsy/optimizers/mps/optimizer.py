@@ -10,7 +10,8 @@ For repeated layout-aware evolution, :meth:`MpsOptimizer.apply_layout`
 installs a persistent position-to-logical mapping and never performs a
 swap-back; logical readout is available through ``logical_order``,
 ``remap_sample``, and ``to_dense``.
-``mode="mpo"`` also accepts explicit sub-MPO events of the form
+``mode="mpo-direct"`` (with ``"mpo"`` retained as an alias) also accepts
+explicit sub-MPO events of the form
 ``("submpo", mpo, where)`` or
 ``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
 may also carry *control events* that are state operations rather than gates:
@@ -80,9 +81,11 @@ from .layout import (
 
 __all__ = [
     "MpsOptimizer",
+    "guess",
     "is_submpo_event",
     "normalize_submpo_where",
     "submpo_event_parts",
+    "svd_guess",
 ]
 
 
@@ -91,6 +94,55 @@ _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
 _SHOT_DEFAULT_MAX_BRANCHES = 128
 _SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS = 0.1
+_DEFAULT_FIT_INIT_STRATEGY = "guess_zipup"
+_DEFAULT_CUTOFF_MODE = "rsum2"
+_MPO_COMPRESSION_METHODS = frozenset(
+    {
+        "direct",
+        "dm",
+        "zipup",
+        "zipup-first",
+        "zipup-oversample",
+        "sdc",
+        "sdc-oversample",
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit",
+        "fit-zipup",
+        "fit-projector",
+        "fit-oversample",
+    }
+)
+_MPO_METHODS_IGNORE_CUTOFF_MODE = frozenset({"src", "srcmps"})
+_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps"})
+_MPO_METHODS_USE_SEED = frozenset(
+    {
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit",
+        "fit-oversample",
+    }
+)
+_MPO_METHODS_NEED_INTERIOR_WORKAROUND = frozenset(
+    {
+        "zipup-first",
+        "zipup-oversample",
+        "fit-zipup",
+        "fit-projector",
+    }
+)
+_FIT_INIT_STRATEGIES = frozenset(
+    {"auto", "direct", "random", "random_expand", "svd_guess"}
+    | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
+)
 # This export-oriented list intentionally contains compatibility totals and
 # their named subsets. It is not an additive partition of elapsed FIT time.
 _FIT_TIMING_PHASES = (
@@ -814,6 +866,219 @@ def _prepare_gate_stream(gates):
     )
 
 
+def _is_interior_submpo_span(p, where):
+    """Return whether ``where`` omits one or more end sites of ``p``."""
+    return min(where) > 0 or max(where) < int(p.L) - 1
+
+
+def _apply_submpo_with_interior_workaround(
+    p,
+    submpo,
+    where,
+    *,
+    chi,
+    method,
+    cutoff,
+    cutoff_mode,
+    info=None,
+    inplace_mpo=False,
+    optimize=None,
+    seed=None,
+):
+    """Apply selected Quimb methods without nested sub-MPO tag permutation.
+
+    Quimb's oversampled zip-up and ``fit-{zipup,projector}`` wrappers call a
+    second compression dispatcher internally. When the input is a partitioned
+    interior sub-MPO, that nested call defaults to permuting full-chain MPS
+    labels and can look for a missing ``I0`` tag. Keep the local sub-MPO
+    partition, but reproduce the documented wrapper stages with
+    ``permute_arrays=False`` at every level.
+    """
+    si, sf = min(where), max(where)
+    p.canonicalize_((si, sf), info=info)
+    p.gate_with_op_lazy_(
+        submpo,
+        transpose=False,
+        inplace_op=inplace_mpo,
+    )
+    site_tags = [p.site_tag(site) for site in range(si, sf + 1)]
+    _, subp = p.partition(site_tags, which="any", inplace=True)
+
+    common = {
+        "site_tags": site_tags,
+        "max_bond": chi,
+        "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff,
+        "permute_arrays": False,
+        "inplace": True,
+    }
+    if seed is not None and method in _MPO_METHODS_USE_SEED:
+        common["seed"] = seed
+    if cutoff_mode is not None:
+        common["cutoff_mode"] = cutoff_mode
+    if optimize is not None:
+        common["optimize"] = optimize
+
+    if method in {"zipup-first", "zipup-oversample"}:
+        # Quimb's native default is max_bond_oversample = 2 * max_bond.
+        qtn.tensor_network_1d_compress(
+            subp,
+            method="zipup",
+            max_bond=2 * chi,
+            cutoff=cutoff,
+            site_tags=site_tags,
+            canonize=True,
+            sweep_reverse=True,
+            permute_arrays=False,
+            optimize=optimize or "auto-hq",
+            inplace=True,
+        )
+        qtn.tensor_network_1d_compress(
+            subp,
+            method="direct",
+            canonize=False,
+            **common,
+        )
+    else:
+        # Quimb's fit-* wrappers use an isolated non-random guess, then an
+        # eight-sweep one-site FIT with no fitting cutoff.
+        guess_method = method.removeprefix("fit-")
+        qtn.tensor_network_1d_compress(
+            subp,
+            method="fit",
+            max_bond=chi,
+            cutoff=0.0,
+            bsz=1,
+            max_iterations=8,
+            tn_fit={
+                "method": guess_method,
+                "cutoff": cutoff,
+                "canonize": guess_method != "projector",
+                "permute_arrays": False,
+            },
+            **{
+                key: value
+                for key, value in common.items()
+                if key not in {"max_bond", "cutoff", "cutoff_mode"}
+            },
+        )
+
+    p |= subp
+    if info is not None:
+        info["cur_orthog"] = (si, si)
+    return p
+
+
+def _apply_dense_gate_with_method(
+    p,
+    gate,
+    where,
+    *,
+    dims,
+    chi,
+    method,
+    cutoff,
+    cutoff_mode,
+    info=None,
+    inplace_mpo=True,
+    optimize=None,
+    seed=None,
+):
+    """Apply a dense gate using native Quimb or the interior workaround."""
+    if dims is None:
+        dims = tuple(p.phys_dim(site) for site in where)
+    if not (
+        method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
+        and _is_interior_submpo_span(p, where)
+    ):
+        opts = {
+            "dims": dims,
+            "method": method,
+            "max_bond": chi,
+            "info": {} if info is None else info,
+        }
+        if cutoff is not None:
+            opts["cutoff"] = (
+                0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
+            )
+        if cutoff_mode is not None and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE:
+            opts["cutoff_mode"] = cutoff_mode
+        if optimize is not None:
+            opts["optimize"] = optimize
+        if seed is not None and method in _MPO_METHODS_USE_SEED:
+            opts["seed"] = seed
+        if method == "fit-projector":
+            # Simple-update gauging can divide by zero on exact product-state
+            # bonds. The projector fit remains valid without that optional
+            # pre-gauge and Quimb's own implementation supports this path.
+            opts["canonize"] = False
+        return p.gate_nonlocal_(gate, where, **opts)
+
+    submpo = qtn.MatrixProductOperator.from_dense(
+        gate,
+        dims=dims,
+        sites=where,
+        L=p.L,
+    )
+    return _apply_submpo_with_interior_workaround(
+        p,
+        submpo,
+        where,
+        chi=chi,
+        method=method,
+        cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
+        info=info,
+        inplace_mpo=inplace_mpo,
+        optimize=optimize,
+        seed=seed,
+    )
+
+
+def guess(
+    p,
+    gate,
+    where,
+    *,
+    chi,
+    method="zipup",
+    dims=None,
+    cutoff=0.0,
+    cutoff_mode=None,
+    info=None,
+    inplace=False,
+    seed=None,
+):
+    """Build a disposable compressed MPS guess for a non-local gate.
+
+    This is deliberately a thin wrapper around Quimb's native operation. The
+    exact target and the live MPS remain separate; by default only a deep copy
+    is modified. ``seed`` is forwarded only to Quimb methods that support
+    randomized initialization or sketching.
+    """
+    method = str(method).strip().lower()
+    if method not in _MPO_COMPRESSION_METHODS:
+        raise ValueError(f"Unknown compression guess method: {method}")
+    guess = p if inplace else p.copy(deep=True)
+    _apply_dense_gate_with_method(
+        guess,
+        gate,
+        where,
+        dims=dims,
+        chi=chi,
+        method=method,
+        cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
+        info=info,
+        seed=seed,
+    )
+    return guess
+
+
+def svd_guess(p, gate, where, *, chi, **kwargs):
+    """Compatibility wrapper for ``guess(..., method="direct")``."""
+    return guess(p, gate, where, chi=chi, method="direct", **kwargs)
+
+
 class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     """High-level wrapper for MPS gate-sweep objectives.
 
@@ -827,7 +1092,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
         applied on the ket family only (state evolution), using :func:`pepsy.operators.gates.gate`.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
-        For ``mode="mpo"``, entries may also have the explicit sub-MPO form
+        For ``mode="mpo-<method>"`` (or compatibility ``"mpo"``), entries may
+        also have the explicit sub-MPO form
         ``("submpo", mpo, where)`` or mapping form
         ``{"kind": "submpo", "mpo": mpo, "where": where}``, with a 1D
         support ``where``. :meth:`submpo_event` builds the tuple form.
@@ -850,7 +1116,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
         committed DMRG/MPO results at or below this limit.
-    mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
         Optimization backend. ``"fit"`` is the clear alias of the historical
         ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
         sweeps, then one-site refinement; once every bond reaches its
@@ -929,33 +1195,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "su",
             "exact",
         }
+        | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
     )
     LayoutFinder = MpsGateStreamLayoutFinder
-    _ALLOWED_SUBMPO_METHODS = frozenset(
-        {
-            "direct",
-            "dm",
-            "zipup",
-            "zipup-first",
-            "zipup-oversample",
-            "src",
-            "src-first",
-            "src-oversample",
-            "srcmps",
-            "srcmps-first",
-            "srcmps-oversample",
-            "fit",
-            "fit-direct",
-            "fit-dm",
-            "fit-zipup",
-            "fit-zipup-first",
-            "fit-zipup-oversample",
-            "fit-src",
-            "fit-src-first",
-            "fit-src-oversample",
-            "fit-oversample",
-        }
-    )
+    _ALLOWED_SUBMPO_METHODS = _MPO_COMPRESSION_METHODS
     _PROGBAR_COLORS = {
         "dmrg": "#1f77b4",
         "mpo": "#2ca02c",
@@ -981,6 +1224,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return mode_norm
 
     @classmethod
+    def _is_mpo_mode(cls, mode):
+        """Return whether ``mode`` is the MPO family or its compatibility alias."""
+        mode_norm = str(mode).strip().lower()
+        return mode_norm == "mpo" or mode_norm.startswith("mpo-")
+
+    @classmethod
+    def _mode_mpo_method(cls, mode):
+        """Return the compression method encoded by an MPO mode name."""
+        mode_norm = str(mode).strip().lower()
+        if mode_norm == "mpo":
+            return "direct"
+        if mode_norm.startswith("mpo-"):
+            return cls._normalize_submpo_method(mode_norm[4:])
+        return "direct"
+
+    def _resolve_mpo_method(self, method):
+        """Resolve an explicit method or the method encoded by ``self.mode``."""
+        if method is None:
+            return self._mode_mpo_method(self.mode)
+        return self._normalize_submpo_method(method)
+
+    @classmethod
     def _dmrg_alias_block_size(cls, mode):
         """Return the fixed block size requested by a DMRG mode alias."""
         return cls._DMRG_MODE_ALIASES.get(str(mode).strip().lower())
@@ -999,26 +1264,46 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"Unknown subMPO method: {method}")
         return method_norm
 
-    def _submpo_compress_opts(self, method):
+    def _submpo_compress_opts(
+        self,
+        method,
+        *,
+        cutoff,
+        cutoff_mode,
+        seed=None,
+    ):
         """Return compression options for a sub-MPO method."""
+        opts = {}
+        opts["cutoff"] = (
+            0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
+        )
+        if (
+            cutoff_mode is not None
+            and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
+        ):
+            opts["cutoff_mode"] = cutoff_mode
         if method == "direct":
-            return {}
+            return opts
+        if seed is not None and method in _MPO_METHODS_USE_SEED:
+            opts["seed"] = seed
         optimize = self.contraction_opt
         if optimize is None:
-            return {}
+            return opts
         if isinstance(optimize, str) and optimize.strip().lower() in {
             "auto",
             "auto-hq",
         }:
-            return {}
-        return {"optimize": optimize}
+            return opts
+        opts["optimize"] = optimize
+        return opts
 
     @staticmethod
     def submpo_event(mpo, where):
         """Return a canonical explicit sub-MPO stream event.
 
         The returned entry can be placed directly inside the ``gates`` stream
-        for ``mode="mpo"``. ``where`` is restricted to 1D integer MPS sites.
+        for the MPO mode family. ``where`` is restricted to 1D integer MPS
+        sites.
         """
 
         return ("submpo", mpo, _normalize_submpo_where(where))
@@ -1861,9 +2146,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Open missing native charge sectors without copying ``p_target``.
 
-        Dense FIT uses its local target-support factors.  Symmray's graded
-        tensors need Quimb's native auto-swap/SVD route to create compatible
-        charge blocks, so retain this native-only preparation.  It mutates
+        Dense FIT uses a disposable randomized guess when dense rank growth is
+        needed. Symmray's graded tensors need Quimb's native auto-swap/SVD
+        route to create compatible charge blocks, so retain this native-only
+        preparation. It mutates
         the current working MPS through the gate algebra; it never transfers
         tensors from the exact target network into ``fit.p``.
         """
@@ -1925,6 +2211,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if strategy not in {"auto", "layered", "mps"}:
             raise ValueError(
                 "fit_target_strategy must be 'auto', 'layered', or 'mps'."
+            )
+        return strategy
+
+    @staticmethod
+    def _validate_fit_init_strategy(strategy):
+        """Normalize the FIT initial-guess construction policy."""
+        strategy = str(strategy).strip().lower()
+        if strategy.startswith("guess-"):
+            # ``mpo-<method>`` is the mode spelling; accept the matching
+            # hyphenated form for the FIT policy as a readable alias while
+            # retaining the historical/documented ``guess_<method>`` name.
+            strategy = "guess_" + strategy[len("guess-") :]
+        strategy = {"mpo": "svd_guess"}.get(strategy, strategy)
+        if strategy not in _FIT_INIT_STRATEGIES:
+            raise ValueError(
+                "fit_init_strategy must be one of 'auto', 'direct', "
+                "'random', 'random_expand', or 'guess_<method>'."
             )
         return strategy
 
@@ -2717,9 +3020,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         has_leakage = any(_leakage_event_parts(entry) is not None for entry in entries)
         has_submpo = any(_is_submpo_event(entry) for entry in entries)
-        if has_submpo and self.mode != "mpo":
+        if has_submpo and not self._is_mpo_mode(self.mode):
             raise ValueError(
-                "shot replay of sub-MPO events requires mode='mpo'; "
+                "shot replay of sub-MPO events requires an MPO mode; "
                 f"mode={self.mode!r} cannot consume sub-MPO payloads."
             )
         if self.mode == "mix" and (controls or has_leakage):
@@ -3456,7 +3759,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter=5,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rsum2",
+        cutoff_mode=None,
         mode=None,
         k_2q_batch=1,
         non_unitary=False,
@@ -3464,7 +3767,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
-        submpo_method="direct",
+        submpo_method=None,
+        compression_seed=None,
         use_layout_finder=False,
         layout_order="quality",
         layout_kwargs=None,
@@ -3490,6 +3794,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_mpo_guess=True,
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=1.0e-1,
+        fit_init_seed=0,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         fit_stabilize_unitary=_DEPRECATED_OPTION,
@@ -3540,10 +3847,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff : float | {"auto"}, default=1e-12
             Truncation cutoff used in gate application and local fitting.
             ``"auto"`` selects a conservative dtype-aware value.
-        cutoff_mode : str, default="rsum2"
+        cutoff_mode : str | None, default=None
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
-            ``tensor_network_1d_compress``.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
+            ``tensor_network_1d_compress``. ``None`` uses ``"rsum2"`` for
+            Pepsy's ordinary compression paths while preserving Quimb's
+            method-specific native default for the MPO path, notably
+            ``"rsum1"`` for ``method="dm"``. Pass a string to override it.
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         k_2q_batch : int, default=1
@@ -3572,10 +3882,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             already normalized. Requires ``non_unitary=True``.
         normalize_eps : float, default=1e-15
             Numerical threshold used by the final normalization path.
-        submpo_method : str, default="direct"
-            MPO mode only: compression method used for explicit sub-MPO stream
-            events. This is forwarded to quimb's
-            ``MatrixProductState.gate_with_submpo_``.
+        submpo_method : str | None, default=None
+            Optional compression-method override for the MPO family. If
+            omitted, ``mode="mpo-<method>"`` selects the method and the
+            compatibility ``mode="mpo"`` selects ``"direct"``. The method
+            is forwarded to Quimb for both dense gates and explicit sub-MPO
+            stream events.
+        compression_seed : int | None, default=None
+            Explicit seed forwarded to randomized Quimb compression methods
+            such as ``src``, ``srcmps``, and randomized FIT variants. ``None``
+            preserves Quimb's backend-global random state.
         use_layout_finder : bool | str | Mapping, default=False
             Deprecated compatibility path. If enabled, call
             :meth:`layout_finder`, temporarily replay the stream in the
@@ -3684,11 +4000,34 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             traditional routed target. ``"auto"`` selects layered targets
             for NumPy/Torch/CuPy and the native MPS route for Symmray.
         fit_mpo_guess : bool, default=True
-            For dense named DMRG1 and DMRG3 growth windows, initialize FIT
-            from an isolated MPO-compressed MPS for the current gate. This
-            does not replace the exact FIT target or live MPS. Set to
-            ``False`` to use the direct current-MPS FIT guess. Native
-            Symmray and fermionic routes retain their native warm-start path.
+            Legacy compatibility switch for the named DMRG1/DMRG3 default
+            ``"guess_zipup"`` policy. New code should use
+            ``fit_init_strategy`` explicitly. This does not replace the exact
+            FIT target or live MPS. Native Symmray and fermionic routes retain
+            their native warm-start path.
+        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess_<method>"}, default="guess_zipup"
+            Select the disposable FIT initial guess. ``"direct"`` uses the
+            current MPS, ``"random"`` perturbs existing tensors without
+            changing bond dimensions, ``"random_expand"`` adds seeded
+            directions on under-capacity active bonds, and
+            ``"guess_<method>"`` uses the corresponding Quimb compression
+            method on an isolated copy. ``"auto"`` selects
+            ``"guess_zipup"`` before active bonds reach their attainable
+            ceilings. The mode-style ``"guess-<method>"`` spelling is accepted
+            as an alias.
+        fit_init_rand_strength : float, default=1e-1
+            For dense two- and three-site FIT growth windows that are below
+            their attainable physical/``chi`` bond ceilings, seed a
+            disposable copy of the current MPS with random entries on only
+            those active bonds. The exact FIT target is still built from the
+            unmodified current MPS. Set to ``0`` to disable this
+            initialization. Native Symmray and fermionic routes ignore it.
+        fit_init_seed : int, default=0
+            Deterministic seed for ``"random"`` and ``"random_expand"`` FIT
+            guesses and randomized Quimb methods selected through
+            ``"guess_<method>"``. The gate position is mixed into the
+            per-window stream so repeated runs are reproducible without
+            sharing a global RNG.
         fit_single_pair_fast_path : bool, default=True
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
@@ -3831,6 +4170,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.quality_checks = []
         if mode is not None:
             self.set_mode(mode)
+
+        # Keep the caller's omission distinct from an explicit cutoff mode.
+        # Most Pepsy paths use rsum2, while Quimb's density-matrix compressor
+        # intentionally defaults to rsum1 in the squared singular-value space.
+        mpo_cutoff_mode = cutoff_mode
+        cutoff_mode = (
+            _DEFAULT_CUTOFF_MODE
+            if cutoff_mode is None
+            else cutoff_mode
+        )
 
         if seed is not None:
             self._rng = np.random.default_rng(seed)
@@ -3983,6 +4332,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # Each stabilized unitary stream needs a fresh raw-norm reference.
             # Mixed mode then carries this working value across its trials.
             self._unitary_previous_norm = None
+        if compression_seed is not None:
+            if not isinstance(compression_seed, Integral) or isinstance(
+                compression_seed, bool
+            ):
+                raise ValueError("compression_seed must be an integer or None.")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError("compression_seed must be non-negative.")
         if self.mode in {"dmrg", "mix"}:
             if self._dmrg_mode_block_size is not None:
                 # A named DMRG mode is an explicit block-size choice. Use the
@@ -4054,6 +4411,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_target_strategy = self._validate_fit_target_strategy(
                 fit_target_strategy
             )
+            fit_init_strategy = self._validate_fit_init_strategy(
+                fit_init_strategy
+            )
+            try:
+                fit_init_rand_strength = float(fit_init_rand_strength)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "fit_init_rand_strength must be finite and non-negative."
+                ) from exc
+            if not np.isfinite(fit_init_rand_strength) or fit_init_rand_strength < 0.0:
+                raise ValueError(
+                    "fit_init_rand_strength must be finite and non-negative."
+                )
+            if not isinstance(fit_init_seed, Integral) or isinstance(
+                fit_init_seed, bool
+            ):
+                raise ValueError("fit_init_seed must be an integer.")
+            fit_init_seed = int(fit_init_seed)
+            if fit_init_seed < 0:
+                raise ValueError("fit_init_seed must be non-negative.")
             if fit_target_strategy == "layered" and (
                 self._has_symmray_data(self.p) or self.p.isfermionic()
             ):
@@ -4095,16 +4472,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "available in exact mode."
             )
 
+        submpo_method = self._resolve_mpo_method(submpo_method)
+
         mode_kwargs = dict(
             n_iter=n_iter,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            mpo_cutoff_mode=mpo_cutoff_mode,
             k_2q_batch=k_2q_batch,
             normalize_every=normalize_every,
             normalize_final=normalize_final,
             normalize_eps=normalize_eps,
             non_unitary=non_unitary,
             submpo_method=submpo_method,
+            compression_seed=compression_seed,
             mix_strict=bool(mix_strict),
             fit_min_iter=int(fit_min_iter),
             fit_rtol=fit_rtol,
@@ -4117,6 +4498,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
             fit_mpo_guess=bool(fit_mpo_guess),
+            fit_init_strategy=fit_init_strategy,
+            fit_init_rand_strength=fit_init_rand_strength,
+            fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
             stabilize_unitary=bool(stabilize_unitary),
             quality_check_every=quality_check_every,
@@ -4310,12 +4694,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar,
         cutoff,
         cutoff_mode,
+        mpo_cutoff_mode=None,
         k_2q_batch,
         normalize_every,
         normalize_final,
         normalize_eps,
         non_unitary,
         submpo_method,
+        compression_seed=None,
         mix_strict=False,
         fit_min_iter=2,
         fit_rtol=None,
@@ -4328,6 +4714,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_mpo_guess=True,
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=1.0e-1,
+        fit_init_seed=0,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         quality_check_every=None,
@@ -4378,6 +4767,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
                 fit_mpo_guess=fit_mpo_guess,
+                fit_init_strategy=fit_init_strategy,
+                fit_init_rand_strength=fit_init_rand_strength,
+                fit_init_seed=fit_init_seed,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
                 stabilize_unitary=stabilize_unitary,
                 quality_check_every=quality_check_every,
@@ -4399,6 +4791,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 submpo_method=submpo_method,
+                compression_seed=compression_seed,
                 mix_strict=mix_strict,
                 fit_min_iter=fit_min_iter,
                 fit_rtol=fit_rtol,
@@ -4410,6 +4803,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_max_span=fit_max_span,
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
+                fit_init_strategy=fit_init_strategy,
+                fit_init_rand_strength=fit_init_rand_strength,
+                fit_init_seed=fit_init_seed,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
                 stabilize_unitary=stabilize_unitary,
                 non_unitary=non_unitary,
@@ -4418,7 +4814,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             return self.p
 
-        if self.mode == "mpo":
+        if self._is_mpo_mode(self.mode):
             self._timed_call(
                 "mpo.replay",
                 self._run_mpo,
@@ -4427,12 +4823,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 event_seq,
                 progbar=progbar,
                 cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
+                cutoff_mode=mpo_cutoff_mode,
                 normalize_every=normalize_every,
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
                 submpo_method=submpo_method,
+                compression_seed=compression_seed,
                 stabilize_unitary=stabilize_unitary,
             )
             return self.p
@@ -5266,8 +5663,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"Unknown MPS stream event type(s): {unknown!r}.")
 
         has_submpo = any(event_type == "submpo" for event_type in event_seq)
-        if has_submpo and self.mode != "mpo":
-            raise ValueError("subMPO stream events currently require mode='mpo'.")
+        if has_submpo and not self._is_mpo_mode(self.mode):
+            raise ValueError("subMPO stream events currently require an MPO mode.")
 
         has_cap = any(event_type == "cap" for event_type in event_seq)
         if not has_submpo:
@@ -5768,44 +6165,332 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return p_target
 
-    def _build_mpo_fit_guess(
+    def _build_compression_fit_guess(
         self,
         p,
         gate,
         where,
         *,
+        method,
         cutoff,
         cutoff_mode,
-        non_unitary,
-        stabilize_unitary,
+        seed=None,
     ):
-        """Build an MPO-compressed MPS guess for a named DMRG growth target.
-
-        The MPO replay runs on an isolated copy.  The returned state is only
-        FIT's initial guess; the exact gate target and named DMRG schedule
-        remain unchanged, and the live MPS is not replaced by the MPO result.
-        """
-        guess = p.copy(deep=True)
-        mpo_optimizer = type(self)(
-            guess,
-            gates=[(gate, where)],
+        """Build a disposable Quimb-compressed guess from one gate."""
+        return guess(
+            p,
+            gate,
+            where,
+            method=method,
+            dims=self._infer_gate_dims(gate, where),
             chi=self.chi,
-            mode="mpo",
-            contraction_opt=self.contraction_opt,
-            ind_id=self.ind_id,
-            inplace=True,
-            _capture_initial=False,
-        )
-        mpo_optimizer.run(
-            progbar=False,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            non_unitary=non_unitary,
-            normalize_every=None,
-            normalize_final=False,
-            stabilize_unitary=stabilize_unitary,
+            seed=seed,
         )
-        return mpo_optimizer.p
+
+    def _build_compression_batch_fit_guess(
+        self,
+        p,
+        gates,
+        wheres,
+        *,
+        method,
+        cutoff,
+        cutoff_mode,
+        seed=None,
+    ):
+        """Build a disposable Quimb-compressed guess for a gate batch."""
+        guess_mps = p.copy(deep=True)
+        for i, (gate, where) in enumerate(zip(gates, wheres)):
+            guess(
+                guess_mps,
+                gate,
+                where,
+                method=method,
+                dims=self._infer_gate_dims(gate, where),
+                chi=self.chi,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                seed=None if seed is None else int(seed) + i,
+                inplace=True,
+            )
+        return guess_mps
+
+    @staticmethod
+    def _fit_random_data(data, shape, *, strength, rng):
+        """Generate deterministic random data and convert it to ``data``'s backend."""
+        dtype_name = str(getattr(data, "dtype", "float64"))
+        if "complex64" in dtype_name:
+            random_dtype = np.complex64
+            real_dtype = np.float32
+        elif "complex" in dtype_name:
+            random_dtype = np.complex128
+            real_dtype = np.float64
+        elif "float32" in dtype_name:
+            random_dtype = np.float32
+            real_dtype = np.float32
+        else:
+            random_dtype = np.float64
+            real_dtype = np.float64
+        random_data = rng.normal(size=tuple(shape)).astype(real_dtype)
+        if np.issubdtype(random_dtype, np.complexfloating):
+            random_data = random_data + 1j * rng.normal(
+                size=tuple(shape)
+            ).astype(real_dtype)
+        random_data = (float(strength) * random_data).astype(random_dtype)
+        return ar.do("array", random_data, like=data)
+
+    def _build_randomized_fit_guess(
+        self,
+        p,
+        where,
+        *,
+        block_size,
+        rand_strength,
+        expand=True,
+        seed=0,
+    ):
+        """Prepare a dense FIT guess with deterministic random initialization.
+
+        The exact gate target remains built from the unmodified current MPS.
+        ``expand=False`` perturbs only existing tensors, while ``expand=True``
+        also adds random directions on active bonds below their physical/``chi``
+        ceiling. Native Symmray and fermionic states retain their graded
+        sector-growth path and are never padded with dense random data.
+        """
+        info = {
+            "enabled": False,
+            "rand_strength": float(rand_strength),
+            "bonds": [],
+            "sites": [],
+            "expanded": bool(expand),
+            "reason": None,
+        }
+        if int(block_size) not in {2, 3}:
+            info["reason"] = "one_site_fit"
+            return p, info
+        if self._has_symmray_data(p) or p.isfermionic():
+            info["reason"] = "native_sector_growth"
+            return p, info
+        if float(rand_strength) == 0.0:
+            info["reason"] = "disabled"
+            return p, info
+
+        xmin, xmax = self._normalize_span(where)
+        guess = p.copy(deep=True)
+        rng = np.random.default_rng(int(seed))
+        bonds = []
+        if expand:
+            target_sizes = FIT._active_bond_rank_targets(  # pylint: disable=protected-access
+                p,
+                xmin,
+                xmax,
+                self.chi,
+            )
+            if target_sizes is None:
+                info["reason"] = "no_active_rank_targets"
+                return p, info
+            for site, target_size in zip(range(xmin, xmax), target_sizes):
+                current_size = int(p.bond_size(site, site + 1))
+                target_size = int(target_size)
+                if current_size < target_size:
+                    bonds.append((site, current_size, target_size))
+            if not bonds:
+                info["reason"] = "already_at_target"
+                return p, info
+
+            by_target = {}
+            for site, current_size, target_size in bonds:
+                by_target.setdefault(target_size, []).append(
+                    (site, current_size, target_size)
+                )
+            for target_size, target_bonds in by_target.items():
+                bond_inds = [
+                    guess.bond(site, site + 1)
+                    for site, _, _ in target_bonds
+                ]
+                qtn.TensorNetwork.expand_bond_dimension(
+                    guess,
+                    target_size,
+                    mode="zeros",
+                    inds_to_expand=bond_inds,
+                    inplace=True,
+                )
+                for site, current_size, _ in target_bonds:
+                    bond = guess.bond(site, site + 1)
+                    for tensor in guess.tensors:
+                        if bond not in tensor.inds:
+                            continue
+                        axis = tensor.inds.index(bond)
+                        old_slices = [slice(None)] * tensor.ndim
+                        old_slices[axis] = slice(0, current_size)
+                        old_data = tensor.data[tuple(old_slices)]
+                        random_shape = list(tensor.shape)
+                        random_shape[axis] = target_size - current_size
+                        random_data = self._fit_random_data(
+                            tensor.data,
+                            random_shape,
+                            strength=rand_strength,
+                            rng=rng,
+                        )
+                        tensor.modify(
+                            data=ar.do(
+                                "concatenate",
+                                (old_data, random_data),
+                                axis=axis,
+                            )
+                        )
+        else:
+            for site in range(xmin, xmax + 1):
+                tensor = guess[site]
+                random_data = self._fit_random_data(
+                    tensor.data,
+                    tensor.shape,
+                    strength=rand_strength,
+                    rng=rng,
+                )
+                tensor.modify(data=ar.do("add", tensor.data, random_data))
+                info["sites"].append(int(site))
+
+        guess_info = {}
+        self.canonize_mps(guess, (xmin, xmax), info=guess_info)
+        info["enabled"] = True
+        info["bonds"] = [
+            {
+                "bond": int(site),
+                "current_rank": int(current_size),
+                "target_rank": int(target_size),
+                "new_rank": int(guess.bond_size(site, site + 1)),
+            }
+            for site, current_size, target_size in bonds
+        ]
+        return guess, info
+
+    def _prepare_fit_initial_guess(
+        self,
+        p,
+        gates,
+        wheres,
+        *,
+        block_size,
+        strategy,
+        fit_mpo_guess,
+        rand_strength,
+        seed,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Select the disposable FIT guess without changing the live MPS."""
+        requested_strategy = self._validate_fit_init_strategy(strategy)
+        info = {
+            "enabled": False,
+            "rand_strength": float(rand_strength),
+            "bonds": [],
+            "sites": [],
+            "expanded": False,
+            "reason": "direct",
+        }
+        result = {
+            "fit_guess": p,
+            "strategy": "direct",
+            "requested_strategy": requested_strategy,
+            "guess_method": None,
+            "guess_used": False,
+            "svd_guess_used": False,
+            "random_initialization": info,
+        }
+        if int(block_size) not in {2, 3}:
+            info["reason"] = "one_site_fit"
+            return result
+        if self._has_symmray_data(p) or p.isfermionic():
+            info["reason"] = "native_sector_growth"
+            result["strategy"] = "direct"
+            return result
+
+        start, stop = self._normalize_span(wheres[0] if len(wheres) == 1 else (
+            min(site for where in wheres for site in where),
+            max(site for where in wheres for site in where),
+        ))
+        needs_growth = not FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+            p,
+            start,
+            stop,
+            self.chi,
+        )
+        is_named_svd_window = (
+            len(gates) == 1
+            and (
+                self._dmrg_mode_alias == "dmrg1" and int(block_size) == 2
+                or self._dmrg_mode_alias == "dmrg3" and int(block_size) == 3
+            )
+        )
+        if requested_strategy == "auto":
+            if needs_growth and (fit_mpo_guess or not is_named_svd_window):
+                selected_strategy = "guess_zipup"
+            else:
+                selected_strategy = "direct"
+        else:
+            selected_strategy = requested_strategy if needs_growth else "direct"
+        if (
+            not fit_mpo_guess
+            and is_named_svd_window
+            and requested_strategy in {"auto", _DEFAULT_FIT_INIT_STRATEGY}
+        ):
+            selected_strategy = "direct"
+
+        if selected_strategy == "svd_guess":
+            guess_method = "direct"
+        elif selected_strategy.startswith("guess_"):
+            guess_method = selected_strategy[len("guess_") :]
+        else:
+            guess_method = None
+
+        if guess_method is not None:
+            if len(gates) == 1:
+                fit_guess = self._build_compression_fit_guess(
+                    p,
+                    gates[0],
+                    wheres[0],
+                    method=guess_method,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    seed=seed,
+                )
+            else:
+                fit_guess = self._build_compression_batch_fit_guess(
+                    p,
+                    gates,
+                    wheres,
+                    method=guess_method,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    seed=seed,
+                )
+            result["fit_guess"] = fit_guess
+            result["strategy"] = "svd_guess"
+            if selected_strategy != "svd_guess":
+                result["strategy"] = selected_strategy
+            result["guess_method"] = guess_method
+            result["guess_used"] = True
+            result["svd_guess_used"] = True
+            info["reason"] = selected_strategy
+            return result
+
+        fit_guess, random_info = self._build_randomized_fit_guess(
+            p,
+            (start, stop),
+            block_size=block_size,
+            rand_strength=rand_strength,
+            expand=selected_strategy == "random_expand",
+            seed=int(seed),
+        ) if selected_strategy in {"random", "random_expand"} else (p, info)
+        if selected_strategy == "direct":
+            info["reason"] = "already_at_target"
+        result["fit_guess"] = fit_guess
+        result["strategy"] = selected_strategy
+        result["random_initialization"] = random_info
+        return result
 
     @staticmethod
     def _normalize_every_interval(normalize_every, non_unitary=False):
@@ -6062,59 +6747,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
         return p_g
 
-    def _build_dmrg_target_support(
-        self,
-        p,
-        batch_G,
-        batch_where,
-        *,
-        start,
-        stop,
-        block_size,
-        target_cutoff,
-        cutoff_mode,
-    ):
-        """Build a separate exact MPS support source for local enrichment.
-
-        This helper deliberately returns a target-side object only.  The
-        live ``p`` is never replaced or copied into FIT's ``p``.  A layered
-        overlap target remains the fast/default objective; the MPS source is
-        constructed only while an active bond is below its requested chi and
-        is consumed by FIT as local Schmidt support rather than as a warm
-        start.
-        """
-        if (
-            int(block_size) not in {2, 3}
-            or int(stop) - int(start) < 2
-            or self._has_symmray_data(p)
-            or p.isfermionic()
-            or FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
-                p,
-                int(start),
-                int(stop),
-                self.chi,
-            )
-        ):
-            return None
-
-        if len(batch_G) == 1:
-            return self._build_norm_target(
-                p,
-                batch_G[0],
-                batch_where[0],
-                target_cutoff,
-                cutoff_mode,
-                target_strategy="mps",
-            )
-        return self._build_dmrg_batch_target(
-            p,
-            batch_G,
-            batch_where,
-            target_cutoff,
-            cutoff_mode,
-            target_strategy="mps",
-        )
-
     def _stabilize_unitary_compression_state(
         self,
         p,
@@ -6181,6 +6813,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         submpo_method,
+        compression_seed=None,
         stabilize_unitary,
     ):
         """Apply one mixed-mode step through the MPO backend."""
@@ -6194,6 +6827,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_every=None,
             normalize_final=False,
             submpo_method=submpo_method,
+            compression_seed=compression_seed,
             stabilize_unitary=stabilize_unitary,
         )
 
@@ -6207,6 +6841,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         submpo_method,
+        compression_seed=None,
         stabilize_unitary,
     ):
         """Apply a mixed-mode fallback batch through the MPO backend."""
@@ -6220,6 +6855,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_every=None,
             normalize_final=False,
             submpo_method=submpo_method,
+            compression_seed=compression_seed,
             stabilize_unitary=stabilize_unitary,
         )
         if not self._mps_data_is_finite(self.p):
@@ -6269,6 +6905,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=1.0e-1,
+        fit_init_seed=0,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
     ):
@@ -6292,6 +6931,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_sweep_sequence=fit_sweep_sequence,
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_rand_strength=fit_init_rand_strength,
+            fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
             stabilize_unitary=stabilize_unitary,
         )
@@ -6315,6 +6957,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=1.0e-1,
+        fit_init_seed=0,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
     ):
@@ -6338,6 +6983,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_sweep_sequence=fit_sweep_sequence,
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_rand_strength=fit_init_rand_strength,
+            fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
             stabilize_unitary=stabilize_unitary,
         )
@@ -6740,11 +7388,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff=1e-12,
         cutoff_mode="rsum2",
         submpo_method="direct",
+        compression_seed=None,
         fit_block_size=2,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=1.0e-1,
+        fit_init_seed=0,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         non_unitary=False,
@@ -6777,6 +7429,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_final=False,
                 non_unitary=True,
                 submpo_method=submpo_method,
+                compression_seed=compression_seed,
                 stabilize_unitary=False,
             )
             return self.p
@@ -6875,6 +7528,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                         submpo_method=submpo_method,
+                        compression_seed=compression_seed,
                         stabilize_unitary=stabilize_unitary,
                     )
                     mpo_steps += 1
@@ -6969,6 +7623,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_sweep_sequence=fit_sweep_sequence,
                         target_cutoff=target_cutoff,
                         fit_target_strategy=fit_target_strategy,
+                        fit_init_strategy=fit_init_strategy,
+                        fit_init_rand_strength=fit_init_rand_strength,
+                        fit_init_seed=fit_init_seed,
                         fit_single_pair_fast_path=fit_single_pair_fast_path,
                         stabilize_unitary=stabilize_unitary,
                     )
@@ -7013,6 +7670,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             submpo_method=submpo_method,
+                            compression_seed=compression_seed,
                             stabilize_unitary=stabilize_unitary,
                         )
                         self._commit_mix_trial(
@@ -7185,6 +7843,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_mpo_guess=True,
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=1.0e-1,
+        fit_init_seed=0,
         fit_single_pair_fast_path=True,
         stabilize_unitary=True,
         quality_check_every=None,
@@ -7288,8 +7949,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
                     # Keep a transaction for an unexpected FIT exception.
                     # Normal low-rank long-range starts are repaired directly
-                    # below by deterministic target-subspace initialization;
-                    # norm loss is never silently converted into an MPO result.
+                    # below by randomized initialization of the disposable FIT
+                    # guess; norm loss is never silently converted into an MPO
+                    # result.
                     fit_state_snapshot = (
                         p.copy(deep=True)
                         if xmax - xmin > 1 and self.mode != "mix"
@@ -7325,50 +7987,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (xmin, xmax),
                         fit_block_size,
                     )
-                    mpo_fit_guess_used = False
-                    fit_guess = p
-                    is_named_mpo_guess_window = (
-                        (
-                            self._dmrg_mode_alias == "dmrg1"
-                            and active_fit_block_size == 2
-                        )
-                        or (
-                            self._dmrg_mode_alias == "dmrg3"
-                            and active_fit_block_size == 3
-                        )
+                    fit_initialization = self._timed_call(
+                        "dmrg.fit_guess",
+                        self._prepare_fit_initial_guess,
+                        p,
+                        (gate,),
+                        (where,),
+                        block_size=active_fit_block_size,
+                        strategy=fit_init_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        rand_strength=fit_init_rand_strength,
+                        seed=(
+                            int(fit_init_seed)
+                            + 1000003 * int(idx)
+                            + 1009 * int(xmin)
+                            + int(xmax)
+                        ),
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
                     )
-                    if (
-                        fit_mpo_guess
-                        and is_named_mpo_guess_window
-                        and not self._has_symmray_data(p)
-                        and not p.isfermionic()
-                    ):
-                        fit_guess = self._timed_call(
-                            "dmrg.mpo_guess",
-                            self._build_mpo_fit_guess,
-                            p,
-                            gate,
-                            where,
-                            cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                            non_unitary=non_unitary,
-                            stabilize_unitary=stabilize_unitary,
-                        )
-                        mpo_fit_guess_used = True
-                    target_support = (
-                        None
-                        if mpo_fit_guess_used
-                        else self._build_dmrg_target_support(
-                            p,
-                            (gate,),
-                            (where,),
-                            start=xmin,
-                            stop=xmax,
-                            block_size=active_fit_block_size,
-                            target_cutoff=target_cutoff,
-                            cutoff_mode=cutoff_mode,
-                        )
-                    )
+                    fit_guess = fit_initialization["fit_guess"]
+                    svd_guess_used = fit_initialization["svd_guess_used"]
+                    mpo_fit_guess_used = svd_guess_used
+                    random_initialization = fit_initialization[
+                        "random_initialization"
+                    ]
                     active_adaptive_sweeps = adaptive_sweeps
                     # A rank-adaptive sweep can finish a long-range window
                     # before its terminal one-site canonicalization has
@@ -7376,8 +8019,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     # the whole represented state, and the unitary norm guard
                     # correctly rejects the next gate.  Use the fixed
                     # block schedule for that window; it retains the same
-                    # target-support enrichment while guaranteeing the
-                    # canonical handoff.  Named modes already use this path.
+                    # randomized FIT initialization while guaranteeing the
+                    # canonical handoff. Named modes already use this path.
                     active_adaptive_rank_schedule = (
                         adaptive_rank_schedule
                         and not (
@@ -7395,7 +8038,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         range_int=[xmin, xmax],
                         inplace=True,
                         copy_target=False,
-                        target_support=target_support,
                     )
                     # Apply the selected one-, two-, or three-site FIT update to
                     # this gate window. ``run_gate`` reuses environments on
@@ -7439,10 +8081,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 native_fermionic_warm_start
                             ),
                             "mpo_fit_guess_used": bool(mpo_fit_guess_used),
+                            "svd_guess_used": bool(svd_guess_used),
+                            "guess_used": bool(fit_initialization["guess_used"]),
+                            "guess_method": fit_initialization["guess_method"],
+                            "fit_init_strategy": fit_initialization["strategy"],
+                            "fit_init_strategy_requested": fit_initialization[
+                                "requested_strategy"
+                            ],
+                            "random_initialization": random_initialization,
                             "target_strategy": fit_target_strategy,
-                            "target_support_expansion": fit.info.get(
-                                "target_subspace_expansion"
-                            ),
                         }
 
                     fit_center = fit.final_center_site
@@ -7603,16 +8250,29 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (xmin, xmax),
                         fit_block_size,
                     )
-                    target_support = self._build_dmrg_target_support(
+                    fit_initialization = self._timed_call(
+                        "dmrg.fit_guess",
+                        self._prepare_fit_initial_guess,
                         p,
                         batch_G,
                         batch_where,
-                        start=xmin,
-                        stop=xmax,
                         block_size=active_fit_block_size,
-                        target_cutoff=target_cutoff,
+                        strategy=fit_init_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        rand_strength=fit_init_rand_strength,
+                        seed=(
+                            int(fit_init_seed)
+                            + 1000003 * int(idx)
+                            + 1009 * int(xmin)
+                            + int(xmax)
+                        ),
+                        cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                     )
+                    fit_guess = fit_initialization["fit_guess"]
+                    random_initialization = fit_initialization[
+                        "random_initialization"
+                    ]
                     active_adaptive_sweeps = adaptive_sweeps
                     active_adaptive_rank_schedule = (
                         adaptive_rank_schedule
@@ -7624,14 +8284,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     fit = FIT(
                         p_g,
-                        p=p,
+                        p=fit_guess,
                         cutoffs=cutoff,
                         contraction_opt=self.contraction_opt,
                         retag=False,
                         range_int=[xmin, xmax],
                         inplace=True,
                         copy_target=False,
-                        target_support=target_support,
                     )
                     fit_error = None
                     try:
@@ -7671,10 +8330,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "native_fermionic_warm_start": bool(
                                 native_fermionic_warm_start
                             ),
-                            "target_strategy": fit_target_strategy,
-                            "target_support_expansion": fit.info.get(
-                                "target_subspace_expansion"
+                            "mpo_fit_guess_used": bool(
+                                fit_initialization["svd_guess_used"]
                             ),
+                            "svd_guess_used": bool(
+                                fit_initialization["svd_guess_used"]
+                            ),
+                            "guess_used": bool(fit_initialization["guess_used"]),
+                            "guess_method": fit_initialization["guess_method"],
+                            "fit_init_strategy": fit_initialization["strategy"],
+                            "fit_init_strategy_requested": fit_initialization[
+                                "requested_strategy"
+                            ],
+                            "random_initialization": random_initialization,
+                            "target_strategy": fit_target_strategy,
                         }
 
                     fit_center = fit.final_center_site
@@ -7902,6 +8571,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_eps=1e-15,
         non_unitary=False,
         submpo_method="direct",
+        compression_seed=None,
         stabilize_unitary=False,
     ):
         """Apply gates with MPO-style nonlocal compression.
@@ -7909,6 +8579,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Uses :meth:`qtn.MatrixProductState.gate_nonlocal_` for two-qubit gates.
         """
         p = self.p
+        mpo_method = self._normalize_submpo_method(submpo_method)
+        gate_cutoff_mode = (
+            _DEFAULT_CUTOFF_MODE
+            if cutoff_mode is None
+            else cutoff_mode
+        )
+        mpo_compress_opts = self._submpo_compress_opts(
+            mpo_method,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            seed=compression_seed,
+        )
+        mpo_optimize = mpo_compress_opts.get("optimize")
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
         if not non_unitary and self._unitary_previous_norm is None:
             self._start_unitary_norm_tracking(p)
@@ -7942,20 +8625,34 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if event_type == "submpo":
                 submpo_count += 1
                 xmin, xmax = min(where), max(where)
-                method = self._normalize_submpo_method(submpo_method)
-                submpo_compress_opts = self._submpo_compress_opts(method)
-                self.canonize_mps(p, (xmin, xmax))
-                p.gate_with_submpo_(
-                    gate,
-                    where=where,
-                    method=method,
-                    max_bond=self.chi,
-                    info=self.info_c,
-                    inplace_mpo=False,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    **submpo_compress_opts,
-                )
+                if (
+                    mpo_method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
+                    and _is_interior_submpo_span(p, where)
+                ):
+                    _apply_submpo_with_interior_workaround(
+                        p,
+                        gate,
+                        where,
+                        chi=self.chi,
+                        method=mpo_method,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        info=self.info_c,
+                        inplace_mpo=False,
+                        optimize=mpo_optimize,
+                        seed=compression_seed,
+                    )
+                else:
+                    self.canonize_mps(p, (xmin, xmax))
+                    p.gate_with_submpo_(
+                        gate,
+                        where=where,
+                        method=mpo_method,
+                        max_bond=self.chi,
+                        info=self.info_c,
+                        inplace_mpo=False,
+                        **mpo_compress_opts,
+                    )
 
                 idx += 1
                 advanced = 1
@@ -7982,7 +8679,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     where,
                     contract=True,
                     cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
+                    cutoff_mode=gate_cutoff_mode,
                     inplace=True,
                 )
                 if non_unitary:
@@ -8003,19 +8700,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         gate,
                         where,
                         cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
+                        cutoff_mode=gate_cutoff_mode,
                         max_bond=self.chi,
                     )
                 else:
-                    p.gate_nonlocal_(
+                    _apply_dense_gate_with_method(
+                        p,
                         gate,
                         where,
                         dims=self._infer_gate_dims(gate, where),
-                        max_bond=self.chi,
-                        info=self.info_c,
-                        method="direct",
+                        chi=self.chi,
+                        method=mpo_method,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
+                        info=self.info_c,
+                        optimize=mpo_optimize,
+                        seed=compression_seed,
                     )
                 idx += 1
                 advanced = 1
