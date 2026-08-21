@@ -97,7 +97,7 @@ def test_mps_stab_statevector_readout_does_not_build_dense_tableau(monkeypatch):
     assert np.linalg.norm(statevector) == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("mode", ["exact", "mpo", "dmrg"])
+@pytest.mark.parametrize("mode", ["exact", "mpo", "quimb-src", "dmrg"])
 def test_mps_stab_physical_mps_replay_matches_matrix_free_readout(mode, monkeypatch):
     """Physical-MPS conversion replays the tableau circuit without a dense C."""
     from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
@@ -122,6 +122,15 @@ def test_mps_stab_physical_mps_replay_matches_matrix_free_readout(mode, monkeypa
     np.testing.assert_allclose(actual, sim.to_statevector(), atol=1e-10)
     np.testing.assert_allclose(sim.to_basis_statevector(), basis_before)
     assert physical.L == sim.n
+
+
+def test_stabilizer_statevector_readout_cleans_clifford_roundoff():
+    """Tableau replay does not expose cancellation noise as amplitudes."""
+    sim = MpsStabOptimizer(2).apply([("x", 0)])
+
+    np.testing.assert_allclose(
+        sim.to_statevector(), [0.0, 0.0, 1.0, 0.0], atol=0.0
+    )
 
 
 def test_mps_stab_physical_mps_restores_logical_order_from_static_layout():
@@ -1070,12 +1079,116 @@ def test_coefficient_compression_modes_preserve_stn_state(mode):
     )
 
 
+@pytest.mark.parametrize(
+    "method",
+    (
+        "direct",
+        "dm",
+        "zipup",
+        "zipup-first",
+        "zipup-oversample",
+        "sdc",
+        "sdc-oversample",
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit",
+        "fit-zipup",
+        "fit-projector",
+        "fit-oversample",
+    ),
+)
+def test_stn_quimb_compression_methods_preserve_state(method):
+    """Every native Quimb compression method is selectable for coefficient MPOs."""
+    stream = [
+        ("h", 0),
+        ("cnot", 0, 1),
+        ("t", 2),
+        ("rxx", 0.37, 0, 2),
+    ]
+    reference = MpsStabOptimizer(
+        3, mode="exact", exact_cooling=False
+    ).apply(stream)
+    optimizer = MpsStabOptimizer(
+        3,
+        chi=4,
+        mode=f"quimb-{method}",
+        exact_cooling=False,
+        compression_seed=7,
+    ).apply(stream)
+
+    assert optimizer.mode == f"quimb-{method}"
+    assert optimizer.state.max_bond() <= 4
+    assert _fidelity(optimizer.to_statevector(), reference.to_statevector()) == pytest.approx(
+        1.0, abs=1e-8
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "method"),
+    (
+        ("quimb", "direct"),
+        ("quimb-direct", "direct"),
+        ("quimb-src", "src"),
+        ("mpo", "direct"),
+        ("mpo-direct", "direct"),
+        ("mpo-src", "src"),
+    ),
+)
+def test_stn_quimb_mode_aliases(mode, method):
+    """Canonical Quimb names and historical MPO aliases share one dispatch."""
+    optimizer = MpsStabOptimizer(
+        3,
+        chi=4,
+        mode=mode,
+        exact_cooling=False,
+        compression_seed=11,
+    ).apply([("h", 0), ("cnot", 0, 1), ("rxx", 0.23, 0, 2)])
+
+    assert optimizer.mode == mode
+    assert optimizer._mode_quimb_method(mode) == method
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    ("guess-zipup", "guess-src", "guess_zipup", "svd_guess", "random", "random_expand"),
+)
+def test_stn_dmrg_fit_initial_guess_strategies(strategy):
+    """STN DMRG keeps the exact target separate from each disposable guess."""
+    optimizer = MpsStabOptimizer(
+        3,
+        chi=4,
+        mode="dmrg2",
+        exact_cooling=False,
+        fit_init_strategy=strategy,
+        fit_init_seed=17,
+        compression_seed=19,
+    ).apply([("h", 0), ("cnot", 0, 1), ("t", 2), ("rxx", 0.37, 0, 2)])
+
+    assert optimizer.state.max_bond() <= 4
+
+
 def test_stn_mode_validation_and_copy_preservation():
     with pytest.raises(ValueError, match="Unknown MpsStabOptimizer mode"):
         MpsStabOptimizer(2, mode="not-a-mode")
 
-    copied = MpsStabOptimizer(2, mode="dmrg3", chi=2).copy()
+    copied = MpsStabOptimizer(
+        2,
+        mode="dmrg3",
+        chi=2,
+        fit_init_strategy="guess-src",
+        fit_init_rand_strength=0.03,
+        fit_init_seed=7,
+        compression_seed=11,
+    ).copy()
     assert copied.mode == "dmrg3"
+    assert copied.fit_init_strategy == "guess_src"
+    assert copied.fit_init_rand_strength == pytest.approx(0.03)
+    assert copied.fit_init_seed == 7
+    assert copied.compression_seed == 11
     assert "mode='dmrg3'" in repr(copied)
 
 

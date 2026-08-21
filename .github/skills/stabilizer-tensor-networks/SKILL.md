@@ -40,8 +40,19 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
     numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
   - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
-    unitary update can record cumulative norm loss `1 - ||p||^2`; bounded evolution does
-    not renormalize `p`, so compression loss remains visible.
+  unitary update can record cumulative norm loss `1 - ||p||^2`; bounded evolution does
+  not renormalize `p`, so compression loss remains visible.
+- **Coefficient-MPS compression methods** use the canonical `quimb-<method>`
+  mode family, with `quimb` as the direct alias. The historical `mpo-<method>`
+  and `mpo` spellings remain supported. Every Quimb direct, density-matrix,
+  zip-up, SDC, SRC, SRCMPS, and `fit-*` method is forwarded to
+  `gate_with_submpo_`; randomized methods accept the separate
+  `compression_seed` control. DMRG modes use a disposable
+  `fit_init_strategy="guess-<method>"` (default `guess-zipup`) before active
+  bonds reach their cap, while the exact target remains built from the live
+  unmodified coefficient MPS. The underscore `guess_<method>` spelling remains
+  a compatibility alias. Native Symmray and fermionic paths retain their
+  sector-aware direct FIT initialization.
 - **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
   quimb operations. Canonicalize explicitly before local projection, evaluate local
   expectations and unitary norm loss at the tracked centre, and renormalize the centre

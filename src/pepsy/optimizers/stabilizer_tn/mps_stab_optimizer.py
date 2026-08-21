@@ -67,6 +67,11 @@ from ...backends import (
 from ...fitting.local import FIT
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
+    _MPO_COMPRESSION_METHODS,
+    _MPO_METHODS_IGNORE_CUTOFF,
+    _MPO_METHODS_NEED_INTERIOR_WORKAROUND,
+    _MPO_METHODS_USE_SEED,
+    _apply_submpo_with_interior_workaround,
     _resolve_conditional,
     conditional_event_parts,
     is_submpo_event,
@@ -123,6 +128,10 @@ _RESET_AXIS_ALIASES = {"reset_x": "X", "reset_y": "Y", "reset_z": "Z"}
 _MR_ALIASES = {"measure_reset", "mr", "mreset", "measure_and_reset"}
 _MR_AXIS_ALIASES = {"mrx": "X", "mry": "Y", "mrz": "Z"}
 _MAX_PAULI_SUM_SUBMPO_TERMS = 4
+_FIT_INIT_STRATEGIES = frozenset(
+    {"auto", "direct", "random", "random_expand", "svd_guess"}
+    | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
+)
 
 # Single-qubit Clifford matrices used to localize a signed Pauli string onto one
 # qubit for the basis-updating measurement (H, S-dagger, CNOT).
@@ -494,14 +503,30 @@ class MpsStabOptimizer:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
-    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "exact"}
-        Compression backend for coefficient-MPS updates. ``"mpo"`` preserves
-        the native stabilizer-MPO path and is the default. The DMRG modes use
-        local FIT on the coefficient target, while ``"svd"``, ``"swap"``, and
-        ``"perm"`` use the native MPS compression path for the already
-        factorized coefficient-frame MPO. ``"exact"`` forces ``chi=None`` and
-        keeps the coefficient MPS lossless up to ``cutoff``. Clifford gates
-        remain tableau-only in every mode.
+    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "svd", "swap", "perm", "exact"}
+        Compression backend for coefficient-MPS updates. ``"quimb-direct"``
+        is the canonical native Quimb spelling and ``"quimb"`` is its direct
+        alias. The legacy ``"mpo-<method>"`` and ``"mpo"`` spellings remain
+        supported. The DMRG modes use local FIT on the coefficient target;
+        ``fit_init_strategy`` controls their disposable initial guess.
+        ``"svd"``, ``"swap"``, and ``"perm"`` remain compatibility aliases
+        for the historical direct coefficient-MPO path. ``"exact"`` forces
+        ``chi=None`` and keeps the coefficient MPS lossless up to ``cutoff``.
+        Clifford gates remain tableau-only in every mode.
+    fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}
+        Disposable FIT initialization for dense DMRG windows. The default
+        ``"guess-zipup"`` selects Quimb zip-up before active bonds reach their
+        attainable ``chi`` ceilings and falls back to the live MPS afterwards.
+        ``"guess_<method>"`` remains accepted as a compatibility spelling;
+        ``"svd_guess"`` is an alias for ``"guess-direct"``. Native Symmray
+        and fermionic paths retain their direct sector-aware initialization.
+    fit_init_rand_strength : float
+        Perturbation strength for ``"random"`` and ``"random_expand"``.
+    fit_init_seed : int
+        Deterministic seed for randomized FIT guesses.
+    compression_seed : int | None
+        Seed forwarded to randomized Quimb compression methods. This is kept
+        separate from ``seed``, which controls STN measurement sampling.
 
     Attributes
     ----------
@@ -566,6 +591,10 @@ class MpsStabOptimizer:
         layout_kwargs=None,
         layout_report: bool = True,
         mode: str = "mpo",
+        fit_init_strategy: str = "guess-zipup",
+        fit_init_rand_strength: float = 1.0e-1,
+        fit_init_seed: int = 0,
+        compression_seed: Optional[int] = None,
     ):
         if isinstance(state, STNState):
             self.state = state if inplace else state.copy()
@@ -588,6 +617,38 @@ class MpsStabOptimizer:
         self.chi = None if chi is None else int(chi)
         if self.mode == "exact":
             self.chi = None
+        self.fit_init_strategy = self._normalize_fit_init_strategy(
+            fit_init_strategy
+        )
+        try:
+            self.fit_init_rand_strength = float(fit_init_rand_strength)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            ) from exc
+        if (
+            not np.isfinite(self.fit_init_rand_strength)
+            or self.fit_init_rand_strength < 0.0
+        ):
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            )
+        if isinstance(fit_init_seed, bool) or not isinstance(fit_init_seed, Integral):
+            raise ValueError("fit_init_seed must be a non-negative integer.")
+        self.fit_init_seed = int(fit_init_seed)
+        if self.fit_init_seed < 0:
+            raise ValueError("fit_init_seed must be a non-negative integer.")
+        if compression_seed is not None:
+            if isinstance(compression_seed, bool) or not isinstance(
+                compression_seed, Integral
+            ):
+                raise ValueError("compression_seed must be a non-negative integer or None.")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError(
+                    "compression_seed must be a non-negative integer or None."
+                )
+        self.compression_seed = compression_seed
         self.cutoff = float(cutoff)
         if operator_tol is not None:
             operator_tol = float(operator_tol)
@@ -702,7 +763,10 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
     _ALLOWED_MODES = frozenset(
-        _DMRG_MODES | {"mpo", "svd", "swap", "perm", "exact"}
+        _DMRG_MODES
+        | {"quimb", "mpo", "svd", "swap", "perm", "exact"}
+        | {f"quimb-{method}" for method in _MPO_COMPRESSION_METHODS}
+        | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
     )
 
     @classmethod
@@ -712,9 +776,54 @@ class MpsStabOptimizer:
         if mode == "fit":
             mode = "dmrg"
         if mode not in cls._ALLOWED_MODES:
-            allowed = ", ".join(sorted(cls._ALLOWED_MODES))
-            raise ValueError(f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}.")
+            allowed = (
+                "dmrg*, quimb[-<method>], mpo[-<method>] (legacy), "
+                "svd, swap, perm, or exact"
+            )
+            raise ValueError(
+                f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}."
+            )
         return mode
+
+    @classmethod
+    def _is_quimb_mode(cls, mode):
+        """Return whether ``mode`` selects native Quimb compression."""
+        mode = str(mode).strip().lower()
+        return mode == "quimb" or mode.startswith(("quimb-", "mpo-")) or mode == "mpo"
+
+    @classmethod
+    def _mode_quimb_method(cls, mode):
+        """Return the Quimb compression method encoded by ``mode``."""
+        mode = str(mode).strip().lower()
+        if mode in {"quimb", "mpo"}:
+            return "direct"
+        for prefix in ("quimb-", "mpo-"):
+            if mode.startswith(prefix):
+                return cls._normalize_quimb_method(mode[len(prefix) :])
+        return "direct"
+
+    @classmethod
+    def _normalize_quimb_method(cls, method):
+        """Validate and normalize a native Quimb compression method."""
+        method = str(method).strip().lower()
+        if method not in _MPO_COMPRESSION_METHODS:
+            allowed = ", ".join(sorted(_MPO_COMPRESSION_METHODS))
+            raise ValueError(f"Unknown Quimb compression method {method!r}; choose one of {allowed}.")
+        return method
+
+    @classmethod
+    def _normalize_fit_init_strategy(cls, strategy):
+        """Validate and normalize the disposable DMRG FIT initialization."""
+        strategy = str(strategy).strip().lower()
+        if strategy.startswith("guess-"):
+            strategy = "guess_" + strategy[len("guess-") :]
+        if strategy not in _FIT_INIT_STRATEGIES:
+            allowed = "auto, direct, random, random_expand, guess-<method>"
+            raise ValueError(
+                "fit_init_strategy must be one of "
+                f"{allowed}; got {strategy!r}."
+            )
+        return strategy
 
     @classmethod
     def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
@@ -2393,6 +2502,10 @@ class MpsStabOptimizer:
                 max_dense_cap_qubits=self.max_dense_cap_qubits,
                 track_infidelity=self.track_infidelity,
                 exact_cooling=self.exact_cooling,
+                fit_init_strategy=self.fit_init_strategy,
+                fit_init_rand_strength=self.fit_init_rand_strength,
+                fit_init_seed=self.fit_init_seed,
+                compression_seed=self.compression_seed,
                 dtype=self.dtype,
                 to_backend=self.to_backend,
                 inplace=True,
@@ -2920,11 +3033,12 @@ class MpsStabOptimizer:
 
         Parameters
         ----------
-        mode : {"exact", "mpo", "dmrg"}, default="exact"
+        mode : {"exact", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "dmrg"}, default="exact"
             ``"exact"`` applies the tableau circuit with unlimited bond and
-            zero cutoff. ``"mpo"`` applies it with ordinary MPS gate
-            compression, while ``"dmrg"`` uses the ordinary MPS variational
-            replay path. The latter two require ``chi``.
+            zero cutoff. Native Quimb modes use the same canonical
+            ``quimb-<method>`` names and legacy ``mpo-*`` aliases as the
+            ordinary MPS optimizer; ``"dmrg"`` uses its variational replay
+            path. Approximate modes require ``chi``.
         chi : int or None
             Maximum bond dimension for the approximate modes.
         cutoff : float, default=0.0
@@ -2950,8 +3064,13 @@ class MpsStabOptimizer:
             A new ordinary MPS. The STN optimizer is never mutated.
         """
         mode = str(mode).strip().lower()
-        if mode not in {"exact", "mpo", "dmrg"}:
-            raise ValueError("mode must be one of 'exact', 'mpo', or 'dmrg'.")
+        from ..mps.optimizer import MpsOptimizer  # pylint: disable=import-outside-toplevel
+
+        if mode != "exact" and mode not in MpsOptimizer._ALLOWED_MODES:
+            raise ValueError(
+                "mode must be 'exact', 'dmrg', or one of the ordinary MPS "
+                "compression modes."
+            )
         if not isinstance(logical_order, (bool, np.bool_)):
             raise TypeError("logical_order must be a boolean.")
         cutoff = float(cutoff)
@@ -3006,8 +3125,6 @@ class MpsStabOptimizer:
                         cutoff_mode="abs",
                     )
             return p
-
-        from ..mps.optimizer import MpsOptimizer  # pylint: disable=import-outside-toplevel
 
         options = dict(run_kwargs)
         options.setdefault("n_iter", n_iter)
@@ -3469,6 +3586,10 @@ class MpsStabOptimizer:
             max_dense_cap_qubits=self.max_dense_cap_qubits,
             track_infidelity=self.track_infidelity,
             exact_cooling=self.exact_cooling,
+            fit_init_strategy=self.fit_init_strategy,
+            fit_init_rand_strength=self.fit_init_rand_strength,
+            fit_init_seed=self.fit_init_seed,
+            compression_seed=self.compression_seed,
             dtype=self.dtype,
             to_backend=self.to_backend,
         )
@@ -4506,6 +4627,69 @@ class MpsStabOptimizer:
             return True
         return False
 
+    def _quimb_compress_opts(self, method):
+        """Return the Quimb options shared by coefficient-MPO updates."""
+        opts = {
+            "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else self.cutoff,
+        }
+        if self.compression_seed is not None and method in _MPO_METHODS_USE_SEED:
+            opts["seed"] = self.compression_seed
+        if method == "fit-projector":
+            # Match the ordinary MPS path: projector fitting does not need the
+            # optional pre-gauge and is safer on exact product-state bonds.
+            opts["canonize"] = False
+        return opts
+
+    def _apply_quimb_submpo(self, p, mpo, where, *, method, max_bond, info):
+        """Apply one coefficient-frame sub-MPO with the selected Quimb method."""
+        method = self._normalize_quimb_method(method)
+        requires_chi = {
+            "sdc-oversample",
+            "src",
+            "src-first",
+            "src-oversample",
+            "srcmps",
+            "srcmps-first",
+            "srcmps-oversample",
+            "fit-oversample",
+        }
+        if max_bond is None and method in requires_chi:
+            raise ValueError(
+                f"MpsStabOptimizer mode {method!r} requires a finite chi."
+            )
+
+        opts = self._quimb_compress_opts(method)
+        is_interior = min(where) > 0 or max(where) < int(p.L) - 1
+        use_workaround = (
+            method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
+            and is_interior
+            and (max_bond is not None or method.startswith("fit-"))
+        )
+        if use_workaround:
+            return _apply_submpo_with_interior_workaround(
+                p,
+                mpo,
+                where,
+                chi=max_bond,
+                method=method,
+                cutoff=self.cutoff,
+                cutoff_mode=None,
+                info=info,
+                inplace_mpo=False,
+                seed=self.compression_seed,
+            )
+
+        p.gate_with_submpo_(
+            mpo,
+            where=where,
+            method=method,
+            max_bond=max_bond,
+            info=info,
+            inplace_mpo=False,
+            **opts,
+        )
+        return p
+
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
         # Validate the complete support before either the tableau or MPS changes.
@@ -4560,13 +4744,18 @@ class MpsStabOptimizer:
         else:
             p = self.state.p
             self._ensure_p_center()
-            info = self.state.info
-            p.gate_with_submpo_(
+            method = (
+                self._mode_quimb_method(self.mode)
+                if self._is_quimb_mode(self.mode)
+                else "direct"
+            )
+            self._apply_quimb_submpo(
+                p,
                 mpo,
-                where=where,
+                where,
+                method=method,
                 max_bond=None if self.mode == "exact" else self.chi,
-                cutoff=self.cutoff,
-                info=info,
+                info=self.state.info,
             )
         infidelity = self._unitary_norm_infidelity() if unitary else None
         if renormalize:
@@ -4576,14 +4765,190 @@ class MpsStabOptimizer:
             self._commit_norm_event(norm_event, projected_norm=projected_norm)
         return infidelity
 
-    def _fit_coefficient_target(self, target, where):
+    @staticmethod
+    def _fit_random_data(data, shape, *, strength, rng):
+        """Generate backend-compatible random data for a disposable FIT guess."""
+        dtype_name = str(getattr(data, "dtype", "float64"))
+        if "complex64" in dtype_name:
+            random_dtype = np.complex64
+            real_dtype = np.float32
+        elif "complex" in dtype_name:
+            random_dtype = np.complex128
+            real_dtype = np.float64
+        elif "float32" in dtype_name:
+            random_dtype = np.float32
+            real_dtype = np.float32
+        else:
+            random_dtype = np.float64
+            real_dtype = np.float64
+        values = rng.normal(size=tuple(shape)).astype(real_dtype)
+        if np.issubdtype(random_dtype, np.complexfloating):
+            values = values + 1j * rng.normal(size=tuple(shape)).astype(real_dtype)
+        return ar.do(
+            "array",
+            (float(strength) * values).astype(random_dtype),
+            like=data,
+        )
+
+    def _fit_randomized_guess(self, p, where, *, block_size, expand):
+        """Build a deterministic dense random FIT guess when rank can grow."""
+        if (
+            block_size not in {2, 3}
+            or self.chi is None
+            or self.fit_init_rand_strength == 0.0
+            or self.backend == "symmray"
+            or p.isfermionic()
+        ):
+            return p
+
+        start, stop = min(where), max(where)
+        try:
+            active = FIT._active_bond_rank_targets(  # pylint: disable=protected-access
+                p,
+                start,
+                stop,
+                self.chi,
+            )
+        except (AttributeError, TypeError, ValueError):
+            active = None
+        if not active:
+            return p
+
+        guess = p.copy(deep=True)
+        rng = np.random.default_rng(self.fit_init_seed)
+        if expand:
+            bonds = []
+            for site, target_size in zip(range(start, stop), active):
+                current_size = int(p.bond_size(site, site + 1))
+                target_size = int(target_size)
+                if current_size < target_size:
+                    bonds.append((site, current_size, target_size))
+            if not bonds:
+                return p
+            for target_size in sorted({target for _, _, target in bonds}):
+                inds = [
+                    guess.bond(site, site + 1)
+                    for site, _, target in bonds
+                    if target == target_size
+                ]
+                qtn.TensorNetwork.expand_bond_dimension(
+                    guess,
+                    target_size,
+                    mode="zeros",
+                    inds_to_expand=inds,
+                    inplace=True,
+                )
+                for site, current_size, target in bonds:
+                    if target != target_size:
+                        continue
+                    bond = guess.bond(site, site + 1)
+                    for tensor in guess.tensors:
+                        if bond not in tensor.inds:
+                            continue
+                        axis = tensor.inds.index(bond)
+                        old_slices = [slice(None)] * tensor.ndim
+                        old_slices[axis] = slice(0, current_size)
+                        shape = list(tensor.shape)
+                        shape[axis] = target_size - current_size
+                        random_data = self._fit_random_data(
+                            tensor.data,
+                            shape,
+                            strength=self.fit_init_rand_strength,
+                            rng=rng,
+                        )
+                        tensor.modify(
+                            data=ar.do(
+                                "concatenate",
+                                (
+                                    tensor.data[tuple(old_slices)],
+                                    random_data,
+                                ),
+                                axis=axis,
+                            )
+                        )
+        else:
+            for site in range(start, stop + 1):
+                tensor = guess[site]
+                tensor.modify(
+                    data=ar.do(
+                        "add",
+                        tensor.data,
+                        self._fit_random_data(
+                            tensor.data,
+                            tensor.shape,
+                            strength=self.fit_init_rand_strength,
+                            rng=rng,
+                        ),
+                    )
+                )
+        guess_info = {}
+        guess.canonize([start, stop], info=guess_info)
+        return guess
+
+    def _fit_initial_guess(self, p, mpo, where, *, block_size):
+        """Select an isolated FIT guess without changing the live coefficient MPS."""
+        strategy = self.fit_init_strategy
+        if (
+            mpo is None
+            or block_size not in {2, 3}
+            or self.chi is None
+            or self.backend == "symmray"
+            or p.isfermionic()
+        ):
+            return p
+
+        start, stop = min(where), max(where)
+        try:
+            at_target = FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+                p,
+                start,
+                stop,
+                self.chi,
+            )
+        except (AttributeError, TypeError, ValueError):
+            at_target = True
+        if at_target:
+            return p
+
+        if strategy == "auto":
+            strategy = "guess_zipup"
+        if strategy == "svd_guess":
+            strategy = "guess_direct"
+        if strategy.startswith("guess_"):
+            method = strategy[len("guess_") :]
+            guess = p.copy(deep=True)
+            self._apply_quimb_submpo(
+                guess,
+                mpo,
+                where,
+                method=method,
+                max_bond=self.chi,
+                info={},
+            )
+            return guess
+        if strategy in {"random", "random_expand"}:
+            return self._fit_randomized_guess(
+                p,
+                where,
+                block_size=block_size,
+                expand=strategy == "random_expand",
+            )
+        return p
+
+    def _fit_coefficient_target(self, target, where, *, guess_mpo=None):
         """Fit a coefficient-MPS target with the selected DMRG schedule."""
         p = self.state.p
         start, stop = min(where), max(where)
         block_size = 3 if self.mode == "dmrg3" else 2
+        fit_guess = self._fit_initial_guess(
+            p,
+            guess_mpo,
+            where,
+            block_size=block_size,
+        )
         fit = FIT(
             target,
-            p=p,
+            p=fit_guess,
             cutoffs=self.cutoff,
             retag=False,
             range_int=[start, stop],
@@ -4622,7 +4987,7 @@ class MpsStabOptimizer:
             info={},
             inplace_mpo=False,
         )
-        self._fit_coefficient_target(target, where)
+        self._fit_coefficient_target(target, where, guess_mpo=mpo)
 
     # ------------------------------------------------------------------ #
     # Measurement (Lemma 3; non-unitary |nu> update)
@@ -6119,6 +6484,7 @@ class MpsStabOptimizer:
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
             f"MpsStabOptimizer(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
+            f"fit_init_strategy={self.fit_init_strategy!r}, "
             f"operator_tol={self.operator_tol}, "
             f"max_pauli_decomposition_qubits="
             f"{self.max_pauli_decomposition_qubits}, "

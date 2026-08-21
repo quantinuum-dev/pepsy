@@ -16,7 +16,19 @@ finite `chi` compresses the mapped operator with the normal diagnostics. The
 coefficient-MPS compression backend is selected with `mode="mpo"` (the
 default), `"dmrg"`/`"dmrg1"`/`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`,
 `"perm"`, or `"exact"`. `mode="exact"` forces `chi=None`; Clifford tableau
-updates remain free in every mode.
+updates remain free in every mode. Canonical Quimb compression names use
+`mode="quimb-<method>"`, with `"quimb"` as the direct alias. The historical
+`"mpo-<method>"` and `"mpo"` names remain supported. Methods include
+`direct`, `dm`, `zipup`, SDC/SRC/SRCMPS variants, and the Quimb `fit-*`
+variants.
+
+For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
+Quimb-compressed FIT guess before active bonds reach their `chi` ceilings;
+`"guess-zipup"` is the default. `"direct"`, `"random"`,
+`"random_expand"`, and `"svd_guess"` are also supported. The underscore
+spelling, for example `"guess_zipup"`, remains a compatibility alias. Set
+`compression_seed` separately from the STN measurement `seed` for randomized
+Quimb methods.
 
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are
