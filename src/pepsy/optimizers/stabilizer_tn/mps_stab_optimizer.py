@@ -72,6 +72,7 @@ from ..mps.optimizer import (
     _MPO_METHODS_NEED_INTERIOR_WORKAROUND,
     _MPO_METHODS_USE_SEED,
     _apply_submpo_with_interior_workaround,
+    _run_seeded_quimb,
     _resolve_conditional,
     conditional_event_parts,
     is_submpo_event,
@@ -4632,8 +4633,6 @@ class MpsStabOptimizer:
         opts = {
             "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else self.cutoff,
         }
-        if self.compression_seed is not None and method in _MPO_METHODS_USE_SEED:
-            opts["seed"] = self.compression_seed
         if method == "fit-projector":
             # Match the ordinary MPS path: projector fitting does not need the
             # optional pre-gauge and is safer on exact product-state bonds.
@@ -4644,7 +4643,6 @@ class MpsStabOptimizer:
         """Apply one coefficient-frame sub-MPO with the selected Quimb method."""
         method = self._normalize_quimb_method(method)
         requires_chi = {
-            "sdc-oversample",
             "src",
             "src-first",
             "src-oversample",
@@ -4679,7 +4677,14 @@ class MpsStabOptimizer:
                 seed=self.compression_seed,
             )
 
-        p.gate_with_submpo_(
+        seed = (
+            self.compression_seed
+            if method in _MPO_METHODS_USE_SEED
+            else None
+        )
+        _run_seeded_quimb(
+            seed,
+            p.gate_with_submpo_,
             mpo,
             where=where,
             method=method,

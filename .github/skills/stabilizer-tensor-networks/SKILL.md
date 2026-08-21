@@ -45,7 +45,7 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 - **Coefficient-MPS compression methods** use the canonical `quimb-<method>`
   mode family, with `quimb` as the direct alias. The historical `mpo-<method>`
   and `mpo` spellings remain supported. Every Quimb direct, density-matrix,
-  zip-up, SDC, SRC, SRCMPS, and `fit-*` method is forwarded to
+  zip-up, SRC, SRCMPS, and `fit-*` method is forwarded to
   `gate_with_submpo_`; randomized methods accept the separate
   `compression_seed` control. DMRG modes use a disposable
   `fit_init_strategy="guess-<method>"` (default `guess-zipup`) before active

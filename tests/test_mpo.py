@@ -39,6 +39,18 @@ def _two_term_mpo():
     )
 
 
+def _symmray_mpo_to_dense(mpo):
+    """Unfuse Symmray sectors before comparing in physical basis order."""
+    value = mpo.to_dense()
+    if hasattr(value, "unfuse_all"):
+        value = value.unfuse_all()
+    if hasattr(value, "to_dense"):
+        value = value.to_dense()
+    value = np.asarray(value)
+    dimension = int(round(np.sqrt(value.size)))
+    return value.reshape(dimension, dimension)
+
+
 def test_first_degree_mpo_public_exports_resolve():
     """The new semantic MPO layer belongs to ``pepsy.operators``."""
     assert FirstDegreeMPO is pepsy.operators.FirstDegreeMPO
@@ -965,17 +977,306 @@ def test_extensive_exponential_streaming_and_sparse_storage_match_dense():
         cache_history=False,
         history_storage="sparse",
     )
+    block_sparse = H.extensive_exponential(
+        0.01,
+        order=3,
+        mode="optimal",
+        cache_history=False,
+        history_storage="block_sparse",
+    )
 
     expected = dense.to_mpo().to_dense()
     np.testing.assert_allclose(streaming.to_mpo().to_dense(), expected)
     np.testing.assert_allclose(sparse.to_mpo().to_dense(), expected)
+    np.testing.assert_allclose(block_sparse.to_mpo().to_dense(), expected)
     assert streaming.metadata["history_storage"] == "streaming"
     assert sparse.metadata["history_storage"] == "sparse"
+    assert block_sparse.metadata["history_storage"] == "block_sparse"
+    assert block_sparse.is_block_sparse
+    assert all(count > 0 for count in block_sparse.sparse_block_counts)
     assert sparse.metadata["history_storage_blocks"]["stored_blocks"] < (
         sparse.metadata["history_storage_blocks"]["total_blocks"]
     )
+    block_info = block_sparse.metadata["history_storage_blocks"]
+    assert block_info["stored_blocks"] < block_info["total_blocks"]
+    assert block_info["materialized_dense_virtual_tensors"] is False
     assert streaming.history_cache_info["orders"] == ()
     assert sparse.history_cache_info["orders"] == ()
+    assert block_sparse.history_cache_info["orders"] == ()
+
+
+def test_block_sparse_history_preserves_torch_autograd():
+    """Sparse virtual transforms keep backend blocks in the autodiff graph."""
+    torch = pytest.importorskip("torch")
+    x, _, z = _paulis()
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        3,
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=coefficient),
+            MPOProductTerm((1, 2), (z, z)),
+        ],
+    )
+
+    exponential = hamiltonian.extensive_exponential(
+        step,
+        order=2,
+        mode="approximate",
+        history_storage="block_sparse",
+    )
+    loss = sum(array.real.sum() for array in exponential.arrays)
+    coefficient_gradient, step_gradient = torch.autograd.grad(
+        loss,
+        (coefficient, step),
+    )
+
+    assert exponential.is_block_sparse
+    assert torch.isfinite(coefficient_gradient)
+    assert torch.isfinite(step_gradient)
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "physical_charges", "forward_charge", "backward_charge"),
+    [
+        ("U1", (0, 1), -1, 1),
+        ("Z2", (0, 1), 1, 1),
+        ("U1U1", ((0, 0), (1, 0)), (-1, 0), (1, 0)),
+        ("Z2Z2", ((0, 0), (1, 0)), (1, 0), (1, 0)),
+    ],
+)
+def test_higher_order_block_sparse_symmetry_matches_dense_mpo(
+    symmetry,
+    physical_charges,
+    forward_charge,
+    backward_charge,
+):
+    """Algorithms 1--4 compile directly to native Abelian charge blocks."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    diagonal = np.diag([-0.2, 0.2])
+    terms = []
+    for left_site in (0, 1):
+        terms.extend([
+            MPOProductTerm(
+                (left_site, left_site + 1),
+                (raising, lowering),
+                charge=forward_charge,
+            ),
+            MPOProductTerm(
+                (left_site, left_site + 1),
+                (lowering, raising),
+                charge=backward_charge,
+            ),
+        ])
+    terms.extend(
+        MPOProductTerm((site,), (diagonal,))
+        for site in range(3)
+    )
+    symmetric_h = FirstDegreeMPO.from_local_terms(
+        3,
+        terms,
+        symmetry=symmetry,
+        physical_charges=physical_charges,
+    )
+    dense_h = FirstDegreeMPO.from_local_terms(3, terms)
+
+    symmetric_u = symmetric_h.extensive_exponential(
+        -0.01j,
+        order=2,
+        mode="approximate",
+    )
+    dense_u = dense_h.extensive_exponential(
+        -0.01j,
+        order=2,
+        mode="approximate",
+        history_storage="dense",
+    )
+    compiled = symmetric_u.to_mpo()
+
+    assert symmetric_u.is_block_sparse
+    assert symmetric_u.metadata["history_storage"] == "block_sparse"
+    assert all(
+        type(tensor.data).__name__ == f"{symmetry}Array"
+        for tensor in compiled.tensors
+    )
+    storage = symmetric_u.metadata["history_storage_blocks"]
+    assert storage["stored_blocks"] < storage["total_blocks"]
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(compiled),
+        dense_u.to_mpo().to_dense(),
+    )
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(symmetric_h.to_mpo()),
+        dense_h.to_mpo().to_dense(),
+    )
+
+
+def test_higher_order_symmetry_rejects_incorrect_virtual_charge():
+    """A nonzero block cannot be silently placed in the wrong charge sector."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        2,
+        [MPOProductTerm((0, 1), (raising, lowering), charge=1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    with pytest.raises(ValueError, match="violates the configured U1 charge flow"):
+        hamiltonian.to_mpo()
+
+
+def test_u1_symmetry_supports_degenerate_physical_sectors():
+    """Sector blocks retain every local basis state inside a charge degeneracy."""
+    pytest.importorskip("symmray")
+    raising = np.zeros((4, 4))
+    raising[1, 0] = 1.0
+    raising[2, 0] = -0.5
+    raising[3, 1] = 0.75
+    raising[3, 2] = 0.25
+    lowering = raising.T
+    terms = [
+        MPOProductTerm((0, 1), (raising, lowering), charge=-1),
+        MPOProductTerm((0, 1), (lowering, raising), charge=1),
+    ]
+    symmetric_h = FirstDegreeMPO.from_local_terms(
+        2,
+        terms,
+        symmetry="U1",
+        physical_charges=(0, 1, 1, 2),
+    )
+    dense_h = FirstDegreeMPO.from_local_terms(2, terms)
+    symmetric_u = symmetric_h.exp(-0.01j, order=2, mode="base")
+    dense_u = dense_h.exp(
+        -0.01j,
+        order=2,
+        mode="base",
+        history_storage="dense",
+    )
+
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(symmetric_u.to_mpo()),
+        dense_u.to_mpo().to_dense(),
+    )
+
+
+def test_symmetry_requires_contiguous_physical_charge_sectors():
+    """Reject a dense basis order that Symmray cannot represent unchanged."""
+    with pytest.raises(ValueError, match="group equal charge sectors contiguously"):
+        FirstDegreeMPO.from_local_terms(
+            1,
+            [MPOProductTerm((0,), (np.eye(3),))],
+            symmetry="U1",
+            physical_charges=(0, 1, 0),
+        )
+
+
+def test_one_site_u1_exponential_compiles_native_rank_two_array():
+    """The local Taylor path uses the same symmetric compilation boundary."""
+    pytest.importorskip("symmray")
+    diagonal = np.diag([-0.3, 0.7])
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (diagonal,))],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    exponential = hamiltonian.exp(-0.02j, order=4, mode="optimal")
+    compiled = exponential.to_mpo()
+
+    assert type(compiled.tensors[0].data).__name__ == "U1Array"
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(compiled),
+        exponential.arrays[0][0, 0],
+    )
+
+
+def test_one_site_u1_zero_operator_retains_native_complex_dtype():
+    """Symmray receives a valid zero sector even when every entry vanishes."""
+    pytest.importorskip("symmray")
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (np.zeros((2, 2), dtype=complex),))],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    compiled = hamiltonian.to_mpo()
+
+    assert type(compiled.tensors[0].data).__name__ == "U1Array"
+    assert np.issubdtype(compiled.tensors[0].data.dtype, np.complexfloating)
+    np.testing.assert_array_equal(
+        _symmray_mpo_to_dense(compiled),
+        np.zeros((2, 2)),
+    )
+
+
+def test_mpo_basis_preserves_symmetry_for_parameterized_exponential():
+    """Reusable coefficient binding keeps charge metadata and sparse history."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    basis = MPOBasis.from_local_terms(
+        2,
+        [
+            MPOProductTerm(
+                (0, 1),
+                (raising, lowering),
+                coefficient=MPOParameter("J"),
+                charge=-1,
+            ),
+            MPOProductTerm(
+                (0, 1),
+                (lowering, raising),
+                coefficient=MPOParameter("J"),
+                charge=1,
+            ),
+        ],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    exponential = basis.exp(
+        -0.01j,
+        {"J": 0.7},
+        order=2,
+        mode="base",
+    )
+
+    assert exponential.symmetry == "U1"
+    assert exponential.physical_charges == (0, 1)
+    assert exponential.is_block_sparse
+    assert all(
+        type(tensor.data).__name__ == "U1Array"
+        for tensor in exponential.to_mpo().tensors
+    )
+
+    compiled = basis.compile_exp(order=2, mode="base")
+    compiled_exponential = compiled.exp(-0.01j, {"J": 0.7})
+    assert compiled_exponential.symmetry == "U1"
+    assert compiled_exponential.is_block_sparse
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(compiled_exponential.to_mpo()),
+        _symmray_mpo_to_dense(exponential.to_mpo()),
+    )
+
+
+def test_higher_order_symmetry_rejects_graded_fermionic_compilation():
+    """Bosonic history tensors must not claim sign-correct fermionic output."""
+    pytest.importorskip("symmray")
+    diagonal = np.diag([0.0, 1.0])
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (diagonal,))],
+        symmetry="U1",
+        physical_charges=(0, 1),
+        fermionic=True,
+    )
+
+    with pytest.raises(NotImplementedError, match="sign-preserving"):
+        hamiltonian.to_mpo()
 
 
 def test_extensive_exponential_supports_generic_order_three_histories():

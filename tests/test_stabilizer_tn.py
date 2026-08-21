@@ -1087,8 +1087,6 @@ def test_coefficient_compression_modes_preserve_stn_state(mode):
         "zipup",
         "zipup-first",
         "zipup-oversample",
-        "sdc",
-        "sdc-oversample",
         "src",
         "src-first",
         "src-oversample",

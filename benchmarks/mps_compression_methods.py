@@ -38,8 +38,6 @@ METHODS = (
     "zipup",
     "zipup-first",
     "zipup-oversample",
-    "sdc",
-    "sdc-oversample",
     "src",
     "src-first",
     "src-oversample",

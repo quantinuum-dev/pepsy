@@ -1,7 +1,10 @@
-# Pepsy documentation
+# PePsY documentation
 
-Pepsy is a tensor-network library for contraction, simulation, optimization,
+PePsY is a tensor-network library for contraction, simulation, optimization,
 sampling, symmetric tensors, and variational Monte Carlo workflows.
+
+**PePsY** is a stylized shorthand for “PEPS in Python.” The public project
+name uses `PePsY`; the Python package and import name remain `pepsy`.
 
 ## Start here
 

@@ -19,7 +19,7 @@ default), `"dmrg"`/`"dmrg1"`/`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`,
 updates remain free in every mode. Canonical Quimb compression names use
 `mode="quimb-<method>"`, with `"quimb"` as the direct alias. The historical
 `"mpo-<method>"` and `"mpo"` names remain supported. Methods include
-`direct`, `dm`, `zipup`, SDC/SRC/SRCMPS variants, and the Quimb `fit-*`
+`direct`, `dm`, `zipup`, SRC/SRCMPS variants, and the Quimb `fit-*`
 variants.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated

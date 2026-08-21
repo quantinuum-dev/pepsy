@@ -8,8 +8,9 @@ retains enough structure for exact algebra and history compression.
 
 The implementation is finite-chain and exact at this stage.  The extensive
 Taylor construction is assembled from local MPO blocks and virtual channels;
-it never forms a global operator matrix.  Numerical bond truncation and native
-Symmray compilation remain separate follow-up layers.
+it never forms a global operator matrix. Numerical bond truncation remains an
+explicit separate layer, while optional Abelian metadata compiles native
+Symmray blocks at the Quimb boundary.
 
 Design contract
 ---------------
@@ -23,8 +24,9 @@ object on the compiled MPO.
 The exact paths only use local tensor operations and exact equality checks.
 ``mode="algorithm4"`` is deliberately separate because Algorithm 4 changes the
 analytical history representation even though it does not use an SVD cutoff.
-This module currently targets ordinary NumPy/Autoray-compatible tensors and
-finite open chains; fermionic/Symmray compilation is a future backend layer.
+This module targets ordinary NumPy/Autoray-compatible tensors and finite open
+chains. Native bosonic Abelian Symmray output accepts NumPy local blocks;
+graded fermionic histories remain a future sign-preserving backend layer.
 """
 
 from __future__ import annotations
@@ -45,6 +47,11 @@ from .mpo_automaton import (
     _backend_reference,
     _backend_name,
     _multiply_scalar,
+)
+from ._mpo_sparse import (
+    SparseVirtualTensor,
+    normalize_charge,
+    symmray_arrays_from_sparse,
 )
 
 __all__ = [
@@ -121,9 +128,11 @@ class MPOProductTerm:
 
     ``sites`` and ``operators`` describe only the non-identity factors.  A
     string operator can be supplied for fermion-compatible automaton routes,
-    but this higher-order implementation does not enable native fermionic
-    compilation yet.  ``charge`` is carried as metadata for a future
-    block-sparse backend and is not interpreted by this class.
+    but the higher-order block-sparse backend is currently bosonic. With
+    symmetry metadata configured on :class:`FirstDegreeMPO`, ``charge`` is the
+    virtual channel charge after the first non-identity factor. For example,
+    a U1 raising/lowering product has the negative of the raising operator's
+    charge because the left MPO virtual leg is dualized.
     """
 
     sites: tuple[int, ...]
@@ -371,6 +380,35 @@ def _as_4d(data, *, site, length):
     return out
 
 
+def _sparse_virtual_to_dense(tensor):
+    """Materialize one sparse virtual tensor on its local block backend."""
+    if not tensor.blocks:
+        return np.zeros(tensor.shape)
+    rows = np.fromiter((key[0] for key in tensor.blocks), dtype=int)
+    columns = np.fromiter((key[1] for key in tensor.blocks), dtype=int)
+    values = _stack(tuple(tensor.blocks.values()), axis=0)
+    result = _zeros(tensor.shape, like=values)
+    return _scatter_add_2d(result, rows, columns, values)
+
+
+def _dense_virtual_to_sparse(array):
+    """Convert a NumPy virtual tensor to retained operator-valued blocks."""
+    if _backend_name(array) not in {"builtins", "numpy"}:
+        raise TypeError(
+            "native block-sparse Symmray MPO compilation currently requires "
+            "NumPy local tensors."
+        )
+    blocks = {
+        (left, right): array[left, right]
+        for left in range(array.shape[0])
+        for right in range(array.shape[1])
+        if np.any(array[left, right])
+    }
+    if not blocks:
+        blocks[(0, 0)] = array[0, 0]
+    return SparseVirtualTensor(array.shape, blocks)
+
+
 def _pauli_matrix(label):
     """Return a dense one-qubit Pauli matrix for a single-character label."""
     label = str(label).upper()
@@ -427,6 +465,13 @@ def _concat(blocks, *, axis):
 
 def _drop_axis(array, axis, position):
     """Remove one virtual channel for the sequential reference primitive."""
+    if isinstance(array, SparseVirtualTensor):
+        groups = [
+            {source: 1.0}
+            for source in range(array.shape[axis])
+            if source != int(position)
+        ]
+        return array.apply_axis_groups(groups, axis=axis)
     size = int(array.shape[axis])
     if size <= 1:
         raise ValueError("cannot remove the last virtual channel.")
@@ -460,6 +505,8 @@ def _backend_index_pairs(array, rows, columns):
 
 def _scatter_add_2d(array, rows, columns, values):
     """Scatter-add paired virtual blocks without leaving the backend graph."""
+    if isinstance(array, SparseVirtualTensor):
+        return array.scatter_add(rows, columns, values)
     backend = ar.infer_backend(array)
     value_dtype = getattr(values, "dtype", None)
     if value_dtype is not None and getattr(array, "dtype", None) != value_dtype:
@@ -588,8 +635,7 @@ def _history_transfer_matrix(groups, old_size):
 def _apply_history_transfer(array, transfer, *, axis):
     """Apply a cached virtual transfer map with one backend contraction."""
     transfer = _as_backend(transfer, like=array)
-    if getattr(transfer, "dtype", None) != getattr(array, "dtype", None):
-        transfer = ar.do("astype", transfer, array.dtype)
+    array, transfer = _align_tensordot_dtypes(array, transfer)
     mapped = ar.do(
         "tensordot",
         transfer,
@@ -764,6 +810,15 @@ class FirstDegreeMPO:
         boundary bonds.  When omitted, neutral level metadata is generated.
     degree : int, default=1
         Algebraic degree represented by the expression.
+    symmetry : {"U1", "Z2", "U1U1", "Z2Z2"}, optional
+        Abelian symmetry used when compiling to native Symmray tensors.
+    physical_charges : sequence, optional
+        Charge of each local dense basis state, in physical-index order. Equal
+        charges must form contiguous sectors.
+    fermionic : bool, default=False
+        Request graded Symmray tensors. The higher-order block-sparse backend
+        currently rejects this option until native fermionic history signs are
+        represented semantically.
     """
 
     def __init__(
@@ -772,6 +827,9 @@ class FirstDegreeMPO:
         *,
         levels=None,
         degree=1,
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         site_tag_id="I{}",
@@ -792,6 +850,13 @@ class FirstDegreeMPO:
         self.lower_ind_id = lower_ind_id
         self.site_tag_id = site_tag_id
         self.metadata = dict(metadata or {})
+        self.symmetry = None if symmetry is None else str(symmetry)
+        self.physical_charges = (
+            None
+            if physical_charges is None
+            else tuple(physical_charges)
+        )
+        self.fermionic = bool(fermionic)
         # Keep this attribute present on every instance so callers do not
         # need to probe for it after an optional compression stage. It is
         # populated by ``compress_exact`` or ``extensive_exponential``.
@@ -816,6 +881,53 @@ class FirstDegreeMPO:
         self._base_level_position_cache = None
         self._levels = self._normalize_levels(levels)
         self._validate()
+        self._validate_symmetry()
+
+    def _validate_symmetry(self):
+        """Validate optional native block-sparse compilation metadata."""
+        if self.symmetry is None:
+            if self.physical_charges is not None:
+                raise ValueError("physical_charges requires symmetry metadata.")
+            if self.fermionic:
+                raise ValueError("fermionic=True requires symmetry metadata.")
+            return
+        if self.physical_charges is None:
+            raise ValueError("symmetry requires physical_charges.")
+        if len(self.physical_charges) != self.phys_dim:
+            raise ValueError(
+                "physical_charges must contain one charge per local basis "
+                f"state, expected {self.phys_dim}."
+            )
+        if self.symmetry not in {"U1", "Z2", "U1U1", "Z2Z2"}:
+            raise ValueError(
+                "block-sparse MPO symmetry must be 'U1', 'Z2', 'U1U1', "
+                "or 'Z2Z2'."
+            )
+        self.physical_charges = tuple(
+            normalize_charge(charge, self.symmetry)
+            for charge in self.physical_charges
+        )
+        closed_sectors = set()
+        sentinel = object()
+        previous = sentinel
+        for charge in self.physical_charges:
+            if charge != previous:
+                if charge in closed_sectors:
+                    raise ValueError(
+                        "physical_charges must group equal charge sectors "
+                        "contiguously in the local dense basis."
+                    )
+                if previous is not sentinel:
+                    closed_sectors.add(previous)
+                previous = charge
+
+    def _symmetry_options(self):
+        """Return constructor options that preserve native symmetry metadata."""
+        return {
+            "symmetry": self.symmetry,
+            "physical_charges": self.physical_charges,
+            "fermionic": self.fermionic,
+        }
 
     def _normalize_levels(self, levels):
         if levels is None:
@@ -878,10 +990,33 @@ class FirstDegreeMPO:
     def arrays(self):
         """Read-only tuple of normalized ``(left, right, up, down)`` tensors.
 
-        The tuple itself is immutable, but the backend tensors are returned
-        by reference to preserve Autoray dtype/device/backend behavior.
+        The tuple itself is immutable, and dense backend tensors are returned
+        by reference to preserve Autoray dtype/device/backend behavior. A
+        block-sparse history result is materialized only when this dense-array
+        compatibility property is explicitly read; :meth:`to_mpo` compiles it
+        directly into Symmray sectors when symmetry metadata is present.
         """
-        return self._arrays
+        return tuple(
+            _sparse_virtual_to_dense(array)
+            if isinstance(array, SparseVirtualTensor)
+            else array
+            for array in self._arrays
+        )
+
+    @property
+    def is_block_sparse(self):
+        """Whether local tensors retain sparse operator-valued virtual blocks."""
+        return all(isinstance(array, SparseVirtualTensor) for array in self._arrays)
+
+    @property
+    def sparse_block_counts(self):
+        """Stored virtual block count per site, or ``None`` for dense tensors."""
+        return tuple(
+            array.stored_blocks
+            if isinstance(array, SparseVirtualTensor)
+            else None
+            for array in self._arrays
+        )
 
     @property
     def levels(self):
@@ -912,6 +1047,7 @@ class FirstDegreeMPO:
             self._arrays,
             levels=self.levels,
             degree=self.degree,
+            **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
@@ -952,6 +1088,9 @@ class FirstDegreeMPO:
         out.upper_ind_id = self.upper_ind_id
         out.lower_ind_id = self.lower_ind_id
         out.site_tag_id = self.site_tag_id
+        out.symmetry = self.symmetry
+        out.physical_charges = self.physical_charges
+        out.fermionic = self.fermionic
         out.metadata = {}
         out.compression_report = None
         out._structural_transitions = self._structural_transitions
@@ -1108,19 +1247,39 @@ class FirstDegreeMPO:
         """
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
-        # Quimb is the stable tensor-network interchange boundary: callers
-        # can immediately use the returned object with existing contraction,
-        # compression, and MPS-application APIs. The semantic object remains
-        # attached for code that needs the level histories later. Keeping this
-        # adapter one-way avoids duplicating Quimb's MPO implementation here.
-        if self.L == 1:
-            compiled_arrays = (self._arrays[0][0, 0],)
-        else:
-            compiled_arrays = (
-                self._arrays[0][0],
-                *self._arrays[1:-1],
-                self._arrays[-1][:, 0],
+        # Quimb is the stable tensor-network interchange boundary. Native
+        # symmetry metadata selects direct Symmray block compilation; this
+        # avoids ever allocating the full dense virtual tensors retained only
+        # for compatibility by ``arrays``.
+        if self.symmetry is not None:
+            sparse_arrays = tuple(
+                array
+                if isinstance(array, SparseVirtualTensor)
+                else _dense_virtual_to_sparse(array)
+                for array in self._arrays
             )
+            compiled_arrays = symmray_arrays_from_sparse(
+                sparse_arrays,
+                self._levels,
+                symmetry=self.symmetry,
+                physical_charges=self.physical_charges,
+                fermionic=self.fermionic,
+            )
+        else:
+            dense_arrays = tuple(
+                _sparse_virtual_to_dense(array)
+                if isinstance(array, SparseVirtualTensor)
+                else array
+                for array in self._arrays
+            )
+            if self.L == 1:
+                compiled_arrays = (dense_arrays[0][0, 0],)
+            else:
+                compiled_arrays = (
+                    dense_arrays[0][0],
+                    *dense_arrays[1:-1],
+                    dense_arrays[-1][:, 0],
+                )
         mpo = qtn.MatrixProductOperator(
             compiled_arrays,
             shape="lrud",
@@ -1280,9 +1439,10 @@ class FirstDegreeMPO:
             output.compression_report = report
             return (output, report) if return_report else output
 
+        source_arrays = self.arrays
         arrays = []
         carry = None
-        for site, array in enumerate(self._arrays[:-1]):
+        for site, array in enumerate(source_arrays[:-1]):
             if site == 0:
                 combined = array
             else:
@@ -1321,7 +1481,7 @@ class FirstDegreeMPO:
         # Absorb the final tensor without another factorization. Its right
         # boundary is retained, preserving the normalized MPO layout.
         arrays.append(
-            ar.do("tensordot", carry, self._arrays[-1], axes=([1], [0]))
+            ar.do("tensordot", carry, source_arrays[-1], axes=([1], [0]))
         )
         final_bond_dimensions = tuple(
             int(array.shape[1]) for array in arrays[:-1]
@@ -1663,11 +1823,20 @@ class FirstDegreeMPO:
         # a convenient product-state constructor often returns NumPy tensors;
         # align that fixed state data to the observable backend without
         # touching the observable's differentiable tensors.
+        local_values = (
+            value
+            for array in self._arrays
+            for value in (
+                array.blocks.values()
+                if isinstance(array, SparseVirtualTensor)
+                else (array,)
+            )
+        )
         reference = next(
             (
-                array
-                for array in self._arrays
-                if _backend_name(array) not in {"builtins", "numpy"}
+                value
+                for value in local_values
+                if _backend_name(value) not in {"builtins", "numpy"}
             ),
             None,
         )
@@ -1691,12 +1860,13 @@ class FirstDegreeMPO:
     def scale(self, coefficient):
         """Return ``coefficient * self`` by scaling one boundary tensor."""
         _check_scalar(coefficient, name="coefficient")
-        arrays = list(self._arrays)
+        arrays = list(self.arrays)
         arrays[0] = _multiply_scalar(coefficient, arrays[0])
         out = type(self)(
             arrays,
             levels=self.levels,
             degree=self.degree,
+            **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
@@ -1708,16 +1878,18 @@ class FirstDegreeMPO:
     def add(self, other):
         """Return the exact direct sum ``self + other``."""
         self._check_compatible(other)
+        self_arrays = self.arrays
+        other_arrays = other.arrays
         if self.L == 1:
-            arrays = (self._arrays[0] + other._arrays[0],)
+            arrays = (self_arrays[0] + other_arrays[0],)
             levels = [[self._levels[0][0]], [self._levels[1][0]]]
         else:
             arrays = []
             levels = [[self._levels[0][0]]]
-            first = _concat((self._arrays[0], other._arrays[0]), axis=1)
+            first = _concat((self_arrays[0], other_arrays[0]), axis=1)
             arrays.append(first)
             for site in range(1, self.L - 1):
-                left, right = self._arrays[site], other._arrays[site]
+                left, right = self_arrays[site], other_arrays[site]
                 top = _concat(
                     (
                         left,
@@ -1733,7 +1905,7 @@ class FirstDegreeMPO:
                     axis=1,
                 )
                 arrays.append(_concat((top, bottom), axis=0))
-            arrays.append(_concat((self._arrays[-1], other._arrays[-1]), axis=0))
+            arrays.append(_concat((self_arrays[-1], other_arrays[-1]), axis=0))
             for bond in range(1, self.L):
                 levels.append([
                     *self._levels[bond],
@@ -1745,6 +1917,7 @@ class FirstDegreeMPO:
             arrays,
             levels=levels,
             degree=max(self.degree, other.degree),
+            **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
@@ -1769,7 +1942,7 @@ class FirstDegreeMPO:
         self._check_compatible(other)
         arrays = []
         levels = []
-        for site, (left, right) in enumerate(zip(self._arrays, other._arrays)):
+        for site, (left, right) in enumerate(zip(self.arrays, other.arrays)):
             # Pairing virtual states explicitly is more verbose than calling
             # Quimb's generic MPO product, but it preserves the symbolic
             # history needed by the paper's later exact rewiring steps.
@@ -1812,6 +1985,7 @@ class FirstDegreeMPO:
             arrays,
             levels=levels,
             degree=self.degree + other.degree,
+            **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
@@ -1855,7 +2029,8 @@ class FirstDegreeMPO:
             return type(self).identity(
                 self.L,
                 self.phys_dim,
-                like=self._arrays[0],
+                like=self.arrays[0],
+                **self._symmetry_options(),
                 upper_ind_id=self.upper_ind_id,
                 lower_ind_id=self.lower_ind_id,
                 site_tag_id=self.site_tag_id,
@@ -2548,6 +2723,80 @@ class FirstDegreeMPO:
         }
         return arrays, levels, cache_hit, storage_info
 
+    def _block_sparse_history_power_data(
+        self,
+        exponent,
+        *,
+        state_lists,
+        cache_hit,
+        execution_plan=None,
+        tensor_plan_cache_hit=False,
+        chunk_size=65536,
+    ):
+        """Build raw histories as sparse matrices of local operators.
+
+        Only structurally allowed virtual transitions are stored. Unlike the
+        older ``history_storage="sparse"`` execution policy, this path keeps
+        that sparsity through Algorithms 1--4 and into the returned semantic
+        MPO rather than scattering into a dense virtual array at every site.
+        """
+        levels = self._history_levels_for_states(state_lists, exponent)
+        arrays = []
+        total_blocks = 0
+        stored_blocks = 0
+        for site in range(self.L):
+            left_states = state_lists[site]
+            right_states = state_lists[site + 1]
+            if execution_plan is None:
+                left_indices, right_indices = self._history_allowed_pairs(
+                    site,
+                    left_states,
+                    right_states,
+                    sparse=True,
+                )
+                positions = self._history_local_position_arrays(
+                    site,
+                    left_states,
+                    right_states,
+                )
+            else:
+                site_plan = execution_plan[site]
+                left_indices = site_plan["left_indices"]
+                right_indices = site_plan["right_indices"]
+                positions = site_plan["positions"]
+
+            tensor = SparseVirtualTensor((
+                len(left_states),
+                len(right_states),
+                self.phys_dim,
+                self.phys_dim,
+            ))
+            for start in range(0, len(left_indices), chunk_size):
+                stop = start + chunk_size
+                values = self._history_local_product_batch_values(
+                    site,
+                    positions,
+                    left_indices[start:stop],
+                    right_indices[start:stop],
+                )
+                tensor = tensor.scatter_add(
+                    left_indices[start:stop],
+                    right_indices[start:stop],
+                    values,
+                )
+            arrays.append(tensor)
+            stored_blocks += tensor.stored_blocks
+            total_blocks += len(left_states) * len(right_states)
+
+        storage_info = {
+            "mode": "block_sparse",
+            "stored_blocks": stored_blocks,
+            "total_blocks": total_blocks,
+            "tensor_plan_cache_hit": bool(tensor_plan_cache_hit),
+            "materialized_dense_virtual_tensors": False,
+        }
+        return arrays, levels, cache_hit, storage_info
+
     def _stream_history_power_data(
         self,
         exponent,
@@ -2652,10 +2901,14 @@ class FirstDegreeMPO:
             raise ValueError("history powers require a first-degree MPO.")
         self._first_degree_structure()
 
-        if history_storage not in {"auto", "dense", "sparse", "streaming"}:
+        if history_storage == "blocks":
+            history_storage = "block_sparse"
+        if history_storage not in {
+            "auto", "dense", "sparse", "streaming", "block_sparse",
+        }:
             raise ValueError(
                 "history_storage must be one of 'auto', 'dense', 'sparse', "
-                "or 'streaming'."
+                "'streaming', or 'block_sparse'."
             )
         if history_storage == "streaming" and cache_history:
             raise ValueError(
@@ -2667,11 +2920,35 @@ class FirstDegreeMPO:
             # Preserve only those nonzero history blocks by default; MPSKit's
             # corresponding path is sparse as well.  Directly constructed
             # MPOs have no safe structural filter and retain the dense path.
-            if self._structural_transitions is not None and cache_history:
+            if self.symmetry is not None:
+                history_storage = "block_sparse"
+            elif self._structural_transitions is not None and cache_history:
                 history_storage = "sparse"
             else:
                 history_storage = "streaming" if not cache_history else "dense"
         schemas = self._history_schemas()
+        if history_storage == "block_sparse":
+            state_lists, cache_hit = self._history_topology(
+                exponent,
+                max_bond=max_bond,
+                on_exceed=on_exceed,
+                cache_history=cache_history,
+            )
+            tensor_plan, tensor_plan_cache_hit = (
+                self._history_tensor_execution_plan(
+                    exponent,
+                    state_lists,
+                    sparse=True,
+                    cache_history=cache_history,
+                )
+            )
+            return self._block_sparse_history_power_data(
+                exponent,
+                state_lists=state_lists,
+                cache_hit=cache_hit,
+                execution_plan=tensor_plan,
+                tensor_plan_cache_hit=tensor_plan_cache_hit,
+            )
         if history_storage in {"sparse", "streaming"}:
             if cache_history:
                 state_lists, cache_hit = self._history_topology(
@@ -2810,6 +3087,8 @@ class FirstDegreeMPO:
     @staticmethod
     def _apply_history_axis_groups(array, groups, *, axis):
         """Apply all channel deletions on one virtual axis in one scatter."""
+        if isinstance(array, SparseVirtualTensor):
+            return array.apply_axis_groups(groups, axis=axis)
         transfer = _history_transfer_matrix(groups, int(array.shape[axis]))
         if transfer is not None:
             return _apply_history_transfer(array, transfer, axis=axis)
@@ -2886,6 +3165,8 @@ class FirstDegreeMPO:
     @staticmethod
     def _apply_history_polynomial_groups(array, groups, dt, *, axis):
         """Apply a parameterized channel schedule in one backend scatter."""
+        if isinstance(array, SparseVirtualTensor):
+            return array.apply_polynomial_axis_groups(groups, dt, axis=axis)
         old_size = int(array.shape[axis])
         power_maps = {}
         for target, group in enumerate(groups):
@@ -2989,11 +3270,15 @@ class FirstDegreeMPO:
         row_operations = []
         column_operations = []
         merges = []
-        for source_history, canonical, mode, source_label in actions:
-            positions = self._history_level_positions(current)
-            source = positions.get(source_history)
-            target = positions.get(canonical)
-            if source is None or target is None or target == source:
+        for (
+            source_history,
+            canonical,
+            mode,
+            source_label,
+            source,
+            target,
+        ) in actions:
+            if source >= len(current) or target >= len(current) or target == source:
                 continue
             if mode == "row":
                 if bond >= len(arrays):
@@ -3079,6 +3364,8 @@ class FirstDegreeMPO:
                         history,
                         target_history,
                         number_of_threes,
+                        source,
+                        target,
                     ))
                     working[bond].pop(source)
 
@@ -3114,6 +3401,8 @@ class FirstDegreeMPO:
                         canonical,
                         mode,
                         level.label,
+                        source,
+                        target,
                     ))
                     working[bond].pop(source)
                     changed = True
@@ -3158,13 +3447,10 @@ class FirstDegreeMPO:
                 source_history,
                 target_history,
                 number_of_threes,
+                source,
+                target,
             ) in actions:
-                positions = self._history_level_positions(current)
-                source = positions.get(source_history)
-                target = positions.get(target_history)
-                if source is None:
-                    continue
-                if target is None or target == source:
+                if source >= len(current) or target >= len(current) or target == source:
                     raise ValueError(
                         "history power lost its all-one Algorithm-1 target."
                     )
@@ -3214,11 +3500,19 @@ class FirstDegreeMPO:
                 levels, len(levels[0][0].history), cache_history=False,
             )
         actions_by_bond = [[] for _ in range(self.L + 1)]
-        for bond, source_history, canonical, mode, source_label in plan[
+        for (
+            bond,
+            source_history,
+            canonical,
+            mode,
+            source_label,
+            source,
+            target,
+        ) in plan[
             "algorithm_two"
         ]:
             actions_by_bond[bond].append(
-                (source_history, canonical, mode, source_label),
+                (source_history, canonical, mode, source_label, source, target),
             )
 
         merges = []
@@ -3792,11 +4086,19 @@ class FirstDegreeMPO:
             raise ValueError("history construction lost a finite boundary state.")
 
         first = arrays[0]
-        arrays[0] = _stack([first[left_target]], axis=0)
+        arrays[0] = (
+            first.select_axis(0, left_target)
+            if isinstance(first, SparseVirtualTensor)
+            else _stack([first[left_target]], axis=0)
+        )
         levels[0] = [MPOLevel(("boundary", "left", order), boundary_history)]
 
         last = arrays[-1]
-        arrays[-1] = _stack([last[:, right_target]], axis=1)
+        arrays[-1] = (
+            last.select_axis(1, right_target)
+            if isinstance(last, SparseVirtualTensor)
+            else _stack([last[:, right_target]], axis=1)
+        )
         levels[-1] = [MPOLevel(("boundary", "right", order), boundary_history)]
 
     def _extensive_history_exponential(
@@ -3877,6 +4179,16 @@ class FirstDegreeMPO:
         final_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
         )
+        if all(isinstance(array, SparseVirtualTensor) for array in arrays):
+            storage_info = {
+                **storage_info,
+                "final_stored_blocks": sum(
+                    array.stored_blocks for array in arrays
+                ),
+                "final_dense_virtual_blocks": sum(
+                    array.shape[0] * array.shape[1] for array in arrays
+                ),
+            }
         metadata = {
             "operation": "extensive_exponential",
             "dt": dt,
@@ -3910,6 +4222,7 @@ class FirstDegreeMPO:
             arrays,
             levels=levels,
             degree=order,
+            **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
@@ -4018,7 +4331,7 @@ class FirstDegreeMPO:
             topology is released after the current MPO is assembled. With the
             default ``history_storage="auto"``, this also selects the
             streaming local-history builder.
-        history_storage : {"auto", "dense", "sparse", "streaming"}, default="auto"
+        history_storage : {"auto", "dense", "sparse", "streaming", "block_sparse"}, default="auto"
             Storage policy for temporary raw-history tensors. ``"dense"``
             retains all structural local pairs. ``"sparse"`` skips
             structurally impossible local transition products and batches the
@@ -4027,16 +4340,18 @@ class FirstDegreeMPO:
             automaton-built MPO, ``"auto"`` selects the structural sparse path
             for cached builds and the compatibility streaming path otherwise;
             direct MPO construction retains the dense/streaming policy. The
-            final MPO tensors are still dense virtual arrays for Algorithms
-            1--4.
+            ``"block_sparse"`` retains structurally present operator-valued
+            virtual blocks through Algorithms 1--4. With configured symmetry
+            metadata, ``"auto"`` selects this path and :meth:`to_mpo` compiles
+            the result directly into native Symmray charge blocks.
 
         Notes
         -----
-        The first implementation targets ordinary NumPy/Autoray-compatible
-        local MPO blocks. Native fermionic/Symmray compilation is deliberately
-        not enabled by this method yet. The one-site path is exact through its
-        requested local Taylor order; Algorithm 3/4 have no virtual history to
-        extend or merge there.
+        Native Symmray compilation currently supports neutral bosonic Abelian
+        ``U1``, ``Z2``, ``U1U1``, and ``Z2Z2`` operators with NumPy local
+        blocks. Graded fermionic histories remain a separate sign-preserving
+        backend. The one-site path is exact through its requested local Taylor
+        order; Algorithm 3/4 have no virtual history to extend or merge there.
         """
         _check_scalar(dt, name="dt")
         if not isinstance(order, Integral) or int(order) < 1:
@@ -4052,10 +4367,14 @@ class FirstDegreeMPO:
             )
         if not isinstance(cache_history, bool):
             raise TypeError("cache_history must be a boolean.")
-        if history_storage not in {"auto", "dense", "sparse", "streaming"}:
+        if history_storage == "blocks":
+            history_storage = "block_sparse"
+        if history_storage not in {
+            "auto", "dense", "sparse", "streaming", "block_sparse",
+        }:
             raise ValueError(
                 "history_storage must be one of 'auto', 'dense', 'sparse', "
-                "or 'streaming'."
+                "'streaming', or 'block_sparse'."
             )
         if history_storage == "streaming" and cache_history:
             raise ValueError(
@@ -4133,6 +4452,7 @@ class FirstDegreeMPO:
                 )
             ]] * 2,
             degree=effective_order,
+            **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
@@ -4164,6 +4484,12 @@ class FirstDegreeMPO:
         conservative and cannot introduce a truncation error.
         """
         target = self if inplace else self.copy()
+        if target.is_block_sparse:
+            # The standalone exact compressor predates the sparse history
+            # executor and performs row/column equality checks by slicing.
+            # Materialize only for this explicit compatibility operation;
+            # Algorithms 1--4 themselves remain sparse.
+            target._arrays = target.arrays
         initial = target.bond_dimensions
         merges = []
         skipped = 0
@@ -4272,6 +4598,8 @@ class FirstDegreeMPO:
             raise ValueError(
                 f"MPO physical dimensions differ: {self.phys_dim} and {other.phys_dim}."
             )
+        if self._symmetry_options() != other._symmetry_options():
+            raise ValueError("MPO symmetry metadata must match.")
 
     def __add__(self, other):
         return self.add(other)
@@ -4774,6 +5102,14 @@ class MPOBasis:
     phys_dim : int, optional
         Local physical dimension.  It is inferred from the first operator
         when omitted.
+    symmetry : {"U1", "Z2", "U1U1", "Z2Z2"}, optional
+        Abelian symmetry used for native Symmray MPO compilation.
+    physical_charges : sequence, optional
+        Charge of each local dense basis state. Equal charges must form
+        contiguous sectors.
+    fermionic : bool, default=False
+        Reserved for a future sign-preserving graded history backend. The
+        current higher-order block-sparse compiler rejects ``True``.
     """
 
     def __init__(
@@ -4782,6 +5118,9 @@ class MPOBasis:
         terms,
         *,
         phys_dim=None,
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         site_tag_id="I{}",
@@ -4853,6 +5192,9 @@ class MPOBasis:
         self._automaton = automaton
         self._template = FirstDegreeMPO.from_automaton(
             automaton,
+            symmetry=symmetry,
+            physical_charges=physical_charges,
+            fermionic=fermionic,
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             site_tag_id=site_tag_id,
@@ -5143,6 +5485,7 @@ class MPOBasis:
         )
         result = FirstDegreeMPO.from_automaton(
             automaton,
+            **self._template._symmetry_options(),
             upper_ind_id=self._template.upper_ind_id,
             lower_ind_id=self._template.lower_ind_id,
             site_tag_id=self._template.site_tag_id,

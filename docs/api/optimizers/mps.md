@@ -255,8 +255,8 @@ sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
 optimizer's `fit_init_strategy` chooses whether a disposable FIT guess is
 direct, randomly perturbed at fixed rank, randomly expanded on active bonds,
 or `guess-<method>` compressed by Quimb. The available methods are
-`direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `sdc`,
-`sdc-oversample`, `src`, `src-first`, `src-oversample`, `srcmps`,
+`direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
+`src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
 `fit-projector`, `fit-oversample`. `auto` selects `guess-zipup` before active
 bonds reach their attainable ceilings; otherwise it uses the current MPS

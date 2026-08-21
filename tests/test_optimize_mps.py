@@ -736,8 +736,6 @@ def test_mps_optimizer_fit_initial_guess_strategy_is_diagnostic(strategy):
         "zipup",
         "zipup-first",
         "zipup-oversample",
-        "sdc",
-        "sdc-oversample",
         "src",
         "src-first",
         "src-oversample",
@@ -807,8 +805,6 @@ def test_mps_optimizer_quimb_mode_aliases(mode, method):
         "zipup",
         "zipup-first",
         "zipup-oversample",
-        "sdc",
-        "sdc-oversample",
         "src",
         "src-first",
         "src-oversample",
@@ -920,6 +916,64 @@ def test_mps_optimizer_src_compression_seed_is_reproducible():
         np.array_equal(tensor_a.data, tensor_b.data)
         for tensor_a, tensor_b in zip(replay_a.tensors, replay_b.tensors)
     )
+
+
+@pytest.mark.parametrize("method", ["srcmps", "fit", "fit-oversample"])
+def test_mps_optimizer_compression_seed_is_not_forwarded_as_quimb_option(method):
+    """Seeded Quimb methods use Quimb's RNG without leaking ``seed`` kwargs."""
+    state = qtn.MPS_rand_state(
+        6,
+        bond_dim=2,
+        phys_dim=2,
+        seed=23,
+        dtype="complex128",
+    )
+    gate = qu.rand_uni(4, seed=11)
+    outputs = []
+    for _ in range(2):
+        optimizer = py.MpsOptimizer(
+            state.copy(deep=True),
+            [(gate, (0, 5))],
+            chi=3,
+            mode=f"quimb-{method}",
+        )
+        out = optimizer.run(
+            progbar=False,
+            cutoff=1.0e-12,
+            compression_seed=17,
+            stabilize_unitary=False,
+        )
+        outputs.append([np.array(tensor.data, copy=True) for tensor in out.tensors])
+
+    assert all(
+        np.array_equal(tensor_a, tensor_b)
+        for tensor_a, tensor_b in zip(outputs[0], outputs[1])
+    )
+
+
+def test_mps_optimizer_submpo_fit_projector_product_state_is_finite():
+    """Explicit endpoint sub-MPOs disable the singular projector pre-gauge."""
+    mpo = qtn.MatrixProductOperator.from_dense(
+        qu.CNOT(),
+        dims=(2, 2),
+        sites=(0, 3),
+        L=4,
+    )
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [py.MpsOptimizer.submpo_event(mpo, (0, 3))],
+        chi=2,
+        mode="quimb-fit-projector",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        non_unitary=True,
+        stabilize_unitary=False,
+    )
+
+    assert all(np.isfinite(np.asarray(tensor.data)).all() for tensor in out.tensors)
 
 
 @pytest.mark.parametrize("method", ["zipup-first", "fit-zipup", "fit-projector"])

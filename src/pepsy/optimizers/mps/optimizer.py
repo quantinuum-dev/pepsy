@@ -61,6 +61,7 @@ import types
 import warnings
 import autoray as ar
 import numpy as np
+import quimb
 import quimb.tensor as qtn
 
 from ...backends import (
@@ -104,8 +105,6 @@ _MPO_COMPRESSION_METHODS = frozenset(
         "zipup",
         "zipup-first",
         "zipup-oversample",
-        "sdc",
-        "sdc-oversample",
         "src",
         "src-first",
         "src-oversample",
@@ -140,6 +139,7 @@ _MPO_METHODS_NEED_INTERIOR_WORKAROUND = frozenset(
         "fit-projector",
     }
 )
+_QUIMB_SEED_LOCK = threading.RLock()
 _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
     | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
@@ -872,7 +872,23 @@ def _is_interior_submpo_span(p, where):
     return min(where) > 0 or max(where) < int(p.L) - 1
 
 
-def _apply_submpo_with_interior_workaround(
+def _run_seeded_quimb(seed, function, *args, **kwargs):
+    """Run a Quimb randomized operation with an isolated reproducibility seed.
+
+    Quimb's current SRC/SRCMPS implementations use its process-global random
+    generator and do not accept a ``seed`` compression option. Seed the public
+    Quimb generator immediately before the complete operation instead of
+    leaking that option into Cotengra or linear-algebra calls. The lock keeps
+    seeded shot replay deterministic when optimizers run concurrently.
+    """
+    if seed is None:
+        return function(*args, **kwargs)
+    with _QUIMB_SEED_LOCK:
+        quimb.seed_rand(int(seed))
+        return function(*args, **kwargs)
+
+
+def _apply_submpo_with_interior_workaround_impl(
     p,
     submpo,
     where,
@@ -884,7 +900,6 @@ def _apply_submpo_with_interior_workaround(
     info=None,
     inplace_mpo=False,
     optimize=None,
-    seed=None,
 ):
     """Apply selected Quimb methods without nested sub-MPO tag permutation.
 
@@ -912,8 +927,6 @@ def _apply_submpo_with_interior_workaround(
         "permute_arrays": False,
         "inplace": True,
     }
-    if seed is not None and method in _MPO_METHODS_USE_SEED:
-        common["seed"] = seed
     if cutoff_mode is not None:
         common["cutoff_mode"] = cutoff_mode
     if optimize is not None:
@@ -969,6 +982,38 @@ def _apply_submpo_with_interior_workaround(
     return p
 
 
+def _apply_submpo_with_interior_workaround(
+    p,
+    submpo,
+    where,
+    *,
+    chi,
+    method,
+    cutoff,
+    cutoff_mode,
+    info=None,
+    inplace_mpo=False,
+    optimize=None,
+    seed=None,
+):
+    """Apply selected Quimb methods with local tags and optional seeding."""
+    seed = seed if method in _MPO_METHODS_USE_SEED else None
+    return _run_seeded_quimb(
+        seed,
+        _apply_submpo_with_interior_workaround_impl,
+        p,
+        submpo,
+        where,
+        chi=chi,
+        method=method,
+        cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
+        info=info,
+        inplace_mpo=inplace_mpo,
+        optimize=optimize,
+    )
+
+
 def _apply_dense_gate_with_method(
     p,
     gate,
@@ -1005,14 +1050,13 @@ def _apply_dense_gate_with_method(
             opts["cutoff_mode"] = cutoff_mode
         if optimize is not None:
             opts["optimize"] = optimize
-        if seed is not None and method in _MPO_METHODS_USE_SEED:
-            opts["seed"] = seed
         if method == "fit-projector":
             # Simple-update gauging can divide by zero on exact product-state
             # bonds. The projector fit remains valid without that optional
             # pre-gauge and Quimb's own implementation supports this path.
             opts["canonize"] = False
-        return p.gate_nonlocal_(gate, where, **opts)
+        seed = seed if method in _MPO_METHODS_USE_SEED else None
+        return _run_seeded_quimb(seed, p.gate_nonlocal_, gate, where, **opts)
 
     submpo = qtn.MatrixProductOperator.from_dense(
         gate,
@@ -1277,7 +1321,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         cutoff,
         cutoff_mode,
-        seed=None,
     ):
         """Return compression options for a sub-MPO method."""
         opts = {}
@@ -1289,10 +1332,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
         ):
             opts["cutoff_mode"] = cutoff_mode
+        if method == "fit-projector":
+            # The optional simple-update pre-gauge is singular on exact
+            # product-state bonds. Match the dense-gate path and let the
+            # projector fit run without that gauge.
+            opts["canonize"] = False
         if method == "direct":
             return opts
-        if seed is not None and method in _MPO_METHODS_USE_SEED:
-            opts["seed"] = seed
         optimize = self.contraction_opt
         if optimize is None:
             return opts
@@ -8599,7 +8645,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             mpo_method,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            seed=compression_seed,
         )
         mpo_optimize = mpo_compress_opts.get("optimize")
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
@@ -8654,7 +8699,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 else:
                     self.canonize_mps(p, (xmin, xmax))
-                    p.gate_with_submpo_(
+                    quimb_seed = (
+                        compression_seed
+                        if mpo_method in _MPO_METHODS_USE_SEED
+                        else None
+                    )
+                    _run_seeded_quimb(
+                        quimb_seed,
+                        p.gate_with_submpo_,
                         gate,
                         where=where,
                         method=mpo_method,

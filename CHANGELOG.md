@@ -1,8 +1,8 @@
 # Changelog
 
-All notable Pepsy changes are documented here.
+All notable PePsY changes are documented here.
 
-Pepsy follows [Semantic Versioning](https://semver.org/):
+PePsY follows [Semantic Versioning](https://semver.org/):
 
 - **MAJOR** versions may contain incompatible public API changes.
 - **MINOR** versions add backwards-compatible public functionality.
