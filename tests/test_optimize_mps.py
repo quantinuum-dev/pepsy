@@ -751,12 +751,12 @@ def test_mps_optimizer_fit_initial_guess_strategy_is_diagnostic(strategy):
     ],
 )
 def test_mps_optimizer_mpo_method_modes(method):
-    """Every supported Quimb MPO method is selectable as ``mpo-<method>``."""
+    """Every Quimb method is selectable as ``quimb-<method>``."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
         chi=2,
-        mode=f"mpo-{method}",
+        mode=f"quimb-{method}",
     )
 
     out = optimizer.run(
@@ -766,7 +766,37 @@ def test_mps_optimizer_mpo_method_modes(method):
     )
 
     assert out.max_bond() <= 2
-    assert optimizer.mode == f"mpo-{method}"
+    assert optimizer.mode == f"quimb-{method}"
+
+
+@pytest.mark.parametrize(
+    "mode, method",
+    [
+        ("quimb", "direct"),
+        ("quimb-direct", "direct"),
+        ("quimb-src", "src"),
+        ("mpo", "direct"),
+        ("mpo-direct", "direct"),
+        ("mpo-src", "src"),
+    ],
+)
+def test_mps_optimizer_quimb_mode_aliases(mode, method):
+    """Quimb names are canonical while the old MPO names remain valid."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert out.max_bond() <= 2
+    assert optimizer._mode_mpo_method(optimizer.mode) == method
 
 
 @pytest.mark.parametrize(
@@ -792,7 +822,7 @@ def test_mps_optimizer_mpo_method_modes(method):
     ],
 )
 def test_mps_optimizer_guess_method_strategies(method):
-    """Every MPO method is also available as a ``guess_<method>`` policy."""
+    """Every Quimb method is available as a ``guess-<method>`` policy."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
@@ -804,7 +834,7 @@ def test_mps_optimizer_guess_method_strategies(method):
         progbar=False,
         n_iter=2,
         fit_rtol=None,
-        fit_init_strategy=f"guess_{method}",
+        fit_init_strategy=f"guess-{method}",
         stabilize_unitary=False,
     )
 
@@ -815,7 +845,7 @@ def test_mps_optimizer_guess_method_strategies(method):
 
 
 def test_mps_optimizer_hyphenated_guess_strategy_alias():
-    """The mode-style ``guess-<method>`` spelling normalizes cleanly."""
+    """The canonical ``guess-<method>`` spelling normalizes cleanly."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
@@ -873,14 +903,14 @@ def test_mps_optimizer_src_compression_seed_is_reproducible():
     )
 
     replay_a = py.MpsOptimizer(
-        state.copy(), [(gate, (0, 5))], chi=3, mode="mpo-src"
+        state.copy(), [(gate, (0, 5))], chi=3, mode="quimb-src"
     ).run(
         progbar=False,
         compression_seed=17,
         stabilize_unitary=False,
     )
     replay_b = py.MpsOptimizer(
-        state.copy(), [(gate, (0, 5))], chi=3, mode="mpo-src"
+        state.copy(), [(gate, (0, 5))], chi=3, mode="quimb-src"
     ).run(
         progbar=False,
         compression_seed=17,
@@ -905,7 +935,7 @@ def test_mps_optimizer_interior_oversampled_mpo_methods(method):
         ),
         [(qu.CNOT(), (1, 6))],
         chi=3,
-        mode=f"mpo-{method}",
+        mode=f"quimb-{method}",
     )
 
     out = optimizer.run(
@@ -936,7 +966,7 @@ def test_mps_optimizer_interior_submpo_oversampled_methods(method):
         ),
         [py.MpsOptimizer.submpo_event(mpo, (1, 6))],
         chi=3,
-        mode=f"mpo-{method}",
+        mode=f"quimb-{method}",
     )
 
     out = optimizer.run(
@@ -969,7 +999,7 @@ def test_mps_optimizer_dm_uses_native_cutoff_mode_by_default(monkeypatch):
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
         chi=2,
-        mode="mpo-dm",
+        mode="quimb-dm",
     )
     optimizer.run(progbar=False, stabilize_unitary=False)
     assert "cutoff_mode" not in calls[-1]

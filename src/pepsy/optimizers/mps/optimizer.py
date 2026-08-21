@@ -10,7 +10,8 @@ For repeated layout-aware evolution, :meth:`MpsOptimizer.apply_layout`
 installs a persistent position-to-logical mapping and never performs a
 swap-back; logical readout is available through ``logical_order``,
 ``remap_sample``, and ``to_dense``.
-``mode="mpo-direct"`` (with ``"mpo"`` retained as an alias) also accepts
+``mode="quimb-direct"`` (with ``"quimb"`` as its direct alias and the
+legacy ``"mpo-<method>"`` / ``"mpo"`` spellings retained) also accepts
 explicit sub-MPO events of the form
 ``("submpo", mpo, where)`` or
 ``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
@@ -1092,7 +1093,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
         applied on the ket family only (state evolution), using :func:`pepsy.operators.gates.gate`.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
-        For ``mode="mpo-<method>"`` (or compatibility ``"mpo"``), entries may
+        For ``mode="quimb-<method>"`` (or aliases ``"quimb"`` and legacy
+        ``"mpo-<method>"`` / ``"mpo"``), entries may
         also have the explicit sub-MPO form
         ``("submpo", mpo, where)`` or mapping form
         ``{"kind": "submpo", "mpo": mpo, "where": where}``, with a 1D
@@ -1116,7 +1118,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
         committed DMRG/MPO results at or below this limit.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
         Optimization backend. ``"fit"`` is the clear alias of the historical
         ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
         sweeps, then one-site refinement; once every bond reaches its
@@ -1187,6 +1189,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "dmrg1",
             "dmrg2",
             "dmrg3",
+            "quimb",
             "mpo",
             "mix",
             "swap",
@@ -1196,6 +1199,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "exact",
         }
         | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
+        | {f"quimb-{method}" for method in _MPO_COMPRESSION_METHODS}
     )
     LayoutFinder = MpsGateStreamLayoutFinder
     _ALLOWED_SUBMPO_METHODS = _MPO_COMPRESSION_METHODS
@@ -1225,18 +1229,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @classmethod
     def _is_mpo_mode(cls, mode):
-        """Return whether ``mode`` is the MPO family or its compatibility alias."""
+        """Return whether ``mode`` selects Quimb compression."""
         mode_norm = str(mode).strip().lower()
-        return mode_norm == "mpo" or mode_norm.startswith("mpo-")
+        return mode_norm in {"mpo", "quimb"} or mode_norm.startswith(
+            ("mpo-", "quimb-")
+        )
 
     @classmethod
     def _mode_mpo_method(cls, mode):
-        """Return the compression method encoded by an MPO mode name."""
+        """Return the compression method encoded by a Quimb mode name."""
         mode_norm = str(mode).strip().lower()
-        if mode_norm == "mpo":
+        if mode_norm in {"mpo", "quimb"}:
             return "direct"
-        if mode_norm.startswith("mpo-"):
-            return cls._normalize_submpo_method(mode_norm[4:])
+        for prefix in ("quimb-", "mpo-"):
+            if mode_norm.startswith(prefix):
+                return cls._normalize_submpo_method(mode_norm[len(prefix) :])
         return "direct"
 
     def _resolve_mpo_method(self, method):
@@ -1302,7 +1309,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return a canonical explicit sub-MPO stream event.
 
         The returned entry can be placed directly inside the ``gates`` stream
-        for the MPO mode family. ``where`` is restricted to 1D integer MPS
+        for the Quimb compression mode family. ``where`` is restricted to 1D integer MPS
         sites.
         """
 
@@ -2219,15 +2226,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Normalize the FIT initial-guess construction policy."""
         strategy = str(strategy).strip().lower()
         if strategy.startswith("guess-"):
-            # ``mpo-<method>`` is the mode spelling; accept the matching
+            # ``quimb-<method>`` is the mode spelling; accept the matching
             # hyphenated form for the FIT policy as a readable alias while
-            # retaining the historical/documented ``guess_<method>`` name.
+            # retaining the historical ``guess_<method>`` name.
             strategy = "guess_" + strategy[len("guess-") :]
         strategy = {"mpo": "svd_guess"}.get(strategy, strategy)
         if strategy not in _FIT_INIT_STRATEGIES:
             raise ValueError(
                 "fit_init_strategy must be one of 'auto', 'direct', "
-                "'random', 'random_expand', or 'guess_<method>'."
+                "'random', 'random_expand', or 'guess-<method>'."
             )
         return strategy
 
@@ -3853,7 +3860,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Pepsy's ordinary compression paths while preserving Quimb's
             method-specific native default for the MPO path, notably
             ``"rsum1"`` for ``method="dm"``. Pass a string to override it.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         k_2q_batch : int, default=1
@@ -3884,8 +3891,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Numerical threshold used by the final normalization path.
         submpo_method : str | None, default=None
             Optional compression-method override for the MPO family. If
-            omitted, ``mode="mpo-<method>"`` selects the method and the
-            compatibility ``mode="mpo"`` selects ``"direct"``. The method
+            omitted, ``mode="quimb-<method>"`` selects the method and
+            ``mode="quimb"`` selects ``"direct"``. The legacy
+            ``mode="mpo-<method>"`` / ``mode="mpo"`` spellings remain valid.
+            The method
             is forwarded to Quimb for both dense gates and explicit sub-MPO
             stream events.
         compression_seed : int | None, default=None
@@ -4001,20 +4010,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             for NumPy/Torch/CuPy and the native MPS route for Symmray.
         fit_mpo_guess : bool, default=True
             Legacy compatibility switch for the named DMRG1/DMRG3 default
-            ``"guess_zipup"`` policy. New code should use
+            ``"guess-zipup"`` policy. New code should use
             ``fit_init_strategy`` explicitly. This does not replace the exact
             FIT target or live MPS. Native Symmray and fermionic routes retain
             their native warm-start path.
-        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess_<method>"}, default="guess_zipup"
+        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}, default="guess-zipup"
             Select the disposable FIT initial guess. ``"direct"`` uses the
             current MPS, ``"random"`` perturbs existing tensors without
             changing bond dimensions, ``"random_expand"`` adds seeded
             directions on under-capacity active bonds, and
-            ``"guess_<method>"`` uses the corresponding Quimb compression
+            ``"guess-<method>"`` uses the corresponding Quimb compression
             method on an isolated copy. ``"auto"`` selects
-            ``"guess_zipup"`` before active bonds reach their attainable
-            ceilings. The mode-style ``"guess-<method>"`` spelling is accepted
-            as an alias.
+            ``"guess-zipup"`` before active bonds reach their attainable
+            ceilings. The underscore spelling ``"guess_<method>"`` remains
+            accepted as a compatibility alias.
         fit_init_rand_strength : float, default=1e-1
             For dense two- and three-site FIT growth windows that are below
             their attainable physical/``chi`` bond ceilings, seed a
@@ -4025,7 +4034,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_seed : int, default=0
             Deterministic seed for ``"random"`` and ``"random_expand"`` FIT
             guesses and randomized Quimb methods selected through
-            ``"guess_<method>"``. The gate position is mixed into the
+            ``"guess-<method>"``. The underscore spelling is also accepted.
+            The gate position is mixed into the
             per-window stream so repeated runs are reproducible without
             sharing a global RNG.
         fit_single_pair_fast_path : bool, default=True

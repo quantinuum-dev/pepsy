@@ -29,8 +29,9 @@ tests before editing.
   remaining `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
-- `mpo-<method>`: native Quimb non-local gate/MPO replay with the selected
-  compression method; `mpo-direct` is explicit and `mpo` remains its alias.
+- `quimb-<method>`: native Quimb non-local gate/MPO replay with the selected
+  compression method; `quimb-direct` is explicit and `quimb` is its direct
+  alias. The legacy `mpo-<method>` and `mpo` spellings remain supported.
   Supported methods include `direct`, `dm`, `zipup`, the zipup/SDC/SRC/SRCMPS
   oversampling variants, `fit`, `fit-zipup`, `fit-projector`, and
   `fit-oversample`.
@@ -154,7 +155,8 @@ clear disconnected-sector error rather than hiding the failure behind a dense
 conversion or global warm start. Dense two-/three-site growth windows select
 their disposable FIT `p` with `fit_init_strategy`: direct current MPS,
 fixed-rank deterministic random perturbation, active-bond random expansion,
-or isolated `guess_<method>` replay (default `guess_zipup`). In `auto`, only active bonds below their attainable
+or isolated `guess-<method>` replay (default `guess-zipup`). The underscore
+spelling remains accepted for compatibility. In `auto`, only active bonds below their attainable
 physical/`chi` rank are expanded, and the exact gate target remains separate as
 `p_g`. Native Symmray/fermionic paths keep their graded sector-growth route and
 do not use dense random padding. If `run()` omits `cutoff_mode`, ordinary paths

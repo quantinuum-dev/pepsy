@@ -1,7 +1,7 @@
-"""Compare the MPO gate-compression methods used by :class:`MpsOptimizer`.
+"""Compare the Quimb gate-compression methods used by :class:`MpsOptimizer`.
 
 The benchmark applies the same long-range unitary gates to a random, already
-entangled MPS with every ``mpo-*`` method.  Accuracy is measured against a
+entangled MPS with every ``quimb-*`` method.  Accuracy is measured against a
 dense reference produced by the same gate stream with Quimb's lazy method.
 The default cases cover one end-to-end gate, one interior gate, and a short
 long-range circuit.
@@ -118,7 +118,7 @@ def _run_once(state, gates, method, chi, cutoff, seed):
         state.copy(deep=True),
         gates=gates,
         chi=chi,
-        mode=f"mpo-{method}",
+        mode=f"quimb-{method}",
     )
     return optimizer.run(
         cutoff=cutoff,

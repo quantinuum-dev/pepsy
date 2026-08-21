@@ -66,9 +66,10 @@ policy. `pepsy.reset_linalg_registrations(backend="torch")` restores native
 Torch and Quimb split registrations.
 
 `MpsOptimizer` consumes canonical bundled gate streams of the form
-`[(gate, where), ...]`. In `mode="mpo-<method>"` (or compatibility
-`mode="mpo"`) the stream can also contain explicit
-sub-MPO events for already-factorized nonlocal operators:
+`[(gate, where), ...]`. In `mode="quimb-<method>"` (or the direct alias
+`mode="quimb"`) the stream can also contain explicit sub-MPO events. The
+legacy `mode="mpo-<method>"` and `mode="mpo"` spellings remain supported.
+These events represent already-factorized nonlocal operators:
 
 ```python
 event = ("submpo", mpo, where)
@@ -79,7 +80,7 @@ event = {"kind": "submpo", "mpo": mpo, "where": where}
 `where` is a non-empty tuple/list of unique 1D MPS sites. The convenience
 helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. These
 events are applied with `gate_with_submpo_` and compressed to `chi`; they are
-only accepted in the MPO mode family.
+only accepted in the Quimb compression mode family.
 
 Modes that use canonical MPS metadata require an open-boundary MPS. A cyclic
 MPS has a nontrivial loop environment, so no single tensor norm can equal its
@@ -142,7 +143,7 @@ simulator = pepsy.MpsOptimizer(
     initial_mps,
     [("h", 0), ("x_error", 1e-3, 0), ("measure", "Z", 0)],
     chi=64,
-    mode="mpo-direct",
+    mode="quimb-direct",
 )
 result = simulator.run(shots=10_000, strategy="auto", seed=7)
 ```
@@ -194,7 +195,7 @@ The practical shot-mode matrix is:
 
 | mode | trajectory status |
 | --- | --- |
-| `mpo-<method>` | selected Quimb MPO compression; `mpo-direct` is the default and `mpo` is an alias |
+| `quimb-<method>` | selected Quimb 1D compression; `quimb-direct` is the default and `quimb` is its direct alias |
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
 | `dmrg`, `dmrg1/2/3` | variational compressed replay; `dmrg2` is the production default |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
@@ -202,7 +203,8 @@ The practical shot-mode matrix is:
 | `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
-The MPO method names are passed to Quimb's native 1D compression dispatcher.
+The `quimb-<method>` names are passed to Quimb's native 1D compression
+dispatcher. The legacy `mpo-<method>` names remain accepted as aliases.
 Oversampled methods retain Quimb's two-stage structure: an intermediate larger
 bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
@@ -211,11 +213,11 @@ not receive `cutoff_mode`, ordinary Pepsy paths use `rsum2` while MPO `dm`
 keeps Quimb's native `rsum1` default. Passing a string explicitly overrides
 that method default.
 
-For example, `mode="mpo-src"` applies each gate with Quimb's Successive
-Randomized Compression, while `fit_init_strategy="guess_src"` uses SRC only
+For example, `mode="quimb-src"` applies each gate with Quimb's Successive
+Randomized Compression, while `fit_init_strategy="guess-src"` uses SRC only
 to build a disposable DMRG/FIT initial guess. The equivalent
-`fit_init_strategy="guess-src"` spelling is accepted as an alias and is
-normalized to `guess_src`. Set `compression_seed` for reproducible randomized
+`fit_init_strategy="guess_src"` spelling is accepted as a compatibility alias
+and is normalized internally to `guess_src`. Set `compression_seed` for reproducible randomized
 MPO replay; `fit_init_seed` controls randomized disposable FIT guesses.
 
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
@@ -228,10 +230,11 @@ later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
 warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
 same fixed warm-up schedule with three-site FIT and then one-site FIT.
 For dense DMRG growth windows, FIT starts from a disposable compressed guess.
-The default is `fit_init_strategy="guess_zipup"`; the exact FIT target and
+The default is `fit_init_strategy="guess-zipup"`; the exact FIT target and
 named schedules are unchanged. The strategy can be `direct`, `random`,
-`random_expand`, or `guess_<method>`, where `<method>` is one of the Quimb MPO
-compression methods listed below. `auto` selects `guess_zipup` while an active
+`random_expand`, or `guess-<method>`, where `<method>` is one of the Quimb
+compression methods listed below. The underscore spelling remains accepted for
+compatibility. `auto` selects `guess-zipup` while an active
 bond still needs growth. Native Symmray and fermionic states retain their
 native warm-start path. The legacy `fit_mpo_guess=False` switch still disables
 the default named-mode guess. Both the target and the guess remain separate
@@ -251,11 +254,11 @@ two-site gate span automatically falls back to `fit_block_size=2`. Both block
 sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
 optimizer's `fit_init_strategy` chooses whether a disposable FIT guess is
 direct, randomly perturbed at fixed rank, randomly expanded on active bonds,
-or `guess_<method>` compressed by Quimb. The available methods are
+or `guess-<method>` compressed by Quimb. The available methods are
 `direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `sdc`,
 `sdc-oversample`, `src`, `src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`. `auto` selects `guess_zipup` before active
+`fit-projector`, `fit-oversample`. `auto` selects `guess-zipup` before active
 bonds reach their attainable ceilings; otherwise it uses the current MPS
 directly.
 Native Symmray and fermionic paths use their graded sector-growth route without
@@ -369,10 +372,10 @@ from FIT's initial state. For a two- or three-site growth window,
 `fit_init_strategy` selects the disposable guess: `direct` uses the current
 MPS, `random` adds deterministic small noise without changing ranks,
 `random_expand` adds noise while opening only under-capacity active bonds, and
-`guess_<method>` uses an isolated Quimb replay with the selected compression
+`guess-<method>` uses an isolated Quimb replay with the selected compression
 method. `fit_init_rand_strength` controls the random scale (default `1e-1`),
 and `fit_init_seed` controls reproducibility, including randomized Quimb
-methods selected through `guess_<method>`.
+methods selected through `guess-<method>`.
 FIT never copies the target into `fit.p` and never uses a target warm start.
 Native nonlocal gates retain their graded auto-swap/sector-growth preparation
 and never receive dense random padding.
