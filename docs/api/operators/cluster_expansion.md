@@ -134,6 +134,72 @@ then perform a spanning-tree SVD factorization. Set `max_tree_rank` to
 truncate those generic tree bonds. The fixed-channel Pauli builder remains
 limited to orders 1–4.
 
+## Arbitrary finite graph lattices
+
+The square `PEPO` builder keeps Quimb's four-leg `PEPO` contract. For a
+triangular, honeycomb, Kagome, or irregular finite graph, use
+`ClusterLattice` and the graph-native builder instead:
+
+```python
+from pepsy.operators import ClusterLattice, build_graph_cluster_expansion_pepo
+
+z = np.diag([1.0, -1.0])
+x = np.array([[0.0, 1.0], [1.0, 0.0]])
+y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+lattice = ClusterLattice.from_edges(
+    (0, 1, 2),
+    ((0, 1), (1, 2), (2, 0)),
+    name="triangle",
+)
+active = build_graph_cluster_expansion_pepo(
+    lattice,
+    0.03,
+    np.kron(z, z),
+    0.2 * x,
+    order=3,
+    materialize=False,
+)
+operator = active.to_tensor_network()
+```
+
+`GraphActivePEPOBlocks` has one virtual leg per graph edge and contracts to a
+generic Quimb `TensorNetwork`; `to_dense()` is intended for small validation
+graphs. The graph solver enumerates connected induced subgraphs, subtracts the
+complete lower-order graph operator, and factors every residual over a
+spanning tree. This is exact at the local residual level when the tree ranks
+are not capped, including for induced graph loops. It is deliberately a
+separate return type because Quimb's `PEPO` wrapper is square-lattice-only.
+
+## Internal symmetries
+
+Geometric `symmetry="C4"` and internal charge symmetry are separate options.
+`ClusterInternalSymmetry` currently validates neutral `U1`, `Z2`, `U1U1`, and
+`Z2Z2` Hamiltonian terms. Sector-ordered dense bases can use
+`physical_sectors`; arbitrary dense bases can use local `generators`:
+
+```python
+from pepsy.operators import ClusterInternalSymmetry
+
+u1 = ClusterInternalSymmetry("U1", physical_sectors={0: 1, 1: 1})
+active = build_graph_cluster_expansion_pepo(
+    lattice,
+    0.03,
+    np.kron(x, x) + np.kron(y, y),
+    z,
+    order=3,
+    internal_symmetry=u1,
+    materialize=False,
+)
+assert active.charge_symmetry == "U1"
+```
+
+The validator prevents charge-changing local terms and records the compatible
+physical-sector metadata on the active blocks. Dense SVD factors are not
+automatically relabeled as native block-sparse factors: Symmray conversion
+still requires explicit `virtual_charges` whenever endpoint factors carry
+nonzero charges. Fermionic graded factorization remains a separate native
+Symmray subsystem.
+
 ## Coefficient-dependent real-time exponentials
 
 For numerical, coefficient-dependent evolution, use

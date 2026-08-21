@@ -1,10 +1,17 @@
 # PEPO cluster expansion
 
-`pepsy.operators.cluster` is the dense square-lattice implementation of the
-connected-cluster PEPO construction. `ClusterExpansionPlan` caches lattice
-directions and cluster-orbit bookkeeping so different beta values do not
-rebuild geometry. `ActivePEPOBlocks` stores only nonzero virtual-sector
-blocks; `to_pepo()` is the explicit dense materialization boundary.
+`pepsy.operators.cluster` contains two construction layers. The legacy
+`ClusterExpansionPlan` is the dense square-lattice implementation of the
+connected-cluster PEPO construction. `GraphClusterExpansionPlan` handles an
+arbitrary finite `ClusterLattice` with one virtual bond per graph edge and
+returns `GraphActivePEPOBlocks`, which materialize as a generic Quimb tensor
+network because Quimb's `PEPO` wrapper is square-lattice-only.
+
+`ClusterExpansionPlan` caches lattice directions and cluster-orbit bookkeeping
+so different beta values do not rebuild geometry. Both active-block types
+store only nonzero virtual-sector blocks; `to_pepo()` is the explicit dense
+materialization boundary for square tensors, while graph blocks use
+`to_tensor_network()`.
 
 `generate_connected_cluster_shapes()` is the value-independent geometry
 inventory for the next implementation stage. It recursively enumerates
@@ -129,6 +136,13 @@ it does not choose projectors from the environment of the full PEPO. The
 report separates these attempts as `generic_loop_solved` and
 `generic_loop_rank`; `loop_rank` remains the overall report, including the
 explicit four-site plaquette history rank.
+
+`ClusterInternalSymmetry` is an explicit validation/metadata boundary for
+neutral `U1`, `Z2`, `U1U1`, and `Z2Z2` terms. It is intentionally separate from
+geometric C4 orbit reduction. Dense SVDs are not treated as native graded
+factorizations; explicit virtual charges are still required for Symmray
+conversion, and fermionic graded solving remains in the native fermion
+subsystem.
 
 The BP loop-cluster API is intentionally not part of this operator builder.
 `pepsy.bp.loop_cluster_expand()` expands a tensor-network contraction around
