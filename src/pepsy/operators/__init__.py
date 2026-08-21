@@ -93,6 +93,7 @@ _MPO_EXPORTS = [
     "CompiledMPOExp",
     "CompiledMPOEvolution",
     "MPOBasis",
+    "exp_mpo",
 ]
 _SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_EXPORTS})
 _SYMBOL_MODULES["PauliMPO"] = ".pauli_mpo"

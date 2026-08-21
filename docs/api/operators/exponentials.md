@@ -11,6 +11,7 @@ builders. The rule is simple:
 
 | Goal | Canonical entry point | Result |
 | --- | --- | --- |
+| One-off term-centric MPO | `exp_mpo(terms, step, ...)` | Compiled Quimb `MatrixProductOperator` |
 | One parameterized 1D Hamiltonian | `MPOBasis.from_pauli_terms(...)` or `MPOBasis.from_local_terms(...)` | Reusable `MPOBasis` |
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
@@ -26,6 +27,45 @@ builders. The rule is simple:
 The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
+
+## Term-centric MPO construction
+
+For the common case, callers only need to provide an operator, its support,
+and a coefficient. `exp_mpo` infers a chain length or regular 2D/3D lattice,
+maps lattice coordinates through the default snake ordering, canonicalizes
+the support of commuting local factors, and shares common MPO channels:
+
+```python
+from pepsy.operators import exp_mpo
+
+terms = [
+    {"operator": "ZZ", "location": ((0, 0), (1, 0)), "coefficient": J},
+    {"operator": "X", "location": (0, 0), "coefficient": h},
+]
+
+# Returns a Quimb MatrixProductOperator by default.
+U = exp_mpo(terms, -1j * tau, shape=(4, 4), order=4, mode="optimal")
+```
+
+`location` can also be a 1D integer site or a sequence of chain sites. In a
+2D/3D term, one coordinate is used for a one-site operator and a sequence of
+coordinates is used for a product operator. Coefficients may be Python
+numbers, Torch/JAX scalars, `MPOParameter` references, or callables supported
+by `MPOBasis`; their slots remain independent even when their structural MPO
+path is shared. Pass a configured `OneDMap` with `mapper=` when a custom
+ordering is needed. Pass `symmetry=` and `physical_charges=` to enable the
+native bosonic block-sparse compilation. Set `return_semantic=True` to keep
+the history-aware `FirstDegreeMPO` instead of materializing the Quimb MPO.
+
+The compact Pauli mapping used elsewhere in Pepsy is accepted directly:
+
+```python
+terms = {"XX": (2, 3)}                    # coefficient defaults to 1
+terms = {"XX": ((2, 3), J)}               # explicit coefficient
+terms = {"xyz": (((0, 0), (1, 0), (0, 1)), J)}
+```
+
+The number of Pauli labels must match the number of supplied sites.
 
 ## MPO: parameterized chain
 
@@ -69,6 +109,39 @@ U = basis.exp(-1j * tau, coefficients=theta, order=4, mode="optimal")
 `parameters` and `coefficients` are mutually exclusive. A parameter mapping
 is resolved through `MPOParameter("name")` references; a coefficient vector
 must have exactly `basis.num_terms` entries.
+
+For a square-lattice Hamiltonian that should be executed as an MPO, use the
+coordinate-aware compiler. It maps coordinates to a reusable 1D ordering with
+`OneDMap`, canonicalizes reversed location/Pauli descriptions, and retains
+the same autodiff coefficient path:
+
+```python
+basis = MPOBasis.from_square_lattice(
+    4,
+    4,
+    [
+        {
+            "locations": ((0, 0), (1, 0)),
+            "paulis": "ZZ",
+            "parameter": "J",
+        },
+        {
+            "locations": ((0, 0),),
+            "paulis": "X",
+            "parameter": "h",
+        },
+    ],
+)
+compiled = basis.compile_exp(order=4, mode="optimal")
+U = compiled.exp(-1j * tau, {"J": J, "h": h})
+```
+
+The default traversal is snake order; pass `map_mode=` or a configured
+`OneDMap` to choose another ordering. Similar and duplicate terms share the
+compiled MPO channel structure while retaining separate coefficient slots, so
+independent autodiff parameters are summed on the shared path at build time.
+If the desired output is a PEPO with local
+square-lattice virtual legs rather than an MPO, use `PauliPEPOBasis` instead.
 
 ### Repeated MPO evaluations
 

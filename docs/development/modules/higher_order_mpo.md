@@ -152,8 +152,11 @@ semantic wrapper for autodiff but marks `history_valid=False`.
 - Finite Torch and JAX paths use functional tensor updates, so Algorithm 3
   remains compatible with reverse-mode autodiff and JIT tracing. Native
   Symmray compilation supports neutral bosonic `U1`, `Z2`, `U1U1`, and
-  `Z2Z2` MPOs with NumPy local blocks. Graded fermionic compilation remains
-  disabled until history construction has a sign-preserving semantic input.
+  `Z2Z2` MPOs with NumPy local blocks. Symmetry names are normalized
+  case-insensitively, and `physical_charges` accepts either one charge per
+  basis state or an insertion-ordered charge-to-multiplicity mapping. Graded
+  fermionic compilation remains disabled until history construction has a
+  sign-preserving semantic input.
 - Public algebraic operations are non-mutating. Mutation is available only
   through the named `inplace=True` compression option.
 

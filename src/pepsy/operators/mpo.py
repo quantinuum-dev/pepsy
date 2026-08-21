@@ -66,6 +66,7 @@ __all__ = [
     "CompiledMPOExp",
     "CompiledMPOEvolution",
     "MPOBasis",
+    "exp_mpo",
 ]
 
 
@@ -254,6 +255,53 @@ def _check_scalar(value, *, name):
         ndim = np.ndim(value)
     if ndim != 0:
         raise TypeError(f"{name} must be scalar, got ndim={ndim}.")
+
+
+_SUPPORTED_MPO_SYMMETRIES = frozenset({"U1", "Z2", "U1U1", "Z2Z2"})
+
+
+def _normalize_mpo_symmetry(value):
+    """Normalize a public MPO symmetry name to Symmray's spelling."""
+    name = str(value).upper().replace("-", "")
+    if name not in _SUPPORTED_MPO_SYMMETRIES:
+        allowed = ", ".join(sorted(_SUPPORTED_MPO_SYMMETRIES))
+        raise ValueError(
+            f"block-sparse MPO symmetry must be one of {allowed}; got {value!r}."
+        )
+    return name
+
+
+def _normalize_mpo_physical_charges(charges, phys_dim, symmetry):
+    """Expand and normalize per-state or per-sector physical charges."""
+    if isinstance(charges, Mapping):
+        expanded = []
+        for charge, multiplicity in charges.items():
+            if (
+                isinstance(multiplicity, bool)
+                or not isinstance(multiplicity, Integral)
+                or int(multiplicity) < 1
+            ):
+                raise ValueError(
+                    "physical charge-sector multiplicities must be positive "
+                    f"integers, got {multiplicity!r} for charge {charge!r}."
+                )
+            expanded.extend([charge] * int(multiplicity))
+        charges = tuple(expanded)
+    else:
+        try:
+            charges = tuple(charges)
+        except TypeError as exc:
+            raise TypeError(
+                "physical_charges must be a sequence or a mapping from "
+                "charge to positive sector multiplicity."
+            ) from exc
+
+    if len(charges) != phys_dim:
+        raise ValueError(
+            "physical_charges must contain one charge per local basis state "
+            f"(or sector multiplicities summing to {phys_dim}), got {len(charges)}."
+        )
+    return tuple(normalize_charge(charge, symmetry) for charge in charges)
 
 
 def _resolve_exp_step(step, dt):
@@ -781,6 +829,444 @@ def _term_from_input(term):
     )
 
 
+def _looks_like_pauli_labels(value):
+    """Return whether ``value`` is a compact Pauli-label sequence."""
+    if isinstance(value, str):
+        return bool(value) and all(len(label) == 1 for label in value)
+    try:
+        labels = tuple(value)
+    except TypeError:
+        return False
+    return bool(labels) and all(
+        isinstance(label, str) and len(label) == 1
+        for label in labels
+    )
+
+
+def _square_lattice_pauli_term(term, lattice_to_chain):
+    """Normalize one coordinate-based Pauli term to chain sites."""
+    if isinstance(term, MPOProductTerm):
+        if not all(isinstance(site, Integral) for site in term.sites):
+            raise TypeError(
+                "MPOProductTerm inputs to from_square_lattice must already "
+                "use integer chain sites; use a mapping or tuple for coordinates."
+            )
+        return term
+
+    charge = None
+    if isinstance(term, Mapping):
+        locations = term.get("locations", term.get("sites"))
+        paulis = term.get("paulis", term.get("operators"))
+        coefficient = term.get("coefficient", _UNSET)
+        if coefficient is _UNSET:
+            if "parameter" in term:
+                coefficient = MPOParameter(
+                    term["parameter"],
+                    term.get("default", _UNSET),
+                )
+            else:
+                coefficient = 1.0
+        charge = term.get("charge")
+    elif isinstance(term, (tuple, list)) and len(term) in (2, 3):
+        first, second = term[:2]
+        if _looks_like_pauli_labels(first) and not _looks_like_pauli_labels(second):
+            paulis, locations = first, second
+        else:
+            locations, paulis = first, second
+        coefficient = term[2] if len(term) == 3 else 1.0
+    else:
+        raise TypeError(
+            "square-lattice Pauli terms must be mappings with 'locations' "
+            "and 'paulis', or (locations, paulis[, coefficient]) pairs."
+        )
+
+    if locations is None or paulis is None:
+        raise ValueError("each square-lattice Pauli term needs locations and paulis.")
+    try:
+        locations = tuple(locations)
+    except TypeError as exc:
+        raise TypeError("term locations must be a sequence of sites.") from exc
+    labels = tuple(paulis) if isinstance(paulis, str) else tuple(paulis)
+    if not locations or len(locations) != len(labels):
+        raise ValueError("term locations and Pauli labels must be non-empty and aligned.")
+
+    mapped = []
+    for location in locations:
+        if isinstance(location, Integral):
+            chain_site = int(location)
+            if not 0 <= chain_site < len(lattice_to_chain):
+                raise ValueError(
+                    f"chain site {chain_site} is outside the square lattice chain."
+                )
+        else:
+            try:
+                coordinate = tuple(int(value) for value in location)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"lattice locations must be 2D coordinates, got {location!r}."
+                ) from exc
+            if len(coordinate) != 2:
+                raise ValueError(
+                    f"lattice locations must be 2D coordinates, got {location!r}."
+                )
+            try:
+                chain_site = lattice_to_chain[coordinate]
+            except KeyError as exc:
+                raise ValueError(
+                    f"lattice location {coordinate!r} is outside the configured lattice."
+                ) from exc
+        mapped.append(chain_site)
+
+    if len(set(mapped)) != len(mapped):
+        raise ValueError("a Pauli term cannot contain the same lattice site twice.")
+
+    # Operators on distinct sites commute, so sorting location/Pauli pairs
+    # gives one canonical word for reversed coordinate descriptions. This
+    # lets the shared automaton merge equivalent terms before evaluation.
+    ordered = sorted(zip(mapped, labels), key=lambda item: item[0])
+    sites, labels = zip(*ordered)
+    return MPOProductTerm.from_pauli(
+        sites,
+        labels,
+        coefficient=coefficient,
+        charge=charge,
+    )
+
+
+def _looks_like_operator_payload(value):
+    """Return whether ``value`` looks like one or more local operators."""
+    if isinstance(value, str) or hasattr(value, "shape"):
+        return True
+    try:
+        entries = tuple(value)
+    except TypeError:
+        return False
+    return bool(entries) and all(
+        isinstance(entry, str) or hasattr(entry, "shape")
+        for entry in entries
+    )
+
+
+def _generic_term_parts(term):
+    """Split a user-facing term into operator, locations, coefficient, metadata."""
+    if isinstance(term, MPOProductTerm):
+        return {
+            "operator": term.operators,
+            "location": term.sites,
+            "coefficient": term.coefficient,
+            "string_operators": term.string_operators,
+            "charge": term.charge,
+        }
+
+    if isinstance(term, Mapping):
+        operator = term.get(
+            "operator",
+            term.get("operators", term.get("paulis", term.get("word"))),
+        )
+        location = term.get(
+            "location",
+            term.get(
+                "locations",
+                term.get("sites", term.get("where")),
+            ),
+        )
+        if operator is None or location is None:
+            raise ValueError(
+                "each term needs an operator and location (or the plural "
+                "operators/locations aliases)."
+            )
+        coefficient = term.get("coefficient", term.get("weight", _UNSET))
+        if coefficient is _UNSET:
+            if "parameter" in term:
+                coefficient = MPOParameter(
+                    term["parameter"],
+                    term.get("default", _UNSET),
+                )
+            else:
+                coefficient = 1.0
+        return {
+            "operator": operator,
+            "location": location,
+            "coefficient": coefficient,
+            "string_operators": term.get(
+                "string_operators",
+                term.get("string_paulis"),
+            ),
+            "charge": term.get("charge"),
+        }
+
+    if isinstance(term, (tuple, list)) and len(term) in (2, 3):
+        first, second = term[:2]
+        if _looks_like_operator_payload(first) and not _looks_like_operator_payload(second):
+            operator, location = first, second
+        else:
+            location, operator = first, second
+        return {
+            "operator": operator,
+            "location": location,
+            "coefficient": term[2] if len(term) == 3 else 1.0,
+            "string_operators": None,
+            "charge": None,
+        }
+
+    raise TypeError(
+        "terms must contain MPOProductTerm values, mappings, or "
+        "(location, operator[, coefficient]) / "
+        "(operator, location[, coefficient]) pairs."
+    )
+
+
+def _operator_factors(operator):
+    """Return a tuple of local operator factors."""
+    if isinstance(operator, str):
+        return tuple(operator)
+    if hasattr(operator, "shape"):
+        return (operator,)
+    try:
+        factors = tuple(operator)
+    except TypeError as exc:
+        raise TypeError("operator must be a local matrix or operator sequence.") from exc
+    if not factors:
+        raise ValueError("operator sequences must be non-empty.")
+    return factors
+
+
+def _looks_like_location_sequence(value):
+    """Return whether a shorthand value is a site or coordinate sequence."""
+    if isinstance(value, Integral):
+        return True
+    try:
+        values = tuple(value)
+    except TypeError:
+        return False
+    if not values:
+        return False
+    if all(isinstance(item, Integral) for item in values):
+        return True
+    return all(
+        not isinstance(item, (str, bytes))
+        and _looks_like_location_sequence(item)
+        for item in values
+    )
+
+
+def _expand_term_collection(terms):
+    """Expand Pepsy-style ``{operator: location[, coefficient]}`` mappings."""
+    if not isinstance(terms, Mapping):
+        return tuple(terms)
+
+    canonical_keys = {
+        "operator",
+        "operators",
+        "paulis",
+        "word",
+        "location",
+        "locations",
+        "sites",
+        "where",
+        "coefficient",
+        "weight",
+        "parameter",
+    }
+    if any(key in canonical_keys for key in terms):
+        return (terms,)
+
+    expanded = []
+    for operator, value in terms.items():
+        if isinstance(value, Mapping):
+            record = dict(value)
+            record.setdefault("operator", operator)
+            expanded.append(record)
+            continue
+
+        # ``{"XX": (2, 3)}`` is a two-site term. To attach a coefficient,
+        # use ``{"XX": ((2, 3), coefficient)}``; nested coordinate supports
+        # such as ``{"XX": ((0, 0), (1, 0))}`` remain unambiguous.
+        location = value
+        coefficient = 1.0
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            first, second = value
+            if not _looks_like_location_sequence(value):
+                location, coefficient = first, second
+            elif _looks_like_location_sequence(first) and not _looks_like_location_sequence(second):
+                location, coefficient = first, second
+        expanded.append(
+            {
+                "operator": operator,
+                "location": location,
+                "coefficient": coefficient,
+            }
+        )
+    return tuple(expanded)
+
+
+def _location_dimensions(location, num_factors, expected_ndim=None):
+    """Normalize locations and identify whether they are chain or lattice sites."""
+    if isinstance(location, Integral):
+        return 1, (int(location),)
+
+    try:
+        values = tuple(location)
+    except TypeError as exc:
+        raise TypeError("location must be an integer or a coordinate sequence.") from exc
+    if not values:
+        raise ValueError("term locations must be non-empty.")
+
+    if all(isinstance(value, Integral) for value in values):
+        # A single local operator at (x, y) or (x, y, z) is one lattice site.
+        # Multiple factors at flat integer locations are the conventional 1D form.
+        if num_factors == 1 and expected_ndim in (2, 3):
+            return expected_ndim, (tuple(int(value) for value in values),)
+        if num_factors == 1 and expected_ndim is None and len(values) in (2, 3):
+            return len(values), (tuple(int(value) for value in values),)
+        return 1, tuple(int(value) for value in values)
+
+    coordinates = []
+    for value in values:
+        try:
+            coordinate = tuple(int(item) for item in value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "lattice locations must be integer coordinates."
+            ) from exc
+        if not coordinate:
+            raise ValueError("lattice coordinates must be non-empty.")
+        coordinates.append(coordinate)
+    ndim = len(coordinates[0])
+    if any(len(coordinate) != ndim for coordinate in coordinates):
+        raise ValueError("all lattice coordinates in a term must have the same dimension.")
+    return ndim, tuple(coordinates)
+
+
+def _normalize_term_shape(shape):
+    """Normalize a public ``shape`` argument to a tuple."""
+    if isinstance(shape, Integral):
+        shape = (int(shape),)
+    else:
+        try:
+            shape = tuple(int(value) for value in shape)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("shape must be an integer or a 2D/3D shape tuple.") from exc
+    if len(shape) not in (1, 2, 3) or any(value < 1 for value in shape):
+        raise ValueError("shape must contain one, two, or three positive dimensions.")
+    return shape
+
+
+def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
+    """Compile coordinate-aware term records into chain product terms."""
+    raw_terms = tuple(
+        _generic_term_parts(term)
+        for term in _expand_term_collection(terms)
+    )
+    if not raw_terms:
+        raise ValueError("terms must contain at least one product term.")
+
+    if mapper is not None:
+        from pepsy.tensors import OneDMap  # pylint: disable=import-outside-toplevel
+
+        if not isinstance(mapper, OneDMap):
+            raise TypeError("mapper must be a pepsy.tensors.OneDMap or None.")
+        mapped_shape = tuple(mapper.shape)
+        if shape is not None and _normalize_term_shape(shape) != mapped_shape:
+            raise ValueError(
+                f"shape {_normalize_term_shape(shape)} does not match mapper shape "
+                f"{mapped_shape}."
+            )
+        shape_tuple = mapped_shape
+    elif shape is not None:
+        shape_tuple = _normalize_term_shape(shape)
+    else:
+        shape_tuple = None
+
+    expected_ndim = None if shape_tuple is None else len(shape_tuple)
+    located_terms = []
+    inferred_shape = []
+    for raw in raw_terms:
+        factors = _operator_factors(raw["operator"])
+        ndim, locations = _location_dimensions(
+            raw["location"],
+            len(factors),
+            expected_ndim=expected_ndim,
+        )
+        if expected_ndim is not None and ndim != expected_ndim:
+            raise ValueError(
+                f"locations have dimension {ndim}, but configured shape is "
+                f"{shape_tuple}."
+            )
+        if located_terms and ndim != located_terms[0][0]:
+            raise ValueError("all terms must use the same location dimension.")
+        if len(locations) != len(factors):
+            raise ValueError(
+                "each term must provide one local operator per location; "
+                f"got {len(factors)} operators for {len(locations)} locations."
+            )
+        located_terms.append((ndim, locations, factors, raw))
+        if shape_tuple is None:
+            if not inferred_shape:
+                inferred_shape = [0] * ndim
+            for location in locations:
+                if ndim == 1:
+                    inferred_shape[0] = max(inferred_shape[0], int(location) + 1)
+                else:
+                    for axis, value in enumerate(location):
+                        inferred_shape[axis] = max(inferred_shape[axis], int(value) + 1)
+
+    if shape_tuple is None:
+        shape_tuple = tuple(inferred_shape)
+        if not shape_tuple or any(value < 1 for value in shape_tuple):
+            raise ValueError("could not infer a positive lattice shape from terms.")
+    if len(shape_tuple) == 1:
+        chain_length = shape_tuple[0]
+        chain_maps = None
+    else:
+        from pepsy.tensors import OneDMap  # pylint: disable=import-outside-toplevel
+
+        if mapper is None:
+            mapper = OneDMap(*shape_tuple, mode=map_mode)
+        elif tuple(mapper.shape) != shape_tuple:
+            raise ValueError(
+                f"mapper shape {mapper.shape} does not match configured shape {shape_tuple}."
+            )
+        chain_maps = mapper.build()
+        chain_length = int(np.prod(shape_tuple))
+
+    compiled = []
+    for ndim, locations, factors, raw in located_terms:
+        if ndim == 1:
+            mapped = tuple(int(location) for location in locations)
+            if any(location < 0 or location >= chain_length for location in mapped):
+                raise ValueError("a term location is outside the configured chain shape.")
+        else:
+            _chain_to_lattice, lattice_to_chain = chain_maps
+            try:
+                mapped = tuple(lattice_to_chain[tuple(location)] for location in locations)
+            except KeyError as exc:
+                raise ValueError(
+                    f"lattice location {exc.args[0]!r} is outside shape {shape_tuple}."
+                ) from exc
+        if len(set(mapped)) != len(mapped):
+            raise ValueError("a product term cannot contain the same site twice.")
+        ordered = sorted(zip(mapped, factors), key=lambda item: item[0])
+        sites, ordered_factors = zip(*ordered)
+        compiled.append(
+            MPOProductTerm(
+                sites=sites,
+                operators=ordered_factors,
+                coefficient=raw["coefficient"],
+                string_operators=raw["string_operators"],
+                charge=raw["charge"],
+            )
+        )
+
+    metadata = {
+        "shape": shape_tuple,
+        "mapper": mapper,
+        "chain_to_lattice": None if chain_maps is None else dict(chain_maps[0]),
+        "lattice_to_chain": None if chain_maps is None else dict(chain_maps[1]),
+    }
+    return chain_length, tuple(compiled), metadata
+
+
 class FirstDegreeMPO:
     """A finite-chain MPO with explicit virtual-level histories.
 
@@ -812,9 +1298,11 @@ class FirstDegreeMPO:
         Algebraic degree represented by the expression.
     symmetry : {"U1", "Z2", "U1U1", "Z2Z2"}, optional
         Abelian symmetry used when compiling to native Symmray tensors.
-    physical_charges : sequence, optional
-        Charge of each local dense basis state, in physical-index order. Equal
-        charges must form contiguous sectors.
+    physical_charges : sequence or mapping, optional
+        Charge of each local dense basis state, in physical-index order. A
+        mapping such as ``{0: 1, 1: 2, 2: 1}`` is also accepted and expands
+        charge sectors by multiplicity in mapping order. Equal charges must
+        form contiguous sectors.
     fermionic : bool, default=False
         Request graded Symmray tensors. The higher-order block-sparse backend
         currently rejects this option until native fermionic history signs are
@@ -850,12 +1338,10 @@ class FirstDegreeMPO:
         self.lower_ind_id = lower_ind_id
         self.site_tag_id = site_tag_id
         self.metadata = dict(metadata or {})
-        self.symmetry = None if symmetry is None else str(symmetry)
-        self.physical_charges = (
-            None
-            if physical_charges is None
-            else tuple(physical_charges)
+        self.symmetry = (
+            None if symmetry is None else _normalize_mpo_symmetry(symmetry)
         )
+        self.physical_charges = physical_charges
         self.fermionic = bool(fermionic)
         # Keep this attribute present on every instance so callers do not
         # need to probe for it after an optional compression stage. It is
@@ -893,19 +1379,10 @@ class FirstDegreeMPO:
             return
         if self.physical_charges is None:
             raise ValueError("symmetry requires physical_charges.")
-        if len(self.physical_charges) != self.phys_dim:
-            raise ValueError(
-                "physical_charges must contain one charge per local basis "
-                f"state, expected {self.phys_dim}."
-            )
-        if self.symmetry not in {"U1", "Z2", "U1U1", "Z2Z2"}:
-            raise ValueError(
-                "block-sparse MPO symmetry must be 'U1', 'Z2', 'U1U1', "
-                "or 'Z2Z2'."
-            )
-        self.physical_charges = tuple(
-            normalize_charge(charge, self.symmetry)
-            for charge in self.physical_charges
+        self.physical_charges = _normalize_mpo_physical_charges(
+            self.physical_charges,
+            self.phys_dim,
+            self.symmetry,
         )
         closed_sectors = set()
         sentinel = object()
@@ -5104,8 +5581,10 @@ class MPOBasis:
         when omitted.
     symmetry : {"U1", "Z2", "U1U1", "Z2Z2"}, optional
         Abelian symmetry used for native Symmray MPO compilation.
-    physical_charges : sequence, optional
-        Charge of each local dense basis state. Equal charges must form
+    physical_charges : sequence or mapping, optional
+        Charge of each local dense basis state. A mapping from charge to
+        positive sector multiplicity is also accepted; its insertion order
+        defines the dense basis sector order. Equal charges must form
         contiguous sectors.
     fermionic : bool, default=False
         Reserved for a future sign-preserving graded history backend. The
@@ -5199,8 +5678,52 @@ class MPOBasis:
             lower_ind_id=lower_ind_id,
             site_tag_id=site_tag_id,
         )
+        self._lattice_shape = None
+        self._lattice_mapper = None
+        self._lattice_to_chain = None
+        self._chain_to_lattice = None
         self._build_count = 0
         self._compiled_evolution_cache = {}
+
+    @classmethod
+    def from_terms(
+        cls,
+        terms,
+        *,
+        shape=None,
+        mapper=None,
+        map_mode="snake",
+        **kwargs,
+    ):
+        """Create a basis directly from operator/location/coefficient terms.
+
+        This is the term-centric entry point for chain and regular-lattice
+        inputs. A term may be written as
+        ``{"operator": "ZZ", "location": (0, 1), "coefficient": value}``
+        or with the existing plural ``operators``/``locations`` aliases.
+        Pepsy's compact Pauli mapping is also accepted: ``{"XX": (2, 3)}``
+        or ``{"XX": ((2, 3), coefficient)}``. A word key with a nested
+        coordinate support follows the same convention, for example
+        ``{"xyz": (((0, 0), (1, 0), (0, 1)), coefficient)}``.
+        ``shape`` may be an integer chain length or a 2D/3D lattice shape. If
+        it is omitted, the smallest shape containing all term locations is
+        inferred. Common supports are canonicalized before the shared MPO
+        automaton is built, while each coefficient remains an independent
+        slot for autodiff.
+        """
+        length, normalized_terms, metadata = _compile_generic_terms(
+            terms,
+            shape=shape,
+            mapper=mapper,
+            map_mode=map_mode,
+        )
+        basis = cls(length, normalized_terms, **kwargs)
+        if len(metadata["shape"]) > 1:
+            basis._lattice_shape = metadata["shape"]
+            basis._lattice_mapper = metadata["mapper"]
+            basis._lattice_to_chain = metadata["lattice_to_chain"]
+            basis._chain_to_lattice = metadata["chain_to_lattice"]
+        return basis
 
     @classmethod
     def from_local_terms(
@@ -5224,10 +5747,79 @@ class MPOBasis:
         """Create a reusable qubit basis from compact Pauli term labels."""
         return cls(L, terms, phys_dim=2, **kwargs)
 
+    @classmethod
+    def from_square_lattice(
+        cls,
+        lx,
+        ly,
+        terms,
+        *,
+        mapper=None,
+        map_mode="snake",
+        **kwargs,
+    ):
+        """Compile coordinate-based Pauli terms into a reusable MPO basis.
+
+        ``terms`` accepts mappings such as
+        ``{"locations": ((0, 0), (1, 0)), "paulis": "ZZ", ...}``, where
+        ``...`` can contain ``coefficient`` or ``parameter``. Tuple forms may
+        be written as either ``(locations, paulis[, coefficient])`` or
+        ``(paulis, locations[, coefficient])``. Locations are mapped to a
+        one-dimensional MPO chain using :class:`pepsy.tensors.OneDMap`.
+
+        Reversed location/Pauli descriptions are canonicalized before the
+        shared automaton is built, so equivalent terms reuse one structural
+        channel while their backend-native coefficients remain differentiable.
+        """
+        from pepsy.tensors import OneDMap  # pylint: disable=import-outside-toplevel
+
+        if mapper is None:
+            mapper = OneDMap(lx, ly, mode=map_mode)
+        elif not isinstance(mapper, OneDMap):
+            raise TypeError("mapper must be a pepsy.tensors.OneDMap or None.")
+        if mapper.shape != (int(lx), int(ly)):
+            raise ValueError(
+                f"mapper shape {mapper.shape} does not match lattice shape "
+                f"{(int(lx), int(ly))}."
+            )
+        chain_to_lattice, lattice_to_chain = mapper.build()
+        normalized_terms = tuple(
+            _square_lattice_pauli_term(term, lattice_to_chain)
+            for term in terms
+        )
+        if not normalized_terms:
+            raise ValueError("terms must contain at least one Pauli term.")
+
+        basis = cls.from_pauli_terms(
+            int(lx) * int(ly),
+            normalized_terms,
+            **kwargs,
+        )
+        basis._lattice_shape = (int(lx), int(ly))
+        basis._lattice_mapper = mapper
+        basis._lattice_to_chain = dict(lattice_to_chain)
+        basis._chain_to_lattice = dict(chain_to_lattice)
+        return basis
+
     @property
     def terms(self):
         """Read-only term specifications, including coefficient references."""
         return self._terms
+
+    @property
+    def lattice_shape(self):
+        """Return the compiled ``(lx, ly)`` shape, or ``None`` for chain input."""
+        return self._lattice_shape
+
+    @property
+    def lattice_to_chain(self):
+        """Return a copy of the coordinate-to-MPO-site map, when configured."""
+        return None if self._lattice_to_chain is None else dict(self._lattice_to_chain)
+
+    @property
+    def chain_to_lattice(self):
+        """Return a copy of the MPO-site-to-coordinate map, when configured."""
+        return None if self._chain_to_lattice is None else dict(self._chain_to_lattice)
 
     @property
     def num_terms(self):
@@ -5256,6 +5848,10 @@ class MPOBasis:
             "compiled_evolution_variants": len(self._compiled_evolution_cache),
             "topology_bond_dimensions": self.bond_dimensions,
             "vectorized_slot_groups": len(self._vectorized_slot_groups),
+            "lattice_shape": self._lattice_shape,
+            "lattice_mode": (
+                None if self._lattice_mapper is None else self._lattice_mapper.mode
+            ),
             "history": self._template.history_cache_info,
         }
 
@@ -5918,3 +6514,94 @@ class MPOBasis:
             differentiable=differentiable,
             return_report=return_report,
         )
+
+
+def exp_mpo(
+    terms,
+    step=None,
+    *,
+    shape=None,
+    mapper=None,
+    map_mode="snake",
+    parameters=None,
+    coefficients=None,
+    dt=None,
+    phys_dim=None,
+    order=1,
+    mode=None,
+    extend=False,
+    approximate=False,
+    max_bond=None,
+    on_exceed="raise",
+    cache_history=True,
+    history_storage="auto",
+    chi=None,
+    cutoff=1.0e-10,
+    cutoff_mode="rel",
+    compression=None,
+    differentiable=False,
+    symmetry=None,
+    physical_charges=None,
+    fermionic=False,
+    return_semantic=False,
+    return_report=False,
+):
+    """Build an exponential MPO directly from local operator terms.
+
+    The usual term form is ``{"operator": "ZZ", "location": (0, 1),
+    "coefficient": value}``. The compact Pepsy mapping form
+    ``{"XX": (2, 3)}`` or ``{"XX": ((2, 3), coefficient)}`` is equivalent.
+    ``operator`` may also be a local matrix or a sequence of local matrices,
+    and locations may be integer chain sites or 2D/3D coordinates. The lattice
+    shape is inferred when possible, or can be supplied as
+    ``shape=(lx, ly[, lz])``. Terms with common supports are
+    compiled through one shared automaton, so onsite contributions are
+    combined at their transition while coefficient slots remain independent.
+
+    By default this convenience function returns a compiled Quimb MPO. Set
+    ``return_semantic=True`` when the higher-order history object and its
+    ``to_mpo()`` boundary are needed. Pass ``symmetry`` and
+    ``physical_charges`` to select the native bosonic block-sparse compiler.
+    """
+    basis = MPOBasis.from_terms(
+        terms,
+        shape=shape,
+        mapper=mapper,
+        map_mode=map_mode,
+        phys_dim=phys_dim,
+        symmetry=symmetry,
+        physical_charges=physical_charges,
+        fermionic=fermionic,
+    )
+    result = basis.exp(
+        step,
+        parameters,
+        coefficients=coefficients,
+        dt=dt,
+        order=order,
+        mode=mode,
+        extend=extend,
+        approximate=approximate,
+        max_bond=max_bond,
+        on_exceed=on_exceed,
+        cache_history=cache_history,
+        history_storage=history_storage,
+        chi=chi,
+        cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
+        compression=compression,
+        differentiable=differentiable,
+        return_report=return_report,
+    )
+    if return_report:
+        semantic_result, report = result
+    else:
+        semantic_result, report = result, None
+
+    if return_semantic:
+        output = semantic_result
+    elif hasattr(semantic_result, "to_mpo"):
+        output = semantic_result.to_mpo()
+    else:
+        output = semantic_result
+    return (output, report) if return_report else output

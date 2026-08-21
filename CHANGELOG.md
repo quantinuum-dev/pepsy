@@ -14,6 +14,16 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- `MPOBasis.from_square_lattice(...)` compiles coordinate-based Pauli terms
+  through a reusable `OneDMap`, aligns reversed location/Pauli descriptions,
+  and preserves backend autodiff coefficients while sharing MPO channels.
+- `exp_mpo(...)` provides a term-centric operator/location/coefficient entry
+  point that infers 1D/2D/3D layouts, accepts custom `OneDMap` orderings,
+  accepts Pepsy-style Pauli-keyed mappings such as `{"XX": ((2, 3), J)}`,
+  shares common MPO paths, and returns a compiled Quimb MPO by default.
+- Higher-order MPO symmetry metadata now accepts case-insensitive compact
+  symmetry names and charge-to-multiplicity mappings for degenerate physical
+  sectors, while retaining the per-basis-state charge sequence form.
 - Core package facades now resolve implementation modules lazily, and the test
   suite exposes explicit `core`, `optional`, and responsibility-based domain
   markers with a scheduled full-suite workflow.

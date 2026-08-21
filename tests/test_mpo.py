@@ -18,6 +18,7 @@ from pepsy.operators import (
     MPODifferentiableCompressionReport,
     MPONumericalCompressionReport,
     MPOProductTerm,
+    exp_mpo,
 )
 
 
@@ -57,6 +58,7 @@ def test_first_degree_mpo_public_exports_resolve():
     assert CompiledMPOEvolution is pepsy.operators.CompiledMPOEvolution
     assert CompiledMPOExp is pepsy.operators.CompiledMPOExp
     assert MPOBasis is pepsy.operators.MPOBasis
+    assert exp_mpo is pepsy.operators.exp_mpo
     assert MPOParameter is pepsy.operators.MPOParameter
     assert MPOLevel is pepsy.operators.MPOLevel
     assert MPOLevelToken is pepsy.operators.MPOLevelToken
@@ -73,6 +75,7 @@ def test_first_degree_mpo_public_exports_resolve():
     assert "FirstDegreeMPO" in pepsy.operators.__all__
     assert "CompiledMPOEvolution" in pepsy.operators.__all__
     assert "CompiledMPOExp" in pepsy.operators.__all__
+    assert "exp_mpo" in pepsy.operators.__all__
 
 
 def test_mpo_basis_reuses_compiled_automaton_for_rebinding():
@@ -290,6 +293,157 @@ def test_mpo_basis_shares_suffixes_and_assembles_terminal_coefficient_groups():
     np.testing.assert_allclose(bound.to_mpo().to_dense(), expected)
     assert bound.bond_dimensions == basis.bond_dimensions
     assert basis.bond_dimensions[-1] < 4
+
+
+def test_mpo_basis_square_lattice_aligns_paulis_and_preserves_autodiff():
+    """Coordinate terms canonicalize into shared MPO paths with live gradients."""
+    torch = pytest.importorskip("torch")
+    basis = MPOBasis.from_square_lattice(
+        2,
+        2,
+        [
+            ("XY", ((1, 0), (0, 0)), MPOParameter("a")),
+            {
+                "locations": ((0, 0), (1, 0)),
+                "paulis": "YX",
+                "parameter": "b",
+            },
+            {
+                "locations": ((0, 0),),
+                "paulis": "Z",
+                "parameter": "h",
+            },
+        ],
+    )
+
+    assert basis.lattice_shape == (2, 2)
+    assert basis.cache_info["lattice_mode"] == "snake"
+    assert basis.lattice_to_chain[(0, 0)] == 0
+    assert basis.terms[0].sites == basis.terms[1].sites
+    np.testing.assert_allclose(basis.terms[0].operators[0], basis.terms[1].operators[0])
+    np.testing.assert_allclose(basis.terms[0].operators[1], basis.terms[1].operators[1])
+    # The two equivalent coordinate descriptions share one structural channel.
+    assert max(basis.bond_dimensions) == 3
+
+    a = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    b = torch.tensor(-0.2, dtype=torch.float64, requires_grad=True)
+    h = torch.tensor(0.1, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    bound = basis.build({"a": a, "b": b, "h": h})
+    reference = FirstDegreeMPO.from_pauli_terms(
+        4,
+        [
+            (basis.terms[0].sites, "YX", a + b),
+            (basis.terms[2].sites, "Z", h),
+        ],
+    )
+    torch.testing.assert_close(
+        bound.to_mpo().to_dense(),
+        reference.to_mpo().to_dense(),
+    )
+    compiled = basis.compile_exp(order=2, mode="base")
+    exponential = compiled.exp(
+        -1j * time,
+        {"a": a, "b": b, "h": h},
+    )
+    loss = sum(array.real.sum() for array in exponential.arrays)
+    gradients = torch.autograd.grad(loss, (a, b, h, time))
+
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+    mapping = basis.lattice_to_chain
+    mapping[(0, 0)] = 99
+    assert basis.lattice_to_chain[(0, 0)] == 0
+    assert basis.chain_to_lattice[basis.lattice_to_chain[(1, 1)]] == (1, 1)
+
+
+def test_term_centric_mpo_api_infers_lattices_and_accepts_custom_map():
+    """The compact operator/location form handles 1D, 2D, and 3D inputs."""
+    from pepsy.tensors import OneDMap
+
+    one_dimensional = MPOBasis.from_terms(
+        [
+            {"operator": "Z", "location": 0, "coefficient": 1.0},
+            {"operator": "XX", "location": (0, 1), "coefficient": 0.25},
+        ]
+    )
+    assert one_dimensional.L == 2
+    assert one_dimensional.lattice_shape is None
+
+    mapper = OneDMap(2, 2, mode="row-major")
+    two_dimensional = MPOBasis.from_terms(
+        [
+            ("Z", (1, 0), 0.5),
+            {
+                "operator": "XX",
+                "location": ((0, 0), (1, 0)),
+                "coefficient": 0.25,
+            },
+        ],
+        mapper=mapper,
+    )
+    assert two_dimensional.lattice_shape == (2, 2)
+    assert two_dimensional.lattice_to_chain == mapper.build()[1]
+    assert two_dimensional.terms[0].sites == (two_dimensional.lattice_to_chain[(1, 0)],)
+
+    three_dimensional = MPOBasis.from_terms(
+        [{"operator": "Z", "location": (1, 0, 0), "coefficient": 0.5}],
+        shape=(2, 1, 1),
+    )
+    assert three_dimensional.L == 2
+    assert three_dimensional.lattice_shape == (2, 1, 1)
+    assert three_dimensional.lattice_to_chain[(1, 0, 0)] == 1
+
+
+def test_term_centric_api_accepts_pepsy_pauli_keyed_mappings():
+    """Pauli-word keys can use the same compact mapping style as PauliMPO."""
+    torch = pytest.importorskip("torch")
+    coefficient = torch.tensor(0.4, dtype=torch.float64, requires_grad=True)
+
+    basis = MPOBasis.from_terms(
+        {"xyz": (((0, 0), (1, 0), (0, 1)), coefficient)},
+        shape=(2, 2),
+    )
+    expected_sites = tuple(
+        sorted(basis.lattice_to_chain[where] for where in ((0, 0), (1, 0), (0, 1)))
+    )
+    assert basis.terms[0].sites == expected_sites
+    assert basis.terms[0].coefficient is coefficient
+
+    chain_basis = MPOBasis.from_terms({"XX": (2, 3)}, shape=4)
+    assert chain_basis.terms[0].sites == (2, 3)
+
+    compiled = exp_mpo({"XX": ((2, 3), coefficient)}, 0.01, shape=4)
+    assert hasattr(compiled, "to_dense")
+
+
+def test_exp_mpo_term_api_combines_common_terms_and_keeps_autodiff():
+    """One high-level call returns an MPO while preserving coefficient graphs."""
+    torch = pytest.importorskip("torch")
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    onsite = torch.tensor(-0.2, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    terms = [
+        {"operator": "XX", "location": (0, 1), "coefficient": coefficient},
+        {"operator": "Z", "location": 0, "coefficient": onsite},
+        {"operator": "Z", "location": 0, "coefficient": 0.3},
+    ]
+    basis = MPOBasis.from_terms(terms, shape=2)
+    assert max(basis.bond_dimensions) <= 3
+
+    semantic = exp_mpo(
+        terms,
+        step,
+        shape=2,
+        order=2,
+        return_semantic=True,
+    )
+    assert isinstance(semantic, FirstDegreeMPO)
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, onsite, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+    compiled = exp_mpo(terms, 0.01, shape=2)
+    assert hasattr(compiled, "to_dense")
 
 
 def test_mpo_basis_batches_coefficients_and_reuses_history_topology():
@@ -1146,7 +1300,7 @@ def test_u1_symmetry_supports_degenerate_physical_sectors():
         2,
         terms,
         symmetry="U1",
-        physical_charges=(0, 1, 1, 2),
+        physical_charges={0: 1, 1: 2, 2: 1},
     )
     dense_h = FirstDegreeMPO.from_local_terms(2, terms)
     symmetric_u = symmetric_h.exp(-0.01j, order=2, mode="base")
@@ -1161,6 +1315,60 @@ def test_u1_symmetry_supports_degenerate_physical_sectors():
         _symmray_mpo_to_dense(symmetric_u.to_mpo()),
         dense_u.to_mpo().to_dense(),
     )
+
+
+def test_mpo_symmetry_metadata_accepts_normalized_names_and_sector_mappings():
+    """The symmetry API accepts the same compact sector form as Pepsy tensors."""
+    identity = FirstDegreeMPO.identity(
+        1,
+        4,
+        symmetry="u1-u1",
+        physical_charges={
+            (0, 0): 1,
+            (0, 1): 1,
+            (1, 0): 1,
+            (1, 1): 1,
+        },
+    )
+
+    assert identity.symmetry == "U1U1"
+    assert identity.physical_charges == (
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    )
+
+
+def test_exp_mpo_forwards_symmetry_to_native_compiler():
+    """The term-centric boundary keeps the optional block-sparse fast path."""
+    pytest.importorskip("symmray")
+    compiled = exp_mpo(
+        [{"operator": np.diag([-0.3, 0.7]), "location": 0}],
+        -0.02j,
+        shape=1,
+        symmetry="u1",
+        physical_charges={0: 1, 1: 1},
+    )
+    assert type(compiled.tensors[0].data).__name__ == "U1Array"
+
+
+@pytest.mark.parametrize(
+    "physical_charges, match",
+    [
+        ({0: 1, 1: 0}, "positive integers"),
+        ({0: 1, 1: 1}, "summing to 3"),
+    ],
+)
+def test_mpo_symmetry_sector_mapping_validates_multiplicities(physical_charges, match):
+    """Invalid sector maps fail before optional Symmray compilation."""
+    with pytest.raises(ValueError, match=match):
+        FirstDegreeMPO.identity(
+            1,
+            3,
+            symmetry="U1",
+            physical_charges=physical_charges,
+        )
 
 
 def test_symmetry_requires_contiguous_physical_charge_sectors():

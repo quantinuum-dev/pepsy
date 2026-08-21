@@ -318,7 +318,9 @@ symmetry is configured, assembles native Symmray sectors directly.
 
 The higher-order path supports neutral bosonic `U1`, `Z2`, `U1U1`, and
 `Z2Z2` operators with NumPy local blocks. Supply one charge per local dense
-basis state and label each active virtual channel through
+basis state, or use a charge-to-multiplicity mapping when the basis contains
+degenerate sectors. Mapping insertion order defines the dense basis sector
+order. Label each active virtual channel through
 `MPOProductTerm.charge`:
 
 ```python
@@ -332,7 +334,7 @@ H = FirstDegreeMPO.from_local_terms(
         MPOProductTerm((0, 3), (lowering, raising), charge=+1),
     ],
     symmetry="U1",
-    physical_charges=(0, 1),
+    physical_charges={0: 1, 1: 1},
 )
 U = H.exp(-1j * 0.01, order=3, mode="approximate")
 mpo = U.to_mpo()  # Quimb MPO whose tensors contain Symmray U1Array data
@@ -341,11 +343,13 @@ mpo = U.to_mpo()  # Quimb MPO whose tensors contain Symmray U1Array data
 The local convention is
 `-q_left + q_right + q_upper - q_lower = 0`. Consequently a first factor that
 raises U1 charge by one opens virtual channel `-1`; its lowering partner closes
-that channel. `Z2` charges are canonicalized modulo two, and product symmetries
-use charge pairs. Equal physical charges must be contiguous in the supplied
-dense basis, matching Symmray's sector-major index layout; degenerate sectors
-are supported. `MPOProductTerm.charge` labels every active channel along that
-term's path, which covers the common neutral onsite and charged-endpoint
+that channel. Symmetry names are case-insensitive and may use the compact
+hyphenated spelling, e.g. `"u1-u1"`. `Z2` charges are canonicalized modulo
+two, and product symmetries use charge pairs. Equal physical charges must be
+contiguous in the supplied dense basis, matching Symmray's sector-major index
+layout; degenerate sectors can be written as `{0: 1, 1: 2, 2: 1}` instead of
+`(0, 1, 1, 2)`. `MPOProductTerm.charge` labels every active channel along
+that term's path, which covers the common neutral onsite and charged-endpoint
 interactions. For a more general charge trajectory, construct an `MPOAutomaton`
 with charge metadata on each channel and call `FirstDegreeMPO.from_automaton`.
 
@@ -390,6 +394,17 @@ numerical approximation. Use `share_channels=False` to retain one dedicated
 channel path per term when debugging the unshared representation. The
 ordinary `from_local_terms()` constructor accepts the same Pauli strings in
 `MPOProductTerm` or mapping inputs.
+
+For a one-call construction from operator/location/coefficient records, use
+`exp_mpo(terms, step, ...)`. It accepts singular keys such as
+`{"operator": "ZZ", "location": (0, 1), "coefficient": value}` (as well as
+the plural `operators`/`locations` aliases), infers 1D/2D/3D layouts, and
+returns a Quimb MPO by default. Pass `shape=` or a configured `OneDMap` with
+`mapper=` for lattice inputs, and use `return_semantic=True` when the
+history-aware `FirstDegreeMPO` is needed. Common supports and same-site terms
+are reduced by the shared automaton, while coefficient slots remain separate
+for autodiff. The compact Pauli-word mapping is also accepted, for example
+`{"XX": (2, 3)}` or `{"XX": ((2, 3), coefficient)}`.
 
 Coefficients may be scalar tensors from an Autoray-compatible autodiff
 backend. Static Pauli matrices are promoted to that backend, so the
