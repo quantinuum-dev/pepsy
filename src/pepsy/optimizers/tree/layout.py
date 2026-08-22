@@ -54,6 +54,7 @@ from .._layout_visualization import (
     resolve_site_coords,
     scale_color,
 )
+from ...tensors.maps import OneDMap
 
 __all__ = ["TreePlan", "TreeLayoutFinder"]
 
@@ -183,7 +184,7 @@ def _normalize_layout_search(search):
 
 
 def _normalize_layout_order(order):
-    """Normalize the high-quality mode or preserve an explicit site order."""
+    """Normalize quality, geometric presets, or an explicit site order."""
     if order is None:
         return None
     if not isinstance(order, (str, bytes)):
@@ -193,11 +194,82 @@ def _normalize_layout_order(order):
         "auto": "quality",
         "best": "quality",
         "best_quality": "quality",
+        "row": "row-major",
+        "row_major": "row-major",
+        "column": "col-major",
+        "column_major": "col-major",
+        "snake_col": "snake",
+        "snake_column": "snake",
+        "snake_col_major": "snake",
+        "folded_snake_col": "folded-snake",
+        "folded_snake_column": "folded-snake",
+        "folded_snake_col_major": "folded-snake",
+        "hilbert_curve": "hilbert",
+        "hilbert_col": "hilbert",
+        "hilbert_column": "hilbert",
+        "hilbert_col_major": "hilbert",
     }
     name = aliases.get(name, name)
-    if name != "quality":
-        raise ValueError("order must be None or 'quality'.")
-    return name
+    if name == "quality":
+        return name
+    geometric = {
+        "row_major": "row-major",
+        "col_major": "col-major",
+        "snake": "snake",
+        "snake_row_major": "snake-row-major",
+        "folded_snake": "folded-snake",
+        "folded_snake_row_major": "folded-snake-row-major",
+        "hilbert": "hilbert",
+        "hilbert_row_major": "hilbert-row-major",
+    }
+    if name in geometric.values():
+        return name
+    if name in geometric:
+        return geometric[name]
+    raise ValueError(
+        "order must be None, 'quality', a geometric lattice preset "
+        "('row-major', 'snake', 'folded-snake', or 'hilbert'), or an "
+        "explicit site permutation."
+    )
+
+
+def _normalize_lattice_shape(shape):
+    """Return a validated two-dimensional ``(Lx, Ly)`` lattice shape."""
+    if shape is None:
+        return None
+    if isinstance(shape, (str, bytes)):
+        raise TypeError("lattice_shape must be a two-item (Lx, Ly) sequence.")
+    try:
+        shape = tuple(shape)
+    except TypeError as exc:
+        raise TypeError(
+            "lattice_shape must be a two-item (Lx, Ly) sequence."
+        ) from exc
+    if len(shape) != 2:
+        raise ValueError("lattice_shape must contain exactly (Lx, Ly).")
+    if any(isinstance(value, bool) for value in shape):
+        raise ValueError("lattice_shape dimensions must be positive integers.")
+    try:
+        shape = tuple(int(value) for value in shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "lattice_shape dimensions must be positive integers."
+        ) from exc
+    if any(value < 1 for value in shape):
+        raise ValueError("lattice_shape dimensions must be positive integers.")
+    return shape
+
+
+def _lattice_site_order(Lx, Ly, mode, *, site=None):
+    """Build a logical-qubit permutation from a regular 2D OneDMap mode."""
+    one_d_to_lattice, _ = OneDMap.build(Lx, Ly, mode=mode)
+    if site is None:
+        # Match OneDMap's logical 2D labels: (x, y) -> x * Ly + y.
+        site = lambda x, y: x * Ly + y
+    if not callable(site):
+        raise TypeError("lattice_site must be callable or None.")
+    order = tuple(int(site(*coord)) for coord in one_d_to_lattice.values())
+    return normalize_fixed_order(order, range(Lx * Ly), name="lattice order")
 
 
 def _nevergrad_available():
@@ -1398,13 +1470,22 @@ class TreeLayoutFinder:
         across every tree scale. It is
         the high-quality, Cotengra-inspired mode; ``order="quality"`` selects
         it automatically and enables its bounded search stages.
-    order : {None, "quality"} or sequence, optional
+    order : {None, "quality", geometric preset} or sequence, optional
         Optional high-quality offline mode. `"quality"` means
         `objective="full_tree"` and enables bounded greedy leaf refinement,
         all-scale subtree topology refinement, and hybrid
-        Nevergrad/annealing search. Omitted keeps the fast deterministic
-        objective selected by `objective`. An explicit site permutation builds
-        a fixed tree without refinement.
+        Nevergrad/annealing search. Named two-dimensional lattice presets
+        (`"row-major"`, `"snake"`, `"folded-snake"`, and `"hilbert"`, plus
+        their OneDMap row/column aliases) require `lattice_shape=` and build
+        an exact balanced tree over that traversal. Omitted keeps the fast
+        deterministic objective selected by `objective`. An explicit site
+        permutation builds a fixed tree without refinement.
+    lattice_shape : pair of int, optional
+        The `(Lx, Ly)` shape used by named geometric `order` presets. The
+        product must equal `n`.
+    lattice_site : callable, optional
+        Optional `(x, y) -> qubit` mapper for named geometric presets. The
+        default is `x * Ly + y`, matching :class:`OneDMap` logical labels.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -1460,6 +1541,7 @@ class TreeLayoutFinder:
                  refine_budget=None, topology_refine=None, topology_budget=None,
                  search=None, search_budget=128, seed=0,
                  nevergrad_optimizer="OnePlusOne", order=None, root_qubit=None,
+                 lattice_shape=None, lattice_site=None,
                  time_decay=None, time_window=None):
         if (
             _looks_like_tree_tensor_network(gates)
@@ -1530,6 +1612,21 @@ class TreeLayoutFinder:
         self.leaf_qubits = tuple(
             q for q in range(self.n) if q != self.root_qubit
         )
+        self.lattice_shape = _normalize_lattice_shape(lattice_shape)
+        if self.lattice_shape is not None:
+            if self.lattice_shape[0] * self.lattice_shape[1] != self.n:
+                raise ValueError(
+                    "lattice_shape product must equal n; got "
+                    f"{self.lattice_shape[0]} * {self.lattice_shape[1]} "
+                    f"!= {self.n}."
+                )
+        if lattice_site is not None and not callable(lattice_site):
+            raise TypeError("lattice_site must be callable or None.")
+        if lattice_site is not None and self.lattice_shape is None:
+            raise ValueError(
+                "lattice_site requires lattice_shape=(Lx, Ly)."
+            )
+        self.lattice_site = lattice_site
         self.max_arity, self.arity_candidates = _normalize_arity_candidates(
             max_arity
         )
@@ -1652,6 +1749,51 @@ class TreeLayoutFinder:
         self.pair_weights = _gate_stream_pair_weights(
             supports, sites, self.event_weights
         )
+
+    @classmethod
+    def lattice_order(cls, Lx, Ly, mode="row-major", *, site=None):
+        """Return a logical-qubit order from a two-dimensional OneDMap mode.
+
+        This is the reusable order-only counterpart to passing a named
+        geometric preset to :meth:`run`:
+
+        ``TreeLayoutFinder.lattice_order(16, 16, "folded-snake")``.
+
+        Parameters
+        ----------
+        Lx, Ly : int
+            Two-dimensional lattice dimensions.
+        mode : str
+            Any supported 2D :class:`OneDMap` mode, including ``"row-major"``,
+            ``"snake"``, ``"folded-snake"``, and ``"hilbert"``, together
+            with their row/column aliases.
+        site : callable, optional
+            Optional ``(x, y) -> qubit`` label mapper. The default is
+            ``x * Ly + y``.
+        """
+        normalized = _normalize_layout_order(mode)
+        if normalized == "quality" or normalized is None:
+            raise ValueError(
+                "lattice_order mode must be a geometric OneDMap preset."
+            )
+        Lx, Ly = _normalize_lattice_shape((Lx, Ly))
+        return _lattice_site_order(Lx, Ly, normalized, site=site)
+
+    def _preset_order(self, mode):
+        """Resolve a named geometric preset against this finder's lattice."""
+        if self.lattice_shape is None:
+            raise ValueError(
+                f"order={mode!r} requires lattice_shape=(Lx, Ly) "
+                "when constructing TreeLayoutFinder."
+            )
+        order = self.lattice_order(
+            *self.lattice_shape,
+            mode=mode,
+            site=self.lattice_site,
+        )
+        if self.root_qubit is not None:
+            order = tuple(q for q in order if q != self.root_qubit)
+        return order
 
     @staticmethod
     def _events_from_gates(gates):
@@ -3153,6 +3295,9 @@ class TreeLayoutFinder:
             order = self.order
         else:
             order = _normalize_layout_order(order)
+        geometric_order = isinstance(order, str) and order != "quality"
+        if geometric_order:
+            order = self._preset_order(order)
         if not isinstance(order, str) and order is not None:
             if self.arity_candidates is not None:
                 raise ValueError(
@@ -3162,7 +3307,11 @@ class TreeLayoutFinder:
             fixed_order = normalize_fixed_order(order, self.leaf_qubits)
             return TreePlan.from_order(
                 fixed_order,
-                structure=self.structure,
+                # Named geometric modes are exact baselines: do not apply the
+                # interaction-aware spectral reorder used by the default
+                # quality structure. Explicit caller-provided permutations
+                # retain the historical ``self.structure`` behavior.
+                structure="balanced" if geometric_order else self.structure,
                 max_arity=self.max_arity,
                 root_qubit=self.root_qubit,
                 top_arity=self.top_arity,
@@ -4665,6 +4814,7 @@ class TreeLayoutFinder:
         node_cmap="YlOrRd",
         color_by="order",
         edge_color=None,
+        leaf_edge_color=None,
         show_edge_arrows=False,
         arrow_size=8.0,
         order=True,
@@ -4713,6 +4863,10 @@ class TreeLayoutFinder:
         ``lattice_rise=1`` to preserve the supplied coordinates.
         The default order/turbo palette and matching hierarchy edges are
         intended to give a compact Cotengra-style structural view.
+        Pass ``leaf_edge_color`` to highlight the first hierarchy layer,
+        namely edges connecting physical leaf sites to their parent nodes.
+        When omitted, those edges follow the same child-node palette as the
+        other hierarchy edges.
         """
         plt, colormaps, ScalarMappable, Normalize, _FancyArrowPatch = (
             matplotlib_modules()
@@ -4903,6 +5057,8 @@ class TreeLayoutFinder:
         def hierarchy_edge_color(parent, child):
             if edge_color is not None:
                 return edge_color
+            if leaf_edge_color is not None and plan.is_leaf(child):
+                return leaf_edge_color
             # ``None`` means "follow the node palette": this is intentionally
             # the node color itself rather than a separate edge colormap, so
             # an incoming edge and its child are visually identical.

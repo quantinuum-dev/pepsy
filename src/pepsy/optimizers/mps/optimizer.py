@@ -1471,6 +1471,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         nevergrad_optimizer="OnePlusOne",
         kahypar_config_path=None,
         kahypar_seed=0,
+        from_scratch=False,
         weight_fn=None,
         weight_mode="auto",
         schmidt_max_dim=4,
@@ -1517,6 +1518,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             NumPy seed used while constructing the optional nevergrad candidate.
         nevergrad_optimizer : str
             Name of the nevergrad optimizer class to use.
+        from_scratch : bool
+            Omit the original site order from the searched candidates and from
+            Nevergrad inoculation. The original order remains available in
+            ``input_stats`` as a comparison baseline.
         kahypar_config_path : path-like | None
             KaHyPar ``.ini`` config path. If omitted, ``PEPSY_KAHYPAR_CONFIG``
             is used. KaHyPar is skipped unless a config is supplied.
@@ -1558,6 +1563,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             nevergrad_optimizer=nevergrad_optimizer,
             kahypar_config_path=kahypar_config_path,
             kahypar_seed=kahypar_seed,
+            from_scratch=from_scratch,
             weight_fn=weight_fn,
             weight_mode=weight_mode,
             schmidt_max_dim=schmidt_max_dim,

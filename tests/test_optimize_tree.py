@@ -996,6 +996,38 @@ def test_tree_layout_accepts_explicit_fixed_site_order():
     assert plan.is_binary()
 
 
+@pytest.mark.parametrize("mode", ["row-major", "snake", "folded-snake", "hilbert"])
+def test_tree_layout_finder_supports_onedmap_lattice_presets(mode):
+    """Named Tree presets preserve the corresponding OneDMap leaf traversal."""
+    Lx = Ly = 4
+    finder = TreeLayoutFinder(
+        [],
+        n=Lx * Ly,
+        structure="quality",
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(Lx, Ly),
+    )
+    one_d_to_lattice, _ = pepsy.OneDMap.build(Lx, Ly, mode=mode)
+    expected = tuple(x * Ly + y for x, y in one_d_to_lattice.values())
+
+    plan = finder.run(order=mode)
+
+    assert plan.mpo_order() == expected
+
+
+def test_tree_lattice_order_helper_and_missing_shape_error():
+    """Tree geometric orders are reusable and require an explicit shape."""
+    expected = (0, 2, 4, 1, 3, 5)
+    assert TreeLayoutFinder.lattice_order(
+        2, 3, "row-major", site=lambda x, y: y * 2 + x,
+    ) == expected
+
+    finder = TreeLayoutFinder([], n=4)
+    with pytest.raises(ValueError, match="lattice_shape"):
+        finder.run(order="hilbert")
+
+
 def test_quality_layout_not_worse_than_balanced():
     """Entanglement-adapted structure scores no worse than balanced order."""
     rng = np.random.default_rng(9)
@@ -2139,6 +2171,36 @@ def test_tree_layout_tent_edges_match_order_colors_by_default():
     }
     assert len(hierarchy_colors) > 1
     assert not ax.patches
+    plt.close(fig)
+
+
+def test_tree_layout_tent_can_highlight_leaf_edges():
+    """The physical-to-first-parent layer can use a contrasting color."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))],
+        n=4,
+        max_arity=2,
+        top_arity=2,
+    )
+    plan = finder.run()
+    fig, ax = finder.plot_tent(
+        plan,
+        lattice=False,
+        show_gate_connectivity=False,
+        leaf_edge_color="#2563eb",
+    )
+
+    line_index = 0
+    for parent, children in plan.children.items():
+        for child in children:
+            if plan.is_leaf(child):
+                assert ax.lines[line_index].get_color() == "#2563eb"
+            line_index += 1
+    assert line_index == len(plan.nodes()) - 1
     plt.close(fig)
 
 

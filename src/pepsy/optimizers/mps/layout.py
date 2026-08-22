@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from itertools import combinations
+import math
 from numbers import Integral
 import os
 
@@ -1159,6 +1160,55 @@ def _gate_stream_recursive_order(
     return ordered
 
 
+def _gate_stream_folded_block_orders(sites):
+    """Return folded block orders useful for periodic grid-like streams.
+
+    A periodic row-major grid has a particularly bad final block: the
+    periodic edge from the first block to the last spans almost the whole
+    MPS. Folding the block order as ``0, last, 1, last - 1, ...`` keeps that
+    edge local while preserving the short within-block path. The heuristic
+    is deliberately based only on the current site order, so it remains a
+    safe generic candidate for opaque or non-integer site labels. Both sides
+    of every factor pair are tried, covering the two grid orientations.
+    """
+    sites = list(sites)
+    n = len(sites)
+    if n < 4:
+        return {}
+
+    block_sizes = set()
+    for divisor in range(2, math.isqrt(n) + 1):
+        if n % divisor:
+            continue
+        block_sizes.add(divisor)
+        block_sizes.add(n // divisor)
+
+    candidates = {}
+    for block_size in sorted(block_sizes):
+        block_count = n // block_size
+        if block_count < 2:
+            continue
+        block_order = []
+        left, right = 0, block_count - 1
+        while left <= right:
+            block_order.append(left)
+            if left != right:
+                block_order.append(right)
+            left += 1
+            right -= 1
+
+        order = []
+        for step, block_index in enumerate(block_order):
+            block = sites[
+                block_index * block_size : (block_index + 1) * block_size
+            ]
+            if step % 2:
+                block.reverse()
+            order.extend(block)
+        candidates[f"folded_{block_size}"] = order
+    return candidates
+
+
 def _kahypar_config_from_user(config_path):
     """Resolve user/environment KaHyPar config path, if any."""
     if config_path in (None, False):
@@ -1460,6 +1510,7 @@ def _gate_stream_layout_candidates(
     sites,
     pair_weights,
     *,
+    include_input=True,
     refine_passes=8,
     spectral_dense_max=512,
     recursive_dense_max=1024,
@@ -1473,8 +1524,12 @@ def _gate_stream_layout_candidates(
     kahypar_seed=0,
 ):
     """Return deterministic candidate orders for gate-stream layout search."""
-    candidates = {"input": list(sites)}
+    candidates = {}
+    if include_input:
+        candidates["input"] = list(sites)
     if not pair_weights:
+        if not candidates:
+            candidates["unweighted"] = list(sites)
         return candidates
 
     candidates["degree"] = _gate_stream_degree_order(sites, pair_weights)
@@ -1491,6 +1546,7 @@ def _gate_stream_layout_candidates(
         pair_weights,
         dense_max=recursive_dense_max,
     )
+    candidates.update(_gate_stream_folded_block_orders(sites))
     if include_kahypar:
         kahypar = _gate_stream_kahypar_order(
             sites,
@@ -1504,7 +1560,7 @@ def _gate_stream_layout_candidates(
         nevergrad = _gate_stream_nevergrad_order(
             sites,
             pair_weights,
-            start_orders=tuple(candidates.values()),
+            start_orders=(tuple(candidates.values()) if include_input else ()),
             budget=nevergrad_budget,
             seed=nevergrad_seed,
             optimizer_name=nevergrad_optimizer,
@@ -1584,6 +1640,7 @@ class MpsGateStreamLayoutFinder:
         nevergrad_optimizer="OnePlusOne",
         kahypar_config_path=None,
         kahypar_seed=0,
+        from_scratch=False,
         weight_fn=None,
         weight_mode="auto",
         schmidt_max_dim=4,
@@ -1594,6 +1651,12 @@ class MpsGateStreamLayoutFinder:
         ``order`` can also be an explicit permutation of the layout sites.
         In that case the permutation is returned as a fixed comparison plan
         and no layout search or refinement is performed.
+
+        ``from_scratch=True`` omits the original site order from the searched
+        candidates and does not use those sites as a Nevergrad inoculation.
+        Graph-derived candidates are still allowed: the gate supports are the
+        data being optimized, while the original order is only a diagnostic
+        baseline.
         """
         fixed_order = None
         if isinstance(order, (str, type(None))):
@@ -1651,6 +1714,7 @@ class MpsGateStreamLayoutFinder:
             candidates = _gate_stream_layout_candidates(
                 self.sites,
                 pair_weights,
+                include_input=not from_scratch,
                 refine_passes=refine_passes,
                 refine_numba=refine_numba,
                 spectral_dense_max=spectral_dense_max,
@@ -1671,8 +1735,7 @@ class MpsGateStreamLayoutFinder:
                 "fixed": list(fixed_order),
             }
 
-        candidate_stats = {}
-        for name, candidate in candidates.items():
+        def score_candidate(candidate):
             locality_stats = _gate_stream_layout_stats(
                 candidate,
                 pair_weights,
@@ -1694,7 +1757,13 @@ class MpsGateStreamLayoutFinder:
                 ))
                 stats["loss"] = stats["compression_loss"]
                 stats["score"] = stats["compression_score"]
-            candidate_stats[name] = stats
+            return stats
+
+        input_stats = score_candidate(self.sites)
+        candidate_stats = {
+            name: score_candidate(candidate)
+            for name, candidate in candidates.items()
+        }
 
         if order_name == "auto":
             selected_order = min(
@@ -1758,8 +1827,9 @@ class MpsGateStreamLayoutFinder:
                 "weight_mode": _normalize_weight_mode(weight_mode),
                 "objective": objective,
                 "max_operator_qubits": max_operator_qubits,
+                "from_scratch": bool(from_scratch),
                 "stats": stats,
-                "input_stats": candidate_stats["input"],
+                "input_stats": input_stats,
                 "score": stats["score"],
             }
 
