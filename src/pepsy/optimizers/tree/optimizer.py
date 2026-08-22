@@ -6390,7 +6390,9 @@ class TreeOptimizer:
                          layout_weight_mode="count",
                          layout_time_decay=None, layout_time_window=None,
                          root_qubit=None, top_arity=_DEFAULT_TOP_ARITY,
-                         max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS):
+                         max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
+                         lattice_shape=None, lattice_site=None,
+                         order=None):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
             gates=gates, n=n, structure=structure,
@@ -6402,6 +6404,9 @@ class TreeOptimizer:
             time_window=layout_time_window,
             root_qubit=root_qubit,
             max_operator_qubits=max_operator_qubits,
+            lattice_shape=lattice_shape,
+            lattice_site=lattice_site,
+            order=order,
         ).run()
 
     @classmethod

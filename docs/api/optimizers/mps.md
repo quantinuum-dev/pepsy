@@ -596,13 +596,34 @@ span statistics. The finder implementation lives in
 builds a weighted interaction graph from gate and
 sub-MPO supports, scores layouts with a Tensy-like scalar objective
 `weighted_total_span + weighted_cut_congestion_l2 + tail_span_penalty`, and
-uses degree/BFS/spectral/recursive candidates plus adjacent-swap refinement. If
-available, the refinement uses numba; `order="quality"` also tries optional
-nevergrad candidates, and optional KaHyPar recursive bisection when a config is
-provided with `kahypar_config_path=...` or `PEPSY_KAHYPAR_CONFIG`. Event weights
-default to `weight_mode="auto"`: angle metadata when present, otherwise a cheap
+uses degree/BFS/spectral/recursive candidates, periodic folded-block candidates,
+and adjacent-swap refinement. Folded-block candidates are useful for periodic
+grid-like streams because they remove the long wrap-around tail from an
+ordinary row/column scan. If available, the refinement uses numba;
+`order="quality"` also tries optional nevergrad candidates, and optional
+KaHyPar recursive bisection when a config is provided with
+`kahypar_config_path=...` or `PEPSY_KAHYPAR_CONFIG`. Event weights default to
+`weight_mode="auto"`: angle metadata when present, otherwise a cheap
 operator-Schmidt proxy for small dense two-site gates, falling back to count
 weights. Pass `weight_fn(payload, support, event_type)` for explicit weights.
+
+By default, the quality search keeps the original site order as an explicit
+baseline and may use it to initialize the optional Nevergrad search. To test
+the graph search independently of that baseline, pass `from_scratch=True`:
+
+```python
+scratch_plan = finder.run(
+    order="quality",
+    from_scratch=True,
+    nevergrad_seed=0,
+)
+```
+
+This still uses the gate-support interaction graph and deterministic
+graph-derived candidates; periodic folded-block candidates may also use the
+declared site labels. `input_stats` reports the omitted original order for
+comparison. On symmetric graphs, different label-equivalent layouts can have
+the same score, so a different order is not necessarily a better one.
 
 For a prescribed baseline rather than a searched order, pass an explicit site
 permutation as `order`. The returned plan is marked `selected_order="fixed"`

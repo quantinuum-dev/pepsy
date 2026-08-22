@@ -827,9 +827,51 @@ three-virtual-bond root convention described above. `TreePlan.max_arity()` and
 `TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
 strict two-child-at-every-internal-node predicate.
 
-Both layout finders also accept an explicit site permutation as `order` for a
-fixed baseline. For example, this builds the same binary/ternary-root geometry
-using a square-lattice snake order without refinement:
+`TreeLayoutFinder` also provides the same regular-lattice baseline vocabulary
+as `OneDMap`. Pass `lattice_shape=(Lx, Ly)` once, then use named `order` presets
+for exact tree coarsenings of the corresponding leaf traversal:
+
+```python
+finder = TreeLayoutFinder(
+    gates,
+    n=36,
+    lattice_shape=(6, 6),
+    max_arity=2,
+    top_arity=3,
+)
+
+tree_row = finder.run(order="row-major")
+tree_snake = finder.run(order="snake")
+tree_folded = finder.run(order="folded-snake")
+tree_hilbert = finder.run(order="hilbert")
+tree_quality = finder.run(order="quality")
+```
+
+The supported geometric presets include `"row-major"`, `"snake"`,
+`"folded-snake"`, and `"hilbert"`, plus the corresponding OneDMap
+row/column aliases. Preset orders use a balanced recursive tree so the leaf
+sequence is preserved exactly; `"quality"` remains the independent
+interaction-aware TreeLayoutFinder search. The default logical label is
+`x * Ly + y`; pass `lattice_site=lambda x, y: ...` when the gate stream uses a
+different coordinate-to-qubit convention.
+
+The lower-level helper is useful when constructing a `TreePlan` directly:
+
+```python
+from pepsy.optimizers.tree import TreeLayoutFinder, TreePlan
+
+zigzag = TreeLayoutFinder.lattice_order(6, 6, "snake")
+tree_plan = TreePlan.from_order(
+    zigzag,
+    structure="balanced",
+    max_arity=2,
+    top_arity=3,
+)
+```
+
+Both layout finders still accept an explicit site permutation as `order` for a
+custom fixed baseline. For example, this builds the same binary/ternary-root
+geometry using a square-lattice snake order without refinement:
 
 ```python
 zigzag = py.square_lattice_zigzag(6, 6)
@@ -1161,6 +1203,18 @@ fig, ax = finder.plot(
 
 # For a live optimizer, the same plot is available without changing its state.
 fig, ax = opt.plot_layout(site_coords=logical_lattice_coords)
+```
+
+To make the first hierarchy layer easier to see, give the leaf-to-parent
+edges a contrasting color while leaving higher layers scale-colored:
+
+```python
+fig, ax = finder.plot_tent(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    leaf_edge_color="#2563eb",
+)
 ```
 
 The default plot is therefore the hierarchy that `TreeLayoutFinder` selected:

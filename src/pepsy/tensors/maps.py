@@ -712,6 +712,10 @@ class OneDMap:
                 center=0.56,
                 width=0.052,
                 length=0.105,
+                # Keep arrowheads fixed-size. Quimb's default relative
+                # scaling makes non-local periodic jumps produce enormous
+                # arrowheads that obscure the lattice schematic.
+                relative=False,
             )
 
         for coord, idx in lattice_to_one_d.items():

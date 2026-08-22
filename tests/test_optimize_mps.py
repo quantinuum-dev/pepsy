@@ -5860,6 +5860,48 @@ def test_mps_optimizer_gate_stream_layout_remaps_long_range_path():
     )
 
 
+def test_mps_quality_layout_includes_periodic_folded_candidate():
+    """Quality search should remove the long wrap tail of a periodic grid."""
+    Lx = Ly = 8
+
+    def site(x, y):
+        return (x % Lx) * Ly + (y % Ly)
+
+    edge_builder = getattr(qtn, "edges_square", qtn.edges_2d_square)
+    gates = tuple(
+        (qu.CNOT(), (site(*left), site(*right)))
+        for left, right in edge_builder(Lx, Ly, cyclic=True)
+    )
+    plan = py.MpsOptimizer.LayoutFinder(gates, L=Lx * Ly).run(
+        order="quality",
+        nevergrad_budget=0,
+    )
+
+    assert "folded_8" in plan["candidate_losses"]
+    assert plan["selected_order"] == "folded_8"
+    assert plan["stats"]["max_span"] < plan["input_stats"]["max_span"]
+    assert plan["stats"]["loss"] < plan["input_stats"]["loss"]
+
+
+def test_mps_quality_layout_can_exclude_input_candidate():
+    """From-scratch search keeps the original order as diagnostics only."""
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+    plan = py.MpsOptimizer.LayoutFinder(gates, L=4).run(
+        order="quality",
+        from_scratch=True,
+        nevergrad_budget=0,
+    )
+
+    assert plan["from_scratch"] is True
+    assert "input" not in plan["candidate_plans"]
+    assert plan["input_stats"]["long_range_events"] == 2
+    assert plan["stats"]["loss"] < plan["input_stats"]["loss"]
+
+
 def test_mps_layout_accepts_explicit_fixed_site_order():
     """An explicit site permutation bypasses search and is preserved."""
     gates = [(qu.CNOT(), (0, 3)), (qu.CNOT(), (1, 2))]
