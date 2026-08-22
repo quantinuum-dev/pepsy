@@ -7956,9 +7956,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
+            progress_mode = self._dmrg_mode_alias or "dmrg"
             pbar = tqdm(
                 total=len(G_seq),
-                desc="dmrg",
+                desc=progress_mode,
                 leave=True,
                 position=0,
                 ascii=True,

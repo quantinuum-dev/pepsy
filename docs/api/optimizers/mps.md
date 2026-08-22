@@ -468,7 +468,9 @@ MPO/DMRG/fallback counts, `~F` (the cumulative norm fidelity), and
 display; accumulation remains logarithmic and numerically stable.
 The progress-bar descriptor is mode-qualified: for example, `quimb-src` and
 `mpo-src` are shown directly, while the `quimb` and `mpo` aliases display as
-`quimb-direct` and `mpo-direct`.
+`quimb-direct` and `mpo-direct`. Named DMRG schedules likewise display as
+`dmrg1`, `dmrg2`, or `dmrg3`; generic `dmrg` and its `fit` alias display as
+`dmrg`.
 
 Replay timing is opt-in and does not print by itself:
 

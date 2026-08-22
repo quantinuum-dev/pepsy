@@ -848,6 +848,58 @@ def test_mps_optimizer_progress_bar_uses_mode_name(
 
 
 @pytest.mark.parametrize(
+    "mode, expected_desc",
+    [
+        ("fit", "dmrg"),
+        ("dmrg", "dmrg"),
+        ("dmrg1", "dmrg1"),
+        ("dmrg2", "dmrg2"),
+        ("dmrg3", "dmrg3"),
+    ],
+)
+def test_mps_optimizer_dmrg_progress_bar_uses_schedule_name(
+    monkeypatch,
+    mode,
+    expected_desc,
+):
+    """Named DMRG schedules identify themselves in the progress bar."""
+    import tqdm as tqdm_module
+
+    descriptors = []
+
+    class FakeProgress:
+        def __init__(self, *args, **kwargs):
+            del args
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, _postfix):
+            pass
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tqdm_module, "tqdm", FakeProgress)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode=mode,
+    )
+
+    optimizer.run(
+        progbar=True,
+        n_iter=2,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    assert descriptors == [expected_desc]
+
+
+@pytest.mark.parametrize(
     "method",
     [
         "direct",
