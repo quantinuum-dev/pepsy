@@ -454,6 +454,19 @@ def _resolve_exp_step(step, dt):
 
 def _fixed_rank_svd(matrix):
     """Run the configured thin SVD, enabling the safe Torch VJP when needed."""
+    if _backend_name(matrix) == "jax":
+        # Pepsy's custom JAX SVD registration intentionally exposes only the
+        # matrix positional argument, whereas native JAX accepts
+        # ``full_matrices``.  Both policies return a thin decomposition; trim
+        # defensively so a third-party Autoray registration returning a full
+        # decomposition cannot change the MPO structural rank.
+        left, singular_values, right = ar.do("linalg.svd", matrix)
+        rank = min(int(matrix.shape[-2]), int(matrix.shape[-1]))
+        return (
+            left[..., :rank],
+            singular_values[..., :rank],
+            right[..., :rank, :],
+        )
     if _backend_name(matrix) != "torch":
         return ar.do("linalg.svd", matrix, full_matrices=False)
 
@@ -466,11 +479,15 @@ def _fixed_rank_svd(matrix):
         get_torch_linalg_config,
     )
 
-    current = get_torch_linalg_config()
-    if current is not None and current.stabilized:
-        return ar.do("linalg.svd", matrix)
     mode = "complex" if getattr(matrix.dtype, "is_complex", False) else "real"
-    config = TorchLinalgConfig(stabilized=True, mode=mode)
+    current = get_torch_linalg_config()
+    if current is not None and current.stabilized and current.mode == mode:
+        return ar.do("linalg.svd", matrix)
+    config = (
+        replace(current, mode=mode, stabilized=True)
+        if current is not None
+        else TorchLinalgConfig(stabilized=True, mode=mode)
+    )
     with config.activated():
         return ar.do("linalg.svd", matrix)
 
@@ -6673,6 +6690,8 @@ class MPOBasis:
         self._chain_to_lattice = None
         self._build_count = 0
         self._compiled_evolution_cache = {}
+        self._cluster_expansion_cache = {}
+        self._graph_cluster_expansion_cache = {}
 
     @classmethod
     def from_terms(
@@ -6838,6 +6857,8 @@ class MPOBasis:
             "compiled_exp_variants": len(self._compiled_evolution_cache),
             # Compatibility diagnostic name.
             "compiled_evolution_variants": len(self._compiled_evolution_cache),
+            "compiled_cluster_variants": len(self._cluster_expansion_cache),
+            "compiled_graph_cluster_variants": len(self._graph_cluster_expansion_cache),
             "topology_bond_dimensions": self.bond_dimensions,
             "vectorized_slot_groups": len(self._vectorized_slot_groups),
             "lattice_shape": self._lattice_shape,
@@ -6852,6 +6873,145 @@ class MPOBasis:
         self._template.clear_history_cache()
         self._compiled_evolution_cache.clear()
         return self
+
+    def clear_cluster_expansion_cache(self):
+        """Release cached cluster-expansion topologies while retaining the basis."""
+
+        self._cluster_expansion_cache.clear()
+        self._graph_cluster_expansion_cache.clear()
+        return self
+
+    def cluster_expansion(
+        self,
+        step=1.0,
+        parameters=None,
+        *,
+        cluster_size=2,
+        cutoff=1.0e-12,
+        max_bond=None,
+    ):
+        """Build a local exact cluster expansion from this term basis.
+
+        This is the cluster-basis counterpart to :meth:`exp`: local
+        exponentials are evaluated exactly on intervals through
+        ``cluster_size`` and assembled as disjoint connected MPO channels.
+        ``parameters`` resolves the same :class:`MPOParameter` references
+        used by ``build``.  Use :class:`MPOClusterBasisExpansion` directly
+        when composing several ordered exponential factors.
+        """
+        from .mpo_cluster import (  # pylint: disable=import-outside-toplevel
+            MPOClusterBasisExpansion,
+        )
+
+        cache_key = (
+            int(cluster_size),
+            None if cutoff is None else float(cutoff),
+            None if max_bond is None else int(max_bond),
+        )
+        expansion = self._cluster_expansion_cache.get(cache_key)
+        if expansion is None:
+            expansion = MPOClusterBasisExpansion.from_mpo_basis(
+                self,
+                cluster_size=cluster_size,
+                cutoff=cutoff,
+                max_bond=max_bond,
+            )
+            self._cluster_expansion_cache[cache_key] = expansion
+        return expansion.exp(step, parameters=parameters)
+
+    def compile_cluster_expansion(
+        self,
+        *,
+        cluster_size=2,
+        cutoff=1.0e-12,
+        max_bond=None,
+    ):
+        """Return a reusable compiled evaluator for local cluster products."""
+
+        from .mpo_cluster import (  # pylint: disable=import-outside-toplevel
+            MPOClusterBasisExpansion,
+        )
+
+        cache_key = (
+            int(cluster_size),
+            None if cutoff is None else float(cutoff),
+            None if max_bond is None else int(max_bond),
+        )
+        expansion = self._cluster_expansion_cache.get(cache_key)
+        if expansion is None:
+            expansion = MPOClusterBasisExpansion.from_mpo_basis(
+                self,
+                cluster_size=cluster_size,
+                cutoff=cutoff,
+                max_bond=max_bond,
+            )
+            self._cluster_expansion_cache[cache_key] = expansion
+        return expansion.compile_exp()
+
+    def graph_cluster_expansion(
+        self,
+        step=1.0,
+        parameters=None,
+        *,
+        graph=None,
+        cluster_size=2,
+        cutoff=1.0e-12,
+        max_bond=None,
+    ):
+        """Build a graph-aware cluster expansion with MPO output.
+
+        ``graph`` may be a :class:`ClusterLattice`, a ``(sites, edges)``
+        pair, or a mapping. Coordinate-labelled graphs are mapped through
+        this basis' square-lattice map. When omitted, a square-lattice basis
+        uses its physical nearest-neighbour graph; a chain basis infers edges
+        from its term supports.
+
+        ``cluster_size`` counts graph sites, not the span in MPO chain
+        positions. A long-range two-site graph edge is therefore a genuine
+        two-site cluster even when its MPO representation crosses many chain
+        sites.
+        """
+        compiled = self.compile_graph_cluster_expansion(
+            graph=graph,
+            cluster_size=cluster_size,
+            cutoff=cutoff,
+            max_bond=max_bond,
+        )
+        return compiled.exp(step, parameters=parameters)
+
+    def compile_graph_cluster_expansion(
+        self,
+        *,
+        graph=None,
+        cluster_size=2,
+        cutoff=1.0e-12,
+        max_bond=None,
+    ):
+        """Compile a reusable graph-aware ordered cluster evaluator."""
+        from .mpo_cluster import (  # pylint: disable=import-outside-toplevel
+            MPOGraphClusterBasisExpansion,
+            _graph_lattice_for_basis,
+        )
+
+        normalized_graph = _graph_lattice_for_basis(graph, self)
+        cache_key = (
+            tuple(normalized_graph.sites),
+            tuple(normalized_graph.edges),
+            int(cluster_size),
+            None if cutoff is None else float(cutoff),
+            None if max_bond is None else int(max_bond),
+        )
+        expansion = self._graph_cluster_expansion_cache.get(cache_key)
+        if expansion is None:
+            expansion = MPOGraphClusterBasisExpansion.from_mpo_basis(
+                self,
+                graph=normalized_graph,
+                cluster_size=cluster_size,
+                cutoff=cutoff,
+                max_bond=max_bond,
+            )
+            self._graph_cluster_expansion_cache[cache_key] = expansion
+        return expansion.compile_exp()
 
     def compile_evolution(
         self,

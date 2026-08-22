@@ -496,5 +496,86 @@ Autoray-compatible local blocks, including the optimal extension path under
 Torch/JAX autodiff. Native Symmray output currently requires NumPy local
 blocks. A small accuracy regression benchmark compares orders one--three with
 a first-order Trotter product and a finite two-site cluster expansion; see
-`tests/test_mpo_benchmarks.py`. Graded fermionic histories and infinite/unit-
-cell MPOs remain separate future work.
+`tests/test_mpo_benchmarks.py`. Graded fermionic histories remain separate
+future work.
+
+## Local cluster-basis expansion
+
+For a spatial cluster cutoff rather than a Taylor-order cutoff, use
+`MPOClusterBasisExpansion`:
+
+```python
+import numpy as np
+from pepsy.operators import MPOClusterBasisExpansion, MPOClusterFactor
+
+z = np.diag([1.0, -1.0])
+expansion = MPOClusterBasisExpansion.from_local_terms(
+    32,
+    [((site, site + 1), (z, z)) for site in range(31)],
+    cluster_size=4,
+)
+U = expansion.exp(-1j * 0.1)
+```
+
+Each connected interval is exponentiated locally, its lower connected
+residuals are subtracted, and the residuals are assembled as disjoint MPO
+paths. `cluster_size=L` is exact for a finite chain; smaller cutoffs give the
+size-extensive approximation described in [arXiv:1912.10512](https://arxiv.org/abs/1912.10512).
+Ordered products such as `exp(A) @ exp(B) @ exp(C)` use
+`MPOClusterBasisExpansion.from_factors(...)` with
+`MPOClusterFactor(terms, coefficient=...)`. For repeated optimization calls,
+use `compiled = expansion.compile_exp()`; it caches interval/factor topology
+but rebuilds backend tensors on every call so Torch/JAX autodiff graphs stay
+current. `from_mpo_bases(...)` is the convenience form when `A`, `B`, and `C`
+already have reusable `MPOBasis` objects. `max_bond` gives an explicit local
+Schmidt-rank cap, while `trace(normalized=True)` provides the finite-chain
+physical trace without forming a global dense matrix. Torch uses Pepsy's
+stabilized SVD policy for repeated singular values; traced JAX evaluations use
+a static, exact full-rank factorization unless `max_bond` is supplied. For a
+single reusable `MPOBasis`, `basis.compile_cluster_expansion(...)` shares this
+topology cache with `basis.cluster_expansion(...)`.
+
+### Graph-aware MPO clusters
+
+For a two-dimensional model, an interval in the snake-ordered MPO is not the
+same object as a connected spatial cluster. Use
+`basis.compile_graph_cluster_expansion(...)` when cluster selection should
+follow a graph instead:
+
+```python
+from pepsy.operators import ClusterLattice, MPOBasis
+
+basis = MPOBasis.from_square_lattice(
+    4,
+    4,
+    [{"locations": ((0, 0), (3, 3)), "paulis": "ZZ"}],
+)
+graph = ClusterLattice.from_edges(
+    tuple((x, y) for x in range(4) for y in range(4)),
+    [
+        ((x, y), (x + 1, y))
+        for x in range(3)
+        for y in range(4)
+    ]
+    + [((x, y), (x, y + 1)) for x in range(4) for y in range(3)]
+    + [((0, 0), (3, 3))],
+)
+compiled = basis.compile_graph_cluster_expansion(
+    graph=graph,
+    cluster_size=2,
+    cutoff=0.0,
+)
+U = compiled.exp(0.01)
+value = compiled.trace(0.01, normalized=True)
+```
+
+Here `cluster_size=2` counts graph sites, so `(0, 0)-(3, 3)` is a genuine
+two-site cluster even though its MPO span crosses many chain positions. The
+local ordered product can contain `exp(A) exp(B) ...`; graph residuals are
+then embedded into the chain with the singleton background on skipped sites
+and factorized by an operator-Schmidt decomposition. When disjoint graph
+clusters have crossing or nested chain spans, compatible cluster collections
+get tensor-product virtual paths so products such as `K_(0,3) K_(1,2)` are
+retained. The report records `cluster_mode="graph"`, the graph cluster count,
+loop counts, and the resulting MPO ranks. For repeated autodiff evaluations,
+only this graph/factor topology is cached.

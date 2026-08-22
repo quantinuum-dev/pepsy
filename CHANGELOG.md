@@ -14,6 +14,16 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- MPO cluster expansions now expose a reusable compiled topology for ordered
+  `exp(A) @ exp(B) @ exp(C)` products, explicit local `max_bond` control, and
+  stabilized Torch/JAX autodiff factorization paths.
+- Graph-aware MPO cluster expansions now reuse `ClusterLattice` connectivity,
+  support long-range two-site clusters on 2D coordinate graphs, preserve
+  ordered local exponential factors, expose trace and rank diagnostics, and
+  map noncontiguous graph residuals into controlled MPO paths.
+- PEPO cluster products now support ordered `exp(A) @ exp(B) @ ...` factors,
+  direct physical traces, optional intermediate PEPO compression, and
+  Torch/JAX-safe factor and step autodiff.
 - `MPOBasis.from_square_lattice(...)` compiles coordinate-based Pauli terms
   through a reusable `OneDMap`, aligns reversed location/Pauli descriptions,
   and preserves backend autodiff coefficients while sharing MPO channels.
@@ -41,8 +51,6 @@ Changes for the next release should be added here before the version is bumped.
 - `history_storage="reduced"` streams reachable products directly into the
   Algorithms 1--2 reduced history space without materializing raw virtual
   tensors, including the Algorithm 3 and 4 policies.
-- `InfiniteMPO` represents cyclic unit cells independently from explicitly
-  bounded finite windows.
 - MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
   `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
   and `stabilize_unitary` now covers DMRG, mixed MPO warm-up/fallback, and the
@@ -75,6 +83,13 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Graph MPO cluster assembly now carries singleton backgrounds through skipped
+  chain sites and retains products of disjoint long-range clusters with
+  crossing or nested MPO spans. PEPO trace now uses Quimb's documented
+  physical upper/lower indices instead of relying on outer-index ordering;
+  ordered MPO-basis products also reject mismatched chain geometry. MPO
+  fixed-rank SVD dispatch now remains compatible with custom JAX registrations
+  and switches stabilized Torch mode to match real or complex inputs.
 - Term-centric MPO parsing now accepts integer coefficients without confusing
   them with lattice sites, rejects fractional shapes and coordinates instead
   of truncating them, and reports when semantic history cannot survive Quimb

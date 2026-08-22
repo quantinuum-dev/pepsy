@@ -45,6 +45,9 @@ __all__ = [
     "PauliPEPOTerm",
     "PauliPEPOBasis",
     "CompiledPEPOExp",
+    "PEPOClusterFactor",
+    "PEPOClusterProductExpansion",
+    "CompiledPEPOClusterProduct",
     "compose_pepo_layers",
     "compose_cluster_expansion_pepo",
     "generate_connected_cluster_shapes",
@@ -624,6 +627,15 @@ def compose_pepo_layers(layers, *, compress=False, **compress_opts):
             **compress_opts,
         )
     return result
+
+
+def _trace_quimb_pepo(pepo, **contract_opts):
+    """Trace a square-lattice PEPO over its physical input/output legs."""
+
+    # Let PEPO select its documented upper/lower physical indices.  The order
+    # returned by ``outer_inds`` is an implementation detail and can change
+    # after Quimb multiplication or compression.
+    return pepo.trace(**contract_opts)
 
 
 def _yoshida4_coefficients():
@@ -2389,6 +2401,14 @@ class ActivePEPOBlocks:
 
     materialize = to_pepo
 
+    def trace(self, *, normalized=False, remove_orphans=True, **contract_opts):
+        """Contract the physical trace without forming a global dense matrix."""
+        active = self.compact() if remove_orphans else self
+        result = _trace_quimb_pepo(active.to_pepo(), **contract_opts)
+        if normalized:
+            result = result / (self.physical_dim ** (self.lx * self.ly))
+        return result
+
 
 @dataclass
 class GraphActivePEPOBlocks:
@@ -2558,6 +2578,17 @@ class GraphActivePEPOBlocks:
 
     to_pepo = to_tensor_network
     materialize = to_tensor_network
+
+    def trace(self, *, normalized=False, remove_orphans=True, **contract_opts):
+        """Contract the physical trace of a graph PEPO network."""
+        active = self.compact() if remove_orphans else self
+        network = active.to_tensor_network(remove_orphans=False)
+        left = [("graph-bra", site) for site in active.sites]
+        right = [("graph-ket", site) for site in active.sites]
+        result = network.trace(left, right, **contract_opts)
+        if normalized:
+            result = result / (self.physical_dim ** len(self.sites))
+        return result
 
 
 def _graph_hamiltonian(nsites, edges, twosite_op, onesite_op):
@@ -3118,6 +3149,24 @@ class CompiledPEPOExp:
             coefficients=coefficients,
             materialize=materialize,
         )
+
+    def trace(
+        self,
+        step,
+        parameters=None,
+        *,
+        coefficients=None,
+        normalized=False,
+        **contract_opts,
+    ):
+        """Evaluate and contract the physical trace of one PEPO exponential."""
+        active = self.exp(
+            step,
+            parameters,
+            coefficients=coefficients,
+            materialize=False,
+        )
+        return active.trace(normalized=normalized, **contract_opts)
 
     evaluate = exp
     __call__ = exp
@@ -4069,6 +4118,28 @@ class PauliPEPOBasis:
             materialize=materialize,
         )
 
+    def trace(
+        self,
+        step=None,
+        parameters=None,
+        *,
+        coefficients=None,
+        tau=None,
+        beta=None,
+        normalized=False,
+        **contract_opts,
+    ):
+        """Evaluate and contract the physical trace without dense inflation."""
+        active = self.exp(
+            step,
+            parameters,
+            coefficients=coefficients,
+            tau=tau,
+            beta=beta,
+            materialize=False,
+        )
+        return active.trace(normalized=normalized, **contract_opts)
+
     def build(self, parameters=None, *, coefficients=None, tau=None, beta=None, materialize=False):
         """Compatibility alias for :meth:`evaluate`."""
         return self.evaluate(
@@ -4078,6 +4149,276 @@ class PauliPEPOBasis:
             beta=beta,
             materialize=materialize,
         )
+
+
+def _resolve_pepo_factor_value(value, parameters):
+    """Resolve a product-level scalar without caching backend values."""
+    if hasattr(value, "resolve"):
+        return value.resolve(parameters)
+    if callable(value):
+        if parameters is None:
+            raise KeyError("callable PEPO factor coefficients require parameters.")
+        return value(parameters)
+    return value
+
+
+def _as_backend_dtype(value, *, like):
+    """Convert a scalar to a backend and dtype compatible with ``like``."""
+    value = _as_backend(value, like=like)
+    target_dtype = getattr(like, "dtype", None)
+    if target_dtype is not None and getattr(value, "dtype", None) != target_dtype:
+        value = ar.do("astype", value, target_dtype)
+    return value
+
+
+@dataclass(frozen=True)
+class PEPOClusterFactor:
+    """One compiled PEPO cluster factor in an ordered exponential product."""
+
+    basis: PauliPEPOBasis
+    coefficient: object = 1.0
+
+    def __post_init__(self):
+        if not isinstance(self.basis, PauliPEPOBasis):
+            raise TypeError("PEPOClusterFactor.basis must be a PauliPEPOBasis.")
+
+
+class CompiledPEPOClusterProduct:
+    """Reusable ordered product of fixed-topology PEPO cluster factors."""
+
+    def __init__(self, expansion):
+        if not isinstance(expansion, PEPOClusterProductExpansion):
+            raise TypeError(
+                "expansion must be a PEPOClusterProductExpansion."
+            )
+        self.expansion = expansion
+        for factor in expansion.factors:
+            factor.basis._prepare_exp_plan()
+
+    @property
+    def cache_info(self):
+        """Return topology and evaluation diagnostics."""
+        return self.expansion.cache_info
+
+    def exp(
+        self,
+        step,
+        parameters=None,
+        *,
+        coefficients=None,
+        compress=False,
+        **compress_opts,
+    ):
+        """Evaluate the ordered product ``exp(A) exp(B) ...``."""
+        return self.expansion.exp(
+            step,
+            parameters,
+            coefficients=coefficients,
+            compress=compress,
+            **compress_opts,
+        )
+
+    def trace(
+        self,
+        step,
+        parameters=None,
+        *,
+        coefficients=None,
+        normalized=False,
+        compress=False,
+        **compress_opts,
+    ):
+        """Evaluate the physical trace of the ordered PEPO product."""
+        return self.expansion.trace(
+            step,
+            parameters,
+            coefficients=coefficients,
+            normalized=normalized,
+            compress=compress,
+            **compress_opts,
+        )
+
+    evaluate = exp
+    __call__ = exp
+
+
+class PEPOClusterProductExpansion:
+    """Compose ordered PEPO cluster exponentials on a square lattice.
+
+    ``factors`` are specified in algebraic order, so ``(A, B, C)`` means
+    ``exp(A) @ exp(B) @ exp(C)``. Each factor is independently built by a
+    :class:`PauliPEPOBasis`, retaining its graph/tree/plaquette cluster
+    channels and autodiff coefficient topology. The final layers are then
+    contracted with Quimb's PEPO multiplication, optionally compressed after
+    each multiplication.
+    """
+
+    def __init__(self, factors):
+        try:
+            factors = tuple(self._normalize_factor(factor) for factor in factors)
+        except TypeError as exc:
+            raise TypeError("factors must be an iterable of PEPO cluster factors.") from exc
+        if not factors:
+            raise ValueError("at least one PEPO cluster factor is required.")
+        reference = factors[0].basis
+        geometry = (reference.lx, reference.ly, reference.cyclic)
+        for factor in factors[1:]:
+            basis = factor.basis
+            if (basis.lx, basis.ly, basis.cyclic) != geometry:
+                raise ValueError(
+                    "all PEPO cluster factors must have matching lattice "
+                    "shape and periodicity."
+                )
+        self.factors = factors
+        self.lx, self.ly, self.cyclic = geometry
+        self._build_count = 0
+        self._compiled_exp = None
+
+    @staticmethod
+    def _normalize_factor(factor):
+        if isinstance(factor, PEPOClusterFactor):
+            return factor
+        if isinstance(factor, PauliPEPOBasis):
+            return PEPOClusterFactor(factor)
+        if isinstance(factor, Mapping):
+            basis = factor.get("basis")
+            if basis is None:
+                raise ValueError("PEPO factor mappings require a 'basis'.")
+            return PEPOClusterFactor(basis, factor.get("coefficient", 1.0))
+        if isinstance(factor, (tuple, list)) and len(factor) == 2:
+            return PEPOClusterFactor(factor[0], factor[1])
+        raise TypeError(
+            "PEPO factors must be PauliPEPOBasis values, PEPOClusterFactor "
+            "values, mappings, or (basis, coefficient) pairs."
+        )
+
+    @classmethod
+    def from_bases(cls, bases, *, coefficients=None):
+        """Construct an ordered product from compiled PEPO bases."""
+        bases = tuple(bases)
+        if not bases:
+            raise ValueError("bases must contain at least one PauliPEPOBasis.")
+        if coefficients is None:
+            coefficients = (1.0,) * len(bases)
+        else:
+            coefficients = tuple(coefficients)
+            if len(coefficients) != len(bases):
+                raise ValueError("coefficients must align with bases.")
+        return cls(
+            PEPOClusterFactor(basis, coefficient)
+            for basis, coefficient in zip(bases, coefficients)
+        )
+
+    @property
+    def cache_info(self):
+        """Return topology-only product diagnostics."""
+        return {
+            "compiled": True,
+            "builds": self._build_count,
+            "factor_count": len(self.factors),
+            "lattice_shape": (self.lx, self.ly),
+            "cyclic": self.cyclic,
+            "factor_orders": tuple(factor.basis.order for factor in self.factors),
+            "compiled_exp": self._compiled_exp is not None,
+        }
+
+    def compile_exp(self):
+        """Return a reusable ordered product evaluator."""
+        if self._compiled_exp is None:
+            self._compiled_exp = CompiledPEPOClusterProduct(self)
+        return self._compiled_exp
+
+    def _factor_coefficients(self, coefficients):
+        if coefficients is None:
+            return (None,) * len(self.factors)
+        if len(self.factors) == 1:
+            return (coefficients,)
+        try:
+            values = tuple(coefficients)
+        except TypeError as exc:
+            raise TypeError(
+                "coefficients must contain one coefficient vector per factor."
+            ) from exc
+        if len(values) != len(self.factors):
+            raise ValueError(
+                "coefficients must contain one vector per PEPO cluster factor."
+            )
+        return values
+
+    def exp(
+        self,
+        step,
+        parameters=None,
+        *,
+        coefficients=None,
+        compress=False,
+        **compress_opts,
+    ):
+        """Build ``exp(A) @ exp(B) @ ...`` in the supplied factor order."""
+        factor_coefficients = self._factor_coefficients(coefficients)
+        layers = []
+        for factor, term_coefficients in zip(self.factors, factor_coefficients):
+            coefficient = _resolve_pepo_factor_value(
+                factor.coefficient,
+                parameters,
+            )
+            factor_step = ar.do("multiply", step, coefficient)
+            if term_coefficients is not None and parameters is not None:
+                raise ValueError(
+                    "parameters and coefficients are mutually exclusive for "
+                    "an ordered PEPO product."
+                )
+            values = factor.basis._coefficient_values(
+                parameters if term_coefficients is None else None,
+                term_coefficients,
+            )
+            reference = _backend_reference((factor_step, *values))
+            factor_step = _as_backend_dtype(factor_step, like=reference)
+            values = tuple(
+                _as_backend_dtype(value, like=reference)
+                for value in values
+            )
+            layers.append(
+                factor.basis.exp(
+                    factor_step,
+                    coefficients=_backend_stack(values),
+                    materialize=True,
+                )
+            )
+
+        # compose_pepo_layers accepts application order and returns the last
+        # layer on the left. Reverse the algebraically ordered factors here.
+        result = compose_pepo_layers(
+            tuple(reversed(layers)),
+            compress=compress,
+            **compress_opts,
+        )
+        self._build_count += 1
+        return result
+
+    def trace(
+        self,
+        step,
+        parameters=None,
+        *,
+        coefficients=None,
+        normalized=False,
+        compress=False,
+        **compress_opts,
+    ):
+        """Build and contract the physical trace of the ordered product."""
+        result = _trace_quimb_pepo(
+            self.exp(
+                step,
+                parameters,
+                coefficients=coefficients,
+                compress=compress,
+                **compress_opts,
+            )
+        )
+        if normalized:
+            result = result / (2 ** (self.lx * self.ly))
+        return result
 
 
 class _SectorAllocator:

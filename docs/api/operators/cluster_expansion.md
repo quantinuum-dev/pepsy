@@ -111,8 +111,8 @@ Factories are provided for transverse-field Ising, spin-1/2 Heisenberg, and
 spin-1/2 XXZ models. Custom adapters can be made from dense `twosite_op` and
 `onesite_op` matrices, or recovered from a mapping/object exposing those
 terms. These adapters are finite and dense; fermionic parity, native
-Symmray charge blocks, and infinite/unit-cell evolution are intentionally
-outside this layer.
+Symmray charge blocks and graded fermionic histories are intentionally outside
+this layer.
 
 ## Generic cluster geometry
 
@@ -300,6 +300,38 @@ virtual-history sector rather than as dense tensor inflation.
 
 For a general dense local model, use
 `build_cluster_expansion_pepo(lx, ly, beta, twosite_op, onesite_op, ...)`.
+
+## Ordered PEPO products and traces
+
+For a noncommuting product, compile one `PauliPEPOBasis` per factor and use
+`PEPOClusterProductExpansion`. Factors are listed in algebraic order, so the
+following constructs `exp(A) @ exp(B) @ exp(C)`:
+
+```python
+from pepsy.operators import PauliPEPOBasis, PEPOClusterProductExpansion
+
+A = PauliPEPOBasis.compile(4, 4, [("onsite", "X")], order=4)
+B = PauliPEPOBasis.compile(4, 4, [("edge", "ZZ")], order=4)
+C = PauliPEPOBasis.compile(4, 4, [("onsite", "Z")], order=4)
+
+product = PEPOClusterProductExpansion.from_bases(
+    (A, B, C),
+    coefficients=(0.2, -0.3, 0.4),
+)
+compiled = product.compile_exp()
+U = compiled.exp(0.01, compress=True, max_bond=64)
+value = compiled.trace(0.01, normalized=True, compress=True, max_bond=64)
+```
+
+Each factor is evaluated with its own connected tree/loop cluster plan, then
+the resulting PEPO layers are multiplied in the requested order. The trace
+contracts each physical bra/ket pair and the remaining PEPO virtual network;
+it does not form the global dense operator. `compress=True` is recommended
+for more than a few factors because uncompressed PEPO bond dimensions grow
+multiplicatively. Factor coefficients, term coefficients, and the step remain
+backend-native for Torch/JAX autodiff. This product path is intentionally
+separate from `exp(A + B + C)`, which is a different operator unless the
+factors commute.
 
 ## Fixed Pauli coefficient slots
 

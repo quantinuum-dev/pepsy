@@ -16,13 +16,17 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
+| `MPOClusterBasisExpansion` | Build exact-local connected cluster MPOs | Local `exp(A) exp(B) ...` products through a finite cluster cutoff; disjoint residual paths are size-extensive |
+| `MPOGraphClusterBasisExpansion` | Build graph-aware connected cluster MPOs | Graph-connected local products, including long-range two-site edges; residuals use singleton backgrounds and tensor-product paths for crossing/nested disjoint spans |
+| `CompiledMPOClusterExp` | Reuse a cluster-expansion topology | Caches interval/factor schedules only; every backend evaluation creates a fresh autodiff graph |
+| `MPOBasis.compile_cluster_expansion` | Optimization-facing cluster evaluator | Reuses the compiled cluster topology across parameter/time updates; `MPOBasis.clear_cluster_expansion_cache` releases it |
+| `MPOBasis.compile_graph_cluster_expansion` | Optimization-facing graph cluster evaluator | Reuses graph/factor topology; accepts coordinate-labelled `ClusterLattice` inputs and long-range edges |
 | `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(step * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; real-time uses `step=-1j * tau`; `differentiable=True` selects fixed-rank TT-SVD |
 | `FirstDegreeMPO.clear_history_cache` / `MPOBasis.clear_history_cache` | Release reusable higher-order plans | Keeps current tensors and compiled first-degree topology unchanged |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
 | `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
 | `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator`, optionally backed by native Symmray blocks |
 | `FirstDegreeMPO.compress_numerical` | Apply explicit numerical policy | Delegates SVD/QR to Quimb and returns a separate truncation report |
-| `InfiniteMPO` | Represent a periodic MPO unit cell | No implicit boundary or seam trace; finite windows require explicit vectors for nontrivial seams |
 | `apply_to_mps`, `expectation` | Execute through tensor-network consumers | Delegates to Quimb/Pepsy contraction APIs and does not densify |
 
 `product(kind=...)` uses `kind` as provenance metadata. In particular,

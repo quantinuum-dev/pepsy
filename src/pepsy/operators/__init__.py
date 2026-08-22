@@ -77,6 +77,9 @@ _CLUSTER_EXPORTS = [
     "PauliPEPOTerm",
     "PauliPEPOBasis",
     "CompiledPEPOExp",
+    "PEPOClusterFactor",
+    "PEPOClusterProductExpansion",
+    "CompiledPEPOClusterProduct",
 ]
 _SYMBOL_MODULES.update({name: ".cluster" for name in _CLUSTER_EXPORTS})
 _AUTOMATON_EXPORTS = ["MPOChannel", "MPOTransition", "MPOAutomaton"]
@@ -99,9 +102,20 @@ _MPO_EXPORTS = [
     "exp_mpo",
 ]
 _SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_EXPORTS})
+_MPO_CLUSTER_EXPORTS = [
+    "MPOClusterFactor",
+    "MPOClusterExpansionReport",
+    "MPOClusterBasisExpansion",
+    "MPOGraphClusterBasisExpansion",
+    "CompiledMPOClusterExp",
+    "ClusterBasisExpansion",
+    "ClusterExpansionBasis",
+    "ClusterExpBasis",
+    "MPOClusterExpansion",
+]
+_SYMBOL_MODULES.update({name: ".mpo_cluster" for name in _MPO_CLUSTER_EXPORTS})
 _SYMBOL_MODULES["MPOBraiding"] = ".mpo_space"
 _SYMBOL_MODULES["MPOPhysicalSpace"] = ".mpo_space"
-_SYMBOL_MODULES["InfiniteMPO"] = ".infinite_mpo"
 _SYMBOL_MODULES["PauliMPO"] = ".pauli_mpo"
 _SYMBOL_MODULES["decompose_pauli"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
@@ -112,6 +126,7 @@ _SUBMODULES = (
     "hamiltonians",
     "mpo",
     "mpo_automaton",
+    "mpo_cluster",
     "pauli_mpo",
 )
 
@@ -129,11 +144,11 @@ __all__ = [
     "ham_tn",
     *_AUTOMATON_EXPORTS,
     *_MPO_EXPORTS,
+    *_MPO_CLUSTER_EXPORTS,
     "PauliMPO",
     "decompose_pauli",
     "PauliCompressionReport",
     "PauliBondCompressionReport",
-    "InfiniteMPO",
     *_SUBMODULES,
 ]
 

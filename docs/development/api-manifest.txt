@@ -19,6 +19,7 @@ CoalescedTrajectoryResult
 CoherentCrosstalkModel
 CompBdy
 CompiledPEPOExp
+CompiledPEPOClusterProduct
 DeferredInjectionRecord
 DeferredInjectionReport
 DeferredProjectionRecord
@@ -59,6 +60,8 @@ OneDMap
 PEPSSampleResult
 PauliPEPOTerm
 PauliPEPOBasis
+PEPOClusterFactor
+PEPOClusterProductExpansion
 PauliErrorModel
 PauliFault
 PepsBpSampler

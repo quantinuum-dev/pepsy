@@ -20,6 +20,7 @@ builders. The rule is simple:
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |
 | One PEPO exponential | `basis.exp(step, ...)` | `ActivePEPOBlocks` by default |
 | Repeated PEPO exponentials | `basis.compile_exp().exp(step, ...)` | Cached `CompiledPEPOExp` call |
+| Ordered PEPO product and trace | `PEPOClusterProductExpansion.from_bases(...)` | Composed PEPO plus direct `trace(...)` |
 | Dense PEPO materialization | `active_blocks.to_pepo()` or `materialize=True` | Quimb `PEPO` |
 | Coefficient-dependent real-time PEPO | `build_real_time_cluster_expansion_pepo(...)` | Quimb `PEPO` or active blocks |
 | Fractional-step PEPO composition | `compose_cluster_expansion_pepo(...)` | Quimb `PEPO` |

@@ -18,8 +18,10 @@ from pepsy.operators import (
     GraphClusterExpansionPlan,
     GraphConnectedClusterShape,
     MPOParameter,
+    CompiledPEPOClusterProduct,
     PauliPEPOBasis,
     PauliPEPOTerm,
+    PEPOClusterProductExpansion,
     adapt_cluster_model,
     build_cluster_expansion_pepo,
     build_model_cluster_expansion_pepo,
@@ -909,6 +911,93 @@ def test_pauli_pepo_basis_matches_finite_chain_through_tree_order(order, nsites)
     pepo = basis.exp(step=-1j * 0.01, materialize=True)
     exact = expm(-1j * 0.01 * _pauli_chain_hamiltonian(nsites, 0.2, 1.0))
     np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
+
+
+def test_ordered_pepo_cluster_product_preserves_factor_order_and_trace():
+    """PEPO factors compose as exp(A) exp(B) exp(C), then trace directly."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+    identity = np.eye(2)
+    bases = (
+        PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("edge", "ZZ")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("onsite", "Z")], order=2),
+    )
+    expansion = PEPOClusterProductExpansion.from_bases(
+        bases,
+        coefficients=(0.2, -0.3, 0.4),
+    )
+    compiled = expansion.compile_exp()
+    assert isinstance(compiled, CompiledPEPOClusterProduct)
+
+    result = compiled.exp(0.05)
+    h_a = np.kron(x, identity) + np.kron(identity, x)
+    h_b = np.kron(z, z)
+    h_c = np.kron(z, identity) + np.kron(identity, z)
+    expected = (
+        expm(0.01 * h_a)
+        @ expm(-0.015 * h_b)
+        @ expm(0.02 * h_c)
+    )
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1e-11)
+    np.testing.assert_allclose(compiled.trace(0.05), np.trace(expected), atol=1e-11)
+    np.testing.assert_allclose(
+        compiled.trace(0.05, normalized=True),
+        np.trace(expected) / 4.0,
+        atol=1e-11,
+    )
+    assert compiled.cache_info["factor_count"] == 3
+    assert compiled.cache_info["compiled_exp"]
+
+
+def test_active_pepo_trace_contracts_physical_legs_without_dense_global_matrix():
+    """Sparse PEPO cluster blocks expose the same physical trace directly."""
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [("onsite", "X"), ("edge", "ZZ")],
+        order=2,
+    )
+    active = basis.exp(0.01, coefficients=np.array([0.2, 1.0]))
+    expected = basis.exp(
+        0.01,
+        coefficients=np.array([0.2, 1.0]),
+        materialize=True,
+    )
+    outer = expected.outer_inds()
+    expected_trace = expected.trace(outer[::2], outer[1::2])
+    np.testing.assert_allclose(active.trace(), expected_trace, atol=1e-11)
+    np.testing.assert_allclose(
+        basis.trace(0.01, coefficients=np.array([0.2, 1.0])),
+        expected_trace,
+        atol=1e-11,
+    )
+    np.testing.assert_allclose(
+        basis.compile_exp().trace(0.01, coefficients=np.array([0.2, 1.0])),
+        expected_trace,
+        atol=1e-11,
+    )
+
+
+def test_ordered_pepo_product_trace_keeps_torch_autodiff_graph():
+    """Factor coefficients, time, PEPO composition, and trace stay differentiable."""
+    torch = pytest.importorskip("torch")
+    bases = (
+        PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("edge", "ZZ")], order=2),
+    )
+    coefficients = (
+        torch.tensor(0.2, dtype=torch.float64, requires_grad=True),
+        torch.tensor(-0.3, dtype=torch.float64, requires_grad=True),
+    )
+    step = torch.tensor(0.05, dtype=torch.float64, requires_grad=True)
+    compiled = PEPOClusterProductExpansion.from_bases(
+        bases,
+        coefficients=coefficients,
+    ).compile_exp()
+    loss = compiled.trace(step).real
+    gradients = torch.autograd.grad(loss, (*coefficients, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
 
 
 def test_pauli_pepo_basis_keeps_torch_coefficient_and_time_graph():

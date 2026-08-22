@@ -108,6 +108,18 @@ small-system boundary. Use `basis.exp(step, ...)` for one-off calls or
 plaquette-loop orders 1–4; PEPO–PEPS contractions remain outside this
 operator-construction API.
 
+`PEPOClusterProductExpansion` composes independently compiled PEPO cluster
+factors in algebraic order and contracts their physical trace without a
+global dense operator. Each factor retains its own tree/plaquette topology;
+Quimb PEPO multiplication is the explicit composition boundary, so
+intermediate compression should be enabled when several factors are used.
+This is the factor-wise product path: it is distinct from a joint connected
+residual where each local cluster would first form
+`exp(A_C) @ exp(B_C) @ ...` and then subtract lower connected partitions.
+The MPO cluster engine already uses that joint local-residual definition;
+the PEPO product API keeps the factor-wise behavior explicit until a generic
+autodiff-safe joint PEPO factorization is available.
+
 The dense path supports orders five through nine through a separate recursive
 generic stage. For each level it contracts the already-built lower-order
 active PEPO on each candidate support with zero boundary sectors, subtracts
@@ -118,8 +130,8 @@ This keeps the residual definition aligned with the actual Quimb PEPO rather
 than an idealized inclusion-exclusion formula. `ClusterModelAdapter` and
 `build_model_cluster_expansion_pepo` provide finite dense Ising, Heisenberg,
 XXZ, and custom local-term entry points. The fixed-channel Pauli path still
-covers tree and plaquette-loop orders 1–4; native Symmray solving and
-infinite/unit-cell evolution remain separate future subsystems.
+covers tree and plaquette-loop orders 1–4; native Symmray solving and graded
+fermionic MPO histories remain separate future subsystems.
 
 `build_real_time_cluster_expansion_pepo()` is the coefficient-dependent dense
 entry point. It assembles weighted local terms before forming the complex
