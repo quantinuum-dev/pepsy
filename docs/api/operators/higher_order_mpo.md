@@ -528,8 +528,8 @@ use `compiled = expansion.compile_exp()`; it caches interval/factor topology
 but rebuilds backend tensors on every call so Torch/JAX autodiff graphs stay
 current. `from_mpo_bases(...)` is the convenience form when `A`, `B`, and `C`
 already have reusable `MPOBasis` objects. `max_bond` gives an explicit local
-Schmidt-rank cap, while `trace(normalized=True)` provides the finite-chain
-physical trace without forming a global dense matrix. Torch uses Pepsy's
+Schmidt-rank cap. Contract the returned MPO with the observable or trace
+workflow appropriate for your application. Torch uses Pepsy's
 stabilized SVD policy for repeated singular values; traced JAX evaluations use
 a static, exact full-rank factorization unless `max_bond` is supplied. For a
 single reusable `MPOBasis`, `basis.compile_cluster_expansion(...)` shares this
@@ -566,7 +566,6 @@ compiled = basis.compile_graph_cluster_expansion(
     cutoff=0.0,
 )
 U = compiled.exp(0.01)
-value = compiled.trace(0.01, normalized=True)
 ```
 
 Here `cluster_size=2` counts graph sites, so `(0, 0)-(3, 3)` is a genuine

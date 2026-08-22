@@ -913,8 +913,8 @@ def test_pauli_pepo_basis_matches_finite_chain_through_tree_order(order, nsites)
     np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
 
 
-def test_ordered_pepo_cluster_product_preserves_factor_order_and_trace():
-    """PEPO factors compose as exp(A) exp(B) exp(C), then trace directly."""
+def test_ordered_pepo_cluster_product_preserves_factor_order():
+    """PEPO factors compose as exp(A) exp(B) exp(C) in one PEPO."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
     z = np.diag([1.0, -1.0])
     identity = np.eye(2)
@@ -940,47 +940,12 @@ def test_ordered_pepo_cluster_product_preserves_factor_order_and_trace():
         @ expm(0.02 * h_c)
     )
     np.testing.assert_allclose(result.to_dense(), expected, atol=1e-11)
-    np.testing.assert_allclose(compiled.trace(0.05), np.trace(expected), atol=1e-11)
-    np.testing.assert_allclose(
-        compiled.trace(0.05, normalized=True),
-        np.trace(expected) / 4.0,
-        atol=1e-11,
-    )
     assert compiled.cache_info["factor_count"] == 3
     assert compiled.cache_info["compiled_exp"]
 
 
-def test_active_pepo_trace_contracts_physical_legs_without_dense_global_matrix():
-    """Sparse PEPO cluster blocks expose the same physical trace directly."""
-    basis = PauliPEPOBasis.compile(
-        1,
-        2,
-        [("onsite", "X"), ("edge", "ZZ")],
-        order=2,
-    )
-    active = basis.exp(0.01, coefficients=np.array([0.2, 1.0]))
-    expected = basis.exp(
-        0.01,
-        coefficients=np.array([0.2, 1.0]),
-        materialize=True,
-    )
-    outer = expected.outer_inds()
-    expected_trace = expected.trace(outer[::2], outer[1::2])
-    np.testing.assert_allclose(active.trace(), expected_trace, atol=1e-11)
-    np.testing.assert_allclose(
-        basis.trace(0.01, coefficients=np.array([0.2, 1.0])),
-        expected_trace,
-        atol=1e-11,
-    )
-    np.testing.assert_allclose(
-        basis.compile_exp().trace(0.01, coefficients=np.array([0.2, 1.0])),
-        expected_trace,
-        atol=1e-11,
-    )
-
-
-def test_ordered_pepo_product_trace_keeps_torch_autodiff_graph():
-    """Factor coefficients, time, PEPO composition, and trace stay differentiable."""
+def test_ordered_pepo_cluster_product_keeps_torch_autodiff_graph():
+    """Joint local products preserve factor, step, and PEPO autodiff paths."""
     torch = pytest.importorskip("torch")
     bases = (
         PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
@@ -995,9 +960,20 @@ def test_ordered_pepo_product_trace_keeps_torch_autodiff_graph():
         bases,
         coefficients=coefficients,
     ).compile_exp()
-    loss = compiled.trace(step).real
+    result = compiled.exp(step)
+    loss = sum(tensor.data.real.sum() for tensor in result.tensors)
     gradients = torch.autograd.grad(loss, (*coefficients, step))
     assert all(torch.isfinite(gradient) for gradient in gradients)
+
+
+def test_ordered_pepo_cluster_product_requires_one_joint_cluster_order():
+    """Mixed p=2/p=3 factors are rejected instead of implying two PEPO layers."""
+    bases = (
+        PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("edge", "ZZ")], order=3),
+    )
+    with pytest.raises(ValueError, match="same joint order"):
+        PEPOClusterProductExpansion.from_bases(bases)
 
 
 def test_pauli_pepo_basis_keeps_torch_coefficient_and_time_graph():

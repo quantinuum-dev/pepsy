@@ -165,7 +165,7 @@ def test_ordered_mpo_bases_require_matching_geometry():
         MPOClusterBasisExpansion.from_mpo_bases((first, second))
 
 
-def test_mpo_basis_cluster_convenience_resolves_parameters_and_trace():
+def test_mpo_basis_cluster_convenience_resolves_parameters():
     """The existing parameter basis can use the local cluster engine."""
     x, z = _paulis()
     basis = MPOBasis.from_local_terms(
@@ -183,21 +183,6 @@ def test_mpo_basis_cluster_convenience_resolves_parameters_and_trace():
     hamiltonian = 0.7 * _kron_all((x, x, np.eye(2))) - 0.2 * _kron_all((np.eye(2), z, z))
     expected = scipy_linalg.expm(0.02 * hamiltonian)
     np.testing.assert_allclose(result.to_mpo().to_dense(), expected, atol=1e-12)
-
-    expansion = MPOClusterBasisExpansion.from_local_terms(
-        3,
-        [((0, 1), (x, x)), ((1, 2), (z, z))],
-        cluster_size=3,
-    )
-    unit_reference = scipy_linalg.expm(
-        0.02 * (_kron_all((x, x, np.eye(2))) + _kron_all((np.eye(2), z, z)))
-    )
-    np.testing.assert_allclose(
-        expansion.trace(0.02, normalized=True),
-        np.trace(unit_reference) / 8.0,
-        atol=1e-12,
-    )
-
 
 def test_graph_cluster_expansion_keeps_a_long_range_two_site_cluster():
     """A distant edge carries the skipped sites' singleton background."""
@@ -220,11 +205,6 @@ def test_graph_cluster_expansion_keeps_a_long_range_two_site_cluster():
     )
     expected = scipy_linalg.expm(0.07 * generator)
     np.testing.assert_allclose(result, expected, atol=1e-11)
-    np.testing.assert_allclose(
-        compiled.trace(0.07),
-        np.trace(expected),
-        atol=1e-11,
-    )
     assert compiled.basis.last_report.cluster_mode == "graph"
     assert compiled.basis.last_report.graph_cluster_count == 5
 
@@ -298,7 +278,6 @@ def test_graph_cluster_expansion_keeps_products_of_crossing_long_range_clusters(
     second = -0.02 * _kron_all((np.eye(2), x, x, np.eye(2)))
     expected = scipy_linalg.expm(first) @ scipy_linalg.expm(second)
     np.testing.assert_allclose(result, expected, atol=1e-11)
-    np.testing.assert_allclose(basis.trace(0.05), np.trace(expected), atol=1e-11)
 
 
 def test_cluster_schmidt_path_keeps_torch_gradients_finite():

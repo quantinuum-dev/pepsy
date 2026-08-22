@@ -108,17 +108,28 @@ small-system boundary. Use `basis.exp(step, ...)` for one-off calls or
 plaquette-loop orders 1–4; PEPO–PEPS contractions remain outside this
 operator-construction API.
 
-`PEPOClusterProductExpansion` composes independently compiled PEPO cluster
-factors in algebraic order and contracts their physical trace without a
-global dense operator. Each factor retains its own tree/plaquette topology;
-Quimb PEPO multiplication is the explicit composition boundary, so
-intermediate compression should be enabled when several factors are used.
-This is the factor-wise product path: it is distinct from a joint connected
-residual where each local cluster would first form
-`exp(A_C) @ exp(B_C) @ ...` and then subtract lower connected partitions.
-The MPO cluster engine already uses that joint local-residual definition;
-the PEPO product API keeps the factor-wise behavior explicit until a generic
-autodiff-safe joint PEPO factorization is available.
+`PEPOClusterProductExpansion` is the joint ordered-residual path. It retains
+the supplied `A`, `B`, `C`, ... objects as local Hamiltonian sources, and for
+each connected spatial cluster `S` forms
+`W_S = exp(A_S) @ exp(B_S) @ exp(C_S) @ ...` before subtracting products of
+lower connected residuals. The resulting channels are assembled once into one
+PEPO. It never constructs an independent full-lattice PEPO for each factor.
+This is the same local-residual definition used by the MPO cluster engine;
+only the final tensor topology differs. All factors must share the lattice,
+symmetry policy, and cluster order.
+
+### Cluster order and dimension accounting
+
+The cluster order `p` is a joint spatial cutoff, not a factor index. For
+local physical dimension `d`, a `p`-site dense cluster target has matrix shape
+`(d**p, d**p)` and `d**(2*p)` operator coefficients. Thus the local work is
+exponential in `p`, while for fixed `p` the number of cluster embeddings grows
+with the lattice size rather than with the full Hilbert-space dimension
+`d**N`. The PEPO bond dimension is the accumulated rank of the connected
+residual channels and their graph-history sectors; it does not multiply three
+full factor-PEPO bond dimensions. Use the smallest `p` that resolves the
+desired spatial correlations, and use optional compression only as a further
+bond-rank approximation.
 
 The dense path supports orders five through nine through a separate recursive
 generic stage. For each level it contracts the already-built lower-order

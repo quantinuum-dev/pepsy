@@ -85,9 +85,10 @@ Changes for the next release should be added here before the version is bumped.
 
 - Graph MPO cluster assembly now carries singleton backgrounds through skipped
   chain sites and retains products of disjoint long-range clusters with
-  crossing or nested MPO spans. PEPO trace now uses Quimb's documented
-  physical upper/lower indices instead of relying on outer-index ordering;
-  ordered MPO-basis products also reject mismatched chain geometry. MPO
+  crossing or nested MPO spans; ordered MPO-basis products also reject
+  mismatched chain geometry. Ordered PEPO products now use the same joint
+  local-residual construction instead of multiplying independent factor
+  PEPOs. MPO
   fixed-rank SVD dispatch now remains compatible with custom JAX registrations
   and switches stabilized Torch mode to match real or complex inputs.
 - Term-centric MPO parsing now accepts integer coefficients without confusing

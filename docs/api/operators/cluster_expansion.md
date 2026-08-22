@@ -301,7 +301,7 @@ virtual-history sector rather than as dense tensor inflation.
 For a general dense local model, use
 `build_cluster_expansion_pepo(lx, ly, beta, twosite_op, onesite_op, ...)`.
 
-## Ordered PEPO products and traces
+## Ordered PEPO products
 
 For a noncommuting product, compile one `PauliPEPOBasis` per factor and use
 `PEPOClusterProductExpansion`. Factors are listed in algebraic order, so the
@@ -320,18 +320,23 @@ product = PEPOClusterProductExpansion.from_bases(
 )
 compiled = product.compile_exp()
 U = compiled.exp(0.01, compress=True, max_bond=64)
-value = compiled.trace(0.01, normalized=True, compress=True, max_bond=64)
 ```
 
-Each factor is evaluated with its own connected tree/loop cluster plan, then
-the resulting PEPO layers are multiplied in the requested order. The trace
-contracts each physical bra/ket pair and the remaining PEPO virtual network;
-it does not form the global dense operator. `compress=True` is recommended
-for more than a few factors because uncompressed PEPO bond dimensions grow
-multiplicatively. Factor coefficients, term coefficients, and the step remain
+For every connected cluster `S`, the local target is formed jointly as
+`exp(A_S) @ exp(B_S) @ exp(C_S)`, lower connected partitions are subtracted,
+and the residual channels are assembled into one PEPO. No full-lattice PEPO is
+built for an individual factor. All bases must use the same cluster order;
+`order=2` is one joint two-site expansion, not `PEPO(order=2) @
+PEPO(order=3)`. Factor coefficients, term coefficients, and the step remain
 backend-native for Torch/JAX autodiff. This product path is intentionally
 separate from `exp(A + B + C)`, which is a different operator unless the
-factors commute.
+factors commute. Contract the returned PEPO with the network contraction
+workflow appropriate for the observable you need.
+
+The order `p` controls local dimension: for physical dimension `d`, each
+`p`-site target is a `(d**p) x (d**p)` matrix, or `d**(2*p)` coefficients.
+The cost is exponential in `p` but not in the total lattice size `N` at fixed
+`p`; the number of translated/graph-embedded clusters scales with `N`.
 
 ## Fixed Pauli coefficient slots
 

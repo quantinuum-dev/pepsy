@@ -629,15 +629,6 @@ def compose_pepo_layers(layers, *, compress=False, **compress_opts):
     return result
 
 
-def _trace_quimb_pepo(pepo, **contract_opts):
-    """Trace a square-lattice PEPO over its physical input/output legs."""
-
-    # Let PEPO select its documented upper/lower physical indices.  The order
-    # returned by ``outer_inds`` is an implementation detail and can change
-    # after Quimb multiplication or compression.
-    return pepo.trace(**contract_opts)
-
-
 def _yoshida4_coefficients():
     """Return the symmetric triple-jump coefficients for fourth order."""
     cube_root_two = 2.0 ** (1.0 / 3.0)
@@ -2401,15 +2392,6 @@ class ActivePEPOBlocks:
 
     materialize = to_pepo
 
-    def trace(self, *, normalized=False, remove_orphans=True, **contract_opts):
-        """Contract the physical trace without forming a global dense matrix."""
-        active = self.compact() if remove_orphans else self
-        result = _trace_quimb_pepo(active.to_pepo(), **contract_opts)
-        if normalized:
-            result = result / (self.physical_dim ** (self.lx * self.ly))
-        return result
-
-
 @dataclass
 class GraphActivePEPOBlocks:
     """Sparse active blocks for an arbitrary finite graph PEPO.
@@ -2578,18 +2560,6 @@ class GraphActivePEPOBlocks:
 
     to_pepo = to_tensor_network
     materialize = to_tensor_network
-
-    def trace(self, *, normalized=False, remove_orphans=True, **contract_opts):
-        """Contract the physical trace of a graph PEPO network."""
-        active = self.compact() if remove_orphans else self
-        network = active.to_tensor_network(remove_orphans=False)
-        left = [("graph-bra", site) for site in active.sites]
-        right = [("graph-ket", site) for site in active.sites]
-        result = network.trace(left, right, **contract_opts)
-        if normalized:
-            result = result / (self.physical_dim ** len(self.sites))
-        return result
-
 
 def _graph_hamiltonian(nsites, edges, twosite_op, onesite_op):
     """Build a dense Hamiltonian for a graph cluster."""
@@ -3150,24 +3120,6 @@ class CompiledPEPOExp:
             materialize=materialize,
         )
 
-    def trace(
-        self,
-        step,
-        parameters=None,
-        *,
-        coefficients=None,
-        normalized=False,
-        **contract_opts,
-    ):
-        """Evaluate and contract the physical trace of one PEPO exponential."""
-        active = self.exp(
-            step,
-            parameters,
-            coefficients=coefficients,
-            materialize=False,
-        )
-        return active.trace(normalized=normalized, **contract_opts)
-
     evaluate = exp
     __call__ = exp
 
@@ -3297,12 +3249,16 @@ class PauliPEPOBasis:
 
     def _prepare_exp_plan(self):
         """Precompute all small cluster embedding maps for this basis."""
-        if self.order < 3:
-            return self
         # Populate the process-wide physical basis cache before building the
         # per-basis cluster maps.
         _backend_pauli_basis(1)
         _backend_pauli_basis(2)
+        # The joint ordered-product path always evaluates the one-site
+        # background and positive reference edge, including at order two.
+        self._cluster_embedding_plan(1, ())
+        self._cluster_embedding_plan(2, ((0, 1, "r"),))
+        if self.order < 3:
+            return self
         representatives = []
         for representative, _orbit in self.pair_orbits:
             representatives.append(
@@ -3464,6 +3420,8 @@ class PauliPEPOBasis:
 
     def _cluster_embedding_plan(self, nsites, edges):
         """Cache linear maps from local Pauli components to a cluster matrix."""
+        _backend_pauli_basis(1)
+        _backend_pauli_basis(2)
         key = (nsites, tuple(edges))
         try:
             return self._cluster_embedding_cache[key]
@@ -3540,6 +3498,43 @@ class PauliPEPOBasis:
         return ar.do("add", onsite_part, edge_part)
 
     @staticmethod
+    def _ordered_cluster_product(factor_data, nsites, edges):
+        """Evaluate one local ordered product on a connected cluster.
+
+        ``factor_data`` contains the local Hamiltonian components for every
+        exponential factor.  This is deliberately a local dense operation:
+        no intermediate full-lattice MPO or PEPO is constructed.  Keeping the
+        matrix products here is what makes the PEPO route a joint
+        Guppy-style cluster expansion rather than a product of independent
+        global approximations.
+        """
+        reference = _backend_reference(
+            tuple(
+                value
+                for _basis, beta, onsite_components, edge_components in factor_data
+                for value in (beta, onsite_components, edge_components)
+            )
+        )
+        result = None
+        for basis, beta, onsite_components, edge_components in factor_data:
+            hamiltonian = basis._cluster_hamiltonian(
+                nsites,
+                edges,
+                onsite_components,
+                edge_components,
+                like=reference,
+            )
+            local_exp = _backend_expm(
+                ar.do("multiply", -beta, hamiltonian)
+            )
+            result = (
+                local_exp
+                if result is None
+                else ar.do("matmul", result, local_exp)
+            )
+        return result
+
+    @staticmethod
     def _embed_with_background(operator, positions, nsites, background):
         """Embed a connected correction and dress untouched sites by ``E1``."""
         result = _backend_embed_operator(operator, positions, nsites, 2)
@@ -3558,29 +3553,12 @@ class PauliPEPOBasis:
         self,
         nsites,
         edges,
-        onsite_components,
-        edge_components,
-        beta,
+        factor_data,
         one_exp,
         edge_residual,
     ):
-        """Evaluate one connected residual using cached cluster embeddings."""
-        reference = _backend_reference(
-            (beta, one_exp, edge_residual, onsite_components, edge_components)
-        )
-        exact = _backend_expm(
-            ar.do(
-                "multiply",
-                -beta,
-                self._cluster_hamiltonian(
-                    nsites,
-                    edges,
-                    onsite_components,
-                    edge_components,
-                    like=reference,
-                ),
-            )
-        )
+        """Evaluate a joint connected residual by partition subtraction."""
+        exact = self._ordered_cluster_product(factor_data, nsites, edges)
         residual = ar.do(
             "subtract",
             exact,
@@ -3630,9 +3608,7 @@ class PauliPEPOBasis:
                 lower = self._connected_residual(
                     3,
                     three_edges,
-                    onsite_components,
-                    edge_components,
-                    beta,
+                    factor_data,
                     one_exp,
                     edge_residual,
                 )
@@ -3744,37 +3720,45 @@ class PauliPEPOBasis:
         )
         return first_corner, second_corner, third_corner, fourth_corner
 
-    def _build_active(self, beta, values):
-        onsite_components, edge_components = self._hamiltonian_components(
-            values,
-            beta,
-        )
-        onsite, edge = self._components_to_operators(
-            onsite_components,
-            edge_components,
-        )
-        reference = _backend_reference((beta, onsite, edge))
-        beta = _as_backend(beta, like=reference)
-        onsite = _as_backend(onsite, like=reference)
-        edge = _as_backend(edge, like=reference)
-        one_exp = _backend_expm(ar.do("multiply", -beta, onsite))
-        edge_exact = _backend_expm(
-            ar.do(
-                "multiply",
-                -beta,
-                ar.do(
-                    "add",
-                    edge,
-                    ar.do("add", _backend_embed_operator(onsite, (0,), 2, 2),
-                          _backend_embed_operator(onsite, (1,), 2, 2)),
-                ),
+    def _build_active(self, beta, values, *, factor_data=None):
+        """Build one PEPO from local joint cluster products.
+
+        A single :class:`PauliPEPOBasis` supplies one factor in the common
+        case.  ``factor_data`` is used by ordered products and contains all
+        factors at once; the same connected residual hierarchy is then used
+        for ``exp(A_C) @ exp(B_C) @ ...`` on every local cluster ``C``.
+        """
+        if factor_data is None:
+            onsite_components, edge_components = self._hamiltonian_components(
+                values,
+                beta,
             )
+            reference = _backend_reference(
+                (beta, onsite_components, edge_components)
+            )
+            beta = _as_backend(beta, like=reference)
+            onsite_components = _as_backend(onsite_components, like=reference)
+            edge_components = _as_backend(edge_components, like=reference)
+            factor_data = (
+                (self, beta, onsite_components, edge_components),
+            )
+        else:
+            factor_data = tuple(factor_data)
+            if not factor_data:
+                raise ValueError("factor_data must contain at least one factor.")
+
+        one_exp = self._ordered_cluster_product(factor_data, 1, ())
+        edge_exact = self._ordered_cluster_product(
+            factor_data,
+            2,
+            ((0, 1, "r"),),
         )
         edge_residual = ar.do(
             "subtract",
             edge_exact,
             _backend_operator_product([one_exp, one_exp]),
         )
+        reference = _backend_reference((one_exp, edge_residual))
         paulis = _backend_pauli_basis(1, like=reference)
         blocks = _initialize_blocks(self.lx, self.ly, one_exp, self.site_directions)
         allocator = _SectorAllocator()
@@ -3813,9 +3797,7 @@ class PauliPEPOBasis:
                 residual = self._connected_residual(
                     3,
                     edges,
-                    onsite_components,
-                    edge_components,
-                    beta,
+                    factor_data,
                     one_exp,
                     edge_residual,
                 )
@@ -3866,9 +3848,7 @@ class PauliPEPOBasis:
                 residual = self._connected_residual(
                     4,
                     edges,
-                    onsite_components,
-                    edge_components,
-                    beta,
+                    factor_data,
                     one_exp,
                     edge_residual,
                 )
@@ -3914,9 +3894,7 @@ class PauliPEPOBasis:
                 residual = self._connected_residual(
                     4,
                     edges,
-                    onsite_components,
-                    edge_components,
-                    beta,
+                    factor_data,
                     one_exp,
                     edge_residual,
                 )
@@ -3968,9 +3946,7 @@ class PauliPEPOBasis:
             loop_residual = self._connected_residual(
                 4,
                 loop_edges,
-                onsite_components,
-                edge_components,
-                beta,
+                factor_data,
                 one_exp,
                 edge_residual,
             )
@@ -4118,28 +4094,6 @@ class PauliPEPOBasis:
             materialize=materialize,
         )
 
-    def trace(
-        self,
-        step=None,
-        parameters=None,
-        *,
-        coefficients=None,
-        tau=None,
-        beta=None,
-        normalized=False,
-        **contract_opts,
-    ):
-        """Evaluate and contract the physical trace without dense inflation."""
-        active = self.exp(
-            step,
-            parameters,
-            coefficients=coefficients,
-            tau=tau,
-            beta=beta,
-            materialize=False,
-        )
-        return active.trace(normalized=normalized, **contract_opts)
-
     def build(self, parameters=None, *, coefficients=None, tau=None, beta=None, materialize=False):
         """Compatibility alias for :meth:`evaluate`."""
         return self.evaluate(
@@ -4173,7 +4127,7 @@ def _as_backend_dtype(value, *, like):
 
 @dataclass(frozen=True)
 class PEPOClusterFactor:
-    """One compiled PEPO cluster factor in an ordered exponential product."""
+    """One local Hamiltonian factor in a joint ordered cluster expansion."""
 
     basis: PauliPEPOBasis
     coefficient: object = 1.0
@@ -4184,7 +4138,7 @@ class PEPOClusterFactor:
 
 
 class CompiledPEPOClusterProduct:
-    """Reusable ordered product of fixed-topology PEPO cluster factors."""
+    """Reusable joint ordered PEPO cluster-expansion evaluator."""
 
     def __init__(self, expansion):
         if not isinstance(expansion, PEPOClusterProductExpansion):
@@ -4218,39 +4172,24 @@ class CompiledPEPOClusterProduct:
             **compress_opts,
         )
 
-    def trace(
-        self,
-        step,
-        parameters=None,
-        *,
-        coefficients=None,
-        normalized=False,
-        compress=False,
-        **compress_opts,
-    ):
-        """Evaluate the physical trace of the ordered PEPO product."""
-        return self.expansion.trace(
-            step,
-            parameters,
-            coefficients=coefficients,
-            normalized=normalized,
-            compress=compress,
-            **compress_opts,
-        )
-
     evaluate = exp
     __call__ = exp
 
 
 class PEPOClusterProductExpansion:
-    """Compose ordered PEPO cluster exponentials on a square lattice.
+    """Build one joint Guppy-style PEPO cluster expansion.
 
     ``factors`` are specified in algebraic order, so ``(A, B, C)`` means
-    ``exp(A) @ exp(B) @ exp(C)``. Each factor is independently built by a
-    :class:`PauliPEPOBasis`, retaining its graph/tree/plaquette cluster
-    channels and autodiff coefficient topology. The final layers are then
-    contracted with Quimb's PEPO multiplication, optionally compressed after
-    each multiplication.
+    ``exp(A) @ exp(B) @ exp(C)``. For every connected spatial cluster ``S``,
+    the local dense target is formed as
+    ``exp(A_S) @ exp(B_S) @ exp(C_S)``. Lower connected partitions are then
+    subtracted and the resulting residual channels are assembled once into
+    one PEPO. No full-lattice PEPO is built for an individual factor.
+
+    All factors must use the same lattice, symmetry policy, and cluster order.
+    The order is a joint local-cluster cutoff, not a factor label: use one
+    order-2 expansion for ``A, B, C`` rather than multiplying an order-2 PEPO
+    by an order-3 PEPO.
     """
 
     def __init__(self, factors):
@@ -4268,6 +4207,14 @@ class PEPOClusterProductExpansion:
                 raise ValueError(
                     "all PEPO cluster factors must have matching lattice "
                     "shape and periodicity."
+                )
+            if basis.order != reference.order:
+                raise ValueError(
+                    "all PEPO cluster factors must use the same joint order."
+                )
+            if basis.symmetry != reference.symmetry:
+                raise ValueError(
+                    "all PEPO cluster factors must use the same symmetry policy."
                 )
         self.factors = factors
         self.lx, self.ly, self.cyclic = geometry
@@ -4319,6 +4266,7 @@ class PEPOClusterProductExpansion:
             "lattice_shape": (self.lx, self.ly),
             "cyclic": self.cyclic,
             "factor_orders": tuple(factor.basis.order for factor in self.factors),
+            "joint_cluster_residual": True,
             "compiled_exp": self._compiled_exp is not None,
         }
 
@@ -4354,15 +4302,20 @@ class PEPOClusterProductExpansion:
         compress=False,
         **compress_opts,
     ):
-        """Build ``exp(A) @ exp(B) @ ...`` in the supplied factor order."""
+        """Build one PEPO for ``exp(A) @ exp(B) @ ...``.
+
+        The exponentials are multiplied only on each small connected cluster.
+        Their connected residuals are combined into a single PEPO topology;
+        independent full-lattice factor PEPOs are never materialized.
+        """
         factor_coefficients = self._factor_coefficients(coefficients)
-        layers = []
+        factor_data = []
         for factor, term_coefficients in zip(self.factors, factor_coefficients):
             coefficient = _resolve_pepo_factor_value(
                 factor.coefficient,
                 parameters,
             )
-            factor_step = ar.do("multiply", step, coefficient)
+            factor_beta = ar.do("multiply", -step, coefficient)
             if term_coefficients is not None and parameters is not None:
                 raise ValueError(
                     "parameters and coefficients are mutually exclusive for "
@@ -4372,54 +4325,35 @@ class PEPOClusterProductExpansion:
                 parameters if term_coefficients is None else None,
                 term_coefficients,
             )
-            reference = _backend_reference((factor_step, *values))
-            factor_step = _as_backend_dtype(factor_step, like=reference)
+            reference = _backend_reference((factor_beta, *values))
+            factor_beta = _as_backend_dtype(factor_beta, like=reference)
             values = tuple(
                 _as_backend_dtype(value, like=reference)
                 for value in values
             )
-            layers.append(
-                factor.basis.exp(
-                    factor_step,
-                    coefficients=_backend_stack(values),
-                    materialize=True,
+            onsite_components, edge_components = factor.basis._hamiltonian_components(
+                values,
+                factor_beta,
+            )
+            factor_data.append(
+                (
+                    factor.basis,
+                    factor_beta,
+                    onsite_components,
+                    edge_components,
                 )
             )
 
-        # compose_pepo_layers accepts application order and returns the last
-        # layer on the left. Reverse the algebraically ordered factors here.
-        result = compose_pepo_layers(
-            tuple(reversed(layers)),
-            compress=compress,
-            **compress_opts,
+        active = self.factors[0].basis._build_active(
+            None,
+            None,
+            factor_data=factor_data,
         )
+        result = active.to_pepo()
+        if compress:
+            result.compress(**compress_opts)
         self._build_count += 1
         return result
-
-    def trace(
-        self,
-        step,
-        parameters=None,
-        *,
-        coefficients=None,
-        normalized=False,
-        compress=False,
-        **compress_opts,
-    ):
-        """Build and contract the physical trace of the ordered product."""
-        result = _trace_quimb_pepo(
-            self.exp(
-                step,
-                parameters,
-                coefficients=coefficients,
-                compress=compress,
-                **compress_opts,
-            )
-        )
-        if normalized:
-            result = result / (2 ** (self.lx * self.ly))
-        return result
-
 
 class _SectorAllocator:
     """Allocate disjoint active-sector ranges for independent tree terms."""

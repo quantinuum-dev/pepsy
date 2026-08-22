@@ -468,15 +468,6 @@ class CompiledMPOClusterExp:
 
         return self.basis.exp(step, parameters=parameters)
 
-    def trace(self, step=1.0, *, parameters=None, normalized=False):
-        """Evaluate the physical trace without materializing a dense operator."""
-
-        return self.basis.trace(
-            step,
-            parameters=parameters,
-            normalized=normalized,
-        )
-
     evaluate = exp
     __call__ = exp
 
@@ -1509,26 +1500,6 @@ class MPOClusterBasisExpansion:
         """Return connected residual matrices keyed by intervals or graph sites."""
 
         return self._residuals(step, parameters)
-
-    def trace(self, step=1.0, *, parameters=None, normalized=False):
-        """Return the physical trace of the finite cluster-expanded MPO."""
-
-        arrays = self.exp(step, parameters=parameters).arrays
-        vector = ar.do("ones", (1,), like=arrays[0])
-        for array in arrays:
-            transfer = ar.do(
-                "zeros",
-                (int(array.shape[0]), int(array.shape[1])),
-                like=array,
-            )
-            for index in range(self.phys_dim):
-                transfer = ar.do("add", transfer, array[:, :, index, index])
-            vector = ar.do("matmul", vector, transfer)
-        result = vector[0]
-        if normalized:
-            result = result / (self.phys_dim ** self.L)
-        return result
-
 
 class MPOGraphClusterBasisExpansion(MPOClusterBasisExpansion):
     """Graph-aware MPO cluster expansion with chain-compatible output.
