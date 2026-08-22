@@ -131,8 +131,17 @@ neighbour edges, diagonal-neighbour metadata, and its graph loop number. Use
 `quotient_rotations=True` for a C4 planning inventory. The dense P=5–9
 builders recursively subtract the actual lower-order PEPO on each support and
 then perform a spanning-tree SVD factorization. Set `max_tree_rank` to
-truncate those generic tree bonds. The fixed-channel Pauli builder remains
-limited to orders 1–4.
+truncate those generic tree bonds. The fixed-channel Pauli builder now uses
+the same connected-shape hierarchy through order 9 while keeping coefficient
+and step values backend-native. On a periodic square lattice, translated
+copies reuse one local residual and C4-related shapes reuse one
+factorization. A loop's full graph is used for its local residual, while the
+final PEPO channel uses an exact spanning-tree representation of that local
+tensor. This avoids a `bond_dim**4` dense allocation at PBC vertices, but
+p≥5 remains exponentially more expensive in local cluster size.
+For memory-controlled p≥5 runs, pass `max_tree_rank` to
+`PauliPEPOBasis.compile`; this is a fixed-rank differentiable truncation of
+generic tree channels, while `None` keeps the local factorization exact.
 
 ## Arbitrary finite graph lattices
 
@@ -310,9 +319,9 @@ following constructs `exp(A) @ exp(B) @ exp(C)`:
 ```python
 from pepsy.operators import PauliPEPOBasis, PEPOClusterProductExpansion
 
-A = PauliPEPOBasis.compile(4, 4, [("onsite", "X")], order=4)
-B = PauliPEPOBasis.compile(4, 4, [("edge", "ZZ")], order=4)
-C = PauliPEPOBasis.compile(4, 4, [("onsite", "Z")], order=4)
+A = PauliPEPOBasis.compile(4, 4, [("onsite", "X")], order=5)
+B = PauliPEPOBasis.compile(4, 4, [("edge", "ZZ")], order=5)
+C = PauliPEPOBasis.compile(4, 4, [("onsite", "Z")], order=5)
 
 product = PEPOClusterProductExpansion.from_bases(
     (A, B, C),

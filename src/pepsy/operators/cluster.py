@@ -29,6 +29,7 @@ import quimb.tensor as qtn
 from quimb.tensor.fitting import tensor_network_distance
 
 from .mpo_automaton import _as_backend, _backend_reference
+from .mpo import _fixed_rank_svd
 
 __all__ = [
     "ActivePEPOBlocks",
@@ -746,7 +747,15 @@ def _backend_expm(matrix):
     """Evaluate a local exponential while retaining Torch/JAX graphs."""
     backend = ar.infer_backend(matrix)
     if backend in ("builtins", "numpy"):
-        return np.asarray(quimb.expm(np.asarray(matrix)), dtype=np.asarray(matrix).dtype)
+        matrix = np.asarray(matrix)
+        if matrix.ndim == 2:
+            return np.asarray(quimb.expm(matrix), dtype=matrix.dtype)
+        if matrix.ndim == 3:
+            return np.stack(
+                [quimb.expm(local_matrix) for local_matrix in matrix],
+                axis=0,
+            ).astype(matrix.dtype, copy=False)
+        raise ValueError("local matrix exponentials must be rank two or three.")
     if backend == "torch":
         import torch  # pylint: disable=import-outside-toplevel
 
@@ -915,6 +924,14 @@ def _operator_tensor(operator, nsites, local_dim):
     )
 
 
+def _backend_operator_tensor(operator, nsites, local_dim):
+    """Backend-preserving counterpart of :func:`_operator_tensor`."""
+    axes = tuple(axis for site in range(nsites) for axis in (site, nsites + site))
+    reshaped = ar.do("reshape", operator, (local_dim,) * (2 * nsites))
+    grouped = ar.do("transpose", reshaped, axes)
+    return ar.do("reshape", grouped, (local_dim**2,) * nsites)
+
+
 def _operator_from_tensor(operator_tensor, nsites, local_dim):
     """Undo :func:`_operator_tensor` for a local operator tensor."""
     pair_axes = tuple(range(2 * nsites))
@@ -923,6 +940,20 @@ def _operator_from_tensor(operator_tensor, nsites, local_dim):
     return operator_tensor.reshape((local_dim, local_dim) * nsites).transpose(
         row_axes + column_axes
     ).reshape(local_dim**nsites, local_dim**nsites)
+
+
+def _backend_operator_from_tensor(operator_tensor, nsites, local_dim):
+    """Backend-preserving counterpart of :func:`_operator_from_tensor`."""
+    pair_axes = tuple(range(2 * nsites))
+    row_axes = pair_axes[::2]
+    column_axes = pair_axes[1::2]
+    local = ar.do(
+        "reshape",
+        operator_tensor,
+        (local_dim, local_dim) * nsites,
+    )
+    ordered = ar.do("transpose", local, row_axes + column_axes)
+    return ar.do("reshape", ordered, (local_dim**nsites, local_dim**nsites))
 
 
 def _permute_operator_sites(operator, order, local_dim):
@@ -3138,10 +3169,14 @@ class PauliPEPOBasis:
     ``H(theta) = sum_i h(theta)_i + sum_<ij> v(theta)_{ij}``,
 
     where ``h`` and ``v`` are linear combinations of the supplied onsite and
-    edge Pauli slots. The returned order-4 representation is normally kept
-    as :class:`ActivePEPOBlocks`; dense Quimb materialization is intended for
+    edge Pauli slots. The returned representation is normally kept as
+    :class:`ActivePEPOBlocks`; dense Quimb materialization is intended for
     small validation lattices because a fixed Pauli channel basis is much
-    larger than an SVD-compressed numerical basis.
+    larger than an SVD-compressed numerical basis. Orders five through nine
+    use the generic connected-shape inventory and a backend-native
+    spanning-tree factorization. Loop edges are included when forming the
+    local residual, so the local loop correction remains exact even though
+    its PEPO channel uses a tree representation of that tensor.
     """
 
     def __init__(
@@ -3153,6 +3188,7 @@ class PauliPEPOBasis:
         order=4,
         cyclic=False,
         symmetry=None,
+        max_tree_rank=None,
     ):
         self.lx = _validate_shape(lx, "lx")
         self.ly = _validate_shape(ly, "ly")
@@ -3160,11 +3196,18 @@ class PauliPEPOBasis:
         if not isinstance(order, Integral):
             raise TypeError("order must be an integer.")
         self.order = int(order)
-        if self.order < 1 or self.order > 4:
-            raise ValueError("PauliPEPOBasis currently supports orders 1 through 4.")
+        if self.order < 1 or self.order > 9:
+            raise ValueError("PauliPEPOBasis currently supports orders 1 through 9.")
         if symmetry not in (None, "C4"):
             raise ValueError("symmetry must be None or 'C4'.")
+        if max_tree_rank is not None:
+            if not isinstance(max_tree_rank, Integral):
+                raise TypeError("max_tree_rank must be an integer or None.")
+            if int(max_tree_rank) < 1:
+                raise ValueError("max_tree_rank must be >= 1 or None.")
+            max_tree_rank = int(max_tree_rank)
         self.symmetry = symmetry
+        self.max_tree_rank = max_tree_rank
         self._terms = tuple(_normalize_pauli_term(term) for term in terms)
         if not self._terms:
             raise ValueError("terms must contain at least one Pauli slot.")
@@ -3181,6 +3224,7 @@ class PauliPEPOBasis:
             else:
                 self._edge_term_map[term_index, labels[0] * 4 + labels[1]] = 1.0
         self._cluster_embedding_cache = {}
+        self._generic_cluster_cache = {}
         self.site_directions = {
             (i, j): _site_directions(i, j, self.lx, self.ly, *self.cyclic)
             for i in range(self.lx)
@@ -3227,12 +3271,21 @@ class PauliPEPOBasis:
             "tree_orbits": len(self.triple_orbits) + len(self.path_orbits),
             "plaquettes": len(self.plaquette_starts),
             "cluster_embedding_plans": len(self._cluster_embedding_cache),
+            "generic_cluster_levels": len(self._generic_cluster_cache),
+            "generic_cluster_shapes": sum(
+                len(level) for level in self._generic_cluster_cache.values()
+            ),
+            "generic_translated_clusters": sum(
+                sum(len(record[1]) for record in level)
+                for level in self._generic_cluster_cache.values()
+            ),
             "fused_pauli_slots": int(
                 np.count_nonzero(self._onsite_term_map)
                 + np.count_nonzero(self._edge_term_map)
             ),
             "cyclic": self.cyclic,
             "symmetry": self.symmetry,
+            "max_tree_rank": self.max_tree_rank,
             "compiled_exp": self._compiled_exp is not None,
         }
 
@@ -3304,6 +3357,66 @@ class PauliPEPOBasis:
                 )
                 self._cluster_embedding_plan(3, three_edges)
         return self
+
+    def _generic_cluster_records(self, order):
+        """Return valid translated generic shapes, cached by lattice level.
+
+        The cache contains geometry only.  A record is
+        ``(source_shape, source_embeddings, variants)`` where ``variants``
+        holds ``(shape, embeddings)`` pairs.  With C4 reduction, the source
+        residual and its tree factorization are transported to the variants;
+        without C4 every oriented shape is its own source.  Invalid shapes
+        are filtered before any local exponential is evaluated, which is
+        important on small periodic tori where many abstract polyominoes
+        self-overlap after wrapping.
+        """
+        try:
+            return self._generic_cluster_cache[order]
+        except KeyError:
+            pass
+        shapes = generate_connected_cluster_shapes(
+            order,
+            min_sites=order,
+            quotient_rotations=self.symmetry == "C4",
+        )
+        records = []
+        for shape in shapes:
+            if self.symmetry == "C4":
+                candidates = tuple(
+                    (variant, _cluster_shape_embeddings(
+                        variant,
+                        self.lx,
+                        self.ly,
+                        self.cyclic,
+                    ))
+                    for variant, _source_to_target, _turns in _cluster_shape_c4_orbit(
+                        shape
+                    )
+                )
+            else:
+                candidates = (
+                    (
+                        shape,
+                        _cluster_shape_embeddings(
+                            shape,
+                            self.lx,
+                            self.ly,
+                            self.cyclic,
+                        ),
+                    ),
+                )
+            variants = tuple(
+                (variant, embeddings)
+                for variant, embeddings in candidates
+                if embeddings
+            )
+            if not variants:
+                continue
+            source_shape, source_embeddings = variants[0]
+            records.append((source_shape, source_embeddings, variants))
+        records = tuple(records)
+        self._generic_cluster_cache[order] = records
+        return records
 
     def _coefficient_values(self, parameters, coefficients):
         if coefficients is not None and parameters is not None:
@@ -3535,6 +3648,61 @@ class PauliPEPOBasis:
         return result
 
     @staticmethod
+    def _ordered_cluster_product_batch(
+        factor_data,
+        nsites,
+        edge_batches,
+        *,
+        batch_size=8,
+    ):
+        """Evaluate several local ordered products in backend batches.
+
+        A translated cluster has the same local ``W_S`` as its source
+        embedding on a homogeneous square lattice.  This helper therefore
+        batches the source shapes at one cluster level, while retaining the
+        factor order inside every batch.  ``batch_size`` bounds the temporary
+        ``(batch, 2**p, 2**p)`` allocation for order-nine clusters.
+        """
+        edge_batches = tuple(tuple(edges) for edges in edge_batches)
+        if not edge_batches:
+            return ()
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        reference = _backend_reference(
+            tuple(
+                value
+                for _basis, beta, onsite_components, edge_components in factor_data
+                for value in (beta, onsite_components, edge_components)
+            )
+        )
+        results = []
+        for start in range(0, len(edge_batches), batch_size):
+            chunk = edge_batches[start : start + batch_size]
+            product_batch = None
+            for basis, beta, onsite_components, edge_components in factor_data:
+                hamiltonians = tuple(
+                    basis._cluster_hamiltonian(
+                        nsites,
+                        edges,
+                        onsite_components,
+                        edge_components,
+                        like=reference,
+                    )
+                    for edges in chunk
+                )
+                hamiltonian_batch = ar.do("stack", hamiltonians, axis=0)
+                local_exp = _backend_expm(
+                    ar.do("multiply", -beta, hamiltonian_batch)
+                )
+                product_batch = (
+                    local_exp
+                    if product_batch is None
+                    else ar.do("matmul", product_batch, local_exp)
+                )
+            results.extend(product_batch[index] for index in range(len(chunk)))
+        return tuple(results)
+
+    @staticmethod
     def _embed_with_background(operator, positions, nsites, background):
         """Embed a connected correction and dress untouched sites by ``E1``."""
         result = _backend_embed_operator(operator, positions, nsites, 2)
@@ -3719,6 +3887,117 @@ class PauliPEPOBasis:
             ones,
         )
         return first_corner, second_corner, third_corner, fourth_corner
+
+    def _add_generic_active_levels(
+        self,
+        blocks,
+        allocator,
+        factor_data,
+        one_exp,
+    ):
+        """Add backend-native connected corrections for orders five to nine.
+
+        ``W_S`` is evaluated once for every source shape at a given level and
+        in small batches.  Its translated copies share the same local
+        residual and PEPO factorization.  For C4-symmetric bases the rotated
+        copies are transported rather than recomputed.  The full shape graph
+        is used in the local ordered product and in lower-order subtraction;
+        only the final tensor factorization chooses a spanning tree.
+        """
+        for cluster_order in range(5, self.order + 1):
+            records = self._generic_cluster_records(cluster_order)
+            if not records:
+                continue
+            lower_active = ActivePEPOBlocks(
+                lx=self.lx,
+                ly=self.ly,
+                cyclic=self.cyclic,
+                bond_dim=allocator.next_sector,
+                physical_dim=one_exp.shape[0],
+                site_directions=self.site_directions,
+                blocks={
+                    site: dict(site_blocks)
+                    for site, site_blocks in blocks.items()
+                },
+            )
+            source_products = self._ordered_cluster_product_batch(
+                factor_data,
+                cluster_order,
+                [record[0].edges for record in records],
+            )
+            for (source_shape, source_embeddings, variants), exact in zip(
+                records,
+                source_products,
+            ):
+                lower = _contract_active_support_backend(
+                    lower_active,
+                    source_embeddings[0],
+                    source_shape.edges,
+                )
+                source_residual = ar.do("subtract", exact, lower)
+                factorized = _tree_factorize_operator_backend(
+                    source_residual,
+                    source_shape.edges,
+                    source_shape.nsites,
+                    one_exp.shape[0],
+                    self.max_tree_rank,
+                )
+                if factorized is None:
+                    continue
+                (
+                    source_tensors,
+                    source_parent,
+                    source_parent_direction,
+                    source_children,
+                    source_ranks,
+                ) = factorized
+
+                for variant, embeddings in variants:
+                    source_to_target, turns = _shape_rotation_map(
+                        source_shape,
+                        variant,
+                    )
+                    if source_to_target == tuple(range(source_shape.nsites)):
+                        local_tensors = source_tensors
+                        parent = source_parent
+                        parent_direction = source_parent_direction
+                        children = source_children
+                    else:
+                        local_tensors, parent, parent_direction, children = (
+                            _transform_tree_factorization(
+                                source_tensors,
+                                source_parent,
+                                source_parent_direction,
+                                source_children,
+                                source_to_target,
+                                turns,
+                            )
+                        )
+                    ranks = {
+                        source_to_target[site]: rank
+                        for site, rank in source_ranks.items()
+                    }
+                    tree_directions = {}
+                    sectors = {}
+                    for child, parent_site in parent.items():
+                        if parent_site is None:
+                            continue
+                        direction = parent_direction[child]
+                        tree_directions[(parent_site, child)] = direction
+                        tree_directions[(child, parent_site)] = _OPPOSITE_DIRECTION[
+                            direction
+                        ]
+                        sectors[child] = allocator.allocate(ranks[child])
+                    _add_tree_factor_blocks_backend(
+                        blocks,
+                        self.site_directions,
+                        embeddings,
+                        local_tensors,
+                        parent,
+                        tree_directions,
+                        sectors,
+                        one_exp.shape[0],
+                    )
 
     def _build_active(self, beta, values, *, factor_data=None):
         """Build one PEPO from local joint cluster products.
@@ -3994,6 +4273,14 @@ class PauliPEPOBasis:
                     (upper_bond, left_bond),
                 )
 
+        if self.order >= 5:
+            self._add_generic_active_levels(
+                blocks,
+                allocator,
+                factor_data,
+                one_exp,
+            )
+
         self._build_count += 1
         return ActivePEPOBlocks(
             lx=self.lx,
@@ -4216,6 +4503,10 @@ class PEPOClusterProductExpansion:
                 raise ValueError(
                     "all PEPO cluster factors must use the same symmetry policy."
                 )
+            if basis.max_tree_rank != reference.max_tree_rank:
+                raise ValueError(
+                    "all PEPO cluster factors must use the same max_tree_rank."
+                )
         self.factors = factors
         self.lx, self.ly, self.cyclic = geometry
         self._build_count = 0
@@ -4266,6 +4557,7 @@ class PEPOClusterProductExpansion:
             "lattice_shape": (self.lx, self.ly),
             "cyclic": self.cyclic,
             "factor_orders": tuple(factor.basis.order for factor in self.factors),
+            "max_tree_rank": self.factors[0].basis.max_tree_rank,
             "joint_cluster_residual": True,
             "compiled_exp": self._compiled_exp is not None,
         }
@@ -5094,6 +5386,113 @@ def _tree_factorize_operator(operator, edges, nsites, local_dim, max_rank):
     )
 
 
+def _tree_factorize_operator_backend(
+    operator,
+    edges,
+    nsites,
+    local_dim,
+    max_rank=None,
+):
+    """Autodiff-safe exact spanning-tree factorization of a local operator.
+
+    The topology and retained ranks are determined from static matrix shapes;
+    no backend value is converted to NumPy and no singular-value threshold is
+    used.  This keeps the factorization differentiable for Torch and JAX.
+    Loop edges are intentionally accepted and ignored only by the
+    factorization tree; they remain present in the operator supplied by the
+    connected-cluster residual solver.
+    """
+    operator_tensor = _backend_operator_tensor(operator, nsites, local_dim)
+    operator_rank = local_dim**2
+    adjacency = [[] for _ in range(nsites)]
+    for source, target, direction in edges:
+        adjacency[source].append((target, direction))
+        adjacency[target].append((source, _OPPOSITE_DIRECTION[direction]))
+
+    parent = {0: None}
+    parent_direction = {}
+    traversal = [0]
+    for site in traversal:
+        for neighbour, direction in adjacency[site]:
+            if neighbour in parent:
+                continue
+            parent[neighbour] = site
+            parent_direction[neighbour] = direction
+            traversal.append(neighbour)
+    if len(parent) != nsites:
+        raise ValueError("cluster graph must be connected for tree factorization.")
+
+    children = {site: [] for site in range(nsites)}
+    for site in traversal[1:]:
+        children[parent[site]].append(site)
+
+    current = operator_tensor
+    axes = [("physical", site) for site in range(nsites)]
+    local_tensors = {}
+    ranks = {}
+    for site in reversed(traversal[1:]):
+        child_nodes = tuple(children[site])
+        row_axes = [("bond", child) for child in child_nodes]
+        row_axes.append(("physical", site))
+        column_axes = [axis for axis in axes if axis not in row_axes]
+        permutation = [axes.index(axis) for axis in row_axes + column_axes]
+        transposed = ar.do("transpose", current, permutation)
+        row_shape = tuple(
+            int(current.shape[index]) for index in permutation[: len(row_axes)]
+        )
+        column_shape = tuple(
+            int(current.shape[index]) for index in permutation[len(row_axes) :]
+        )
+        matrix = ar.do(
+            "reshape",
+            transposed,
+            (int(np.prod(row_shape)), int(np.prod(column_shape))),
+        )
+        left, singular_values, right = _fixed_rank_svd(matrix)
+        rank = min(int(matrix.shape[-2]), int(matrix.shape[-1]))
+        if max_rank is not None:
+            rank = min(rank, max_rank)
+        if rank < 1:
+            return None
+        left = left[:, :rank]
+        singular_values = singular_values[:rank]
+        right = right[:rank, :]
+        local_tensors[site] = (
+            child_nodes,
+            ar.do(
+                "reshape",
+                left,
+                tuple(
+                    int(current.shape[axes.index(("bond", child))])
+                    for child in child_nodes
+                )
+                + (operator_rank, rank),
+            ),
+        )
+        ranks[site] = rank
+        weighted_right = ar.do(
+            "multiply",
+            ar.do("reshape", singular_values, (rank, 1)),
+            right,
+        )
+        current = ar.do(
+            "reshape",
+            weighted_right,
+            (rank,)
+            + tuple(int(current.shape[axes.index(axis)]) for axis in column_axes),
+        )
+        axes = [("bond", site)] + column_axes
+
+    root = 0
+    root_axes = [("bond", child) for child in children[root]]
+    root_axes.append(("physical", root))
+    permutation = [axes.index(axis) for axis in root_axes]
+    root_tensor = ar.do("transpose", current, permutation)
+    root_shape = tuple(int(root_tensor.shape[index]) for index in range(root_tensor.ndim))
+    local_tensors[root] = (tuple(children[root]), ar.do("reshape", root_tensor, root_shape))
+    return local_tensors, parent, parent_direction, children, ranks
+
+
 def _spanning_tree_edge_indices(edges, nsites):
     """Return a breadth-first spanning tree through ``edges``."""
     adjacency = [[] for _ in range(nsites)]
@@ -5548,6 +5947,70 @@ def _add_tree_factor_blocks(
                     blocks[lattice_site][key] = block
 
 
+def _add_tree_factor_blocks_backend(
+    blocks,
+    site_directions,
+    embeddings,
+    local_tensors,
+    parent,
+    tree_directions,
+    sectors,
+    local_dim,
+):
+    """Insert backend-valued tree factors without detaching their graph."""
+    reference = next(
+        tensor
+        for _children, tensor in local_tensors.values()
+    )
+    matrix_units = _as_backend(
+        np.eye(local_dim**2).reshape(local_dim**2, local_dim, local_dim),
+        like=reference,
+        dtype=reference.dtype,
+    )
+    root = next(site for site, value in parent.items() if value is None)
+    pending = {site: {} for site in site_directions}
+    for embedding in embeddings:
+        for site, (child_nodes, tensor) in local_tensors.items():
+            physical_axis = len(child_nodes)
+            local_blocks = ar.do(
+                "tensordot",
+                tensor,
+                matrix_units,
+                axes=([physical_axis], [0]),
+            )
+            lattice_site = embedding[site]
+            directions = site_directions[lattice_site]
+            for active_indices in np.ndindex(local_blocks.shape[:-2]):
+                key = [0] * len(directions)
+                for axis, child in enumerate(child_nodes):
+                    direction = tree_directions[(site, child)]
+                    key[directions.index(direction)] = sectors[child][
+                        active_indices[axis]
+                    ]
+                if site != root:
+                    direction = tree_directions[(site, parent[site])]
+                    key[directions.index(direction)] = sectors[site][
+                        active_indices[-1]
+                    ]
+                key = tuple(key)
+                block = local_blocks[active_indices]
+                pending[lattice_site].setdefault(key, []).append(block)
+    for site, site_blocks in pending.items():
+        for key, contributions in site_blocks.items():
+            if len(contributions) == 1:
+                block = contributions[0]
+            else:
+                block = ar.do(
+                    "sum",
+                    ar.do("stack", tuple(contributions), axis=0),
+                    axis=0,
+                )
+            if key in blocks[site]:
+                blocks[site][key] = ar.do("add", blocks[site][key], block)
+            else:
+                blocks[site][key] = block
+
+
 def _add_graph_factor_blocks(
     blocks,
     site_directions,
@@ -5648,6 +6111,205 @@ def _contract_active_support(active, sites, edges):
         optimize=True,
     )
     return result.reshape(local_dim**len(sites), local_dim**len(sites))
+
+
+def _contract_active_support_backend(active, sites, edges):
+    """Backend-preserving active-support contraction with zero boundaries."""
+    internal_directions = {site: set() for site in sites}
+    edge_labels = {}
+    for edge_label, (source, target, direction) in enumerate(edges):
+        source_site = sites[source]
+        target_site = sites[target]
+        internal_directions[source_site].add(direction)
+        internal_directions[target_site].add(_OPPOSITE_DIRECTION[direction])
+        edge_labels[(source_site, direction)] = edge_label
+        edge_labels[(target_site, _OPPOSITE_DIRECTION[direction])] = edge_label
+
+    local_dim = active.physical_dim
+    reference = next(iter(active.blocks[sites[0]].values()))
+
+    def sum_values(values):
+        values = list(values)
+        if not values:
+            return ar.do("zeros", (local_dim, local_dim), like=reference)
+        while len(values) > 1:
+            values = [
+                ar.do("add", values[index], values[index + 1])
+                for index in range(0, len(values) - 1, 2)
+            ] + (values[-1:] if len(values) % 2 else [])
+        return values[0]
+
+    # Each factor is a sparse map from its incident virtual-sector tuple to a
+    # physical matrix.  Keeping this representation sparse avoids creating a
+    # ``bond_dim**4`` site tensor at a four-leg PBC vertex.
+    factors = []
+    for site in sites:
+        directions = active.site_directions[site]
+        role_directions = tuple(
+            direction
+            for direction in directions
+            if direction in internal_directions[site]
+        )
+        role_edges = tuple(
+            edge_labels[(site, direction)] for direction in role_directions
+        )
+        direction_to_axis = {
+            direction: axis for axis, direction in enumerate(directions)
+        }
+        entries = {}
+        for key, block in active.blocks[site].items():
+            if any(
+                key[axis] != 0
+                for direction, axis in direction_to_axis.items()
+                if direction not in internal_directions[site]
+            ):
+                continue
+            sector_indices = tuple(
+                key[direction_to_axis[direction]]
+                for direction in role_directions
+            )
+            entries.setdefault(sector_indices, []).append(block)
+        factors.append(
+            {
+                "edges": role_edges,
+                "sites": (site,),
+                "entries": {
+                    sector_indices: sum_values(values)
+                    for sector_indices, values in entries.items()
+                },
+            }
+        )
+
+    remaining_edges = set(range(len(edges)))
+    while remaining_edges:
+        # Eliminate the edge with the smallest resulting factor scope. This
+        # is a tiny min-fill heuristic and is particularly useful for PBC
+        # plaquettes and five-site loops.
+        candidates = []
+        for edge_label in remaining_edges:
+            containing = [
+                index
+                for index, factor in enumerate(factors)
+                if edge_label in factor["edges"]
+            ]
+            if not containing:
+                raise ValueError("active support lost a cluster virtual edge.")
+            if len(containing) == 1:
+                scope_size = len(factors[containing[0]]["edges"])
+            else:
+                scope_size = len(
+                    set(factors[containing[0]]["edges"])
+                    | set(factors[containing[1]]["edges"])
+                )
+            candidates.append((scope_size, edge_label, containing))
+        _scope_size, edge_label, containing = min(candidates)
+        remaining_edges.remove(edge_label)
+
+        if len(containing) == 1:
+            factor = factors[containing[0]]
+            position = factor["edges"].index(edge_label)
+            new_edges = tuple(
+                edge for index, edge in enumerate(factor["edges"])
+                if index != position
+            )
+            reduced = {}
+            for key, value in factor["entries"].items():
+                new_key = key[:position] + key[position + 1 :]
+                reduced.setdefault(new_key, []).append(value)
+            factors[containing[0]] = {
+                "edges": new_edges,
+                "sites": factor["sites"],
+                "entries": {
+                    key: sum_values(values) for key, values in reduced.items()
+                },
+            }
+            continue
+
+        first_index, second_index = containing
+        first = factors[first_index]
+        second = factors[second_index]
+        first_position = first["edges"].index(edge_label)
+        second_position = second["edges"].index(edge_label)
+        common_edges = tuple(
+            edge
+            for edge in first["edges"]
+            if edge in second["edges"]
+        )
+        first_groups = {}
+        for key, value in first["entries"].items():
+            group_key = tuple(key[first["edges"].index(edge)] for edge in common_edges)
+            first_groups.setdefault(group_key, []).append((key, value))
+        second_groups = {}
+        for key, value in second["entries"].items():
+            group_key = tuple(key[second["edges"].index(edge)] for edge in common_edges)
+            second_groups.setdefault(group_key, []).append((key, value))
+
+        new_edges = tuple(
+            edge for edge in first["edges"] if edge != edge_label
+        ) + tuple(
+            edge
+            for edge in second["edges"]
+            if edge != edge_label and edge not in first["edges"]
+        )
+        first_positions = {
+            edge: first["edges"].index(edge)
+            for edge in first["edges"]
+            if edge != edge_label
+        }
+        second_positions = {
+            edge: second["edges"].index(edge)
+            for edge in second["edges"]
+            if edge != edge_label
+        }
+        merged = {}
+        for group_key, first_items in first_groups.items():
+            second_items = second_groups.get(group_key, ())
+            for first_key, first_value in first_items:
+                for second_key, second_value in second_items:
+                    if first_key[first_position] != second_key[second_position]:
+                        continue
+                    merged_key = tuple(
+                        first_key[first_positions[edge]]
+                        if edge in first_positions
+                        else second_key[second_positions[edge]]
+                        for edge in new_edges
+                    )
+                    value = ar.do(
+                        "tensordot",
+                        first_value,
+                        second_value,
+                        axes=0,
+                    )
+                    merged.setdefault(merged_key, []).append(value)
+        merged_factor = {
+            "edges": new_edges,
+            "sites": first["sites"] + second["sites"],
+            "entries": {
+                key: sum_values(values) for key, values in merged.items()
+            },
+        }
+        for index in sorted((first_index, second_index), reverse=True):
+            factors.pop(index)
+        factors.append(merged_factor)
+
+    if len(factors) != 1:
+        raise ValueError("active support contraction did not produce one factor.")
+    final_factor = factors[0]
+    value = final_factor["entries"].get(())
+    if value is None:
+        value = sum_values(tuple(final_factor["entries"].values()))
+    site_order = final_factor["sites"]
+    pair_permutation = tuple(
+        axis
+        for site in sites
+        for axis in (
+            2 * site_order.index(site),
+            2 * site_order.index(site) + 1,
+        )
+    )
+    if pair_permutation != tuple(range(2 * len(sites))):
+        value = ar.do("transpose", value, pair_permutation)
+    return _backend_operator_from_tensor(value, len(sites), local_dim)
 
 
 def _add_generic_cluster_levels(

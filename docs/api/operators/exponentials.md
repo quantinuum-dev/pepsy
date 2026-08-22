@@ -271,9 +271,12 @@ to calling `.to_pepo()` for a single evaluation.
 autodiff and memory-saving result; dense PEPO tensors should be materialized
 only when required by downstream code or a small-system validation.
 
-The fixed Pauli implementation currently supports tree orders 1–4. It does
-not perform PEPO × PEPS contractions, expectation values, loop-cluster
-corrections, or symmetry-native block-space calculations.
+The fixed Pauli implementation supports connected orders 1–9. Orders 1–4
+use compact fixed Pauli channels; orders 5–9 use cached translated-shape
+residuals and backend-native spanning-tree SVD channels. It does not perform
+PEPO × PEPS contractions, expectation values, or symmetry-native block-space
+calculations. For memory-controlled p≥5 runs, pass `max_tree_rank` to the
+`PauliPEPOBasis` constructor; `None` retains exact local tree ranks.
 
 ## Dense cluster-expansion convenience API
 

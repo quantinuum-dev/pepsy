@@ -913,6 +913,118 @@ def test_pauli_pepo_basis_matches_finite_chain_through_tree_order(order, nsites)
     np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
 
 
+def test_pauli_pepo_basis_order_five_is_exact_on_a_five_site_chain():
+    """The backend-native generic path closes the first five-site tree."""
+    basis = PauliPEPOBasis.compile(
+        1,
+        5,
+        [
+            PauliPEPOTerm("onsite", "X", coefficient=0.2),
+            PauliPEPOTerm("edge", "ZZ", coefficient=1.0),
+        ],
+        order=5,
+    )
+    pepo = basis.exp(step=-1j * 0.001, materialize=True)
+    exact = expm(-1j * 0.001 * _pauli_chain_hamiltonian(5, 0.2, 1.0))
+    np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
+    assert basis.cache_info["generic_cluster_levels"] == 1
+    assert basis.cache_info["generic_translated_clusters"] == 1
+
+
+def test_pauli_pepo_basis_batches_translated_pbc_shapes():
+    """PBC higher-order sources are reused across their torus translations."""
+    basis = PauliPEPOBasis.compile(
+        2,
+        3,
+        [("onsite", "X"), ("edge", "ZZ")],
+        order=5,
+        cyclic=True,
+        symmetry="C4",
+    )
+    active = basis.exp(
+        step=-1j * 1e-4,
+        coefficients=np.array([0.2, 1.0]),
+        materialize=False,
+    )
+    assert active.active_block_count > 0
+    assert basis.cache_info["generic_cluster_levels"] == 1
+    assert basis.cache_info["generic_translated_clusters"] > 1
+
+
+def test_pauli_pepo_basis_order_five_keeps_torch_autodiff():
+    """Generic tree SVD and sparse PBC-safe contraction keep Torch graphs."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        5,
+        [("onsite", "X"), ("edge", "ZZ")],
+        order=5,
+    )
+    coefficients = torch.tensor(
+        [0.2, 1.0], dtype=torch.float64, requires_grad=True
+    )
+    step = torch.tensor(0.001, dtype=torch.float64, requires_grad=True)
+    active = basis.exp(
+        step=-1j * step,
+        coefficients=coefficients,
+        materialize=False,
+    )
+    loss = sum(
+        block.real.sum()
+        for site_blocks in active.blocks.values()
+        for block in site_blocks.values()
+    )
+    coefficient_gradient, step_gradient = torch.autograd.grad(
+        loss,
+        (coefficients, step),
+    )
+    assert torch.isfinite(coefficient_gradient).all()
+    assert torch.isfinite(step_gradient)
+
+
+def test_ordered_pepo_cluster_product_order_five_is_joint_and_exact():
+    """exp(A) exp(B) exp(C) shares one p=5 cluster hierarchy."""
+    identity = np.eye(2)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+
+    def onsite_sum(operator):
+        result = np.zeros((32, 32))
+        for site in range(5):
+            factors = [identity] * 5
+            factors[site] = operator
+            local = factors[0]
+            for factor in factors[1:]:
+                local = np.kron(local, factor)
+            result += local
+        return result
+
+    # Construct the expected local factors explicitly so the ordered product
+    # is tested against three dense cluster Hamiltonians.
+    h_a = onsite_sum(x)
+    h_c = onsite_sum(z)
+    h_b = np.zeros((32, 32))
+    for site in range(4):
+        factors = [identity] * 5
+        factors[site] = z
+        factors[site + 1] = z
+        local = factors[0]
+        for factor in factors[1:]:
+            local = np.kron(local, factor)
+        h_b += local
+    bases = (
+        PauliPEPOBasis.compile(1, 5, [("onsite", "X")], order=5),
+        PauliPEPOBasis.compile(1, 5, [("edge", "ZZ")], order=5),
+        PauliPEPOBasis.compile(1, 5, [("onsite", "Z")], order=5),
+    )
+    result = PEPOClusterProductExpansion.from_bases(
+        bases,
+        coefficients=(0.2, -0.3, 0.4),
+    ).exp(0.001)
+    expected = expm(0.0002 * h_a) @ expm(-0.0003 * h_b) @ expm(0.0004 * h_c)
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1e-11)
+
+
 def test_ordered_pepo_cluster_product_preserves_factor_order():
     """PEPO factors compose as exp(A) exp(B) exp(C) in one PEPO."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
