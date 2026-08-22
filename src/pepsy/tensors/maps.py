@@ -311,48 +311,111 @@ class OneDMap:
         raise ValueError(f"Unknown folded snake major axis: {major!r}.")
 
     @staticmethod
-    def _is_power_of_two(value):
-        return value > 0 and (value & (value - 1)) == 0
+    def _hilbert_sign(value):
+        """Return the sign of an integer Hilbert basis component."""
+        return -1 if value < 0 else (1 if value > 0 else 0)
 
-    @staticmethod
-    def _next_power_of_two(value):
-        value = int(value)
-        if value < 1:
-            raise ValueError("value must be >= 1.")
-        return 1 << (value - 1).bit_length()
+    @classmethod
+    def _generate_hilbert_2d(cls, x, y, ax, ay, bx, by):
+        """Recursively generate one oriented rectangular Hilbert region.
 
-    @staticmethod
-    def _hilbert_rot(n, x, y, rx, ry):
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            x, y = y, x
-        return x, y
+        This is the generalized rectangular Hilbert (often called Gilbert)
+        construction. Unlike cropping a power-of-two Hilbert square, each
+        recursive region is part of the requested rectangle, so arbitrary
+        rectangular sizes remain complete and deterministic. The classical
+        Hilbert traversal is recovered when both dimensions are powers of two.
+
+        The construction is adapted from Jakub Cerveny's BSD-2-Clause
+        reference implementation (copyright 2018) at
+        https://github.com/jakubcerveny/gilbert.
+        """
+        width = abs(ax + ay)
+        height = abs(bx + by)
+        dax, day = cls._hilbert_sign(ax), cls._hilbert_sign(ay)
+        dbx, dby = cls._hilbert_sign(bx), cls._hilbert_sign(by)
+
+        if height == 1:
+            for _ in range(width):
+                yield x, y
+                x += dax
+                y += day
+            return
+        if width == 1:
+            for _ in range(height):
+                yield x, y
+                x += dbx
+                y += dby
+            return
+
+        ax2, ay2 = ax // 2, ay // 2
+        bx2, by2 = bx // 2, by // 2
+        width2 = abs(ax2 + ay2)
+        height2 = abs(bx2 + by2)
+
+        if 2 * width > 3 * height:
+            if width2 % 2 and width > 2:
+                ax2 += dax
+                ay2 += day
+            yield from cls._generate_hilbert_2d(
+                x, y, ax2, ay2, bx, by,
+            )
+            yield from cls._generate_hilbert_2d(
+                x + ax2,
+                y + ay2,
+                ax - ax2,
+                ay - ay2,
+                bx,
+                by,
+            )
+            return
+
+        if height2 % 2 and height > 2:
+            bx2 += dbx
+            by2 += dby
+        yield from cls._generate_hilbert_2d(
+            x, y, bx2, by2, ax2, ay2,
+        )
+        yield from cls._generate_hilbert_2d(
+            x + bx2,
+            y + by2,
+            ax,
+            ay,
+            bx - bx2,
+            by - by2,
+        )
+        yield from cls._generate_hilbert_2d(
+            x + (ax - dax) + (bx2 - dbx),
+            y + (ay - day) + (by2 - dby),
+            -bx2,
+            -by2,
+            -(ax - ax2),
+            -(ay - ay2),
+        )
 
     @classmethod
     def _coords_hilbert_2d_base(cls, L_x, L_y):
-        # For rectangles, traverse the smallest enclosing power-of-two square
-        # in Hilbert order and keep only points inside the requested bounds.
-        side = cls._next_power_of_two(max(L_x, L_y))
-        coords = []
-        for distance in range(side * side):
-            x = 0
-            y = 0
-            t = distance
-            scale = 1
-            while scale < side:
-                rx = 1 & (t // 2)
-                ry = 1 & (t ^ rx)
-                x, y = cls._hilbert_rot(scale, x, y, rx, ry)
-                x += scale * rx
-                y += scale * ry
-                t //= 4
-                scale *= 2
-            if x < L_x and y < L_y:
-                coords.append((x, y))
-                if len(coords) == L_x * L_y:
-                    break
+        """Return a complete x-oriented Hilbert traversal of a rectangle."""
+        # Keep the basis orientation explicit instead of rotating based on
+        # aspect ratio.  ``hilbert-row-major`` is the transposed orientation,
+        # and both remain useful distinct baselines on rectangular lattices.
+        coords = list(
+            cls._generate_hilbert_2d(0, 0, L_x, 0, 0, L_y)
+        )
+
+        expected = L_x * L_y
+        if len(coords) != expected or len(set(coords)) != expected:
+            raise RuntimeError(
+                "generalized Hilbert traversal did not cover the requested "
+                f"rectangle {L_x}x{L_y} exactly."
+            )
+        if any(
+            x < 0 or x >= L_x or y < 0 or y >= L_y
+            for x, y in coords
+        ):
+            raise RuntimeError(
+                "generalized Hilbert traversal escaped the requested "
+                f"rectangle {L_x}x{L_y}."
+            )
         return coords
 
     @classmethod

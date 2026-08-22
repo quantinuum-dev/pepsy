@@ -634,6 +634,28 @@ zigzag = py.square_lattice_zigzag(6, 6)
 fixed_plan = finder.run(order=zigzag)
 ```
 
+For regular two-dimensional lattices, the MPS finder also accepts the shared
+`OneDMap` geometric presets. Set `lattice_shape=(Lx, Ly)` on the finder (or
+pass it through `MpsOptimizer.gate_stream_layout`) and choose
+`"row-major"`, `"col-major"`, `"snake"`, `"snake-row-major"`,
+`"folded-snake"`, `"folded-snake-row-major"`, `"hilbert"`, or
+`"hilbert-row-major"`. The default logical label is `x * Ly + y`; pass
+`lattice_site=lambda x, y: ...` for another site-label convention.
+`"folded-snake"` is the periodic-boundary baseline, while the Hilbert modes
+use the classical traversal on power-of-two squares and a complete
+generalized rectangular Hilbert traversal elsewhere. Tree geometric presets
+use the same `OneDMap` order, so an MPS/tree handoff does not silently change
+the lattice traversal.
+
+```python
+finder = py.MpsOptimizer.LayoutFinder(
+    gates,
+    L=36,
+    lattice_shape=(6, 6),
+)
+hilbert_plan = finder.run(order="hilbert")
+```
+
 `square_lattice_zigzag` scans x across each row and reverses direction on
 successive rows. It is a deterministic comparison layout; it performs no
 refinement or tensor work.

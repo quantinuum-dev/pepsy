@@ -5902,6 +5902,44 @@ def test_mps_quality_layout_can_exclude_input_candidate():
     assert plan["stats"]["loss"] < plan["input_stats"]["loss"]
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "row-major",
+        "col-major",
+        "snake",
+        "snake-row-major",
+        "folded-snake",
+        "folded-snake-row-major",
+        "hilbert",
+        "hilbert-row-major",
+    ],
+)
+def test_mps_layout_geometric_presets_match_onedmap(mode):
+    """MPS geometric presets must use the shared OneDMap traversal exactly."""
+    Lx, Ly = 3, 5
+    mapping, _ = py.OneDMap.build(Lx, Ly, mode=mode)
+    expected = tuple(x * Ly + y for x, y in mapping.values())
+
+    finder = py.MpsOptimizer.LayoutFinder(
+        [],
+        L=Lx * Ly,
+        lattice_shape=(Lx, Ly),
+    )
+    plan = finder.run(order=mode)
+
+    assert plan["selected_order"] == mode
+    assert plan["site_order"] == expected
+    assert plan["mapped_where"] == ()
+
+
+def test_mps_hilbert_layout_requires_lattice_shape():
+    """Named MPS lattice orders reject ambiguous unshaped site sets."""
+    finder = py.MpsOptimizer.LayoutFinder([], L=6)
+    with pytest.raises(ValueError, match="lattice_shape"):
+        finder.run(order="hilbert")
+
+
 def test_mps_layout_accepts_explicit_fixed_site_order():
     """An explicit site permutation bypasses search and is preserved."""
     gates = [(qu.CNOT(), (0, 3)), (qu.CNOT(), (1, 2))]

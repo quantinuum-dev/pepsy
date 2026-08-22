@@ -155,8 +155,9 @@ not need `charge_sectors=True` just to construct one operator object;
 `charge_sectors=True` remains available when separate objects are preferred.
 Structured observables can use a smaller compact TTNO.
 Pass `fermionic=False` only for dense ordinary/Jordan--Wigner-compatible terms.
-Existing `OneDMap` lattice maps remain unchanged and should continue to be used
-for regular 2D/3D coordinate layouts.
+`OneDMap` is the shared source of truth for regular 2D/3D coordinate layouts;
+the tree and MPS geometric layout finders consume its row/column, snake,
+folded-snake, and generalized Hilbert traversals directly.
 
 `TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, in the same way that
 `TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
@@ -850,8 +851,9 @@ tree_quality = finder.run(order="quality")
 The supported geometric presets include `"row-major"`, `"snake"`,
 `"folded-snake"`, and `"hilbert"`, plus the corresponding OneDMap
 row/column aliases. Preset orders use a balanced recursive tree so the leaf
-sequence is preserved exactly; `"quality"` remains the independent
-interaction-aware TreeLayoutFinder search. The default logical label is
+sequence and every higher tree layer are preserved as contiguous intervals of
+that traversal, including the root's top children; `"quality"` remains the
+independent interaction-aware TreeLayoutFinder search. The default logical label is
 `x * Ly + y`; pass `lattice_site=lambda x, y: ...` when the gate stream uses a
 different coordinate-to-qubit convention.
 
