@@ -54,14 +54,14 @@ _GATE_EXPORTS = [
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
 _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
-_SYMBOL_MODULES["build_cluster_expansion_pepo"] = ".cluster"
-_SYMBOL_MODULES["build_model_cluster_expansion_pepo"] = ".cluster"
-_SYMBOL_MODULES["build_itf_cluster_expansion_pepo"] = ".cluster"
-_SYMBOL_MODULES["build_real_time_cluster_expansion_pepo"] = ".cluster"
-_SYMBOL_MODULES["compose_pepo_layers"] = ".cluster"
-_SYMBOL_MODULES["compose_cluster_expansion_pepo"] = ".cluster"
-_SYMBOL_MODULES["generate_connected_cluster_shapes"] = ".cluster"
-_SYMBOL_MODULES["build_graph_cluster_expansion_pepo"] = ".cluster"
+_SYMBOL_MODULES["build_cluster_expansion_pepo"] = ".pepo_cluster"
+_SYMBOL_MODULES["build_model_cluster_expansion_pepo"] = ".pepo_cluster"
+_SYMBOL_MODULES["build_itf_cluster_expansion_pepo"] = ".pepo_cluster"
+_SYMBOL_MODULES["build_real_time_cluster_expansion_pepo"] = ".pepo_cluster"
+_SYMBOL_MODULES["compose_pepo_layers"] = ".pepo_cluster"
+_SYMBOL_MODULES["compose_cluster_expansion_pepo"] = ".pepo_cluster"
+_SYMBOL_MODULES["generate_connected_cluster_shapes"] = ".pepo_cluster"
+_SYMBOL_MODULES["build_graph_cluster_expansion_pepo"] = ".pepo_cluster"
 _CLUSTER_EXPORTS = [
     "ActivePEPOBlocks",
     "GraphActivePEPOBlocks",
@@ -81,9 +81,12 @@ _CLUSTER_EXPORTS = [
     "PEPOClusterProductExpansion",
     "CompiledPEPOClusterProduct",
 ]
-_SYMBOL_MODULES.update({name: ".cluster" for name in _CLUSTER_EXPORTS})
+_SYMBOL_MODULES.update({name: ".pepo_cluster" for name in _CLUSTER_EXPORTS})
 _AUTOMATON_EXPORTS = ["MPOChannel", "MPOTransition", "MPOAutomaton"]
 _SYMBOL_MODULES.update({name: ".mpo_automaton" for name in _AUTOMATON_EXPORTS})
+# Canonical higher-order MPO construction API.  Keep compatibility spellings
+# in a separate group below so the public facade makes the migration direction
+# visible without changing which names resolve.
 _MPO_EXPORTS = [
     "MPOParameter",
     "MPOLevelToken",
@@ -97,23 +100,34 @@ _MPO_EXPORTS = [
     "MPODifferentiableCompressionReport",
     "FirstDegreeMPO",
     "CompiledMPOExp",
-    "CompiledMPOEvolution",
     "MPOBasis",
     "exp_mpo",
 ]
-_SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_EXPORTS})
+_SYMBOL_MODULES.update({name: ".mpo_higher_order" for name in _MPO_EXPORTS})
+_MPO_COMPATIBILITY_EXPORTS = ["CompiledMPOEvolution"]
+_SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_COMPATIBILITY_EXPORTS})
+
+# Connected MPO cluster aliases are retained for older callers, but the
+# descriptive ``MPO*`` names above are the canonical vocabulary.
 _MPO_CLUSTER_EXPORTS = [
     "MPOClusterFactor",
     "MPOClusterExpansionReport",
     "MPOClusterBasisExpansion",
     "MPOGraphClusterBasisExpansion",
     "CompiledMPOClusterExp",
+]
+_SYMBOL_MODULES.update({name: ".mpo_cluster" for name in _MPO_CLUSTER_EXPORTS})
+_MPO_CLUSTER_COMPATIBILITY_EXPORTS = [
     "ClusterBasisExpansion",
     "ClusterExpansionBasis",
     "ClusterExpBasis",
     "MPOClusterExpansion",
 ]
-_SYMBOL_MODULES.update({name: ".mpo_cluster" for name in _MPO_CLUSTER_EXPORTS})
+_SYMBOL_MODULES.update(
+    {name: ".mpo_cluster" for name in _MPO_CLUSTER_COMPATIBILITY_EXPORTS}
+)
+_DIAGNOSTIC_EXPORTS = ["OperatorReportInfo"]
+_SYMBOL_MODULES.update({name: ".diagnostics" for name in _DIAGNOSTIC_EXPORTS})
 _SYMBOL_MODULES["MPOBraiding"] = ".mpo_space"
 _SYMBOL_MODULES["MPOPhysicalSpace"] = ".mpo_space"
 _SYMBOL_MODULES["PauliMPO"] = ".pauli_mpo"
@@ -125,8 +139,11 @@ _SUBMODULES = (
     "gates",
     "hamiltonians",
     "mpo",
+    "mpo_higher_order",
     "mpo_automaton",
     "mpo_cluster",
+    "pepo_cluster",
+    "diagnostics",
     "pauli_mpo",
 )
 
@@ -144,7 +161,10 @@ __all__ = [
     "ham_tn",
     *_AUTOMATON_EXPORTS,
     *_MPO_EXPORTS,
+    *_MPO_COMPATIBILITY_EXPORTS,
     *_MPO_CLUSTER_EXPORTS,
+    *_MPO_CLUSTER_COMPATIBILITY_EXPORTS,
+    *_DIAGNOSTIC_EXPORTS,
     "PauliMPO",
     "decompose_pauli",
     "PauliCompressionReport",

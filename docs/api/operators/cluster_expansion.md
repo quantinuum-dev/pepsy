@@ -1,8 +1,9 @@
-# `pepsy.operators.build_itf_cluster_expansion_pepo`
+# PEPO cluster expansion and joint ordered products
 
 For the canonical MPO/PEPO entry-point map, step convention, and return-type
 summary, see the [unified exponential API](exponentials.md). This page gives
-the detailed cluster and fixed-channel PEPO reference.
+the detailed `pepsy.operators.pepo_cluster` cluster and fixed-channel PEPO
+reference. The higher-order MPO and MPO cluster families are separate APIs.
 
 `build_itf_cluster_expansion_pepo` constructs a dense square-lattice PEPO
 approximation to `exp(-beta * H)` for Pepsy's transverse-field Ising

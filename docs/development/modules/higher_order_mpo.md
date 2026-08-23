@@ -1,8 +1,15 @@
 # Higher-order MPO
 
-`pepsy.operators.mpo` contains the semantic MPO layer for the size-extensive
-higher-order construction in SciPost Phys. 17, 135. The implementation keeps
-the paper's virtual-level histories alongside ordinary local MPO tensors.
+`pepsy.operators.mpo_higher_order` is the public family facade for the
+size-extensive higher-order construction in SciPost Phys. 17, 135. The
+implementation keeps the paper's virtual-level histories alongside ordinary
+local MPO tensors and currently delegates to the compatibility implementation
+in `pepsy.operators.mpo`.
+
+This page covers only the paper-style higher-order MPO exponential. Connected
+spatial MPO clusters and ordered products of several exponentials belong to
+`pepsy.operators.mpo_cluster`, where `cluster_size` and `factor_count` have
+different meanings from history `order`.
 
 ## Public API contract
 
@@ -16,11 +23,7 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
-| `MPOClusterBasisExpansion` | Build exact-local connected cluster MPOs | Local `exp(A) exp(B) ...` products through a finite cluster cutoff; disjoint residual paths are size-extensive |
-| `MPOGraphClusterBasisExpansion` | Build graph-aware connected cluster MPOs | Graph-connected local products, including long-range two-site edges; residuals use singleton backgrounds and tensor-product paths for crossing/nested disjoint spans |
-| `CompiledMPOClusterExp` | Reuse a cluster-expansion topology | Caches interval/factor schedules only; every backend evaluation creates a fresh autodiff graph |
-| `MPOBasis.compile_cluster_expansion` | Optimization-facing cluster evaluator | Reuses the compiled cluster topology across parameter/time updates; `MPOBasis.clear_cluster_expansion_cache` releases it |
-| `MPOBasis.compile_graph_cluster_expansion` | Optimization-facing graph cluster evaluator | Reuses graph/factor topology; accepts coordinate-labelled `ClusterLattice` inputs and long-range edges |
+| `MPOBasis.compile_cluster_expansion` / `compile_graph_cluster_expansion` | Compatibility adapters to the MPO cluster family | Delegate to `operators.mpo_cluster`; they do not turn a spatial cluster order into a history order |
 | `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(step * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; real-time uses `step=-1j * tau`; `differentiable=True` selects fixed-rank TT-SVD |
 | `FirstDegreeMPO.clear_history_cache` / `MPOBasis.clear_history_cache` | Release reusable higher-order plans | Keeps current tensors and compiled first-degree topology unchanged |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |

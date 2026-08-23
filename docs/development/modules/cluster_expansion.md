@@ -1,11 +1,18 @@
 # PEPO cluster expansion
 
-`pepsy.operators.cluster` contains two construction layers. The legacy
+`pepsy.operators.pepo_cluster` contains two construction layers. The legacy
 `ClusterExpansionPlan` is the dense square-lattice implementation of the
 connected-cluster PEPO construction. `GraphClusterExpansionPlan` handles an
 arbitrary finite `ClusterLattice` with one virtual bond per graph edge and
 returns `GraphActivePEPOBlocks`, which materialize as a generic Quimb tensor
 network because Quimb's `PEPO` wrapper is square-lattice-only.
+
+The geometry, active-block, and fixed-channel source is currently implemented
+in the compatibility module `pepsy.operators.cluster`; the facade is the
+ownership boundary for new code. The ordered-product implementation is
+extracted to `pepsy.operators.pepo_product`.
+The PEPO family is separate from both the paper-style higher-order MPO facade
+and `pepsy.operators.mpo_cluster`.
 
 `ClusterExpansionPlan` caches lattice directions and cluster-orbit bookkeeping
 so different beta values do not rebuild geometry. Both active-block types
@@ -116,7 +123,8 @@ lower connected residuals. The resulting channels are assembled once into one
 PEPO. It never constructs an independent full-lattice PEPO for each factor.
 This is the same local-residual definition used by the MPO cluster engine;
 only the final tensor topology differs. All factors must share the lattice,
-symmetry policy, and cluster order.
+symmetry policy, and cluster order. `cache_info["joint_cluster_residual"]`
+records this construction invariant.
 
 ### Cluster order and dimension accounting
 

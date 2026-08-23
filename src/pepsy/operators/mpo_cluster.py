@@ -34,6 +34,7 @@ from .mpo import (
     _scatter_add_2d,
     _term_from_input,
 )
+from .diagnostics import OperatorReportInfo
 
 __all__ = [
     "MPOClusterFactor",
@@ -442,6 +443,18 @@ class MPOClusterExpansionReport:
     cluster_mode: str = "interval"
     graph_cluster_count: int = 0
     graph_loop_counts: tuple[int, ...] = ()
+
+    @property
+    def api_info(self):
+        """Return the stable cross-family report summary."""
+        return OperatorReportInfo(
+            family="mpo",
+            algorithm="cluster_expansion",
+            representation="semantic_mpo",
+            order=self.cluster_size,
+            factor_count=self.factor_count,
+            truncated=self.local_svd_truncated,
+        )
 
 
 class CompiledMPOClusterExp:

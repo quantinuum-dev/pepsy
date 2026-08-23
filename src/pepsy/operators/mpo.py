@@ -55,6 +55,7 @@ from ._mpo_sparse import (
     normalize_charge,
     symmray_arrays_from_sparse,
 )
+from .diagnostics import OperatorReportInfo
 from .mpo_space import MPOBraiding, MPOPhysicalSpace
 
 __all__ = [
@@ -330,6 +331,16 @@ class MPOCompressionReport:
     merges: tuple[Mapping[str, object], ...] = ()
     skipped_candidates: int = 0
 
+    @property
+    def api_info(self):
+        """Return the stable cross-family report summary."""
+        return OperatorReportInfo(
+            family="mpo",
+            algorithm="history_compression",
+            representation="semantic_mpo",
+            truncated=not self.exact,
+        )
+
 
 @dataclass(frozen=True)
 class MPONumericalCompressionReport:
@@ -356,6 +367,16 @@ class MPONumericalCompressionReport:
     operator_frobenius_relative_error: object = None
     error_estimator: str | None = None
 
+    @property
+    def api_info(self):
+        """Return the stable cross-family report summary."""
+        return OperatorReportInfo(
+            family="mpo",
+            algorithm="numerical_compression",
+            representation="materialized_mpo",
+            truncated=self.truncated,
+        )
+
 
 @dataclass(frozen=True)
 class MPODifferentiableCompressionReport:
@@ -373,6 +394,17 @@ class MPODifferentiableCompressionReport:
     final_bond_dimensions: tuple[int, ...]
     truncated: bool
     differentiable: bool = True
+
+    @property
+    def api_info(self):
+        """Return the stable cross-family report summary."""
+        return OperatorReportInfo(
+            family="mpo",
+            algorithm="fixed_rank_compression",
+            representation="semantic_mpo",
+            truncated=self.truncated,
+            differentiable=self.differentiable,
+        )
 
 
 def _check_scalar(value, *, name):
