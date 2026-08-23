@@ -26,7 +26,7 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
-from .mpo import (
+from .mpo_semantic import (
     FirstDegreeMPO,
     MPOLocalOperatorTerm,
     MPOParameter,
@@ -252,7 +252,7 @@ def _jax_stable_factorization(matrix):
 def _graph_lattice_from_input(graph, L):
     """Normalize an arbitrary graph input to chain-labelled sites."""
 
-    from .cluster import ClusterLattice  # pylint: disable=import-outside-toplevel
+    from .pepo_dense import ClusterLattice  # pylint: disable=import-outside-toplevel
 
     if isinstance(graph, ClusterLattice):
         sites = tuple(graph.sites)
@@ -285,7 +285,7 @@ def _graph_lattice_from_input(graph, L):
 def _graph_lattice_for_basis(graph, basis):
     """Map coordinate-labelled graph sites to a basis' MPO chain."""
 
-    from .cluster import ClusterLattice  # pylint: disable=import-outside-toplevel
+    from .pepo_dense import ClusterLattice  # pylint: disable=import-outside-toplevel
 
     if graph is None:
         if basis.lattice_shape is not None and len(basis.lattice_shape) == 2:
@@ -429,7 +429,7 @@ class MPOClusterFactor:
     def from_mpo_basis(cls, basis, *, coefficient=1.0):
         """Create a factor from an existing parameterized ``MPOBasis``."""
 
-        from .mpo import MPOBasis  # pylint: disable=import-outside-toplevel
+        from .mpo_basis import MPOBasis  # pylint: disable=import-outside-toplevel
 
         if not isinstance(basis, MPOBasis):
             raise TypeError("basis must be an MPOBasis.")
@@ -749,7 +749,7 @@ class MPOClusterProductExpansion:
         MPO term basis.
         """
 
-        from .mpo import MPOBasis  # pylint: disable=import-outside-toplevel
+        from .mpo_basis import MPOBasis  # pylint: disable=import-outside-toplevel
 
         bases = tuple(bases)
         if not bases:
@@ -802,7 +802,7 @@ class MPOClusterProductExpansion:
     def from_mpo_basis(cls, basis, **kwargs):
         """Reuse the local terms and coefficient references of an ``MPOBasis``."""
 
-        from .mpo import MPOBasis  # pylint: disable=import-outside-toplevel
+        from .mpo_basis import MPOBasis  # pylint: disable=import-outside-toplevel
 
         if not isinstance(basis, MPOBasis):
             raise TypeError("basis must be an MPOBasis.")

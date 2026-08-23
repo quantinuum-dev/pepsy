@@ -6,9 +6,9 @@ This is the operator-layer ownership and API-tier map. It complements the
 
 The rule is simple: callers should import from `pepsy.operators`; the named
 family facades below are the preferred advanced discovery surfaces. Direct
-imports from the older `pepsy.operators.mpo` and `pepsy.operators.cluster`
-implementation facades remain supported during extraction, but are not the
-preferred style for new examples.
+imports from `pepsy.operators.mpo` and `pepsy.operators.cluster` remain
+supported compatibility paths, but are not the preferred style for new
+examples.
 
 The facade now keeps canonical exports and compatibility exports in separate
 internal groups. The split is intentionally organizational: both groups still
@@ -23,13 +23,13 @@ These are the names to use in new code.
 
 | Area | Canonical names | Owner |
 | --- | --- | --- |
-| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (basis implementation: `operators.mpo_basis`) |
+| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`) |
 | MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
 | Shared report summary | `OperatorReportInfo` and each concrete report's `.api_info` | `operators.diagnostics` |
 | Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct` | `operators.mpo_product` |
 | PEPO active results | `ActivePEPOBlocks`, `GraphActivePEPOBlocks` | `operators.pepo_cluster` (implementation: `operators.pepo_active`) |
 | Square-lattice PEPO exponential | `PauliPEPOTerm`, `PauliPEPOBasis`, `CompiledPEPOExp` | `operators.pepo_cluster` (implementation: `operators.pepo_basis`) |
-| Dense/graph PEPO clusters | `ClusterExpansionPlan`, `GraphClusterExpansionPlan`, `ClusterExpansionReport`, `ClusterLattice`, `ConnectedClusterShape`, `GraphConnectedClusterShape` | `operators.pepo_cluster` |
+| Dense/graph PEPO clusters | `ClusterExpansionPlan`, `GraphClusterExpansionPlan`, `ClusterExpansionReport`, `ClusterLattice`, `ConnectedClusterShape`, `GraphConnectedClusterShape` | `operators.pepo_cluster` (implementation: `operators.pepo_dense`; planner boundary: `operators.pepo_geometry`) |
 | PEPO model adapters | `ClusterModelAdapter`, `adapt_cluster_model`, `build_cluster_expansion_pepo`, `build_model_cluster_expansion_pepo`, `build_itf_cluster_expansion_pepo`, `build_real_time_cluster_expansion_pepo`, `build_graph_cluster_expansion_pepo` | `operators.pepo_cluster` |
 | Ordered PEPO products | `PEPOClusterFactor`, `PEPOClusterProductExpansion`, `CompiledPEPOClusterProduct` | `operators.pepo_cluster` (implementation: `operators.pepo_product`) |
 | PEPO composition | `compose_pepo_layers`, `compose_cluster_expansion_pepo` | `operators.pepo_cluster` |
@@ -73,10 +73,13 @@ The public facades are:
 - `operators.mpo_higher_order` — paper-style higher-order MPOs;
 - `operators.mpo_product` — connected/joint MPO cluster products;
 - `operators.mpo_cluster` — compatibility facade for the MPO product family;
-- `operators.pepo_cluster` — connected/joint PEPO cluster expansions.
+- `operators.mpo_semantic` — semantic/history MPO implementation;
+- `operators.pepo_cluster` — connected/joint PEPO cluster expansions;
+- `operators.pepo_dense` — dense/graph PEPO implementation;
+- `operators.pepo_geometry` — shared PEPO geometry/planner boundary;
 
 The older `operators.mpo` and `operators.cluster` modules remain importable
-implementation facades while their large source files are extracted.
+compatibility facades; they no longer own the large implementation sources.
 
 Every construction/compression report keeps its detailed algorithm-specific
 fields and also exposes `.api_info`. That common summary has the keys
@@ -172,7 +175,7 @@ guard for this decision is [`test_operator_api_contract.py`](../../../tests/test
 
 ## Example smoke set
 
-The four small scripts in [`examples/operators`](../../../examples/operators)
+The five small scripts in [`examples/operators`](../../../examples/operators)
 are the canonical smoke examples:
 
 1. [`higher_order_mpo.py`](../../../examples/operators/higher_order_mpo.py)
@@ -183,6 +186,8 @@ are the canonical smoke examples:
    — build a finite dense connected-cluster PEPO.
 4. [`ordered_pepo_product.py`](../../../examples/operators/ordered_pepo_product.py)
    — build an ordered `exp(A) @ exp(B)` product through one joint topology.
+5. [`ordered_mpo_product.py`](../../../examples/operators/ordered_mpo_product.py)
+   — build the MPO analogue through the joint local-residual path.
 
 They intentionally use small systems, public namespace imports, and no
 notebook output. They are examples of API selection, not performance

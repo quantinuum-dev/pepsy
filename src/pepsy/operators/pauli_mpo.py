@@ -26,7 +26,7 @@ import autoray as ar
 import numpy as np
 
 from .._internal.validation import is_strict_integer, normalize_integer_tuple
-from .mpo import FirstDegreeMPO, MPOProductTerm
+from .mpo_semantic import FirstDegreeMPO, MPOProductTerm
 
 __all__ = [
     "PauliBondCompressionReport",

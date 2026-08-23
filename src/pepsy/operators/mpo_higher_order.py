@@ -3,7 +3,8 @@
 This module names the SciPost higher-order family explicitly.  It owns the
 history-aware construction of ``exp(step * H)`` on a finite chain; it does not
 own spatial MPO cluster residuals or ordered multi-factor products. The
-semantic history implementation remains in :mod:`pepsy.operators.mpo`, while
+semantic history implementation remains in
+:mod:`pepsy.operators.mpo_semantic`, while
 coefficient bases and compiled evaluators live in
 :mod:`pepsy.operators.mpo_basis`.
 
@@ -13,7 +14,7 @@ The historical :mod:`pepsy.operators.mpo_cluster` import remains a
 compatibility facade.
 """
 
-from .mpo import (
+from .mpo_semantic import (
     FirstDegreeMPO,
     MPODifferentiableCompressionReport,
     MPOLocalOperatorTerm,

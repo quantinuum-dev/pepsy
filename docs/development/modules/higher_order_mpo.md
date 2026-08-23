@@ -3,9 +3,9 @@
 `pepsy.operators.mpo_higher_order` is the public family facade for the
 size-extensive higher-order construction in SciPost Phys. 17, 135. The
 implementation keeps the paper's virtual-level histories alongside ordinary
-local MPO tensors. The semantic history implementation remains in
-`pepsy.operators.mpo`; parameterized bases and compiled evaluators are
-implemented in `pepsy.operators.mpo_basis`.
+local MPO tensors. The semantic history implementation lives in
+`pepsy.operators.mpo_semantic`; parameterized bases and compiled evaluators
+are implemented in `pepsy.operators.mpo_basis`.
 
 This page covers only the paper-style higher-order MPO exponential. Connected
 spatial MPO clusters and ordered products of several exponentials belong to

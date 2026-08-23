@@ -1,8 +1,9 @@
 """Parameterized higher-order MPO bases and compiled evaluators.
 
 This module owns coefficient-slot topology and repeated value-only
-evaluation. The semantic history algebra remains in :mod:`operators.mpo`,
-while this module provides the basis/compiled lifecycle boundary.
+evaluation. The semantic history implementation lives in
+:mod:`operators.mpo_semantic`, while this module provides the basis/compiled
+lifecycle boundary.
 """
 
 from __future__ import annotations
@@ -1735,7 +1736,7 @@ def exp_mpo(
 # Resolve the semantic implementation only after this module's classes and
 # convenience function have been defined. This keeps direct imports safe while
 # ``mpo.py`` re-exports the same objects at its extraction boundary.
-from .mpo import (  # noqa: E402
+from .mpo_semantic import (  # noqa: E402
     FirstDegreeMPO,
     MPOLocalOperatorTerm,
     MPOParameter,

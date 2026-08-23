@@ -1,6 +1,6 @@
 # Operator and exponential API plan
 
-Status: proposed architecture
+Status: organized architecture; numerical behavior unchanged
 Last updated: 2026-08-22
 Owners: Pepsy maintainers
 
@@ -149,40 +149,37 @@ pepsy/operators/
     spaces.py                # physical dimensions, charges, braiding
     gates.py                 # elementary gates and gate application
     hamiltonians.py          # model-to-MPO helpers
-    mpo/
-        semantic.py          # FirstDegreeMPO and exact semantic algebra
-        exponential.py       # higher-order history algorithms
-        basis.py             # MPOBasis and compiled value binding
-        cluster.py           # interval and graph MPO cluster expansions
-    pepo/
-        active.py            # ActivePEPOBlocks and graph active blocks
-        basis.py             # PauliPEPOBasis and compiled evaluation
-        cluster.py           # dense connected-cluster plans
-        product.py            # ordered PEPO factor products
+    mpo_semantic.py          # FirstDegreeMPO and exact/history algebra
+    mpo_basis.py             # MPOBasis and compiled value binding
+    mpo_product.py           # interval and graph MPO cluster products
+    pepo_active.py           # ActivePEPOBlocks and graph active blocks
+    pepo_basis.py            # PauliPEPOBasis and compiled evaluation
+    pepo_dense.py            # dense connected-cluster plans
+    pepo_geometry.py         # shared geometry/planner boundary
+    pepo_product.py          # ordered PEPO factor products
     pauli.py                 # PauliMPO and Pauli decomposition/algebra
     automaton.py             # MPO channel/transition automata
 ```
 
-This is a target structure, not an immediate file-move instruction. During
-the transition, the existing modules can remain the implementation owners
-while smaller private modules are extracted behind them. The public imports
-must continue to resolve from `pepsy.operators`.
+This is the current flat implementation structure. A future package-directory
+layout remains possible, but the public imports must continue to resolve from
+`pepsy.operators` and the explicit flat owners below are sufficient for the
+current API.
 
-The first public extraction seams now exist as lightweight family facades:
-`operators.mpo_higher_order`, `operators.mpo_cluster`, and
-`operators.pepo_cluster`. The large `mpo.py` and `cluster.py` files remain
-compatibility implementation facades until the next extraction slice.
+The public extraction seams now exist as lightweight family facades:
+`operators.mpo_higher_order`, `operators.mpo_product`, and
+`operators.pepo_cluster`. The historical `mpo.py` and `cluster.py` paths are
+compatibility facades over the explicit implementation modules.
 
 ### Ownership rules
 
 - `terms.py` owns parsing and validation shared by MPO and PEPO inputs.
 - `spaces.py` owns physical-space metadata, not exponential algorithms.
-- `mpo/semantic.py` owns exact operator algebra and history metadata.
-- `mpo/exponential.py` owns Taylor/history construction and its compression
-  policies.
-- `mpo/cluster.py` owns connected residuals on chain/graph supports.
-- `pepo/cluster.py` owns spatial residual factorization and graph PEPOs.
-- `pepo/product.py` owns joint local products; it must not multiply separate
+- `mpo_semantic.py` owns exact operator algebra and history metadata.
+- `mpo_basis.py` owns Taylor/history value binding and compiled evaluation.
+- `mpo_product.py` owns connected residuals on chain/graph supports.
+- `pepo_dense.py` owns spatial residual factorization and graph PEPOs.
+- `pepo_product.py` owns joint local products; it must not multiply separate
   full-lattice factor PEPOs as its primary algorithm.
 - `pauli.py` owns Pauli-basis algebra; it may provide adapters to MPO/PEPO
   builders but should not become a second exponential framework.
@@ -224,11 +221,11 @@ Status: complete.
 - Add small end-to-end examples for MPO, fixed-channel PEPO, dense PEPO, and
   ordered products.
 - Do not move files or change numerical behavior in this phase. **Completed:**
-  the inventory, module map, and four smoke examples are now present.
+  the inventory, module map, and five smoke examples are now present.
 
 ### Phase 1 — stabilize contracts
 
-Status: in progress.
+Status: complete.
 
 - Define a small shared protocol for plans/bases: `exp`, `compile_exp`,
   `cache_info`, and cache-clearing methods where applicable.
@@ -264,8 +261,9 @@ are unchanged.
 `operators.pepo_basis`. The legacy cluster module continues to re-export them.
 
 **Completed fifth slice:** `MPOBasis`, `CompiledMPOExp`, and `exp_mpo` now live
-in `operators.mpo_basis`. The semantic `FirstDegreeMPO` history engine remains
-in `operators.mpo`, which re-exports the basis API for compatibility.
+in `operators.mpo_basis`. The semantic `FirstDegreeMPO` history engine lives
+in `operators.mpo_semantic`; `operators.mpo` re-exports both owners for
+compatibility.
 
 **Completed sixth slice:** The connected MPO interval/graph residual engine and
 joint ordered ``exp(A) @ exp(B) @ ...`` construction now live in
@@ -274,15 +272,22 @@ joint ordered ``exp(A) @ exp(B) @ ...`` construction now live in
 module and `MPOClusterBasisExpansion`/`CompiledMPOClusterExp` names remain
 compatibility aliases.
 
+**Completed seventh slice:** Dense PEPO plans now live in
+`operators.pepo_dense`, semantic/history MPOs in `operators.mpo_semantic`, and
+shared fixed-channel planner lookup in `operators.pepo_geometry`. The legacy
+`mpo.py` and `cluster.py` modules are thin compatibility facades.
+
 ### Phase 2 — extract implementation modules
 
-Status: public facade slice started.
+Status: complete.
 
 - Keep `operators.mpo_higher_order` limited to the SciPost-style history
   construction and `operators.mpo_product` limited to connected MPO
   residuals, including joint ordered local products.
-- Keep `operators.pepo_cluster` as the sole named owner for PEPO cluster
-  geometry, fixed channels, dense residuals, and joint ordered products.
+- Keep `operators.pepo_cluster` as the public family facade for PEPO cluster
+  geometry, fixed channels, dense residuals, and joint ordered products; keep
+  their implementations in `pepo_geometry`, `pepo_basis`, `pepo_dense`, and
+  `pepo_product` respectively.
 - Keep the joint ordered-product algorithm in `operators.pepo_product`; the
   facade should re-export it without duplicating the implementation.
 - Preserve `operators.mpo`, `operators.cluster`, and `operators.mpo_cluster` as
@@ -290,15 +295,17 @@ Status: public facade slice started.
   until implementation moves can be made without duplicate algorithms.
 
 - Split `operators.mpo` by responsibility, preserving it as a compatibility
-  implementation facade during the transition.
-- Split `operators.cluster` into active-block, basis, dense-cluster, and
-  product modules.
+  facade.
+- Split `operators.cluster` into active-block, basis, dense-cluster, geometry,
+  and product modules.
 - Move shared parsing/space logic only after duplicate implementations have
   been removed and focused tests cover the boundary cases.
 - Keep lazy imports so optional Torch/JAX/Symmray dependencies do not leak
   into ordinary `import pepsy` or `import pepsy.operators` paths.
 
 ### Phase 3 — unify diagnostics and examples
+
+Status: complete.
 
 - Give MPO and PEPO reports a common vocabulary for topology, retained rank,
   compression, backend, and approximation mode while retaining
@@ -307,6 +314,10 @@ Status: public facade slice started.
   cluster, and ordered-product results on the same two- and three-site models.
 - Put reusable examples under `pepsy/examples/operators/`; keep notebooks in
   sibling example repositories focused on experiments and visualization.
+
+The comparison matrix in `tests/test_operator_comparison.py` covers exact
+two- and three-site references for MPO clusters, ordered MPO products,
+fixed-channel PEPOs, ordered PEPO products, and dense PEPO clusters.
 
 ### Phase 4 — only then consider API additions
 
@@ -342,13 +353,7 @@ must not be mixed into an API-renaming effort.
 
 ## 8. Immediate next actions
 
-1. Review this plan against the current public API and agree on the canonical
-   names.
-2. Add a canonical/compatibility/internal inventory to the operator module
-   map.
-3. Build four minimal examples and run the focused public API, MPO, and PEPO
-   tests before any source move.
-4. Extract only one low-risk shared component first, preferably term/space
-   normalization, and measure import-boundary effects.
-5. Revisit the target module tree after that extraction; do not perform a
-   broad mechanical split while numerical work is still landing.
+The planned organizational work is complete. Future changes should be
+algorithmic or maintenance-focused: improve diagnostics, add benchmark
+coverage, and only introduce shared term/configuration objects if repeated
+option normalization proves confusing in real callers.

@@ -81,9 +81,12 @@ def test_operator_family_facades_keep_construction_domains_separate():
         ".mpo_higher_order", operators.__name__
     )
     mpo_basis = importlib.import_module(".mpo_basis", operators.__name__)
+    mpo_semantic = importlib.import_module(".mpo_semantic", operators.__name__)
     mpo_cluster = importlib.import_module(".mpo_cluster", operators.__name__)
     mpo_product = importlib.import_module(".mpo_product", operators.__name__)
     pepo_cluster = importlib.import_module(".pepo_cluster", operators.__name__)
+    pepo_dense = importlib.import_module(".pepo_dense", operators.__name__)
+    pepo_geometry = importlib.import_module(".pepo_geometry", operators.__name__)
     pepo_active = importlib.import_module(".pepo_active", operators.__name__)
     pepo_basis = importlib.import_module(".pepo_basis", operators.__name__)
     pepo_product = importlib.import_module(".pepo_product", operators.__name__)
@@ -92,12 +95,16 @@ def test_operator_family_facades_keep_construction_domains_separate():
     assert "PEPOClusterProductExpansion" not in higher_order.__all__
     assert "MPOBasis" not in mpo_cluster.__all__
     assert "PEPOClusterProductExpansion" not in mpo_cluster.__all__
+    assert "MPOBasis" not in mpo_semantic.__all__
     assert "MPOBasis" not in pepo_cluster.__all__
     assert "MPOClusterBasisExpansion" not in pepo_cluster.__all__
+    assert "PauliPEPOBasis" not in pepo_dense.__all__
 
     assert higher_order.MPOBasis is mpo_basis.MPOBasis
     assert higher_order.CompiledMPOExp is mpo_basis.CompiledMPOExp
     assert higher_order.exp_mpo is mpo_basis.exp_mpo
+    assert higher_order.FirstDegreeMPO is mpo_semantic.FirstDegreeMPO
+    assert operators.FirstDegreeMPO is mpo_semantic.FirstDegreeMPO
     assert operators.MPOClusterProductExpansion is mpo_product.MPOClusterProductExpansion
     assert operators.CompiledMPOClusterProduct is mpo_product.CompiledMPOClusterProduct
     assert operators.MPOClusterBasisExpansion is mpo_product.MPOClusterProductExpansion
@@ -105,6 +112,9 @@ def test_operator_family_facades_keep_construction_domains_separate():
     assert operators.MPOGraphClusterBasisExpansion is mpo_product.MPOGraphClusterProductExpansion
     assert mpo_cluster.MPOClusterBasisExpansion is mpo_product.MPOClusterProductExpansion
     assert mpo_cluster.CompiledMPOClusterExp is mpo_product.CompiledMPOClusterProduct
+    assert pepo_cluster.ClusterExpansionPlan is pepo_dense.ClusterExpansionPlan
+    assert pepo_cluster.ClusterLattice is pepo_dense.ClusterLattice
+    assert pepo_geometry.ClusterLattice is pepo_dense.ClusterLattice
     assert pepo_cluster.PEPOClusterProductExpansion is operators.PEPOClusterProductExpansion
     assert pepo_cluster.PEPOClusterProductExpansion is pepo_product.PEPOClusterProductExpansion
     assert pepo_cluster.CompiledPEPOClusterProduct is pepo_product.CompiledPEPOClusterProduct

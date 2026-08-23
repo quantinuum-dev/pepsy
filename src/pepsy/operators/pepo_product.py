@@ -22,7 +22,7 @@ import autoray as ar
 from .mpo_automaton import _as_backend, _backend_reference
 
 if TYPE_CHECKING:
-    from .cluster import PauliPEPOBasis
+    from .pepo_basis import PauliPEPOBasis
 
 __all__ = [
     "PEPOClusterFactor",
@@ -33,7 +33,7 @@ __all__ = [
 
 def _pauli_pepo_basis_type():
     """Resolve the basis type lazily to keep the compatibility facade acyclic."""
-    from .cluster import PauliPEPOBasis
+    from .pepo_basis import PauliPEPOBasis
 
     return PauliPEPOBasis
 

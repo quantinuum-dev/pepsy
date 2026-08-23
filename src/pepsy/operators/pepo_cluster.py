@@ -6,14 +6,14 @@ products.  In particular, ``exp(A) @ exp(B) @ exp(C)`` is assembled from local
 cluster targets and connected residuals in one PEPO topology; separately
 materialized full-lattice factor PEPOs are not the primary algorithm.
 
-The geometry, active-block, and fixed-channel implementation is still in
-:mod:`pepsy.operators.cluster`, while the joint product implementation now
-lives in :mod:`pepsy.operators.pepo_product`. This facade makes the intended
-public owner explicit without breaking the legacy ``operators.cluster`` import
-path.
+The dense/geometry implementation lives in :mod:`pepsy.operators.pepo_dense`,
+active blocks in :mod:`pepsy.operators.pepo_active`, fixed channels in
+:mod:`pepsy.operators.pepo_basis`, and joint products in
+:mod:`pepsy.operators.pepo_product`. This facade makes the intended public
+owners explicit without breaking the legacy ``operators.cluster`` path.
 """
 
-from .cluster import (
+from .pepo_dense import (
     ClusterExpansionPlan,
     ClusterExpansionReport,
     ClusterInternalSymmetry,

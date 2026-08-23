@@ -1,9 +1,9 @@
 """Fixed-channel Pauli PEPO basis and compiled exponential evaluator.
 
 This module owns the value-independent Pauli-slot topology and the
-coefficient-only evaluation boundary. Geometry-specific residual helpers
-remain in the legacy cluster implementation for now and are resolved
-lazily to avoid coupling the basis to the planner at import time.
+coefficient-only evaluation boundary. Geometry-specific residual helpers are
+resolved lazily through the shared PEPO geometry/planner boundary so this
+basis does not depend on a compatibility facade.
 """
 
 from __future__ import annotations
@@ -28,9 +28,9 @@ _OPPOSITE_DIRECTION = {"u": "d", "r": "l", "d": "u", "l": "r"}
 
 def _cluster_helper(name):
     """Resolve a planner helper only when a basis operation needs it."""
-    from . import cluster
+    from . import pepo_geometry
 
-    return getattr(cluster, name)
+    return getattr(pepo_geometry, name)
 
 
 def _lazy_cluster_proxy(name):
