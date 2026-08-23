@@ -3697,11 +3697,22 @@ class TreeLayoutFinder:
             ``max_bond_cut``, ``chi_overflow``, and ``exact_at_chi``.
             When omitted, uses the ``chi`` supplied to the finder; pass
             ``chi=None`` explicitly for a chi-blind comparison.
-        refine, refine_budget, topology_refine, topology_budget, search,
-        search_budget, seed, nevergrad_optimizer
-            Optional fixed-plan search controls with the same meaning as in
-            :meth:`recommend_layered`. They are applied to each arity candidate
-            before selecting one final immutable plan.
+        refine : {None, "greedy"}, optional
+            Override the finder refinement setting for each arity candidate.
+        refine_budget : int, optional
+            Maximum number of greedy proposals per arity candidate.
+        topology_refine : {None, "nni", "subtree"}, optional
+            Override the optional topology refinement for each candidate.
+        topology_budget : int, optional
+            Maximum number of topology proposals per candidate.
+        search : {None, "nevergrad", "anneal", "hybrid"}, optional
+            Override the optional offline search for each candidate.
+        search_budget : int, optional
+            Budget for the selected offline search.
+        seed : int, optional
+            Seed for deterministic candidate refinement and search.
+        nevergrad_optimizer : str, optional
+            Nevergrad optimizer name used by the optional search stage.
         progbar : bool, optional
             Display local-search progress for each candidate.
         """

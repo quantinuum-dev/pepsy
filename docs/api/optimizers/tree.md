@@ -46,7 +46,7 @@ structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
 
-### Layout-aware native MPOs
+## Layout-aware native MPOs
 
 After selecting a plan, the canonical tree-native operator is built with
 `plan.build_tree_operator(...)` or `Fermion.build_tree_operator(...)`. The
@@ -268,7 +268,7 @@ fermionic centre uses a one-tensor `TensorNetwork.H` contraction (which applies
 the required outer-leg phase flips), while an unknown centre falls back to an
 exact complete doubled-network contraction.
 
-### Native fermionic QR stability
+## Native fermionic QR stability
 
 Native Symmray tree routes use Pepsy's internal
 `TreeTensorNetwork._native_qr_split` policy for every lossless QR gauge move,
@@ -292,7 +292,7 @@ graded block SVD and the configured `chi`, `cutoff`, and `cutoff_mode`. This
 policy is specific to `TreeTensorNetwork` / `TreeOptimizer`; the separate MPS
 optimizer implementation is unchanged.
 
-### Native central-edge compression and profiling
+## Native central-edge compression and profiling
 
 For a compression from active endpoint `A` to destination endpoint `B`, the
 one-sided native path is valid only when `B` is structurally proven isometric
@@ -363,7 +363,7 @@ fidelity was 0.590; at χ=64 this measures different truncation histories on
 the two geometries, not a QR gauge error. Compare observables or increase χ
 when using this number as an accuracy diagnostic.
 
-#### QR/hop and bond-growth diagnostics
+### QR/hop and bond-growth diagnostics
 
 Construct `TreeOptimizer(..., profile=True)` to split the update envelope into
 timed `thread_hop`, `edge_canonize`, and `edge_compress` events. The profile

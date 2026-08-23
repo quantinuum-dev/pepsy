@@ -128,7 +128,7 @@ only the final tensor topology differs. All factors must share the lattice,
 symmetry policy, and cluster order. `cache_info["joint_cluster_residual"]`
 records this construction invariant.
 
-### Cluster order and dimension accounting
+## Cluster order and dimension accounting
 
 The cluster order `p` is a joint spatial cutoff, not a factor index. For
 local physical dimension `d`, a `p`-site dense cluster target has matrix shape

@@ -9,3 +9,17 @@
 - [PEPS direct sampler plan](peps_sampler.md)
 - [Sweep optimizer plan](sweep_optimizer.md)
 - [Stabilizer tensor-network plan](stabilizer_tn.md)
+
+```{toctree}
+:hidden:
+
+project
+operator_api
+lightweight-package
+optimizers
+symdmrg_matvec_fanout
+peps_optimizer
+peps_sampler
+sweep_optimizer
+stabilizer_tn
+```

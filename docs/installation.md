@@ -17,5 +17,15 @@ pip install -e .[stabilizer]
 pip install -e .[layout]
 ```
 
-Documentation is plain Markdown under `docs/`; no documentation builder is
-needed for package development or installation.
+Documentation sources are plain Markdown under `docs/`. The generated API
+reference is optional and is built with Sphinx:
+
+```bash
+source ~/envs/py312/bin/activate
+python -m pip install -e ".[docs]"
+python -m sphinx -b html docs docs/_build/html
+```
+
+The build reads the source tree statically through AutoAPI, so optional
+Torch, JAX, NetKet, Stim, and Symmray integrations do not need to be enabled
+just to generate the API navigation.

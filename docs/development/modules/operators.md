@@ -175,7 +175,8 @@ guard for this decision is [`test_operator_api_contract.py`](../../../tests/test
 
 ## Example smoke set
 
-The five small scripts in [`examples/operators`](../../../examples/operators)
+The five small scripts in
+[`examples/operators`](https://github.com/quantinuum-dev/pepsy/tree/develop/examples/operators)
 are the canonical smoke examples:
 
 1. [`higher_order_mpo.py`](../../../examples/operators/higher_order_mpo.py)

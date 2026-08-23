@@ -1166,16 +1166,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
         committed DMRG/MPO results at or below this limit.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
-            Optimization backend. ``"fit"`` is the clear alias of the historical
-            ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
-            sweeps, then one-site refinement; once every bond reaches its
-            attainable physical/``chi`` ceiling, it latches one-site updates
-            for the rest of the replay. An already-capped window starts
-            directly with one-site sweeps. ``"dmrg2"`` uses two-site updates
-            for the required warm-up (two sweeps by default), then one-site
-            refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
-            three-site updates before one-site refinement.
+    mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
+        Optimization backend. ``"fit"`` is the clear alias of the historical
+        ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
+        sweeps, then one-site refinement; once every bond reaches its
+        attainable physical/``chi`` ceiling, it latches one-site updates
+        for the rest of the replay. An already-capped window starts
+        directly with one-site sweeps. ``"dmrg2"`` uses two-site updates
+        for the required warm-up (two sweeps by default), then one-site
+        refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
+        three-site updates before one-site refinement.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -4254,10 +4254,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             serial local execution.
         progress : {"auto", True, False}, default="auto"
             Show one aggregate rank-zero shot progress bar for MPI runs.
-        observable, chunk_size, checkpoint_path, resume, checkpoint_keep,
-        checkpoint_sync, collect_diagnostics, checkpoint_id
-            MPI checkpointing and bounded-memory reduction options. These
-            require ``mpi=True`` or an explicit MPI communicator.
+        observable : callable, optional
+            Observable evaluated during checkpointed MPI shot reduction.
+        chunk_size : int, optional
+            Number of shots processed in one checkpoint/reduction chunk.
+        checkpoint_path : path-like, optional
+            Destination for resumable MPI checkpoints.
+        resume : bool, default=False
+            Resume from ``checkpoint_path`` when a compatible checkpoint exists.
+        checkpoint_keep : int, default=2
+            Number of completed checkpoints retained on disk.
+        checkpoint_sync : bool, default=True
+            Synchronize checkpoint writes across MPI ranks.
+        collect_diagnostics : bool, default=True
+            Collect bounded-memory diagnostic summaries during reduction.
+        checkpoint_id : str, optional
+            Stable identifier used to distinguish checkpoint streams.
+            These options require ``mpi=True`` or an explicit MPI communicator.
         retain : {"all", "final", "none"}, default="all"
             Result retention policy for shot replay. ``"all"`` retains final
             states and replay metadata, ``"final"`` retains final states only,

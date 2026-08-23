@@ -15,3 +15,17 @@ Concise implementation guides for the main Pepsy package areas:
 - [Unified exponential API](../../api/operators/exponentials.md)
 - The cross-cutting [operator and exponential API plan](../plans/operator_api.md)
   records canonical names, ownership boundaries, and staged module extraction.
+
+```{toctree}
+:hidden:
+
+boundary
+tensors
+optimizers
+peps_optimizer
+sweep_optimizer
+vmc
+higher_order_mpo
+cluster_expansion
+operators
+```

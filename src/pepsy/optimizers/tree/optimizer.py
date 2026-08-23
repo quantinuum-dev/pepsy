@@ -475,8 +475,6 @@ class TreeOptimizer:
         The live tree tensor network (a geometry-owning ``quimb`` subclass).
     plan : TreePlan
         The tree structure.
-    center : int or None
-        Node id of the current orthogonality centre (``None`` if unknown).
     """
 
     @staticmethod

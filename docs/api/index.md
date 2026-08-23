@@ -4,6 +4,11 @@ Start with the [package API map](package.md), which explains the core versus
 advanced namespaces and shows the recommended imports. The pages below contain
 the detailed functions and classes for each area.
 
+When the optional Sphinx build is used, the navigation also contains a
+generated reference for the canonical source modules. It complements these
+curated pages by listing signatures, parameters, class members, and direct
+source links for each public object.
+
 ## Core
 
 - [Package exports](package.md)
@@ -45,3 +50,48 @@ the detailed functions and classes for each area.
 - [Tree tensor networks](optimizers/tree.md)
 - [Tree stabilizer optimization](optimizers/tree_stabilizer.md)
 - [VMC](vmc.md)
+
+```{toctree}
+:hidden:
+
+package
+boundary/metrics
+boundary/states
+boundary/sweeps
+tensors/maps
+tensors/constructors
+tensors/contractions
+tensors/observables
+tensors/core
+tensors/symmetric
+fitting/local
+operators/gates
+operators/automaton
+operators/higher_order_mpo
+operators/mpo_cluster
+operators/pauli_mpo
+operators/cluster_expansion
+operators/exponentials
+interop
+operators/hamiltonians
+solvers/gradient
+solvers/finite_difference
+sampling/samplers
+sampling/stabilizer
+sampling/tree
+bp
+optimizers/mps
+optimizers/mpo
+optimizers/peps
+optimizers/sweep
+optimizers/global_opt
+optimizers/energy
+optimizers/qmera
+optimizers/noise
+optimizers/planning
+optimizers/stabilizer_tn
+optimizers/sym_dmrg
+optimizers/tree
+optimizers/tree_stabilizer
+vmc
+```

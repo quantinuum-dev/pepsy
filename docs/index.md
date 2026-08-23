@@ -25,3 +25,19 @@ name uses `PePsY`; the Python package and import name remain `pepsy`.
 - [Package layout](development/package_layout.md)
 - [Development notes and plans](development/README.md)
 - [Fermi-Hubbard notes](development/fermi_hubbard_u1u1_mpo_notes.md)
+
+```{toctree}
+:hidden:
+
+installation
+getting_started
+quickstart
+tutorials/index
+howto/index
+examples
+api/index
+stability
+development/package_layout
+development/README
+development/fermi_hubbard_u1u1_mpo_notes
+```

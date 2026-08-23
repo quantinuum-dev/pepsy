@@ -106,8 +106,20 @@ assert ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193
 ```
 
 ## Documentation
-Documentation is maintained as Markdown under `docs/`. No documentation
-builder or documentation-specific package extra is required.
+Documentation is maintained as Markdown under `docs/`, with an optional
+Sphinx build that adds searchable, generated API pages. Install the docs
+extra and build the site locally with:
+
+```bash
+source ~/envs/py312/bin/activate
+python -m pip install -e ".[docs]"
+python -m sphinx -b html docs docs/_build/html
+```
+
+The generated API pages include signatures, parameter descriptions, class
+members, cross-references, and links back to the corresponding GitHub source
+lines. The hand-written pages remain the place for tutorials, workflows, and
+Pepsy-specific guidance.
 
 See [the API stability policy](docs/stability.md) for the distinction between
 stable core modules and advanced domains.
