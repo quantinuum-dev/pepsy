@@ -1,6 +1,7 @@
 # Implementation plans
 
 - [Project roadmap](project.md)
+- [Operator and exponential API plan](operator_api.md)
 - [Lightweight package plan](lightweight-package.md)
 - [Optimizer plan](optimizers.md)
 - [SymDMRG2 matvec fanout-GEMM plan](symdmrg_matvec_fanout.md)

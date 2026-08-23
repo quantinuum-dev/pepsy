@@ -3,6 +3,9 @@
 This page is the short usage guide for the two higher-order exponential
 builders. The rule is simple:
 
+For the longer-term ownership map, canonical vocabulary, and staged
+refactoring roadmap, see the [operator and exponential API plan](../../development/plans/operator_api.md).
+
 > Use `exp(step, ...)` for the operator exponential. Use `compile_exp(...)`
 > when the operator topology is reused. The `step` is the scalar in
 > `exp(step * H)`; it is not automatically a physical time.
@@ -15,6 +18,7 @@ builders. The rule is simple:
 | One parameterized 1D Hamiltonian | `MPOBasis.from_pauli_terms(...)` or `MPOBasis.from_local_terms(...)` | Reusable `MPOBasis` |
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
+| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
 | Quimb MPO interoperability | `semantic_mpo.to_mpo()` | Quimb `MatrixProductOperator` |
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |
@@ -28,6 +32,14 @@ builders. The rule is simple:
 The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
+
+There are three distinct construction axes: SciPost higher-order MPO history,
+connected MPO cluster size, and PEPO spatial cluster order. In both cluster
+families, `exp(A) @ exp(B) @ exp(C)` is a joint local-residual expansion: the
+ordered target is formed on each small connected support and inserted into one
+MPO or PEPO topology. It is not sequential multiplication of three separately
+truncated full-lattice layers. See the [MPO cluster guide](mpo_cluster.md)
+and [PEPO cluster guide](cluster_expansion.md).
 
 ## Term-centric MPO construction
 
@@ -322,6 +334,12 @@ evolution workflows.
   compiled term topology intact.
 - `to_mpo()` and `to_pepo()` are explicit interoperability/materialization
   boundaries; neither is needed to construct the exponential itself.
+
+When an API returns a detailed construction or compression report, use
+`report.api_info` for cross-family logging. It provides the stable
+`family`/`algorithm`/`representation` vocabulary plus `order`,
+`factor_count`, `truncated`, and `differentiable`; the concrete report retains
+the algorithm-specific residual, rank, cutoff, and error fields.
 
 ## Compatibility names
 
