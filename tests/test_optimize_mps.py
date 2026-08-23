@@ -624,9 +624,9 @@ def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
     initialization = diagnostics["random_initialization"]
     assert diagnostics["mpo_fit_guess_used"] is True
     assert diagnostics["guess_used"] is True
-    assert diagnostics["guess_method"] == "zipup"
+    assert diagnostics["guess_method"] == "src"
     assert initialization["enabled"] is False
-    assert initialization["reason"] == "guess_zipup"
+    assert initialization["reason"] == "guess_src"
 
 
 def test_randomized_fit_guess_is_disposable_and_active_only():
@@ -963,6 +963,35 @@ def test_mps_optimizer_hyphenated_guess_strategy_alias():
     assert diagnostics["fit_init_strategy_requested"] == "guess_src"
     assert diagnostics["fit_init_strategy"] == "guess_src"
     assert diagnostics["guess_method"] == "src"
+
+
+def test_mps_optimizer_default_src_guess_reaches_one_site_fit():
+    """The default DMRG warm-start remains SRC after reaching ``chi``."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_rand_state(
+            3,
+            bond_dim=2,
+            phys_dim=2,
+            dtype="complex128",
+            seed=20260823,
+        ),
+        [(np.eye(4, dtype=np.complex128), (0, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=1,
+        fit_rtol=None,
+        fit_block_size=1,
+        timing=True,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
 
 
 def test_mps_optimizer_src_compression_seed_is_reproducible():
@@ -2378,8 +2407,11 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
     ] == [1, 1, 1]
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["adaptive_sweeps"] == 0
+    assert diagnostics["one_site_refinement_sweeps"] == 3
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
     assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
 
 

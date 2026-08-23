@@ -96,7 +96,7 @@ _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
 _SHOT_DEFAULT_MAX_BRANCHES = 128
 _SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS = 0.1
-_DEFAULT_FIT_INIT_STRATEGY = "guess_zipup"
+_DEFAULT_FIT_INIT_STRATEGY = "guess_src"
 _DEFAULT_CUTOFF_MODE = "rsum2"
 _MPO_COMPRESSION_METHODS = frozenset(
     {
@@ -4137,20 +4137,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             for NumPy/Torch/CuPy and the native MPS route for Symmray.
         fit_mpo_guess : bool, default=True
             Legacy compatibility switch for the named DMRG1/DMRG3 default
-            ``"guess-zipup"`` policy. New code should use
-            ``fit_init_strategy`` explicitly. This does not replace the exact
-            FIT target or live MPS. Native Symmray and fermionic routes retain
-            their native warm-start path.
-        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}, default="guess-zipup"
+            ``"guess-src"`` policy. New code should use
+            ``fit_init_strategy`` explicitly. Dense DMRG uses the disposable
+            SRC guess in both the expansion and one-site/reached-chi phases.
+            This does not replace the exact FIT target or live MPS. Native
+            Symmray and fermionic routes retain their native warm-start path.
+        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}, default="guess-src"
             Select the disposable FIT initial guess. ``"direct"`` uses the
             current MPS, ``"random"`` perturbs existing tensors without
             changing bond dimensions, ``"random_expand"`` adds seeded
             directions on under-capacity active bonds, and
             ``"guess-<method>"`` uses the corresponding Quimb compression
-            method on an isolated copy. ``"auto"`` selects
-            ``"guess-zipup"`` before active bonds reach their attainable
-            ceilings. The underscore spelling ``"guess_<method>"`` remains
-            accepted as a compatibility alias.
+            method on an isolated copy. ``"auto"`` and the default select
+            ``"guess-src"`` in both expansion and reached-chi phases. The
+            underscore spelling ``"guess_<method>"`` remains accepted as a
+            compatibility alias.
         fit_init_rand_strength : float, default=1e-1
             For dense two- and three-site FIT growth windows that are below
             their attainable physical/``chi`` bond ceilings, seed a
@@ -6537,11 +6538,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "svd_guess_used": False,
             "random_initialization": info,
         }
-        if int(block_size) not in {2, 3}:
-            info["reason"] = "one_site_fit"
-            return result
         if self._has_symmray_data(p) or p.isfermionic():
-            info["reason"] = "native_sector_growth"
+            info["reason"] = (
+                "native_sector_growth"
+                if int(block_size) in {2, 3}
+                else "native_one_site_fit"
+            )
             result["strategy"] = "direct"
             return result
 
@@ -6555,20 +6557,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             stop,
             self.chi,
         )
-        is_named_svd_window = (
-            len(gates) == 1
-            and (
-                self._dmrg_mode_alias == "dmrg1" and int(block_size) == 2
-                or self._dmrg_mode_alias == "dmrg3" and int(block_size) == 3
-            )
-        )
+        is_named_svd_window = len(gates) == 1 and self._dmrg_mode_alias in {
+            "dmrg1",
+            "dmrg3",
+        }
         if requested_strategy == "auto":
-            if needs_growth and (fit_mpo_guess or not is_named_svd_window):
-                selected_strategy = "guess_zipup"
-            else:
-                selected_strategy = "direct"
+            selected_strategy = _DEFAULT_FIT_INIT_STRATEGY
         else:
-            selected_strategy = requested_strategy if needs_growth else "direct"
+            # An explicit Quimb guess is a warm-start policy, not only a rank
+            # enrichment policy. Keep applying it after the active bonds have
+            # reached their attainable rank so the one-site FIT phase receives
+            # the same SRC-prepared state as the expansion phase.
+            selected_strategy = (
+                requested_strategy
+                if requested_strategy.startswith("guess_")
+                or requested_strategy == "svd_guess"
+                else requested_strategy if needs_growth else "direct"
+            )
         if (
             not fit_mpo_guess
             and is_named_svd_window

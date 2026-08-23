@@ -214,8 +214,10 @@ keeps Quimb's native `rsum1` default. Passing a string explicitly overrides
 that method default.
 
 For example, `mode="quimb-src"` applies each gate with Quimb's Successive
-Randomized Compression, while `fit_init_strategy="guess-src"` uses SRC only
-to build a disposable DMRG/FIT initial guess. The equivalent
+Randomized Compression, while `fit_init_strategy="guess-src"` uses SRC to
+build the disposable DMRG/FIT initial guess. The default DMRG policy is now
+`guess-src`, including the one-site phase after the active bonds reach `chi`,
+so FIT always receives the SRC-prepared guess. The equivalent
 `fit_init_strategy="guess_src"` spelling is accepted as a compatibility alias
 and is normalized internally to `guess_src`. Set `compression_seed` for reproducible randomized
 MPO replay; `fit_init_seed` controls randomized disposable FIT guesses.
@@ -229,16 +231,18 @@ reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
 later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
 warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
 same fixed warm-up schedule with three-site FIT and then one-site FIT.
-For dense DMRG growth windows, FIT starts from a disposable compressed guess.
-The default is `fit_init_strategy="guess-zipup"`; the exact FIT target and
-named schedules are unchanged. The strategy can be `direct`, `random`,
+For dense DMRG windows, FIT starts from a disposable compressed guess. The
+default is `fit_init_strategy="guess-src"`; the exact FIT target and named
+schedules are unchanged. The strategy can be `direct`, `random`,
 `random_expand`, or `guess-<method>`, where `<method>` is one of the Quimb
 compression methods listed below. The underscore spelling remains accepted for
-compatibility. `auto` selects `guess-zipup` while an active
-bond still needs growth. Native Symmray and fermionic states retain their
-native warm-start path. The legacy `fit_mpo_guess=False` switch still disables
-the default named-mode guess. Both the target and the guess remain separate
-from the live MPS.
+compatibility. `auto` selects `guess-src` in both the rank-expansion and
+reached-chi phases. Native Symmray and fermionic states retain their native
+warm-start path. The legacy `fit_mpo_guess=False` switch still disables the
+default named-mode guess. Both the target and the guess remain separate from
+the live MPS. The fixed expansion handoff remains two two-site sweeps followed
+by one one-site sweep; a window already at its attainable `chi` ceiling uses
+one-site FIT directly.
 `mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
 schedule for local windows. For a long-range window that is wider than the
 selected FIT block, it uses the corresponding fixed block handoff so the
@@ -258,9 +262,9 @@ or `guess-<method>` compressed by Quimb. The available methods are
 `direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
 `src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`. `auto` selects `guess-zipup` before active
-bonds reach their attainable ceilings; otherwise it uses the current MPS
-directly.
+`fit-projector`, `fit-oversample`. `auto` selects `guess-src` in both phases;
+the current MPS is used directly only when the caller explicitly requests
+`direct` (or a native Symmray/fermionic route requires its native warm-start).
 Native Symmray and fermionic paths use their graded sector-growth route without
 dense random padding. `fit_block_size=1` retains
 the fixed-rank compatibility algorithm, for which mixed mode still warms short
