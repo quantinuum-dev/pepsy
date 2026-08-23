@@ -14,19 +14,14 @@ path.
 """
 
 from .cluster import (
-    ActivePEPOBlocks,
     ClusterExpansionPlan,
     ClusterExpansionReport,
     ClusterInternalSymmetry,
     ClusterLattice,
     ClusterModelAdapter,
-    CompiledPEPOExp,
     ConnectedClusterShape,
-    GraphActivePEPOBlocks,
     GraphClusterExpansionPlan,
     GraphConnectedClusterShape,
-    PauliPEPOBasis,
-    PauliPEPOTerm,
     adapt_cluster_model,
     build_cluster_expansion_pepo,
     build_graph_cluster_expansion_pepo,
@@ -37,6 +32,8 @@ from .cluster import (
     compose_pepo_layers,
     generate_connected_cluster_shapes,
 )
+from .pepo_active import ActivePEPOBlocks, GraphActivePEPOBlocks
+from .pepo_basis import CompiledPEPOExp, PauliPEPOBasis, PauliPEPOTerm
 from .pepo_product import (
     CompiledPEPOClusterProduct,
     PEPOClusterFactor,

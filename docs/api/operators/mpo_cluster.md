@@ -1,6 +1,6 @@
-# MPO cluster expansion
+# MPO cluster expansion and ordered products
 
-This page documents `pepsy.operators.mpo_cluster`, the connected spatial MPO
+This page documents `pepsy.operators.mpo_product`, the connected spatial MPO
 family. It is separate from the SciPost higher-order/history construction in
 [`higher_order_mpo.md`](higher_order_mpo.md): `cluster_size` counts local
 connected support, while higher-order `order` controls virtual history/Taylor
@@ -11,10 +11,10 @@ construction.
 ```python
 import numpy as np
 
-from pepsy.operators import MPOClusterBasisExpansion
+from pepsy.operators import MPOClusterProductExpansion
 
 z = np.diag([1.0, -1.0])
-expansion = MPOClusterBasisExpansion.from_local_terms(
+expansion = MPOClusterProductExpansion.from_local_terms(
     32,
     [((site, site + 1), (z, z)) for site in range(31)],
     cluster_size=4,
@@ -28,7 +28,7 @@ are subtracted, and the residuals are assembled as disjoint MPO paths.
 size-extensive approximation described in
 [arXiv:1912.10512](https://arxiv.org/abs/1912.10512).
 
-Use `MPOGraphClusterBasisExpansion` or
+Use `MPOGraphClusterProductExpansion` or
 `MPOBasis.compile_graph_cluster_expansion(...)` when cluster selection should
 follow a graph rather than a snake-ordered interval. A graph cluster can be a
 genuine two-site cluster even when its MPO span crosses many chain positions.
@@ -37,16 +37,17 @@ local residual ranks.
 
 ## Joint ordered products
 
-For factors `A`, `B`, and `C`, use `MPOClusterBasisExpansion.from_factors(...)`:
+For factors `A`, `B`, and `C`, use
+`MPOClusterProductExpansion.from_factors(...)`:
 
 ```python
-from pepsy.operators import MPOClusterBasisExpansion, MPOClusterFactor
+from pepsy.operators import MPOClusterFactor, MPOClusterProductExpansion
 
 A = MPOClusterFactor([((0, 1), (z, z))], coefficient=0.2)
 B = MPOClusterFactor([((1, 2), (z, z))], coefficient=-0.3)
 C = MPOClusterFactor([((2, 3), (z, z))], coefficient=0.4)
 
-product = MPOClusterBasisExpansion.from_factors(
+product = MPOClusterProductExpansion.from_factors(
     8,
     (A, B, C),
     cluster_size=4,
@@ -73,3 +74,6 @@ execution-level operation, not the cluster-residual algorithm.
 each evaluation, so Torch/JAX autodiff graphs stay current. `max_bond` is an
 explicit local Schmidt-rank cap; it is separate from the history guard used by
 the higher-order MPO family.
+
+`MPOClusterBasisExpansion` and `CompiledMPOClusterExp` remain compatibility
+aliases for `MPOClusterProductExpansion` and `CompiledMPOClusterProduct`.

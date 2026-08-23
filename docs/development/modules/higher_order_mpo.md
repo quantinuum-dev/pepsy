@@ -3,13 +3,15 @@
 `pepsy.operators.mpo_higher_order` is the public family facade for the
 size-extensive higher-order construction in SciPost Phys. 17, 135. The
 implementation keeps the paper's virtual-level histories alongside ordinary
-local MPO tensors and currently delegates to the compatibility implementation
-in `pepsy.operators.mpo`.
+local MPO tensors. The semantic history implementation remains in
+`pepsy.operators.mpo`; parameterized bases and compiled evaluators are
+implemented in `pepsy.operators.mpo_basis`.
 
 This page covers only the paper-style higher-order MPO exponential. Connected
 spatial MPO clusters and ordered products of several exponentials belong to
-`pepsy.operators.mpo_cluster`, where `cluster_size` and `factor_count` have
-different meanings from history `order`.
+`pepsy.operators.mpo_product`, where `cluster_size` and `factor_count` have
+different meanings from history `order`. The historical
+`pepsy.operators.mpo_cluster` path is a compatibility facade.
 
 ## Public API contract
 
@@ -23,7 +25,7 @@ different meanings from history `order`.
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
-| `MPOBasis.compile_cluster_expansion` / `compile_graph_cluster_expansion` | Compatibility adapters to the MPO cluster family | Delegate to `operators.mpo_cluster`; they do not turn a spatial cluster order into a history order |
+| `MPOBasis.compile_cluster_expansion` / `compile_graph_cluster_expansion` | Compatibility adapters to the MPO cluster family | Delegate to `operators.mpo_product`; they do not turn a spatial cluster order into a history order |
 | `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(step * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; real-time uses `step=-1j * tau`; `differentiable=True` selects fixed-rank TT-SVD |
 | `FirstDegreeMPO.clear_history_cache` / `MPOBasis.clear_history_cache` | Release reusable higher-order plans | Keeps current tensors and compiled first-degree topology unchanged |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |

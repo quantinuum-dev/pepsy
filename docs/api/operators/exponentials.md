@@ -18,7 +18,7 @@ refactoring roadmap, see the [operator and exponential API plan](../../developme
 | One parameterized 1D Hamiltonian | `MPOBasis.from_pauli_terms(...)` or `MPOBasis.from_local_terms(...)` | Reusable `MPOBasis` |
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
-| Connected/joint MPO clusters | `MPOClusterBasisExpansion` / `MPOGraphClusterBasisExpansion` | One MPO assembled from local connected residuals |
+| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
 | Quimb MPO interoperability | `semantic_mpo.to_mpo()` | Quimb `MatrixProductOperator` |
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |

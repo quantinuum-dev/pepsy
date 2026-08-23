@@ -18,11 +18,11 @@ different abstraction levels:
 | Family | Current implementation | What it means |
 | --- | --- | --- |
 | Higher-order MPO exponential | `MPOBasis`, `FirstDegreeMPO`, `CompiledMPOExp` in `operators.mpo_higher_order` | Approximate `exp(step * H)` using virtual history and Taylor/order controls |
-| MPO local cluster expansion | `MPOClusterBasisExpansion` and `MPOGraphClusterBasisExpansion` in `operators.mpo_cluster` | Build connected spatial/graph residuals and assemble them as an MPO |
+| MPO local cluster expansion | `MPOClusterProductExpansion` and `MPOGraphClusterProductExpansion` in `operators.mpo_product` | Build connected spatial/graph residuals and assemble them as an MPO |
 | Fixed-channel PEPO exponential | `PauliPEPOBasis`, `CompiledPEPOExp` in `operators.pepo_cluster` | Differentiable square-lattice PEPO with value-independent Pauli channels |
 | Dense PEPO cluster expansion | `ClusterExpansionPlan` and graph plans in `operators.pepo_cluster` | Factor local connected residuals for a finite model or graph |
 | Ordered PEPO products | `PEPOClusterProductExpansion` in `operators.pepo_cluster` | Jointly construct `exp(A) @ exp(B) @ exp(C) @ ...` |
-| Ordered MPO products | `MPOClusterFactor` and `MPOClusterBasisExpansion` in `operators.mpo_cluster` | Jointly construct local ordered exponential factors on a chain/graph |
+| Ordered MPO products | `MPOClusterFactor` and `MPOClusterProductExpansion` in `operators.mpo_product` | Jointly construct local ordered exponential factors on a chain/graph |
 | Native Pauli MPO | `PauliMPO` in `operators.pauli_mpo` | Sparse Pauli-basis operator algebra and conversion to an MPO |
 
 These are not all the same algorithm. In particular:
@@ -258,18 +258,35 @@ for compatibility, while `operators.pepo_cluster` is the clean public family
 facade. Numerical behavior and the existing `exp(A) @ exp(B) @ exp(C)` tests
 are unchanged.
 
+**Completed fourth slice:** `ActivePEPOBlocks` and
+`GraphActivePEPOBlocks` now live in `operators.pepo_active`, while
+`PauliPEPOTerm`, `PauliPEPOBasis`, and `CompiledPEPOExp` live in
+`operators.pepo_basis`. The legacy cluster module continues to re-export them.
+
+**Completed fifth slice:** `MPOBasis`, `CompiledMPOExp`, and `exp_mpo` now live
+in `operators.mpo_basis`. The semantic `FirstDegreeMPO` history engine remains
+in `operators.mpo`, which re-exports the basis API for compatibility.
+
+**Completed sixth slice:** The connected MPO interval/graph residual engine and
+joint ordered ``exp(A) @ exp(B) @ ...`` construction now live in
+`operators.mpo_product`. `MPOClusterProductExpansion` and
+`CompiledMPOClusterProduct` are the canonical names. The old `mpo_cluster`
+module and `MPOClusterBasisExpansion`/`CompiledMPOClusterExp` names remain
+compatibility aliases.
+
 ### Phase 2 — extract implementation modules
 
 Status: public facade slice started.
 
 - Keep `operators.mpo_higher_order` limited to the SciPost-style history
-  construction and `operators.mpo_cluster` limited to connected MPO
+  construction and `operators.mpo_product` limited to connected MPO
   residuals, including joint ordered local products.
 - Keep `operators.pepo_cluster` as the sole named owner for PEPO cluster
   geometry, fixed channels, dense residuals, and joint ordered products.
 - Keep the joint ordered-product algorithm in `operators.pepo_product`; the
   facade should re-export it without duplicating the implementation.
-- Preserve `operators.mpo` and `operators.cluster` as compatibility facades
+- Preserve `operators.mpo`, `operators.cluster`, and `operators.mpo_cluster` as
+  compatibility facades
   until implementation moves can be made without duplicate algorithms.
 
 - Split `operators.mpo` by responsibility, preserving it as a compatibility

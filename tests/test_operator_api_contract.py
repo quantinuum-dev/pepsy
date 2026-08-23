@@ -18,9 +18,9 @@ _CANONICAL_OWNERS = {
     "FirstDegreeMPO": ".mpo_higher_order",
     "CompiledMPOExp": ".mpo_higher_order",
     "exp_mpo": ".mpo_higher_order",
-    "MPOClusterBasisExpansion": ".mpo_cluster",
-    "MPOGraphClusterBasisExpansion": ".mpo_cluster",
-    "CompiledMPOClusterExp": ".mpo_cluster",
+    "MPOClusterProductExpansion": ".mpo_product",
+    "MPOGraphClusterProductExpansion": ".mpo_product",
+    "CompiledMPOClusterProduct": ".mpo_product",
     "ActivePEPOBlocks": ".pepo_cluster",
     "GraphActivePEPOBlocks": ".pepo_cluster",
     "PauliPEPOBasis": ".pepo_cluster",
@@ -36,10 +36,13 @@ _CANONICAL_OWNERS = {
 
 _COMPATIBILITY_ALIASES = {
     "CompiledMPOEvolution": "CompiledMPOExp",
-    "ClusterBasisExpansion": "MPOClusterBasisExpansion",
-    "ClusterExpansionBasis": "MPOClusterBasisExpansion",
-    "ClusterExpBasis": "MPOClusterBasisExpansion",
-    "MPOClusterExpansion": "MPOClusterBasisExpansion",
+    "MPOClusterBasisExpansion": "MPOClusterProductExpansion",
+    "MPOGraphClusterBasisExpansion": "MPOGraphClusterProductExpansion",
+    "CompiledMPOClusterExp": "CompiledMPOClusterProduct",
+    "ClusterBasisExpansion": "MPOClusterProductExpansion",
+    "ClusterExpansionBasis": "MPOClusterProductExpansion",
+    "ClusterExpBasis": "MPOClusterProductExpansion",
+    "MPOClusterExpansion": "MPOClusterProductExpansion",
 }
 
 
@@ -77,20 +80,38 @@ def test_operator_family_facades_keep_construction_domains_separate():
     higher_order = importlib.import_module(
         ".mpo_higher_order", operators.__name__
     )
+    mpo_basis = importlib.import_module(".mpo_basis", operators.__name__)
     mpo_cluster = importlib.import_module(".mpo_cluster", operators.__name__)
+    mpo_product = importlib.import_module(".mpo_product", operators.__name__)
     pepo_cluster = importlib.import_module(".pepo_cluster", operators.__name__)
+    pepo_active = importlib.import_module(".pepo_active", operators.__name__)
+    pepo_basis = importlib.import_module(".pepo_basis", operators.__name__)
     pepo_product = importlib.import_module(".pepo_product", operators.__name__)
 
-    assert "MPOClusterBasisExpansion" not in higher_order.__all__
+    assert "MPOClusterProductExpansion" not in higher_order.__all__
     assert "PEPOClusterProductExpansion" not in higher_order.__all__
     assert "MPOBasis" not in mpo_cluster.__all__
     assert "PEPOClusterProductExpansion" not in mpo_cluster.__all__
     assert "MPOBasis" not in pepo_cluster.__all__
     assert "MPOClusterBasisExpansion" not in pepo_cluster.__all__
 
+    assert higher_order.MPOBasis is mpo_basis.MPOBasis
+    assert higher_order.CompiledMPOExp is mpo_basis.CompiledMPOExp
+    assert higher_order.exp_mpo is mpo_basis.exp_mpo
+    assert operators.MPOClusterProductExpansion is mpo_product.MPOClusterProductExpansion
+    assert operators.CompiledMPOClusterProduct is mpo_product.CompiledMPOClusterProduct
+    assert operators.MPOClusterBasisExpansion is mpo_product.MPOClusterProductExpansion
+    assert operators.CompiledMPOClusterExp is mpo_product.CompiledMPOClusterProduct
+    assert operators.MPOGraphClusterBasisExpansion is mpo_product.MPOGraphClusterProductExpansion
+    assert mpo_cluster.MPOClusterBasisExpansion is mpo_product.MPOClusterProductExpansion
+    assert mpo_cluster.CompiledMPOClusterExp is mpo_product.CompiledMPOClusterProduct
     assert pepo_cluster.PEPOClusterProductExpansion is operators.PEPOClusterProductExpansion
     assert pepo_cluster.PEPOClusterProductExpansion is pepo_product.PEPOClusterProductExpansion
     assert pepo_cluster.CompiledPEPOClusterProduct is pepo_product.CompiledPEPOClusterProduct
+    assert pepo_cluster.ActivePEPOBlocks is pepo_active.ActivePEPOBlocks
+    assert pepo_cluster.GraphActivePEPOBlocks is pepo_active.GraphActivePEPOBlocks
+    assert pepo_cluster.PauliPEPOBasis is pepo_basis.PauliPEPOBasis
+    assert pepo_cluster.CompiledPEPOExp is pepo_basis.CompiledPEPOExp
 
 
 def test_report_summary_uses_one_cross_family_vocabulary():

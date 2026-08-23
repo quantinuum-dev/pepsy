@@ -7,12 +7,13 @@ arbitrary finite `ClusterLattice` with one virtual bond per graph edge and
 returns `GraphActivePEPOBlocks`, which materialize as a generic Quimb tensor
 network because Quimb's `PEPO` wrapper is square-lattice-only.
 
-The geometry, active-block, and fixed-channel source is currently implemented
-in the compatibility module `pepsy.operators.cluster`; the facade is the
-ownership boundary for new code. The ordered-product implementation is
-extracted to `pepsy.operators.pepo_product`.
+The geometry and dense-cluster source remains in the compatibility module
+`pepsy.operators.cluster`; the facade is the ownership boundary for new code.
+Active blocks are implemented in `pepsy.operators.pepo_active`, the
+fixed-channel basis in `pepsy.operators.pepo_basis`, and ordered products in
+`pepsy.operators.pepo_product`.
 The PEPO family is separate from both the paper-style higher-order MPO facade
-and `pepsy.operators.mpo_cluster`.
+and the MPO product implementation in `pepsy.operators.mpo_product`.
 
 `ClusterExpansionPlan` caches lattice directions and cluster-orbit bookkeeping
 so different beta values do not rebuild geometry. Both active-block types

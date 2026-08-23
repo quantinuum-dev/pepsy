@@ -23,12 +23,12 @@ These are the names to use in new code.
 
 | Area | Canonical names | Owner |
 | --- | --- | --- |
-| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` |
+| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (basis implementation: `operators.mpo_basis`) |
 | MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
 | Shared report summary | `OperatorReportInfo` and each concrete report's `.api_info` | `operators.diagnostics` |
-| MPO connected clusters | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterBasisExpansion`, `MPOGraphClusterBasisExpansion`, `CompiledMPOClusterExp` | `operators.mpo_cluster` |
-| PEPO active results | `ActivePEPOBlocks`, `GraphActivePEPOBlocks` | `operators.pepo_cluster` |
-| Square-lattice PEPO exponential | `PauliPEPOTerm`, `PauliPEPOBasis`, `CompiledPEPOExp` | `operators.pepo_cluster` |
+| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct` | `operators.mpo_product` |
+| PEPO active results | `ActivePEPOBlocks`, `GraphActivePEPOBlocks` | `operators.pepo_cluster` (implementation: `operators.pepo_active`) |
+| Square-lattice PEPO exponential | `PauliPEPOTerm`, `PauliPEPOBasis`, `CompiledPEPOExp` | `operators.pepo_cluster` (implementation: `operators.pepo_basis`) |
 | Dense/graph PEPO clusters | `ClusterExpansionPlan`, `GraphClusterExpansionPlan`, `ClusterExpansionReport`, `ClusterLattice`, `ConnectedClusterShape`, `GraphConnectedClusterShape` | `operators.pepo_cluster` |
 | PEPO model adapters | `ClusterModelAdapter`, `adapt_cluster_model`, `build_cluster_expansion_pepo`, `build_model_cluster_expansion_pepo`, `build_itf_cluster_expansion_pepo`, `build_real_time_cluster_expansion_pepo`, `build_graph_cluster_expansion_pepo` | `operators.pepo_cluster` |
 | Ordered PEPO products | `PEPOClusterFactor`, `PEPOClusterProductExpansion`, `CompiledPEPOClusterProduct` | `operators.pepo_cluster` (implementation: `operators.pepo_product`) |
@@ -71,7 +71,8 @@ records this invariant as `cache_info["joint_cluster_residual"]`.
 The public facades are:
 
 - `operators.mpo_higher_order` — paper-style higher-order MPOs;
-- `operators.mpo_cluster` — connected/joint MPO cluster expansions;
+- `operators.mpo_product` — connected/joint MPO cluster products;
+- `operators.mpo_cluster` — compatibility facade for the MPO product family;
 - `operators.pepo_cluster` — connected/joint PEPO cluster expansions.
 
 The older `operators.mpo` and `operators.cluster` modules remain importable
@@ -113,10 +114,12 @@ new examples:
 | `evolution_mpo(...)` | `exp(...)` | `MPOBasis` method |
 | `dt=` | `step=` | Compatibility keyword for the exponential scalar |
 | `evaluate(...)` | `exp(...)` | Retained on compiled/basis APIs |
-| `ClusterBasisExpansion` | `MPOClusterBasisExpansion` | Historical class alias |
-| `ClusterExpansionBasis` | `MPOClusterBasisExpansion` | Historical class alias |
-| `ClusterExpBasis` | `MPOClusterBasisExpansion` | Historical class alias |
-| `MPOClusterExpansion` | `MPOClusterBasisExpansion` | Historical class alias |
+| `MPOClusterBasisExpansion` | `MPOClusterProductExpansion` | Historical class alias |
+| `CompiledMPOClusterExp` | `CompiledMPOClusterProduct` | Historical class alias |
+| `ClusterBasisExpansion` | `MPOClusterProductExpansion` | Historical class alias |
+| `ClusterExpansionBasis` | `MPOClusterProductExpansion` | Historical class alias |
+| `ClusterExpBasis` | `MPOClusterProductExpansion` | Historical class alias |
+| `MPOClusterExpansion` | `MPOClusterProductExpansion` | Historical class alias |
 | `mode="paper_algorithm4"` | `mode="algorithm4"` | Historical mode spelling |
 | `mode="paper_optimal"` | `mode="optimal"` | Historical mode spelling |
 | `mode="paper_approximate"` | `mode="approximate"` | Historical mode spelling |
@@ -163,7 +166,7 @@ guard for this decision is [`test_operator_api_contract.py`](../../../tests/test
 | Connected spatial PEPO residuals | `ClusterExpansionPlan` / `GraphClusterExpansionPlan` | Snake-chain MPO intervals when graph geometry matters |
 | Differentiable fixed-channel PEPO | `PauliPEPOBasis` | Dense adaptive SVD fitting, which is not the same autodiff contract |
 | Ordered `exp(A) @ exp(B) @ ...` PEPO | `PEPOClusterProductExpansion` | `exp(A + B + ...)` or independent full-lattice factor multiplication |
-| Ordered local MPO clusters | `MPOClusterBasisExpansion.from_factors` | Multiplying separately truncated full-lattice MPOs |
+| Ordered local MPO clusters | `MPOClusterProductExpansion.from_factors` | Multiplying separately truncated full-lattice MPOs |
 | Pauli sparse algebra/trace | `PauliMPO` | Treating it as a second unrelated exponential engine |
 | PEPS/PEPO contraction corrections | `pepsy.bp` loop/cluster APIs | Operator cluster expansion; BP acts on contractions/environments |
 

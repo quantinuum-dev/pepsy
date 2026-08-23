@@ -107,17 +107,20 @@ _SYMBOL_MODULES.update({name: ".mpo_higher_order" for name in _MPO_EXPORTS})
 _MPO_COMPATIBILITY_EXPORTS = ["CompiledMPOEvolution"]
 _SYMBOL_MODULES.update({name: ".mpo" for name in _MPO_COMPATIBILITY_EXPORTS})
 
-# Connected MPO cluster aliases are retained for older callers, but the
-# descriptive ``MPO*`` names above are the canonical vocabulary.
+# Connected MPO product names are canonical. The old ``BasisExpansion`` and
+# ``CompiledMPOClusterExp`` spellings remain explicit compatibility aliases.
 _MPO_CLUSTER_EXPORTS = [
     "MPOClusterFactor",
     "MPOClusterExpansionReport",
+    "MPOClusterProductExpansion",
+    "MPOGraphClusterProductExpansion",
+    "CompiledMPOClusterProduct",
+]
+_SYMBOL_MODULES.update({name: ".mpo_product" for name in _MPO_CLUSTER_EXPORTS})
+_MPO_CLUSTER_COMPATIBILITY_EXPORTS = [
     "MPOClusterBasisExpansion",
     "MPOGraphClusterBasisExpansion",
     "CompiledMPOClusterExp",
-]
-_SYMBOL_MODULES.update({name: ".mpo_cluster" for name in _MPO_CLUSTER_EXPORTS})
-_MPO_CLUSTER_COMPATIBILITY_EXPORTS = [
     "ClusterBasisExpansion",
     "ClusterExpansionBasis",
     "ClusterExpBasis",
@@ -142,6 +145,7 @@ _SUBMODULES = (
     "mpo_higher_order",
     "mpo_automaton",
     "mpo_cluster",
+    "mpo_product",
     "pepo_cluster",
     "diagnostics",
     "pauli_mpo",
