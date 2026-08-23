@@ -86,6 +86,7 @@ from .operators import (
     single_qubit_combo_matrix,
     single_qubit_rotation_matrix,
 )
+from .dense import _as_gate_matrix, _is_unitary, _tableau_from_exact_unitary
 from .paulis import hermitian_pauli_terms, pauli_string
 from .records import (
     DeferredInjectionRecord,
@@ -2067,6 +2068,7 @@ class MpsStabOptimizer:
     def _frame_layout_trace_matrix(self, gate, where, records, *, entry, weight_mode):
         """Trace an explicit physical matrix entry for layout."""
         where = _normalize_sites(where)
+        gate = _as_gate_matrix(gate, len(where))
         dim = gate.shape[0]
         nq = int(round(math.log2(dim)))
         if 2 ** nq != dim or gate.shape != (dim, dim):
@@ -2074,15 +2076,8 @@ class MpsStabOptimizer:
         if len(where) != nq:
             raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
 
-        import stim
-
-        tableau = None
+        tableau = _tableau_from_exact_unitary(gate)
         gate_is_unitary = _is_unitary(gate)
-        if gate_is_unitary:
-            try:
-                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-            except (ValueError, RuntimeError):
-                tableau = None
         if tableau is not None:
             self.state.do_tableau(tableau, where)
             return
@@ -4029,6 +4024,23 @@ class MpsStabOptimizer:
         return {int(q): self._frame_terms("Z", int(q)) for q in order}
 
     @staticmethod
+    def _resolve_sample_basis(basis, n, rng):
+        """Resolve a product Pauli-basis policy for a sampling call."""
+        # Reuse the mature sampler's validation, including ``random`` and
+        # per-site patterns, without importing the public sampler at module
+        # import time (which would introduce an optimizer/sampling cycle).
+        from ...sampling.samplers import _resolve_measurement_basis
+
+        return _resolve_measurement_basis(basis, int(n), rng=rng)
+
+    def _sample_frame_terms(self, basis, order):
+        """Return frame images for a resolved local measurement basis."""
+        return {
+            int(q): self._frame_terms(basis[int(q)], int(q))
+            for q in order
+        }
+
+    @staticmethod
     def _prob_zero_from_expectation(exp: float) -> float:
         """Return clipped ``P(bit=0)`` for a computational-basis Z readout."""
         return min(max(0.5 * (1.0 + float(exp)), 0.0), 1.0)
@@ -4075,6 +4087,82 @@ class MpsStabOptimizer:
         self._apply_projector(terms, sign, outcome)
         return probability
 
+    def _sample_basis_arrays(
+        self,
+        shots: int,
+        *,
+        basis="Z",
+        seed=None,
+        order=None,
+        shuffle: bool = True,
+        resolved_basis=None,
+    ):
+        """Sample product-Pauli outcomes and return bits, probabilities, basis."""
+        shots = int(shots)
+        if shots < 0:
+            raise ValueError("shots must be nonnegative.")
+        rng = self._sample_rng(seed)
+        if resolved_basis is None:
+            resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
+        else:
+            resolved_basis = tuple(str(axis).upper() for axis in resolved_basis)
+            if len(resolved_basis) != self.n or any(
+                axis not in {"X", "Y", "Z"} for axis in resolved_basis
+            ):
+                raise ValueError(
+                    "resolved_basis must contain exactly one X/Y/Z axis per qubit."
+                )
+        order = self._bit_measurement_order(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
+        bits = np.empty((shots, self.n), dtype=np.int8)
+        probabilities = np.empty(shots, dtype=float)
+        if shots == 0:
+            return bits, probabilities, resolved_basis
+
+        # Rows sharing a measured prefix share the collapsed coefficient MPS.
+        # The additional prefix probability lets the mature sampler-style API
+        # return the exact Born probability of every emitted configuration.
+        stack = [(self.copy(), 0, 0, shots, 1.0)]
+        while stack:
+            sim, pos, lo, hi, prefix_probability = stack.pop()
+            q = order[pos]
+            count = hi - lo
+            terms, sign = frame_terms[q]
+            expectation = sim._pauli_expectation(terms, sign)
+            p0 = self._prob_zero_from_expectation(expectation)
+            if p0 <= 1e-12:
+                n0 = 0
+            elif p0 >= 1.0 - 1e-12:
+                n0 = count
+            else:
+                n0 = int(rng.binomial(count, p0))
+            mid = lo + n0
+            bits[lo:mid, q] = 0
+            bits[mid:hi, q] = 1
+            p_zero = prefix_probability * p0
+            p_one = prefix_probability * (1.0 - p0)
+            if pos + 1 == self.n:
+                probabilities[lo:mid] = p_zero
+                probabilities[mid:hi] = p_one
+                continue
+            both = 0 < n0 < count
+            if n0 > 0:
+                child = sim.copy() if both else sim
+                child._condition_computational_bit(
+                    terms, sign, 0, probability=p0
+                )
+                stack.append((child, pos + 1, lo, mid, p_zero))
+            if n0 < count:
+                sim._condition_computational_bit(
+                    terms, sign, 1, probability=1.0 - p0
+                )
+                stack.append((sim, pos + 1, mid, hi, p_one))
+        if shuffle:
+            permutation = rng.permutation(shots)
+            bits = bits[permutation]
+            probabilities = probabilities[permutation]
+        return bits, probabilities, resolved_basis
+
     @staticmethod
     def _bits_matrix(bitstrings, *, expected_length: int) -> np.ndarray:
         """Normalize one or more bitstrings to an ``(rows, n)`` int8 matrix."""
@@ -4115,8 +4203,9 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
     ) -> np.ndarray:
-        """Sample computational-basis bitstrings ``x ~ |<x|psi>|**2`` (scalable).
+        """Sample product-Pauli basis bitstrings from ``C|nu>`` (scalable).
 
         Uses **perfect (tree) sampling**: shots that share a measured prefix
         share the collapsed state, so the ``Z_0 ... Z_{n-1}`` collapse work is
@@ -4134,45 +4223,19 @@ class MpsStabOptimizer:
         to return ``np.packbits(..., axis=1, bitorder="big")`` output with dtype
         ``uint8`` and ``ceil(n / 8)`` columns.
         """
-        rng = self._sample_rng(seed)
         shots = int(shots)
-        out = np.empty((shots, self.n), dtype=np.int8)
-        if shots == 0:
-            return self.pack_bit_samples(out) if packed else out
-        order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
-        # Stack of (collapsed_sim, order_position, lo, hi): rows [lo:hi) share
-        # this state and have measured the prefix order[:order_position].
-        stack = [(self.copy(), 0, 0, shots)]
-        while stack:
-            sim, pos, lo, hi = stack.pop()
-            q = order[pos]
-            count = hi - lo
-            terms, sign = frame_terms[q]
-            exp = sim._pauli_expectation(terms, sign)
-            p0 = self._prob_zero_from_expectation(exp)
-            if p0 <= 1e-12:
-                n0 = 0
-            elif p0 >= 1.0 - 1e-12:
-                n0 = count
-            else:
-                n0 = int(rng.binomial(count, p0))
-            mid = lo + n0
-            out[lo:mid, q] = 0
-            out[mid:hi, q] = 1
-            if pos + 1 == self.n:
-                continue  # last qubit: bits written, nothing left to collapse
-            both = 0 < n0 < count
-            if n0 > 0:
-                s0 = sim.copy() if both else sim
-                s0._condition_computational_bit(terms, sign, 0, probability=p0)
-                stack.append((s0, pos + 1, lo, mid))
-            if n0 < count:
-                sim._condition_computational_bit(terms, sign, 1, probability=1.0 - p0)
-                stack.append((sim, pos + 1, mid, hi))
-        if shuffle:
-            rng.shuffle(out, axis=0)
+        out, _probs, _resolved_basis = self._sample_basis_arrays(
+            shots,
+            basis=basis,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+        )
         return self.pack_bit_samples(out) if packed else out
+
+    def sample_basis(self, shots: int = 1, *, basis="Z", **kwargs):
+        """Explicit alias for :meth:`sample_bits` with a Pauli basis policy."""
+        return self.sample_bits(shots, basis=basis, **kwargs)
 
     def sample_bitstrings(
         self,
@@ -4182,6 +4245,7 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
     ) -> np.ndarray:
         """Alias for :meth:`sample_bits` with a more explicit public name."""
         return self.sample_bits(
@@ -4190,10 +4254,11 @@ class MpsStabOptimizer:
             order=order,
             shuffle=shuffle,
             packed=packed,
+            basis=basis,
         )
 
-    def probability_bits(self, bits, *, order=None) -> float:
-        """Return ``|<bits|psi>|**2`` via chain-rule conditionals (scalable).
+    def probability_bits(self, bits, *, order=None, basis="Z", seed=None) -> float:
+        """Return a product-Pauli outcome probability via chain-rule conditionals.
 
         Multiplies the per-qubit conditional Born probabilities along a forced
         computational-basis measurement of a copy, so it costs ``O(n)`` MPS
@@ -4202,8 +4267,10 @@ class MpsStabOptimizer:
         ``order`` accepts the same values as :meth:`sample_bits`.
         """
         bits = _validate_bits(bits, expected_length=self.n)
+        rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
         tmp = self.copy()
         prob = 1.0
         for q in order:
@@ -4221,8 +4288,10 @@ class MpsStabOptimizer:
             tmp._condition_computational_bit(terms, sign, b, probability=pq)
         return float(prob)
 
-    def probability_bits_many(self, bitstrings, *, order=None) -> np.ndarray:
-        """Return probabilities for many computational-basis bitstrings.
+    def probability_bits_many(
+        self, bitstrings, *, order=None, basis="Z", seed=None
+    ) -> np.ndarray:
+        """Return probabilities for many product-Pauli basis bitstrings.
 
         This is the batched counterpart to :meth:`probability_bits`.  Rows with
         a shared measured prefix share one collapsed simulator copy, so repeated
@@ -4233,8 +4302,10 @@ class MpsStabOptimizer:
         probs = np.zeros(bits.shape[0], dtype=float)
         if bits.shape[0] == 0:
             return probs
+        rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
         stack = [(self.copy(), 0, np.arange(bits.shape[0]), 1.0)]
         while stack:
             sim, pos, indices, prefix_prob = stack.pop()
@@ -4271,13 +4342,17 @@ class MpsStabOptimizer:
                 stack.append((child, pos + 1, idx, branch_prob))
         return probs
 
-    def bitstring_probability(self, bits, *, order=None) -> float:
+    def bitstring_probability(self, bits, *, order=None, basis="Z", seed=None) -> float:
         """Alias for :meth:`probability_bits`."""
-        return self.probability_bits(bits, order=order)
+        return self.probability_bits(bits, order=order, basis=basis, seed=seed)
 
-    def bitstring_probabilities(self, bitstrings, *, order=None) -> np.ndarray:
+    def bitstring_probabilities(
+        self, bitstrings, *, order=None, basis="Z", seed=None
+    ) -> np.ndarray:
         """Alias for :meth:`probability_bits_many`."""
-        return self.probability_bits_many(bitstrings, order=order)
+        return self.probability_bits_many(
+            bitstrings, order=order, basis=basis, seed=seed
+        )
 
     def iter_sample_bits(
         self,
@@ -4288,6 +4363,7 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
     ):
         """Yield computational-basis samples in chunks.
 
@@ -4302,6 +4378,7 @@ class MpsStabOptimizer:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive.")
         rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         done = 0
         while done < shots:
             take = min(chunk_size, shots - done)
@@ -4311,6 +4388,7 @@ class MpsStabOptimizer:
                 order=order,
                 shuffle=shuffle,
                 packed=packed,
+                basis=resolved_basis,
             )
             done += take
 
@@ -4323,6 +4401,7 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
     ):
         """Alias for :meth:`iter_sample_bits` with an explicit bitstring name."""
         yield from self.iter_sample_bits(
@@ -4332,6 +4411,7 @@ class MpsStabOptimizer:
             order=order,
             shuffle=shuffle,
             packed=packed,
+            basis=basis,
         )
 
     # ------------------------------------------------------------------ #
@@ -4415,7 +4495,8 @@ class MpsStabOptimizer:
             # matrix form: (gate_tensor, where)
             gate, where = entry
             self._diagnose_gate_backend(gate)
-            self._apply_matrix(self._gate_to_numpy(gate), where)
+            where = _normalize_sites(where)
+            self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
             return
 
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
@@ -6191,6 +6272,7 @@ class MpsStabOptimizer:
 
     def _apply_matrix(self, gate: np.ndarray, where) -> None:
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
+        gate = _as_gate_matrix(gate, len(where))
         dim = gate.shape[0]
         nq = int(round(math.log2(dim)))
         if 2 ** nq != dim or gate.shape != (dim, dim):
@@ -6198,20 +6280,13 @@ class MpsStabOptimizer:
         if len(where) != nq:
             raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
 
-        import stim
-
         # NOTE: stim.Tableau.from_unitary_matrix does NOT verify unitarity, so a
         # non-unitary matrix that happens to be close to a Clifford (e.g. the
         # near-identity weighted "coin" (1-p)I + pX) would be silently accepted
         # as that Clifford and misapplied. Only attempt the tableau route when the
         # gate is actually unitary.
-        tableau = None
+        tableau = _tableau_from_exact_unitary(gate)
         gate_is_unitary = _is_unitary(gate)
-        if gate_is_unitary:
-            try:
-                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-            except (ValueError, RuntimeError):
-                tableau = None
 
         if tableau is not None:  # Clifford -> tableau update
             self.state.do_tableau(tableau, where)
@@ -6756,12 +6831,6 @@ def _looks_like_stream(gates) -> bool:
         return False
     # First element is a str/number -> ``gates`` is a single named entry.
     return False
-
-
-def _is_unitary(gate: np.ndarray, tol: float = 1e-9) -> bool:
-    """Return whether ``gate`` is unitary within ``tol``."""
-    g = np.asarray(ar.to_numpy(gate), dtype=complex)
-    return np.allclose(g.conj().T @ g, np.eye(g.shape[0]), atol=tol)
 
 
 def _zyz_angles(gate: np.ndarray):

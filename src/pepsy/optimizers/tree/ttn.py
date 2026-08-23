@@ -442,6 +442,10 @@ def _native_qr_options_for_tensor(tensor):
 def _native_qr_split_tensor(tensor, **kwargs):
     """Split one tree tensor using the native graded QR policy."""
     kwargs.update(_native_qr_options_for_tensor(tensor))
+    # QR is a lossless gauge move. Keep it independent from the optimizer's
+    # truncating SVD cutoff even though Quimb's shared split signature exposes
+    # a nonzero cutoff default.
+    kwargs.setdefault("cutoff", 0.0)
     if _is_symmray_array(tensor.data):
         kwargs.setdefault("fn", _native_qr_block_scaled)
     kwargs.setdefault("method", "qr")

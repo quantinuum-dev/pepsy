@@ -36,6 +36,7 @@ from ..stabilizer_tn.records import (
     StabilizerMpsSettingsAdvice,
     StabilizerTreeRunResult,
 )
+from ..stabilizer_tn.dense import _as_gate_matrix, _tableau_from_exact_unitary
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
 from ..mps.optimizer import conditional_event_parts, submpo_event_parts
@@ -140,19 +141,6 @@ def _looks_like_single_entry(gates):
     if isinstance(gates[0], str):
         return True
     return len(gates) == 2 and _is_matrix_like(gates[0])
-
-
-def _is_unitary(gate):
-    """Return whether a dense gate is unitary to the STN tolerance."""
-    gate = np.asarray(ar.to_numpy(gate))
-    if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
-        return False
-    return np.allclose(
-        gate.conj().T @ gate,
-        np.eye(gate.shape[0], dtype=gate.dtype),
-        rtol=1e-10,
-        atol=1e-12,
-    )
 
 
 def _apply_dense_gate(state, gate, where, n):
@@ -1279,22 +1267,15 @@ class TreeStabOptimizer:
         if not isinstance(head, str):
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            gate = np.asarray(ar.to_numpy(entry[0]))
             where = _normalize_sites(entry[1])
+            gate = _as_gate_matrix(entry[0], len(where))
             if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
                 raise ValueError(f"Gate matrix must be square, got {gate.shape}.")
             dim = int(gate.shape[0])
             nq = int(round(math.log2(dim)))
             if 2 ** nq != dim or len(where) != nq:
                 raise ValueError(f"Gate shape {gate.shape} does not match where={where!r}.")
-            import stim
-
-            tableau = None
-            if _is_unitary(gate):
-                try:
-                    tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-                except (ValueError, RuntimeError):
-                    tableau = None
+            tableau = _tableau_from_exact_unitary(gate)
             if tableau is not None:
                 self.state.do_tableau(tableau, where)
                 return
@@ -1909,8 +1890,9 @@ class TreeStabOptimizer:
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             gate = entry[0]
+            where = _normalize_sites(entry[1])
             self._diagnose_gate_backend(gate)
-            self._apply_matrix(gate, entry[1])
+            self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
             return
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
 
@@ -1928,7 +1910,7 @@ class TreeStabOptimizer:
 
     def _apply_matrix(self, gate, where):
         where = _normalize_sites(where)
-        gate = np.asarray(ar.to_numpy(gate), dtype=complex)
+        gate = _as_gate_matrix(gate, len(where))
         if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
             raise ValueError(f"Gate matrix must be square, got shape {gate.shape}.")
         dim = int(gate.shape[0])
@@ -1937,17 +1919,7 @@ class TreeStabOptimizer:
             raise ValueError(
                 f"Gate shape {gate.shape} does not match where={where!r}."
             )
-        import stim
-
-        gate_is_unitary = _is_unitary(gate)
-        tableau = None
-        if gate_is_unitary:
-            # Stim does not verify unitarity itself, so this route is guarded
-            # explicitly before attempting Clifford recognition.
-            try:
-                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-            except (ValueError, RuntimeError):
-                tableau = None
+        tableau = _tableau_from_exact_unitary(gate)
         if tableau is not None:
             self.state.do_tableau(tableau, where)
             return
@@ -3826,6 +3798,19 @@ class TreeStabOptimizer:
 
     def norm(self):
         return self._tree.norm()
+
+    def shift_orthogonality_center(self, node=None):
+        """Move the coefficient-tree centre before a canonical norm readout.
+
+        ``TreeOptimizer`` already performs incremental centre movement along
+        the tree geodesic. Exposing the same operation on the stabilizer
+        wrapper keeps ordinary Tree and TreeStab diagnostics on one public
+        path without enabling expensive singular-spectrum tracking.
+        """
+        if node is None:
+            node = self._tree.plan.root
+        self._tree.shift_orthogonality_center(node)
+        return self
 
     def backend_info(self):
         """Return the coefficient TTN backend, dtype, and device."""
