@@ -798,6 +798,70 @@ def test_mps_optimizer_quimb_mode_aliases(mode, method):
 
 
 @pytest.mark.parametrize(
+    ("mode", "canonical", "method"),
+    [
+        ("direct", "quimb-direct", "direct"),
+        ("dm", "quimb-dm", "dm"),
+        ("zipup", "quimb-zipup", "zipup"),
+        ("src", "quimb-src", "src"),
+        ("srcmps", "quimb-srcmps", "srcmps"),
+        ("fit-projector", "quimb-fit-projector", "fit-projector"),
+    ],
+)
+def test_mps_optimizer_accepts_bare_quimb_method_modes(mode, canonical, method):
+    """Bare Quimb method names normalize to the qualified backend mode."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode=mode,
+    )
+
+    assert optimizer.mode == canonical
+    assert optimizer._is_mpo_mode(mode)
+    assert optimizer._mode_mpo_method(mode) == method
+
+
+def test_mps_optimizer_fit_name_remains_dmrg_alias():
+    """Bare ``fit`` remains DMRG while Quimb FIT stays qualified."""
+    dmrg = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="fit",
+    )
+    quimb_fit = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="quimb-fit",
+    )
+
+    assert dmrg.mode == "dmrg"
+    assert quimb_fit.mode == "quimb-fit"
+
+
+@pytest.mark.parametrize("mode", ["src", "zipup"])
+def test_mps_optimizer_runs_bare_quimb_method_mode(mode):
+    """Bare SRC and zip-up names select the corresponding replay backend."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert optimizer.mode == f"quimb-{mode}"
+    assert out.max_bond() <= 2
+
+
+@pytest.mark.parametrize(
     "mode, expected_desc",
     [
         ("quimb", "quimb-direct"),

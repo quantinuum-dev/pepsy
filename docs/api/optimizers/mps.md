@@ -66,9 +66,12 @@ policy. `pepsy.reset_linalg_registrations(backend="torch")` restores native
 Torch and Quimb split registrations.
 
 `MpsOptimizer` consumes canonical bundled gate streams of the form
-`[(gate, where), ...]`. In `mode="quimb-<method>"` (or the direct alias
-`mode="quimb"`) the stream can also contain explicit sub-MPO events. The
-legacy `mode="mpo-<method>"` and `mode="mpo"` spellings remain supported.
+`[(gate, where), ...]`. Bare Quimb compression names such as `mode="src"`,
+`mode="zipup"`, and `mode="direct"` are accepted; they normalize internally
+to `quimb-<method>`. The qualified `mode="quimb-<method>"` forms, direct alias
+`mode="quimb"`, and legacy `mode="mpo-<method>"` / `mode="mpo"` spellings
+remain supported. The bare name `fit` remains the DMRG alias, so Quimb's
+`fit` compression method is selected as `mode="quimb-fit"`.
 These events represent already-factorized nonlocal operators:
 
 ```python
@@ -143,7 +146,7 @@ simulator = pepsy.MpsOptimizer(
     initial_mps,
     [("h", 0), ("x_error", 1e-3, 0), ("measure", "Z", 0)],
     chi=64,
-    mode="quimb-direct",
+    mode="direct",
 )
 result = simulator.run(shots=10_000, strategy="auto", seed=7)
 ```
@@ -195,7 +198,7 @@ The practical shot-mode matrix is:
 
 | mode | trajectory status |
 | --- | --- |
-| `quimb-<method>` | selected Quimb 1D compression; `quimb-direct` is the default and `quimb` is its direct alias |
+| bare `<method>` / `quimb-<method>` | selected Quimb 1D compression; `direct` is the preferred spelling, while `quimb` is its direct alias |
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
 | `dmrg`, `dmrg1/2/3` | variational compressed replay; `dmrg2` is the production default |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
@@ -203,8 +206,10 @@ The practical shot-mode matrix is:
 | `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
-The `quimb-<method>` names are passed to Quimb's native 1D compression
-dispatcher. The legacy `mpo-<method>` names remain accepted as aliases.
+Bare Quimb method names and their `quimb-<method>` qualified forms are passed
+to Quimb's native 1D compression dispatcher. The legacy `mpo-<method>` names
+remain accepted as aliases. The bare `fit` name is reserved for DMRG; use
+`quimb-fit` when selecting Quimb's one-site FIT compressor.
 Oversampled methods retain Quimb's two-stage structure: an intermediate larger
 bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
@@ -470,8 +475,9 @@ convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
 MPO/DMRG/fallback counts, `~F` (the cumulative norm fidelity), and
 `bond=current/chi`. `~F` is converted from the log-survival ledger only for
 display; accumulation remains logarithmic and numerically stable.
-The progress-bar descriptor is mode-qualified: for example, `quimb-src` and
-`mpo-src` are shown directly, while the `quimb` and `mpo` aliases display as
+The progress-bar descriptor is mode-qualified: bare `src` and `zipup` inputs
+are displayed canonically as `quimb-src` and `quimb-zipup`; legacy `mpo-*`
+forms remain visible as supplied. The `quimb` and `mpo` aliases display as
 `quimb-direct` and `mpo-direct`. Named DMRG schedules likewise display as
 `dmrg1`, `dmrg2`, or `dmrg3`; generic `dmrg` and its `fit` alias display as
 `dmrg`.

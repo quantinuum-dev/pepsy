@@ -10,8 +10,10 @@ For repeated layout-aware evolution, :meth:`MpsOptimizer.apply_layout`
 installs a persistent position-to-logical mapping and never performs a
 swap-back; logical readout is available through ``logical_order``,
 ``remap_sample``, and ``to_dense``.
-``mode="quimb-direct"`` (with ``"quimb"`` as its direct alias and the
-legacy ``"mpo-<method>"`` / ``"mpo"`` spellings retained) also accepts
+Bare Quimb method names such as ``mode="src"`` and ``mode="zipup"`` are
+accepted and normalized internally to ``"quimb-<method>"``. The explicit
+``mode="quimb-direct"`` spelling (with ``"quimb"`` as its direct alias and
+the legacy ``"mpo-<method>"`` / ``"mpo"`` spellings retained) also accepts
 explicit sub-MPO events of the form
 ``("submpo", mpo, where)`` or
 ``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
@@ -1137,7 +1139,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
         applied on the ket family only (state evolution), using :func:`pepsy.operators.gates.gate`.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
-        For ``mode="quimb-<method>"`` (or aliases ``"quimb"`` and legacy
+        For a bare Quimb method such as ``mode="src"`` or the qualified
+        ``mode="quimb-<method>"`` (with aliases ``"quimb"`` and legacy
         ``"mpo-<method>"`` / ``"mpo"``), entries may
         also have the explicit sub-MPO form
         ``("submpo", mpo, where)`` or mapping form
@@ -1162,16 +1165,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
         committed DMRG/MPO results at or below this limit.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
-        Optimization backend. ``"fit"`` is the clear alias of the historical
-        ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
-        sweeps, then one-site refinement; once every bond reaches its
-        attainable physical/``chi`` ceiling, it latches one-site updates for
-        the rest of the replay. An already-capped window starts directly with
-        one-site sweeps. ``"dmrg2"`` uses two-site updates for the required
-        warm-up (two sweeps by default), then one-site refinement. ``"dmrg3"``
-        follows the same fixed warm-up policy with three-site updates before
-        one-site refinement.
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
+            Optimization backend. ``"fit"`` is the clear alias of the historical
+            ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
+            sweeps, then one-site refinement; once every bond reaches its
+            attainable physical/``chi`` ceiling, it latches one-site updates
+            for the rest of the replay. An already-capped window starts
+            directly with one-site sweeps. ``"dmrg2"`` uses two-site updates
+            for the required warm-up (two sweeps by default), then one-site
+            refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
+            three-site updates before one-site refinement.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -1242,6 +1245,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "su",
             "exact",
         }
+        | _MPO_COMPRESSION_METHODS
         | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
         | {f"quimb-{method}" for method in _MPO_COMPRESSION_METHODS}
     )
@@ -1267,6 +1271,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # the same implementation and are normalized to ``dmrg``.
         if mode_norm == "fit" or mode_norm in cls._DMRG_MODE_ALIASES:
             mode_norm = "dmrg"
+        elif mode_norm in _MPO_COMPRESSION_METHODS:
+            # Bare Quimb method names are the user-facing spelling. Keep the
+            # qualified form as the canonical internal mode so old
+            # ``quimb-*`` and ``mpo-*`` aliases continue to behave identically.
+            mode_norm = f"quimb-{mode_norm}"
         if mode_norm not in cls._ALLOWED_MODES:
             raise ValueError(f"Unknown mode: {mode}")
         return mode_norm
@@ -1275,8 +1284,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _is_mpo_mode(cls, mode):
         """Return whether ``mode`` selects Quimb compression."""
         mode_norm = str(mode).strip().lower()
-        return mode_norm in {"mpo", "quimb"} or mode_norm.startswith(
-            ("mpo-", "quimb-")
+        return (
+            mode_norm in {"mpo", "quimb"}
+            or mode_norm in _MPO_COMPRESSION_METHODS - {"fit"}
+            or mode_norm.startswith(("mpo-", "quimb-"))
         )
 
     @classmethod
@@ -1285,6 +1296,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mode_norm = str(mode).strip().lower()
         if mode_norm in {"mpo", "quimb"}:
             return f"{mode_norm}-direct"
+        if mode_norm in _MPO_COMPRESSION_METHODS - {"fit"}:
+            return f"quimb-{mode_norm}"
         return mode_norm
 
     @classmethod
@@ -1293,6 +1306,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mode_norm = str(mode).strip().lower()
         if mode_norm in {"mpo", "quimb"}:
             return "direct"
+        if mode_norm in _MPO_COMPRESSION_METHODS - {"fit"}:
+            return cls._normalize_submpo_method(mode_norm)
         for prefix in ("quimb-", "mpo-"):
             if mode_norm.startswith(prefix):
                 return cls._normalize_submpo_method(mode_norm[len(prefix) :])
@@ -3987,7 +4002,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Pepsy's ordinary compression paths while preserving Quimb's
             method-specific native default for the MPO path, notably
             ``"rsum1"`` for ``method="dm"``. Pass a string to override it.
-        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
+        mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         k_2q_batch : int, default=1
@@ -4018,7 +4033,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Numerical threshold used by the final normalization path.
         submpo_method : str | None, default=None
             Optional compression-method override for the MPO family. If
-            omitted, ``mode="quimb-<method>"`` selects the method and
+            omitted, a bare Quimb method such as ``mode="src"`` or the
+            qualified ``mode="quimb-<method>"`` selects the method;
             ``mode="quimb"`` selects ``"direct"``. The legacy
             ``mode="mpo-<method>"`` / ``mode="mpo"`` spellings remain valid.
             The method
