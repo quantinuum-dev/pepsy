@@ -72,6 +72,7 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ...tensors.core import tn_fidelity
 from ...operators.gates import (
     _normalize_gate_entries,
     gate as apply_gate,
@@ -3947,7 +3948,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=True,
-        stabilize_unitary=True,
+        stabilize_unitary=False,
         fit_stabilize_unitary=_DEPRECATED_OPTION,
         timing=False,
         timing_sync_device=False,
@@ -4186,13 +4187,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
             disable it only for diagnostics that deliberately repeat sweeps.
-        stabilize_unitary : bool, default=True
-            Restore the raw working norm after each unitary FIT compression
-            and each compressed mixed/MPO/swap/permutation/SVD update. The
-            discarded scale is not stored in ``p.exponent``. This keeps
-            complex64 tensors near unit scale during deep streams. Pass
-            ``non_unitary=True`` for norm-changing streams to disable unitary
-            restoration.
+        stabilize_unitary : bool, default=False
+            By default, retain the raw norm change after each unitary FIT or
+            mixed/MPO/swap/permutation/SVD compression so norm loss remains
+            observable. Set this to ``True`` to restore the working norm for
+            numerical scale control; the discarded scale is not stored in
+            ``p.exponent``. Pass ``non_unitary=True`` for norm-changing
+            streams.
         fit_stabilize_unitary : optional
             Deprecated compatibility alias for ``stabilize_unitary``.
         timing : bool, default=False
@@ -4478,7 +4479,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         stabilize_unitary = self._resolve_legacy_fit_option(
             canonical_name="stabilize_unitary",
             canonical_value=stabilize_unitary,
-            canonical_default=True,
+            canonical_default=False,
             legacy_name="fit_stabilize_unitary",
             legacy_value=fit_stabilize_unitary,
         )
@@ -4833,9 +4834,57 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         The result is ``None`` before a DMRG/FIT update has completed and for
         replay modes that do not use FIT. The returned dictionary is
-        independent of the optimizer's internal diagnostic state.
+        independent of the optimizer's internal diagnostic state. Successful
+        FIT updates also include ``fit_overlap_fidelity`` and
+        ``fit_overlap_infidelity``: a direct contraction of the fitted MPS
+        with the disposable exact FIT target. Those fields are target-overlap
+        diagnostics and are intentionally separate from norm-survival fields
+        such as ``cumulative_norm_fidelity``. If the optional contraction is
+        unavailable for a backend, both values are ``None`` and
+        ``fit_overlap_error`` records the diagnostic failure without rejecting
+        the successful FIT update.
         """
         return deepcopy(self._last_dmrg_fit_diagnostics)
+
+    def _fit_overlap_diagnostics(self, target, fitted):
+        """Return the optional direct FIT-target overlap readout.
+
+        This is deliberately separate from the automatic norm ledger.  The
+        norm ledger is available for every compression backend and only reads
+        the retained canonical centre.  This contraction compares the final
+        FIT MPS with the disposable exact DMRG target, so it is a genuine
+        target-state overlap but is specific to DMRG and costs an additional
+        contraction.
+        """
+        # DMRG already paid for the target construction. Keep this diagnostic
+        # contraction deterministic and local: the high-level ``auto-hq``
+        # optimizer can create a multiprocessing pool, which is unnecessary
+        # for a one-window overlap and unavailable in restricted runtimes.
+        contraction_opt = self.contraction_opt
+        if contraction_opt is None or (
+            isinstance(contraction_opt, str)
+            and contraction_opt.strip().lower() in {"auto", "auto-hq"}
+        ):
+            contraction_opt = "greedy"
+        try:
+            overlap = tn_fidelity(
+                target.copy(),
+                fitted.copy(),
+                contraction_opt=contraction_opt,
+            )
+            overlap = float(ar.do("real", overlap))
+        except Exception as exc:  # diagnostic only; FIT result remains valid
+            return {
+                "fit_overlap_fidelity": None,
+                "fit_overlap_infidelity": None,
+                "fit_overlap_error": f"{type(exc).__name__}: {exc}",
+            }
+        overlap = min(1.0, max(0.0, overlap))
+        return {
+            "fit_overlap_fidelity": overlap,
+            "fit_overlap_infidelity": float(1.0 - overlap),
+            "fit_overlap_error": None,
+        }
 
     def _execute_mode(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -4872,7 +4921,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=True,
-        stabilize_unitary=True,
+        stabilize_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
     ):
@@ -5954,6 +6003,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "norm_fidelity_raw": None if raw is None else float(raw),
             "norm_fidelity": None if survival is None else float(survival),
             "norm_infidelity": None if survival is None else float(1.0 - survival),
+            # Explicit names for the local compression metric.  The shorter
+            # ``norm_fidelity`` spellings below are retained for compatibility,
+            # but neither metric is a target-state overlap unless a reference
+            # state is supplied separately.
+            "local_norm_fidelity": (
+                None if survival is None else float(survival)
+            ),
+            "local_norm_infidelity": (
+                None if survival is None else float(1.0 - survival)
+            ),
             "branch_probability": (
                 None
                 if branch_probability is None
@@ -5981,20 +6040,27 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             event["cumulative_norm_fidelity"] = cumulative
             event["cumulative_norm_infidelity"] = cumulative_infidelity
+            event["cumulative_compression_fidelity"] = cumulative
+            event["cumulative_compression_infidelity"] = cumulative_infidelity
         else:
             event["cumulative_norm_fidelity"] = None
             event["cumulative_norm_infidelity"] = None
+            event["cumulative_compression_fidelity"] = None
+            event["cumulative_compression_infidelity"] = None
         self.norm_events.append(event)
         if physical_boundary:
             self._invalidate_unitary_norm_baseline()
         return event
 
     def norm_diagnostics(self):
-        """Return automatic cumulative norm-survival diagnostics.
+        """Return automatic norm-based compression diagnostics.
 
-        The reported infidelity is a norm-survival/compression proxy. Born
-        probabilities for stochastic branches are retained in ``norm_events``
-        but deliberately do not reduce the cumulative compression fidelity.
+        ``*_norm_fidelity`` is the retained canonical-center norm ratio.  It
+        is a compression/norm-survival proxy, not a directional overlap with
+        an independently supplied target state.  DMRG target overlap, when
+        available, is reported separately by :meth:`get_fit_diagnostics`.
+        Born probabilities for stochastic branches remain in ``norm_events``
+        and do not reduce cumulative compression fidelity.
         """
         valid = [event for event in self.norm_events if event.get("valid")]
         physical = [
@@ -6010,6 +6076,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             survival = float(math.exp(self._norm_log_survival))
             infidelity = float(-math.expm1(self._norm_log_survival))
         current = valid[-1] if valid else None
+        state_norm = self._real_float(ar.do("abs", self.p.norm()))
         event_survivals = [float(event["norm_fidelity"]) for event in valid]
         event_infidelities = [
             float(event["norm_infidelity"]) for event in valid
@@ -6036,9 +6103,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "completed_segment_infidelities": event_infidelities,
             "norm_survival": survival,
             "norm_infidelity": infidelity,
+            "local_norm_fidelity": (
+                None if current is None else current.get("local_norm_fidelity")
+            ),
+            "local_norm_infidelity": (
+                None if current is None else current.get("local_norm_infidelity")
+            ),
+            "cumulative_norm_fidelity": survival,
+            "cumulative_norm_infidelity": infidelity,
+            "cumulative_compression_fidelity": survival,
+            "cumulative_compression_infidelity": infidelity,
             "fidelity": survival,
             "infidelity": infidelity,
             "norm": None if survival is None else float(survival**0.5),
+            "state_norm": state_norm,
+            "cumulative_norm": (
+                None if survival is None else float(survival**0.5)
+            ),
             "total_survival_proxy": survival,
             "total_infidelity_proxy": infidelity,
             "total_norm_proxy": None if survival is None else float(survival**0.5),
@@ -7067,7 +7148,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=True,
-        stabilize_unitary=True,
+        stabilize_unitary=False,
     ):
         """Apply one mixed-mode step through the DMRG backend."""
         self._run_mix_dmrg(
@@ -7119,7 +7200,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=True,
-        stabilize_unitary=True,
+        stabilize_unitary=False,
     ):
         """Apply a contiguous two-site batch through the DMRG backend."""
         self._run_mix_dmrg(
@@ -7556,7 +7637,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=True,
-        stabilize_unitary=True,
+        stabilize_unitary=False,
         non_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
@@ -8005,7 +8086,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=True,
-        stabilize_unitary=True,
+        stabilize_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
     ):
@@ -8249,6 +8330,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             ],
                             "random_initialization": random_initialization,
                             "target_strategy": fit_target_strategy,
+                            # Filled only after FIT succeeds.  This is a
+                            # target-overlap diagnostic, not norm survival.
+                            "fit_overlap_fidelity": None,
+                            "fit_overlap_infidelity": None,
+                            "fit_overlap_error": None,
                         }
 
                     fit_center = fit.final_center_site
@@ -8329,10 +8415,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 center_site=fit_center,
                                 restore=stabilize_unitary,
                             )
+                        fit_overlap = (
+                            {}
+                            if self.mode == "mix"
+                            else self._fit_overlap_diagnostics(p_g, fit.p)
+                        )
                         self._last_dmrg_fit_diagnostics.update(
                             {
                                 "backend": "fit",
                                 "fallback": False,
+                                **fit_overlap,
                             }
                         )
                     self._maybe_lock_dmrg1_one_site_phase()
@@ -8503,6 +8595,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             ],
                             "random_initialization": random_initialization,
                             "target_strategy": fit_target_strategy,
+                            # Filled only after FIT succeeds.  This is a
+                            # target-overlap diagnostic, not norm survival.
+                            "fit_overlap_fidelity": None,
+                            "fit_overlap_infidelity": None,
+                            "fit_overlap_error": None,
                         }
 
                     fit_center = fit.final_center_site
@@ -8583,10 +8680,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 center_site=fit_center,
                                 restore=stabilize_unitary,
                             )
+                        fit_overlap = (
+                            {}
+                            if self.mode == "mix"
+                            else self._fit_overlap_diagnostics(p_g, fit.p)
+                        )
                         self._last_dmrg_fit_diagnostics.update(
                             {
                                 "backend": "fit",
                                 "fallback": False,
+                                **fit_overlap,
                             }
                         )
                     self._maybe_lock_dmrg1_one_site_phase()

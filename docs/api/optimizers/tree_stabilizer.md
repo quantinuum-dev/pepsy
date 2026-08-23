@@ -185,5 +185,15 @@ the caller's operator and the TTN's canonical/isometry metadata. Stim gate
 classification remains a NumPy-side operation, while TreeOptimizer applies
 the coefficient update on the inferred backend.
 
+TreeStab's `norm_diagnostics()` keeps two coefficient-state diagnostics
+separate. `local_norm_fidelity` and `cumulative_norm_fidelity` are cheap
+canonical-centre retained-norm compression metrics, controlled by
+`track_infidelity` and available independently of `track_truncation`.
+`track_truncation=True` additionally enables the expensive
+per-edge singular-spectrum and discarded-weight records returned by
+`truncation_report()` and `get_infidelity_samples()`. Neither metric is a
+physical target-state overlap; the tableau frame does not turn a norm proxy
+into directional fidelity.
+
 
 > API details are maintained as handwritten Markdown in this page.

@@ -699,6 +699,44 @@ def test_tree_truncation_infidelity_compatibility_trace():
     assert opt.get_normalizations() == []
 
 
+def test_tree_norm_ledger_is_independent_of_spectrum_tracking():
+    """Tree norm fidelity remains available without per-edge SVD probes."""
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        [(h, 0), (cnot, (0, 3))],
+        n=4,
+        chi=1,
+        track_truncation=False,
+    )
+
+    diagnostics = opt.norm_diagnostics()
+    assert diagnostics["norm_tracking"] is True
+    assert diagnostics["truncation_tracking"] is False
+    assert diagnostics["cumulative_norm_fidelity"] == pytest.approx(0.5)
+    assert diagnostics["cumulative_norm_infidelity"] == pytest.approx(0.5)
+    assert len(opt.get_norm_events()) == 2
+    assert opt.get_infidelity_samples() == []
+
+
+def test_tree_norm_ledger_can_exclude_known_nonunitary_updates():
+    """Physical filter scale must not be labeled retained compression loss."""
+    filter_gate = np.diag([1.0, 0.25]).astype(complex)
+    opt = TreeOptimizer(None, n=2, chi=1, track_truncation=False, run=False)
+
+    opt.apply_subtree_operator(filter_gate, (0,), track_norm=False)
+
+    assert opt.get_norm_events() == []
+    assert opt.norm_diagnostics()["cumulative_norm_fidelity"] is None
+
+    opt.apply_1q(np.eye(2, dtype=complex), 0)
+    assert len(opt.get_norm_events()) == 1
+    assert opt.get_norm_events()[0]["local_norm_fidelity"] == pytest.approx(1.0)
+
+
 def test_tree_truncation_survival_accumulates_in_log_space():
     """Many local survival factors remain stable in the cumulative trace."""
     opt = TreeOptimizer(None, n=2, chi=2, track_truncation=True, run=False)

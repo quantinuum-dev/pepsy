@@ -422,7 +422,8 @@ delegate to the state.
 
 ## Multi-qubit / sub-MPO application
 
-`apply_subtree_operator(op, where, *, max_bond=None, cutoff=None, renormalize=False)`
+`apply_subtree_operator(op, where, *, max_bond=None, cutoff=None,
+renormalize=False, track_norm=True)`
 applies a general operator on `k >= 1` qubits as a single object, the one-shot
 generalisation of the two-qubit gate: a `k`-qubit gate, a multi-site
 **non-unitary / Kraus** operator, or a whole **Trotter block**. It is the tree
@@ -456,6 +457,11 @@ default to the optimizer's `chi` / `cutoff`. `apply_gate` dispatches `len(where)
 larger support to `apply_subtree_operator`; the cost scales with the operator's
 spread and factor ranks, using recursive edge messages rather than one dense
 state tensor for the whole spanning subtree.
+
+`track_norm=True` records the cheap path-level retained-norm ledger. Set it to
+`False` for a known non-unitary operator: its physical norm change is then not
+misreported as compression loss. The same keyword is accepted by
+`apply_gate`, `apply_1q`, `apply_2q`, `apply_submpo`, and `apply_pauli_sum`.
 
 An explicit MPS-style sub-MPO marker, `("submpo", mpo, where)` (or the
 equivalent mapping form), is accepted in a TreeOptimizer stream. Quimb MPOs are
@@ -508,8 +514,9 @@ oversubscribing the small tree contractions, `subtree_workers=1` keeps the
 serial path allocation-free, `profile=False` avoids timing overhead, and
 `track_truncation=False` avoids full-spectrum diagnostic SVDs, while
 `track_bond_diagnostics=False` avoids live-bond scans. `record_history` and
-`track_infidelity` retain the established API defaults; the latter only
-adds norm-based progress readouts when a progress bar is requested.
+`track_infidelity` retain the established API defaults; the latter enables the
+cheap canonical-centre norm ledger and its progress-bar readout. It does not
+enable spectrum probes.
 
 Warnings are reserved for an actionable behavior change: enabling
 `track_truncation=True` emits one diagnostic-performance warning, explicit
@@ -520,7 +527,7 @@ proof-reuse optimizations. Only the QR phase safeguard and graded reduced-core
 SVD are native Symmray specializations; dense arrays continue through Quimb's
 ordinary QR/SVD with the same cutoff, path, and truncation semantics.
 
-`TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
+`TreeOptimizer.apply_submpo(..., track_norm=True)` is the public form for an explicit MPO of
 arbitrary support. It losslessly QR-routes its virtual bonds, then uses its
 supplied (or configured) `max_bond` / `cutoff` in one final canonical sweep over
 the affected subtree. Existing bonds at or below `max_bond` take a lossless
@@ -1325,6 +1332,14 @@ scale.
   streams.
   The report also contains gate-level `updates`, grouping
   edge events by support and reporting the cumulative relative loss.
+- `TreeOptimizer.get_norm_events()` and `TreeOptimizer.norm_diagnostics()`
+  expose the separate cheap path-level norm ledger. A Tree event groups the
+  complete QR-thread/compression path for one gate or subtree update and
+  reports `local_norm_fidelity` plus the log-accumulated
+  `cumulative_norm_fidelity`. These are retained-norm compression proxies, not
+  target-state overlaps. They are collected independently of
+  `track_truncation`; use the latter only when per-edge discarded weight and
+  singular-spectrum attribution are required.
 - `TreeOptimizer.convergence_sweep(gates, n, chi_values, ops=...)` replays the
   stream at several `chi` on one fixed tree and returns per-`chi` `max_bond`,
   `norm`, observable `expectations`, `fidelity` against the untruncated state
@@ -1341,8 +1356,10 @@ counts, current bond usage, state norm, and a norm-based truncation proxy.
 Both dense and native fermionic replay report
 `1 - (norm / reference_norm)^2`; the reference is established at run start and
 reset after control or explicitly non-unitary events. This is display-only and
-is not a replacement for the recorded truncation history. The bar is disabled
-by default.
+is not a replacement for either the path-level norm ledger or the recorded
+per-edge truncation history. The bar is disabled by default. The norm ledger is
+the canonical `local_norm_fidelity` / `cumulative_norm_fidelity` diagnostic;
+`track_truncation=True` is the more expensive spectrum-attribution diagnostic.
 For dense two-level qubit TTNs, `measure(q, outcome=None)` projectively
 measures a qubit in the computational basis and returns a bit; `reset(q)`
 returns a qubit to `|0>`. Native fermionic TTNs deliberately do not expose

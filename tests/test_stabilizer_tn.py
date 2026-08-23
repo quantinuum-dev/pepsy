@@ -657,6 +657,34 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
     )
 
 
+def test_stabilizer_mps_exposes_per_update_norm_ratios():
+    """The local STN norm field is one compression update, not a segment total."""
+    rng = np.random.default_rng(1)
+    n = 6
+    stream = [("h", q) for q in range(n)]
+    for _ in range(12):
+        a, b = rng.choice(n, size=2, replace=False)
+        stream.extend([
+            ("cnot", int(a), int(b)),
+            ("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))),
+        ])
+
+    sim = MpsStabOptimizer(n, chi=2, track_infidelity=True).apply(stream)
+    events = sim.get_compression_norm_events()
+    diagnostics = sim.norm_diagnostics()
+
+    assert events
+    assert diagnostics["norm_tracking"] is True
+    assert diagnostics["truncation_tracking"] is None
+    assert diagnostics["local_norm_fidelity"] == pytest.approx(
+        events[-1]["local_norm_fidelity"]
+    )
+    assert diagnostics["cumulative_norm_fidelity"] == pytest.approx(
+        events[-1]["cumulative_norm_fidelity"]
+    )
+    assert diagnostics["compression_events"] == len(events)
+
+
 def test_nonunitary_dense_gate_reports_gdagger_g_infidelity():
     """Non-unitary compression is normalized by the exact G-dagger-G norm."""
     gate = np.diag([1.0, 1.0, 1.0, 0.2]).astype(complex)

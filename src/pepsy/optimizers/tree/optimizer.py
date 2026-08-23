@@ -423,10 +423,10 @@ class TreeOptimizer:
         truncating split/compression and record discarded-weight diagnostics.
         The extra spectrum probes are disabled by default.
     track_infidelity : bool
-        Whether to compute the norm-based progress infidelity and include it
-        in progress-bar updates. This is enabled by default for compatibility
-        with direct TreeOptimizer use, but can be disabled for non-unitary
-        transfer-operator streams where norm changes are physical.
+        Whether to record the cheap canonical-centre norm ledger and include
+        its norm-based progress readout. This is enabled by default for
+        compatibility with direct TreeOptimizer use, but can be disabled for
+        non-unitary transfer-operator streams where norm changes are physical.
     max_intermediate_bond : int, optional
         Conservative preflight limit for the untruncated crossing-bond bound.
         When set, eager replay raises :class:`MemoryError` before tensor work if
@@ -727,11 +727,13 @@ class TreeOptimizer:
         self.truncation_history = []
         self.update_history = []
         self.bond_history = []
-        # Keep the same readout attributes as MpsOptimizer. Tree infidelity
-        # samples are populated when ``track_truncation`` is enabled; without
-        # the spectrum probes the only honest trace is the initial zero.
+        # ``infidelities`` remains the historical spectrum-based Tree trace.
+        # The cheap canonical-centre norm ledger lives separately in
+        # ``norm_events`` so enabling/disabling ``track_truncation`` cannot
+        # change the meaning of the norm-based compression metric.
         self.infidelities = [0.0]
         self.infidelity_samples = []
+        self.norm_events = []
         self.normalizations = []
         self.projection_diagnostics = []
         self._backend_conversion_warnings = set()
@@ -750,6 +752,8 @@ class TreeOptimizer:
         self._active_update = None
         self._update_counter = 0
         self._truncation_log_survival = 0.0
+        self._norm_log_survival = 0.0
+        self._norm_tracking_enabled = True
 
         if tree is None:
             self.layout_finder = TreeLayoutFinder(
@@ -1402,9 +1406,11 @@ class TreeOptimizer:
         self.bond_history.clear()
         self.infidelities[:] = [0.0]
         self.infidelity_samples.clear()
+        self.norm_events.clear()
         self.normalizations.clear()
         self.projection_diagnostics.clear()
         self._truncation_log_survival = 0.0
+        self._norm_log_survival = 0.0
         self._update_counter = 0
         self._attach_profile_sink()
         return self
@@ -2267,8 +2273,14 @@ class TreeOptimizer:
 
     # -- gate application -----------------------------------------------------
 
-    def _begin_update(self, kind, where):
-        """Start aggregating edge truncations for one state update."""
+    def _begin_update(self, kind, where, *, track_norm=True):
+        """Start aggregating diagnostics for one state update.
+
+        ``track_norm`` is explicit because a subtree or MPO update is not
+        necessarily unitary. The cheap norm ledger is meaningful for a
+        unitary update, but not for a general Kraus/filter operator whose
+        physical norm is expected to change.
+        """
         if self._active_update is not None:
             return False
         live_before = (
@@ -2286,7 +2298,19 @@ class TreeOptimizer:
             "live_max_bond_before": live_before,
             "transient_max_bond": live_before,
             "bond_trace": [],
+            "track_norm": bool(track_norm),
         }
+        # A Tree gate can touch several edges, so the norm event is recorded
+        # once for the complete path update. This is the Tree analogue of one
+        # MPS compression event. It deliberately does not inspect singular
+        # spectra; that extra per-edge work remains behind track_truncation.
+        if (
+            self.track_infidelity
+            and bool(track_norm)
+            and self._norm_tracking_enabled
+            and str(kind) in {"gate", "subtree", "submpo"}
+        ):
+            self._active_update["norm_before"] = float(self.norm())
         return True
 
     def _record_transient_bond(self, dimension, *, phase, edge=None):
@@ -2313,6 +2337,55 @@ class TreeOptimizer:
         start = self._active_update["edge_start"]
         del self.truncation_history[start:]
         self._active_update = None
+
+    def _finish_norm_update(self, active):
+        """Record one path-level canonical norm-survival event.
+
+        The resulting metric is a retained-norm compression proxy. It is not
+        a target-state overlap and it is intentionally independent of the
+        optional edge-spectrum records collected by ``track_truncation``.
+        """
+        if not active.get("track_norm", True):
+            return
+        expected = active.get("norm_before")
+        if expected is None:
+            return
+        observed = float(self.norm())
+        log_local = log_fidelity_from_norms(observed, expected)
+        raw_local = (
+            None
+            if (
+                expected <= 0.0
+                or not np.isfinite(expected)
+                or not np.isfinite(observed)
+            )
+            else float((observed / expected) ** 2)
+        )
+        local_fidelity = fidelity_from_log(log_local)
+        local_infidelity = infidelity_from_log(log_local)
+        if self._norm_log_survival == -np.inf or log_local == -np.inf:
+            self._norm_log_survival = -np.inf
+        else:
+            self._norm_log_survival += float(log_local)
+        cumulative_fidelity = fidelity_from_log(self._norm_log_survival)
+        cumulative_infidelity = infidelity_from_log(self._norm_log_survival)
+        self.norm_events.append({
+            "step": int(active["update"]),
+            "kind": active["kind"],
+            "where": tuple(active["support"]),
+            "valid": True,
+            "expected_norm": float(abs(expected)),
+            "observed_norm": float(abs(observed)),
+            "norm_fidelity_raw": raw_local,
+            "norm_fidelity": local_fidelity,
+            "norm_infidelity": local_infidelity,
+            "local_norm_fidelity": local_fidelity,
+            "local_norm_infidelity": local_infidelity,
+            "cumulative_norm_fidelity": cumulative_fidelity,
+            "cumulative_norm_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": cumulative_fidelity,
+            "cumulative_compression_infidelity": cumulative_infidelity,
+        })
 
     def _finish_update(self):
         """Commit one gate-level truncation aggregation."""
@@ -2348,6 +2421,7 @@ class TreeOptimizer:
             "transient_exceeds_chi": transient_over_chi,
             "bond_trace": deepcopy(active.get("bond_trace", [])),
         }
+        self._finish_norm_update(active)
         if self.track_bond_diagnostics:
             self.bond_history.append(deepcopy(bond_record))
         if not self.record_history:
@@ -2453,12 +2527,16 @@ class TreeOptimizer:
             })
         self._active_update = None
 
-    def apply_gate(self, gate, where, *, renormalize=False):
+    def apply_gate(self, gate, where, *, renormalize=False, track_norm=True):
         """Apply a gate and aggregate its edge truncation diagnostics."""
         self._warn_track_truncation_slow()
-        started = self._begin_update("gate", _normalize_where(where))
+        started = self._begin_update(
+            "gate", _normalize_where(where), track_norm=track_norm
+        )
         try:
-            result = self._apply_gate_impl(gate, where, renormalize=renormalize)
+            result = self._apply_gate_impl(
+                gate, where, renormalize=renormalize, track_norm=track_norm
+            )
         except Exception:
             if started:
                 self._abort_update()
@@ -2467,7 +2545,9 @@ class TreeOptimizer:
             self._finish_update()
         return result
 
-    def _apply_gate_impl(self, gate, where, *, renormalize=False):
+    def _apply_gate_impl(
+        self, gate, where, *, renormalize=False, track_norm=True
+    ):
         """Apply a gate without opening a nested diagnostic update."""
         logical_where = _normalize_where(where)
         where = self._validate_support(logical_where)
@@ -2475,7 +2555,10 @@ class TreeOptimizer:
         with self._thread_ctx():
             if len(where) == 1:
                 self.apply_1q(
-                    gate, logical_where[0], renormalize=renormalize
+                    gate,
+                    logical_where[0],
+                    renormalize=renormalize,
+                    track_norm=track_norm,
                 )
             elif len(where) == 2:
                 if where[0] == where[1]:
@@ -2483,7 +2566,12 @@ class TreeOptimizer:
                         "A two-qubit gate needs two distinct qubits; "
                         f"got where={where}."
                     )
-                self.apply_2q(gate, logical_where[0], logical_where[1])
+                self.apply_2q(
+                    gate,
+                    logical_where[0],
+                    logical_where[1],
+                    track_norm=track_norm,
+                )
                 if renormalize:
                     self.normalize()
             else:
@@ -2493,7 +2581,10 @@ class TreeOptimizer:
                         f"got where={where}."
                     )
                 self.apply_subtree_operator(
-                    gate, logical_where, renormalize=renormalize
+                    gate,
+                    logical_where,
+                    renormalize=renormalize,
+                    track_norm=track_norm,
                 )
         return self
 
@@ -2932,6 +3023,12 @@ class TreeOptimizer:
             if pbar is not None and self.track_infidelity
             else None
         )
+        previous_norm_tracking = self._norm_tracking_enabled
+        # A non-unitary stream changes the physical norm for reasons other
+        # than compression. Do not present that scale change as retained
+        # compression fidelity; explicit Tree calls remain unitary by default
+        # and can use the cheap ledger normally.
+        self._norm_tracking_enabled = not non_unitary
 
         try:
             for step, (payload, where, event_type) in enumerate(zip(
@@ -3017,6 +3114,7 @@ class TreeOptimizer:
                     pbar.set_postfix(postfix)
                     pbar.update(1)
         finally:
+            self._norm_tracking_enabled = previous_norm_tracking
             if pbar is not None:
                 pbar.close()
         if normalize_final and self.G:
@@ -3135,11 +3233,22 @@ class TreeOptimizer:
         """Return whether ``entry`` is an explicit sub-MPO stream marker."""
         return submpo_event_parts(entry) is not None
 
-    def apply_1q(self, gate, q, *, renormalize=False):
+    def apply_1q(self, gate, q, *, renormalize=False, track_norm=True):
         """Absorb a one-qubit gate into the site tensor of qubit ``q``."""
         self._invalidate_state_norm_cache()
-        with self._thread_ctx():
-            return self._apply_1q_impl(gate, q, renormalize=renormalize)
+        started = self._begin_update(
+            "gate", _normalize_where(q), track_norm=track_norm
+        )
+        try:
+            with self._thread_ctx():
+                result = self._apply_1q_impl(gate, q, renormalize=renormalize)
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return result
 
     def _apply_1q_impl(self, gate, q, *, renormalize=False):
         """Apply a one-qubit gate without opening another thread context."""
@@ -3159,6 +3268,12 @@ class TreeOptimizer:
             unitary = np.allclose(
                 gate_np.conj().T @ gate_np, np.eye(d, dtype=gate_np.dtype),
                 rtol=1e-10, atol=1e-12,
+            )
+        if self._active_update is not None:
+            # A direct one-site call can be non-unitary. Do not report its
+            # physical scale change as retained compression loss.
+            self._active_update["track_norm"] = (
+                bool(self._active_update.get("track_norm", True)) and unitary
             )
         site_node = self.plan.node_of_qubit[q]
         if not unitary:
@@ -3188,7 +3303,7 @@ class TreeOptimizer:
                 self.normalize()
         return self
 
-    def apply_2q(self, gate, qa, qb):
+    def apply_2q(self, gate, qa, qb, *, track_norm=True):
         """Apply a two-qubit gate to physical sites ``qa`` and ``qb``.
 
         Following Seitz et al. (Figs. 3-6): SVD-split the gate into two factors
@@ -3199,8 +3314,19 @@ class TreeOptimizer:
         path, so every bond truncation sees the complete gate.
         """
         self._invalidate_state_norm_cache()
-        with self._thread_ctx():
-            return self._apply_2q_impl(gate, qa, qb)
+        started = self._begin_update(
+            "gate", (int(qa), int(qb)), track_norm=track_norm
+        )
+        try:
+            with self._thread_ctx():
+                result = self._apply_2q_impl(gate, qa, qb)
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return result
 
     @staticmethod
     def _as_gate_tensor4(gate, da, db):
@@ -4456,12 +4582,20 @@ class TreeOptimizer:
 
     # -- general multi-qubit / sub-MPO application ----------------------------
 
-    def apply_subtree_operator(self, op, where, *, max_bond=None,
-                               cutoff=None, renormalize=False):
-        """Apply a subtree operator and aggregate its edge truncations."""
+    def apply_subtree_operator(
+        self, op, where, *, max_bond=None, cutoff=None,
+        renormalize=False, track_norm=True,
+    ):
+        """Apply a subtree operator and aggregate its edge truncations.
+
+        Set ``track_norm=False`` for a known non-unitary/Kraus operator so its
+        physical norm change is not reported as compression loss.
+        """
         self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
-        started = self._begin_update("subtree", _normalize_where(where))
+        started = self._begin_update(
+            "subtree", _normalize_where(where), track_norm=track_norm
+        )
         try:
             result = self._apply_subtree_operator_impl(
                 op, where, max_bond=max_bond, cutoff=cutoff,
@@ -4475,7 +4609,9 @@ class TreeOptimizer:
             self._finish_update()
         return result
 
-    def apply_submpo(self, submpo, where, *, max_bond=None, cutoff=None):
+    def apply_submpo(
+        self, submpo, where, *, max_bond=None, cutoff=None, track_norm=True
+    ):
         """Apply an explicit MPO on ``where`` using the native tree path.
 
         This is the backend-neutral coefficient-state entry point used by
@@ -4484,6 +4620,7 @@ class TreeOptimizer:
         stay structured and are QR-routed through the Steiner subtree before
         one compression sweep. Opaque MPO-like payloads fall back to dense
         :meth:`apply_subtree_operator` lowering.
+        Set ``track_norm=False`` when the MPO is a known non-unitary map.
         """
         self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
@@ -4506,7 +4643,7 @@ class TreeOptimizer:
             )
         return self._apply_submpo_resolved(
             submpo, where, logical_where=logical_where,
-            max_bond=max_bond, cutoff=cutoff,
+            max_bond=max_bond, cutoff=cutoff, track_norm=track_norm,
         )
 
     def expectation_mpo(
@@ -4562,6 +4699,7 @@ class TreeOptimizer:
             logical_where,
             max_bond=max_bond,
             cutoff=effective_cutoff,
+            track_norm=False,
         )
         compression_events = work.truncation_history[history_start:]
         truncated_events = [
@@ -4636,8 +4774,10 @@ class TreeOptimizer:
             optimize=optimize,
         )
 
-    def _apply_submpo_resolved(self, submpo, where, *, max_bond=None,
-                               cutoff=None, logical_where=None):
+    def _apply_submpo_resolved(
+        self, submpo, where, *, max_bond=None, cutoff=None,
+        logical_where=None, track_norm=True,
+    ):
         """Apply a sub-MPO whose support is already in compact TTN positions."""
         where = tuple(where)
         if logical_where is None:
@@ -4657,7 +4797,9 @@ class TreeOptimizer:
             raise ValueError(
                 "max_bond must be positive or None and cutoff non-negative."
             )
-        started = self._begin_update("submpo", where)
+        started = self._begin_update(
+            "submpo", where, track_norm=track_norm
+        )
         try:
             with self._thread_ctx():
                 applied = None
@@ -4743,7 +4885,9 @@ class TreeOptimizer:
         self._coerce_tensor_network_backend(mpo, warn=False)
         return self._apply_submpo_resolved(mpo, mpo_where)
 
-    def apply_pauli_sum(self, weighted_terms, *, max_bond=None, cutoff=None):
+    def apply_pauli_sum(
+        self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True
+    ):
         """Apply a weighted sum of Pauli products as one tree MPO.
 
         ``weighted_terms`` contains ``(coefficient, mapping)`` pairs, where
@@ -4771,7 +4915,11 @@ class TreeOptimizer:
         )
         self._coerce_tensor_network_backend(mpo, warn=False)
         return self._apply_submpo_resolved(
-            mpo, where, max_bond=max_bond, cutoff=cutoff
+            mpo,
+            where,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            track_norm=track_norm,
         )
 
     def expectation_pauli(self, pauli, where, *, sign=1.0):
@@ -4838,7 +4986,8 @@ class TreeOptimizer:
         canonical subtree sweep truncates every affected edge once against an
         isometric environment.
 
-        ``op`` acts on ``len(where)`` qubits: an array reshaped to ``(2,) * 2k``
+        ``track_norm`` controls the cheap retained-norm ledger. ``op`` acts on
+        ``len(where)`` qubits: an array reshaped to ``(2,) * 2k``
         with output indices first, ``op[o_0..o_{k-1}, i_0..i_{k-1}]`` (a
         ``(2**k, 2**k)`` matrix is accepted and reshaped).  It need **not** be
         unitary; pass ``renormalize=True`` to renormalise the state afterwards
@@ -6251,6 +6400,7 @@ class TreeOptimizer:
         other.bond_history = deepcopy(self.bond_history)
         other.infidelities = list(self.infidelities)
         other.infidelity_samples = deepcopy(self.infidelity_samples)
+        other.norm_events = deepcopy(self.norm_events)
         other.normalizations = deepcopy(self.normalizations)
         other.projection_diagnostics = deepcopy(self.projection_diagnostics)
         other._backend_conversion_warnings = set(
@@ -6261,6 +6411,8 @@ class TreeOptimizer:
         other._logical_positions = dict(self._logical_positions)
         other._update_counter = self._update_counter
         other._truncation_log_survival = self._truncation_log_survival
+        other._norm_log_survival = self._norm_log_survival
+        other._norm_tracking_enabled = self._norm_tracking_enabled
         other.profile_events = deepcopy(self.profile_events)
         other._attach_profile_sink()
         return other
@@ -6379,6 +6531,93 @@ class TreeOptimizer:
         state norm.
         """
         return self.normalizations
+
+    def get_norm_events(self):
+        """Return path-level retained-norm compression events.
+
+        These events are collected independently of ``track_truncation``.
+        Each event represents the complete gate/subtree path update, whereas
+        :meth:`truncation_report` contains optional per-edge spectrum data.
+        """
+        return deepcopy(self.norm_events)
+
+    def norm_diagnostics(self):
+        """Return canonical norm-based compression diagnostics.
+
+        ``cumulative_norm_fidelity`` is the log-accumulated product of the
+        path-level retained-norm fidelities. It is a compression proxy, not a
+        directional overlap with a target state. Tree target-overlap checks,
+        when a caller has an exact reference, must be reported separately.
+        ``track_truncation`` is intentionally exposed as an independent flag:
+        it controls expensive per-edge singular-spectrum probes only.
+        """
+        valid = [event for event in self.norm_events if event.get("valid")]
+        current = valid[-1] if valid else None
+        cumulative_fidelity = (
+            None
+            if not valid
+            else fidelity_from_log(self._norm_log_survival)
+        )
+        cumulative_infidelity = (
+            None
+            if cumulative_fidelity is None
+            else infidelity_from_log(self._norm_log_survival)
+        )
+        state_norm = float(self.norm())
+        return {
+            "tracking": bool(self.track_infidelity),
+            "norm_tracking": bool(self.track_infidelity),
+            "truncation_tracking": bool(self.track_truncation),
+            "events": len(self.norm_events),
+            "completed_events": len(valid),
+            "current_valid": current is not None,
+            "current_norm_fidelity": (
+                None if current is None else current["local_norm_fidelity"]
+            ),
+            "current_norm_infidelity": (
+                None if current is None else current["local_norm_infidelity"]
+            ),
+            "current_segment_norm": (
+                None
+                if current is None
+                else float(current["local_norm_fidelity"] ** 0.5)
+            ),
+            "current_segment_infidelity": (
+                None if current is None else current["local_norm_infidelity"]
+            ),
+            "local_norm_fidelity": (
+                None if current is None else current["local_norm_fidelity"]
+            ),
+            "local_norm_infidelity": (
+                None if current is None else current["local_norm_infidelity"]
+            ),
+            "local_norm": (
+                None
+                if current is None
+                else float(current["local_norm_fidelity"] ** 0.5)
+            ),
+            "cumulative_norm_fidelity": cumulative_fidelity,
+            "cumulative_norm_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": cumulative_fidelity,
+            "cumulative_compression_infidelity": cumulative_infidelity,
+            # Short aliases are retained for parity with MpsOptimizer, but
+            # the explicit names above document that this is norm survival.
+            "norm_survival": cumulative_fidelity,
+            "norm_infidelity": cumulative_infidelity,
+            "fidelity": cumulative_fidelity,
+            "infidelity": cumulative_infidelity,
+            "state_norm": state_norm,
+            "cumulative_norm": (
+                None
+                if cumulative_fidelity is None
+                else float(cumulative_fidelity ** 0.5)
+            ),
+            # ``norm`` historically means the represented Tree norm. Keep it
+            # as a compatibility alias; ``cumulative_norm`` is the retained
+            # norm proxy shared with the MPS diagnostics.
+            "norm": state_norm,
+            "norm_events": self.get_norm_events(),
+        }
 
     def get_projection_diagnostics(self):
         """Return projection norm/support/span/bond diagnostics in order."""

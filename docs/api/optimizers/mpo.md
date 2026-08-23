@@ -136,11 +136,12 @@ print(diagnostics["fidelity"])
 print(diagnostics["infidelity"])
 ```
 
-`diagnostics["fidelity"]` is the stable cumulative product of the per-event
-`norm_fidelity` values, evaluated in log space. `infidelity` is
-`1 - fidelity`, evaluated with `expm1` for small losses. The progress bar's
-`~F` field uses this same cumulative value. `get_fidelities()` remains the
-legacy normalized-MPO-norm history and is not the compression ledger.
+`diagnostics["cumulative_norm_fidelity"]` is the stable cumulative product of
+the per-event `local_norm_fidelity` values, evaluated in log space. The
+matching `cumulative_norm_infidelity` uses `expm1` for small losses. The
+shorter `fidelity`/`infidelity` keys are compatibility aliases. The progress
+bar's `~F` field uses this same cumulative value. `get_fidelities()` remains
+the legacy normalized-MPO-norm history and is not the compression ledger.
 
 DMRG FIT controls are exposed directly through `run`: `fit_min_iter`,
 `fit_rtol`, `fit_patience`, `fit_finite_check`, `timing`,

@@ -12,6 +12,26 @@ Use `res.fidel` to understand where approximation error accumulates.
 If values are close to `1.0`, local fit quality is strong at those steps.
 Lower values identify harder regions.
 
+## Do not mix fidelity meanings
+
+Pepsy uses two different diagnostics that are both commonly called
+“fidelity”:
+
+- `local_norm_fidelity` and `cumulative_norm_fidelity` are retained-norm
+  compression proxies. They are available from canonical MPS/Tree updates and
+  their stabilizer coefficient states without a reference-state overlap.
+- `fit_overlap_fidelity` is a genuine target-state overlap produced by a
+  successful DMRG/FIT update when its disposable exact target is available.
+
+The first metric measures compression loss through the canonical tensor norm;
+the second compares two states. A DMRG overlap is therefore an additional
+quality check, not a replacement for the norm ledger used by MPO, SVD, Tree,
+or stabilizer compression.
+
+For Tree optimizers, `track_truncation=True` is a third, independent diagnostic:
+it performs extra local spectrum work to report per-edge discarded weight. It
+is not needed for the cheap path-level norm ledger.
+
 ## Split left/right products
 
 For `direction="y"` and `max_separation=0`, a common split is `Ly // 2`:

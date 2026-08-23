@@ -69,6 +69,8 @@ class NormEventRecord(_TypedRecord):
     pre_norm: Optional[float] = None
     pre_norm_sq: Optional[float] = None
     segment_infidelity: Optional[float] = None
+    segment_norm_fidelity: Optional[float] = None
+    segment_norm_infidelity: Optional[float] = None
     branch_probability: Optional[float] = None
     expected_projected_norm: Optional[float] = None
     expected_projected_norm_sq: Optional[float] = None
@@ -77,6 +79,8 @@ class NormEventRecord(_TypedRecord):
     projector_survival: Optional[float] = None
     projector_survival_raw: Optional[float] = None
     projector_infidelity: Optional[float] = None
+    cumulative_norm_fidelity: Optional[float] = None
+    cumulative_norm_infidelity: Optional[float] = None
     post_norm: Optional[float] = None
     post_norm_sq: Optional[float] = None
 

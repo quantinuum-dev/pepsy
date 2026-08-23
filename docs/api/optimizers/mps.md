@@ -421,31 +421,41 @@ directions while retaining every representable nonzero value. This prevents
 invalid duplicate dummy modes without introducing target truncation.
 
 All unitary compressed modes (`dmrg*`, `mix`, `mpo`, `swap`, `perm`, and
-`svd`) default to `stabilize_unitary=True`. After each compression Pepsy
-restores the raw working MPS to its pre-compression norm without accumulating
-the approximation scale in `p.exponent`. FIT and the direct compression modes
-reuse the final canonical center rather than sweeping or contracting the state
-again. This prevents deep complex64 streams from underflowing. Pass
-`non_unitary=True` for filters/Kraus/sub-MPO streams so this unitary rescaling
-is disabled. Set `stabilize_unitary=False` only to reproduce historical
-norm-decay behavior. The old `fit_stabilize_unitary` spelling remains as a
-deprecated alias.
+`svd`) default to `stabilize_unitary=False`. The retained approximation scale
+therefore remains in the raw working MPS, making norm decay visible by default.
+Canonicalization and QR only move that scale to the tracked orthogonality
+center; they do not normalize the whole MPS or change the represented state.
+Set `stabilize_unitary=True` when numerical scale control is more important
+than observing raw norm decay. In that opt-in mode Pepsy restores the raw
+working MPS to its pre-compression norm without accumulating the approximation
+scale in `p.exponent`. Pass `non_unitary=True` for filters/Kraus/sub-MPO
+streams. The old `fit_stabilize_unitary` spelling remains a deprecated alias.
 
 Norm-survival bookkeeping is automatic; there is no
 `track_infidelity` constructor or run flag for `MpsOptimizer`. Every retained
 unitary compression records an event in `opt.get_norm_events()`. Its
-`norm_fidelity` is the clipped squared ratio of retained norm to the expected
-pre-compression norm, while `norm_fidelity_raw` preserves the unclipped ratio.
-`opt.norm_diagnostics()` reports the cumulative product in `norm_survival` and
-the corresponding `norm_infidelity`; `norm` and `total_norm_proxy` are its
-square root. Measurement, reset, and state-dependent Kraus events are also
-recorded, including `branch_probability`, `physical_boundary`, and
-`renormalized`. Their expected norm includes the Born probability, so a normal
-physical branch has zero compression infidelity. Renormalization closes the
-current raw-norm baseline but does not erase the cumulative compression ledger.
-This same contract is used by the DMRG1/2/3 schedules and the MPO, SVD,
-swap/perm, and mixed backends. The metric is a norm-survival proxy: it does
-not replace a directional state fidelity check.
+`local_norm_fidelity` is the clipped squared ratio of retained canonical-centre
+norm to the expected pre-compression norm, while `norm_fidelity_raw` preserves
+the unclipped ratio. `opt.norm_diagnostics()` exposes the latest local value as
+`local_norm_fidelity` and the log-accumulated product as
+`cumulative_norm_fidelity` (with matching `*_infidelity` fields). The shorter
+`fidelity`/`infidelity` and `norm_survival`/`norm_infidelity` keys remain
+compatibility aliases. These are compression/norm-survival proxies, not
+directional target-state fidelities.
+
+DMRG additionally reports `fit_overlap_fidelity` and
+`fit_overlap_infidelity` in `opt.get_fit_diagnostics()` after a successful FIT
+update. Those values contract the final fitted MPS against the disposable exact
+FIT target and are genuine target-overlap diagnostics. They are specific to
+DMRG and must not be substituted for the norm ledger used by the other modes.
+If a backend cannot perform that optional contraction, the values are `None`
+and `fit_overlap_error` explains why; the FIT update itself is not rejected.
+Measurement, reset, and state-dependent Kraus events are also recorded,
+including `branch_probability`, `physical_boundary`, and `renormalized`. Their
+expected norm includes the Born probability, so a normal physical branch has
+zero compression infidelity. Renormalization closes the current raw-norm
+baseline but does not erase the cumulative compression ledger. The same norm
+contract is used by DMRG1/2/3 and the MPO, SVD, swap/perm, and mixed backends.
 
 Unitary compression also validates that the retained canonical-center norm
 does not materially exceed its pre-compression norm. The raw overshoot remains

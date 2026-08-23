@@ -534,6 +534,26 @@ def test_mps_optimizer_fit_diagnostics_is_none_before_fit():
     assert opt.get_fit_diagnostics() is None
 
 
+def test_mps_optimizer_fit_overlap_diagnostic_failure_is_nonfatal(monkeypatch):
+    """Optional FIT overlap failures stay diagnostics, not replay failures."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="dmrg",
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("diagnostic unavailable")
+
+    monkeypatch.setattr(mps_optimizer_module, "tn_fidelity", fail)
+    result = opt._fit_overlap_diagnostics(opt.p, opt.p)
+
+    assert result["fit_overlap_fidelity"] is None
+    assert result["fit_overlap_infidelity"] is None
+    assert "diagnostic unavailable" in result["fit_overlap_error"]
+
+
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd", "dmrg", "mix"])
 def test_mps_optimizer_modes_skip_clocks_when_timing_disabled(
     monkeypatch,
@@ -5230,7 +5250,7 @@ def test_unitary_fit_stabilization_preserves_working_norm():
         mode="fit",
     )
 
-    out = optimizer.run(progbar=False, n_iter=2)
+    out = optimizer.run(progbar=False, n_iter=2, stabilize_unitary=True)
     raw = out.copy()
     raw.exponent = 0.0
 
@@ -8057,12 +8077,30 @@ def test_dmrg_schedules_record_automatic_norm_survival(mode):
         chi=1,
         mode=mode,
     )
-    opt.run(progbar=False, cutoff=0.0, n_iter=3)
+    opt.run(progbar=False, cutoff=0.0, n_iter=3, stabilize_unitary=True)
 
     diagnostics = opt.norm_diagnostics()
     assert diagnostics["events"] == 1
     assert diagnostics["norm_infidelity"] == pytest.approx(0.5, abs=2.0e-5)
     assert _mps_data_norm(opt.p) == pytest.approx(1.0, abs=2.0e-5)
+
+
+def test_mps_norm_names_and_dmrg_target_overlap_are_distinct():
+    """DMRG exposes target overlap separately from retained norm fidelity."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 2))],
+        chi=1,
+        mode="dmrg",
+    )
+    opt.run(progbar=False, cutoff=0.0, n_iter=3)
+
+    diagnostics = opt.norm_diagnostics()
+    fit = opt.get_fit_diagnostics()
+    assert diagnostics["local_norm_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert diagnostics["cumulative_norm_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert fit["fit_overlap_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert fit["fit_overlap_infidelity"] == pytest.approx(0.5, abs=2e-5)
 
 
 def test_fit_run_gate_reuse_resets_per_run_traces_and_split_diagnostics():

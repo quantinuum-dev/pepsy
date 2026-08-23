@@ -628,6 +628,7 @@ class TreeStabOptimizer:
         seed=None,
         inplace=True,
         track_truncation=False,
+        track_infidelity=True,
         max_operator_qubits=DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS,
         max_pauli_decomposition_qubits=None,
         max_pauli_terms=256,
@@ -830,6 +831,7 @@ class TreeStabOptimizer:
             run=False,
             tn=coefficient_state,
             track_truncation=track_truncation,
+            track_infidelity=track_infidelity,
             max_operator_qubits=max_operator_qubits,
             max_subtree_nodes=max_subtree_nodes,
         )
@@ -845,6 +847,7 @@ class TreeStabOptimizer:
         self.operator_tol = operator_tol
         self.max_dense_sample_qubits = max_dense_sample_qubits
         self.max_dense_cap_qubits = max_dense_cap_qubits
+        self.track_infidelity = bool(track_infidelity)
         self.exact_cooling = bool(exact_cooling)
         self.state = _TreeStabilizerFrame(self._tree.n)
         self._queue = list(entries)
@@ -853,7 +856,9 @@ class TreeStabOptimizer:
         self.bond_history = [self._tree.tn.max_bond()]
         self.projection_diagnostics = self._tree.projection_diagnostics
         self._clifford_rotation_cache = {}
-        self.norm_events = []
+        # Keep the wrapper's historical public list live as the Tree ledger is
+        # appended to during direct coefficient updates.
+        self.norm_events = self._tree.norm_events
         self.exact_cooling_events = []
         self.disentangle_events = []
         self.immediate_projection_events = []
@@ -874,7 +879,8 @@ class TreeStabOptimizer:
         optimizer = cls(len(values), **kwargs)
         for q, bit in enumerate(values):
             if bit:
-                optimizer._tree.apply_1q(_X, q)
+                # This is state construction, not replay compression.
+                optimizer._tree.apply_1q(_X, q, track_norm=False)
         return optimizer
 
     @classmethod
@@ -972,23 +978,21 @@ class TreeStabOptimizer:
         """Return stream-based TreeStab settings advice.
 
         Stream classification and magic scheduling are shared with the MPS
-        frontend. Constructor names are translated to TreeOptimizer's
-        terminology while retaining the same advisory semantics.
+        frontend. The cheap retained-norm flag remains ``track_infidelity``;
+        the expensive Tree-only spectrum flag is ``track_truncation``.
         """
         from ..stabilizer_tn.mps_stab_optimizer import MpsStabOptimizer
 
         mps_advice = MpsStabOptimizer.recommend_settings(gates, **kwargs)
         settings = dict(mps_advice.settings)
-        if "track_infidelity" in settings:
-            settings["track_truncation"] = settings.pop("track_infidelity")
         settings.pop("layout_report", None)
         settings.setdefault(
             "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
         )
         warnings = list(mps_advice.warnings)
         warnings.append(
-            "TreeStab reports TTN truncation survival; it is not an MPS "
-            "overlap fidelity proxy."
+            "TreeStab keeps retained-norm tracking separate from optional "
+            "TTN truncation-spectrum diagnostics; neither is an overlap fidelity."
         )
         return StabilizerMpsSettingsAdvice(
             goal=mps_advice.goal,
@@ -1467,6 +1471,7 @@ class TreeStabOptimizer:
             run=False,
             tn=self.p,
             track_truncation=self._tree.track_truncation,
+            track_infidelity=self._tree.track_infidelity,
             max_operator_qubits=self._tree.max_operator_qubits,
             max_subtree_nodes=self._tree.max_subtree_nodes,
             record_history=self._tree.record_history,
@@ -1747,11 +1752,16 @@ class TreeStabOptimizer:
                 self.bond_history.append(self.p.max_bond())
                 if pbar is not None:
                     pbar.update(1)
-                    infidelity = self._tree.get_infidelities()[-1]
-                    formatted = self._format_progress_infidelity(infidelity)
+                    diagnostics = self.norm_diagnostics()
+                    norm_infidelity = diagnostics["cumulative_norm_infidelity"]
+                    truncation_infidelity = diagnostics["truncation_infidelity"]
                     pbar.set_postfix(
-                        infidelity=formatted,
-                        norm_infidelity=formatted,
+                        norm_infidelity=self._format_progress_infidelity(
+                            norm_infidelity
+                        ),
+                        truncation_infidelity=self._format_progress_infidelity(
+                            truncation_infidelity
+                        ),
                     )
         finally:
             if pbar is not None:
@@ -1797,7 +1807,10 @@ class TreeStabOptimizer:
             mpo = self._tree._prepare_gate_stream_backend(
                 [mpo], ["submpo"]
             )[0]
-            self._tree.apply_submpo(mpo, where)
+            # A caller-supplied coefficient MPO has no unitary certificate.
+            # Keep its physical norm change out of the compression ledger,
+            # matching MpsStabOptimizer's sub-MPO contract.
+            self._tree.apply_submpo(mpo, where, track_norm=False)
             return
         if isinstance(entry, (tuple, list)) and entry:
             head = entry[0]
@@ -1919,6 +1932,12 @@ class TreeStabOptimizer:
             raise ValueError(
                 f"Gate shape {gate.shape} does not match where={where!r}."
             )
+        unitary = np.allclose(
+            gate.conj().T @ gate,
+            np.eye(dim, dtype=gate.dtype),
+            rtol=1e-10,
+            atol=1e-12,
+        )
         tableau = _tableau_from_exact_unitary(gate)
         if tableau is not None:
             self.state.do_tableau(tableau, where)
@@ -1958,7 +1977,7 @@ class TreeStabOptimizer:
             # annihilates the state. Applying a zero one-site operator is the
             # tree-native way to represent that result without a fake branch.
             zero = np.zeros((2, 2), dtype=complex)
-            self._tree.apply_1q(zero, where[0])
+            self._tree.apply_1q(zero, where[0], track_norm=unitary)
             return
         coefficient_support = {
             int(site) for _weight, terms in branches for site in terms
@@ -1972,12 +1991,13 @@ class TreeStabOptimizer:
             operator = np.zeros((2, 2), dtype=complex)
             for weight, terms in branches:
                 operator += weight * pauli_matrix(terms.get(q, "I"))
-            self._tree.apply_1q(operator, q)
+            self._tree.apply_1q(operator, q, track_norm=unitary)
             return
         self._tree.apply_pauli_sum(
             branches,
             max_bond=self._tree.chi,
             cutoff=self._tree.cutoff,
+            track_norm=unitary,
         )
 
     def _dense_gate_target_norm(self, gate, where):
@@ -3446,6 +3466,7 @@ class TreeStabOptimizer:
         other.operator_tol = self.operator_tol
         other.max_dense_sample_qubits = self.max_dense_sample_qubits
         other.max_dense_cap_qubits = self.max_dense_cap_qubits
+        other.track_infidelity = self.track_infidelity
         other.exact_cooling = self.exact_cooling
         other.to_backend = self.to_backend
         other._clifford_rotation_cache = self._clifford_rotation_cache
@@ -3491,10 +3512,13 @@ class TreeStabOptimizer:
                     self._tree._as_state_backend(projector, warn=False), q
                 )
             else:
-                self._tree.apply_pauli_sum([
-                    (0.5, {}),
-                    (0.5 * outcome * float(sign), dict(terms)),
-                ])
+                self._tree.apply_pauli_sum(
+                    [
+                        (0.5, {}),
+                        (0.5 * outcome * float(sign), dict(terms)),
+                    ],
+                    track_norm=False,
+                )
             self._tree.normalize()
         return probability
 
@@ -3793,7 +3817,7 @@ class TreeStabOptimizer:
         self.frame_layout_plan = None
         self.frame_layout_events = ()
         self.projection_diagnostics = self._tree.projection_diagnostics
-        self.norm_events = []
+        self.norm_events = self._tree.norm_events
         return self
 
     def norm(self):
@@ -3849,16 +3873,20 @@ class TreeStabOptimizer:
         """Return detailed tree truncation samples."""
         return self._tree.get_infidelity_samples()
 
-    def norm_diagnostics(self, *, include_current=True):
-        """Summarize TTN truncation and norm-survival diagnostics.
+    def get_norm_events(self):
+        """Return coefficient-tree path-level retained-norm events."""
+        return self._tree.get_norm_events()
 
-        Tree compression records are aggregated over the affected edges of
-        each update. They are deliberately reported as a truncation-survival
-        proxy, not as exact overlap fidelity and not as physical measurement
-        probability. Projective details remain available in
-        ``projection_diagnostics`` / ``truncation_report``.
+    def norm_diagnostics(self, *, include_current=True):
+        """Summarize coefficient-TTN norm and truncation diagnostics.
+
+        The canonical-centre norm ledger is available independently of
+        ``track_truncation``. ``track_truncation`` adds the separate,
+        spectrum-based per-edge report below. Neither quantity is a target
+        state overlap; the stabilizer tableau does not change that distinction.
         """
         _ = include_current  # tree updates have no open segment boundary
+        norm_report = self._tree.norm_diagnostics()
         tracking = bool(self._tree.track_truncation)
         samples = tuple(self._tree.get_infidelity_samples())
         losses = tuple(
@@ -3874,8 +3902,15 @@ class TreeStabOptimizer:
         )
         report = self._tree.truncation_report()
         return {
+            # ``tracking`` is retained as the historical truncation flag for
+            # callers that used it to detect get_infidelity_samples(). The
+            # explicit fields below remove that ambiguity.
             "tracking": tracking,
-            "current_valid": tracking,
+            "norm_tracking": norm_report["norm_tracking"],
+            "truncation_tracking": tracking,
+            "current_valid": norm_report["current_valid"],
+            "norm_events_count": norm_report["events"],
+            "norm_completed_events": norm_report["completed_events"],
             "completed_segments": len(losses),
             "segments_including_current": len(losses),
             "completed_segment_norms": [
@@ -3885,18 +3920,37 @@ class TreeStabOptimizer:
             "completed_projector_infidelities": [],
             "completed_nonunitary_infidelities": [],
             "completed_combined_infidelities": list(losses),
-            "current_segment_norm": (
-                None if current_loss is None else float(max(0.0, 1.0 - current_loss) ** 0.5)
-            ),
+            "current_segment_norm": norm_report["local_norm"],
             "current_segment_infidelity": current_loss,
-            "norm_survival": survival,
-            "norm_infidelity": None if survival is None else float(1.0 - survival),
-            "fidelity": survival,
-            "infidelity": None if survival is None else float(1.0 - survival),
-            "norm": float(self.norm()),
-            "total_survival_proxy": survival,
-            "total_infidelity_proxy": None if survival is None else float(1.0 - survival),
-            "total_norm_proxy": None if survival is None else float(survival ** 0.5),
+            "current_norm_fidelity": norm_report["current_norm_fidelity"],
+            "current_norm_infidelity": norm_report["current_norm_infidelity"],
+            # Canonical-centre norm/compression metrics shared with MPS and
+            # ordinary Tree. These are not the spectrum-based values above.
+            "local_norm_fidelity": norm_report["local_norm_fidelity"],
+            "local_norm_infidelity": norm_report["local_norm_infidelity"],
+            "local_norm": norm_report["local_norm"],
+            "cumulative_norm_fidelity": norm_report["cumulative_norm_fidelity"],
+            "cumulative_norm_infidelity": norm_report["cumulative_norm_infidelity"],
+            "cumulative_compression_fidelity": norm_report[
+                "cumulative_compression_fidelity"
+            ],
+            "cumulative_compression_infidelity": norm_report[
+                "cumulative_compression_infidelity"
+            ],
+            "norm_survival": norm_report["norm_survival"],
+            "norm_infidelity": norm_report["norm_infidelity"],
+            "fidelity": norm_report["cumulative_norm_fidelity"],
+            "infidelity": norm_report["cumulative_norm_infidelity"],
+            "state_norm": norm_report["state_norm"],
+            "norm": norm_report["norm"],
+            "total_survival_proxy": norm_report["norm_survival"],
+            "total_infidelity_proxy": norm_report["norm_infidelity"],
+            "total_norm_proxy": norm_report["cumulative_norm"],
+            "cumulative_norm": norm_report["cumulative_norm"],
+            "truncation_survival": survival,
+            "truncation_infidelity": (
+                None if survival is None else float(1.0 - survival)
+            ),
             "geometric_mean_survival": (
                 None if not losses else float(max(0.0, 1.0 - losses[-1]))
             ),
@@ -3914,6 +3968,7 @@ class TreeStabOptimizer:
             "mean_projector_infidelity": None,
             "max_projector_infidelity": None,
             "truncation_report": report,
+            "norm_events": norm_report["norm_events"],
             "projection_diagnostics": list(self._tree.get_projection_diagnostics()),
         }
 
@@ -3971,6 +4026,7 @@ class TreeStabOptimizer:
         other.operator_tol = self.operator_tol
         other.max_dense_sample_qubits = self.max_dense_sample_qubits
         other.max_dense_cap_qubits = self.max_dense_cap_qubits
+        other.track_infidelity = self.track_infidelity
         other.exact_cooling = self.exact_cooling
         other.to_backend = self.to_backend
         other.state = self.state.copy()
@@ -3979,7 +4035,7 @@ class TreeStabOptimizer:
         other.measurements = list(self.measurements)
         other.bond_history = list(self.bond_history)
         other.projection_diagnostics = other._tree.projection_diagnostics
-        other.norm_events = [dict(event) for event in self.norm_events]
+        other.norm_events = other._tree.norm_events
         other._clifford_rotation_cache = dict(self._clifford_rotation_cache)
         other.exact_cooling_events = list(self.exact_cooling_events)
         other.disentangle_events = [dict(event) for event in self.disentangle_events]
@@ -4043,13 +4099,6 @@ def _tree_runner_constructor_settings(advice, settings, *, seed):
         if not isinstance(settings, Mapping):
             raise TypeError("settings must be a mapping or None.")
         ctor.update(dict(settings))
-    if "track_infidelity" in ctor:
-        if "track_truncation" in ctor:
-            raise ValueError(
-                "pass only one of track_infidelity and track_truncation "
-                "to the TreeStab runner."
-            )
-        ctor["track_truncation"] = ctor.pop("track_infidelity")
     ctor.pop("layout_report", None)
     ctor.setdefault(
         "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS

@@ -112,8 +112,17 @@ print(sim.stim_sample.faults)
 
 With `progbar=True`, the STN progress bar reports the current stream
 `part` (`clifford`, `T`, `measurement`, `reset`, `nonclifford`, ...) and the
-MPS-compatible diagnostic field `infidelity`. The legacy
-`norm_infidelity` field is emitted with the same value.
+MPS-compatible `norm_infidelity` field. The explicit name denotes the
+retained-norm proxy; it is not a target-state overlap.
+
+The STN norm diagnostics use the same naming contract as ordinary MPS
+compression: `current_norm_fidelity` / `current_norm_infidelity` describe the
+active normalized coefficient segment, while
+`cumulative_norm_fidelity` / `cumulative_norm_infidelity` are accumulated in
+log space. These are retained-norm compression proxies for `|nu>`, not direct
+overlaps with the physical target state `C|nu>`. A direct target overlap is a
+separate diagnostic and is only available when an explicit reference state is
+contracted, such as the final FIT-target check in ordinary MPS DMRG.
 
 For physical readout, keep the two representations explicit:
 `sim.to_basis_statevector()` returns the dense coefficient vector `|nu>` in
@@ -317,7 +326,10 @@ coefficient-frame sub-MPOs where applicable. `track_infidelity=True` performs
 no reference-state copy or overlap contraction. For normalized unitary
 evolution it records the cumulative proxy `1 - ||nu||**2` after compressed
 coefficient-MPS updates, reading the norm from the tracked one-site canonical
-centre. Unitary updates are not renormalized, so lost norm remains visible.
+centre. `get_compression_norm_events()` exposes each update's local retained
+norm ratio, while `norm_diagnostics()["local_norm_fidelity"]` is the latest
+such ratio and `cumulative_norm_fidelity` is the stable cumulative proxy.
+Unitary updates are not renormalized, so lost norm remains visible.
 For dense multi-qubit non-unitary matrices, the target norm is measured from
 the local physical `G†G` expectation and the retained norm ratio is reported as
 `infidelity`. Coefficient-frame sub-MPOs and arbitrary physical maps without a

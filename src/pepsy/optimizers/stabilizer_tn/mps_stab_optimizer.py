@@ -65,6 +65,11 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from .._fidelity import (
+    fidelity_from_log,
+    infidelity_from_log,
+    log_fidelity_from_norms,
+)
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
     _MPO_COMPRESSION_METHODS,
@@ -733,6 +738,11 @@ class MpsStabOptimizer:
         self._quality_checks: list[dict] = []
         self.infidelities: List[float] = []
         self._nonunitary_infidelities: List[float] = []
+        # Per-update norm ratios are separate from projective boundary events.
+        # ``norm_events`` remains the historical boundary ledger; this list
+        # makes the ordinary-MPS local-vs-cumulative API available for every
+        # compressed unitary coefficient update as well.
+        self._compression_norm_events: List[dict] = []
         self.norm_events: List[NormEventRecord] = []
         self.bond_history: List[int] = [self.state.max_bond()]
         self.exact_cooling_events: List[dict] = []
@@ -2709,6 +2719,7 @@ class MpsStabOptimizer:
             "state": self.state.copy(),
             "infidelities": list(self.infidelities),
             "nonunitary_infidelities": list(self._nonunitary_infidelities),
+            "compression_norm_events": deepcopy(self._compression_norm_events),
             "norm_events": deepcopy(self.norm_events),
             "norm_log_survival": self._norm_log_survival,
             "norm_infidelity_valid": self._norm_infidelity_valid,
@@ -2736,6 +2747,9 @@ class MpsStabOptimizer:
         self.state = snapshot["state"]
         self.infidelities = list(snapshot["infidelities"])
         self._nonunitary_infidelities = list(snapshot["nonunitary_infidelities"])
+        self._compression_norm_events = deepcopy(
+            snapshot["compression_norm_events"]
+        )
         self.norm_events = deepcopy(snapshot["norm_events"])
         self._norm_log_survival = snapshot["norm_log_survival"]
         self._norm_infidelity_valid = snapshot["norm_infidelity_valid"]
@@ -2961,6 +2975,16 @@ class MpsStabOptimizer:
             event.as_dict() if isinstance(event, NormEventRecord) else dict(event)
             for event in self.norm_events
         ]
+
+    def get_compression_norm_events(self):
+        """Return per-update retained-norm compression events.
+
+        These are intentionally separate from :meth:`get_norm_events`, whose
+        records mark projective/Kraus normalization boundaries. Each event
+        here contains both the local ratio for the update and the cumulative
+        ratio within the current boundary-aware ledger.
+        """
+        return deepcopy(self._compression_norm_events)
 
     def get_normalizations(self):
         """Return explicit normalization records.
@@ -3193,6 +3217,55 @@ class MpsStabOptimizer:
         self._current_norm_infidelity = infidelity
         return infidelity
 
+    def _record_compression_norm_event(
+        self,
+        before_norm_sq: Optional[float],
+        after_infidelity: Optional[float],
+        *,
+        kind: str = "unitary_compression",
+    ) -> None:
+        """Record one local retained-norm ratio for a compressed update."""
+        if (
+            not self.track_infidelity
+            or before_norm_sq is None
+            or after_infidelity is None
+            or not np.isfinite(before_norm_sq)
+            or before_norm_sq <= 0.0
+        ):
+            return
+        observed_norm_sq = min(1.0, max(0.0, 1.0 - float(after_infidelity)))
+        raw = float(np.divide(observed_norm_sq, float(before_norm_sq)))
+        local_log_fidelity = log_fidelity_from_norms(
+            observed_norm_sq ** 0.5,
+            float(before_norm_sq) ** 0.5,
+        )
+        local_fidelity = fidelity_from_log(local_log_fidelity)
+        local_infidelity = infidelity_from_log(local_log_fidelity)
+        if observed_norm_sq == 0.0 or self._norm_log_survival == -math.inf:
+            cumulative_log_fidelity = -math.inf
+        else:
+            cumulative_log_fidelity = (
+                self._norm_log_survival + math.log(observed_norm_sq)
+            )
+        cumulative_fidelity = fidelity_from_log(cumulative_log_fidelity)
+        cumulative_infidelity = infidelity_from_log(cumulative_log_fidelity)
+        self._compression_norm_events.append({
+            "step": len(self._compression_norm_events) + 1,
+            "kind": str(kind),
+            "valid": True,
+            "expected_norm": float(max(0.0, before_norm_sq) ** 0.5),
+            "observed_norm": float(observed_norm_sq ** 0.5),
+            "norm_fidelity_raw": float(raw),
+            "norm_fidelity": local_fidelity,
+            "norm_infidelity": local_infidelity,
+            "local_norm_fidelity": local_fidelity,
+            "local_norm_infidelity": local_infidelity,
+            "cumulative_norm_fidelity": float(cumulative_fidelity),
+            "cumulative_norm_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": float(cumulative_fidelity),
+            "cumulative_compression_infidelity": cumulative_infidelity,
+        })
+
     def _invalidate_norm_infidelity(self) -> None:
         """Stop unitary norm-loss reporting after an unnormalized update."""
         self._norm_infidelity_valid = False
@@ -3235,6 +3308,8 @@ class MpsStabOptimizer:
             pre_norm=float(norm_sq ** 0.5),
             pre_norm_sq=float(norm_sq),
             segment_infidelity=float(infidelity),
+            segment_norm_fidelity=float(norm_sq),
+            segment_norm_infidelity=float(infidelity),
         )
         return event
 
@@ -3289,6 +3364,16 @@ class MpsStabOptimizer:
             if projector_survival is not None:
                 survival *= max(0.0, min(1.0, float(projector_survival)))
             self._accumulate_norm_survival(survival)
+            event["cumulative_norm_fidelity"] = (
+                0.0
+                if self._norm_log_survival == -math.inf
+                else float(math.exp(self._norm_log_survival))
+            )
+            event["cumulative_norm_infidelity"] = (
+                1.0
+                if self._norm_log_survival == -math.inf
+                else float(-math.expm1(self._norm_log_survival))
+            )
 
     def _accumulate_norm_survival(self, survival: float) -> None:
         """Accumulate one validated norm-survival factor in log space."""
@@ -3307,8 +3392,10 @@ class MpsStabOptimizer:
         norm is also folded into the product/geometric summaries. The returned
         values are compression/norm-survival proxies only; measurement branch
         probabilities are kept in the individual events and are not multiplied
-        into the truncation total. Dense non-unitary matrix updates contribute
-        their ``G^dagger G``-normalized compression loss.
+        into the truncation total. Per-update local ratios are available from
+        :meth:`get_compression_norm_events`. Dense non-unitary matrix updates
+        contribute their ``G^dagger G``-normalized compression loss. These
+        values are not target-state overlaps.
         """
         completed = [
             event
@@ -3376,6 +3463,7 @@ class MpsStabOptimizer:
             mean_segment_infidelity = float(sum(event_losses) / len(event_losses))
             max_segment_infidelity = float(max(event_losses))
         else:
+            log_survival = None
             total_survival = None
             geometric_mean_survival = None
             mean_segment_infidelity = None
@@ -3386,13 +3474,29 @@ class MpsStabOptimizer:
             else float(max(0.0, 1.0 - current_loss) ** 0.5)
         )
         norm_infidelity = (
-            None if total_survival is None else float(1.0 - total_survival)
+            None
+            if total_survival is None
+            else infidelity_from_log(log_survival)
         )
         norm_survival = total_survival
         norm = None if total_survival is None else float(total_survival ** 0.5)
+        latest_compression = (
+            self._compression_norm_events[-1]
+            if self._compression_norm_events
+            else None
+        )
         return {
             "tracking": self.track_infidelity,
+            "norm_tracking": self.track_infidelity,
+            # MPS-STN has no Tree-style per-edge spectrum tracker. Keep the
+            # explicit field present so cross-backend diagnostics can branch
+            # on one stable schema without mistaking ``None`` for disabled
+            # norm tracking.
+            "truncation_tracking": None,
             "current_valid": bool(self._norm_infidelity_valid),
+            "events": len(self.norm_events),
+            "norm_events_count": len(self.norm_events),
+            "completed_events": len(completed),
             "completed_segments": len(completed),
             "segments_including_current": len(survivals),
             "completed_segment_norms": [event["pre_norm"] for event in completed],
@@ -3406,16 +3510,46 @@ class MpsStabOptimizer:
             "completed_combined_infidelities": [
                 float(1.0 - survival) for survival in completed_survivals
             ],
+            "compression_events": len(self._compression_norm_events),
+            "compression_norm_events": self.get_compression_norm_events(),
             "current_segment_norm": current_norm,
             "current_segment_infidelity": current_loss,
+            "current_norm_fidelity": (
+                None if current_loss is None else float(1.0 - current_loss)
+            ),
+            "current_norm_infidelity": current_loss,
+            # Local means the most recent compressed update, matching the
+            # ordinary MPS and Tree ledgers. The current-segment fields above
+            # remain available for the boundary-aware STN history.
+            "local_norm_fidelity": (
+                None
+                if latest_compression is None
+                else latest_compression["local_norm_fidelity"]
+            ),
+            "local_norm_infidelity": (
+                None
+                if latest_compression is None
+                else latest_compression["local_norm_infidelity"]
+            ),
+            "local_norm": (
+                None
+                if latest_compression is None
+                else float(latest_compression["local_norm_fidelity"] ** 0.5)
+            ),
             "norm_survival": norm_survival,
             "norm_infidelity": norm_infidelity,
+            "cumulative_norm_fidelity": norm_survival,
+            "cumulative_norm_infidelity": norm_infidelity,
+            "cumulative_compression_fidelity": norm_survival,
+            "cumulative_compression_infidelity": norm_infidelity,
             # MpsOptimizer-compatible public names. ``infidelity`` is the
             # cumulative multiplicative compression infidelity; it never
             # includes stochastic measurement branch probabilities.
             "fidelity": norm_survival,
             "infidelity": norm_infidelity,
             "norm": norm,
+            "state_norm": float(self.norm()),
+            "cumulative_norm": norm,
             "total_survival_proxy": norm_survival,
             "total_infidelity_proxy": norm_infidelity,
             "total_norm_proxy": norm,
@@ -3595,6 +3729,7 @@ class MpsStabOptimizer:
         copied._norm_log_survival = self._norm_log_survival
         copied.infidelities = list(self.infidelities)
         copied._nonunitary_infidelities = list(self._nonunitary_infidelities)
+        copied._compression_norm_events = deepcopy(self._compression_norm_events)
         copied.norm_events = [
             NormEventRecord(**event.as_dict())
             if isinstance(event, NormEventRecord)
@@ -4825,6 +4960,11 @@ class MpsStabOptimizer:
         compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
+        before_norm_sq = (
+            self._norm_squared()
+            if unitary and self.track_infidelity and self._norm_infidelity_valid
+            else None
+        )
         if self.mode in self._DMRG_MODES:
             self._evolve_p_dmrg(mpo, where)
         else:
@@ -4844,6 +4984,7 @@ class MpsStabOptimizer:
                 info=self.state.info,
             )
         infidelity = self._unitary_norm_infidelity() if unitary else None
+        self._record_compression_norm_event(before_norm_sq, infidelity)
         if renormalize:
             site = self._canonize_p_single()
             projected_norm = self._renorm_p_at(site)
@@ -6261,10 +6402,11 @@ class MpsStabOptimizer:
         approx_norm = float(self.norm())
         if target_norm <= 1.0e-15:
             fidelity = 1.0 if approx_norm <= 1.0e-15 else 0.0
+            infidelity = 1.0 - fidelity
         else:
-            fidelity = (approx_norm / target_norm) ** 2
-            fidelity = min(1.0, max(0.0, fidelity))
-        infidelity = float(1.0 - fidelity)
+            log_fidelity = log_fidelity_from_norms(approx_norm, target_norm)
+            fidelity = fidelity_from_log(log_fidelity)
+            infidelity = infidelity_from_log(log_fidelity)
         self._nonunitary_infidelities.append(infidelity)
         self._accumulate_norm_survival(fidelity)
         self._invalidate_norm_infidelity()
@@ -6416,10 +6558,17 @@ class MpsStabOptimizer:
         """
         p = self.state.p
         branches = tuple(branches)
+        before_norm_sq = (
+            self._norm_squared()
+            if unitary and self.track_infidelity and self._norm_infidelity_valid
+            else None
+        )
         if not branches or self._norm_squared() <= 0.0:
             self._set_zero_coefficient_state()
             if unitary:
-                return self._unitary_norm_infidelity()
+                infidelity = self._unitary_norm_infidelity()
+                self._record_compression_norm_event(before_norm_sq, infidelity)
+                return infidelity
             if target_norm is not None:
                 return self._nonunitary_compression_infidelity(target_norm)
             self._invalidate_norm_infidelity()
@@ -6474,7 +6623,9 @@ class MpsStabOptimizer:
             # compress() leaves the rebuilt MPS canonical with the centre at site 0.
             self.state.info["cur_orthog"] = (0, 0)
         if unitary:
-            return self._unitary_norm_infidelity()
+            infidelity = self._unitary_norm_infidelity()
+            self._record_compression_norm_event(before_norm_sq, infidelity)
+            return infidelity
         if target_norm is not None:
             return self._nonunitary_compression_infidelity(target_norm)
         self._invalidate_norm_infidelity()

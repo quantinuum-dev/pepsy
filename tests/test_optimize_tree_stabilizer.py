@@ -405,13 +405,32 @@ def test_tree_stab_parity_advice_runner_ghz_and_rank():
         [("h", 0), ("t", 0)], n_qubits=1
     )
     assert advice.settings["max_operator_qubits"] == 2
-    assert advice.settings["track_truncation"] is True
+    assert advice.settings["track_infidelity"] is True
+    assert "track_truncation" not in advice.settings
     result = pepsy.TreeStabOptimizer.run_stream(
         [("h", 0), ("t", 0)], n_qubits=1, settings={"chi": None}
     )
     assert isinstance(result, StabilizerTreeRunResult)
     assert result.mode == "direct"
     assert result.norm_diagnostics["tracking"] is False
+
+
+def test_tree_stab_norm_tracking_is_separate_from_truncation_tracking():
+    """TreeStab exposes both tracking controls without conflating them."""
+    tracked = pepsy.TreeStabOptimizer(
+        1, chi=1, track_infidelity=True, track_truncation=False
+    ).apply([("t", 0)])
+    disabled = pepsy.TreeStabOptimizer(
+        1, chi=1, track_infidelity=False, track_truncation=False
+    ).apply([("t", 0)])
+
+    tracked_diagnostics = tracked.norm_diagnostics()
+    disabled_diagnostics = disabled.norm_diagnostics()
+    assert tracked_diagnostics["norm_tracking"] is True
+    assert tracked_diagnostics["truncation_tracking"] is False
+    assert disabled_diagnostics["norm_tracking"] is False
+    assert disabled_diagnostics["truncation_tracking"] is False
+    assert disabled_diagnostics["local_norm_fidelity"] is None
 
 
 def test_tree_stab_norm_diagnostics_and_sampling_copy_contract():
