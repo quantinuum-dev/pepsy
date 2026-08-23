@@ -1460,6 +1460,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         sites=None,
         L=None,
+        lattice_shape=None,
+        lattice_site=None,
         order="quality",
         objective="locality",
         refine_passes=8,
@@ -1495,6 +1497,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             inferred from first use in ``gate_stream`` unless ``L`` is given.
         L : int | None
             Convenience for ``sites=range(L)``.
+        lattice_shape : pair of int, optional
+            The ``(Lx, Ly)`` shape used by named geometric orders such as
+            ``"snake"``, ``"folded-snake"``, and ``"hilbert"``. The product
+            must equal the number of MPS sites.
+        lattice_site : callable, optional
+            Optional ``(x, y) -> logical_site`` mapper for named geometric
+            orders. The default is ``x * Ly + y``.
         objective : {"locality", "compression"}
             ``"locality"`` minimizes support span and cut congestion using
             event weights. ``"compression"`` ranks layouts by operator-
@@ -1502,7 +1511,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         order : str
             One of ``"quality"``/``"auto"``/``"best"``, ``"recursive"``,
             ``"input"``, ``"degree"``, ``"bfs"``, ``"spectral"``,
-            ``"nevergrad"``, ``"kahypar"``, or the ``"*_refined"`` variants.
+            ``"nevergrad"``, ``"kahypar"``, the geometric lattice presets
+            ``"row-major"``, ``"col-major"``, ``"snake"``,
+            ``"folded-snake"``, and ``"hilbert"``, or the ``"*_refined"``
+            variants. Geometric presets require ``lattice_shape``.
         refine_passes : int
             Number of greedy adjacent-swap improvement passes.
         refine_numba : bool
@@ -1550,7 +1562,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``stats``, and ``candidate_scores``.
         """
 
-        finder = cls.LayoutFinder(gate_stream, sites=sites, L=L)
+        finder = cls.LayoutFinder(
+            gate_stream,
+            sites=sites,
+            L=L,
+            lattice_shape=lattice_shape,
+            lattice_site=lattice_site,
+        )
         return finder.run(
             order=order,
             objective=objective,
@@ -1576,15 +1594,51 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return cls.gate_stream_layout(gate_stream, **kwargs)
 
-    def layout_finder(self, *, sites=None, L=None):
+    def layout_finder(
+        self,
+        *,
+        sites=None,
+        L=None,
+        lattice_shape=None,
+        lattice_site=None,
+    ):
         """Return a layout finder for the currently queued gate stream."""
 
-        return type(self).LayoutFinder.from_optimizer(self, sites=sites, L=L)
+        return type(self).LayoutFinder.from_optimizer(
+            self,
+            sites=sites,
+            L=L,
+            lattice_shape=lattice_shape,
+            lattice_site=lattice_site,
+        )
 
-    def current_gate_stream_layout(self, *, sites=None, L=None, **kwargs):
+    def current_gate_stream_layout(
+        self,
+        *,
+        sites=None,
+        L=None,
+        lattice_shape=None,
+        lattice_site=None,
+        **kwargs,
+    ):
         """Find a layout for the optimizer's currently queued gate stream."""
 
-        return self.layout_finder(sites=sites, L=L).run(**kwargs)
+        return self.layout_finder(
+            sites=sites,
+            L=L,
+            lattice_shape=lattice_shape,
+            lattice_site=lattice_site,
+        ).run(**kwargs)
+
+    @staticmethod
+    def _split_layout_finder_kwargs(layout_kwargs):
+        """Split finder-construction options from per-run layout options."""
+        kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
+        finder_kwargs = {}
+        for name in ("lattice_shape", "lattice_site"):
+            if name in kwargs:
+                finder_kwargs[name] = kwargs.pop(name)
+        return finder_kwargs, kwargs
 
     def select_layout_for_compression(
         self,
@@ -1635,8 +1689,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pilot_steps < 1:
                 raise ValueError("pilot_steps must be a positive integer or None.")
 
-        finder = self.layout_finder(sites=sites, L=L)
         kwargs = dict(layout_kwargs or {})
+        finder_kwargs, kwargs = self._split_layout_finder_kwargs(kwargs)
+        finder = self.layout_finder(
+            sites=sites,
+            L=L,
+            **finder_kwargs,
+        )
         kwargs["objective"] = "compression"
         static_plan = finder.run(**kwargs)
         candidates = dict(static_plan.get("candidate_plans", {}))
@@ -1719,9 +1778,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``plan`` is omitted, the finder computes its default quality plan;
         pass ``layout_kwargs`` to customize that search.
         """
-        finder = self.layout_finder(sites=sites, L=L)
+        finder_kwargs, run_kwargs = self._split_layout_finder_kwargs(layout_kwargs)
+        finder = self.layout_finder(
+            sites=sites,
+            L=L,
+            **finder_kwargs,
+        )
         if plan is None:
-            plan = finder.run(**dict(layout_kwargs or {}))
+            plan = finder.run(**run_kwargs)
         return finder.plot(plan, **plot_kwargs)
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -3362,8 +3426,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             order = layout_order
             if isinstance(layout, str):
                 order = layout
-            finder = self.layout_finder()
-            kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
+            finder_kwargs, kwargs = self._split_layout_finder_kwargs(layout_kwargs)
+            finder = self.layout_finder(**finder_kwargs)
             plan = finder.run(order=order, **kwargs)
 
         self._validate_layout_plan_for_mps(plan)
@@ -3418,8 +3482,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if isinstance(plan_or_order, Mapping):
             plan = dict(plan_or_order)
         elif isinstance(plan_or_order, str):
-            kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
-            plan = self.layout_finder().run(order=plan_or_order, **kwargs)
+            finder_kwargs, kwargs = self._split_layout_finder_kwargs(layout_kwargs)
+            plan = self.layout_finder(**finder_kwargs).run(
+                order=plan_or_order,
+                **kwargs,
+            )
         else:
             try:
                 plan = self._explicit_layout_plan(plan_or_order)

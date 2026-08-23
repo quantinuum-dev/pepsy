@@ -428,7 +428,7 @@ def test_map_builder_hilbert_rejects_unsupported_shapes():
 
 
 def test_map_builder_supports_rectangular_hilbert_mode():
-    """hilbert mode should cover rectangular 2D lattices via cropped Hilbert order."""
+    """hilbert mode should cover arbitrary rectangles without cropping gaps."""
     map_, map_inv = OneDMap.build(3, 5, mode="hilbert")
 
     assert len(map_) == 15
@@ -436,10 +436,16 @@ def test_map_builder_supports_rectangular_hilbert_mode():
     assert set(map_.values()) == {(x, y) for x in range(3) for y in range(5)}
     assert all(map_inv[coord] == idx for idx, coord in map_.items())
     assert map_[0] == (0, 0)
+    assert all(
+        abs(map_[idx][0] - map_[idx + 1][0])
+        + abs(map_[idx][1] - map_[idx + 1][1])
+        == 1
+        for idx in range(len(map_) - 1)
+    )
 
 
 def test_map_builder_supports_rectangular_hilbert_row_major_mode():
-    """Row-major Hilbert should also cover rectangular lattices with swapped orientation."""
+    """Row-major Hilbert should preserve the transposed rectangular orientation."""
     map_, map_inv = OneDMap.build(3, 5, mode="hilbert-row-major")
 
     assert len(map_) == 15
@@ -448,6 +454,33 @@ def test_map_builder_supports_rectangular_hilbert_row_major_mode():
     assert all(map_inv[coord] == idx for idx, coord in map_.items())
     assert map_[0] == (0, 0)
     assert map_ != OneDMap.build(3, 5, mode="hilbert")[0]
+    assert all(
+        abs(map_[idx][0] - map_[idx + 1][0])
+        + abs(map_[idx][1] - map_[idx + 1][1])
+        == 1
+        for idx in range(len(map_) - 1)
+    )
+
+
+@pytest.mark.parametrize("shape", [(1, 7), (2, 5), (5, 2), (5, 4), (8, 3)])
+@pytest.mark.parametrize("mode", ["hilbert", "hilbert-row-major"])
+def test_map_builder_hilbert_corner_shapes_are_bijective(shape, mode):
+    """Generalized Hilbert maps stay bounded and complete at corner shapes."""
+    Lx, Ly = shape
+    map_, map_inv = OneDMap.build(Lx, Ly, mode=mode)
+
+    assert len(map_) == Lx * Ly
+    assert set(map_.values()) == {(x, y) for x in range(Lx) for y in range(Ly)}
+    assert map_inv == {coord: idx for idx, coord in map_.items()}
+    steps = [
+        abs(map_[idx][0] - map_[idx + 1][0])
+        + abs(map_[idx][1] - map_[idx + 1][1])
+        for idx in range(len(map_) - 1)
+    ]
+    # A rectangular Hilbert traversal is orthogonal except for the single
+    # parity-forced diagonal allowed by the generalized construction.
+    assert max(steps, default=0) <= 2
+    assert steps.count(2) <= 1
 
 
 def test_ham_tn_accepts_builtin_mapping_mode_string():

@@ -196,18 +196,22 @@ def _normalize_layout_order(order):
         "best_quality": "quality",
         "row": "row-major",
         "row_major": "row-major",
+        "col": "col-major",
         "column": "col-major",
         "column_major": "col-major",
         "snake_col": "snake",
         "snake_column": "snake",
         "snake_col_major": "snake",
+        "snake_row": "snake-row-major",
         "folded_snake_col": "folded-snake",
         "folded_snake_column": "folded-snake",
         "folded_snake_col_major": "folded-snake",
+        "folded_snake_row": "folded-snake-row-major",
         "hilbert_curve": "hilbert",
         "hilbert_col": "hilbert",
         "hilbert_column": "hilbert",
         "hilbert_col_major": "hilbert",
+        "hilbert_row": "hilbert-row-major",
     }
     name = aliases.get(name, name)
     if name == "quality":

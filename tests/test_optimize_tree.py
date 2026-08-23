@@ -996,7 +996,19 @@ def test_tree_layout_accepts_explicit_fixed_site_order():
     assert plan.is_binary()
 
 
-@pytest.mark.parametrize("mode", ["row-major", "snake", "folded-snake", "hilbert"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "row-major",
+        "col-major",
+        "snake",
+        "snake-row-major",
+        "folded-snake",
+        "folded-snake-row-major",
+        "hilbert",
+        "hilbert-row-major",
+    ],
+)
 def test_tree_layout_finder_supports_onedmap_lattice_presets(mode):
     """Named Tree presets preserve the corresponding OneDMap leaf traversal."""
     Lx = Ly = 4
@@ -1014,6 +1026,91 @@ def test_tree_layout_finder_supports_onedmap_lattice_presets(mode):
     plan = finder.run(order=mode)
 
     assert plan.mpo_order() == expected
+
+
+def test_tree_layout_aliases_match_onedmap_hilbert_orientation():
+    """Tree aliases preserve both rectangular generalized-Hilbert orientations."""
+    finder = TreeLayoutFinder(
+        [],
+        n=15,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(3, 5),
+    )
+    expected = {
+        mode: tuple(x * 5 + y for x, y in pepsy.OneDMap.build(
+            3, 5, mode="hilbert-row-major" if "row" in mode else "hilbert",
+        )[0].values())
+        for mode in ("hilbert-row", "hilbert-row-major", "hilbert")
+    }
+
+    assert finder.run(order="hilbert-row").mpo_order() == expected["hilbert-row"]
+    assert finder.run(order="hilbert-row-major").mpo_order() == expected[
+        "hilbert-row-major"
+    ]
+    assert finder.run(order="hilbert").mpo_order() == expected["hilbert"]
+    assert expected["hilbert-row"] != expected["hilbert"]
+
+
+@pytest.mark.parametrize("mode", [
+    "row-major",
+    "col-major",
+    "snake",
+    "snake-row-major",
+    "folded-snake",
+    "folded-snake-row-major",
+    "hilbert",
+    "hilbert-row-major",
+])
+@pytest.mark.parametrize("shape", [(3, 5), (5, 3), (1, 7), (2, 5)])
+def test_tree_geometric_order_is_preserved_at_every_hierarchy_layer(
+    mode, shape,
+):
+    """Geometric trees coarsen adjacent OneDMap intervals at every level."""
+    Lx, Ly = shape
+    n = Lx * Ly
+    finder = TreeLayoutFinder(
+        [],
+        n=n,
+        max_arity=2,
+        top_arity=3,
+        lattice_shape=shape,
+    )
+    expected = tuple(
+        x * Ly + y
+        for x, y in pepsy.OneDMap.build(Lx, Ly, mode=mode)[0].values()
+    )
+    plan = finder.run(order=mode)
+
+    assert plan.mpo_order() == expected
+    masks = plan.subtree_qubit_masks()
+    positions = {qubit: i for i, qubit in enumerate(expected)}
+
+    # Every internal node must partition one contiguous path interval into
+    # consecutive child intervals. This includes the top layer, rather than
+    # checking only the leaf MPO order.
+    for node, children in plan.children.items():
+        if len(children) < 2:
+            continue
+        intervals = []
+        for child in children:
+            child_positions = sorted(
+                positions[q]
+                for q in range(n)
+                if masks[child] & (1 << q)
+            )
+            intervals.append((child_positions[0], child_positions[-1]))
+            assert child_positions == list(
+                range(child_positions[0], child_positions[-1] + 1)
+            )
+        assert intervals[0][0] == min(interval[0] for interval in intervals)
+        for previous, current in zip(intervals, intervals[1:]):
+            assert previous[1] + 1 == current[0]
+
+    # These cases are large enough to exercise the root plus multiple middle
+    # layers; the top children must themselves be non-leaf subtrees.
+    assert len(plan.children[plan.root]) == 3
+    assert all(plan.children[child] for child in plan.children[plan.root])
 
 
 def test_tree_lattice_order_helper_and_missing_shape_error():
