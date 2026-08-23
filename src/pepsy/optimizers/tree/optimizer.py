@@ -3767,6 +3767,7 @@ class TreeOptimizer:
         keep, carry = tu.split(
             left_inds=left_inds,
             method="qr",
+            cutoff=0.0,
             absorb="right",
             get="tensors",
         )

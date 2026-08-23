@@ -131,6 +131,14 @@ def test_sampler_public_exports_resolve():
     assert pepsy.MpsBatchSampleResult is sampler_mod.MpsBatchSampleResult
 
 
+def test_stabilizer_mps_sampler_public_exports_resolve():
+    """The STN physical sampler is available from both public namespaces."""
+    from pepsy.sampling.stabilizer import MpsStabSampler, StabilizerMpsSampler
+
+    assert pepsy.MpsStabSampler is MpsStabSampler
+    assert pepsy.StabilizerMpsSampler is StabilizerMpsSampler
+
+
 def test_mps_sampler_rejects_incomplete_site_map():
     """MPS sampler should fail at construction for incomplete site maps."""
     psi = qtn.MPS_computational_state("00")

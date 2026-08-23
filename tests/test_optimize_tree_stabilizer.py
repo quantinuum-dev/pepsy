@@ -103,6 +103,32 @@ def test_tree_stab_cutoff_defaults_match_tree_quimb_path():
     assert opt.tree_optimizer.cutoff_mode == "rsum2"
 
 
+def test_tree_stab_coefficient_route_uses_lossless_qr_before_compression(
+    monkeypatch,
+):
+    """TreeStab inherits TreeOptimizer's exact geodesic QR routing."""
+    import quimb.tensor.tensor_core as qtc
+
+    calls = []
+    tensor_split = qtc.tensor_split
+
+    def traced_tensor_split(*args, **kwargs):
+        if kwargs.get("method") == "qr":
+            calls.append(dict(kwargs))
+        return tensor_split(*args, **kwargs)
+
+    monkeypatch.setattr(qtc, "tensor_split", traced_tensor_split)
+    opt = pepsy.TreeStabOptimizer(
+        8, chi=64, cutoff=1e-10, track_truncation=False,
+    )
+    opt.apply([("rzz", 0.37, 0, 7)])
+
+    assert opt.tree_optimizer.track_truncation is False
+    assert calls
+    assert all(call["cutoff"] == 0.0 for call in calls)
+    assert opt.p.validate(check_canonical=True) is opt.p
+
+
 def test_tree_stab_isometry_api_and_backend_conversion_preserve_proofs():
     """TreeStab delegates one live map and backend conversion keeps it valid."""
     def converter(array):
@@ -533,6 +559,14 @@ def test_tree_stab_frame_maps_pauli_rotation_to_tree_coefficient_state():
     assert opt.norm() == pytest.approx(1.0)
 
 
+def test_tree_stab_public_centre_shift_supports_canonical_norm_readout():
+    opt = pepsy.TreeStabOptimizer.from_bits("0000", track_truncation=False)
+    initial_norm = opt.norm()
+
+    assert opt.shift_orthogonality_center() is opt
+    assert opt.norm() == pytest.approx(initial_norm)
+
+
 def test_tree_stab_fixed_measurement_matches_dense_born_probability():
     opt = pepsy.TreeStabOptimizer(1)
     opt.apply(("h", 0))
@@ -804,6 +838,29 @@ def test_tree_stab_nonclifford_two_qubit_matrix_matches_dense():
     expected = _apply_local(before, _rzz(0.5), (0, 1), 3)
     _assert_same_state(opt.to_statevector(), expected)
     assert opt.norm() == pytest.approx(np.linalg.norm(expected))
+
+
+def test_tree_and_mps_stab_accept_the_same_pepsy_dense_gate_stream():
+    """Rank-4 Pepsy gates replay identically through both STN facades."""
+    stream = [
+        (pepsy.rx(0.23), 0),
+        (pepsy.rzz(0.41), (0, 1)),
+        (pepsy.rx(-0.17), 2),
+    ]
+    tree = pepsy.TreeStabOptimizer(3, chi=None).apply(stream)
+    mps = pepsy.MpsStabOptimizer(3, chi=None).apply(stream)
+
+    expected = np.zeros(8, dtype=complex)
+    expected[0] = 1.0
+    expected = _apply_local(expected, np.asarray(pepsy.rx(0.23)), (0,), 3)
+    expected = _apply_local(
+        expected, np.asarray(pepsy.rzz(0.41)).reshape(4, 4), (0, 1), 3
+    )
+    expected = _apply_local(expected, np.asarray(pepsy.rx(-0.17)), (2,), 3)
+
+    _assert_same_state(tree.to_statevector(), expected)
+    _assert_same_state(mps.to_statevector(), expected)
+    _assert_same_state(tree.to_statevector(), mps.to_statevector())
 
 
 def test_tree_stab_three_qubit_dense_operator_matches_mps_and_dense():

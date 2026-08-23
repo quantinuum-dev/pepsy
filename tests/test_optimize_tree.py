@@ -220,6 +220,29 @@ def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
+def test_dense_thread_hops_use_explicitly_lossless_qr(monkeypatch):
+    """Geodesic threading never inherits Quimb's truncating cutoff default."""
+    import quimb.tensor.tensor_core as qtc
+
+    rng = np.random.default_rng(9191)
+    calls = []
+    tensor_split = qtc.tensor_split
+
+    def traced_tensor_split(*args, **kwargs):
+        if kwargs.get("method") == "qr":
+            calls.append(dict(kwargs))
+        return tensor_split(*args, **kwargs)
+
+    monkeypatch.setattr(qtc, "tensor_split", traced_tensor_split)
+    opt = TreeOptimizer(
+        None, n=8, chi=64, cutoff=1e-10, mode="direct", run=False,
+    )
+    opt.apply_2q(_rand_unitary(2, rng), 0, 7)
+
+    assert calls
+    assert all(call["cutoff"] == 0.0 for call in calls)
+
+
 @pytest.mark.parametrize("mode", ("direct", "mpo", "submpo"))
 def test_two_site_modes_reuse_path_isometries_for_compression(
     mode, monkeypatch,

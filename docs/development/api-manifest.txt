@@ -47,6 +47,7 @@ MpsEnergyOptimizer
 MpsOptimizer
 MpsSampleResult
 MpsSampler
+MpsStabSampler
 MpsStabOptimizer
 MPIRankDiagnostics
 MPIShotError
@@ -79,6 +80,7 @@ SpinfulFermionHubbard
 StabilizerMpsRunResult
 StabilizerMpsSettingsAdvice
 StabilizerMpsSimulator
+StabilizerMpsSampler
 StabilizerTreeRunResult
 StimCircuitPlan
 StimDetector
