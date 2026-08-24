@@ -6188,7 +6188,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "cumulative_compression_infidelity": infidelity,
             "fidelity": survival,
             "infidelity": infidelity,
-            "norm": None if survival is None else float(survival**0.5),
+            # ``norm`` is the represented live MPS norm. The retained-norm
+            # proxy is deliberately separate as ``cumulative_norm``.
+            "norm": state_norm,
             "state_norm": state_norm,
             "cumulative_norm": (
                 None if survival is None else float(survival**0.5)
@@ -6988,7 +6990,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return f"{MpsOptimizer._real_float(value):.6f}"
 
     def _cumulative_norm_fidelity(self):
-        """Return displayed cumulative fidelity from the log-space ledger."""
+        """Return displayed cumulative retained-norm fidelity.
+
+        This is not the live MPS norm and is not a target-state overlap. It is
+        the product of the local squared canonical-centre norm-survival ratios
+        accumulated in ``_norm_log_survival``.
+        """
         if self._norm_log_survival == -np.inf:
             return 0.0
         return float(math.exp(self._norm_log_survival))

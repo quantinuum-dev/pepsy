@@ -28,6 +28,10 @@ the second compares two states. A DMRG overlap is therefore an additional
 quality check, not a replacement for the norm ledger used by MPO, SVD, Tree,
 or stabilizer compression.
 
+For `norm_diagnostics()`, use `state_norm` (or `norm`) for the represented live
+state scale. `cumulative_norm` is the square-root retained-norm proxy and should
+not be interpreted as the current MPS norm.
+
 For Tree optimizers, `track_truncation=True` is a third, independent diagnostic:
 it performs extra local spectrum work to report per-edge discarded weight. It
 is not needed for the cheap path-level norm ledger.

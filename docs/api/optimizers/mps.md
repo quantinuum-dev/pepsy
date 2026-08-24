@@ -454,6 +454,12 @@ the unclipped ratio. `opt.norm_diagnostics()` exposes the latest local value as
 compatibility aliases. These are compression/norm-survival proxies, not
 directional target-state fidelities.
 
+In `opt.norm_diagnostics()`, `norm` and `state_norm` are the actual represented
+live-MPS norm. `cumulative_norm` is different: it is the square root of the
+accumulated retained-norm survival proxy. Thus the local and cumulative
+fidelity fields describe compression survival, while `state_norm` describes
+the current tensor-network state scale.
+
 DMRG additionally reports `fit_overlap_fidelity` and
 `fit_overlap_infidelity` in `opt.get_fit_diagnostics()` after a successful FIT
 update. Those values contract the final fitted MPS against the disposable exact

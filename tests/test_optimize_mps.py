@@ -8116,12 +8116,22 @@ def test_mps_norm_names_and_dmrg_target_overlap_are_distinct():
         chi=1,
         mode="dmrg",
     )
-    opt.run(progbar=False, cutoff=0.0, n_iter=3)
+    opt.run(
+        progbar=False,
+        cutoff=0.0,
+        n_iter=3,
+        stabilize_unitary=True,
+    )
 
     diagnostics = opt.norm_diagnostics()
     fit = opt.get_fit_diagnostics()
     assert diagnostics["local_norm_fidelity"] == pytest.approx(0.5, abs=2e-5)
     assert diagnostics["cumulative_norm_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert diagnostics["norm"] == pytest.approx(1.0, abs=2e-5)
+    assert diagnostics["state_norm"] == pytest.approx(1.0, abs=2e-5)
+    assert diagnostics["cumulative_norm"] == pytest.approx(
+        np.sqrt(0.5), abs=2e-5,
+    )
     assert fit["fit_overlap_fidelity"] == pytest.approx(0.5, abs=2e-5)
     assert fit["fit_overlap_infidelity"] == pytest.approx(0.5, abs=2e-5)
 
