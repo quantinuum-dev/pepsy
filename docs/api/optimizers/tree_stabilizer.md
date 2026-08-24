@@ -175,8 +175,14 @@ result = sim.run(
 
 Each shot starts from an independent copy of the current tableau and
 coefficient tree; the caller's state and queued stream are not consumed.
-The tree stabilizer path intentionally uses `strategy="independent"` for
-local and MPI execution.
+Local replay supports `strategy="independent"`, `"coalesced"`, and `"auto"`,
+including state-dependent Kraus channels. MPI `"auto"` resolves to independent
+replay to preserve stable shot seeds across rank counts.
+
+Trajectory events and native stochastic entries are compiled when they enter
+the TreeStab queue, so they can also be replayed through `run(shots=...)`.
+Do not combine stream-local trajectory events with the separate
+`error_model=` convenience macro.
 
 `cap(where, vec)` contracts one physical qubit with a length-two vector and
 compacts the remaining labels, matching the MPS physical-cap semantics. It is

@@ -197,8 +197,7 @@ new simulator features.
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
   matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current
-  stream part and MPS-compatible `infidelity`, with `norm_infidelity` retained as
-  an alias); `norm_diagnostics()` reports the same multiplicative `infidelity`
+  stream part and MPS-compatible `infidelity`); `norm_diagnostics()` reports the same multiplicative `infidelity`
   and `fidelity` names, and `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import time
+from copy import deepcopy
 from collections.abc import Mapping
 from itertools import combinations
 from numbers import Integral
@@ -166,6 +167,18 @@ def _apply_dense_gate(state, gate, where, n):
 def _as_entries(gates):
     if gates is None:
         return []
+    # Keep the trajectory objects opaque to the tree layout code, but treat a
+    # single event/compiled plan as one stream entry.  The generic iterable
+    # fallback would otherwise either reject a TrajectoryEvent or misclassify
+    # ``[TrajectoryEvent(...)]`` as a bundled gate.
+    try:
+        from ..noise import TrajectoryEvent, TrajectoryStreamPlan
+    except ImportError:  # pragma: no cover - optional import cycle guard
+        TrajectoryEvent = TrajectoryStreamPlan = ()
+    if isinstance(gates, TrajectoryStreamPlan):
+        return list(gates.entries)
+    if isinstance(gates, TrajectoryEvent):
+        return [gates]
     if _looks_like_single_entry(gates):
         return [gates]
     if isinstance(gates, (str, bytes)):
@@ -176,8 +189,30 @@ def _as_entries(gates):
         raise TypeError("gates must be a gate entry or an iterable of entries.") from exc
 
 
+def _compile_stream_plan(gates):
+    """Compile trajectory/stochastic entries before tree-layout discovery."""
+    from ..noise import compile_trajectory_stream
+
+    return compile_trajectory_stream(_as_entries(gates))
+
+
 def _entry_support(entry):
     """Extract a physical support for automatic tree layout construction."""
+    from ..noise import (
+        TrajectoryEvent,
+        _leakage_event_parts,
+        _trajectory_event_from_stochastic_entry,
+    )
+
+    if isinstance(entry, TrajectoryEvent):
+        return _normalize_sites(entry.where)
+    leakage = _leakage_event_parts(entry)
+    if leakage is not None:
+        _kind, _payload, where = leakage
+        return tuple(int(site) for site in where)
+    trajectory_event = _trajectory_event_from_stochastic_entry(entry)
+    if trajectory_event is not None:
+        return _normalize_sites(trajectory_event.where)
     tree_mpo_parts = _tree_mpo_event_parts(entry)
     if tree_mpo_parts is not None:
         _tree_mpo, where = tree_mpo_parts
@@ -605,8 +640,8 @@ class TreeStabOptimizer:
     Parameters are intentionally close to ``TreeOptimizer`` and
     ``MpsStabOptimizer``. ``gates`` are queued at construction and consumed by
     :meth:`run`; :meth:`apply` queues and immediately replays a stream.
-    Noisy trajectories and MPS-specific layout/noise APIs remain separate
-    milestones. Dense non-Clifford matrices are supported only up to
+    Noisy trajectories use the shared Pepsy shot runner; MPS-specific layout
+    APIs remain separate. Dense non-Clifford matrices are supported only up to
     ``max_operator_qubits`` through bounded Pauli decomposition. Set
     ``exact_cooling=False`` to exercise the ordinary multi-site rotation path.
     """
@@ -706,7 +741,8 @@ class TreeStabOptimizer:
             if candidate and not isinstance(state, (Integral, TreeTensorNetwork)):
                 state, gates = None, candidate
 
-        entries = _as_entries(gates)
+        stream_plan = _compile_stream_plan(gates)
+        entries = list(stream_plan.entries)
         coefficient_state = state
         if isinstance(state, Integral):
             state_n = int(state)
@@ -855,7 +891,12 @@ class TreeStabOptimizer:
         self.track_infidelity = bool(track_infidelity)
         self.exact_cooling = bool(exact_cooling)
         self.state = _TreeStabilizerFrame(self._tree.n)
-        self._queue = list(entries)
+        self._trajectory_plan = stream_plan
+        self._gate_stream = tuple(stream_plan.entries)
+        self._has_trajectory_events = bool(
+            stream_plan.has_trajectory_events or stream_plan.has_leakage
+        )
+        self._queue = list(stream_plan.entries)
         self._rng = np.random.default_rng(seed)
         self.measurements = []
         self.bond_history = [self._tree.tn.max_bond()]
@@ -1116,12 +1157,31 @@ class TreeStabOptimizer:
         return self.state.simulator
 
     def set_gates(self, gates):
-        self._queue = _as_entries(gates)
+        self._install_stream_plan(gates)
         return self
 
     def add_gates(self, gates):
-        self._queue.extend(_as_entries(gates))
+        self._install_stream_plan(tuple(self._queue) + tuple(_as_entries(gates)))
         return self
+
+    def _install_stream_plan(self, gates):
+        """Install the normalized trajectory plan owned by the queue."""
+        plan = _compile_stream_plan(gates)
+        self._trajectory_plan = plan
+        self._gate_stream = tuple(plan.entries)
+        self._has_trajectory_events = bool(
+            plan.has_trajectory_events or plan.has_leakage
+        )
+        self._queue = list(plan.entries)
+
+    def gate_stream(self):
+        """Return the immutable compiled stream owned by this optimizer."""
+        return self._gate_stream
+
+    @property
+    def has_trajectory_events(self):
+        """Whether the queue requires the shared shot/trajectory runner."""
+        return bool(self._has_trajectory_events)
 
     @staticmethod
     def submpo_event(mpo, where):
@@ -1643,12 +1703,6 @@ class TreeStabOptimizer:
         if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
             raise ValueError("shots must be a nonnegative integer.")
         strategy = str(strategy).strip().lower()
-        if strategy == "auto":
-            strategy = "independent"
-        if strategy != "independent":
-            raise ValueError(
-                "TreeStabOptimizer shot replay supports strategy='independent' only."
-            )
         mpi_enabled = mpi is not None and mpi is not False
         if not mpi_enabled and any(
             value is not None for value in (observable, checkpoint_path)
@@ -1758,6 +1812,11 @@ class TreeStabOptimizer:
                     **common,
                 )
             else:
+                if self._has_trajectory_events:
+                    raise ValueError(
+                        "do not combine stream-local trajectory events with "
+                        "error_model; use one noise representation per stream."
+                    )
                 raw = run_noisy_shots(
                     factory,
                     stream,
@@ -1809,12 +1868,14 @@ class TreeStabOptimizer:
 
         ``progbar`` is accepted for parity with ``MpsStabOptimizer``. The
         displayed infidelity is the tree truncation proxy, when tracked.
-        ``shots`` and ``mpi`` use the shared independent trajectory/MPI runner
-        and leave this optimizer's tableau, coefficient tree, and queue
-        unchanged.
+        ``shots`` uses the shared trajectory runner. Local ``strategy='auto'``
+        may use exact branch coalescing; MPI ``strategy='auto'`` resolves to
+        independent replay for rank-count-invariant shot seeds. Shot replay
+        leaves this optimizer's tableau, coefficient tree, and queue unchanged.
         """
         shot_requested = bool(
-            error_model is not None
+            self._has_trajectory_events
+            or error_model is not None
             or isinstance(shots, bool)
             or not isinstance(shots, Integral)
             or int(shots) != 1
@@ -4294,7 +4355,11 @@ class TreeStabOptimizer:
         other.to_backend = self.to_backend
         other.state = self.state.copy()
         other._queue = list(self._queue)
+        other._trajectory_plan = self._trajectory_plan
+        other._gate_stream = tuple(self._gate_stream)
+        other._has_trajectory_events = bool(self._has_trajectory_events)
         other._rng = np.random.default_rng()
+        other._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         other.measurements = list(self.measurements)
         other.bond_history = list(self.bond_history)
         other.projection_diagnostics = other._tree.projection_diagnostics
