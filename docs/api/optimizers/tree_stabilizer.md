@@ -63,13 +63,16 @@ The first milestone supports:
 - explicit, caller-scheduled greedy two-qubit Clifford disentangling over
   selected logical qubit pairs;
 - dynamic frame-layout planning from the queued ``C† P C`` supports;
-- conditional/batched computational-basis sampling without a ``2**n``
-  statevector;
+- conditional/batched product-Pauli sampling without a ``2**n`` statevector;
 - ``chi=None`` for exact evolution up to the requested singular-value cutoff;
 - ``from_stim`` and non-consuming ``analyze_stream`` compatibility with the MPS
   STN frontend.
 - coefficient-frame ``submpo`` stream events for arbitrary unitary or
   non-unitary MPO operators.
+- complete Tree-native ``TreeMPO``/TTNO stream events via
+  ``subtreempo_event`` (with ``subttno_event`` as an alias); these contract
+  internal TreeMPO bonds on the coefficient TreePlan rather than lowering to
+  a chain MPO.
 - bounded physical ``cap`` events, with dense state reconstruction guarded by
   ``max_dense_cap_qubits`` and an identity-frame rebuild on ``n - 1`` qubits;
  ``amplitude`` and ``probability`` provide matching small-state readouts.
@@ -146,9 +149,18 @@ The safe MPS naming compatibility surface includes `from_mps`,
 `expectation_pauli_sum`, and tree truncation accessors. MPS-only
 `apply_layout` remains chain-specific. Tree also exposes `from_stim`,
 `analyze_stream`, `queued_stream_analysis`, `current_frame_layout`,
-`apply_frame_layout`, `probability_bits`, `probability_bits_many`, and
-`iter_sample_bits`, plus `amplitude`, `probability`, and `cap`. Computational-basis sampling uses tree-native conditional
-projections and is not bounded by `max_dense_sample_qubits`; that constructor
+`apply_frame_layout`, `sample_basis`, `sample_bits`, `sample_bitstrings`,
+`probability_bits`, `probability_bits_many`, `iter_sample_bits`, and
+`iter_sample_bitstrings`, plus `amplitude`, `probability`, and `cap`.
+Sampling accepts `basis="X"`, `"Y"`, or `"Z"`, a per-qubit pattern such as
+`"XYZ"`, or `basis="random"`; returned columns remain physical-qubit
+indexed. The conditional projections behind all of these methods stay
+Tree-native and share collapsed TTN prefixes, rather than copying the MPS
+chain sampler. The same event constructors are available on TreeStab as on
+MpsStab: `submpo_event`, `submpo_event_parts`, `is_submpo_event`,
+`subtreempo_event`, `subttno_event`,
+`measure_event`, `reset_event`, `measure_reset_event`, and `cap_event`.
+Sampling is not bounded by `max_dense_sample_qubits`; that constructor
 argument remains accepted for compatibility with older callers.
 
 `TreeStabOptimizer.run` also accepts the shared shot and MPI options:
@@ -181,10 +193,19 @@ layout.
 An entry such as ``("submpo", mpo, where)`` acts directly on the coefficient
 state ``|p>`` in the same way as the MPS STN API; it is not conjugated through
 the physical Clifford frame. The payload must expose a usable MPO interface,
-or TreeOptimizer may lower it to a bounded dense operator. For an arbitrary
-physical operator, pass ``(matrix, where)`` instead so TreeStab can Pauli-map it
-through ``C† G C``; large dense physical matrices remain subject to
-``max_operator_qubits``.
+or TreeOptimizer may lower it to a bounded dense operator. A complete
+``TreeMPO``/TTNO can instead be scheduled with
+``TreeStabOptimizer.subtreempo_event(tree_mpo)`` (or ``subttno_event``). Its
+TreePlan must match the coefficient tree and its declared support must include
+all TreePlan physical sites, or exactly the complete operator's explicit
+``operator_support`` (for example, one produced by ``TreeMPO.from_gate``); the
+coefficient backend then contracts the
+operator's internal virtual bonds with Tree-native QR routing and one final
+configured compression sweep. Set ``track_norm=False`` for a non-unitary
+operator, since its physical norm change is not a compression-fidelity loss.
+For an arbitrary physical operator, pass ``(matrix, where)`` instead so
+TreeStab can Pauli-map it through ``C† G C``; large dense physical matrices
+remain subject to ``max_operator_qubits``.
 
 Feed-forward uses `("if", record, bit, action)`, with Stim-style negative
 measurement offsets and computational bits (`+1 -> 0`, `-1 -> 1`). The action

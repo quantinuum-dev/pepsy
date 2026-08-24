@@ -1143,10 +1143,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 operator_work = operator.copy()
                 ket_reindex = {}
                 operator_reindex = {}
+                upper_id = getattr(mpo, "upper_ind_id", "k{}")
+                lower_id = getattr(mpo, "lower_ind_id", "b{}")
                 for site in all_sites:
                     physical = self.site_ind(site)
-                    upper = f"k{site}"
-                    lower = f"b{site}"
+                    upper = upper_id.format(site)
+                    lower = lower_id.format(site)
                     if upper not in operator_work.ind_map:
                         raise ValueError(
                             "TreePlan MPO embedding is missing physical site "
@@ -1159,6 +1161,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                         )
                     fresh = qtn.rand_uuid()
                     ket_reindex[physical] = fresh
+                    operator_reindex[upper] = physical
                     operator_reindex[lower] = fresh
                 ket.reindex_(ket_reindex)
                 operator_work.reindex_(operator_reindex)
@@ -1234,6 +1237,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 )
             fresh = qtn.rand_uuid()
             ket_reindex[physical] = fresh
+            mpo_reindex[upper] = physical
             mpo_reindex[lower] = fresh
 
         # This is the key orientation: bra <- MPO upper, MPO lower -> ket.

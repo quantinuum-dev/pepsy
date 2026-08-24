@@ -11,6 +11,7 @@ import pepsy
 
 from pepsy.optimizers.tree import (
     TreeLayoutFinder,
+    TreeMPO,
     TreeOptimizer,
     TreePlan,
     TreeTensorNetwork,
@@ -19,6 +20,70 @@ from pepsy.optimizers.tree.optimizer import _contract_two_tensors
 from pepsy.optimizers.tree.ttn import _native_qr_block_scaled
 
 
+def test_tree_mpo_higher_order_term_routes_and_replays_natively():
+    """A dense higher-order TreeMPO applies without chain-MPO lowering."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    rng = np.random.default_rng(42)
+    term = rng.normal(size=(2,) * 8) + 1j * rng.normal(size=(2,) * 8)
+    operator = TreeMPO.from_terms(
+        plan,
+        {(3, 0, 2, 1): term},
+        compress=True,
+        cutoff=0.0,
+    )
+
+    assert operator.max_bond() > 1
+    assert operator.tree_network.pepsy_tree_operator_is_ttno is True
+    support = (3, 0, 2, 1)
+    order = tuple(sorted(range(4), key=support.__getitem__))
+    reference = term.transpose(order + tuple(axis + 4 for axis in order))
+    np.testing.assert_allclose(operator.to_dense(), reference.reshape(16, 16))
+    operator.canonicalize(center=plan.root)
+    assert operator.is_canonical_form()
+    assert operator.validate(check_canonical=True) is operator
+    operator.compress(
+        max_bond=None,
+        cutoff=0.0,
+    )
+    assert operator.validate() is operator
+    np.testing.assert_allclose(operator.to_dense(), reference.reshape(16, 16))
+
+    initial = np.zeros(16, dtype=complex)
+    initial[0] = 1.0
+    optimizer = TreeOptimizer(
+        None,
+        n=4,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        run=False,
+    )
+    optimizer.apply_subtreempo(operator, track_norm=False)
+
+    np.testing.assert_allclose(
+        optimizer.to_dense(),
+        operator.to_dense() @ initial,
+        rtol=1e-11,
+        atol=1e-11,
+    )
+    assert optimizer.tn.is_canonical_form()
+    assert optimizer.tn.validate_isometry_metadata() is optimizer.tn
+
+    streamed = TreeOptimizer(
+        [TreeOptimizer.subtreempo_event(operator)],
+        n=4,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        run=False,
+    )
+    streamed.run()
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        optimizer.to_dense(),
+        rtol=1e-11,
+        atol=1e-11,
+    )
 # -- exact statevector reference ----------------------------------------------
 
 
@@ -4348,6 +4413,42 @@ def test_tree_submpo_stream_backend_preparation_preserves_input():
     assert prepared is not submpo
     assert all(torch.is_tensor(tensor.data) for tensor in prepared.tensors)
     assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
+
+
+def test_tree_treemppo_stream_backend_preparation_preserves_input():
+    """A TreeMPO stream payload is converted without mutating its source."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    plan = TreePlan.from_order(range(2), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    state.apply_to_arrays(to_backend)
+    identity = np.eye(4, dtype=complex).reshape(2, 2, 2, 2)
+    tree_mpo = TreeMPO.from_terms(
+        plan,
+        {(0, 1): identity},
+        compress=False,
+    )
+    opt = TreeOptimizer(None, state=state, tree=plan, run=False)
+
+    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
+        prepared = opt._prepare_gate_stream_backend(
+            [tree_mpo], ["subtreempo"]
+        )[0]
+
+    assert prepared is not tree_mpo
+    assert all(
+        torch.is_tensor(tensor.data)
+        for network in prepared.tree_networks
+        for tensor in network
+    )
+    assert all(
+        isinstance(tensor.data, np.ndarray)
+        for network in tree_mpo.tree_networks
+        for tensor in network
+    )
+    opt.apply_subtreempo(prepared, track_norm=False)
+    np.testing.assert_allclose(opt.to_dense(), [1.0, 0.0, 0.0, 0.0])
+    assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
 def test_tree_rejects_a_mixed_backend_initial_state():

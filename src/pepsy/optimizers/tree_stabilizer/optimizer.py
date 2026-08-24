@@ -45,6 +45,7 @@ from ..tree.optimizer import (
     TreeOptimizer,
     _DEFAULT_CUTOFF,
     _DEFAULT_CUTOFF_MODE,
+    _tree_mpo_event_parts,
 )
 from ..tree.ttn import TreeTensorNetwork
 
@@ -177,6 +178,10 @@ def _as_entries(gates):
 
 def _entry_support(entry):
     """Extract a physical support for automatic tree layout construction."""
+    tree_mpo_parts = _tree_mpo_event_parts(entry)
+    if tree_mpo_parts is not None:
+        _tree_mpo, where = tree_mpo_parts
+        return _normalize_sites(where)
     submpo_parts = submpo_event_parts(entry, normalize_where=True)
     if submpo_parts is not None:
         _submpo, where = submpo_parts
@@ -1118,6 +1123,108 @@ class TreeStabOptimizer:
         self._queue.extend(_as_entries(gates))
         return self
 
+    @staticmethod
+    def submpo_event(mpo, where):
+        """Return the canonical coefficient-frame sub-MPO event."""
+        return ("submpo", mpo, _normalize_sites(where))
+
+    @staticmethod
+    def submpo_event_parts(entry, *, normalize_where=False):
+        """Return ``(mpo, where)`` for a sub-MPO event."""
+        return submpo_event_parts(entry, normalize_where=normalize_where)
+
+    @staticmethod
+    def is_submpo_event(entry):
+        """Return whether ``entry`` is a sub-MPO event."""
+        return submpo_event_parts(entry) is not None
+
+    @staticmethod
+    def subtreempo_event(tree_mpo, where=None):
+        """Build a Tree-native TreeMPO/TTNO event."""
+        return TreeOptimizer.subtreempo_event(tree_mpo, where=where)
+
+    subttno_event = subtreempo_event
+    sub_treempo_event = subtreempo_event
+    sub_tree_mpo_event = subtreempo_event
+
+    @staticmethod
+    def subtreempo_event_parts(entry):
+        """Return ``(TreeMPO, declared_support)`` for a TreeMPO event."""
+        return _tree_mpo_event_parts(entry)
+
+    subttno_event_parts = subtreempo_event_parts
+    sub_treempo_event_parts = subtreempo_event_parts
+
+    @staticmethod
+    def is_subtreempo_event(entry):
+        """Return whether ``entry`` is a Tree-native TreeMPO event."""
+        return _tree_mpo_event_parts(entry) is not None
+
+    is_subttno_event = is_subtreempo_event
+    is_sub_treempo_event = is_subtreempo_event
+
+    @staticmethod
+    def measure_event(pauli, where, outcome=None, absorb_basis=None):
+        """Build an MPS-compatible Pauli-measurement event.
+
+        The optional ``absorb_basis`` field is retained when explicitly
+        supplied.  This keeps event tuples portable between the MPS and Tree
+        stabilizer frontends while the Tree dispatcher still owns the actual
+        tree-native measurement implementation.
+        """
+        where = _normalize_sites(where)
+        _normalize_axes(pauli, where, allow_identity=True)
+        if outcome is not None:
+            if not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
+                raise ValueError("measure event outcome must be +1 or -1.")
+            outcome = int(outcome)
+        entry = ("measure", str(pauli), where)
+        if absorb_basis is None:
+            if outcome is not None:
+                entry += (outcome,)
+        else:
+            entry += (outcome, bool(absorb_basis))
+        return entry
+
+    @staticmethod
+    def cap_event(where, vec, absorb="left"):
+        """Build an MPS-compatible physical cap event."""
+        sites = _normalize_sites(where)
+        if len(sites) != 1:
+            raise ValueError("cap event where must reference exactly one site.")
+        absorb = str(absorb).strip().lower()
+        if absorb not in {"left", "right"}:
+            raise ValueError("cap absorb direction must be 'left' or 'right'.")
+        return ("cap", int(sites[0]), np.asarray(vec, dtype=complex).ravel(), absorb)
+
+    @staticmethod
+    def reset_event(where, basis="Z"):
+        """Build an MPS-compatible reset event."""
+        where = _normalize_sites(where)
+        axes = _normalize_basis_axes(basis, where, event="reset")
+        if all(axis == "Z" for axis in axes):
+            return ("reset", where)
+        return ("reset", where, "".join(axes))
+
+    @staticmethod
+    def measure_reset_event(pauli, where, outcome=None, absorb_basis=None):
+        """Build an MPS-compatible measure-then-reset event."""
+        where = _normalize_sites(where)
+        axes = _normalize_basis_axes(pauli, where, event="measure_reset")
+        outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
+        if any(value is not None and value not in (-1, 1) for value in outcomes):
+            raise ValueError("measure_reset outcomes must be +1 or -1.")
+        entry = ("measure_reset", "".join(axes), where)
+        value = None if outcome is None else (
+            outcomes[0] if len(outcomes) == 1 else outcomes
+        )
+        if absorb_basis is None:
+            if outcome is not None:
+                entry += (value,)
+        else:
+            entry += (value, bool(absorb_basis))
+        return entry
+
     @classmethod
     def _build_frame_layout(
         cls,
@@ -1263,6 +1370,19 @@ class TreeStabOptimizer:
             if support:
                 records.append({
                     "kind": "submpo",
+                    "entry": entry,
+                    "support": support,
+                    "weight": 1.0,
+                    "absorbs_basis": False,
+                })
+            return
+        tree_mpo_parts = _tree_mpo_event_parts(entry)
+        if tree_mpo_parts is not None:
+            _tree_mpo, where = tree_mpo_parts
+            support = tuple(sorted(_normalize_sites(where)))
+            if support:
+                records.append({
+                    "kind": "subtreempo",
                     "entry": entry,
                     "support": support,
                     "weight": 1.0,
@@ -1800,6 +1920,17 @@ class TreeStabOptimizer:
         conditional = conditional_event_parts(entry)
         if conditional is not None:
             self._apply_conditional_entry(entry)
+            return
+        tree_mpo_parts = _tree_mpo_event_parts(entry)
+        if tree_mpo_parts is not None:
+            tree_mpo, where = tree_mpo_parts
+            self._tree.apply_subtreempo(
+                tree_mpo,
+                where,
+                max_bond=self._tree.chi,
+                cutoff=self._tree.cutoff,
+                track_norm=False,
+            )
             return
         submpo_parts = submpo_event_parts(entry, normalize_where=True)
         if submpo_parts is not None:
@@ -3466,6 +3597,33 @@ class TreeStabOptimizer:
         }
 
     @staticmethod
+    def _resolve_sample_basis(basis, n, rng):
+        """Normalize a global, per-site, or random Pauli basis policy."""
+        # Keep the public basis contract shared with MpsStabOptimizer and the
+        # standalone stabilizer sampler.  The import is local to avoid making
+        # the optimizer module part of the sampling-module import cycle.
+        from ...sampling.samplers import _resolve_measurement_basis
+
+        return _resolve_measurement_basis(basis, int(n), rng=rng)
+
+    def _sample_frame_terms(self, basis, order):
+        """Return ``C^dagger P_q C`` terms for each measured physical site."""
+        return {
+            int(q): self._frame_terms(
+                basis[int(q)], (int(q),), allow_identity=True
+            )
+            for q in order
+        }
+
+    def _sample_expectation(self, terms, sign):
+        """Evaluate one resolved frame Pauli on the coefficient tree."""
+        if not terms:
+            return float(sign)
+        support = tuple(sorted(terms))
+        axes = "".join(terms[q] for q in support)
+        return float(sign) * self._tree.expectation_pauli(axes, support)
+
+    @staticmethod
     def _prob_zero_from_expectation(expectation):
         return min(max(0.5 * (1.0 + float(expectation)), 0.0), 1.0)
 
@@ -3549,6 +3707,87 @@ class TreeStabOptimizer:
             self._tree.normalize()
         return probability
 
+    def _sample_basis_arrays(
+        self,
+        shots,
+        *,
+        basis="Z",
+        seed=None,
+        order=None,
+        shuffle=True,
+        resolved_basis=None,
+    ):
+        """Sample product-Pauli outcomes with shared Tree prefix branches.
+
+        The readout basis is resolved in the physical frame, then each sampled
+        bit is conditioned through ``_condition_computational_bit``.  That
+        method is intentionally the only projection primitive used here: its
+        compact-support Pauli-sum route remains Tree-native.
+        """
+        shots = int(shots)
+        if shots < 0:
+            raise ValueError("shots must be nonnegative.")
+        rng = self._sample_rng(seed)
+        if resolved_basis is None:
+            resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
+        else:
+            resolved_basis = tuple(str(axis).upper() for axis in resolved_basis)
+            if len(resolved_basis) != self.n or any(
+                axis not in {"X", "Y", "Z"} for axis in resolved_basis
+            ):
+                raise ValueError(
+                    "resolved_basis must contain exactly one X/Y/Z axis per qubit."
+                )
+        order = self._bit_measurement_order(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
+        bits = np.empty((shots, self.n), dtype=np.int8)
+        probabilities = np.empty(shots, dtype=float)
+        if shots == 0:
+            return bits, probabilities, resolved_basis
+
+        # Rows sharing a measured prefix share the collapsed coefficient TTN.
+        # The prefix probability is retained so this internal helper has the
+        # same exact Born-probability contract as MpsStabOptimizer.
+        stack = [(self._sampling_copy(), 0, 0, shots, 1.0)]
+        while stack:
+            sim, position, lo, hi, prefix_probability = stack.pop()
+            q = order[position]
+            count = hi - lo
+            terms, sign = frame_terms[q]
+            expectation = sim._sample_expectation(terms, sign)
+            p0 = self._prob_zero_from_expectation(expectation)
+            n0 = (
+                0 if p0 <= 1e-12 else
+                count if p0 >= 1.0 - 1e-12 else
+                int(rng.binomial(count, p0))
+            )
+            mid = lo + n0
+            bits[lo:mid, q] = 0
+            bits[mid:hi, q] = 1
+            p_zero = prefix_probability * p0
+            p_one = prefix_probability * (1.0 - p0)
+            if position + 1 == self.n:
+                probabilities[lo:mid] = p_zero
+                probabilities[mid:hi] = p_one
+                continue
+            both = 0 < n0 < count
+            if n0:
+                child = sim._sampling_copy() if both else sim
+                child._condition_computational_bit(
+                    terms, sign, 0, probability=p0
+                )
+                stack.append((child, position + 1, lo, mid, p_zero))
+            if n0 < count:
+                sim._condition_computational_bit(
+                    terms, sign, 1, probability=1.0 - p0
+                )
+                stack.append((sim, position + 1, mid, hi, p_one))
+        if shuffle:
+            permutation = rng.permutation(shots)
+            bits = bits[permutation]
+            probabilities = probabilities[permutation]
+        return bits, probabilities, resolved_basis
+
     @staticmethod
     def _bits_matrix(bitstrings, *, expected_length):
         """Normalize one or many bitstrings to an ``(rows, n)`` matrix."""
@@ -3581,68 +3820,69 @@ class TreeStabOptimizer:
         return np.asarray(rows, dtype=np.int8)
 
     def sample_bits(
-        self, shots=1, *, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots=1,
+        *,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
-        """Sample computational-basis bitstrings using shared TTN branches."""
-        shots = int(shots)
-        if shots < 0:
-            raise ValueError("shots must be nonnegative.")
-        rng = self._sample_rng(seed)
-        order = self._bit_measurement_order(order)
-        if shots == 0:
-            bits = np.empty((0, self.n), dtype=np.int8)
-            return self.pack_bit_samples(bits) if packed else bits
-        frame_terms = self._computational_z_frame_terms(order)
-        bits = np.empty((shots, self.n), dtype=np.int8)
-        stack = [(self._sampling_copy(), 0, 0, shots)]
-        while stack:
-            sim, position, lo, hi = stack.pop()
-            q = order[position]
-            count = hi - lo
-            terms, sign = frame_terms[q]
-            p0 = self._prob_zero_from_expectation(sim.expectation("Z", q))
-            n0 = (
-                0 if p0 <= 1e-12 else
-                count if p0 >= 1.0 - 1e-12 else
-                int(rng.binomial(count, p0))
-            )
-            mid = lo + n0
-            bits[lo:mid, q] = 0
-            bits[mid:hi, q] = 1
-            if position + 1 == self.n:
-                continue
-            both = 0 < n0 < count
-            if n0:
-                child = sim._sampling_copy() if both else sim
-                child._condition_computational_bit(terms, sign, 0, probability=p0)
-                stack.append((child, position + 1, lo, mid))
-            if n0 < count:
-                sim._condition_computational_bit(
-                    terms, sign, 1, probability=1.0 - p0
-                )
-                stack.append((sim, position + 1, mid, hi))
-        if shuffle:
-            rng.shuffle(bits, axis=0)
-        return self.pack_bit_samples(bits) if packed else bits
+        """Sample product-Pauli basis bitstrings using shared TTN branches.
+
+        ``basis`` accepts one global ``X``, ``Y``, or ``Z`` axis, a per-qubit
+        pattern such as ``"XYZ"``, or ``"random"``.  Returned columns remain
+        indexed by physical qubit, independently of the conditional
+        measurement ``order``.
+        """
+        out, _probabilities, _resolved_basis = self._sample_basis_arrays(
+            shots,
+            basis=basis,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+        )
+        return self.pack_bit_samples(out) if packed else out
+
+    def sample_basis(self, shots=1, *, basis="Z", **kwargs):
+        """Explicit alias for :meth:`sample_bits` with a Pauli basis policy."""
+        return self.sample_bits(shots, basis=basis, **kwargs)
 
     def sample_bitstrings(
-        self, shots=1, *, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots=1,
+        *,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
         """Alias for :meth:`sample_bits`."""
         return self.sample_bits(
-            shots, seed=seed, order=order, shuffle=shuffle, packed=packed
+            shots,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+            packed=packed,
+            basis=basis,
         )
 
-    def probability_bits(self, bits, *, order=None):
-        """Return one computational-basis probability by conditional projection."""
+    def probability_bits(self, bits, *, order=None, basis="Z", seed=None):
+        """Return one product-Pauli outcome probability by conditional projection."""
         bits = _validate_bits(bits, expected_length=self.n)
+        rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
         tmp = self._sampling_copy()
         probability = 1.0
         for q in order:
             terms, sign = frame_terms[q]
-            p0 = self._prob_zero_from_expectation(tmp.expectation("Z", q))
+            p0 = self._prob_zero_from_expectation(
+                tmp._sample_expectation(terms, sign)
+            )
             bit = int(bits[q])
             branch = p0 if bit == 0 else 1.0 - p0
             if branch <= 1e-12:
@@ -3651,20 +3891,26 @@ class TreeStabOptimizer:
             tmp._condition_computational_bit(terms, sign, bit, probability=branch)
         return float(probability)
 
-    def probability_bits_many(self, bitstrings, *, order=None):
+    def probability_bits_many(
+        self, bitstrings, *, order=None, basis="Z", seed=None
+    ):
         """Return many computational-basis probabilities with shared prefixes."""
         bits = self._bits_matrix(bitstrings, expected_length=self.n)
-        probabilities = np.zeros(len(bits), dtype=float)
-        if not len(bits):
+        probabilities = np.zeros(bits.shape[0], dtype=float)
+        if bits.shape[0] == 0:
             return probabilities
+        rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
-        stack = [(self._sampling_copy(), 0, np.arange(len(bits)), 1.0)]
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
+        stack = [(self._sampling_copy(), 0, np.arange(bits.shape[0]), 1.0)]
         while stack:
             sim, position, indices, prefix = stack.pop()
             q = order[position]
             terms, sign = frame_terms[q]
-            p0 = self._prob_zero_from_expectation(sim.expectation("Z", q))
+            p0 = self._prob_zero_from_expectation(
+                sim._sample_expectation(terms, sign)
+            )
             branches = (
                 (0, indices[bits[indices, q] == 0], p0),
                 (1, indices[bits[indices, q] == 1], 1.0 - p0),
@@ -3689,18 +3935,30 @@ class TreeStabOptimizer:
                 stack.append((child, position + 1, selected, value))
         return probabilities
 
-    def bitstring_probability(self, bits, *, order=None):
+    def bitstring_probability(self, bits, *, order=None, basis="Z", seed=None):
         """Alias for :meth:`probability_bits`."""
-        return self.probability_bits(bits, order=order)
+        return self.probability_bits(bits, order=order, basis=basis, seed=seed)
 
-    def bitstring_probabilities(self, bitstrings, *, order=None):
+    def bitstring_probabilities(
+        self, bitstrings, *, order=None, basis="Z", seed=None
+    ):
         """Alias for :meth:`probability_bits_many`."""
-        return self.probability_bits_many(bitstrings, order=order)
+        return self.probability_bits_many(
+            bitstrings, order=order, basis=basis, seed=seed
+        )
 
     def iter_sample_bits(
-        self, shots, *, chunk_size, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots,
+        *,
+        chunk_size,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
-        """Yield computational-basis samples in bounded-size chunks."""
+        """Yield product-Pauli basis samples in bounded-size chunks."""
         shots = int(shots)
         chunk_size = int(chunk_size)
         if shots < 0:
@@ -3708,21 +3966,35 @@ class TreeStabOptimizer:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive.")
         rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         done = 0
         while done < shots:
             take = min(chunk_size, shots - done)
             yield self.sample_bits(
-                take, seed=rng, order=order, shuffle=shuffle, packed=packed
+                take,
+                seed=rng,
+                order=order,
+                shuffle=shuffle,
+                packed=packed,
+                basis=resolved_basis,
             )
             done += take
 
     def iter_sample_bitstrings(
-        self, shots, *, chunk_size, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots,
+        *,
+        chunk_size,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
         """Alias for :meth:`iter_sample_bits`."""
         yield from self.iter_sample_bits(
             shots, chunk_size=chunk_size, seed=seed, order=order,
-            shuffle=shuffle, packed=packed,
+            shuffle=shuffle, packed=packed, basis=basis,
         )
 
     # ------------------------------------------------------------------

@@ -245,6 +245,125 @@ def test_tree_stab_chi_none_is_uncapped_and_sampling_is_conditional():
     assert np.all(samples[:, 0] == samples[:, 1])
 
 
+def test_tree_stab_basis_sampling_matches_mps_and_keeps_tree_projection(monkeypatch):
+    """TreeStab adds MPS basis semantics without borrowing chain projection."""
+    tree = pepsy.TreeStabOptimizer(2)
+    mps = pepsy.MpsStabOptimizer(2)
+    stream = [("h", 0), ("cnot", 0, 1)]
+    tree.apply(stream)
+    mps.apply(stream)
+
+    calls = []
+    original = pepsy.TreeStabOptimizer._condition_computational_bit
+
+    def record_projection(self, *args, **kwargs):
+        calls.append(type(self).__name__)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        pepsy.TreeStabOptimizer,
+        "_condition_computational_bit",
+        record_projection,
+    )
+
+    configs = ["00", "01", "10", "11"]
+    for basis in ("XX", "XY", ["Y", "X"]):
+        np.testing.assert_allclose(
+            tree.probability_bits_many(configs, basis=basis, order=(1, 0)),
+            mps.probability_bits_many(configs, basis=basis, order=(1, 0)),
+            atol=1e-10,
+        )
+    samples = tree.sample_basis(32, basis="X", seed=4, shuffle=False)
+    assert samples.shape == (32, 2)
+    assert calls
+    assert all(name == "TreeStabOptimizer" for name in calls)
+
+
+def test_tree_stab_basis_sampling_aliases_and_random_resolution():
+    opt = pepsy.TreeStabOptimizer(3)
+    opt.apply([("h", 0), ("h", 1)])
+
+    np.testing.assert_array_equal(
+        opt.sample_bitstrings(8, basis="Z", seed=3),
+        opt.sample_bits(8, basis="Z", seed=3),
+    )
+    chunks = list(
+        opt.iter_sample_bitstrings(
+            7, chunk_size=3, basis="random", seed=11, packed=True
+        )
+    )
+    assert [chunk.shape[0] for chunk in chunks] == [3, 3, 1]
+    assert all(chunk.dtype == np.uint8 for chunk in chunks)
+
+    random_probs = opt.probability_bits_many(
+        ["000", "001", "010", "011", "100", "101", "110", "111"],
+        basis="random",
+        seed=11,
+    )
+    assert random_probs.sum() == pytest.approx(1.0)
+
+
+def test_tree_stab_exposes_mps_compatible_event_helpers():
+    assert pepsy.TreeStabOptimizer.measure_event("Z", 0) == (
+        "measure", "Z", (0,)
+    )
+    assert pepsy.TreeStabOptimizer.measure_event("Z", 0, +1, True) == (
+        "measure", "Z", (0,), +1, True
+    )
+    assert pepsy.TreeStabOptimizer.reset_event([0, 1], basis="X") == (
+        "reset", (0, 1), "XX"
+    )
+    assert pepsy.TreeStabOptimizer.measure_reset_event("Y", 0, -1) == (
+        "measure_reset", "Y", (0,), -1
+    )
+
+    marker = pepsy.TreeStabOptimizer.submpo_event(object(), [0, 2])
+    assert pepsy.TreeStabOptimizer.is_submpo_event(marker)
+    assert pepsy.TreeStabOptimizer.submpo_event_parts(
+        marker, normalize_where=True
+    )[1] == (0, 2)
+
+    cap = pepsy.TreeStabOptimizer.cap_event(1, [1.0, 0.0], absorb="right")
+    assert cap[0:2] == ("cap", 1)
+    np.testing.assert_allclose(cap[2], [1.0, 0.0])
+    assert cap[3] == "right"
+
+
+def test_tree_stab_routes_complete_treempo_event_on_coefficient_tree():
+    """TreeStab keeps complete TTNO application Tree-native."""
+    plan = pepsy.TreePlan.from_order(range(3), structure="balanced")
+    term = np.zeros((2,) * 6, dtype=complex)
+    term[(0, 0, 0, 0, 0, 0)] = 2.0
+    term[(1, 1, 1, 1, 1, 1)] = 3.0
+    operator = pepsy.TreeMPO.from_terms(
+        plan,
+        {(0, 1, 2): term},
+        compress=False,
+    )
+    event = pepsy.TreeStabOptimizer.subtreempo_event(operator)
+    assert pepsy.TreeStabOptimizer.is_subtreempo_event(event)
+    assert pepsy.TreeStabOptimizer.subtreempo_event_parts(event)[1] == (
+        0, 1, 2,
+    )
+
+    optimizer = pepsy.TreeStabOptimizer.from_bits(
+        "000",
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        gates=[event],
+    )
+    optimizer.run()
+
+    expected = np.zeros(8, dtype=complex)
+    expected[0] = 2.0
+    np.testing.assert_allclose(optimizer.to_statevector(), expected)
+    assert optimizer.tree_optimizer.tn.is_canonical_form()
+    assert optimizer.tree_optimizer.tn.validate_isometry_metadata() is (
+        optimizer.tree_optimizer.tn
+    )
+
+
 def test_tree_stab_frame_layout_uses_current_conjugated_supports():
     opt = pepsy.TreeStabOptimizer(
         4,

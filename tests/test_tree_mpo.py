@@ -5,7 +5,14 @@ import pytest
 import quimb.tensor as qtn
 
 import pepsy
-from pepsy.optimizers.tree import TreeMPO, TreePlan, build_tree_operator, tree_mpo
+from pepsy.optimizers.tree import (
+    TreeMPO,
+    TreeOptimizer,
+    TreePlan,
+    TreeLayoutFinder,
+    build_tree_operator,
+    tree_mpo,
+)
 
 
 pytest.importorskip("symmray")
@@ -203,13 +210,233 @@ def test_tree_mpo_class_dense_backend_and_direct_expectation():
     assert len(operator.tree_networks) == 1
     assert operator.tree_network.pepsy_tree_operator_kind == "dense_tree_tnno"
     assert operator.compressed is True
-    np.testing.assert_allclose(operator.expectation(state), direct)
     np.testing.assert_allclose(
-        state.expectation_mpo_exact(operator, range(4)), direct,
+        operator.expectation(state, optimize="greedy"), direct,
+    )
+    np.testing.assert_allclose(
+        state.expectation_mpo_exact(operator, range(4), optimize="greedy"),
+        direct,
+    )
+    # The approximate expectation path must recognize a complete TreeMPO as
+    # a TTNO. Routing it through the ordinary site-MPO path would leave the
+    # TreeMPO's internal operator bonds dangling.
+    np.testing.assert_allclose(
+        state.expectation_mpo(
+            operator,
+            range(4),
+            max_bond=16,
+            optimize="greedy",
+            warn_on_truncation=False,
+        ),
+        direct,
+        atol=1e-10,
     )
     operator.canonicalize()
     operator.compress(max_bond=4)
-    np.testing.assert_allclose(operator.expectation(state), direct, atol=1e-10)
+    np.testing.assert_allclose(
+        operator.expectation(state, optimize="greedy"), direct, atol=1e-10,
+    )
+
+
+def test_tree_mpo_custom_physical_index_ids_route_natively():
+    """Native TreeMPO APIs honor non-default upper/lower physical labels."""
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = pepsy.TreeTensorNetwork.from_plan(plan, dtype=complex)
+    operator = TreeMPO.from_dense(
+        plan,
+        np.eye(2**3, dtype=complex),
+        dims=2,
+        upper_ind_id="u{}",
+        lower_ind_id="d{}",
+        node_tag_id="T{}",
+    )
+
+    assert operator.validate() is operator
+    np.testing.assert_allclose(
+        operator.expectation(state, optimize="greedy"), 1.0,
+    )
+    np.testing.assert_allclose(
+        state.expectation_mpo(
+            operator,
+            range(3),
+            max_bond=16,
+            optimize="greedy",
+            warn_on_truncation=False,
+        ),
+        1.0,
+    )
+    operator.canonicalize(center=operator.node_tag(plan.root)).validate(
+        check_canonical=True,
+    )
+    operator.compress(max_bond=4, cutoff=0.0).validate()
+
+
+def test_tree_ttn_mpo_readout_maps_custom_state_and_mpo_indices():
+    """Generic MPO readout maps both physical index naming conventions."""
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = pepsy.TreeTensorNetwork.from_plan(
+        plan, dtype=complex, site_ind_id="s{}",
+    )
+    mpo = qtn.MatrixProductOperator.from_dense(
+        np.eye(2**3, dtype=complex),
+        dims=2,
+        L=3,
+        upper_ind_id="u{}",
+        lower_ind_id="d{}",
+    )
+
+    np.testing.assert_allclose(
+        state.expectation_mpo_exact(mpo, range(3), optimize="greedy"), 1.0,
+    )
+    np.testing.assert_allclose(
+        state.expectation_mpo(
+            mpo,
+            range(3),
+            max_bond=16,
+            optimize="greedy",
+            warn_on_truncation=False,
+        ),
+        1.0,
+    )
+
+
+def test_native_tree_mpo_identity_stays_native_for_tree_application():
+    """Native TreeMPO.identity is directly usable by TreeOptimizer."""
+    fermion = pepsy.Fermion(spinful=True, symmetry="U1", dtype="complex128")
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    operator = plan.build_tree_operator(
+        fermion.hamiltonian([(0, 1)], t=1.0, U=0.0, mu=0.0),
+        fermionic=True,
+        compress=False,
+    )
+    identity = operator.identity()
+    state = pepsy.ps_to_ttn(
+        3,
+        tree=plan,
+        fermion=fermion,
+        occupations=[0, 1, 0],
+        dtype="complex128",
+    )
+
+    assert identity.fermionic is True
+    assert identity.backend == operator.backend
+    assert identity.validate() is identity
+    np.testing.assert_allclose(
+        state.expectation_mpo_exact(identity, range(3), optimize="greedy"),
+        1.0,
+        atol=1e-12,
+    )
+    reference = state.copy()
+    engine = TreeOptimizer(
+        None, state=state, tree=plan, chi=16, cutoff=0.0, run=False,
+    )
+    engine.apply_subtreempo(identity, range(3), cutoff=0.0)
+    overlap = (reference.H | engine.tn).contract(all, optimize="greedy")
+    np.testing.assert_allclose(overlap, 1.0, atol=1e-12)
+
+
+def test_tree_mpo_from_gate_uses_logical_snake_support_not_chain_positions():
+    """A local gate becomes a compact TTNO on a snake-derived TreePlan."""
+    order = TreeLayoutFinder.lattice_order(2, 3, "snake")
+    plan = TreePlan.from_order(order, structure="balanced", top_arity=2)
+    gate = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    operator = TreeMPO.from_gate(
+        plan, gate, where=(order[0], order[-1]), compress=False,
+    )
+    assert operator.validate() is operator
+    assert operator.max_bond() <= 2
+
+    direct = TreeOptimizer(
+        [(gate, (order[0], order[-1]))],
+        n=6,
+        tree=plan,
+        chi=16,
+        cutoff=0.0,
+    )
+    native = TreeOptimizer(
+        None,
+        n=6,
+        tree=plan,
+        chi=16,
+        cutoff=0.0,
+        run=False,
+    )
+    native.apply_subtreempo(
+        operator, operator.operator_support, cutoff=0.0,
+    )
+    np.testing.assert_allclose(native.to_dense(), direct.to_dense(), atol=1e-12)
+
+
+def test_tree_mpo_from_gate_honors_custom_layout_labels():
+    """Gate-generated TTNOs use the same custom layout contract as states."""
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    gate = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    operator = TreeMPO.from_gate(
+        plan,
+        gate,
+        where=(0, 2),
+        site_tag_id="Q{}",
+        upper_ind_id="u{}",
+        lower_ind_id="d{}",
+        node_tag_id="T{}",
+    )
+    assert operator.validate() is operator
+    assert all(
+        operator.node_tag(node) in operator.tree_networks[0].tag_map
+        for node in plan.nodes()
+    )
+    state = pepsy.TreeTensorNetwork.from_plan(
+        plan, dtype=complex, site_ind_id="s{}",
+    )
+    np.testing.assert_allclose(
+        state.expectation_mpo(operator, range(3), optimize="greedy"),
+        1.0,
+        atol=1e-12,
+    )
+
+
+def test_native_tree_mpo_from_gate_preserves_symmetry_and_tree_geometry():
+    """A native local gate uses its Symmray charge maps on the TreePlan."""
+    fermion = pepsy.Fermion(spinful=True, symmetry="U1", dtype="complex128")
+    hamiltonian = fermion.hamiltonian([(0, 1)], t=1.0, U=0.0, mu=0.0)
+    order = TreeLayoutFinder.lattice_order(2, 2, "folded-snake")
+    plan = TreePlan.from_order(order, structure="balanced", top_arity=2)
+    operator = TreeMPO.from_gate(
+        plan,
+        hamiltonian.terms[(0, 1)],
+        where=(order[0], order[-1]),
+        fermionic=True,
+        site_tag_id="Q{}",
+        upper_ind_id="u{}",
+        lower_ind_id="d{}",
+        node_tag_id="T{}",
+    )
+    state = pepsy.ps_to_ttn(
+        4,
+        tree=plan,
+        fermion=fermion,
+        occupations=[0, 1, 0, 1],
+        dtype="complex128",
+    )
+
+    assert operator.backend == "symmray"
+    assert operator.fermionic is True
+    assert operator.validate() is operator
+    assert all(
+        type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in operator.tree_networks[0]
+    )
+    np.testing.assert_allclose(
+        operator.expectation(state, optimize="greedy"),
+        0.0,
+        atol=1e-12,
+    )
 
 
 def test_native_tree_mpo_amalgamates_higher_rank_term():

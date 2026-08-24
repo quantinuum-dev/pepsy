@@ -155,6 +155,9 @@ not need `charge_sectors=True` just to construct one operator object;
 `charge_sectors=True` remains available when separate objects are preferred.
 Structured observables can use a smaller compact TTNO.
 Pass `fermionic=False` only for dense ordinary/Jordan--Wigner-compatible terms.
+Native `TreeMPO.identity()` preserves the operator's Symmray symmetry and
+returns a bond-one TTNO that can be applied directly to a native
+`TreeTensorNetwork`; dense identities remain ordinary dense TTNOs.
 `OneDMap` is the shared source of truth for regular 2D/3D coordinate layouts;
 the tree and MPS geometric layout finders consume its row/column, snake,
 folded-snake, and generalized Hilbert traversals directly.
@@ -169,7 +172,27 @@ of Quimb's `MatrixProductOperator`: the common operator surface includes
 tree-wide QR/SVD sweeps. It cannot inherit Quimb's chain-only
 `MatrixProductOperator` implementation because a branched tree has no single
 left/right ordering. The optional `chain_mpo` remains the separate object for
-chain workflows.
+chain workflows. `validate()` checks every stored TTNO network against the
+TreePlan; `validate(check_canonical=True)` also checks the tracked operator
+`left_inds` directions when a canonical region is known.
+
+`TreeMPO.from_terms(plan, terms)` accepts dense one-site, two-site, and
+higher-order terms. A higher-order term is first factorized exactly on the
+minimal Steiner subtree joining its physical sites, then combined with the
+other terms by a TTNO virtual direct sum. Thus every resulting network still
+has one operator tensor per `TreePlan` node; it is not a hyperedge that must be
+lowered to a chain. The same Tree-native factorization is used by the dense
+term path and by the native Hamiltonian builders (with graded Symmray tensors
+on the fermionic path).
+
+For a local gate, use `TreeMPO.from_gate(plan, gate, where)` instead of
+materializing a full-system matrix. `where` always contains logical qubit
+labels, independent of whether the plan was created from row-major, snake,
+folded-snake, or Hilbert order. The constructor factors only the gate over
+the minimal TreePlan Steiner subtree and adds bond-one identity legs elsewhere,
+so the result can be sent directly to `TreeOptimizer.apply_subtreempo` or a
+`subtreempo_event`. Dense gate factorization removes only machine-precision
+null operator-Schmidt sectors; configured TreeMPO compression remains explicit.
 
 The conventional binary TTN with a three-leg top tensor is the default when
 there are at least three leaves and no `root_qubit`. Pass
@@ -477,6 +500,24 @@ estimates use MPO bond dimensions as a conservative Schmidt-rank bound.
 Payloads without the required site interface fall back to `mpo.to_dense()`,
 which must produce an operator on the declared support.
 `TreeOptimizer.submpo_event(...)` builds the tuple form.
+
+For a complete operator already represented as a `TreeMPO`, use
+`apply_subtreempo(tree_mpo, where=None, ...)` or the aliases
+`apply_sub_tree_mpo` / `apply_subttno`. This contracts the operator's internal
+TTNO bonds directly on the TreePlan, routes the resulting messages by the
+TreePlan geometry, and performs one final configured Tree compression sweep.
+It never extracts a contiguous chain MPO. The operator must use the same plan,
+contain one primary network, and either declare all physical sites or declare
+exactly its `operator_support` metadata when that known non-identity support is
+available. Bond-one identity factors outside a term's active support are still
+part of the complete TTNO; the shorter declaration only selects the minimal
+Steiner route. Any omitted boundary operator bond must be bond one, otherwise
+the application raises instead of silently discarding operator information.
+The stream constructor `TreeOptimizer.subtreempo_event(tree_mpo)` and
+the matching `TreeStabOptimizer.subtreempo_event(...)` provide the same
+native route; `subttno_event` is an accepted spelling alias. Set
+`track_norm=False` for a general non-unitary TreeMPO so its physical norm
+change is not recorded as compression loss.
 
 The internal Pauli rotation and Pauli-sum constructors have a separate compact
 support form for Tree evolution. A sparse operator on qubits such as

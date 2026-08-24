@@ -97,6 +97,56 @@ def _normalize_where(where):
     return tuple(int(site) for site in where)
 
 
+_TREE_MPO_EVENT_NAMES = frozenset({
+    "subtreempo",
+    "sub_treempo",
+    "sub_tree_mpo",
+    "subttno",
+    "sub_ttno",
+})
+
+
+def _tree_mpo_event_parts(entry):
+    """Return ``(TreeMPO, declared_support)`` for a TreeMPO event.
+
+    TreeMPO events are deliberately a Tree-only stream extension.  The
+    payload carries its ``TreePlan`` and the default support is every physical
+    site of that plan; unlike an MPS sub-MPO marker, no chain interval is
+    inferred or inserted.
+    """
+    if isinstance(entry, Mapping):
+        kind = str(entry.get("kind", entry.get("type", ""))).strip().lower()
+        if kind not in _TREE_MPO_EVENT_NAMES:
+            return None
+        payload = entry.get("treempo")
+        if payload is None:
+            payload = entry.get("tree_mpo")
+        if payload is None:
+            payload = entry.get("ttno", entry.get("operator"))
+        where = entry.get("where")
+    elif isinstance(entry, (tuple, list)) and entry:
+        head = entry[0]
+        if not isinstance(head, str) or head.strip().lower() not in _TREE_MPO_EVENT_NAMES:
+            return None
+        if len(entry) < 2 or len(entry) > 3:
+            raise ValueError(
+                "TreeMPO events must be ('subtreempo', operator[, where])."
+            )
+        payload = entry[1]
+        where = entry[2] if len(entry) == 3 else None
+    else:
+        return None
+
+    plan = getattr(payload, "plan", None)
+    if plan is None or not hasattr(payload, "tree_networks"):
+        raise TypeError(
+            "TreeMPO events require a TreeMPO/TTNO payload with a TreePlan."
+        )
+    if where is None:
+        where = tuple(sorted(plan.node_of_qubit))
+    return payload, _normalize_where(where)
+
+
 def _submpo_to_dense(submpo, where):
     """Materialize an explicit sub-MPO on its declared support.
 
@@ -829,6 +879,11 @@ class TreeOptimizer:
         if hasattr(gates, "__next__"):
             gates = list(gates)
 
+        tree_mpo_parts = _tree_mpo_event_parts(gates)
+        if tree_mpo_parts is not None:
+            tree_mpo, where = tree_mpo_parts
+            return [tree_mpo], [where], ["subtreempo"]
+
         submpo_parts = submpo_event_parts(gates)
         if submpo_parts is not None:
             submpo, where = submpo_parts
@@ -840,7 +895,8 @@ class TreeOptimizer:
             return [payload], [where], [name]
 
         if isinstance(gates, (tuple, list)) and any(
-            submpo_event_parts(entry) is not None
+            _tree_mpo_event_parts(entry) is not None
+            or submpo_event_parts(entry) is not None
             or _mps_control_event_parts(entry) is not None
             for entry in gates
         ):
@@ -848,6 +904,13 @@ class TreeOptimizer:
             wheres = []
             event_types = []
             for entry in gates:
+                tree_mpo_parts = _tree_mpo_event_parts(entry)
+                if tree_mpo_parts is not None:
+                    tree_mpo, where = tree_mpo_parts
+                    payloads.append(tree_mpo)
+                    wheres.append(where)
+                    event_types.append("subtreempo")
+                    continue
                 submpo_parts = submpo_event_parts(entry)
                 if submpo_parts is not None:
                     submpo, where = submpo_parts
@@ -904,6 +967,8 @@ class TreeOptimizer:
 
             if event_type == "gate":
                 stream.append((payload, original_where))
+            elif event_type == "subtreempo":
+                stream.append(self.subtreempo_event(payload, original_where))
             elif event_type == "submpo":
                 stream.append(self.submpo_event(payload, original_where))
             elif event_type == "measure":
@@ -1210,6 +1275,40 @@ class TreeOptimizer:
                     continue
                 for op_tensor in tensor_map.values():
                     op_tensor.modify(data=self._as_state_backend(op_tensor.data))
+            prepared[index] = copied
+
+        for index, (payload, event_type) in enumerate(
+            zip(payloads, event_types)
+        ):
+            if event_type != "subtreempo":
+                continue
+            networks = tuple(getattr(payload, "tree_networks", ()))
+            if not networks:
+                continue
+            source_signatures = {
+                _array_backend_signature(tensor.data)
+                for network in networks
+                for tensor in network
+            }
+            if source_signatures == {target_signature}:
+                continue
+            for source_signature in source_signatures:
+                if source_signature != target_signature:
+                    self._warn_backend_conversion(
+                        source_signature, target_signature
+                    )
+            if converter is None:
+                converter = self._backend_converter(like)
+            copied = payload.copy()
+            for network in copied.tree_networks:
+                apply_to_arrays = getattr(network, "apply_to_arrays", None)
+                if callable(apply_to_arrays):
+                    apply_to_arrays(converter)
+                    continue
+                for op_tensor in network.tensor_map.values():
+                    op_tensor.modify(
+                        data=self._as_state_backend(op_tensor.data)
+                    )
             prepared[index] = copied
 
         return prepared
@@ -2341,7 +2440,7 @@ class TreeOptimizer:
             self.track_infidelity
             and bool(track_norm)
             and self._norm_tracking_enabled
-            and str(kind) in {"gate", "subtree", "submpo"}
+            and str(kind) in {"gate", "subtree", "submpo", "subtreempo"}
         ):
             self._active_update["norm_before"] = float(self.norm())
         return True
@@ -2638,6 +2737,8 @@ class TreeOptimizer:
             support = _normalize_where(where)
             if event_type == "gate":
                 stream.append((payload, support))
+            elif event_type == "subtreempo":
+                stream.append(self.subtreempo_event(payload, support))
             elif event_type == "submpo":
                 stream.append(self.submpo_event(payload, support))
             elif event_type == "measure":
@@ -3077,6 +3178,14 @@ class TreeOptimizer:
                     else:
                         multi_qubit_count += 1
                     self.apply_gate(payload, support)
+                elif event_type == "subtreempo":
+                    self.apply_subtreempo(
+                        payload,
+                        support,
+                        max_bond=self.chi,
+                        cutoff=self.cutoff,
+                    )
+                    multi_qubit_count += 1
                 elif event_type == "submpo":
                     # Reuse the public sub-MPO implementation so stream
                     # replay gets the two-site factor fast path as well as
@@ -3255,6 +3364,40 @@ class TreeOptimizer:
     def submpo_event(submpo, where):
         """Return an explicit sub-MPO stream marker for TTN replay."""
         return ("submpo", submpo, normalize_submpo_where(where))
+
+    @staticmethod
+    def subtreempo_event(tree_mpo, where=None):
+        """Return a Tree-native TreeMPO/TTNO stream marker.
+
+        The operator carries the complete TreePlan geometry. ``where`` is
+        therefore only a declared logical support for stream/layout metadata;
+        when omitted, all physical sites of the operator's plan are used.
+        Application validates that the declared support is either the complete
+        TreeMPO site set or the operator's explicit ``operator_support`` before
+        routing its internal TTNO bonds.
+        """
+        parts = _tree_mpo_event_parts(("subtreempo", tree_mpo, where))
+        return ("subtreempo", tree_mpo, parts[1])
+
+    subttno_event = subtreempo_event
+    sub_treempo_event = subtreempo_event
+    sub_tree_mpo_event = subtreempo_event
+
+    @staticmethod
+    def subtreempo_event_parts(entry):
+        """Return ``(TreeMPO, declared_support)`` for a TreeMPO marker."""
+        return _tree_mpo_event_parts(entry)
+
+    subttno_event_parts = subtreempo_event_parts
+    sub_treempo_event_parts = subtreempo_event_parts
+
+    @staticmethod
+    def is_subtreempo_event(entry):
+        """Return whether ``entry`` is a Tree-native TreeMPO marker."""
+        return _tree_mpo_event_parts(entry) is not None
+
+    is_subttno_event = is_subtreempo_event
+    is_sub_treempo_event = is_subtreempo_event
 
     @staticmethod
     def submpo_event_parts(entry):
@@ -4642,6 +4785,192 @@ class TreeOptimizer:
             self._finish_update()
         return result
 
+    def apply_subtreempo(
+        self,
+        tree_mpo,
+        where=None,
+        *,
+        max_bond=None,
+        cutoff=None,
+        track_norm=True,
+    ):
+        """Apply a complete TreeMPO/TTNO without lowering it to a chain MPO.
+
+        ``tree_mpo`` must use the same :class:`TreePlan` as this state and
+        contain one primary TTNO network.  The operator's virtual bonds are
+        contracted on the Tree geometry itself: each state/operator site is
+        absorbed locally, open operator bonds are QR-routed from the leaves to
+        a common hub, and the affected state bonds are compressed once after
+        the complete TreeMPO has arrived.  This is the Tree-native analogue of
+        applying a sub-MPO, not a call into an MPS backend.
+        """
+        self._warn_track_truncation_slow()
+        self._invalidate_state_norm_cache()
+        # Direct calls, like stream replay, must cross the live state backend
+        # boundary without mutating the caller's operator tensors.
+        tree_mpo = self._prepare_gate_stream_backend(
+            [tree_mpo], ["subtreempo"]
+        )[0]
+        plan = getattr(tree_mpo, "plan", None)
+        networks = getattr(tree_mpo, "tree_networks", None)
+        if plan is None or networks is None:
+            raise TypeError(
+                "apply_subtreempo requires a TreeMPO/TTNO payload with a TreePlan."
+            )
+        if not _same_tree_plan(self.plan, plan):
+            raise ValueError("TreeMPO and state use different TreePlans.")
+        networks = tuple(networks)
+        if len(networks) != 1:
+            raise NotImplementedError(
+                "apply_subtreempo currently requires one TreeMPO network; "
+                "multi-sector TreeMPO expectation remains supported separately."
+            )
+        sites = tuple(sorted(self.plan.node_of_qubit))
+        declared = sites if where is None else _normalize_where(where)
+        if len(set(declared)) != len(declared):
+            raise ValueError(
+                f"TreeMPO application support repeats a site: {declared!r}."
+            )
+        operator_support = getattr(tree_mpo, "operator_support", None)
+        if operator_support is not None:
+            operator_support = tuple(sorted(_normalize_where(operator_support)))
+            if any(site not in sites for site in operator_support):
+                raise ValueError(
+                    "TreeMPO operator_support contains sites outside its "
+                    f"TreePlan: {operator_support!r}."
+                )
+        if tuple(sorted(declared)) == sites:
+            active_support = sites if operator_support is None else operator_support
+        elif operator_support is not None and set(declared) == set(operator_support):
+            # A complete TreeMPO may be declared by its non-identity support.
+            # Identity legs outside that support are validated and stripped
+            # below before the minimal Steiner route is constructed.
+            active_support = operator_support
+        else:
+            raise ValueError(
+                "a TreeMPO application must declare every physical site of its "
+                "TreePlan, or exactly its known operator_support; got "
+                f"{declared!r} for sites {sites!r}."
+            )
+        if bool(getattr(tree_mpo, "fermionic", False)) != bool(
+            getattr(self.tn, "fermionic", False)
+        ):
+            raise TypeError(
+                "TreeMPO and TreeTensorNetwork must agree on the fermionic "
+                "backend when applying a TreeMPO."
+            )
+        if bool(getattr(self.tn, "fermionic", False)) and (
+            getattr(tree_mpo, "symmetry", None)
+            != getattr(self.tn, "symmetry", None)
+        ):
+            raise TypeError(
+                "native TreeMPO and TreeTensorNetwork must use the same "
+                f"symmetry, got operator={getattr(tree_mpo, 'symmetry', None)!r} "
+                f"and state={getattr(self.tn, 'symmetry', None)!r}."
+            )
+        if hasattr(tree_mpo, "validate"):
+            tree_mpo.validate()
+
+        max_bond = self.chi if max_bond is None else self._normalize_max_bond(max_bond)
+        cutoff = self.cutoff if cutoff is None else float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        started = self._begin_update(
+            "subtreempo", declared, track_norm=track_norm
+        )
+        try:
+            with self._thread_ctx():
+                active_nodes = tuple(
+                    self.plan.node_of_qubit[site] for site in active_support
+                )
+                snodes = (
+                    frozenset(self.plan.nodes())
+                    if tuple(sorted(active_support)) == sites
+                    else self._steiner_nodes(active_nodes)
+                )
+                order, hub = self._peel_order(snodes)
+                self._move_center(hub)
+                local = {}
+                state_inds = {}
+                operator_inds = {}
+                for nid in snodes:
+                    state_t = self.tn.tensor_map[self._tid(nid)].copy()
+                    state_inds[nid] = set(state_t.inds)
+                    op_t = tree_mpo.node_tensor(nid).copy()
+                    # The state plan is the validated routing authority. Use
+                    # its adjacency here so compatible TreeMPO views need only
+                    # expose node tensors, not duplicate the neighbor API.
+                    for neighbor in self._neighbors(nid):
+                        if neighbor in snodes:
+                            continue
+                        shared = qtn.bonds(
+                            op_t, tree_mpo.node_tensor(neighbor),
+                        )
+                        if len(shared) != 1:
+                            raise ValueError(
+                                "TreeMPO boundary must have one virtual bond "
+                                f"on edge {(nid, neighbor)!r}."
+                            )
+                        edge = next(iter(shared))
+                        if int(op_t.ind_size(edge)) != 1:
+                            raise ValueError(
+                                "TreeMPO operator_support omits a nontrivial "
+                                f"boundary bond on edge {(nid, neighbor)!r}."
+                            )
+                        op_t = op_t.isel({edge: 0})
+                    qubit = self.plan.qubit_of_node.get(nid)
+                    if qubit is not None:
+                        upper = tree_mpo.upper_ind(qubit)
+                        lower = tree_mpo.lower_ind(qubit)
+                        physical = self._phys(qubit)
+                        if upper not in op_t.inds or lower not in op_t.inds:
+                            raise ValueError(
+                                f"TreeMPO is missing physical site {qubit!r}."
+                            )
+                        op_t.reindex_({
+                            lower: physical,
+                            upper: physical + "*",
+                        })
+                        local[nid] = _contract_two_tensors(
+                            state_t, op_t, shared_ind=physical,
+                        ).reindex_({physical + "*": physical})
+                    else:
+                        local[nid] = qtn.tensor_contract(state_t, op_t)
+                    operator_inds[nid] = (
+                        set(local[nid].inds) - state_inds[nid]
+                    )
+
+                self._route_subtree_messages(
+                    local,
+                    state_inds,
+                    operator_inds,
+                    order,
+                    token=qtn.rand_uuid(),
+                    workers=self.subtree_workers,
+                )
+                if operator_inds[hub]:
+                    raise ValueError(
+                        "TreeMPO application left open operator bonds at its hub."
+                    )
+                self._install_routed_subtree(local, snodes, hub)
+                self._compress_subtree(
+                    snodes,
+                    hub,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                )
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return self
+
+    apply_sub_tree_mpo = apply_subtreempo
+    apply_sub_treempo = apply_subtreempo
+    apply_subttno = apply_subtreempo
+
     def apply_submpo(
         self, submpo, where, *, max_bond=None, cutoff=None, track_norm=True
     ):
@@ -4686,9 +5015,11 @@ class TreeOptimizer:
     ):
         """Evaluate ``<psi|MPO|psi>`` through one structured tree-MPO pass.
 
-        The live state is not modified.  A private branch routes the MPO with
-        :meth:`apply_submpo`, so MPO site tensors remain blockwise native on a
-        Symmray tree and no ``to_dense`` conversion is needed.  ``max_bond``
+        The live state is not modified.  A private branch routes an ordinary
+        chain MPO with :meth:`apply_submpo`, while a complete :class:`TreeMPO`
+        is routed with :meth:`apply_subtreempo` so its internal TTNO bonds are
+        contracted through the TreePlan rather than left open.  In both cases
+        no ``to_dense`` conversion is needed.  ``max_bond``
         defaults to this optimizer's ``chi``; pass a larger cap when the
         operator application must retain more of the exact MPO-transformed
         state.  ``cutoff=0.0`` is the default because this is a measurement,
@@ -4727,13 +5058,31 @@ class TreeOptimizer:
         event_start = len(self.profile_events)
         work = self.copy()
         history_start = len(work.truncation_history)
-        work.apply_submpo(
-            submpo,
-            logical_where,
-            max_bond=max_bond,
-            cutoff=effective_cutoff,
-            track_norm=False,
+        # A TreeMPO is already a complete tree operator.  It cannot be
+        # treated as an ordinary site-labelled MPO: doing so extracts only
+        # its physical legs and strands the TTNO virtual bonds.  Keep this
+        # check structural instead of importing TreeMPO here, which avoids a
+        # module cycle and also permits TreeMPO-compatible subclasses.
+        is_tree_mpo = (
+            getattr(submpo, "plan", None) is not None
+            and hasattr(submpo, "tree_networks")
         )
+        if is_tree_mpo:
+            work.apply_subtreempo(
+                submpo,
+                logical_where,
+                max_bond=max_bond,
+                cutoff=effective_cutoff,
+                track_norm=False,
+            )
+        else:
+            work.apply_submpo(
+                submpo,
+                logical_where,
+                max_bond=max_bond,
+                cutoff=effective_cutoff,
+                track_norm=False,
+            )
         compression_events = work.truncation_history[history_start:]
         truncated_events = [
             event for event in compression_events
