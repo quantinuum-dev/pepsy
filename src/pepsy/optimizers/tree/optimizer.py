@@ -1567,6 +1567,41 @@ class TreeOptimizer:
                 target=target,
             )
 
+    def sync_canonicalization(self, center=None):
+        """Rebuild the tracked tree canonical centre after external access.
+
+        Tree canonical metadata is owned by the live
+        :class:`TreeTensorNetwork`, unlike the separate ``info_c`` mapping used
+        by :class:`MpsOptimizer`. Internal tree readout and gate paths update
+        that state-owned metadata. This explicit recovery method is for code
+        that directly modified or canonicalized :attr:`tn` through a lower-
+        level API and now wants to resume optimizer evolution.
+
+        Diagnostic readout should normally use :meth:`copy` so the live
+        optimizer remains untouched.
+
+        Parameters
+        ----------
+        center : int, optional
+            Tree node at which to leave the single-node canonical centre.
+            Defaults to the plan root.
+
+        Returns
+        -------
+        int
+            The synchronized tree node centre.
+        """
+        if center is None:
+            center = self.plan.root
+        center = int(center)
+        # Clearing the state-owned region forces the next shift to use the
+        # full canonicalization fallback instead of trusting possibly stale
+        # lower-level metadata.
+        self._invalidate_state_norm_cache()
+        self.tn.orthogonality_center = None
+        self.tn.shift_orthogonality_center(center)
+        return self.center
+
     def _nearest_anchor(self, nodes):
         """Choose the closest node to the current centre or canonical region.
 
@@ -4878,7 +4913,8 @@ class TreeOptimizer:
         c = np.cos(float(theta) / 2.0)
         coef = -1j * sign * np.sin(float(theta) / 2.0)
         mpo, mpo_where = pauli_combo_submpo(
-            c, coef, terms, self.n, dtype=self.dtype
+            c, coef, terms, self.n, dtype=self.dtype,
+            compact_support=True,
         )
         self._coerce_tensor_network_backend(mpo, warn=False)
         return self._apply_submpo_resolved(mpo, mpo_where)
@@ -4909,7 +4945,8 @@ class TreeOptimizer:
                 },
             ))
         mpo, where = pauli_sum_submpo(
-            resolved_terms, self.n, dtype=self.dtype
+            resolved_terms, self.n, dtype=self.dtype,
+            compact_support=True,
         )
         self._coerce_tensor_network_backend(mpo, warn=False)
         return self._apply_submpo_resolved(

@@ -3618,7 +3618,11 @@ class MpsStabOptimizer:
         L = int(getattr(p, "L", 0))
         if L <= 0:
             return
-        p.canonize([0], cur_orthog=(0, max(0, L - 1)))
+        p.canonize(
+            [0],
+            cur_orthog=(0, max(0, L - 1)),
+            info=info,
+        )
         info["cur_orthog"] = (0, 0)
 
     def _canonize_p_single(self) -> int:
@@ -5294,6 +5298,27 @@ class MpsStabOptimizer:
             where = term[2] if len(term) > 2 else None
             total += complex(coeff) * self.expectation(pauli, where)
         return float(np.real(total))
+
+    def sync_canonicalization(self, site=None):
+        """Re-establish coefficient-MPS metadata after external state access.
+
+        Stabilizer measurement and projection paths pass ``state.info`` to
+        Quimb's canonical routines. If a caller instead uses a lower-level
+        method directly on ``state.p``, call this before resuming evolution.
+        Ordinary diagnostic expectations already operate on a private copy and
+        do not require synchronization.
+        """
+        p = self.state.p
+        current = tuple(int(x) for x in p.calc_current_orthog_center())
+        current = (min(current), max(current))
+        if site is None:
+            site = current[1]
+        site = int(site)
+        if not 0 <= site < int(p.L):
+            raise ValueError(f"site must lie in [0, {int(p.L)}), got {site}.")
+        p.canonize([site], cur_orthog=current, info=self.state.info)
+        self.state.info["cur_orthog"] = (site, site)
+        return self.state.info["cur_orthog"]
 
     def sample(self, pauli, where=None, *, shots: int = 1, seed=None):
         """Draw ``shots`` Born-rule outcomes (+/-1) of a Pauli observable.

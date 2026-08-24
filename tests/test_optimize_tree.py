@@ -3437,6 +3437,32 @@ def test_tree_public_submpo_and_pauli_backend_operations():
     )
 
 
+def test_tree_pauli_sum_routes_only_active_support_over_steiner_subtree():
+    """Sparse Pauli MPOs must not turn Tree support into a chain window."""
+    plan = TreePlan.from_order(range(8), structure="balanced")
+    active = (0, 2, 7)
+    opt = TreeOptimizer(
+        None, n=8, tree=plan, chi=8, cutoff=0.0, profile=True, run=False
+    )
+
+    opt.apply_pauli_sum([
+        (0.7, {0: "X", 2: "Y", 7: "Z"}),
+        (0.2, {0: "Z", 7: "X"}),
+    ])
+
+    assert opt.update_history[-1]["support"] == active
+    routes = [
+        event for event in opt.profile_events
+        if event.get("route") == "submpo_subtree"
+    ]
+    assert routes
+    assert routes[-1]["support"] == active
+    assert routes[-1]["subtree_nodes"] == len(
+        opt._steiner_nodes([opt.plan.node_of_qubit[q] for q in active])
+    )
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_tree_two_site_numpy_mpo_is_coerced_to_cupy_state_backend():
     """Two-site MPO factors follow a CuPy TTN without mutating the MPO."""
     cupy = pytest.importorskip("cupy")
@@ -3700,6 +3726,18 @@ def test_tree_pauli_expectation_and_projection_are_public():
     assert opt.expectation_pauli("XX", (0, 1)) == pytest.approx(1.0)
     opt.project_pauli("ZZ", (0, 1), +1)
     assert opt.expectation_pauli("ZZ", (0, 1)) == pytest.approx(1.0)
+
+
+def test_tree_sync_canonicalization_rebuilds_state_owned_center():
+    """Tree recovery clears stale lower-level canonical-region metadata."""
+    opt = TreeOptimizer([], n=4, chi=8, run=False)
+    opt.tn.canonize_around_qubits_((0, 3))
+
+    center = opt.sync_canonicalization()
+
+    assert center == opt.plan.root
+    assert opt.center == opt.tn.orthogonality_center == center
+    assert opt.is_canonical_form(center)
 
 
 def test_tree_public_pauli_measurement_returns_probability_and_diagnostics():

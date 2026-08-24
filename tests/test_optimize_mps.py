@@ -7622,6 +7622,29 @@ def test_mps_optimizer_local_expectation_matches_full_network(pauli, where):
     assert local == pytest.approx(full, abs=1e-10)
 
 
+def test_mps_optimizer_sync_canonicalization_repairs_external_readout():
+    """External Quimb readout can be explicitly rebound to ``info_c``."""
+    z = np.diag([1.0, -1.0]).astype(complex)
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 4, seed=17), gates=[], chi=8, mode="dmrg2"
+    )
+    opt.canonize_mps(opt.p, 0)
+    assert opt.info_c["cur_orthog"] == (0, 0)
+
+    # This deliberately models a lower-level caller bypassing Pepsy's
+    # tracked expectation helper.
+    opt.p.local_expectation_canonical(z, (5,), normalized=True)
+    assert opt.info_c["cur_orthog"] == (0, 0)
+    assert tuple(opt.p.calc_current_orthog_center()) == (5, 5)
+
+    assert opt.sync_canonicalization() == (5, 5)
+    assert opt.info_c["cur_orthog"] == (5, 5)
+
+    opt.set_gates([(np.eye(4, dtype=complex), (0, 1))])
+    opt.run(progbar=False, n_iter=1, cutoff=0.0)
+    assert tuple(opt.p.calc_current_orthog_center()) == opt.info_c["cur_orthog"]
+
+
 def test_mps_optimizer_measure_born_statistics():
     """Sampled outcomes should follow the Born rule for a biased qubit."""
     theta = np.pi / 3

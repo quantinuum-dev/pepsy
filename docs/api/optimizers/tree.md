@@ -231,6 +231,10 @@ aid. `TreeOptimizer` mirrors this public surface: `TreeOptimizer.center` (with
 the `orthogonality_center` name-parity alias), `shift_orthogonality_center(node)`
 and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 `TreeTensorNetwork` speak the same canonicalisation vocabulary.
+`TreeOptimizer.sync_canonicalization(center=None)` is the explicit recovery
+path after lower-level code directly mutates or canonicalizes `opt.tn`; it
+rebuilds the state-owned centre before replay resumes. Post-run diagnostics
+should normally use `opt.copy()` so the gate-evolution state is not touched.
 
 Local isometry orientation also has one owner: each live Quimb tensor carries
 its proven `left_inds`, while `TreeTensorNetwork.isometry_direction(node)` and
@@ -252,7 +256,9 @@ Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
 it also invalidates the native fermionic norm cache. The optimizer's
 state-aware wrappers do both automatically and restore the centre only for
-operations that prove canonicality is preserved.
+operations that prove canonicality is preserved. `TreeOptimizer` also exposes
+`sync_canonicalization(center=None)` to explicitly rebuild a single tracked
+centre before replay continues.
 
 Native fermionic trees use a separate graded edge path. Centre moves explicitly
 QR-split the Symmray tensor and absorb the native carry into the next node;
@@ -471,6 +477,15 @@ estimates use MPO bond dimensions as a conservative Schmidt-rank bound.
 Payloads without the required site interface fall back to `mpo.to_dense()`,
 which must produce an operator on the declared support.
 `TreeOptimizer.submpo_event(...)` builds the tuple form.
+
+The internal Pauli rotation and Pauli-sum constructors have a separate compact
+support form for Tree evolution. A sparse operator on qubits such as
+`(q0, q7)` is represented by MPO tensors only at `q0` and `q7`; identity-only
+sites between them are not inserted into a fictitious chain window. The native
+Tree MPO router therefore receives the true active support and computes the
+minimal Steiner subtree/geodesic before QR routing and compression. The shared
+constructors retain their contiguous-window default for the one-dimensional
+MPS backend, whose compression domain is a chain interval.
 
 Both two-site implementations preserve native Symmray gates and their
 block-sparse fermionic grading. Direct mode splits the rank-four gate; MPO mode

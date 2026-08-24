@@ -37,6 +37,11 @@ available at top level as `pepsy.StabilizerMpsSimulator` and
 prefer the descriptive class name and the explicit bitstring helpers
 (`sample_bitstrings`, `bitstring_probability`, and
 `bitstring_probabilities`); the shorter historical names remain supported.
+Internal measurement and projection paths keep the coefficient-MPS
+`state.info["cur_orthog"]` metadata synchronized. Ordinary diagnostic
+expectations and samples use non-collapsing paths; if lower-level code directly
+canonicalizes `sim.state.p`, call `sim.sync_canonicalization()` before
+continuing the simulation.
 Supported
 gate-stream entries include Clifford gates,
 non-Clifford Pauli rotations, `("t", q)` / `("tdg", q)`, explicit `(matrix,

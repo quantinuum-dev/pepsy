@@ -103,6 +103,17 @@ NumPy, Torch, or CuPy charge-sector blocks. Dense payloads cannot be promoted
 to native Symmray gates because that would lose charge and fermionic metadata;
 construct those gates with the matching Symmray convention instead.
 
+Canonical metadata and observable readout are deliberately separate. Internal
+mid-circuit `measure`, `reset`, and Kraus paths pass the live `info_c` mapping
+through Quimb's canonical routines, so moving the centre during state
+evolution remains tracked. For post-run diagnostics, evaluate observables on
+`opt.p.copy()` rather than on the live `opt.p`: Quimb's
+`local_expectation_canonical` moves an MPS centre in place. If lower-level code
+has intentionally touched the live state, call
+`opt.sync_canonicalization()` before resuming a canonical-mode replay; it
+re-discovers the centre, canonicalizes to one site, and refreshes
+`info_c["cur_orthog"]`.
+
 Streams may also include control events. `("measure", pauli, where[, outcome])`
 collapses onto a Pauli eigenvalue and records `(pauli, where, outcome, prob)`.
 `("reset", where[, basis])` resets each target to the `+1` eigenstate of

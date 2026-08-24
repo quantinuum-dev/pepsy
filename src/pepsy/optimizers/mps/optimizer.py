@@ -2674,6 +2674,58 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.backend_info()
         self._init_canonicalization()
 
+    def sync_canonicalization(self, site=None):
+        """Re-establish tracked canonical metadata after external MPS access.
+
+        Quimb's canonical readout helpers, such as
+        ``local_expectation_canonical``, move the live MPS orthogonality centre
+        in place.  Internal Pepsy paths pass ``info_c`` and stay synchronized,
+        but direct calls through :attr:`p` cannot update this optimizer's
+        metadata.  Call this method before resuming a canonical-mode replay
+        after such an external mutation.  It performs an explicit centre
+        discovery, canonicalizes to a single site, and records the resulting
+        ``info_c['cur_orthog']``.
+
+        Post-run diagnostic readout should normally use ``p.copy()`` instead;
+        this method is the recovery path when the live state was intentionally
+        inspected or modified.
+
+        Parameters
+        ----------
+        site : int, optional
+            Site at which to leave the one-site canonical centre.  If omitted,
+            the upper endpoint of Quimb's discovered canonical span is used.
+
+        Returns
+        -------
+        tuple[int, int]
+            The synchronized one-site canonical span.
+        """
+        if self.mode in {"exact", "su"}:
+            raise ValueError(
+                "sync_canonicalization requires a canonical MPS mode; "
+                f"mode={self.mode!r} does not track info_c."
+            )
+        if not hasattr(self.p, "calc_current_orthog_center"):
+            raise TypeError("the live state does not expose MPS canonical metadata.")
+
+        current = self._normalize_span(self.p.calc_current_orthog_center())
+        if site is None:
+            site = current[1]
+        site = int(site)
+        if not 0 <= site < int(self.p.L):
+            raise ValueError(
+                f"site must lie in [0, {int(self.p.L)}), got {site}."
+            )
+
+        self.p.canonize(
+            [site],
+            cur_orthog=current,
+            info=self.info_c,
+        )
+        self.info_c["cur_orthog"] = (site, site)
+        return self.info_c["cur_orthog"]
+
     def normalize(self, eps=1e-15, insert=None):
         """Normalize current ``self.p`` in-place.
 
@@ -5377,7 +5429,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         L = int(getattr(self.p, "L", 0))
         if L <= 0:
             return
-        self.p.canonize([0], cur_orthog=(0, max(0, L - 1)))
+        self.p.canonize(
+            [0],
+            cur_orthog=(0, max(0, L - 1)),
+            info=self.info_c,
+        )
         self.info_c["cur_orthog"] = (0, 0)
 
     def _state_backend_like(self):
@@ -5627,7 +5683,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         to unit norm (its Frobenius norm equals the represented state norm).
         """
         site = int(site)
-        self.p.canonize([site], cur_orthog=self._current_orthog(self.p))
+        self.p.canonize(
+            [site],
+            cur_orthog=self._current_orthog(self.p),
+            info=self.info_c,
+        )
         self.info_c["cur_orthog"] = (site, site)
         if not renormalize:
             return
@@ -6305,7 +6365,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         center = int(requested_span[1])
         if current_span != (center, center):
-            p.canonize([center], cur_orthog=current_span)
+            p.canonize(
+                [center],
+                cur_orthog=current_span,
+                info=state_info,
+            )
 
         state_info["cur_orthog"] = (center, center)
         return p[center].norm()
@@ -9509,6 +9573,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p.canonize(
             where_canon,
             cur_orthog=self._current_orthog(p, info=state_info),
+            info=state_info,
         )
         # Preserve the fitting-window semantics expected by gate updates.
         state_info["cur_orthog"] = target_orthog

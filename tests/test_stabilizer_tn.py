@@ -1628,6 +1628,33 @@ def test_norm_expectation_and_measurement_respect_mps_exponent():
     assert np.linalg.norm(sim.to_statevector()) == pytest.approx(1.0)
 
 
+def test_mps_stab_sync_canonicalization_repairs_external_readout():
+    """Coefficient-MPS readout can be explicitly rebound to ``state.info``."""
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    z = np.diag([1.0, -1.0]).astype(complex)
+    sim = MpsStabOptimizer(6)
+    sim.state.p.local_expectation_canonical(z, (5,), normalized=True)
+
+    assert sim.sync_canonicalization() == sim.state.info["cur_orthog"]
+    assert sim.state.info["cur_orthog"] == tuple(
+        int(x) for x in sim.state.p.calc_current_orthog_center()
+    )
+
+
+def test_mps_stab_basis_measurement_tracks_entangled_coefficient_center():
+    """Basis-updating measurement leaves the coefficient centre synchronized."""
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+
+    coefficient = qtn.MPS_rand_state(5, bond_dim=2, seed=31, dtype="complex128")
+    sim = MpsStabOptimizer.from_mps(coefficient, chi=8).apply([("rz", 0.31, 2)])
+    sim.measure("X", 2, absorb_basis=True)
+
+    assert sim.state.info["cur_orthog"] == tuple(
+        int(x) for x in sim.state.p.calc_current_orthog_center()
+    )
+
+
 def test_run_progbar_smoke():
     pytest.importorskip("tqdm")
     sim = MpsStabOptimizer(3)

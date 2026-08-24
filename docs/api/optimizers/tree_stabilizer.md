@@ -18,6 +18,18 @@ reuse TreeOptimizer's Quimb MPO tag lookup, lossless QR routing, and one final
 subtree compression sweep; a payload without that MPO interface is the only
 case that uses the bounded dense fallback.
 
+When a dense non-Clifford gate maps to exactly two coefficient sites, TreeStab
+reassembles that two-site coefficient operator and uses TreeOptimizer's
+selected two-site gate kernel (direct by default, or MPO when requested). This
+keeps ordinary Tree and TreeStab dense two-site replays on the same
+factorization and truncation path at finite `chi`.
+Wider coefficient-frame Pauli images and explicit Pauli sums remain structured
+sub-MPO updates, since they cannot be represented by one two-site gate. These
+TreeStab coefficient-frame MPOs keep only the actual active Pauli sites, so
+separated supports are routed over their minimal Tree geodesic/Steiner subtree
+instead of being expanded to a contiguous MPS-style window. Explicit
+`mode="submpo"` likewise retains its stream-oriented behavior.
+
 Canonical and compression state has the same single owner as ordinary tree
 simulation: local isometry proofs live on the coefficient tensors'
 ``left_inds`` and are interpreted by ``TreeTensorNetwork``. TreeStab delegates
@@ -28,6 +40,10 @@ therefore reuse proven path/subtree Q tensors and select one-sided SVD
 compression only when the live proof is valid. Backend conversion and dense
 cap reconstruction preserve or install those proofs rather than forcing a
 second canonicalization sweep.
+State-evolution measurements use the coefficient tree's state-owned canonical
+centre. After lower-level direct access to the coefficient TTN,
+``sync_canonicalization()`` explicitly rebuilds that centre before replay
+continues; post-run diagnostics should normally use ``copy()``.
 
 The first milestone supports:
 

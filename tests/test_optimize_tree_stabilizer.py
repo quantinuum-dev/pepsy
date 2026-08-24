@@ -956,6 +956,92 @@ def test_tree_stab_nonunitary_matrix_matches_dense_without_clifford_coercion():
     assert opt.norm() == pytest.approx(np.linalg.norm(expected))
 
 
+def test_tree_stab_two_site_dense_gate_matches_tree_direct_kernel():
+    """A two-site Pauli image uses the same truncation route as Tree."""
+    from pepsy.optimizers.tree import TreePlan
+
+    n = 6
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    stream = []
+    for _ in range(4):
+        stream.extend((pepsy.rx(0.31), q) for q in range(n))
+        stream.extend([
+            (pepsy.rzz(0.73), (0, n - 1)),
+            (pepsy.rzz(0.61), (1, n - 2)),
+            (pepsy.rzz(0.47), (2, 3)),
+        ])
+
+    ordinary = pepsy.TreeOptimizer(
+        stream,
+        n=n,
+        tree=plan,
+        state=pepsy.ps_to_ttn(n, tree=plan, dtype="complex128"),
+        chi=2,
+        cutoff=1e-8,
+        cutoff_mode="rsum2",
+        mode="direct",
+        run=False,
+    )
+    stabilizer = pepsy.TreeStabOptimizer.from_bits(
+        "0" * n,
+        gates=stream,
+        tree=plan,
+        chi=2,
+        cutoff=1e-8,
+        cutoff_mode="rsum2",
+        mode="auto",
+    )
+    ordinary.run()
+    stabilizer.run()
+
+    np.testing.assert_allclose(
+        stabilizer.to_statevector(), ordinary.to_dense(), atol=1e-11, rtol=1e-11
+    )
+
+
+def test_tree_stab_three_site_dense_gate_preserves_separated_active_support():
+    """Dense TreeStab Pauli images use the Tree geodesic, not a chain span."""
+    from pepsy.optimizers.tree import TreePlan
+
+    n = 8
+    support = (0, 2, 7)
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    theta = 0.71
+    xxx = np.kron(np.kron(X, X), X)
+    c = np.cos(theta / 2.0)
+    s = -1j * np.sin(theta / 2.0)
+    gate = c * np.eye(8, dtype=complex) + s * xxx
+
+    ordinary = pepsy.TreeOptimizer(
+        None,
+        n=n,
+        tree=plan,
+        chi=2,
+        cutoff=0.0,
+        mode="direct",
+        run=False,
+    )
+    ordinary.apply_pauli_sum([
+        (c, {}),
+        (s, {support[0]: "X", support[1]: "X", support[2]: "X"}),
+    ])
+
+    stabilizer = pepsy.TreeStabOptimizer.from_bits(
+        "0" * n,
+        tree=plan,
+        chi=2,
+        cutoff=0.0,
+        mode="auto",
+        max_operator_qubits=3,
+    )
+    stabilizer.apply([(gate, support)])
+
+    assert stabilizer.tree_optimizer.update_history[-1]["support"] == support
+    np.testing.assert_allclose(
+        stabilizer.to_statevector(), ordinary.to_dense(), atol=1e-11, rtol=1e-11
+    )
+
+
 def test_tree_stab_dense_matrix_budget_is_checked_before_decomposition():
     gate = np.eye(8, dtype=complex)
     gate[0, 0] = 0.5

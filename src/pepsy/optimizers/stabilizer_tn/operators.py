@@ -198,22 +198,28 @@ def pauli_combo_submpo(
     L: int,
     *,
     dtype: str = "complex128",
+    compact_support: bool = False,
 ):
-    """Windowed sub-MPO for ``c I + coef (prod_i P_i)`` placed on its true sites.
+    """Sub-MPO for ``c I + coef (prod_i P_i)`` placed on its true sites.
 
     ``terms`` maps ``site -> 'X'/'Y'/'Z'`` (the non-identity support, size >= 2).
-    The returned MPO spans only the contiguous window ``[min, max]`` of the
-    support and is built on those actual sites (so quimb's
-    ``gate_with_submpo_`` aligns and compresses only that region).
+    By default the returned MPO spans the contiguous window ``[min, max]`` of
+    the support, which is the layout expected by a one-dimensional MPS.
+    With ``compact_support=True``, identity-only sites inside that window are
+    omitted and the MPO is built only on the active sites. This compact form
+    is intended for TreeOptimizer, where the site list is routed over the
+    actual Tree geodesic rather than over a fictitious chain interval.
 
     Returns
     -------
     (MatrixProductOperator, tuple[int])
-        The sub-MPO and its support ``where`` (contiguous sites ``lo..hi``).
+        The sub-MPO and its support ``where``. ``where`` is contiguous by
+        default and equals the active support when ``compact_support=True``.
     """
     support = sorted(terms)
     lo, hi = support[0], support[-1]
-    axes = [terms.get(i, "I") for i in range(lo, hi + 1)]
+    where = tuple(sorted(terms)) if compact_support else tuple(range(lo, hi + 1))
+    axes = [terms.get(i, "I") for i in where]
     w = len(axes)  # >= 2 by contract (single-support handled by the caller)
     arrays = []
     for i, ch in enumerate(axes):
@@ -231,7 +237,6 @@ def pauli_combo_submpo(
             t[0, 0] = _I
             t[1, 1] = pmat
         arrays.append(t.astype(dtype))
-    where = tuple(range(lo, hi + 1))
     mpo = qtn.MatrixProductOperator(arrays, sites=where, L=L, shape="lrud")
     return mpo, where
 
@@ -241,18 +246,23 @@ def pauli_sum_submpo(
     L: int,
     *,
     dtype: str = "complex128",
+    compact_support: bool = False,
 ):
     """Windowed sub-MPO for a sparse sum of coefficient-frame Pauli strings.
 
     ``weighted_terms`` is an iterable of ``(weight, terms)`` pairs where
     ``terms`` maps ``site -> 'X'/'Y'/'Z'``. Identity factors are implicit. If
     there are ``r`` product-string branches, the returned exact MPO has bond
-    dimension at most ``r`` and spans only the contiguous support window.
+    dimension at most ``r``. By default it spans the contiguous support
+    window, as required by a one-dimensional MPS. With
+    ``compact_support=True``, it contains only the active sites and is
+    suitable for TreeOptimizer's geodesic routing.
 
     Returns
     -------
     (MatrixProductOperator, tuple[int])
-        The sub-MPO and its contiguous support window.
+        The sub-MPO and its support window, or the compact active support when
+        ``compact_support=True``.
     """
     terms = []
     for weight, sites in weighted_terms:
@@ -276,7 +286,11 @@ def pauli_sum_submpo(
         lo, hi = support[0], support[-1]
     else:  # pure scalar times identity; place it on site 0.
         lo = hi = 0
-    where = tuple(range(lo, hi + 1))
+    where = (
+        tuple(support)
+        if compact_support and support
+        else tuple(range(lo, hi + 1))
+    )
     width = len(where)
 
     if width == 1:
