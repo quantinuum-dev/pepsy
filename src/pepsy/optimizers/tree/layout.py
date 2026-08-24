@@ -1142,26 +1142,13 @@ class TreePlan:
             return (self.root_qubit, *order)
         return order
 
-    def to_mpo(self, hamiltonian, **kwargs):
-        """Build a native chain MPO and its TreePlan embedding.
-
-        This delegates to :func:`pepsy.optimizers.tree.tree_mpo`. The returned
-        object is the ordinary Quimb ``MatrixProductOperator`` with native
-        Symmray tensors when ``fermionic=True``. Its chain order follows
-        :meth:`mpo_order`; exact native tree readout uses the separate
-        TreePlan-routed operator attached by the builder and contracts the
-        doubled ``tree.H | operator | tree`` network.
-        """
-        from .operators import tree_mpo
-
-        return tree_mpo(self, hamiltonian, **kwargs)
-
     def build_tree_operator(self, hamiltonian, **kwargs):
         """Build the canonical :class:`TreeMPO` operator for this plan.
 
-        The returned object keeps the optional chain MPO available as
-        ``.chain_mpo`` and exposes the TreePlan-routed representation through
-        ``.tree_networks`` and ``.expectation``. With
+        The returned object is the native `TreeMPO`; its
+        ``.tree_networks`` and ``.expectation`` expose the TreePlan-routed
+        representation. A chain MPO, if needed, is built separately with the
+        model's ``to_mpo`` method. With
         mixed native charges, one public ``TreeMPO`` contains one homogeneous
         network per charge. ``charge_sectors=True`` remains available when
         separate sector objects are specifically desired.

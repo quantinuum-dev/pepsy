@@ -50,9 +50,7 @@ Nevergrad objectives permute only the remaining leaf sites.
 
 After selecting a plan, the canonical tree-native operator is built with
 `plan.build_tree_operator(...)` or `Fermion.build_tree_operator(...)`. The
-legacy `tree_mpo(plan, hamiltonian)` / `plan.to_mpo(...)` builders return the
-ordinary compatibility chain MPO with the tree operator attached. The native
-path includes `U1FermionicArray` and `U1U1FermionicArray` tensors:
+native path includes `U1FermionicArray` and `U1U1FermionicArray` tensors:
 
 ```python
 from pepsy.tensors import Fermion
@@ -64,14 +62,12 @@ fermion = Fermion(spinful=True, symmetry="U1U1")
 hamiltonian = fermion.hamiltonian(edges, t=1.0, U=2.0, mu=0.1)
 
 tree_operator = plan.build_tree_operator(hamiltonian)
-chain_mpo = tree_operator.chain_mpo
-energy = opt.tn.expectation_mpo_exact(chain_mpo, range(plan.n))
+energy = tree_operator.expectation(opt.tn)
 ```
 
 For a model-facing operator build, use `Fermion.build_tree_operator(...)`.
-`Fermion.to_tree_mpo(...)` and `TreePlan.to_tree_mpo(...)` remain compatibility
-aliases. `TreeMPO` exposes the optional chain representation without mixing
-the two tensor-network geometries:
+`Fermion.to_tree_mpo(...)` and `TreePlan.to_tree_mpo(...)` remain native
+compatibility aliases. `TreeMPO` stores only the native tree representation:
 
 ```python
 from pepsy.tensors import Fermion
@@ -81,9 +77,12 @@ tree_operator = fermion.build_tree_operator(
     tree=plan,
     compress=True,
 )
-chain_operator = tree_operator.chain_mpo       # optional linear MPO
 energy = tree_operator.expectation(opt.tn)      # TreePlan-native readout
 ```
+
+When a chain MPO is specifically required, call the model-level
+`Fermion.to_mpo(...)` or `SymHamiltonian.to_mpo(...)` explicitly. Tree builders
+do not create or attach chain MPOs.
 
 `TreeMPO.from_terms(plan, dense_terms)` provides the corresponding ordinary
 dense backend. Native fermionic `TreeMPO` objects retain Symmray arrays for
@@ -132,16 +131,14 @@ the bra, and Quimb contracts the complete doubled network. No state-bond
 compression or `to_dense()` lowering occurs. Native Symmray MPOs retain their
 graded contraction and fermionic sign rules.
 
-`TreePlan.mpo_order()` is the structural leaf-position order chosen by the
-plan; a physical `root_qubit`, when present, is placed first. The helper
-constructs the chain MPO in that one-dimensional order, then restores the
-physical labels to their logical qubit numbers. It returns the ordinary Quimb
-MPO for compatibility, while exact native readout uses the separate
-TreePlan-aware embedding attached by the builder.
+`TreePlan.mpo_order()` remains available as the structural leaf-position order
+chosen by the plan; a physical `root_qubit`, when present, is placed first.
+It is useful when a caller deliberately chooses a one-dimensional model-level
+MPO ordering, but Tree builders do not construct a chain MPO from it.
 
-`TreeMPO` is the tree-routed operator class. Its optional `chain_mpo` remains a
-linear MPO for MPS workflows, while `tree_networks` contains the
-TreePlan-labelled operator networks used by `expectation`. Native neutral
+`TreeMPO` is the tree-routed operator class. `tree_networks` contains the
+TreePlan-labelled operator networks used by `expectation`; no second chain
+representation is stored on the object. Native neutral
 terms are factorized directly from their native Symmray operator tensor over
 the term's TreePlan Steiner subtree, then amalgamated into one charge-aware
 direct-sum TTNO. This applies to one-, two-, and higher-site native terms; it
@@ -166,16 +163,18 @@ folded-snake, and generalized Hilbert traversals directly.
 `TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
 of Quimb's `MatrixProductOperator`: the common operator surface includes
 `sites`, `nsites`, `site_tag`, `upper_ind`, `lower_ind`, `to_dense`, `H`,
-`copy`, `identity`, `from_dense`, `add_MPO`, `singular_values`, and
+`copy`, `identity`, `from_dense`, `add_TreeMPO`, `singular_values`, and
 `amplitude`. Tree-specific geometry is exposed through `plan`, `node_tensor`,
 `neighbors`, and `bond`; `canonicalize`/`compress` perform the corresponding
 tree-wide QR/SVD sweeps. It cannot inherit Quimb's chain-only
 `MatrixProductOperator` implementation because a branched tree has no single
-left/right ordering. The optional `chain_mpo` remains the separate object for
-chain workflows. `validate()` checks every stored TTNO network against the
+left/right ordering. A chain MPO for a chain workflow is constructed
+separately with the model-level `to_mpo(...)`; it is not stored on `TreeMPO`.
+`validate()`
+checks every stored TTNO network against the
 TreePlan; `validate(check_canonical=True)` also checks the tracked operator
 `left_inds` directions when a canonical region is known.
-`add_MPO(..., compress=True)` first builds the tree direct sum and then runs
+`add_TreeMPO(..., compress=True)` first builds the tree direct sum and then runs
 the same native tree SVD sweep; its compression options are `max_bond`,
 `cutoff`, and `order`. The default `order="rank"` is a deterministic greedy
 leaf-elimination policy that uses live edge dimensions to reduce small-rank
@@ -188,8 +187,17 @@ reordering requires an explicit graded permutation proof. Ordinary
 `copy(transpose=True)` and `conj()` views preserve the
 canonical gauge metadata when they keep the TreePlan index layout unchanged.
 For native Symmray operators, addition uses a charge-aware TreePlan direct
-sum; it does not use Quimb's dense-axis padding, and the optional linear
-`chain_mpo` is not synthesized for that result.
+sum; it does not use Quimb's dense-axis padding. A chain MPO, when needed, is
+constructed separately with the model-level `to_mpo(...)`.
+`add_MPO(...)` remains a compatibility alias for `add_TreeMPO(...)`.
+
+`canonicalize(center=..., info_c=...)` performs lossless tree QR
+canonicalization. The tree-native source of truth is `canonical_region` plus
+each tensor's `left_inds`; when `info_c` is supplied, Pepsy mirrors the
+single-node center as `info_c["cur_orthog"] = (center, center)` and stores the
+connected region in `info_c["canonical_region"]`. It also records
+`info_c["isometry_map"]` and immutable per-network `info_c["left_inds"]`
+snapshots for diagnostics and optimizer synchronization.
 
 `TreeMPO.from_terms(plan, terms)` accepts dense one-site, two-site, and
 higher-order terms. A higher-order term is first factorized exactly on the
@@ -514,7 +522,7 @@ which must produce an operator on the declared support.
 `TreeOptimizer.submpo_event(...)` builds the tuple form.
 
 For a complete operator already represented as a `TreeMPO`, use
-`apply_subtreempo(tree_mpo, where=None, ...)` or the aliases
+`apply_subtreempo(tree_operator, where=None, ...)` or the aliases
 `apply_sub_tree_mpo` / `apply_subttno`. This contracts the operator's internal
 TTNO bonds directly on the TreePlan, routes the resulting messages by the
 TreePlan geometry, and performs one final configured Tree compression sweep.
@@ -525,7 +533,7 @@ available. Bond-one identity factors outside a term's active support are still
 part of the complete TTNO; the shorter declaration only selects the minimal
 Steiner route. Any omitted boundary operator bond must be bond one, otherwise
 the application raises instead of silently discarding operator information.
-The stream constructor `TreeOptimizer.subtreempo_event(tree_mpo)` and
+The stream constructor `TreeOptimizer.subtreempo_event(tree_operator)` and
 the matching `TreeStabOptimizer.subtreempo_event(...)` provide the same
 native route; `subttno_event` is an accepted spelling alias. Set
 `track_norm=False` for a general non-unitary TreeMPO so its physical norm

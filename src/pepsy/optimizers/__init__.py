@@ -50,7 +50,6 @@ _SYMBOL_MODULES = {
     "TreeOptimizer": ".tree",
     "TreePlan": ".tree",
     "build_tree_operator": ".tree",
-    "tree_mpo": ".tree",
     "square_lattice_zigzag": "._layout_orders",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",

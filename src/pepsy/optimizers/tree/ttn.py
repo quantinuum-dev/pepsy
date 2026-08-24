@@ -466,22 +466,6 @@ def _is_native_mpo(value):
         return None
 
 
-def _tree_plan_signature(plan):
-    """Return the structural identity used by source-aware tree MPOs."""
-    return (
-        int(plan.root),
-        tuple(
-            (int(node), tuple(int(child) for child in children))
-            for node, children in sorted(plan.children.items())
-        ),
-        tuple(
-            (int(node), int(qubit))
-            for node, qubit in sorted(plan.qubit_of_leaf.items())
-        ),
-        None if plan.root_qubit is None else int(plan.root_qubit),
-    )
-
-
 def _contract_two_tensors(left, right, *, shared_ind=None):
     """Contract two tensors along one ordinary shared index cheaply.
 
@@ -1071,13 +1055,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Contract ``<psi|MPO|psi>`` without applying or compressing the TTN.
 
         The tree, a private ket view, and the MPO remain separate tensor
-        networks. A :class:`TreeMPO` or an MPO created by :func:`tree_mpo`
-        supplies a TreePlan-labelled operator representation, contracted as
-        ``tree.H | tree_operator | tree``; its optional chain MPO is never
-        moved into the tree, applied, densified, or compressed. For an
-        unannotated MPO, the lower physical legs are connected to fresh
-        copies of the ket physical legs, while its upper physical legs
-        connect to the bra, and the complete doubled network is contracted.
+        networks. The lower physical legs are connected to fresh copies of
+        the ket physical legs, while the upper physical legs connect to the
+        bra, and the complete doubled network is contracted. A native
+        :class:`TreeMPO` uses its own ``expectation`` method for tree-native
+        contraction.
 
         ``mpo`` must expose Quimb's regular MPO site interface. Its active site
         labels must match ``where``. For a native fermionic TTN the MPO must
@@ -1105,74 +1087,6 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 normalized=normalized,
                 optimize=optimize,
             )
-
-        tree_operator = getattr(mpo, "pepsy_tree_operator", None)
-        if tree_operator is not None:
-            if getattr(mpo, "pepsy_tree_plan_signature", None) != (
-                _tree_plan_signature(self.plan)
-            ):
-                raise ValueError(
-                    "tree MPO embedding was built for a different TreePlan."
-                )
-            all_sites = tuple(sorted(self.plan.node_of_qubit))
-            if tuple(sorted(where)) != all_sites:
-                raise ValueError(
-                    "a TreePlan MPO embedding must be evaluated on all tree "
-                    "sites so its identity legs remain explicit."
-                )
-            if hasattr(tree_operator, "expectation"):
-                return tree_operator.expectation(
-                    self,
-                    normalized=normalized,
-                    optimize=optimize,
-                )
-            if not self.fermionic:
-                raise TypeError(
-                    "native TreePlan MPO embeddings require a native "
-                    "fermionic TreeTensorNetwork."
-                )
-
-            operators = (
-                tree_operator
-                if isinstance(tree_operator, (tuple, list))
-                else (tree_operator,)
-            )
-            numerator = 0.0
-            for operator in operators:
-                ket = self.copy()
-                operator_work = operator.copy()
-                ket_reindex = {}
-                operator_reindex = {}
-                upper_id = getattr(mpo, "upper_ind_id", "k{}")
-                lower_id = getattr(mpo, "lower_ind_id", "b{}")
-                for site in all_sites:
-                    physical = self.site_ind(site)
-                    upper = upper_id.format(site)
-                    lower = lower_id.format(site)
-                    if upper not in operator_work.ind_map:
-                        raise ValueError(
-                            "TreePlan MPO embedding is missing physical site "
-                            f"{site!r}."
-                        )
-                    if lower not in operator_work.ind_map:
-                        raise ValueError(
-                            "TreePlan MPO embedding is missing lower physical "
-                            f"site {site!r}."
-                        )
-                    fresh = qtn.rand_uuid()
-                    ket_reindex[physical] = fresh
-                    operator_reindex[upper] = physical
-                    operator_reindex[lower] = fresh
-                ket.reindex_(ket_reindex)
-                operator_work.reindex_(operator_reindex)
-                numerator = numerator + (self.H | operator_work | ket).contract(
-                    all,
-                    optimize=optimize,
-                )
-            if not normalized:
-                return numerator
-            denominator = (self.H | self).contract(all, optimize=optimize)
-            return numerator / denominator
 
         required = (
             "gen_sites_present", "site_tag", "upper_ind_id", "lower_ind_id",

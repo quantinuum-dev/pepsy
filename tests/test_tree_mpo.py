@@ -11,16 +11,21 @@ from pepsy.optimizers.tree import (
     TreePlan,
     TreeLayoutFinder,
     build_tree_operator,
-    tree_mpo,
 )
 
 
 pytest.importorskip("symmray")
 
 
+def test_tree_api_does_not_expose_chain_builder():
+    """Tree construction has one native operator path."""
+    assert not hasattr(pepsy, "tree_mpo")
+    assert not hasattr(TreePlan, "to_mpo")
+
+
 @pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
-def test_tree_mpo_preserves_native_fermionic_symmetry_and_expectation(symmetry):
-    """A tree-ordered MPO remains native and routes exactly over the TTN."""
+def test_tree_operator_preserves_native_fermionic_symmetry_and_expectation(symmetry):
+    """A native TreeMPO routes exactly over the TTN."""
     fermion = pepsy.Fermion(spinful=True, symmetry=symmetry)
     hamiltonian = fermion.hamiltonian(
         [(0, 1), (1, 2), (2, 3)], t=1.0, U=2.0, mu=0.1,
@@ -29,7 +34,7 @@ def test_tree_mpo_preserves_native_fermionic_symmetry_and_expectation(symmetry):
         (2, 0, 3, 1), structure="balanced", top_arity=2,
     )
 
-    mpo = tree_mpo(
+    operator = build_tree_operator(
         plan,
         hamiltonian,
         fermionic=True,
@@ -45,15 +50,14 @@ def test_tree_mpo_preserves_native_fermionic_symmetry_and_expectation(symmetry):
     )
 
     assert pepsy.build_tree_operator is build_tree_operator
-    assert pepsy.tree_mpo is tree_mpo
-    assert mpo.pepsy_tree_order == (2, 0, 3, 1)
-    assert mpo.pepsy_tree_native is True
+    assert isinstance(operator, TreeMPO)
     assert all(
         type(tensor.data).__name__ == f"{symmetry}FermionicArray"
-        for tensor in mpo
+        for network in operator.tree_networks
+        for tensor in network
     )
     assert all(
-        tuple(mpo[mpo.site_tag(qubit)].tags) == (f"I{qubit}",)
+        operator.site_tag(qubit) in operator[operator.site_tag(qubit)].tags
         for qubit in range(4)
     )
 
@@ -65,14 +69,16 @@ def test_tree_mpo_preserves_native_fermionic_symmetry_and_expectation(symmetry):
         dtype="complex64",
     )
     tree_value = state.expectation_mpo(
-        mpo, range(4), max_bond=64,
+        operator, range(4), max_bond=64,
     )
-    exact_value = state.expectation_mpo_exact(mpo, range(4))
-    reference_value = state.expectation_mpo(
-        reference, range(4), max_bond=64,
+    exact_value = state.expectation_mpo_exact(operator, range(4))
+    reference_value = state.expectation_mpo_exact(reference, range(4))
+    np.testing.assert_allclose(
+        exact_value, reference_value, rtol=3e-5, atol=3e-5,
     )
-    np.testing.assert_allclose(exact_value, reference_value, rtol=3e-5, atol=3e-5)
-    np.testing.assert_allclose(tree_value, reference_value, rtol=3e-5, atol=3e-5)
+    np.testing.assert_allclose(
+        tree_value, reference_value, rtol=3e-5, atol=3e-5,
+    )
 
 
 @pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
@@ -109,10 +115,12 @@ def test_tree_mpo_nonlocal_native_sign_uses_tree_fermion_convention(symmetry):
     direct = state.local_expectation(
         hamiltonian.terms[(0, 2)], (0, 2),
     )
-    mpo = tree_mpo(plan, hamiltonian, fermionic=True, compress=False)
+    operator = build_tree_operator(
+        plan, hamiltonian, fermionic=True, compress=False,
+    )
 
     np.testing.assert_allclose(
-        state.expectation_mpo_exact(mpo, range(4)),
+        state.expectation_mpo_exact(operator, range(4)),
         direct,
         rtol=1e-12,
         atol=1e-12,
@@ -128,15 +136,15 @@ def test_native_tree_mpo_add_uses_charge_aware_tree_sum():
         [(0, 1), (1, 2)], t=1.0, U=0.5, mu=0.1,
     )
     plan = TreePlan.from_order(range(3), structure="balanced")
-    operator = tree_mpo(
+    operator = build_tree_operator(
         plan,
         hamiltonian,
         fermionic=True,
         compress=False,
         dtype="complex128",
-    ).pepsy_tree_operator
+    )
 
-    combined = operator.add_MPO(
+    combined = operator.add_TreeMPO(
         operator.identity(),
         compress=True,
         max_bond=64,
@@ -144,7 +152,7 @@ def test_native_tree_mpo_add_uses_charge_aware_tree_sum():
     )
     assert combined.validate() is combined
     assert combined.compressed is True
-    assert combined.chain_mpo is None
+    assert not hasattr(combined, "chain_mpo")
     assert combined.pepsy_compression_report["order"] == "rank"
     assert combined.pepsy_compression_report["effective_order"] == "depth"
     dense = operator.to_dense()
@@ -203,16 +211,18 @@ def test_tree_mpo_pair_observable_stays_compact_and_contracts_on_tree(symmetry):
         dtype="complex128",
     )
 
-    mpo = tree_mpo(plan, hamiltonian, fermionic=True, compress=False)
-    assert mpo.max_bond() == 4
-    assert mpo.pepsy_tree_operator.pepsy_tree_operator_kind == (
+    operator = build_tree_operator(
+        plan, hamiltonian, fermionic=True, compress=False,
+    )
+    assert operator.max_bond() == 4
+    assert operator.tree_network.pepsy_tree_operator_kind == (
         "pair_endpoint_automaton"
     )
     direct = sum(
         state.local_expectation(term, support)
         for support, term in terms.items()
     )
-    exact = state.expectation_mpo_exact(mpo, range(nsite))
+    exact = state.expectation_mpo_exact(operator, range(nsite))
     np.testing.assert_allclose(exact, direct.real, rtol=1e-12, atol=1e-12)
 
 
@@ -242,7 +252,7 @@ def test_tree_mpo_class_dense_backend_and_direct_expectation():
     )
 
     assert operator.backend == "dense"
-    assert operator.chain_mpo is None
+    assert not hasattr(operator, "chain_mpo")
     assert len(operator.tree_networks) == 1
     assert operator.tree_network.pepsy_tree_operator_kind == "dense_tree_tnno"
     assert operator.compressed is True
@@ -574,7 +584,7 @@ def test_tree_operator_combines_mixed_native_charges(symmetry):
     )
 
     assert isinstance(operator, TreeMPO)
-    assert operator.chain_mpo is None
+    assert not hasattr(operator, "chain_mpo")
     assert len(operator.tree_networks) == 2
     assert all(
         type(tensor.data).__name__.endswith("FermionicArray")
@@ -643,8 +653,8 @@ def test_tree_operator_combines_mixed_native_charges(symmetry):
 
 
 @pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
-def test_fermion_tree_mpo_class_is_native_and_keeps_chain_representation(symmetry):
-    """Fermion exposes the class API for both native Symmray symmetries."""
+def test_fermion_tree_mpo_class_is_native_without_chain_representation(symmetry):
+    """Fermion exposes one native TreeMPO for both Symmray symmetries."""
     fermion = pepsy.Fermion(
         spinful=True, symmetry=symmetry, dtype="complex128",
     )
@@ -676,7 +686,7 @@ def test_fermion_tree_mpo_class_is_native_and_keeps_chain_representation(symmetr
     assert type(fermion).to_tree_mpo is type(fermion).build_tree_operator
     assert type(fermion).build_tree_mpo is type(fermion).build_tree_operator
     assert operator.backend == "symmray"
-    assert operator.chain_mpo is not None
+    assert not hasattr(operator, "chain_mpo")
     assert len(operator.tree_networks) == 1
     assert operator.tree_network.pepsy_tree_operator_kind == "native_tree_tnno"
     assert operator.compressed is True
@@ -795,6 +805,37 @@ def test_tree_mpo_matches_quimb_generalized_operator_surface():
     assert operator.canonize_around_(root) is operator
 
 
+def test_tree_mpo_canonicalize_syncs_optional_info_c():
+    """Tree canonical metadata can be mirrored into an optimizer mapping."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    operator = TreeMPO.from_terms(
+        plan,
+        {(0,): np.eye(2)},
+        compress=False,
+    )
+    info_c = {}
+
+    canonical = operator.canonicalize(
+        center=plan.root,
+        inplace=False,
+        info_c=info_c,
+    )
+
+    assert canonical.is_canonical_form(plan.root)
+    assert info_c["cur_orthog"] == (plan.root, plan.root)
+    assert info_c["canonical_region"] == frozenset({plan.root})
+    assert info_c["isometry_map"] == canonical.isometry_map()
+    assert len(info_c["left_inds"]) == len(canonical.tree_networks)
+    assert info_c["left_inds"][0][plan.root] is None
+    for node in plan.nodes():
+        tensor = canonical.node_tensor(node)
+        recorded = info_c["left_inds"][0][node]
+        assert recorded == (
+            None if tensor.left_inds is None else tuple(tensor.left_inds)
+        )
+    assert operator.canonical_region is None
+
+
 def test_tree_mpo_is_mpo_twin_over_tree_geometry():
     """The mature TreeMPO surface mirrors useful Quimb MPO operations."""
     plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
@@ -809,12 +850,12 @@ def test_tree_mpo_is_mpo_twin_over_tree_geometry():
     identity = operator.identity()
     np.testing.assert_allclose(identity.to_dense(), np.eye(16))
     np.testing.assert_allclose(
-        operator.add_MPO(identity).to_dense(), dense + np.eye(16),
+        operator.add_TreeMPO(identity).to_dense(), dense + np.eye(16),
     )
     np.testing.assert_allclose(
-        operator.add_MPO(identity, negate=True).to_dense(), dense - np.eye(16),
+        operator.add_TreeMPO(identity, negate=True).to_dense(), dense - np.eye(16),
     )
-    compressed_sum = operator.add_MPO(
+    compressed_sum = operator.add_TreeMPO(
         identity,
         compress=True,
         max_bond=16,

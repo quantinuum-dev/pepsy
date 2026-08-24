@@ -179,7 +179,6 @@ _SYMBOL_MODULES = {
     "TreeOptimizer": ".optimizers",
     "TreePlan": ".optimizers",
     "build_tree_operator": ".optimizers",
-    "tree_mpo": ".optimizers",
     "square_lattice_zigzag": ".optimizers",
     "TreeStabOptimizer": ".optimizers",
     "TreeTensorNetwork": ".optimizers",

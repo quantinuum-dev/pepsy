@@ -223,9 +223,10 @@ def _is_symmray_array(array):
 def _submpo_is_native(submpo):
     """Return whether an MPO visibly contains native Symmray tensors.
 
-    ``tree_mpo`` records this explicitly, while ordinary Quimb MPOs are
-    inspected as a fallback. ``None`` means that the payload does not expose
-    enough information to classify it without materialising it.
+    An explicit ``pepsy_tree_native`` marker is honored for lightweight
+    payloads, otherwise ordinary Quimb MPOs are inspected from their tensor
+    payload. ``None`` means that the payload does not expose enough
+    information to classify it without materialising it.
     """
     marker = getattr(submpo, "pepsy_tree_native", None)
     if marker is not None:
@@ -5082,8 +5083,7 @@ class TreeOptimizer:
                 raise TypeError(
                     "native fermionic TreeTensorNetwork requires a native "
                     "Symmray MPO. Build it with build_tree_operator(...) or "
-                    "tree_mpo(..., fermionic=True) "
-                    "or supply a model-native MPO."
+                    "supply a model-native MPO."
                 )
             raise TypeError(
                 "a native Symmray MPO cannot be applied to an ordinary dense "
@@ -5132,16 +5132,6 @@ class TreeOptimizer:
         )
         if effective_cutoff < 0.0:
             raise ValueError("cutoff must be non-negative.")
-        plan_order = getattr(submpo, "pepsy_tree_order", None)
-        if plan_order is not None and tuple(plan_order) != self.plan.mpo_order():
-            warnings.warn(
-                "the structured MPO was built for tree MPO order "
-                f"{tuple(plan_order)!r}, while this state uses "
-                f"{self.plan.mpo_order()!r}; the value remains logically "
-                "valid, but the MPO is not layout-optimized for this tree.",
-                UserWarning,
-                stacklevel=2,
-            )
         event_start = len(self.profile_events)
         work = self.copy()
         history_start = len(work.truncation_history)

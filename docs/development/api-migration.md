@@ -51,3 +51,12 @@ notes with the table above, and remove only aliases that have completed the
 deprecation window. The root-level compatibility facade is governed by
 [`api-manifest.txt`](api-manifest.txt) and remains unchanged until that
 review.
+
+## Tree operator chain conversion
+
+The Tree-specific `tree_mpo(...)` builder and `TreePlan.to_mpo(...)` alias are
+not part of the native Tree API. Build a native operator with
+`TreePlan.build_tree_operator(...)` or `Fermion.build_tree_operator(...)`.
+When a one-dimensional Quimb `MatrixProductOperator` is explicitly needed,
+convert at the model level with `Fermion.to_mpo(...)` or
+`SymHamiltonian.to_mpo(...)`.

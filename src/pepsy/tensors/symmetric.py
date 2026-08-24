@@ -10645,9 +10645,10 @@ class Fermion:
     ):
         """Build the native :class:`pepsy.TreeMPO` for a selected plan.
 
-        ``tree`` and ``plan`` are aliases.  The returned object exposes the
-        optional linear representation as ``.chain_mpo`` and the TreePlan
-        representation through ``.tree_networks`` and ``.expectation``.
+        ``tree`` and ``plan`` are aliases.  The returned object is the native
+        ``TreeMPO``; its TreePlan representation is exposed through
+        ``.tree_networks`` and ``.expectation``. A linear chain MPO, if
+        needed, is built separately with ``Fermion.to_mpo``.
         Native ``fermionic=True`` keeps Symmray's graded tensors intact for
         U1, U1U1, and other supported symmetries.
 

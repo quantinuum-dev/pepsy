@@ -192,7 +192,7 @@ state ``|p>`` in the same way as the MPS STN API; it is not conjugated through
 the physical Clifford frame. The payload must expose a usable MPO interface,
 or TreeOptimizer may lower it to a bounded dense operator. A complete
 ``TreeMPO``/TTNO can instead be scheduled with
-``TreeStabOptimizer.subtreempo_event(tree_mpo)`` (or ``subttno_event``). Its
+``TreeStabOptimizer.subtreempo_event(tree_operator)`` (or ``subttno_event``). Its
 TreePlan must match the coefficient tree and its declared support must include
 all TreePlan physical sites, or exactly the complete operator's explicit
 ``operator_support`` (for example, one produced by ``TreeMPO.from_gate``); the
