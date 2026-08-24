@@ -2987,6 +2987,36 @@ def test_fresh_state_is_canonical_at_root():
     assert abs(opt.norm() - 1.0) < 1e-12
 
 
+def test_tree_tensor_network_has_native_whole_tree_compress():
+    """Direct TTN compression leaves one validated tree canonical centre."""
+    plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=2, seed=31, canonicalize=False)
+
+    assert state.compress(
+        max_bond=None,
+        cutoff=0.0,
+        center=plan.root,
+    ) is state
+    assert state.orthogonality_center == plan.root
+    assert state.is_canonical_form()
+    assert state.validate(check_canonical=True) is state
+
+
+def test_tree_mpo_rank_aware_compression_records_edge_order():
+    """TreeMPO compression uses and reports the native rank-aware order."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    rng = np.random.default_rng(32)
+    dense = rng.normal(size=(2**4, 2**4))
+    operator = TreeMPO.from_dense(plan, dense)
+
+    operator.compress(max_bond=4, cutoff=1e-12)
+    report = operator.pepsy_compression_report
+    assert report["order"] == "rank"
+    assert len(report["edge_order"]) == len(plan.nodes()) - 1
+    assert operator.validate() is operator
+    assert operator.max_bond() <= 4
+
+
 def test_two_qubit_gate_rejects_repeated_qubit():
     """A two-qubit gate on a single qubit is rejected loudly."""
     rng = np.random.default_rng(15)
@@ -3503,7 +3533,7 @@ def test_tree_public_submpo_and_pauli_backend_operations():
 
 
 def test_tree_pauli_sum_routes_only_active_support_over_steiner_subtree():
-    """Sparse Pauli MPOs must not turn Tree support into a chain window."""
+    """Sparse Pauli TreeMPOs must not turn support into a chain window."""
     plan = TreePlan.from_order(range(8), structure="balanced")
     active = (0, 2, 7)
     opt = TreeOptimizer(
@@ -3518,7 +3548,8 @@ def test_tree_pauli_sum_routes_only_active_support_over_steiner_subtree():
     assert opt.update_history[-1]["support"] == active
     routes = [
         event for event in opt.profile_events
-        if event.get("route") == "submpo_subtree"
+        if event.get("route") == "subtreempo"
+        and event.get("kind") == "metadata_path"
     ]
     assert routes
     assert routes[-1]["support"] == active

@@ -175,6 +175,21 @@ left/right ordering. The optional `chain_mpo` remains the separate object for
 chain workflows. `validate()` checks every stored TTNO network against the
 TreePlan; `validate(check_canonical=True)` also checks the tracked operator
 `left_inds` directions when a canonical region is known.
+`add_MPO(..., compress=True)` first builds the tree direct sum and then runs
+the same native tree SVD sweep; its compression options are `max_bond`,
+`cutoff`, and `order`. The default `order="rank"` is a deterministic greedy
+leaf-elimination policy that uses live edge dimensions to reduce small-rank
+branches before they enlarge parent tensors. Use `order="depth"` for the
+simple fixed depth-first sweep when reproducing older benchmarks. This is
+rank-aware ordering on a fixed TreePlan, not a global search over alternate
+tree geometries. Native graded Symmray TTNOs safely retain the charge-preserving
+depth order and report that effective fallback, because arbitrary sibling
+reordering requires an explicit graded permutation proof. Ordinary
+`copy(transpose=True)` and `conj()` views preserve the
+canonical gauge metadata when they keep the TreePlan index layout unchanged.
+For native Symmray operators, addition uses a charge-aware TreePlan direct
+sum; it does not use Quimb's dense-axis padding, and the optional linear
+`chain_mpo` is not synthesized for that result.
 
 `TreeMPO.from_terms(plan, terms)` accepts dense one-site, two-site, and
 higher-order terms. A higher-order term is first factorized exactly on the
@@ -193,6 +208,11 @@ the minimal TreePlan Steiner subtree and adds bond-one identity legs elsewhere,
 so the result can be sent directly to `TreeOptimizer.apply_subtreempo` or a
 `subtreempo_event`. Dense gate factorization removes only machine-precision
 null operator-Schmidt sectors; configured TreeMPO compression remains explicit.
+`TreeMPO.from_pauli_sum(plan, weighted_terms)` provides the analogous compact
+TTNO for a weighted sum of product-Pauli branches. It uses one virtual branch
+channel per retained term only on the union of the active Steiner subtrees,
+with bond-one identity legs outside; it never constructs a full-system dense
+matrix or a chain MPO.
 
 The conventional binary TTN with a three-leg top tensor is the default when
 there are at least three leaves and no `root_qubit`. Pass
@@ -209,24 +229,12 @@ node.
 
 Gates are absorbed into the tree:
 
-- **single-qubit gates** are contracted into their site tensor with no bond
-  growth; a unitary one-qubit gate preserves the tree canonical form regardless
-  of where the orthogonality centre sits;
-- **two-qubit gates** on sites `a` and `b` are split by SVD into two factors
-  joined by a virtual bond; the factors are absorbed into the two site nodes and the
-  bond is *threaded exactly* (lossless economical QR) along the tree path from
-  `a` to `b`. Only once **both** factors are in place is a single canonical
-  compression sweep run back along the path, truncating every touched bond to
-  `chi` -- so each truncation sees the complete gate, markedly more accurate at
-  finite `chi` than truncating each hop as the bond is threaded (Seitz et al.,
-  Figs. 3-6).
-- **operators on three or more qubits** -- a `k`-qubit gate (Toffoli, Fredkin),
-  a multi-site non-unitary / Kraus operator, or a whole Trotter block -- are
-  applied *in one shot* over their minimal spanning subtree by
-  `apply_subtree_operator`. All open operator bonds are QR-routed to a subtree
-  hub before a final canonical compression sweep truncates every touched edge
-  once; `apply_gate` routes any support with `len(where) >= 3` there
-  automatically (see *Multi-qubit / sub-MPO application*).
+- **dense gates and operators** are compiled into a complete `TreeMPO`, including
+  one-, two-, and multi-qubit gates. The operator is factorized on the minimal
+  Steiner subtree, its virtual bonds are QR-routed to a hub, and one final
+  canonical compression sweep applies the configured `chi` / `cutoff`. The
+  direct `apply_subtree_operator` primitive remains available for compatibility
+  callers that explicitly want dense factorization without a TreeMPO object.
 - **stream events** -- MPS-compatible `measure`, `cap`, `reset`, and
   `measure_reset` entries can be mixed into the stream. Measurements use Pauli
   eigenvalue outcomes (`+1`/`-1`) and are appended to `measurements`;
@@ -258,6 +266,12 @@ and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 path after lower-level code directly mutates or canonicalizes `opt.tn`; it
 rebuilds the state-owned centre before replay resumes. Post-run diagnostics
 should normally use `opt.copy()` so the gate-evolution state is not touched.
+
+Direct state users can call `TreeTensorNetwork.compress(max_bond=..., cutoff=...,
+center=...)`. This performs one native leaf-to-centre SVD sweep over every
+TreePlan edge and leaves the requested node as the validated canonical centre.
+The canonicalization phase is QR-only; `max_bond` and `cutoff` control only the
+compression phase.
 
 Local isometry orientation also has one owner: each live Quimb tensor carries
 its proven `left_inds`, while `TreeTensorNetwork.isometry_direction(node)` and
@@ -481,11 +495,9 @@ an isometric environment.
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
 accepted). It need **not** be unitary; pass `renormalize=True` to renormalise
 afterwards (e.g. after a Kraus/projection operator). `max_bond` / `cutoff`
-default to the optimizer's `chi` / `cutoff`. `apply_gate` dispatches `len(where)
-== 1` and `== 2` to the optimised leaf-absorb / geodesic-threading paths and any
-larger support to `apply_subtree_operator`; the cost scales with the operator's
-spread and factor ranks, using recursive edge messages rather than one dense
-state tensor for the whole spanning subtree.
+default to the optimizer's `chi` / `cutoff`. The native TreeMPO route scales
+with the operator's spread and factor ranks, using recursive edge messages
+rather than one dense state tensor for the whole spanning subtree.
 
 `track_norm=True` records the cheap path-level retained-norm ledger. Set it to
 `False` for a known non-unitary operator: its physical norm change is then not

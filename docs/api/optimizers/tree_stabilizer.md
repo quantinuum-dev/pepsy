@@ -18,17 +18,14 @@ reuse TreeOptimizer's Quimb MPO tag lookup, lossless QR routing, and one final
 subtree compression sweep; a payload without that MPO interface is the only
 case that uses the bounded dense fallback.
 
-When a dense non-Clifford gate maps to exactly two coefficient sites, TreeStab
-reassembles that two-site coefficient operator and uses TreeOptimizer's
-selected two-site gate kernel (direct by default, or MPO when requested). This
-keeps ordinary Tree and TreeStab dense two-site replays on the same
-factorization and truncation path at finite `chi`.
-Wider coefficient-frame Pauli images and explicit Pauli sums remain structured
-sub-MPO updates, since they cannot be represented by one two-site gate. These
-TreeStab coefficient-frame MPOs keep only the actual active Pauli sites, so
-separated supports are routed over their minimal Tree geodesic/Steiner subtree
-instead of being expanded to a contiguous MPS-style window. Explicit
-`mode="submpo"` likewise retains its stream-oriented behavior.
+Dense non-Clifford gates are Pauli-decomposed through ``C† G C`` in the
+coefficient frame, then compiled into compact Tree-native ``TreeMPO``/TTNO
+operators. The same applies to one-site, two-site, and wider coefficient-frame
+Pauli sums: branches use Tree virtual channels only on the union of their
+minimal Steiner subtrees, and TreeOptimizer performs the final canonical
+compression. Separated supports therefore never become a fictitious
+contiguous MPS window. Explicit ``mode="submpo"`` and caller-supplied
+MPS-style ``submpo`` events retain their compatibility behavior.
 
 Canonical and compression state has the same single owner as ordinary tree
 simulation: local isometry proofs live on the coefficient tensors'
@@ -129,8 +126,8 @@ TreeStab factories for random-unitary mixtures, depolarizing channels, and
 state-dependent Kraus channels; selected branches are normalized at their
 trajectory boundary. Dense matrix
   decomposition is bounded by ``max_operator_qubits=2`` by default (the MPS-compatible alias
-`max_pauli_decomposition_qubits` is also accepted) and uses the tree-native
-Pauli-sum MPO path. `max_pauli_terms` (default 256) is a second guard for
+`max_pauli_decomposition_qubits` is also accepted) and uses the compact
+tree-native Pauli-sum TreeMPO path. `max_pauli_terms` (default 256) is a second guard for
 explicit larger-matrix opt-ins; it fails before constructing an oversized
 coefficient-frame MPO. Immediate injection is explicit: use
 `prepare_magic`/`inject_rz` for one gadget or `run_with_injection` for a stream

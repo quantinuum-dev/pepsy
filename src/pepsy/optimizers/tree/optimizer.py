@@ -2684,6 +2684,53 @@ class TreeOptimizer:
         logical_where = _normalize_where(where)
         where = self._validate_support(logical_where)
         self._check_operator_limits(where)
+        if len(logical_where) == 2 and logical_where[0] == logical_where[1]:
+            raise ValueError(
+                "A two-qubit gate needs two distinct qubits; "
+                f"got where={logical_where}."
+            )
+        if len(logical_where) > 2 and len(set(logical_where)) != len(logical_where):
+            raise ValueError(
+                "A multi-qubit gate needs distinct qubits; "
+                f"got where={logical_where}."
+            )
+        if self.mode != "submpo":
+            # Dense gates use the same complete TreeMPO representation as
+            # scheduled TTNO events. This keeps layout routing, backend
+            # conversion, QR canonicalization, and the final compression
+            # sweep in one native Tree path for one-, two-, and multi-site
+            # operators. Explicit ``mode='submpo'`` remains the opt-in MPS
+            # compatibility mode.
+            from .operators import TreeMPO
+
+            factor_started = (
+                self._profile_phase_start() if len(logical_where) > 1 else None
+            )
+            tree_mpo = TreeMPO.from_gate(
+                self.plan,
+                gate,
+                where,
+                fermionic=bool(getattr(self.tn, "fermionic", False)),
+                symmetry=getattr(self.tn, "symmetry", None),
+                dtype=self.dtype,
+            )
+            self._profile_phase_event(
+                "gate_factorization",
+                factor_started,
+                route="treempo",
+                support=tuple(logical_where),
+                operator_bond=tree_mpo.max_bond(),
+            )
+            self.apply_subtreempo(
+                tree_mpo,
+                tree_mpo.operator_support,
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                track_norm=track_norm,
+            )
+            if renormalize:
+                self.normalize()
+            return self
         with self._thread_ctx():
             if len(where) == 1:
                 self.apply_1q(
@@ -4531,7 +4578,10 @@ class TreeOptimizer:
             )
         self.center = path[0]
 
-    def _compress_subtree(self, snodes, hub, *, max_bond=None, cutoff=None):
+    def _compress_subtree(
+        self, snodes, hub, *, max_bond=None, cutoff=None,
+        preserve_subcap=True,
+    ):
         """Canonically compress every edge of a connected updated subtree.
 
         Starting at ``hub``, descend each branch. Compressing ``node -> child``
@@ -4554,10 +4604,11 @@ class TreeOptimizer:
             over-cap bonds, and using a lossless QR on bonds that remain within
             the cap.
             """
+            if not preserve_subcap:
+                return self.cutoff if cutoff is None else float(cutoff)
             return self._subtree_cutoff_for_size(
                 self.tn.ind_size(self.tn.bond(node, child)),
-                max_bond=max_bond,
-                cutoff=cutoff,
+                max_bond=max_bond, cutoff=cutoff,
             )
 
         def descend(node, parent):
@@ -4658,9 +4709,18 @@ class TreeOptimizer:
                         if ix != state_bond and ix not in operator_inds[u]
                     ]
                     new_bond = f"_ttn_mpo_route_{token}_{u}_{v}"
-                    kept, message = self._qr_route_message(
-                        local[u], left_inds, bond_ind=new_bond,
-                    )
+                    hop_started = self._profile_phase_start()
+                    try:
+                        kept, message = self._qr_route_message(
+                            local[u], left_inds, bond_ind=new_bond,
+                        )
+                    finally:
+                        self._profile_phase_event(
+                            "thread_hop",
+                            hop_started,
+                            edge=(u, v),
+                            route="subtreempo",
+                        )
                     return index, u, v, state_bond, new_bond, kept, message
 
                 if pool is not None and len(ready) > 1:
@@ -4889,6 +4949,17 @@ class TreeOptimizer:
                     else self._steiner_nodes(active_nodes)
                 )
                 order, hub = self._peel_order(snodes)
+                if order:
+                    path_started = self._profile_phase_start()
+                    self._profile_phase_event(
+                        "metadata_path",
+                        path_started,
+                        support=tuple(active_support),
+                        route="subtreempo",
+                        subtree_nodes=len(snodes),
+                        message_edges=len(order),
+                        hub=hub,
+                    )
                 self._move_center(hub)
                 local = {}
                 state_inds = {}
@@ -4919,6 +4990,7 @@ class TreeOptimizer:
                             )
                         op_t = op_t.isel({edge: 0})
                     qubit = self.plan.qubit_of_node.get(nid)
+                    absorb_started = self._profile_phase_start()
                     if qubit is not None:
                         upper = tree_mpo.upper_ind(qubit)
                         lower = tree_mpo.lower_ind(qubit)
@@ -4931,11 +5003,27 @@ class TreeOptimizer:
                             lower: physical,
                             upper: physical + "*",
                         })
-                        local[nid] = _contract_two_tensors(
-                            state_t, op_t, shared_ind=physical,
-                        ).reindex_({physical + "*": physical})
+                        try:
+                            local[nid] = _contract_two_tensors(
+                                state_t, op_t, shared_ind=physical,
+                            ).reindex_({physical + "*": physical})
+                        finally:
+                            self._profile_phase_event(
+                                "tensor_absorption",
+                                absorb_started,
+                                support=(qubit,),
+                                route="subtreempo",
+                            )
                     else:
-                        local[nid] = qtn.tensor_contract(state_t, op_t)
+                        try:
+                            local[nid] = qtn.tensor_contract(state_t, op_t)
+                        finally:
+                            self._profile_phase_event(
+                                "tensor_absorption",
+                                absorb_started,
+                                support=(),
+                                route="subtreempo",
+                            )
                     operator_inds[nid] = (
                         set(local[nid].inds) - state_inds[nid]
                     )
@@ -4958,6 +5046,7 @@ class TreeOptimizer:
                     hub,
                     max_bond=max_bond,
                     cutoff=cutoff,
+                    preserve_subcap=False,
                 )
         except Exception:
             if started:
@@ -5230,16 +5319,14 @@ class TreeOptimizer:
     def apply_pauli_rotation(self, theta, pauli, where, *, sign=1.0):
         """Apply ``exp(-i theta * sign * P / 2)`` on a Pauli support.
 
-        The operator is represented as a bond-two MPO on the true support
-        window, so this remains efficient when ``where`` is sparse or long.
-        This method is deliberately frame-neutral: callers such as a future
+        The operator is represented as a compact TreeMPO on the true support
+        Steiner subtree, so this remains efficient when ``where`` is sparse or
+        long. Explicit ``mode='submpo'`` retains the chain-MPO compatibility
+        route. This method is deliberately frame-neutral: callers such as a
         stabilizer wrapper may pass a tableau-conjugated Pauli here.
         """
         self._require_dense_qubit_state("apply_pauli_rotation")
-        from ..stabilizer_tn.operators import (
-            pauli_combo_submpo,
-            single_qubit_rotation_matrix,
-        )
+        from ..stabilizer_tn.operators import pauli_combo_submpo
 
         logical_where = _normalize_where(where)
         where = self._validate_support(logical_where)
@@ -5247,39 +5334,43 @@ class TreeOptimizer:
         sign = float(sign)
         if sign not in (-1.0, 1.0):
             raise ValueError("Pauli rotation sign must be +1 or -1.")
-        if len(where) == 1:
-            self.apply_gate(
-                self._as_state_backend(
-                    single_qubit_rotation_matrix(
-                        float(theta), axes[0], sign=sign, dtype=self.dtype
-                    ),
-                    warn=False,
-                ),
-                logical_where,
-            )
-            return self
         terms = dict(zip(where, axes))
         c = np.cos(float(theta) / 2.0)
         coef = -1j * sign * np.sin(float(theta) / 2.0)
-        mpo, mpo_where = pauli_combo_submpo(
-            c, coef, terms, self.n, dtype=self.dtype,
-            compact_support=True,
+        if self.mode == "submpo":
+            mpo, mpo_where = pauli_combo_submpo(
+                c, coef, terms, self.n, dtype=self.dtype,
+                compact_support=True,
+            )
+            self._coerce_tensor_network_backend(mpo, warn=False)
+            return self._apply_submpo_resolved(mpo, mpo_where)
+
+        from .operators import TreeMPO
+
+        tree_mpo = TreeMPO.from_pauli_sum(
+            self.plan,
+            [(c, {}), (coef, terms)],
+            dtype=self.dtype,
         )
-        self._coerce_tensor_network_backend(mpo, warn=False)
-        return self._apply_submpo_resolved(mpo, mpo_where)
+        return self.apply_subtreempo(
+            tree_mpo,
+            tree_mpo.operator_support,
+            track_norm=True,
+        )
 
     def apply_pauli_sum(
         self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True
     ):
-        """Apply a weighted sum of Pauli products as one tree MPO.
+        """Apply a weighted sum of Pauli products as one native TreeMPO.
 
         ``weighted_terms`` contains ``(coefficient, mapping)`` pairs, where
-        each mapping is ``{qubit: 'X'|'Y'|'Z'}``. The exact MPO bond is bounded
-        by the number of branches and is compressed by the usual tree path
-        message sweep.
+        each mapping is ``{qubit: 'X'|'Y'|'Z'}``. The exact TTNO bond is
+        bounded by the number of branches, its exterior legs remain bond one,
+        and the resulting operator is absorbed through the native TreeMPO
+        QR-routing and compression path. ``mode='submpo'`` retains the
+        explicit MPS-style compatibility implementation.
         """
         self._require_dense_qubit_state("apply_pauli_sum")
-        from ..stabilizer_tn.operators import pauli_sum_submpo
 
         terms = tuple(weighted_terms)
         if not terms:
@@ -5293,14 +5384,32 @@ class TreeOptimizer:
                     for q, axis in term.items()
                 },
             ))
-        mpo, where = pauli_sum_submpo(
-            resolved_terms, self.n, dtype=self.dtype,
-            compact_support=True,
+        if self.mode == "submpo":
+            from ..stabilizer_tn.operators import pauli_sum_submpo
+
+            mpo, where = pauli_sum_submpo(
+                resolved_terms, self.n, dtype=self.dtype,
+                compact_support=True,
+            )
+            self._coerce_tensor_network_backend(mpo, warn=False)
+            return self._apply_submpo_resolved(
+                mpo,
+                where,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                track_norm=track_norm,
+            )
+
+        from .operators import TreeMPO
+
+        tree_mpo = TreeMPO.from_pauli_sum(
+            self.plan,
+            resolved_terms,
+            dtype=self.dtype,
         )
-        self._coerce_tensor_network_backend(mpo, warn=False)
-        return self._apply_submpo_resolved(
-            mpo,
-            where,
+        return self.apply_subtreempo(
+            tree_mpo,
+            tree_mpo.operator_support,
             max_bond=max_bond,
             cutoff=cutoff,
             track_norm=track_norm,
@@ -5850,33 +5959,22 @@ class TreeOptimizer:
         before = self._projection_snapshot(where)
         started = self._begin_update("measure", where)
         try:
-            if len(where) == 1:
-                projector = 0.5 * (
-                    np.eye(2, dtype=complex)
-                    + outcome * _PAULI_1Q[axes[0]]
-                )
-                self.apply_subtree_operator(
-                    self._as_state_backend(projector, warn=False),
-                    tuple(self._logical_qubits[q] for q in where),
-                    max_bond=self.chi,
-                    cutoff=self.cutoff, renormalize=renormalize,
-                )
-            else:
-                # Build the projector as a two-branch Pauli sum. This keeps
-                # the sign of a forced parity branch explicit and routes the
-                # long sparse support through the native tree-MPO path. The
-                # older branch-copy implementation could collapse both
-                # outcomes into the same parity sector on a rooted tree.
-                self.apply_pauli_sum(
-                    [
-                        (0.5, {}),
-                        (0.5 * outcome, dict(zip(where, axes))),
-                    ],
-                    max_bond=self.chi,
-                    cutoff=self.cutoff,
-                )
-                if renormalize:
-                    self.normalize()
+            # Build every projector, including the one-site case, as the
+            # same two-branch TreeMPO. ``where`` is in compact Tree positions;
+            # map it back to logical qubit labels before constructing the
+            # operator so custom/snake layouts remain correct.
+            logical_where = tuple(self._logical_qubits[q] for q in where)
+            self.apply_pauli_sum(
+                [
+                    (0.5, {}),
+                    (0.5 * outcome, dict(zip(logical_where, axes))),
+                ],
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                track_norm=False,
+            )
+            if renormalize:
+                self.normalize()
         except Exception:
             if started:
                 self._abort_update()

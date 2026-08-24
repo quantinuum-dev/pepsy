@@ -2086,7 +2086,7 @@ class TreeStabOptimizer:
                 f"max_operator_qubits={limit} (at most {4**limit} terms)."
             )
 
-        from ..stabilizer_tn.operators import pauli_decomposition, pauli_matrix
+        from ..stabilizer_tn.operators import pauli_decomposition
 
         branches = []
         for term_index, (labels, coeff) in enumerate(
@@ -2109,45 +2109,12 @@ class TreeStabOptimizer:
 
         if not branches:
             # A zero matrix, or an explicitly over-toleranced decomposition,
-            # annihilates the state. Applying a zero one-site operator is the
-            # tree-native way to represent that result without a fake branch.
-            zero = np.zeros((2, 2), dtype=complex)
-            self._tree.apply_1q(zero, where[0], track_norm=unitary)
-            return
-        coefficient_support = {
-            int(site) for _weight, terms in branches for site in terms
-        }
-        if len(coefficient_support) <= 1:
-            # ``pauli_sum_submpo`` intentionally has a multi-site MPO shape;
-            # lower a one-site coefficient-frame sum directly instead. The
-            # frame image may be a different single site from the physical
-            # matrix target, so use the mapped support when one exists.
-            q = next(iter(coefficient_support), where[0])
-            operator = np.zeros((2, 2), dtype=complex)
-            for weight, terms in branches:
-                operator += weight * pauli_matrix(terms.get(q, "I"))
-            self._tree.apply_1q(operator, q, track_norm=unitary)
-            return
-        if len(coefficient_support) == 2 and self._tree.mode != "submpo":
-            # A two-site coefficient-frame image is an ordinary two-site
-            # gate, even when it arrived as a Pauli decomposition of a dense
-            # physical gate. Route it through TreeOptimizer's selected
-            # two-site kernel so Tree and TreeStab use the same factorization
-            # and truncation semantics. Keeping this case out of the generic
-            # Pauli-sum sub-MPO path is important at finite chi: the two
-            # mathematically equivalent factorizations can otherwise discard
-            # different components at the first capped bond.
-            support = tuple(sorted(coefficient_support))
-            operator = np.zeros((4, 4), dtype=complex)
-            for weight, terms in branches:
-                operator += complex(weight) * np.kron(
-                    pauli_matrix(terms.get(support[0], "I")),
-                    pauli_matrix(terms.get(support[1], "I")),
-                )
-            self._tree.apply_2q(
-                self._tree._as_state_backend(operator, warn=False),
-                support[0],
-                support[1],
+            # annihilates the state. Keep this on the same native TreeMPO
+            # route as nonzero coefficient branches.
+            self._tree.apply_pauli_sum(
+                [(0.0, {})],
+                max_bond=self._tree.chi,
+                cutoff=self._tree.cutoff,
                 track_norm=unitary,
             )
             return
@@ -3682,28 +3649,17 @@ class TreeStabOptimizer:
         if probability <= 1e-12:
             return None
         if terms:
-            # Use the tree's Pauli-sum MPO rather than its legacy multi-site
-            # parity-projector branch tensor. The MPO keeps the ``+`` and ``-``
-            # branches distinct and remains efficient for long sparse supports.
-            if len(terms) == 1:
-                from ..stabilizer_tn.operators import pauli_matrix
-
-                q, axis = next(iter(terms.items()))
-                projector = 0.5 * (
-                    np.eye(2, dtype=complex)
-                    + outcome * float(sign) * pauli_matrix(axis)
-                )
-                self._tree.apply_1q(
-                    self._tree._as_state_backend(projector, warn=False), q
-                )
-            else:
-                self._tree.apply_pauli_sum(
-                    [
-                        (0.5, {}),
-                        (0.5 * outcome * float(sign), dict(terms)),
-                    ],
-                    track_norm=False,
-                )
+            # Every coefficient-frame projector, including a one-site one,
+            # uses the compact TreeMPO route. This keeps sampling and
+            # multi-site projection on the same Tree-native canonical/
+            # compression implementation.
+            self._tree.apply_pauli_sum(
+                [
+                    (0.5, {}),
+                    (0.5 * outcome * float(sign), dict(terms)),
+                ],
+                track_norm=False,
+            )
             self._tree.normalize()
         return probability
 

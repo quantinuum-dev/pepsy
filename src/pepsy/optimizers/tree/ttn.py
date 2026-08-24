@@ -7,9 +7,9 @@ a thin, geometry-owning subclass of ``quimb``'s arbitrary-geometry vector class
 binary), a configurable physical-index /
 site-tag / node-tag naming scheme, and deterministic tree-edge bond names, so
 that higher-level code (notably :class:`~pepsy.optimizers.tree.TreeOptimizer`)
-can talk in *node ids* and *qubit labels* while all the heavy lifting --
-canonicalisation, bond compression, gate application, dense read-out, copying --
-is inherited unchanged from ``quimb``.
+can talk in *node ids* and *qubit labels*. Arbitrary-geometry readout and
+low-level tensor operations remain Quimb-backed, while canonicalization,
+whole-tree compression, and canonical metadata are owned by this Tree class.
 
 Layout of a tree state
 ----------------------
@@ -2260,6 +2260,100 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
+
+    def compress(
+        self,
+        *,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        center=None,
+        reduced=True,
+    ):
+        """Compress the complete tree with a centre-oriented SVD sweep.
+
+        This is the high-level Tree analogue of an MPS ``compress`` call. The
+        tree has no left-to-right direction, so ``center`` selects the final
+        canonical node and every edge is compressed from the outer leaves
+        inward along its unique geodesic to that node. ``max_bond`` and
+        ``cutoff`` are applied by :meth:`compress_edge_` on each edge.
+
+        Canonicalization itself is always lossless QR. A truncating sweep uses
+        native edge SVDs and then records the selected node as the canonical
+        centre. Thus direct ``TreeTensorNetwork`` users get the same metadata
+        guarantees as :class:`TreeOptimizer`, without needing an optimizer or
+        a separate ``info_c`` mapping.
+
+        Parameters
+        ----------
+        max_bond : int, optional
+            Maximum virtual bond dimension. ``None`` keeps every retained
+            singular direction.
+        cutoff : float, optional
+            Singular-value cutoff. ``0.0`` requests a lossless QR gauge move
+            whenever no finite ``max_bond`` requires an SVD.
+        cutoff_mode : str, optional
+            Quimb cutoff convention, normally ``"rsum2"`` or ``"rel"``.
+        center : int, optional
+            TreePlan node at which to leave the final canonical centre. By
+            default, the current centre is retained, or the plan root is used
+            when no centre is known.
+        reduced : bool, optional
+            Use the reduced two-sided edge compression path where available.
+
+        Returns
+        -------
+        TreeTensorNetwork
+            ``self``, after compression and canonical metadata validation.
+        """
+        if cutoff is None:
+            cutoff = 1e-10
+        cutoff = float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        if max_bond is not None:
+            max_bond = int(max_bond)
+            if max_bond < 1:
+                raise ValueError("max_bond must be at least one.")
+
+        if center is None:
+            center = self.orthogonality_center
+            if center is None:
+                center = self._plan.root
+        if center not in self._plan.children:
+            raise ValueError(f"{center!r} is not a node of the tree.")
+
+        # Establish a known centre once. The subsequent post-order traversal
+        # then compresses each edge exactly after all of its outward branches
+        # have been reduced, so the final sweep has a valid tree-canonical
+        # gauge without a second full canonicalization pass.
+        self.shift_orthogonality_center(center)
+        order = sorted(
+            (node for node in self._plan.nodes() if node != center),
+            key=lambda node: (
+                -len(self._plan.node_path(node, center)),
+                int(node),
+            ),
+        )
+        for node in order:
+            neighbor = self._plan.node_path(node, center)[1]
+            self.compress_edge_(
+                node,
+                neighbor,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                reduced=reduced,
+            )
+
+        # ``compress_edge_`` conservatively clears the global centre when the
+        # prior centre is not the source endpoint. The traversal above has
+        # nevertheless established the defining outward isometries, so record
+        # the proven final region explicitly and verify it before returning.
+        self._canonical_region = frozenset({center})
+        self._set_isometry_metadata_from_region({center})
+        return self.validate(check_canonical=True)
 
     def canonize_around_node_(self, nid):
         """Canonicalise the whole tree around node ``nid`` and track it as centre.

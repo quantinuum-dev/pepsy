@@ -119,6 +119,42 @@ def test_tree_mpo_nonlocal_native_sign_uses_tree_fermion_convention(symmetry):
     )
 
 
+def test_native_tree_mpo_add_uses_charge_aware_tree_sum():
+    """Native TTNO addition must not use dense Quimb axis padding."""
+    fermion = pepsy.Fermion(
+        spinful=True, symmetry="U1", dtype="complex128",
+    )
+    hamiltonian = fermion.hamiltonian(
+        [(0, 1), (1, 2)], t=1.0, U=0.5, mu=0.1,
+    )
+    plan = TreePlan.from_order(range(3), structure="balanced")
+    operator = tree_mpo(
+        plan,
+        hamiltonian,
+        fermionic=True,
+        compress=False,
+        dtype="complex128",
+    ).pepsy_tree_operator
+
+    combined = operator.add_MPO(
+        operator.identity(),
+        compress=True,
+        max_bond=64,
+        cutoff=0.0,
+    )
+    assert combined.validate() is combined
+    assert combined.compressed is True
+    assert combined.chain_mpo is None
+    assert combined.pepsy_compression_report["order"] == "rank"
+    assert combined.pepsy_compression_report["effective_order"] == "depth"
+    dense = operator.to_dense()
+    np.testing.assert_allclose(
+        combined.to_dense(), dense + np.eye(dense.shape[0]),
+        rtol=1e-11,
+        atol=1e-11,
+    )
+
+
 @pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
 def test_tree_mpo_pair_observable_stays_compact_and_contracts_on_tree(symmetry):
     """The full pair table uses the four-state native endpoint automaton."""
@@ -398,6 +434,37 @@ def test_tree_mpo_from_gate_honors_custom_layout_labels():
         state.expectation_mpo(operator, range(3), optimize="greedy"),
         1.0,
         atol=1e-12,
+    )
+
+
+def test_tree_mpo_from_pauli_sum_has_compact_steiner_support():
+    """Pauli branches use Tree channels only on their active Steiner tree."""
+    plan = TreePlan.from_order(range(8), structure="balanced", top_arity=2)
+    terms = [
+        (0.7, {0: "X", 2: "Y", 7: "Z"}),
+        (0.2, {0: "Z", 7: "X"}),
+    ]
+    operator = TreeMPO.from_pauli_sum(plan, terms)
+    assert operator.operator_support == (0, 2, 7)
+    assert operator.validate() is operator
+    active = operator.plan.node_path(
+        operator.plan.node_of_qubit[0], operator.plan.node_of_qubit[7],
+    )
+    active = set(active) | set(
+        operator.plan.node_path(
+            operator.plan.node_of_qubit[2], operator.plan.node_of_qubit[7],
+        )
+    )
+    assert all(
+        operator.bond_size(node, child) == 1
+        for node, child in operator.edge_nodes()
+        if node not in active or child not in active
+    )
+
+    state = TreeOptimizer(None, n=8, tree=plan, chi=16, run=False)
+    state.apply_subtreempo(operator, operator.operator_support, cutoff=0.0)
+    np.testing.assert_allclose(
+        state.to_dense(), operator.to_dense()[:, 0], atol=1e-12,
     )
 
 
@@ -747,6 +814,17 @@ def test_tree_mpo_is_mpo_twin_over_tree_geometry():
     np.testing.assert_allclose(
         operator.add_MPO(identity, negate=True).to_dense(), dense - np.eye(16),
     )
+    compressed_sum = operator.add_MPO(
+        identity,
+        compress=True,
+        max_bond=16,
+        cutoff=0.0,
+    )
+    assert compressed_sum.compressed is True
+    assert compressed_sum.validate() is compressed_sum
+    np.testing.assert_allclose(
+        compressed_sum.to_dense(), dense + np.eye(16), rtol=1e-11, atol=1e-11,
+    )
     assert operator.amplitude([0, 0, 0, 0]) == pytest.approx(dense[0, 0])
 
     selected = operator.select_sites((0, 1))
@@ -760,9 +838,16 @@ def test_tree_mpo_is_mpo_twin_over_tree_geometry():
     canonical = operator.canonize_between(root, child)
     assert canonical.is_subtree_canonical_form((root, child))
     assert canonical is not operator
-    assert operator.copy(conj=True).to_dense().shape == (16, 16)
+    canonical_operator = operator.canonicalize(inplace=False)
+    conjugated = canonical_operator.conj()
+    transposed = canonical_operator.copy(transpose=True)
+    assert conjugated.validate(check_canonical=True) is conjugated
+    assert transposed.validate(check_canonical=True) is transposed
+    assert conjugated.is_canonical_form()
+    assert transposed.is_canonical_form()
+    assert conjugated.to_dense().shape == (16, 16)
     np.testing.assert_allclose(
-        operator.copy(transpose=True).to_dense(), dense.T, rtol=1e-11, atol=1e-11,
+        transposed.to_dense(), dense.T, rtol=1e-11, atol=1e-11,
     )
 
 
