@@ -136,12 +136,21 @@ print(diagnostics["fidelity"])
 print(diagnostics["infidelity"])
 ```
 
-`diagnostics["cumulative_norm_fidelity"]` is the stable cumulative product of
-the per-event `local_norm_fidelity` values, evaluated in log space. The
-matching `cumulative_norm_infidelity` uses `expm1` for small losses. The
-shorter `fidelity`/`infidelity` keys are compatibility aliases. The progress
-bar's `~F` field uses this same cumulative value. `get_fidelities()` remains
-the legacy normalized-MPO-norm history and is not the compression ledger.
+`diagnostics["cumulative_fidelity"]` is the stable cumulative product of the
+per-event `local_fidelity` values, evaluated in log space. The matching
+`cumulative_infidelity` uses `expm1` for small losses. These are compression
+fidelities measured from retained norms, not target-state overlaps. The live
+represented MPO norm is reported separately as `norm`/`state_norm`, while
+`cumulative_norm` is only the square-root retained-compression proxy. The
+progress bar's `~F` field uses the cumulative compression fidelity.
+`get_fidelities()` remains the legacy normalized-MPO-norm history and is not
+the compression ledger.
+
+If lower-level code accesses `opt.p` and moves its canonical centre directly,
+call `opt.sync_canonicalization()` before resuming replay so `opt.info_c` is
+rebased to the live MPO. With no compression events yet, the cumulative
+fidelity fields are `None`; they are not a claim that a compression has been
+measured.
 
 DMRG FIT controls are exposed directly through `run`: `fit_min_iter`,
 `fit_rtol`, `fit_patience`, `fit_finite_check`, `timing`,

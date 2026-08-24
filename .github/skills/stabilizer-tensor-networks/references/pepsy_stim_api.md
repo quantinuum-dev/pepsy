@@ -148,8 +148,9 @@ The public simulator types are exported at top level (`import pepsy`); see
   reset, and normalized Kraus-trajectory boundaries, including the Born
   `branch_probability` and the actual `projected_norm_sq` before normalization; compare it
   to `pre_norm_sq * branch_probability` for the separate compression-survival proxy.
-  Prefer `norm_diagnostics()["norm_infidelity"]`, `["norm_survival"]`, and `["norm"]`;
-  the older `total_*_proxy` keys remain compatibility aliases. `geometric_mean_norm`
+  Prefer `norm_diagnostics()["cumulative_infidelity"]`, `["norm_survival"]`, and
+  `["norm"]`; the older `total_*_proxy` keys remain compatibility aliases.
+  `geometric_mean_norm`
   is only a per-segment average.
   Never sum `.infidelities`: each sample is already cumulative for its segment.
   `.measurements` stores tuple-compatible `MeasurementRecord` objects; `.norm_events`,
@@ -235,9 +236,9 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   compression is reported separately in `.norm_events` as `projector_infidelity`, while
   physical measurement probabilities remain separate. A normalized selected Kraus branch
   likewise closes the current segment and starts a fresh one; it must not leave the proxy
-  invalid. STN progress reports a compact stream `part` label and `norm_infidelity`;
-  use `norm = sqrt(norm_survival)` from `norm_diagnostics()` when the norm-survival
-  summary is needed programmatically.
+  invalid. STN progress reports a compact stream `part` label and `infidelity`.
+  Use `norm = sqrt(cumulative_fidelity)` only for the retained-compression proxy;
+  the live represented norm is reported separately by `norm_diagnostics()`.
   Validate physical accuracy independently against dense evolution on small systems.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 

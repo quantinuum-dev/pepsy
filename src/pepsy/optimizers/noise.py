@@ -2984,7 +2984,7 @@ def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
     """Recognize the chain STN optimizer without importing it at setup time."""
-    return all(
+    required = all(
         callable(getattr(optimizer, attr, None))
         for attr in (
             "copy",
@@ -2992,10 +2992,10 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
             "_canonize_p",
             "_renorm_p_at",
             "_make_norm_event",
-            "_reset_norm_infidelity",
             "_commit_norm_event",
         )
     )
+    return required and callable(getattr(optimizer, "_reset_infidelity", None))
 
 
 def _trajectory_norm_squared(optimizer) -> float:
@@ -3399,7 +3399,7 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         # A selected Kraus outcome is a normalized quantum-trajectory branch:
         # close the preceding unitary segment without counting its Born weight
         # as compression loss, then establish the new unit-norm baseline.
-        optimizer._reset_norm_infidelity()
+        optimizer._reset_infidelity()
         optimizer._commit_norm_event(norm_event, projected_norm=projected_norm)
         return
     normalize = getattr(optimizer, "normalize", None)

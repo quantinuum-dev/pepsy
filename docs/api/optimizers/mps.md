@@ -497,9 +497,10 @@ stored in `opt.mix_history` and summarized in `opt.last_mix_summary`; entries
 include logical `where`, execution `execution_where`, FIT iterations and
 convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
 `progbar=True`, the progress bar shows the current backend, cumulative
-MPO/DMRG/fallback counts, `~F` (the cumulative norm fidelity), and
-`bond=current/chi`. `~F` is converted from the log-survival ledger only for
-display; accumulation remains logarithmic and numerically stable.
+MPO/DMRG/fallback counts, `~F` (the cumulative compression fidelity), and
+`bond=current/chi`. `~F` is the cumulative compression fidelity measured from
+retained norms, converted from the log-survival ledger only for display;
+accumulation remains logarithmic and numerically stable.
 The progress-bar descriptor is mode-qualified: bare `src` and `zipup` inputs
 are displayed canonically as `quimb-src` and `quimb-zipup`; legacy `mpo-*`
 forms remain visible as supplied. The `quimb` and `mpo` aliases display as

@@ -954,6 +954,45 @@ def test_tree_stab_state_dependent_kraus_branches_use_tree_normalization():
         assert optimizer.norm() == pytest.approx(1.0, abs=1e-8)
 
 
+def test_tree_stab_public_queue_compiles_trajectory_events_and_coalesces():
+    """TreeStab's public queue uses the shared local trajectory runner."""
+    channel = pepsy.TrajectoryChannel.amplitude_damping(0.5)
+    simulator = pepsy.TreeStabOptimizer(
+        1,
+        gates=[(_X, 0), pepsy.TrajectoryEvent(channel, 0)],
+    )
+
+    assert simulator.has_trajectory_events is True
+    assert isinstance(simulator.gate_stream()[1], pepsy.TrajectoryEvent)
+
+    result = simulator.run(
+        shots=32,
+        seed=6,
+        strategy="coalesced",
+        run_kwargs={"progbar": False},
+    )
+
+    assert result.coalesced is True
+    assert result.branches == 2
+    assert sum(result.counts) == 32
+    assert all(optimizer.norm() == pytest.approx(1.0, abs=1e-8)
+               for optimizer in result.optimizers)
+
+
+def test_tree_stab_public_error_model_can_coalesce_clean_stream():
+    """The Pauli error-model convenience path shares TreeStab prefixes."""
+    simulator = pepsy.TreeStabOptimizer(1, gates=[("h", 0)])
+    result = simulator.run(
+        shots=32,
+        error_model=pepsy.PauliErrorModel.bit_flip(0.01),
+        seed=3,
+        strategy="coalesced",
+    )
+
+    assert result.coalesced is True
+    assert sum(result.counts) == 32
+
+
 def test_tree_stab_norm_ledger_tracks_unitary_coeff_updates_without_spectra():
     """TreeStab keeps norm tracking on when spectrum tracking is off."""
     simulator = pepsy.TreeStabOptimizer(1, chi=1, track_truncation=False)

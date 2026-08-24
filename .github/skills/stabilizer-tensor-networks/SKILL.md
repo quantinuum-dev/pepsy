@@ -88,9 +88,10 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
   projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
   product/geometric summaries that multiply unitary and projector compression-survival
-  factors, but never measurement probabilities. Prefer `infidelity`, `fidelity`,
-  `norm_survival`, and `norm`; `norm_infidelity` and
-  the older `total_*_proxy` keys are compatibility aliases. `geometric_mean_norm`
+  factors, but never measurement probabilities. Prefer `local_fidelity`,
+  `local_infidelity`, `cumulative_fidelity`, `cumulative_infidelity`,
+  `norm_survival`, and `norm`; the older `total_*_proxy` keys are compatibility
+  aliases. `geometric_mean_norm`
   is only the per-segment geometric mean, not the
   total norm summary.
 - A selected `TrajectoryEvent` Kraus outcome is a normalized trajectory
@@ -99,8 +100,9 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   canonical centre, reset the proxy, and commit a `"trajectory_kraus"` norm
   event. This lets later unitary steps track a fresh segment without treating
   the Born probability as compression loss. STN progress reports the shared
-  `infidelity` field plus a compact stream `part` label and retains
-  `norm_infidelity` as a compatibility alias.
+  `infidelity` field plus a compact stream `part` label. Fidelity and
+  infidelity names describe compression measured from norms; live `norm`
+  remains separate.
 - Treat stream-local stochastic entries as the primary Pepsy noise design.
   `("x_error", p, q)`, `("depolarize1", p, q)`,
   `("depolarize2", p, q0, q1)`, `("pauli_channel1", probs, q)`,

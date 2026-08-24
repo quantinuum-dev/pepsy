@@ -854,8 +854,8 @@ class MpoOptimizer:
         return self._exp_from_log(log_norm - self._reference_log_norm)
 
     @staticmethod
-    def _norm_fidelity_ratio(observed_norm, expected_norm):
-        """Return raw and clipped squared norm survival for one compression."""
+    def _fidelity_ratio_from_norms(observed_norm, expected_norm):
+        """Return raw and clipped fidelity measured from two norms."""
         observed_norm = float(abs(observed_norm))
         expected_norm = float(abs(expected_norm))
         if (
@@ -883,12 +883,19 @@ class MpoOptimizer:
         as compression infidelity; only the retained/expected norm ratio is
         accumulated.
         """
-        raw, survival = self._norm_fidelity_ratio(observed_norm, expected_norm)
+        raw, survival = self._fidelity_ratio_from_norms(
+            observed_norm, expected_norm
+        )
         if survival is not None:
             if survival == 0.0:
                 self._norm_log_survival = -math.inf
             elif math.isfinite(self._norm_log_survival):
                 self._norm_log_survival += math.log(survival)
+            cumulative_fidelity = self._cumulative_fidelity()
+            cumulative_infidelity = self._cumulative_infidelity()
+        else:
+            cumulative_fidelity = None
+            cumulative_infidelity = None
 
         event = {
             "kind": str(kind),
@@ -903,23 +910,27 @@ class MpoOptimizer:
             "target_norm": (
                 None if target_norm is None else float(abs(target_norm))
             ),
-            "norm_fidelity_raw": None if raw is None else float(raw),
-            "norm_fidelity": None if survival is None else float(survival),
-            "norm_infidelity": (
+            "fidelity_raw": None if raw is None else float(raw),
+            # These are compression fidelities measured from norms. The
+            # metric name intentionally does not repeat its measurement source.
+            "local_fidelity": None if survival is None else float(survival),
+            "local_infidelity": (
                 None if survival is None else float(1.0 - survival)
             ),
-            "cumulative_norm_fidelity": self._cumulative_norm_fidelity(),
-            "cumulative_norm_infidelity": self._cumulative_norm_infidelity(),
+            "cumulative_fidelity": cumulative_fidelity,
+            "cumulative_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": cumulative_fidelity,
+            "cumulative_compression_infidelity": cumulative_infidelity,
         }
         self.norm_events.append(event)
         return event
 
-    def _cumulative_norm_fidelity(self):
-        """Return cumulative squared norm survival in a stable form."""
+    def _cumulative_fidelity(self):
+        """Return cumulative fidelity measured from retained norms."""
         return self._exp_from_log(self._norm_log_survival)
 
-    def _cumulative_norm_infidelity(self):
-        """Return cumulative norm infidelity using stable ``expm1``."""
+    def _cumulative_infidelity(self):
+        """Return cumulative infidelity using stable ``expm1``."""
         if self._norm_log_survival == -math.inf:
             return 1.0
         if not math.isfinite(self._norm_log_survival):
@@ -927,24 +938,64 @@ class MpoOptimizer:
         return float(-math.expm1(self._norm_log_survival))
 
     def norm_diagnostics(self):
-        """Return structured MPO norm-survival diagnostics."""
+        """Return MPO compression fidelities and separate live norm diagnostics."""
         valid = [event for event in self.norm_events if event["valid"]]
+        cumulative_fidelity = (
+            None if not valid else self._cumulative_fidelity()
+        )
+        cumulative_infidelity = (
+            None if cumulative_fidelity is None else self._cumulative_infidelity()
+        )
+        current = None if not valid else valid[-1]
+        state_norm = self._canonical_norm_value(self.p)
         return {
             "tracking": True,
+            "norm_tracking": True,
+            "truncation_tracking": None,
             "events": len(self.norm_events),
             "completed_events": len(valid),
-            "norm_survival": self._cumulative_norm_fidelity(),
-            "norm_infidelity": self._cumulative_norm_infidelity(),
-            "fidelity": self._cumulative_norm_fidelity(),
-            "infidelity": self._cumulative_norm_infidelity(),
-            "current_event": None if not valid else deepcopy(valid[-1]),
+            "current_valid": current is not None,
+            "current_event": None if current is None else deepcopy(current),
+            "current_fidelity": (
+                None if current is None else current["local_fidelity"]
+            ),
+            "current_infidelity": (
+                None if current is None else current["local_infidelity"]
+            ),
+            "local_fidelity": (
+                None if current is None else current["local_fidelity"]
+            ),
+            "local_infidelity": (
+                None if current is None else current["local_infidelity"]
+            ),
+            "cumulative_fidelity": cumulative_fidelity,
+            "cumulative_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": cumulative_fidelity,
+            "cumulative_compression_infidelity": cumulative_infidelity,
+            "norm_survival": cumulative_fidelity,
+            "fidelity": cumulative_fidelity,
+            "infidelity": cumulative_infidelity,
+            "norm": state_norm,
+            "state_norm": state_norm,
+            "cumulative_norm": (
+                None
+                if cumulative_fidelity is None
+                else float(cumulative_fidelity ** 0.5)
+            ),
+            "total_survival_proxy": cumulative_fidelity,
+            "total_infidelity_proxy": cumulative_infidelity,
+            "total_norm_proxy": (
+                None
+                if cumulative_fidelity is None
+                else float(cumulative_fidelity ** 0.5)
+            ),
             "segment_infidelities": [
-                event["norm_infidelity"] for event in valid
+                event["local_infidelity"] for event in valid
             ],
             "max_segment_infidelity": (
                 None
                 if not valid
-                else max(event["norm_infidelity"] for event in valid)
+                else max(event["local_infidelity"] for event in valid)
             ),
         }
 
@@ -2258,7 +2309,7 @@ class MpoOptimizer:
                     pbar.set_postfix(
                         {
                             "2q": two_qubit_count,
-                            "~F": self._cumulative_norm_fidelity(),
+                            "~F": self._cumulative_fidelity(),
                             "norm": norm_proxy,
                             "bnd": p.max_bond(),
                         }
@@ -2528,7 +2579,7 @@ class MpoOptimizer:
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": self._cumulative_norm_fidelity(),
+                    "~F": self._cumulative_fidelity(),
                     "norm": norm_proxy,
                     "bnd": p.max_bond(),
                 }
@@ -2595,7 +2646,7 @@ class MpoOptimizer:
                     pbar.set_postfix(
                         {
                             "2q": two_qubit_count,
-                            "~F": self._cumulative_norm_fidelity(),
+                            "~F": self._cumulative_fidelity(),
                             "norm": norm_proxy,
                             "bnd": p.max_bond(),
                         }
@@ -2691,7 +2742,7 @@ class MpoOptimizer:
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": self._cumulative_norm_fidelity(),
+                    "~F": self._cumulative_fidelity(),
                     "norm": norm_proxy,
                     "bnd": p.max_bond(),
                 }
@@ -2762,7 +2813,7 @@ class MpoOptimizer:
                     pbar.set_postfix(
                         {
                             "2q": two_qubit_count,
-                            "~F": self._cumulative_norm_fidelity(),
+                            "~F": self._cumulative_fidelity(),
                             "norm": norm_proxy,
                             "bnd": p.max_bond(),
                         }
@@ -2862,7 +2913,7 @@ class MpoOptimizer:
                 postfix = {
                     "2q": two_qubit_count,
                     "nonlocal": nonlocal_count,
-                    "~F": self._cumulative_norm_fidelity(),
+                    "~F": self._cumulative_fidelity(),
                     "norm": norm_proxy,
                     "bnd": self.p.max_bond(),
                 }
@@ -3363,6 +3414,48 @@ class MpoOptimizer:
 
         p.canonize(where_canon, cur_orthog=self._current_orthog(p))
         self.info_c["cur_orthog"] = target_orthog
+
+    def sync_canonicalization(self, site=None):
+        """Repair ``info_c`` after direct canonicalization of the live MPO.
+
+        Low-level access through :attr:`p` can move the MPO orthogonality
+        centre without updating the optimizer-owned ``info_c`` dictionary.
+        Discover the actual live centre, move it to a single site, and bind
+        the resulting metadata back to this optimizer before replay resumes.
+        """
+        if not hasattr(self.p, "calc_current_orthog_center"):
+            raise TypeError("the live MPO does not expose canonical metadata.")
+
+        current = self.p.calc_current_orthog_center()
+        if isinstance(current, Integral):
+            current = (int(current), int(current))
+        else:
+            try:
+                current = tuple(int(value) for value in current)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "the live MPO returned an invalid orthogonality centre."
+                ) from exc
+            if len(current) == 1:
+                current = (current[0], current[0])
+            elif len(current) == 2:
+                current = (min(current), max(current))
+            else:
+                raise ValueError(
+                    "the live MPO returned an invalid orthogonality span."
+                )
+
+        if site is None:
+            site = current[1]
+        site = int(site)
+        if not 0 <= site < int(self.p.L):
+            raise ValueError(
+                f"site must lie in [0, {int(self.p.L)}), got {site}."
+            )
+
+        self.p.canonize([site], cur_orthog=current)
+        self.info_c["cur_orthog"] = (site, site)
+        return self.info_c["cur_orthog"]
 
     def get_fidelities(self):
         """Return the legacy normalized-MPO-norm history.

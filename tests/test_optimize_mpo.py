@@ -540,6 +540,35 @@ def test_mpo_optimizer_current_orthog_normalizes_supported_shapes():
         opt._current_orthog()
 
 
+def test_mpo_optimizer_sync_canonicalization_repairs_external_readout():
+    """External MPO canonicalization can be rebound to ``info_c``."""
+    mpo0 = qtn.MPO_identity(5, dtype="complex128")
+    opt = py.MpoOptimizer(mpo0.copy(), gates=[], chi=6, mode="dmrg")
+    opt.canonize_mpo(opt.p, 0)
+    assert opt.info_c["cur_orthog"] == (0, 0)
+
+    # Model a low-level caller bypassing the optimizer's metadata owner.
+    opt.p.canonize([4], cur_orthog=(0, 0))
+    assert opt.info_c["cur_orthog"] == (0, 0)
+    assert tuple(opt.p.calc_current_orthog_center()) == (4, 4)
+
+    assert opt.sync_canonicalization() == (4, 4)
+    assert opt.info_c["cur_orthog"] == (4, 4)
+
+
+def test_mpo_optimizer_empty_norm_diagnostics_use_none_for_compression():
+    """No compression events should not masquerade as unit fidelity."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"), gates=[], chi=4, mode="svd"
+    )
+    diagnostics = opt.norm_diagnostics()
+
+    assert diagnostics["cumulative_fidelity"] is None
+    assert diagnostics["cumulative_infidelity"] is None
+    assert diagnostics["cumulative_norm"] is None
+    assert diagnostics["norm"] == pytest.approx(diagnostics["state_norm"])
+
+
 def test_mpo_optimizer_canonize_mpo_accepts_supported_where_shapes():
     """canonize_mpo should accept int, singleton, and pair site selectors."""
     mpo0 = qtn.MPO_identity(5, dtype="complex128")
@@ -627,13 +656,32 @@ def test_mpo_optimizer_norm_ledger_separates_gate_norm_from_compression():
     diagnostics = opt.norm_diagnostics()
     assert len(events) == 2
     assert all(event["valid"] for event in events)
-    assert events[0]["norm_fidelity"] == pytest.approx(1.0, abs=1.0e-10)
+    removed_metric_names = {
+        "norm_fidelity_raw",
+        "norm_fidelity",
+        "norm_infidelity",
+        "local_norm_fidelity",
+        "local_norm_infidelity",
+        "cumulative_norm_fidelity",
+        "cumulative_norm_infidelity",
+    }
+    assert removed_metric_names.isdisjoint(diagnostics)
+    assert removed_metric_names.isdisjoint(events[0])
+    assert events[0]["local_fidelity"] == pytest.approx(1.0, abs=1.0e-10)
     assert events[1]["expected_norm"] != pytest.approx(events[0]["expected_norm"])
     assert diagnostics["events"] == 2
     assert diagnostics["completed_events"] == 2
     assert diagnostics["norm_survival"] == pytest.approx(
-        np.prod([event["norm_fidelity"] for event in events])
+        np.prod([event["local_fidelity"] for event in events])
     )
+    assert diagnostics["cumulative_fidelity"] == pytest.approx(
+        diagnostics["norm_survival"]
+    )
+    assert diagnostics["norm"] == pytest.approx(diagnostics["state_norm"])
+    assert diagnostics["cumulative_norm"] == pytest.approx(
+        diagnostics["cumulative_fidelity"] ** 0.5
+    )
+    assert diagnostics["norm"] != pytest.approx(diagnostics["cumulative_norm"])
 
 
 def test_mpo_optimizer_set_mpo_resets_lifecycle_diagnostics():
