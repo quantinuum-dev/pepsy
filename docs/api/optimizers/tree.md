@@ -1403,11 +1403,15 @@ scale.
 - `TreeOptimizer.get_norm_events()` and `TreeOptimizer.norm_diagnostics()`
   expose the separate cheap path-level norm ledger. A Tree event groups the
   complete QR-thread/compression path for one gate or subtree update and
-  reports `local_norm_fidelity` plus the log-accumulated
-  `cumulative_norm_fidelity`. These are retained-norm compression proxies, not
-  target-state overlaps. They are collected independently of
+  reports `local_fidelity` plus the log-accumulated `cumulative_fidelity`.
+  These are compression fidelities measured from retained norms, not target-
+  state overlaps. They are collected independently of
   `track_truncation`; use the latter only when per-edge discarded weight and
   singular-spectrum attribution are required.
+  In `norm_diagnostics()`, `norm`/`state_norm` are the live represented Tree
+  norm, while `cumulative_norm` is the square-root retained-compression
+  proxy. `norm_survival` is an explicit provenance alias for
+  `cumulative_fidelity`.
 - `TreeOptimizer.convergence_sweep(gates, n, chi_values, ops=...)` replays the
   stream at several `chi` on one fixed tree and returns per-`chi` `max_bond`,
   `norm`, observable `expectations`, `fidelity` against the untruncated state
@@ -1426,7 +1430,7 @@ Both dense and native fermionic replay report
 reset after control or explicitly non-unitary events. This is display-only and
 is not a replacement for either the path-level norm ledger or the recorded
 per-edge truncation history. The bar is disabled by default. The norm ledger is
-the canonical `local_norm_fidelity` / `cumulative_norm_fidelity` diagnostic;
+the canonical `local_fidelity` / `cumulative_fidelity` diagnostic;
 `track_truncation=True` is the more expensive spectrum-attribution diagnostic.
 For dense two-level qubit TTNs, `measure(q, outcome=None)` projectively
 measures a qubit in the computational basis and returns a bit; `reset(q)`

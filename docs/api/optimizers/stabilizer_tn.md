@@ -117,17 +117,19 @@ print(sim.stim_sample.faults)
 
 With `progbar=True`, the STN progress bar reports the current stream
 `part` (`clifford`, `T`, `measurement`, `reset`, `nonclifford`, ...) and the
-MPS-compatible `norm_infidelity` field. The explicit name denotes the
-retained-norm proxy; it is not a target-state overlap.
+MPS-compatible `infidelity` field. It denotes the retained-norm compression
+proxy; it is not a target-state overlap.
 
 The STN norm diagnostics use the same naming contract as ordinary MPS
-compression: `current_norm_fidelity` / `current_norm_infidelity` describe the
-active normalized coefficient segment, while
-`cumulative_norm_fidelity` / `cumulative_norm_infidelity` are accumulated in
-log space. These are retained-norm compression proxies for `|nu>`, not direct
+compression: `current_fidelity` / `current_infidelity` describe the active
+normalized coefficient segment, while
+`cumulative_fidelity` / `cumulative_infidelity` are accumulated in log space.
+These are compression fidelities measured from retained norms for `|nu>`, not direct
 overlaps with the physical target state `C|nu>`. A direct target overlap is a
 separate diagnostic and is only available when an explicit reference state is
 contracted, such as the final FIT-target check in ordinary MPS DMRG.
+In `norm_diagnostics()`, `norm`/`state_norm` are the live coefficient-state
+norm, while `cumulative_norm` is the square-root retained-compression proxy.
 
 For physical readout, keep the two representations explicit:
 `sim.to_basis_statevector()` returns the dense coefficient vector `|nu>` in
@@ -332,8 +334,8 @@ no reference-state copy or overlap contraction. For normalized unitary
 evolution it records the cumulative proxy `1 - ||nu||**2` after compressed
 coefficient-MPS updates, reading the norm from the tracked one-site canonical
 centre. `get_compression_norm_events()` exposes each update's local retained
-norm ratio, while `norm_diagnostics()["local_norm_fidelity"]` is the latest
-such ratio and `cumulative_norm_fidelity` is the stable cumulative proxy.
+norm ratio, while `norm_diagnostics()["local_fidelity"]` is the latest such
+ratio and `cumulative_fidelity` is the stable cumulative proxy.
 Unitary updates are not renormalized, so lost norm remains visible.
 For dense multi-qubit non-unitary matrices, the target norm is measured from
 the local physical `G†G` expectation and the retained norm ratio is reported as
@@ -352,9 +354,8 @@ The post-collapse state is then normalized. Use `norm_diagnostics()` to form
 product/geometric-mean survival summaries across completed segments plus the
 current open segment; these summaries multiply unitary- and projector-
 compression survival factors, but not measurement probabilities. The preferred
-summary keys are `infidelity`, `fidelity`, `norm_survival`, and `norm`;
-`norm_infidelity` and the older
-`total_*_proxy` keys remain compatibility aliases.
+summary keys are `infidelity`, `fidelity`, `norm_survival`, and `norm`; the
+older `total_*_proxy` keys remain compatibility aliases.
 The proxy is not exact overlap fidelity or a discarded-SVD-weight report;
 validate physical accuracy independently when that distinction matters.
 

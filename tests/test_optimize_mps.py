@@ -635,7 +635,7 @@ def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-12)
     assert out.max_bond() == 2
-    assert optimizer.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+    assert optimizer.norm_diagnostics()["infidelity"] == pytest.approx(
         0.0, abs=1.0e-12
     )
     diagnostics = optimizer.get_fit_diagnostics()
@@ -3636,8 +3636,8 @@ def test_unitary_norm_overshoot_tolerance_is_dtype_aware():
         observed_norm=np.sqrt(1.0 + 1.0e-5),
         where=(0, 1),
     )
-    assert event["norm_fidelity_raw"] == pytest.approx(1.0 + 1.0e-5)
-    assert event["norm_fidelity"] == pytest.approx(1.0)
+    assert event["fidelity_raw"] == pytest.approx(1.0 + 1.0e-5)
+    assert event["local_fidelity"] == pytest.approx(1.0)
 
     with pytest.raises(FloatingPointError, match="squared ratio"):
         complex64._record_norm_event(
@@ -7494,7 +7494,7 @@ def test_mps_optimizer_measure_forced_outcome_collapses_and_records():
     assert event["branch_probability"] == pytest.approx(prob)
     assert event["physical_boundary"] is True
     assert event["renormalized"] is True
-    assert event["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+    assert event["local_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_mps_optimizer_measure_multisite_pauli():
@@ -7748,7 +7748,7 @@ def test_mps_optimizer_reset_returns_qubit_to_zero():
     assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (1,)), 1.0)
     assert opt.measurements == []
     assert [event["kind"] for event in opt.get_norm_events()] == ["reset"]
-    assert opt.norm_diagnostics()["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+    assert opt.norm_diagnostics()["infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("axis", ["X", "Y", "Z"])
@@ -8081,10 +8081,10 @@ def test_standalone_compression_modes_honor_unitary_stabilization(mode):
 
     assert _mps_data_norm(stabilized.p) == pytest.approx(1.0, abs=2.0e-5)
     assert _mps_data_norm(unstabilized.p) < 0.999
-    assert stabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+    assert stabilized.norm_diagnostics()["infidelity"] == pytest.approx(
         0.5, abs=2.0e-5
     )
-    assert unstabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+    assert unstabilized.norm_diagnostics()["infidelity"] == pytest.approx(
         0.5, abs=2.0e-5
     )
     assert stabilized.get_norm_events()[0]["kind"] == "unitary_compression"
@@ -8104,7 +8104,7 @@ def test_dmrg_schedules_record_automatic_norm_survival(mode):
 
     diagnostics = opt.norm_diagnostics()
     assert diagnostics["events"] == 1
-    assert diagnostics["norm_infidelity"] == pytest.approx(0.5, abs=2.0e-5)
+    assert diagnostics["infidelity"] == pytest.approx(0.5, abs=2.0e-5)
     assert _mps_data_norm(opt.p) == pytest.approx(1.0, abs=2.0e-5)
 
 
@@ -8125,8 +8125,19 @@ def test_mps_norm_names_and_dmrg_target_overlap_are_distinct():
 
     diagnostics = opt.norm_diagnostics()
     fit = opt.get_fit_diagnostics()
-    assert diagnostics["local_norm_fidelity"] == pytest.approx(0.5, abs=2e-5)
-    assert diagnostics["cumulative_norm_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    removed_metric_names = {
+        "norm_fidelity_raw",
+        "norm_fidelity",
+        "norm_infidelity",
+        "local_norm_fidelity",
+        "local_norm_infidelity",
+        "cumulative_norm_fidelity",
+        "cumulative_norm_infidelity",
+    }
+    assert removed_metric_names.isdisjoint(diagnostics)
+    assert removed_metric_names.isdisjoint(opt.get_norm_events()[0])
+    assert diagnostics["local_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert diagnostics["cumulative_fidelity"] == pytest.approx(0.5, abs=2e-5)
     assert diagnostics["norm"] == pytest.approx(1.0, abs=2e-5)
     assert diagnostics["state_norm"] == pytest.approx(1.0, abs=2e-5)
     assert diagnostics["cumulative_norm"] == pytest.approx(

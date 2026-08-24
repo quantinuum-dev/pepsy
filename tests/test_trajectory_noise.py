@@ -888,7 +888,7 @@ def test_state_dependent_kraus_branches_are_sampled_from_the_current_state(kind)
             assert event["branch_probability"] == pytest.approx(0.5)
             assert event["physical_boundary"] is True
             assert event["renormalized"] is True
-            assert diagnostics["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+            assert diagnostics["infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_coalesced_ordinary_mps_kraus_norm_is_a_physical_boundary():
@@ -911,7 +911,7 @@ def test_coalesced_ordinary_mps_kraus_norm_is_a_physical_boundary():
         event = leaf.optimizer.get_norm_events()[0]
         assert event["kind"] == "trajectory_kraus"
         assert event["branch_probability"] == pytest.approx(0.5)
-        assert diagnostics["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+        assert diagnostics["infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state():
@@ -962,7 +962,7 @@ def test_tree_stab_norm_ledger_tracks_unitary_coeff_updates_without_spectra():
     diagnostics = simulator.norm_diagnostics()
     assert diagnostics["norm_tracking"] is True
     assert diagnostics["truncation_tracking"] is False
-    assert diagnostics["local_norm_fidelity"] == pytest.approx(1.0)
+    assert diagnostics["local_fidelity"] == pytest.approx(1.0)
     assert len(simulator.get_norm_events()) == 1
     assert len(simulator.norm_events) == 1
     assert simulator.get_infidelity_samples() == []
@@ -975,7 +975,7 @@ def test_tree_stab_known_nonunitary_matrix_does_not_create_norm_event():
     simulator.apply([(filter_gate, (0,))])
 
     assert simulator.get_norm_events() == []
-    assert simulator.norm_diagnostics()["cumulative_norm_fidelity"] is None
+    assert simulator.norm_diagnostics()["cumulative_fidelity"] is None
 
 
 def test_tree_stab_random_unitary_depolarizing_channel_replays_branches():

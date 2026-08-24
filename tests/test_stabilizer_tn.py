@@ -676,11 +676,22 @@ def test_stabilizer_mps_exposes_per_update_norm_ratios():
     assert events
     assert diagnostics["norm_tracking"] is True
     assert diagnostics["truncation_tracking"] is None
-    assert diagnostics["local_norm_fidelity"] == pytest.approx(
-        events[-1]["local_norm_fidelity"]
+    removed_metric_names = {
+        "norm_fidelity_raw",
+        "norm_fidelity",
+        "norm_infidelity",
+        "local_norm_fidelity",
+        "local_norm_infidelity",
+        "cumulative_norm_fidelity",
+        "cumulative_norm_infidelity",
+    }
+    assert removed_metric_names.isdisjoint(diagnostics)
+    assert removed_metric_names.isdisjoint(events[-1])
+    assert diagnostics["local_fidelity"] == pytest.approx(
+        events[-1]["local_fidelity"]
     )
-    assert diagnostics["cumulative_norm_fidelity"] == pytest.approx(
-        events[-1]["cumulative_norm_fidelity"]
+    assert diagnostics["cumulative_fidelity"] == pytest.approx(
+        events[-1]["cumulative_fidelity"]
     )
     assert diagnostics["compression_events"] == len(events)
 
@@ -768,7 +779,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
         expected_total_survival ** 0.5
     )
     assert diagnostics["norm_survival"] == pytest.approx(expected_total_survival)
-    assert diagnostics["norm_infidelity"] == pytest.approx(
+    assert diagnostics["infidelity"] == pytest.approx(
         1.0 - expected_total_survival
     )
     assert diagnostics["infidelity"] == pytest.approx(
@@ -776,7 +787,11 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     )
     assert diagnostics["fidelity"] == pytest.approx(expected_total_survival)
     assert sim.get_infidelities() is sim.infidelities
-    assert diagnostics["norm"] == pytest.approx(expected_total_survival ** 0.5)
+    assert diagnostics["norm"] == pytest.approx(sim.norm(), abs=1e-10)
+    assert diagnostics["state_norm"] == pytest.approx(sim.norm(), abs=1e-10)
+    assert diagnostics["cumulative_norm"] == pytest.approx(
+        expected_total_survival ** 0.5
+    )
     assert diagnostics["geometric_mean_norm"] == pytest.approx(
         expected_total_survival ** 0.5
     )
@@ -833,7 +848,7 @@ def test_norm_events_track_projector_compression_loss_separately():
     )
 
 
-def test_norm_progress_reports_entry_part_and_norm_infidelity(monkeypatch):
+def test_norm_progress_reports_entry_part_and_infidelity(monkeypatch):
     progress_instances = []
 
     class _FakeTqdm:
@@ -864,12 +879,11 @@ def test_norm_progress_reports_entry_part_and_norm_infidelity(monkeypatch):
         "measurement",
     ]
     last = progress.postfix_calls[-1]
-    assert sorted(last) == ["infidelity", "norm_infidelity", "part"]
+    assert sorted(last) == ["infidelity", "part"]
     expected = sim._format_progress_infidelity(
         sim.norm_diagnostics()["infidelity"]
     )
     assert last["infidelity"] == expected
-    assert last["norm_infidelity"] == expected
 
 
 def test_simulator_two_qubit_nonclifford_matrix_supported():

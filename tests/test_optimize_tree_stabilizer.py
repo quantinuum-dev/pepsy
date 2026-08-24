@@ -549,7 +549,7 @@ def test_tree_stab_norm_tracking_is_separate_from_truncation_tracking():
     assert tracked_diagnostics["truncation_tracking"] is False
     assert disabled_diagnostics["norm_tracking"] is False
     assert disabled_diagnostics["truncation_tracking"] is False
-    assert disabled_diagnostics["local_norm_fidelity"] is None
+    assert disabled_diagnostics["local_fidelity"] is None
 
 
 def test_tree_stab_norm_diagnostics_and_sampling_copy_contract():

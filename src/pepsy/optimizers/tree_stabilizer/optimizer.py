@@ -1877,11 +1877,11 @@ class TreeStabOptimizer:
                 if pbar is not None:
                     pbar.update(1)
                     diagnostics = self.norm_diagnostics()
-                    norm_infidelity = diagnostics["cumulative_norm_infidelity"]
+                    infidelity = diagnostics["cumulative_infidelity"]
                     truncation_infidelity = diagnostics["truncation_infidelity"]
                     pbar.set_postfix(
-                        norm_infidelity=self._format_progress_infidelity(
-                            norm_infidelity
+                        infidelity=self._format_progress_infidelity(
+                            infidelity
                         ),
                         truncation_infidelity=self._format_progress_infidelity(
                             truncation_infidelity
@@ -4139,6 +4139,8 @@ class TreeStabOptimizer:
         ``track_truncation``. ``track_truncation`` adds the separate,
         spectrum-based per-edge report below. Neither quantity is a target
         state overlap; the stabilizer tableau does not change that distinction.
+        ``state_norm`` and ``norm`` are the live represented Tree norm, while
+        ``cumulative_norm`` is the square-root retained-compression proxy.
         """
         _ = include_current  # tree updates have no open segment boundary
         norm_report = self._tree.norm_diagnostics()
@@ -4175,17 +4177,24 @@ class TreeStabOptimizer:
             "completed_projector_infidelities": [],
             "completed_nonunitary_infidelities": [],
             "completed_combined_infidelities": list(losses),
-            "current_segment_norm": norm_report["local_norm"],
+            # ``current_segment_*`` below are optional spectrum/truncation
+            # diagnostics. The plain ``current_*`` and local/cumulative
+            # fidelity fields are the separate norm-derived ledger.
+            "current_segment_norm": (
+                None
+                if current_loss is None
+                else float(max(0.0, 1.0 - current_loss) ** 0.5)
+            ),
             "current_segment_infidelity": current_loss,
-            "current_norm_fidelity": norm_report["current_norm_fidelity"],
-            "current_norm_infidelity": norm_report["current_norm_infidelity"],
-            # Canonical-centre norm/compression metrics shared with MPS and
+            "current_fidelity": norm_report["current_fidelity"],
+            "current_infidelity": norm_report["current_infidelity"],
+            # Canonical-centre compression metrics shared with MPS and
             # ordinary Tree. These are not the spectrum-based values above.
-            "local_norm_fidelity": norm_report["local_norm_fidelity"],
-            "local_norm_infidelity": norm_report["local_norm_infidelity"],
+            "local_fidelity": norm_report["local_fidelity"],
+            "local_infidelity": norm_report["local_infidelity"],
             "local_norm": norm_report["local_norm"],
-            "cumulative_norm_fidelity": norm_report["cumulative_norm_fidelity"],
-            "cumulative_norm_infidelity": norm_report["cumulative_norm_infidelity"],
+            "cumulative_fidelity": norm_report["cumulative_fidelity"],
+            "cumulative_infidelity": norm_report["cumulative_infidelity"],
             "cumulative_compression_fidelity": norm_report[
                 "cumulative_compression_fidelity"
             ],
@@ -4193,13 +4202,12 @@ class TreeStabOptimizer:
                 "cumulative_compression_infidelity"
             ],
             "norm_survival": norm_report["norm_survival"],
-            "norm_infidelity": norm_report["norm_infidelity"],
-            "fidelity": norm_report["cumulative_norm_fidelity"],
-            "infidelity": norm_report["cumulative_norm_infidelity"],
+            "fidelity": norm_report["cumulative_fidelity"],
+            "infidelity": norm_report["cumulative_infidelity"],
             "state_norm": norm_report["state_norm"],
             "norm": norm_report["norm"],
             "total_survival_proxy": norm_report["norm_survival"],
-            "total_infidelity_proxy": norm_report["norm_infidelity"],
+            "total_infidelity_proxy": norm_report["cumulative_infidelity"],
             "total_norm_proxy": norm_report["cumulative_norm"],
             "cumulative_norm": norm_report["cumulative_norm"],
             "truncation_survival": survival,

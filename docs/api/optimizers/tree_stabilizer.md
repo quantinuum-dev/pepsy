@@ -220,9 +220,15 @@ classification remains a NumPy-side operation, while TreeOptimizer applies
 the coefficient update on the inferred backend.
 
 TreeStab's `norm_diagnostics()` keeps two coefficient-state diagnostics
-separate. `local_norm_fidelity` and `cumulative_norm_fidelity` are cheap
-canonical-centre retained-norm compression metrics, controlled by
+separate. `local_fidelity` and `cumulative_fidelity` are cheap
+canonical-centre compression metrics measured from retained norms, controlled by
 `track_infidelity` and available independently of `track_truncation`.
+`norm`/`state_norm` report the live represented coefficient-Tree norm;
+`cumulative_norm` is the square-root retained-compression proxy, and
+`norm_survival` is the explicit norm-derived alias of `cumulative_fidelity`.
+The `current_segment_*` and `truncation_*` fields remain the optional
+spectrum/discarded-weight diagnostics and should not be compared directly with
+the norm-derived `current_*` fidelity fields.
 `track_truncation=True` additionally enables the expensive
 per-edge singular-spectrum and discarded-weight records returned by
 `truncation_report()` and `get_infidelity_samples()`. Neither metric is a

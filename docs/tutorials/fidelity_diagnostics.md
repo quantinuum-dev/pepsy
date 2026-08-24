@@ -17,9 +17,10 @@ Lower values identify harder regions.
 Pepsy uses two different diagnostics that are both commonly called
 “fidelity”:
 
-- `local_norm_fidelity` and `cumulative_norm_fidelity` are retained-norm
-  compression proxies. They are available from canonical MPS/Tree updates and
-  their stabilizer coefficient states without a reference-state overlap.
+- `local_fidelity` and `cumulative_fidelity` are compression fidelities
+  measured from retained canonical norms. They are available from canonical
+  MPS/Tree updates and their stabilizer coefficient states without a
+  reference-state overlap.
 - `fit_overlap_fidelity` is a genuine target-state overlap produced by a
   successful DMRG/FIT update when its disposable exact target is available.
 

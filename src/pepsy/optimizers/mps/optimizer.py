@@ -4904,7 +4904,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``fit_overlap_infidelity``: a direct contraction of the fitted MPS
         with the disposable exact FIT target. Those fields are target-overlap
         diagnostics and are intentionally separate from norm-survival fields
-        such as ``cumulative_norm_fidelity``. If the optional contraction is
+        such as ``cumulative_fidelity``. If the optional contraction is
         unavailable for a backend, both values are ``None`` and
         ``fit_overlap_error`` records the diagnostic failure without rejecting
         the successful FIT update.
@@ -6003,8 +6003,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._unitary_previous_norm = None
 
     @staticmethod
-    def _norm_fidelity_ratio(observed_norm, expected_norm):
-        """Return raw and clipped squared norm survival for one event."""
+    def _fidelity_ratio_from_norms(observed_norm, expected_norm):
+        """Return raw and clipped fidelity measured from two norms."""
         observed_norm = float(abs(observed_norm))
         expected_norm = float(abs(expected_norm))
         if (
@@ -6052,7 +6052,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Only the observed/expected norm ratio contributes to the cumulative
         compression survival product.
         """
-        raw, survival = self._norm_fidelity_ratio(observed_norm, expected_norm)
+        raw, survival = self._fidelity_ratio_from_norms(
+            observed_norm, expected_norm
+        )
         if (
             kind == "unitary_compression"
             and raw is not None
@@ -6073,17 +6075,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "expected_norm_sq": None if raw is None else float(abs(expected_norm) ** 2),
             "observed_norm": None if raw is None else float(abs(observed_norm)),
             "observed_norm_sq": None if raw is None else float(abs(observed_norm) ** 2),
-            "norm_fidelity_raw": None if raw is None else float(raw),
-            "norm_fidelity": None if survival is None else float(survival),
-            "norm_infidelity": None if survival is None else float(1.0 - survival),
-            # Explicit names for the local compression metric.  The shorter
-            # ``norm_fidelity`` spellings below are retained for compatibility,
-            # but neither metric is a target-state overlap unless a reference
-            # state is supplied separately.
-            "local_norm_fidelity": (
+            "fidelity_raw": None if raw is None else float(raw),
+            # These are fidelity/infidelity values measured from norms. The
+            # metric name intentionally does not repeat its measurement source.
+            "local_fidelity": (
                 None if survival is None else float(survival)
             ),
-            "local_norm_infidelity": (
+            "local_infidelity": (
                 None if survival is None else float(1.0 - survival)
             ),
             "branch_probability": (
@@ -6111,13 +6109,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 if self._norm_log_survival == -np.inf
                 else float(-math.expm1(self._norm_log_survival))
             )
-            event["cumulative_norm_fidelity"] = cumulative
-            event["cumulative_norm_infidelity"] = cumulative_infidelity
+            event["cumulative_fidelity"] = cumulative
+            event["cumulative_infidelity"] = cumulative_infidelity
             event["cumulative_compression_fidelity"] = cumulative
             event["cumulative_compression_infidelity"] = cumulative_infidelity
         else:
-            event["cumulative_norm_fidelity"] = None
-            event["cumulative_norm_infidelity"] = None
+            event["cumulative_fidelity"] = None
+            event["cumulative_infidelity"] = None
             event["cumulative_compression_fidelity"] = None
             event["cumulative_compression_infidelity"] = None
         self.norm_events.append(event)
@@ -6128,12 +6126,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def norm_diagnostics(self):
         """Return automatic norm-based compression diagnostics.
 
-        ``*_norm_fidelity`` is the retained canonical-center norm ratio.  It
-        is a compression/norm-survival proxy, not a directional overlap with
-        an independently supplied target state.  DMRG target overlap, when
-        available, is reported separately by :meth:`get_fit_diagnostics`.
+        ``local_fidelity`` and ``cumulative_fidelity`` are fidelities measured
+        from retained canonical-centre norms. They are compression-survival
+        proxies, not directional overlaps with an independently supplied
+        target state. DMRG target overlap, when available, is reported
+        separately by :meth:`get_fit_diagnostics`.
         Born probabilities for stochastic branches remain in ``norm_events``
         and do not reduce cumulative compression fidelity.
+
+        ``state_norm`` and ``norm`` are the live represented MPS norm.
+        ``cumulative_norm`` is instead the square root of
+        ``cumulative_fidelity``. The latter is a retained-compression proxy,
+        not a second reading of the live state norm.
         """
         valid = [event for event in self.norm_events if event.get("valid")]
         physical = [
@@ -6150,9 +6154,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             infidelity = float(-math.expm1(self._norm_log_survival))
         current = valid[-1] if valid else None
         state_norm = self._real_float(ar.do("abs", self.p.norm()))
-        event_survivals = [float(event["norm_fidelity"]) for event in valid]
+        event_survivals = [float(event["local_fidelity"]) for event in valid]
         event_infidelities = [
-            float(event["norm_infidelity"]) for event in valid
+            float(event["local_infidelity"]) for event in valid
         ]
         if event_survivals and any(value <= 0.0 for value in event_survivals):
             geometric_survival = 0.0
@@ -6165,6 +6169,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             geometric_survival = None
         return {
             "tracking": True,
+            "norm_tracking": True,
+            # MpsOptimizer does not maintain Tree-style per-edge spectrum
+            # probes; its canonical path ledger is the available diagnostic.
+            "truncation_tracking": None,
             "current_valid": current is not None,
             "events": len(self.norm_events),
             "completed_events": len(valid),
@@ -6174,16 +6182,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 float(max(0.0, value) ** 0.5) for value in event_survivals
             ],
             "completed_segment_infidelities": event_infidelities,
+            # Provenance alias: this is the cumulative fidelity obtained from
+            # norm survival, not the live state norm below.
             "norm_survival": survival,
-            "norm_infidelity": infidelity,
-            "local_norm_fidelity": (
-                None if current is None else current.get("local_norm_fidelity")
+            "local_fidelity": (
+                None if current is None else current.get("local_fidelity")
             ),
-            "local_norm_infidelity": (
-                None if current is None else current.get("local_norm_infidelity")
+            "local_infidelity": (
+                None if current is None else current.get("local_infidelity")
             ),
-            "cumulative_norm_fidelity": survival,
-            "cumulative_norm_infidelity": infidelity,
+            "cumulative_fidelity": survival,
+            "cumulative_infidelity": infidelity,
+            # Explicit compression aliases retained for callers that want to
+            # emphasize what the cumulative fidelity measures.
             "cumulative_compression_fidelity": survival,
             "cumulative_compression_infidelity": infidelity,
             "fidelity": survival,
@@ -6216,30 +6227,27 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "current_segment_norm": (
                 None
                 if current is None
-                else float(max(0.0, current["norm_fidelity"]) ** 0.5)
+                else float(max(0.0, current["local_fidelity"]) ** 0.5)
             ),
             "current_segment_infidelity": (
-                None if current is None else current["norm_infidelity"]
+                None if current is None else current["local_infidelity"]
             ),
-            "current_norm_fidelity": (
-                None if current is None else current["norm_fidelity"]
+            "current_fidelity": (
+                None if current is None else current["local_fidelity"]
             ),
-            "current_norm_infidelity": (
-                None if current is None else current["norm_infidelity"]
+            "current_infidelity": (
+                None if current is None else current["local_infidelity"]
             ),
-            "completed_norm_infidelities": [
-                event["norm_infidelity"] for event in valid
-            ],
             "physical_boundary_events": len(physical),
             "physical_boundary_infidelities": [
-                event["norm_infidelity"]
+                event["local_infidelity"]
                 for event in physical
             ],
             "completed_projector_infidelities": [
-                event["norm_infidelity"] for event in physical
+                event["local_infidelity"] for event in physical
             ],
             "completed_nonunitary_infidelities": [
-                event["norm_infidelity"] for event in physical
+                event["local_infidelity"] for event in physical
             ],
             "completed_combined_infidelities": event_infidelities,
         }
@@ -6989,8 +6997,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Format displayed progress scalar with stable precision."""
         return f"{MpsOptimizer._real_float(value):.6f}"
 
-    def _cumulative_norm_fidelity(self):
-        """Return displayed cumulative retained-norm fidelity.
+    def _cumulative_fidelity(self):
+        """Return displayed cumulative fidelity measured from norms.
 
         This is not the live MPS norm and is not a target-state overlap. It is
         the product of the local squared canonical-centre norm-survival ratios
@@ -7798,7 +7806,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "fallback": fallback_steps,
                     "bond": f"{final['end_bond']}/{self.chi}",
                     "~F": self._format_progress_scalar(
-                        self._cumulative_norm_fidelity()
+                        self._cumulative_fidelity()
                     ),
                 }
                 pbar.set_postfix(postfix)
@@ -8806,7 +8814,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 postfix = {
                     "2q": two_qubit_count,
                     "~F": self._format_progress_scalar(
-                        self._cumulative_norm_fidelity()
+                        self._cumulative_fidelity()
                     ),
                     "bnd": p.max_bond(),
                 }
@@ -9106,7 +9114,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 postfix = {
                     "2q": two_qubit_count,
                     "~F": self._format_progress_scalar(
-                        self._cumulative_norm_fidelity()
+                        self._cumulative_fidelity()
                     ),
                     "bnd": p.max_bond(),
                 }
@@ -9276,7 +9284,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 postfix = {
                     "2q": two_qubit_count,
                     "~F": self._format_progress_scalar(
-                        self._cumulative_norm_fidelity()
+                        self._cumulative_fidelity()
                     ),
                     "bnd": p.max_bond(),
                 }
@@ -9439,7 +9447,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 postfix = {
                     "2q": two_qubit_count,
                     "~F": self._format_progress_scalar(
-                        self._cumulative_norm_fidelity()
+                        self._cumulative_fidelity()
                     ),
                     "bnd": p.max_bond(),
                 }
@@ -9515,7 +9523,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         {
                             "2q": two_qubit_count,
                             "~F": self._format_progress_scalar(
-                                self._cumulative_norm_fidelity()
+                                self._cumulative_fidelity()
                             ),
                             "bnd": "inf",
                         }
@@ -9529,7 +9537,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     {
                         "2q": two_qubit_count,
                         "~F": self._format_progress_scalar(
-                            self._cumulative_norm_fidelity()
+                            self._cumulative_fidelity()
                         ),
                         "bnd": "inf",
                     }

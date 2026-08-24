@@ -2508,13 +2508,11 @@ class TreeOptimizer:
             "valid": True,
             "expected_norm": float(abs(expected)),
             "observed_norm": float(abs(observed)),
-            "norm_fidelity_raw": raw_local,
-            "norm_fidelity": local_fidelity,
-            "norm_infidelity": local_infidelity,
-            "local_norm_fidelity": local_fidelity,
-            "local_norm_infidelity": local_infidelity,
-            "cumulative_norm_fidelity": cumulative_fidelity,
-            "cumulative_norm_infidelity": cumulative_infidelity,
+            "fidelity_raw": raw_local,
+            "local_fidelity": local_fidelity,
+            "local_infidelity": local_infidelity,
+            "cumulative_fidelity": cumulative_fidelity,
+            "cumulative_infidelity": cumulative_infidelity,
             "cumulative_compression_fidelity": cumulative_fidelity,
             "cumulative_compression_infidelity": cumulative_infidelity,
         })
@@ -7026,12 +7024,17 @@ class TreeOptimizer:
     def norm_diagnostics(self):
         """Return canonical norm-based compression diagnostics.
 
-        ``cumulative_norm_fidelity`` is the log-accumulated product of the
-        path-level retained-norm fidelities. It is a compression proxy, not a
-        directional overlap with a target state. Tree target-overlap checks,
-        when a caller has an exact reference, must be reported separately.
+        ``cumulative_fidelity`` is the log-accumulated product of the
+        path-level fidelities measured from retained norms. It is a
+        compression proxy, not a directional overlap with a target state.
+        Tree target-overlap checks, when a caller has an exact reference, must
+        be reported separately.
         ``track_truncation`` is intentionally exposed as an independent flag:
         it controls expensive per-edge singular-spectrum probes only.
+
+        ``state_norm`` and ``norm`` are the live represented Tree norm.
+        ``cumulative_norm`` is instead the square root of
+        ``cumulative_fidelity`` and is only a retained-compression proxy.
         """
         valid = [event for event in self.norm_events if event.get("valid")]
         current = valid[-1] if valid else None
@@ -7053,39 +7056,40 @@ class TreeOptimizer:
             "events": len(self.norm_events),
             "completed_events": len(valid),
             "current_valid": current is not None,
-            "current_norm_fidelity": (
-                None if current is None else current["local_norm_fidelity"]
+            "current_fidelity": (
+                None if current is None else current["local_fidelity"]
             ),
-            "current_norm_infidelity": (
-                None if current is None else current["local_norm_infidelity"]
+            "current_infidelity": (
+                None if current is None else current["local_infidelity"]
             ),
             "current_segment_norm": (
                 None
                 if current is None
-                else float(current["local_norm_fidelity"] ** 0.5)
+                else float(current["local_fidelity"] ** 0.5)
             ),
             "current_segment_infidelity": (
-                None if current is None else current["local_norm_infidelity"]
+                None if current is None else current["local_infidelity"]
             ),
-            "local_norm_fidelity": (
-                None if current is None else current["local_norm_fidelity"]
+            "local_fidelity": (
+                None if current is None else current["local_fidelity"]
             ),
-            "local_norm_infidelity": (
-                None if current is None else current["local_norm_infidelity"]
+            "local_infidelity": (
+                None if current is None else current["local_infidelity"]
             ),
             "local_norm": (
                 None
                 if current is None
-                else float(current["local_norm_fidelity"] ** 0.5)
+                else float(current["local_fidelity"] ** 0.5)
             ),
-            "cumulative_norm_fidelity": cumulative_fidelity,
-            "cumulative_norm_infidelity": cumulative_infidelity,
+            "cumulative_fidelity": cumulative_fidelity,
+            "cumulative_infidelity": cumulative_infidelity,
             "cumulative_compression_fidelity": cumulative_fidelity,
             "cumulative_compression_infidelity": cumulative_infidelity,
-            # Short aliases are retained for parity with MpsOptimizer, but
-            # the explicit names above document that this is norm survival.
+            # ``norm_survival`` records the norm-derived provenance; it is not
+            # the live ``norm`` returned below. ``fidelity`` and ``infidelity``
+            # are cumulative convenience
+            # aliases; the explicit names above distinguish local from total.
             "norm_survival": cumulative_fidelity,
-            "norm_infidelity": cumulative_infidelity,
             "fidelity": cumulative_fidelity,
             "infidelity": cumulative_infidelity,
             "state_norm": state_norm,

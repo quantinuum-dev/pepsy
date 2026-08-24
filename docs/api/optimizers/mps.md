@@ -445,14 +445,12 @@ streams. The old `fit_stabilize_unitary` spelling remains a deprecated alias.
 Norm-survival bookkeeping is automatic; there is no
 `track_infidelity` constructor or run flag for `MpsOptimizer`. Every retained
 unitary compression records an event in `opt.get_norm_events()`. Its
-`local_norm_fidelity` is the clipped squared ratio of retained canonical-centre
-norm to the expected pre-compression norm, while `norm_fidelity_raw` preserves
-the unclipped ratio. `opt.norm_diagnostics()` exposes the latest local value as
-`local_norm_fidelity` and the log-accumulated product as
-`cumulative_norm_fidelity` (with matching `*_infidelity` fields). The shorter
-`fidelity`/`infidelity` and `norm_survival`/`norm_infidelity` keys remain
-compatibility aliases. These are compression/norm-survival proxies, not
-directional target-state fidelities.
+`local_fidelity` is the clipped squared ratio of retained canonical-centre norm
+to the expected pre-compression norm, while `fidelity_raw` preserves the
+unclipped ratio. `opt.norm_diagnostics()` exposes the latest local value as
+`local_fidelity` and the log-accumulated product as `cumulative_fidelity`, with
+matching `*_infidelity` fields. These are compression fidelities measured from
+norms, not directional target-state fidelities.
 
 In `opt.norm_diagnostics()`, `norm` and `state_norm` are the actual represented
 live-MPS norm. `cumulative_norm` is different: it is the square root of the
@@ -476,7 +474,7 @@ contract is used by DMRG1/2/3 and the MPO, SVD, swap/perm, and mixed backends.
 
 Unitary compression also validates that the retained canonical-center norm
 does not materially exceed its pre-compression norm. The raw overshoot remains
-visible in `norm_fidelity_raw`; only small dtype-scaled roundoff is accepted
+visible in `fidelity_raw`; only small dtype-scaled roundoff is accepted
 for low-precision data (for example, `complex64` uses a bounded multiple of
 float32 machine epsilon). A larger overshoot still raises because it indicates
 broken canonical projection metadata rather than ordinary truncation loss.
