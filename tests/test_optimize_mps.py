@@ -884,10 +884,12 @@ def test_mps_optimizer_runs_bare_quimb_method_mode(mode):
 @pytest.mark.parametrize(
     "mode, expected_desc",
     [
-        ("quimb", "quimb-direct"),
-        ("quimb-src", "quimb-src"),
-        ("mpo", "mpo-direct"),
-        ("mpo-src", "mpo-src"),
+        ("quimb", "direct"),
+        ("quimb-dm", "dm"),
+        ("quimb-src", "src"),
+        ("mpo", "direct"),
+        ("mpo-zipup", "zipup"),
+        ("mpo-src", "src"),
     ],
 )
 def test_mps_optimizer_progress_bar_uses_mode_name(
@@ -895,7 +897,7 @@ def test_mps_optimizer_progress_bar_uses_mode_name(
     mode,
     expected_desc,
 ):
-    """MPO-family progress bars identify the selected replay mode."""
+    """MPO-family progress bars show only the selected replay mode."""
     import tqdm as tqdm_module
 
     descriptors = []

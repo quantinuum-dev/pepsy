@@ -1293,12 +1293,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @classmethod
     def _progress_mode_name(cls, mode):
-        """Return the mode-qualified name shown by a replay progress bar."""
+        """Return the short active mode name shown by a replay progress bar."""
         mode_norm = str(mode).strip().lower()
-        if mode_norm in {"mpo", "quimb"}:
-            return f"{mode_norm}-direct"
-        if mode_norm in _MPO_COMPRESSION_METHODS - {"fit"}:
-            return f"quimb-{mode_norm}"
+        if cls._is_mpo_mode(mode_norm):
+            return cls._mode_mpo_method(mode_norm)
         return mode_norm
 
     @classmethod

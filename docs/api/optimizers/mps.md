@@ -502,12 +502,11 @@ MPO/DMRG/fallback counts, `~F` (the cumulative compression fidelity), and
 `bond=current/chi`. `~F` is the cumulative compression fidelity measured from
 retained norms, converted from the log-survival ledger only for display;
 accumulation remains logarithmic and numerically stable.
-The progress-bar descriptor is mode-qualified: bare `src` and `zipup` inputs
-are displayed canonically as `quimb-src` and `quimb-zipup`; legacy `mpo-*`
-forms remain visible as supplied. The `quimb` and `mpo` aliases display as
-`quimb-direct` and `mpo-direct`. Named DMRG schedules likewise display as
-`dmrg1`, `dmrg2`, or `dmrg3`; generic `dmrg` and its `fit` alias display as
-`dmrg`.
+The progress-bar descriptor shows only the active mode: `src`, `zipup`, and
+other Quimb compression modes are displayed without the internal `quimb-` or
+legacy `mpo-` prefix, while the `quimb` and `mpo` aliases display as `direct`.
+Named DMRG schedules display as `dmrg1`, `dmrg2`, or `dmrg3`; generic `dmrg`
+and its `fit` alias display as `dmrg`.
 
 Replay timing is opt-in and does not print by itself:
 
