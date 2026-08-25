@@ -479,8 +479,9 @@ for low-precision data (for example, `complex64` uses a bounded multiple of
 float32 machine epsilon). A larger overshoot still raises because it indicates
 broken canonical projection metadata rather than ordinary truncation loss.
 
-`cutoff="auto"` selects `1e-3` for 16-bit data, `1e-6` for 32-bit/complex64
-data, and `1e-12` for 64-bit data. Explicit numeric cutoffs are unchanged.
+`MpsOptimizer.run()` now defaults to `cutoff="auto"`. This selects `1e-3`
+for 16-bit data, `1e-6` for 32-bit/complex64 data, and `1e-12` for 64-bit
+data. Explicit numeric cutoffs are unchanged.
 Set `quality_check_every=N` to record finite-data and canonical-gauge health in
 `opt.get_quality_checks()`. Checks are disabled by default; when enabled,
 `quality_check_repair=True` re-canonicalizes if canonical coverage is lost.

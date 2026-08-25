@@ -3040,6 +3040,26 @@ def test_fit_auto_cutoff_is_dtype_aware():
     assert fit.info["cutoff_resolved"] == pytest.approx(1.0e-6)
 
 
+def test_mps_optimizer_default_cutoff_is_dtype_aware(monkeypatch):
+    """An omitted MPS run cutoff resolves from the live tensor dtype."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype="complex64"),
+        gates=[(qu.hadamard(), (0,))],
+        chi=2,
+        mode="svd",
+    )
+    calls = {}
+
+    def record_execute(*args, **kwargs):
+        calls.update(kwargs)
+        return optimizer.p
+
+    monkeypatch.setattr(optimizer, "_execute_mode", record_execute)
+    optimizer.run(progbar=False)
+
+    assert calls["cutoff"] == pytest.approx(1.0e-6)
+
+
 def test_fit_retag_resolves_environment_and_preserves_info_object():
     """Retagging precedes route selection and caller diagnostics stay live."""
     state = qtn.MPS_rand_state(
@@ -3170,6 +3190,7 @@ def test_new_fit_configuration_is_keyword_only():
     run_parameters = inspect.signature(py.MpsOptimizer.run).parameters
 
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["cutoff"].default == "auto"
     assert run_parameters["fit_rtol"].default == pytest.approx(1.0e-8)
     for name in (
         "fit_min_iter",

@@ -3960,7 +3960,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self,
         n_iter=5,
         progbar=False,
-        cutoff=1e-12,
+        cutoff="auto",
         cutoff_mode=None,
         mode=None,
         k_2q_batch=1,
@@ -4046,9 +4046,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Ignored by ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
             Show per-mode progress bars.
-        cutoff : float | {"auto"}, default=1e-12
+        cutoff : float | {"auto"}, default="auto"
             Truncation cutoff used in gate application and local fitting.
-            ``"auto"`` selects a conservative dtype-aware value.
+            The default ``"auto"`` selects a conservative dtype-aware value;
+            pass an explicit number to preserve a fixed cutoff.
         cutoff_mode : str | None, default=None
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``. ``None`` uses ``"rsum2"`` for
