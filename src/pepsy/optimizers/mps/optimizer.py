@@ -7449,20 +7449,61 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "mixed-mode trial changed the number of MPS tensors; "
                     "cannot preserve inplace object identity."
                 )
-            if sites is None:
-                sites = range(len(committed_p.tensors))
-            for site in sites:
+            # DMRG can legitimately replace virtual bonds, especially when a
+            # non-nearest gate is routed through a trial MPS. Preserve the
+            # caller-owned network object, but adopt the valid trial graph
+            # rather than rejecting its fresh bond labels. Take detached
+            # snapshots first because the shallow trial copy can still share
+            # tensors outside its transaction window.
+            requested_sites = (
+                tuple(range(len(committed_p.tensors)))
+                if sites is None
+                else tuple(sites)
+            )
+            changed_sites = set()
+            for site in range(len(committed_p.tensors)):
                 committed_tensor = committed_p[site]
                 trial_tensor = trial_p[site]
-                if committed_tensor.inds != trial_tensor.inds:
+                if committed_p.site_ind(site) != trial_p.site_ind(site):
                     raise RuntimeError(
-                        "mixed-mode trial changed MPS index structure; "
+                        "mixed-mode trial changed a physical MPS index; "
                         "cannot preserve inplace object identity."
                     )
-                committed_tensor.modify(
-                    data=self._copy_mix_tensor_data(trial_tensor.data),
-                    left_inds=trial_tensor.left_inds,
+                if committed_tensor.tags != trial_tensor.tags:
+                    raise RuntimeError(
+                        "mixed-mode trial changed MPS tensor tags; "
+                        "cannot preserve inplace object identity."
+                    )
+                if committed_tensor.inds != trial_tensor.inds:
+                    changed_sites.add(site)
+            commit_sites = tuple(sorted(set(requested_sites) | changed_sites))
+            trial_records = []
+            for site in commit_sites:
+                trial_tensor = trial_p[site]
+                trial_records.append(
+                    (
+                        self._copy_mix_tensor_data(trial_tensor.data),
+                        tuple(trial_tensor.inds),
+                        trial_tensor.tags,
+                        trial_tensor.left_inds,
+                    )
                 )
+            # Include every changed endpoint in addition to the transaction
+            # window so both sides of a newly labelled virtual bond are
+            # updated. Unchanged tensors outside that window are not copied.
+            for site, (data, inds, tags, left_inds) in zip(
+                commit_sites,
+                trial_records,
+            ):
+                committed_p[site].modify(
+                    data=data,
+                    inds=inds,
+                    tags=tags,
+                    left_inds=left_inds,
+                )
+            reset_cached = getattr(committed_p, "reset_cached_properties", None)
+            if callable(reset_cached):
+                reset_cached()
             committed_p.exponent = trial_p.exponent
         self.p = committed_p
 
