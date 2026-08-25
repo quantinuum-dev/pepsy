@@ -17,7 +17,10 @@ the legacy ``"mpo-<method>"`` / ``"mpo"`` spellings retained) also accepts
 explicit sub-MPO events of the form
 ``("submpo", mpo, where)`` or
 ``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
-may also carry *control events* that are state operations rather than gates:
+may also carry *control events* that are state operations rather than gates.
+MPO compression modes apply sub-MPO events with ``gate_with_submpo_``;
+DMRG keeps multi-site sub-MPOs as tagged lazy FIT target layers and uses the
+same SRC warm-up policy as ordinary DMRG targets.  The stream may also carry:
 
 ``mode="su"`` is the simple-update backend. It keeps the MPS core and its
 bond gauges separate, initializes missing gauges with
@@ -875,7 +878,7 @@ def _is_interior_submpo_span(p, where):
     return min(where) > 0 or max(where) < int(p.L) - 1
 
 
-def _run_seeded_quimb(seed, function, *args, **kwargs):
+def _run_seeded_quimb(random_seed, function, *args, **kwargs):
     """Run a Quimb randomized operation with an isolated reproducibility seed.
 
     Quimb's current SRC/SRCMPS implementations use its process-global random
@@ -884,10 +887,10 @@ def _run_seeded_quimb(seed, function, *args, **kwargs):
     leaking that option into Cotengra or linear-algebra calls. The lock keeps
     seeded shot replay deterministic when optimizers run concurrently.
     """
-    if seed is None:
+    if random_seed is None:
         return function(*args, **kwargs)
     with _QUIMB_SEED_LOCK:
-        quimb.seed_rand(int(seed))
+        quimb.seed_rand(int(random_seed))
         return function(*args, **kwargs)
 
 
@@ -903,6 +906,7 @@ def _apply_submpo_with_interior_workaround_impl(
     info=None,
     inplace_mpo=False,
     optimize=None,
+    seed=None,
 ):
     """Apply selected Quimb methods without nested sub-MPO tag permutation.
 
@@ -972,6 +976,7 @@ def _apply_submpo_with_interior_workaround_impl(
                 "canonize": guess_method != "projector",
                 "permute_arrays": False,
             },
+            seed=seed,
             **{
                 key: value
                 for key, value in common.items()
@@ -1014,6 +1019,7 @@ def _apply_submpo_with_interior_workaround(
         info=info,
         inplace_mpo=inplace_mpo,
         optimize=optimize,
+        seed=seed,
     )
 
 
@@ -1058,8 +1064,9 @@ def _apply_dense_gate_with_method(
             # bonds. The projector fit remains valid without that optional
             # pre-gauge and Quimb's own implementation supports this path.
             opts["canonize"] = False
-        seed = seed if method in _MPO_METHODS_USE_SEED else None
-        return _run_seeded_quimb(seed, p.gate_nonlocal_, gate, where, **opts)
+        if method in _MPO_METHODS_USE_SEED:
+            opts["seed"] = seed
+        return _run_seeded_quimb(None, p.gate_nonlocal_, gate, where, **opts)
 
     submpo = qtn.MatrixProductOperator.from_dense(
         gate,
@@ -2437,6 +2444,229 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             target.tensor_map[tids[0]].add_tag(target.site_tag_id.format(site))
         return target
+
+    @staticmethod
+    def _align_layered_submpo_tags(submpo, target, where):
+        """Copy and align an explicit sub-MPO with the target MPS site tags.
+
+        FIT permits multiple target tensors per site, but every target tensor
+        must carry exactly one site tag. Explicit sub-MPO events can arrive
+        with a different site-tag formatter (or after a persistent layout
+        remap), so align the operator copy before attaching it lazily.
+        """
+        submpo = submpo.copy()
+        site_tag = getattr(submpo, "site_tag", None)
+        if not callable(site_tag):
+            raise TypeError(
+                "Layered DMRG sub-MPO targets require a site-tagged operator."
+            )
+
+        active_sites = tuple(sorted({int(site) for site in where}))
+        target_tags = set()
+        for site in active_sites:
+            old_tag = site_tag(site)
+            new_tag = target.site_tag(site)
+            target_tags.add(new_tag)
+            if old_tag != new_tag:
+                submpo.retag_({old_tag: new_tag})
+
+        for tensor in submpo.tensors:
+            tensor_site_tags = tuple(tag for tag in tensor.tags if tag in target_tags)
+            if len(tensor_site_tags) != 1:
+                raise ValueError(
+                    "Each layered DMRG sub-MPO tensor must carry exactly one "
+                    f"target site tag, got {tuple(tensor.tags)!r}."
+                )
+        return submpo
+
+    def _build_submpo_fit_target(
+        self,
+        p,
+        submpo,
+        where,
+        target_cutoff,
+        cutoff_mode,
+        *,
+        target_strategy,
+    ):
+        """Build an exact layered or materialized target for a sub-MPO event."""
+        start, stop = min(where), max(where)
+        target = p.copy()
+        target.canonicalize_((start, stop), info={})
+
+        layered_supported = not (
+            self._has_symmray_data(target)
+            or target.isfermionic()
+            or submpo.isfermionic()
+        )
+        if target_strategy == "layered" and layered_supported:
+            aligned_submpo = self._align_layered_submpo_tags(
+                submpo,
+                target,
+                where,
+            )
+            target.gate_with_op_lazy_(
+                aligned_submpo,
+                inplace=True,
+                inplace_op=False,
+            )
+            return target, "layered"
+
+        if target_strategy == "layered" and not layered_supported:
+            raise ValueError(
+                "Layered DMRG sub-MPO targets are not available for "
+                "Symmray/fermionic data; use fit_target_strategy='auto' or 'mps'."
+            )
+
+        target.gate_with_submpo_(
+            submpo,
+            where=where,
+            method="direct",
+            max_bond=None,
+            cutoff=target_cutoff,
+            cutoff_mode=cutoff_mode,
+            info={},
+            inplace_mpo=False,
+        )
+        return target, "mps"
+
+    def _prepare_submpo_fit_initial_guess(
+        self,
+        p,
+        submpo,
+        where,
+        *,
+        block_size,
+        strategy,
+        fit_mpo_guess,
+        rand_strength,
+        seed,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Build a disposable FIT guess from an explicit sub-MPO event."""
+        requested_strategy = self._validate_fit_init_strategy(strategy)
+        info = {
+            "enabled": False,
+            "rand_strength": float(rand_strength),
+            "bonds": [],
+            "sites": [],
+            "expanded": False,
+            "reason": "direct",
+        }
+        result = {
+            "fit_guess": p,
+            "strategy": "direct",
+            "requested_strategy": requested_strategy,
+            "guess_method": None,
+            "guess_used": False,
+            "svd_guess_used": False,
+            "random_initialization": info,
+        }
+        if self._has_symmray_data(p) or p.isfermionic():
+            info["reason"] = (
+                "native_sector_growth"
+                if int(block_size) in {2, 3}
+                else "native_one_site_fit"
+            )
+            return result
+
+        start, stop = self._normalize_span(where)
+        needs_growth = not FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+            p,
+            start,
+            stop,
+            self.chi,
+        )
+        if requested_strategy == "auto":
+            selected_strategy = _DEFAULT_FIT_INIT_STRATEGY
+        else:
+            selected_strategy = (
+                requested_strategy
+                if requested_strategy.startswith("guess_")
+                or requested_strategy == "svd_guess"
+                else requested_strategy if needs_growth else "direct"
+            )
+        if (
+            not fit_mpo_guess
+            and requested_strategy in {"auto", _DEFAULT_FIT_INIT_STRATEGY}
+        ):
+            selected_strategy = "direct"
+
+        if selected_strategy == "svd_guess":
+            guess_method = "direct"
+        elif selected_strategy.startswith("guess_"):
+            guess_method = selected_strategy[len("guess_") :]
+        else:
+            guess_method = None
+
+        if guess_method is not None:
+            fit_guess = p.copy()
+            opts = self._submpo_compress_opts(
+                guess_method,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+            if (
+                guess_method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
+                and _is_interior_submpo_span(fit_guess, where)
+            ):
+                _apply_submpo_with_interior_workaround(
+                    fit_guess,
+                    submpo,
+                    where,
+                    chi=self.chi,
+                    method=guess_method,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    info={},
+                    inplace_mpo=False,
+                    optimize=opts.get("optimize"),
+                    seed=seed,
+                )
+            else:
+                quimb_seed = seed if guess_method in _MPO_METHODS_USE_SEED else None
+                _run_seeded_quimb(
+                    quimb_seed,
+                    fit_guess.gate_with_submpo_,
+                    submpo,
+                    where=where,
+                    method=guess_method,
+                    max_bond=self.chi,
+                    info={},
+                    inplace_mpo=False,
+                    **opts,
+                )
+            result["fit_guess"] = fit_guess
+            result["strategy"] = (
+                selected_strategy
+                if selected_strategy != "svd_guess"
+                else "svd_guess"
+            )
+            result["guess_method"] = guess_method
+            result["guess_used"] = True
+            result["svd_guess_used"] = True
+            info["reason"] = selected_strategy
+            return result
+
+        fit_guess, random_info = (
+            self._build_randomized_fit_guess(
+                p,
+                (start, stop),
+                block_size=block_size,
+                rand_strength=rand_strength,
+                expand=selected_strategy == "random_expand",
+                seed=int(seed),
+            )
+            if selected_strategy in {"random", "random_expand"}
+            else (p, info)
+        )
+        if selected_strategy == "direct":
+            info["reason"] = "already_at_target"
+        result["fit_guess"] = fit_guess
+        result["strategy"] = selected_strategy
+        result["random_initialization"] = random_info
+        return result
 
     def _apply_gate(self, p, gate, where, **kwargs):
         """Apply a gate using this optimizer's physical-index convention."""
@@ -4203,6 +4433,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             intermediate target-MPS rank growth. ``"mps"`` materializes the
             traditional routed target. ``"auto"`` selects layered targets
             for NumPy/Torch/CuPy and the native MPS route for Symmray.
+            Explicit multi-site sub-MPO events in DMRG use the same layered
+            representation when the backend supports lazy FIT targets.
         fit_mpo_guess : bool, default=True
             Legacy compatibility switch for the named DMRG1/DMRG3 default
             ``"guess-src"`` policy. New code should use
@@ -5014,6 +5246,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self._run_dmrg,
                 G_seq,
                 where_seq,
+                event_seq=event_seq,
                 n_iter=n_iter,
                 progbar=progbar,
                 cutoff=cutoff,
@@ -5938,8 +6171,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"Unknown MPS stream event type(s): {unknown!r}.")
 
         has_submpo = any(event_type == "submpo" for event_type in event_seq)
-        if has_submpo and not self._is_mpo_mode(self.mode):
-            raise ValueError("subMPO stream events currently require an MPO mode.")
+        if has_submpo and not (
+            self._is_mpo_mode(self.mode) or self.mode == "dmrg"
+        ):
+            raise ValueError(
+                "subMPO stream events require an MPO or DMRG mode."
+            )
 
         has_cap = any(event_type == "cap" for event_type in event_seq)
         if not has_submpo:
@@ -8195,6 +8432,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         G_seq,
         where_seq,
         n_iter,
+        event_seq=None,
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
@@ -8223,6 +8461,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         quality_check_repair=True,
     ):
         """Apply gates with local DMRG-style fitting."""
+        if event_seq is None:
+            event_seq = ("gate",) * len(G_seq)
+        if len(event_seq) != len(G_seq):
+            raise ValueError("DMRG event metadata must match the gate stream length.")
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
         fit_target_strategy = self._validate_fit_target_strategy(
@@ -8254,6 +8496,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p = self.p
         self._maybe_lock_dmrg1_one_site_phase()
         two_qubit_count = 0
+        submpo_count = 0
         last_where = self._current_orthog(p)
         last_normalized_step = None
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
@@ -8280,27 +8523,55 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             compressed = False
             where = where_seq[idx]
             gate = G_seq[idx]
+            event_type = event_seq[idx]
             if len(where) == 1:
-                self._apply_gate(
-                    p,
-                    gate,
-                    where,
-                    contract=True,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    inplace=True,
-                )
+                if event_type == "submpo":
+                    # A one-site sub-MPO does not need a variational window;
+                    # keep this small compatibility path on the direct MPO
+                    # application route.
+                    self._run_mpo(
+                        [gate],
+                        [where],
+                        [event_type],
+                        progbar=False,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        normalize_every=None,
+                        normalize_final=False,
+                        non_unitary=non_unitary,
+                        stabilize_unitary=stabilize_unitary,
+                    )
+                    p = self.p
+                    compressed = True
+                else:
+                    self._apply_gate(
+                        p,
+                        gate,
+                        where,
+                        contract=True,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        inplace=True,
+                    )
                 if non_unitary:
                     self.canonize_mps(p, where)
                 idx += 1
                 advanced = 1
                 last_where = where
             else:
-                if len(where) != 2:
+                is_submpo = event_type == "submpo"
+                if not is_submpo and len(where) != 2:
                     raise ValueError("Each gate location must have one or two sites.")
+                if is_submpo and len(where) < 2:
+                    raise ValueError(
+                        "DMRG sub-MPO events require at least two support sites."
+                    )
 
-                if k_2q_batch == 1:
-                    two_qubit_count += 1
+                if is_submpo or k_2q_batch == 1:
+                    if is_submpo:
+                        submpo_count += 1
+                    else:
+                        two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     active_fit_block_size = min(
                         fit_block_size,
@@ -8335,49 +8606,80 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         else None
                     )
 
-                    p_g = self._timed_call(
-                        "dmrg.target",
-                        self._build_norm_target,
-                        p,
-                        gate,
-                        where,
-                        target_cutoff,
-                        cutoff_mode,
-                        target_strategy=fit_target_strategy,
-                    )
-                    native_fermionic_warm_start = self._timed_call(
-                        "dmrg.native_warm_start",
-                        self._warm_start_native_fermionic_fit,
-                        p,
-                        (gate,),
-                        (where,),
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                    )
+                    if is_submpo:
+                        p_g, active_target_strategy = self._timed_call(
+                            "dmrg.target",
+                            self._build_submpo_fit_target,
+                            p,
+                            gate,
+                            where,
+                            target_cutoff,
+                            cutoff_mode,
+                            target_strategy=fit_target_strategy,
+                        )
+                        native_fermionic_warm_start = False
+                    else:
+                        active_target_strategy = fit_target_strategy
+                        p_g = self._timed_call(
+                            "dmrg.target",
+                            self._build_norm_target,
+                            p,
+                            gate,
+                            where,
+                            target_cutoff,
+                            cutoff_mode,
+                            target_strategy=fit_target_strategy,
+                        )
+                        native_fermionic_warm_start = self._timed_call(
+                            "dmrg.native_warm_start",
+                            self._warm_start_native_fermionic_fit,
+                            p,
+                            (gate,),
+                            (where,),
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
                     active_fit_block_size = self._dmrg_fit_block_size(
                         p,
                         (xmin, xmax),
                         fit_block_size,
                     )
-                    fit_initialization = self._timed_call(
-                        "dmrg.fit_guess",
-                        self._prepare_fit_initial_guess,
-                        p,
-                        (gate,),
-                        (where,),
-                        block_size=active_fit_block_size,
-                        strategy=fit_init_strategy,
-                        fit_mpo_guess=fit_mpo_guess,
-                        rand_strength=fit_init_rand_strength,
-                        seed=(
-                            int(fit_init_seed)
-                            + 1000003 * int(idx)
-                            + 1009 * int(xmin)
-                            + int(xmax)
-                        ),
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
+                    fit_guess_seed = (
+                        int(fit_init_seed)
+                        + 1000003 * int(idx)
+                        + 1009 * int(xmin)
+                        + int(xmax)
                     )
+                    if is_submpo:
+                        fit_initialization = self._timed_call(
+                            "dmrg.fit_guess",
+                            self._prepare_submpo_fit_initial_guess,
+                            p,
+                            gate,
+                            where,
+                            block_size=active_fit_block_size,
+                            strategy=fit_init_strategy,
+                            fit_mpo_guess=fit_mpo_guess,
+                            rand_strength=fit_init_rand_strength,
+                            seed=fit_guess_seed,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
+                    else:
+                        fit_initialization = self._timed_call(
+                            "dmrg.fit_guess",
+                            self._prepare_fit_initial_guess,
+                            p,
+                            (gate,),
+                            (where,),
+                            block_size=active_fit_block_size,
+                            strategy=fit_init_strategy,
+                            fit_mpo_guess=fit_mpo_guess,
+                            rand_strength=fit_init_rand_strength,
+                            seed=fit_guess_seed,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
                     fit_guess = fit_initialization["fit_guess"]
                     svd_guess_used = fit_initialization["svd_guess_used"]
                     mpo_fit_guess_used = svd_guess_used
@@ -8461,7 +8763,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 "requested_strategy"
                             ],
                             "random_initialization": random_initialization,
-                            "target_strategy": fit_target_strategy,
+                            "target_strategy": active_target_strategy,
                             # Filled only after FIT succeeds.  This is a
                             # target-overlap diagnostic, not norm survival.
                             "fit_overlap_fidelity": None,
@@ -8507,7 +8809,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             self._run_mpo(
                                 [gate],
                                 [where],
-                                ["gate"],
+                                [event_type],
                                 progbar=False,
                                 cutoff=cutoff,
                                 cutoff_mode=cutoff_mode,
@@ -8858,6 +9160,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     ),
                     "bnd": p.max_bond(),
                 }
+                if submpo_count:
+                    postfix["mpo"] = submpo_count
                 pbar.set_postfix(postfix)
                 pbar.update(advanced)
 
@@ -9041,13 +9345,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 else:
                     self.canonize_mps(p, (xmin, xmax))
-                    quimb_seed = (
-                        compression_seed
-                        if mpo_method in _MPO_METHODS_USE_SEED
-                        else None
-                    )
+                    submpo_opts = dict(mpo_compress_opts)
+                    if mpo_method in _MPO_METHODS_USE_SEED:
+                        submpo_opts["seed"] = compression_seed
                     _run_seeded_quimb(
-                        quimb_seed,
+                        None,
                         p.gate_with_submpo_,
                         gate,
                         where=where,
@@ -9055,7 +9357,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         max_bond=self.chi,
                         info=self.info_c,
                         inplace_mpo=False,
-                        **mpo_compress_opts,
+                        **submpo_opts,
                     )
 
                 idx += 1

@@ -6563,6 +6563,35 @@ def test_mps_optimizer_mpo_mode_applies_submpo_stream_event():
     assert out.max_bond() <= 8
 
 
+def test_mps_optimizer_dmrg_mode_applies_submpo_as_layered_fit_target():
+    """DMRG keeps an explicit sub-MPO lazy and fits its tagged target layer."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(1, 3), targets=(1, 3))
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (1, 3))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    out = opt.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        non_unitary=True,
+        normalize_final=False,
+    )
+    vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
+    expected = np.zeros(16, dtype=np.complex128)
+    expected[0] = 0.7
+    expected[5] = 0.3
+
+    assert np.allclose(vec, expected)
+    diagnostics = opt.get_fit_diagnostics()
+    assert diagnostics["target_strategy"] == "layered"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["fit_overlap_fidelity"] == pytest.approx(1.0)
+
+
 def test_mps_optimizer_mpo_mode_accepts_submpo_mapping_event():
     """Mapping events should provide a readable public sub-MPO stream API."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -6747,8 +6776,8 @@ def test_mps_optimizer_submpo_method_validation(monkeypatch):
         bad.run(progbar=False, submpo_method="bad")
 
 
-def test_mps_optimizer_submpo_stream_events_require_mpo_mode():
-    """Non-MPO modes should reject sub-MPO stream events clearly."""
+def test_mps_optimizer_submpo_stream_events_require_mpo_or_dmrg_mode():
+    """SVD/swap/exact modes still reject sub-MPO stream events clearly."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     mpo = _two_branch_flip_submpo(L=3, sites=(0, 2), targets=(0, 2))
     opt = py.MpsOptimizer(
@@ -6758,7 +6787,7 @@ def test_mps_optimizer_submpo_stream_events_require_mpo_mode():
         mode="svd",
     )
 
-    with pytest.raises(ValueError, match="subMPO stream events"):
+    with pytest.raises(ValueError, match="require an MPO or DMRG mode"):
         opt.run(progbar=False)
 
 

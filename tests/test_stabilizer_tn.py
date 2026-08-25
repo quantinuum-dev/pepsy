@@ -249,6 +249,36 @@ _H = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
 _T = np.diag([1, np.exp(1j * np.pi / 4)]).astype(complex)
 
 
+def test_stn_tableau_ascii_show_and_draw_are_read_only(capsys):
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1)])
+    before = sim.to_statevector().copy()
+
+    tableau = sim.tableau()
+    assert isinstance(tableau, stim.Tableau)
+    assert tableau.x_output(0) == stim.PauliString("+Z__")
+    assert tableau.z_output(0) == stim.PauliString("+XX_")
+
+    text = sim.ascii_tableau(color=False)
+    assert "STN  |psi> = C |nu>" in text
+    assert "frame=active" in text
+    assert "d0: +Z@0" in text
+    assert "s0: +X@0 X@1" in text
+
+    sim.show(color=False)
+    assert capsys.readouterr().out.rstrip("\n") == text
+
+    limited = sim.ascii_tableau(color=False, max_generators=1)
+    assert "... 2 generator row(s) omitted" in limited
+
+    circuit = sim.draw(format="circuit")
+    assert isinstance(circuit, stim.Circuit)
+    assert "q0:" in sim.draw()
+    svg = sim.draw(format="timeline-svg")
+    assert str(svg).lstrip().startswith("<svg")
+
+    np.testing.assert_allclose(sim.to_statevector(), before)
+
+
 def _rot(axis, theta):
     p = {"X": _X, "Y": _Y, "Z": _Z}[axis]
     return np.cos(theta / 2) * _I - 1j * np.sin(theta / 2) * p
@@ -938,7 +968,7 @@ def test_sparse_dense_matrix_uses_submpo_instead_of_branch_sum(monkeypatch):
     )
 
 
-def test_three_qubit_dense_matrix_explicit_opt_in_balanced_sum_matches_dense():
+def test_three_qubit_dense_matrix_default_balanced_sum_matches_dense():
     matrices = {"I": _I, "X": _X, "Y": _Y, "Z": _Z}
     weighted_paulis = [
         (0.31, "III"),
@@ -957,9 +987,7 @@ def test_three_qubit_dense_matrix_explicit_opt_in_balanced_sum_matches_dense():
             pmat = np.kron(pmat, matrices[label])
         gate += weight * pmat
 
-    sim = MpsStabOptimizer(
-        3, max_pauli_decomposition_qubits=3
-    ).apply(
+    sim = MpsStabOptimizer(3).apply(
         [("h", 0), ("cnot", 0, 1), ("t", 2)]
     )
     before = sim.to_statevector()
@@ -979,7 +1007,7 @@ def test_dense_gate_budget_rejects_before_decomposition_or_state_mutation(
 ):
     import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
 
-    sim = MpsStabOptimizer(3)
+    sim = MpsStabOptimizer(3, max_pauli_decomposition_qubits=2)
     gate = np.eye(8, dtype=complex)
     gate[0, 0] = 0.5
     before = sim.to_statevector()
@@ -1002,6 +1030,23 @@ def test_dense_gate_budget_rejects_before_decomposition_or_state_mutation(
 
     np.testing.assert_allclose(sim.to_statevector(), before)
     assert (tuple(sim.infidelities), tuple(sim.bond_history)) == before_history
+
+
+def test_four_qubit_dense_gate_warns_and_requires_explicit_opt_in():
+    gate = np.eye(16, dtype=complex)
+    gate[0, 0] = 0.5
+
+    guarded = MpsStabOptimizer(4)
+    with pytest.warns(UserWarning, match="4-qubit dense physical gate"):
+        with pytest.raises(
+            ValueError, match="max_pauli_decomposition_qubits=3"
+        ):
+            guarded.apply([(gate, tuple(range(4)))])
+
+    allowed = MpsStabOptimizer(4, max_pauli_decomposition_qubits=4)
+    with pytest.warns(UserWarning, match="4-qubit dense physical gate"):
+        allowed.apply([(gate, tuple(range(4)))])
+    assert allowed.norm() == pytest.approx(0.5)
 
 
 def test_dense_gate_budget_does_not_limit_clifford_matrix_dispatch(monkeypatch):
@@ -1092,7 +1137,7 @@ def test_copy_preserves_pauli_decomposition_budget():
 
 @pytest.mark.parametrize(
     "mode",
-    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "exact"),
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "direct", "svd", "swap", "perm", "exact"),
 )
 def test_coefficient_compression_modes_preserve_stn_state(mode):
     stream = [
@@ -1135,7 +1180,6 @@ def test_coefficient_compression_modes_preserve_stn_state(mode):
         "srcmps",
         "srcmps-first",
         "srcmps-oversample",
-        "fit",
         "fit-zipup",
         "fit-projector",
         "fit-oversample",
@@ -1155,12 +1199,12 @@ def test_stn_quimb_compression_methods_preserve_state(method):
     optimizer = MpsStabOptimizer(
         3,
         chi=4,
-        mode=f"quimb-{method}",
+        mode=method,
         exact_cooling=False,
         compression_seed=7,
     ).apply(stream)
 
-    assert optimizer.mode == f"quimb-{method}"
+    assert optimizer.mode == method
     assert optimizer.state.max_bond() <= 4
     assert _fidelity(optimizer.to_statevector(), reference.to_statevector()) == pytest.approx(
         1.0, abs=1e-8
@@ -1179,7 +1223,7 @@ def test_stn_quimb_compression_methods_preserve_state(method):
     ),
 )
 def test_stn_quimb_mode_aliases(mode, method):
-    """Canonical Quimb names and historical MPO aliases share one dispatch."""
+    """Legacy Quimb/MPO spellings share dispatch with the bare API."""
     optimizer = MpsStabOptimizer(
         3,
         chi=4,
@@ -1190,6 +1234,13 @@ def test_stn_quimb_mode_aliases(mode, method):
 
     assert optimizer.mode == mode
     assert optimizer._mode_quimb_method(mode) == method
+
+
+def test_stn_defaults_use_bare_native_mode_and_src_warmup():
+    optimizer = MpsStabOptimizer(2)
+
+    assert optimizer.mode == "direct"
+    assert optimizer.fit_init_strategy == "guess_src"
 
 
 @pytest.mark.parametrize(
@@ -1230,6 +1281,120 @@ def test_stn_mode_validation_and_copy_preservation():
     assert copied.fit_init_seed == 7
     assert copied.compression_seed == 11
     assert "mode='dmrg3'" in repr(copied)
+
+
+def test_stn_dmrg3_falls_back_for_two_site_window():
+    """dmrg3 remains usable for the common two-qubit mapped-gate case."""
+    stream = [("rx", 0.31, 0), ("cnot", 0, 1), ("rz", 0.71, 1)]
+    reference = MpsStabOptimizer(
+        2, mode="exact", exact_cooling=False
+    ).apply(stream)
+    optimizer = MpsStabOptimizer(
+        2,
+        chi=4,
+        mode="dmrg3",
+        exact_cooling=False,
+    ).apply(stream)
+
+    assert optimizer.state.max_bond() <= 4
+    assert _fidelity(
+        optimizer.to_statevector(), reference.to_statevector()
+    ) == pytest.approx(1.0, abs=1e-10)
+
+
+def test_stn_dmrg_keeps_submpo_as_layered_fit_target():
+    """DMRG retains the exact coefficient sub-MPO as a tagged FIT layer."""
+    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn.operators import pauli_combo_submpo
+
+    sim = MpsStabOptimizer(
+        4,
+        chi=2,
+        mode="dmrg2",
+        exact_cooling=False,
+    )
+    mpo, where = pauli_combo_submpo(
+        0.8,
+        -0.2j,
+        {1: "X", 3: "Z"},
+        sim.n,
+        dtype=sim.dtype,
+    )
+
+    target, strategy = sim._build_dmrg_fit_target(mpo, where)
+
+    assert strategy == "layered"
+    assert len(target.tensor_map) == sim.n + len(where)
+    for site in range(sim.n):
+        tag = sim.state.p.site_tag(site)
+        assert len(target.tag_map[tag]) == (2 if site in where else 1)
+    assert all(
+        len(set(tensor.tags) & set(target.site_tags)) == 1
+        for tensor in target.tensors
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "block_size"),
+    (("dmrg1", 2), ("dmrg2", 2), ("dmrg3", 3)),
+)
+def test_stn_named_dmrg_modes_use_growth_refinement_and_src_guess(
+    mode, block_size
+):
+    sim = MpsStabOptimizer(
+        3,
+        chi=2,
+        mode=mode,
+        exact_cooling=False,
+    ).apply([("rxx", 0.37, 0, 2)])
+
+    diagnostics = sim.get_fit_diagnostics()
+    assert diagnostics["block_size"] == block_size
+    assert diagnostics["growth_sweeps"] == 2
+    assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert diagnostics["iterations"] == 3
+    assert diagnostics["fit_init_strategy"] == "guess_src"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
+    assert diagnostics["target_strategy"] == "layered"
+    assert sim.state.max_bond() <= 2
+
+
+def test_stn_dmrg_auto_resolves_to_src_warmup():
+    sim = MpsStabOptimizer(
+        3,
+        chi=2,
+        mode="dmrg2",
+        fit_init_strategy="auto",
+        exact_cooling=False,
+    ).apply([("rxx", 0.37, 0, 2)])
+
+    diagnostics = sim.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy_requested"] == "auto"
+    assert diagnostics["fit_init_strategy"] == "guess_src"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
+
+
+def test_stn_dmrg1_latches_one_site_phase_after_full_chain_growth():
+    sim = MpsStabOptimizer(
+        3,
+        chi=2,
+        mode="dmrg1",
+        exact_cooling=False,
+    ).apply(
+        [
+            ("rxx", 0.37, 0, 2),
+            ("ryy", 0.23, 0, 2),
+        ]
+    )
+
+    diagnostics = sim.get_fit_diagnostics()
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["growth_sweeps"] == 0
+    assert diagnostics["dmrg1_one_site_locked"] is True
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
 
 
 @pytest.mark.parametrize(
@@ -2348,6 +2513,27 @@ def test_run_with_injection_non_pi4_rz_applied_normally():
     direct = MpsStabOptimizer(nd).apply(stream)
     inj = MpsStabOptimizer.with_injection(nd, stream, n_ancilla=1)
     assert _fidelity(inj.to_statevector(), _data_marginal_ref(direct, 1)) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("gate_factory", ["t", "tdg"])
+def test_matrix_t_gate_streams_are_injectable(gate_factory):
+    """Pepsy matrix gates must enter the same MAST path as named T entries."""
+    import pepsy as py
+
+    gate = getattr(py, gate_factory)()
+    stream = [(py.h(), 0), (gate, 0)]
+    direct = MpsStabOptimizer(1).apply(stream)
+    immediate = MpsStabOptimizer.with_injection(1, stream, n_ancilla=1)
+    deferred = MpsStabOptimizer.with_deferred_injection(1, stream)
+
+    assert immediate.last_immediate_injection_report["n_injections"] == 1
+    assert deferred.last_deferred_injection_report["n_injections"] == 1
+    assert _fidelity(
+        immediate.to_statevector(), _data_marginal_ref(direct, 1)
+    ) == pytest.approx(1.0, abs=1e-6)
+    assert _fidelity(
+        deferred.to_statevector(), _data_marginal_ref(direct, 1)
+    ) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_run_with_injection_rejects_target_in_pool():

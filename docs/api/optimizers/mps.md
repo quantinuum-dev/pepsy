@@ -81,9 +81,13 @@ event = {"kind": "submpo", "mpo": mpo, "where": where}
 ```
 
 `where` is a non-empty tuple/list of unique 1D MPS sites. The convenience
-helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. These
-events are applied with `gate_with_submpo_` and compressed to `chi`; they are
-only accepted in the Quimb compression mode family.
+helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. In the
+Quimb compression family these events are applied with `gate_with_submpo_` and
+compressed to `chi`. DMRG also accepts multi-site sub-MPO events: it
+canonicalizes the active region, aligns the MPO site tags, and keeps the
+operator as a layered FIT target while using the DMRG SRC warm-up guess.
+`svd`, `swap`, `perm`, `su`, and `exact` reject sub-MPO stream events; `mix`
+retains its existing gate-oriented unitary path.
 
 Modes that use canonical MPS metadata require an open-boundary MPS. A cyclic
 MPS has a nontrivial loop environment, so no single tensor norm can equal its
@@ -173,8 +177,9 @@ Use `retain="all"` (the default) for final states plus replay metadata,
 `retain="none"` when only the shot count/side effects matter. The latter keeps
 no optimizer states in the result and therefore cannot be used to evaluate
 observables afterward. `dmrg2` is the normal variational production backend;
-`mpo` is the direct-compression reference and is required for explicit
-sub-MPO events. `svd`, `swap`, and the other DMRG schedules use the same
+`mpo` is the direct-compression reference for explicit sub-MPO events, while
+DMRG schedules retain multi-site sub-MPOs as layered FIT targets. `svd`, `swap`,
+and the other DMRG schedules use the same
 trajectory contract and should be benchmarked for the workload. `mix` and `su`
 remain gate-oriented/unitary modes, while `exact` also supports state-dependent
 Kraus branches by evaluating copied dense TensorNetwork leaves. Shot

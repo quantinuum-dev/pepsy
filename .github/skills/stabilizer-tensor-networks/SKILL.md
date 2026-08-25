@@ -33,8 +33,9 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
     paper/reference implementation's CNOT-cascade execution.
   - General few-qubit matrices are Pauli-decomposed, frame-mapped branch by branch, summed,
     and compressed with a balanced streaming reduction. The fallback defaults to at most
-    two qubits via `max_pauli_decomposition_qubits=2`; larger values explicitly opt into
-    the `4**k` cost. A `("submpo", mpo, where)` event instead acts directly in the
+    three qubits via `max_pauli_decomposition_qubits=3`; four-qubit dense gates warn and
+    require an explicit limit of at least `4` because of the `4**k` cost. A
+    `("submpo", mpo, where)` event instead acts directly in the
     coefficient frame.
 - **Exact vs approximate (bounded-$\chi$) mode** is selected on `MpsStabOptimizer`:
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
@@ -42,17 +43,27 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
   unitary update can record cumulative norm loss `1 - ||p||^2`; bounded evolution does
   not renormalize `p`, so compression loss remains visible.
-- **Coefficient-MPS compression methods** use the canonical `quimb-<method>`
-  mode family, with `quimb` as the direct alias. The historical `mpo-<method>`
-  and `mpo` spellings remain supported. Every Quimb direct, density-matrix,
+- **Coefficient-MPS compression methods** use the same bare native method names
+  as `MpsOptimizer` (`direct`, `zipup`, `src`, `fit-*`, and variants).
+  Historical `quimb-*` and `mpo-*` spellings remain supported with deprecation
+  warnings. Every direct, density-matrix,
   zip-up, SRC, SRCMPS, and `fit-*` method is forwarded to
   `gate_with_submpo_`; randomized methods accept the separate
   `compression_seed` control. DMRG modes use a disposable
-  `fit_init_strategy="guess-<method>"` (default `guess-zipup`) before active
-  bonds reach their cap, while the exact target remains built from the live
-  unmodified coefficient MPS. The underscore `guess_<method>` spelling remains
-  a compatibility alias. Native Symmray and fermionic paths retain their
-  sector-aware direct FIT initialization.
+  `fit_init_strategy="guess-<method>"` (default `guess-src`) before active
+  bonds reach their cap and through the fixed-rank one-site phase, while the
+  exact coefficient sub-MPO target remains separate from the live coefficient
+  MPS as a tagged lazy FIT layer on dense backends. The active target window is
+  canonicalized before the layer is attached; FIT then contracts multiple
+  target tensors per site directly. `auto` resolves to `guess-src`. The
+  underscore `guess_<method>` spelling remains a compatibility alias. Native
+  Symmray and fermionic paths retain their sector-aware materialized target
+  and direct FIT initialization.
+- STN `dmrg1`, `dmrg2`, and `dmrg3` mirror the ordinary MPS local schedule:
+  isolated SRC warm-up, two-site or three-site growth, then one-site refinement
+  on longer windows. `dmrg3` falls back to two-site FIT on an adjacent two-site
+  window, and `dmrg1` latches one-site updates after full-chain rank ceilings
+  are reached. `get_fit_diagnostics()` exposes this schedule.
 - **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
   quimb operations. Canonicalize explicitly before local projection, evaluate local
   expectations and unitary norm loss at the tracked centre, and renormalize the centre

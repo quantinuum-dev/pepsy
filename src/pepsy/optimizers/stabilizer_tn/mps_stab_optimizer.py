@@ -105,7 +105,9 @@ from .records import (
     StabilizerMpsRunResult,
     StreamAnalysisRecord,
 )
-from .settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
+from .settings import (
+    DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS,
+)
 from .stn_state import STNState, _tableau_gate_stream, _validate_bits
 
 __all__ = [
@@ -139,6 +141,35 @@ _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
     | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
 )
+
+_TABLEAU_ANSI = {
+    "header": "1;36",
+    "section": "1;35",
+    "destabilizer": "32",
+    "stabilizer": "33",
+    "muted": "2",
+}
+
+
+def _tableau_color(text, style, enabled):
+    """Apply one small ANSI style used by the compact tableau display."""
+    if not enabled:
+        return str(text)
+    return f"\033[{_TABLEAU_ANSI[style]}m{text}\033[0m"
+
+
+def _format_tableau_pauli(pauli, *, compact=True):
+    """Format a Stim Pauli string densely or by its non-identity support."""
+    text = str(pauli)
+    if not compact:
+        return text
+    sign, body = text[0], text[1:]
+    support = [
+        f"{axis}@{site}"
+        for site, axis in enumerate(body)
+        if axis != "_"
+    ]
+    return sign + ("I" if not support else " ".join(support))
 
 # Single-qubit Clifford matrices used to localize a signed Pauli string onto one
 # qubit for the basis-updating measurement (H, S-dagger, CNOT).
@@ -510,20 +541,27 @@ class MpsStabOptimizer:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
-    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "svd", "swap", "perm", "exact"}
-        Compression backend for coefficient-MPS updates. ``"quimb-direct"``
-        is the canonical native Quimb spelling and ``"quimb"`` is its direct
-        alias. The legacy ``"mpo-<method>"`` and ``"mpo"`` spellings remain
-        supported. The DMRG modes use local FIT on the coefficient target;
-        ``fit_init_strategy`` controls their disposable initial guess.
+    mode : {"direct", "dm", "zipup", "src", "fit-*", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "swap", "perm", "exact"}
+        Compression backend for coefficient-MPS updates. Native compression
+        names are used directly, for example ``"direct"``, ``"zipup"``, or
+        ``"src"``; the ``"*-first"`` and ``"*-oversample"`` variants are
+        available as well. The DMRG modes use local FIT on the coefficient
+        target; ``fit_init_strategy`` controls their disposable initial guess.
+        On dense backends, DMRG retains the exact coefficient sub-MPO as a
+        tagged lazy FIT target layer after canonicalizing the active MPS window;
+        Symmray and fermionic routes use the materialized backend-safe target.
+        Historical ``"quimb-*"`` and ``"mpo-*"`` spellings remain accepted as
+        deprecated aliases.
         ``"svd"``, ``"swap"``, and ``"perm"`` remain compatibility aliases
         for the historical direct coefficient-MPO path. ``"exact"`` forces
         ``chi=None`` and keeps the coefficient MPS lossless up to ``cutoff``.
         Clifford gates remain tableau-only in every mode.
     fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}
         Disposable FIT initialization for dense DMRG windows. The default
-        ``"guess-zipup"`` selects Quimb zip-up before active bonds reach their
-        attainable ``chi`` ceilings and falls back to the live MPS afterwards.
+        ``"guess-src"`` selects the SRC warm-up before active bonds reach their
+        attainable ``chi`` ceilings and continues to prepare the fixed-rank
+        one-site phase after expansion. ``"auto"`` resolves to the same
+        ``"guess-src"`` policy.
         ``"guess_<method>"`` remains accepted as a compatibility spelling;
         ``"svd_guess"`` is an alias for ``"guess-direct"``. Native Symmray
         and fermionic paths retain their direct sector-aware initialization.
@@ -532,7 +570,7 @@ class MpsStabOptimizer:
     fit_init_seed : int
         Deterministic seed for randomized FIT guesses.
     compression_seed : int | None
-        Seed forwarded to randomized Quimb compression methods. This is kept
+        Seed forwarded to randomized native compression methods. This is kept
         separate from ``seed``, which controls STN measurement sampling.
 
     Attributes
@@ -584,7 +622,7 @@ class MpsStabOptimizer:
         cutoff: float = 1e-12,
         operator_tol: Optional[float] = None,
         max_pauli_decomposition_qubits: Optional[int] = (
-            DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
+            DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS
         ),
         max_pauli_terms: Optional[int] = 256,
         max_dense_cap_qubits: Optional[int] = 10,
@@ -597,8 +635,8 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
-        mode: str = "mpo",
-        fit_init_strategy: str = "guess-zipup",
+        mode: str = "direct",
+        fit_init_strategy: str = "guess-src",
         fit_init_rand_strength: float = 1.0e-1,
         fit_init_seed: int = 0,
         compression_seed: Optional[int] = None,
@@ -735,6 +773,8 @@ class MpsStabOptimizer:
         self._trajectory_plan = None
         self._has_trajectory_events = False
         self._last_run_timing = None
+        self._last_fit_diagnostics = None
+        self._dmrg1_one_site_locked = False
         self._quality_checks: list[dict] = []
         self.infidelities: List[float] = []
         self._nonunitary_infidelities: List[float] = []
@@ -774,11 +814,19 @@ class MpsStabOptimizer:
     # Initial-state constructors (product / GHZ / user tableau+MPS)
     # ------------------------------------------------------------------ #
     _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
+    _CANONICAL_MPO_MODES = frozenset(_MPO_COMPRESSION_METHODS)
+    _LEGACY_MODE_NAMES = frozenset({"quimb", "mpo"})
+    _LEGACY_MODE_PREFIXES = ("quimb-", "mpo-")
     _ALLOWED_MODES = frozenset(
         _DMRG_MODES
-        | {"quimb", "mpo", "svd", "swap", "perm", "exact"}
-        | {f"quimb-{method}" for method in _MPO_COMPRESSION_METHODS}
-        | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
+        | _CANONICAL_MPO_MODES
+        | {"svd", "swap", "perm", "exact"}
+        | _LEGACY_MODE_NAMES
+        | {
+            f"{prefix}{method}"
+            for prefix in _LEGACY_MODE_PREFIXES
+            for method in _MPO_COMPRESSION_METHODS
+        }
     )
 
     @classmethod
@@ -789,11 +837,18 @@ class MpsStabOptimizer:
             mode = "dmrg"
         if mode not in cls._ALLOWED_MODES:
             allowed = (
-                "dmrg*, quimb[-<method>], mpo[-<method>] (legacy), "
-                "svd, swap, perm, or exact"
+                "a native method such as direct, zipup, or src; "
+                "dmrg*, svd, swap, perm, or exact"
             )
             raise ValueError(
                 f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}."
+            )
+        if mode in cls._LEGACY_MODE_NAMES or mode.startswith(cls._LEGACY_MODE_PREFIXES):
+            warnings.warn(
+                f"mode={mode!r} is deprecated; use the bare native compression "
+                "method name (for example mode='src' or mode='direct').",
+                DeprecationWarning,
+                stacklevel=3,
             )
         return mode
 
@@ -801,15 +856,21 @@ class MpsStabOptimizer:
     def _is_quimb_mode(cls, mode):
         """Return whether ``mode`` selects native Quimb compression."""
         mode = str(mode).strip().lower()
-        return mode == "quimb" or mode.startswith(("quimb-", "mpo-")) or mode == "mpo"
+        return (
+            mode in cls._CANONICAL_MPO_MODES
+            or mode in cls._LEGACY_MODE_NAMES
+            or mode.startswith(cls._LEGACY_MODE_PREFIXES)
+        )
 
     @classmethod
     def _mode_quimb_method(cls, mode):
         """Return the Quimb compression method encoded by ``mode``."""
         mode = str(mode).strip().lower()
-        if mode in {"quimb", "mpo"}:
+        if mode in cls._CANONICAL_MPO_MODES:
+            return mode
+        if mode in cls._LEGACY_MODE_NAMES:
             return "direct"
-        for prefix in ("quimb-", "mpo-"):
+        for prefix in cls._LEGACY_MODE_PREFIXES:
             if mode.startswith(prefix):
                 return cls._normalize_quimb_method(mode[len(prefix) :])
         return "direct"
@@ -835,6 +896,15 @@ class MpsStabOptimizer:
                 "fit_init_strategy must be one of "
                 f"{allowed}; got {strategy!r}."
             )
+        return strategy
+
+    @staticmethod
+    def _resolved_fit_init_strategy(strategy):
+        """Resolve strategy aliases to the canonical FIT warm-start policy."""
+        if strategy == "auto":
+            return "guess_src"
+        if strategy == "svd_guess":
+            return "guess_direct"
         return strategy
 
     @classmethod
@@ -2740,6 +2810,8 @@ class MpsStabOptimizer:
             "layout_plan": deepcopy(self.layout_plan),
             "last_layout_plan": deepcopy(self.last_layout_plan),
             "rng_state": rng_state,
+            "last_fit_diagnostics": deepcopy(self._last_fit_diagnostics),
+            "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
         }
 
     def _restore_execution_snapshot(self, snapshot) -> None:
@@ -2774,6 +2846,8 @@ class MpsStabOptimizer:
         self._refresh_layout_map()
         self.layout_plan = deepcopy(snapshot["layout_plan"])
         self.last_layout_plan = deepcopy(snapshot["last_layout_plan"])
+        self._last_fit_diagnostics = deepcopy(snapshot["last_fit_diagnostics"])
+        self._dmrg1_one_site_locked = bool(snapshot["dmrg1_one_site_locked"])
         self._rng.bit_generator.state = deepcopy(snapshot["rng_state"])
         self.backend_info()
 
@@ -2998,8 +3072,8 @@ class MpsStabOptimizer:
         return deepcopy(self._quality_checks)
 
     def get_fit_diagnostics(self):
-        """Return ``None`` because STN replay has no variational FIT stage."""
-        return None
+        """Return diagnostics for the most recent STN DMRG/FIT update."""
+        return deepcopy(self._last_fit_diagnostics)
 
     def get_run_timing(self):
         """Return the most recent replay timing record."""
@@ -3051,21 +3125,22 @@ class MpsStabOptimizer:
 
         Parameters
         ----------
-        mode : {"exact", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "dmrg"}, default="exact"
+        mode : {"exact", "direct", "zipup", "src", "fit-*", "dmrg"}, default="exact"
             ``"exact"`` applies the tableau circuit with unlimited bond and
-            zero cutoff. Native Quimb modes use the same canonical
-            ``quimb-<method>`` names and legacy ``mpo-*`` aliases as the
-            ordinary MPS optimizer; ``"dmrg"`` uses its variational replay
-            path. Approximate modes require ``chi``.
+            zero cutoff. Native MPS compression methods use their bare names,
+            matching the ordinary MPS optimizer; ``"dmrg"`` uses its
+            variational replay path. Approximate modes require ``chi``.
+            Historical ``"quimb-*"`` and ``"mpo-*"`` forms remain accepted as
+            deprecated aliases.
         chi : int or None
             Maximum bond dimension for the approximate modes.
         cutoff : float, default=0.0
-            Singular-value cutoff for ``"mpo"`` and ``"dmrg"``. It is
+            Singular-value cutoff for native compression modes and ``"dmrg"``. It is
             intentionally ignored by the lossless ``"exact"`` path.
         cutoff_mode : str, default="rsum2"
             Cutoff convention for the approximate modes.
         n_iter : int, default=5
-            DMRG replay sweeps. Ignored by ``"exact"`` and ``"mpo"``.
+            DMRG replay sweeps. Ignored by ``"exact"`` and native non-DMRG modes.
         logical_order : bool, default=True
             Return sites in logical qubit order. If false, preserve the
             coefficient MPS's current physical layout and map tableau gates
@@ -3074,7 +3149,7 @@ class MpsStabOptimizer:
             Show the ordinary MPS progress bar for approximate modes.
         **run_kwargs
             Additional keyword arguments forwarded to
-            :meth:`pepsy.MpsOptimizer.run` in ``"mpo"`` and ``"dmrg"`` mode.
+            :meth:`pepsy.MpsOptimizer.run` in native and ``"dmrg"`` modes.
 
         Returns
         -------
@@ -3164,6 +3239,145 @@ class MpsStabOptimizer:
     def to_physical_mps(self, *args, **kwargs):
         """Compatibility alias for :meth:`to_mps`."""
         return self.to_mps(*args, **kwargs)
+
+    def tableau(self):
+        """Return a read-only snapshot of the live basis Clifford tableau.
+
+        The returned :class:`stim.Tableau` represents ``C`` in the STN
+        factorization ``|psi> = C |nu>``.  Use ``x_output(i)`` and
+        ``z_output(i)`` to inspect destabilizer and stabilizer generators.
+        """
+        return self.state.tableau()
+
+    def ascii_tableau(
+        self,
+        *,
+        compact=True,
+        color=False,
+        generators=True,
+        max_generators=None,
+        diagnostics=True,
+    ):
+        """Return a compact, Pepsy-style text view of the STN tableau.
+
+        Parameters
+        ----------
+        compact : bool, default=True
+            Show Pauli generators by non-identity support, e.g. ``+X@0 Z@3``.
+            Set to ``False`` for Stim's full-width strings such as ``+X__Z``.
+        color : bool, default=False
+            Add ANSI colour styles to the returned text.
+        generators : bool, default=True
+            Include the destabilizer/stabilizer generator rows.
+        max_generators : int or None, default=None
+            Limit the number of generator rows shown.  The header and MPS
+            summary are still emitted when this is used for large systems.
+        diagnostics : bool, default=True
+            Include the coefficient-MPS bond, norm, mode, and queue summary.
+
+        Notes
+        -----
+        This method only reads the Stim tableau and MPS metadata.  It never
+        constructs the dense Clifford matrix and does not mutate the state.
+        """
+        if max_generators is not None:
+            if isinstance(max_generators, bool) or not isinstance(max_generators, Integral):
+                raise TypeError("max_generators must be a non-negative integer or None.")
+            max_generators = int(max_generators)
+            if max_generators < 0:
+                raise ValueError("max_generators must be non-negative or None.")
+
+        tableau = self.tableau()
+        frame = "I" if self.state.is_identity_frame() else "active"
+        chi = "inf" if self.chi is None else str(self.chi)
+        header = (
+            "STN  |psi> = C |nu>"
+            f"   n={self.n}   frame={frame}"
+            f"   max_bond={self.state.max_bond()}   chi={chi}"
+        )
+        lines = [_tableau_color(header, "header", color)]
+
+        if diagnostics:
+            norm = self.norm()
+            lines.append(
+                "  "
+                f"mode={self.mode}   norm={norm:.6g}"
+                f"   queued={len(self._queue)}"
+                f"   recorded_steps={max(0, len(self.bond_history) - 1)}"
+            )
+
+        if generators:
+            lines.append(_tableau_color("tableau generators:", "section", color))
+            count = self.n if max_generators is None else min(self.n, max_generators)
+            for q in range(count):
+                destabilizer = _format_tableau_pauli(
+                    tableau.x_output(q), compact=compact
+                )
+                stabilizer = _format_tableau_pauli(
+                    tableau.z_output(q), compact=compact
+                )
+                d_label = _tableau_color(f"d{q}", "destabilizer", color)
+                s_label = _tableau_color(f"s{q}", "stabilizer", color)
+                lines.append(
+                    f"  {d_label}: {destabilizer}   {s_label}: {stabilizer}"
+                )
+            if count < self.n:
+                omitted = self.n - count
+                lines.append(
+                    _tableau_color(
+                        f"  ... {omitted} generator row(s) omitted",
+                        "muted",
+                        color,
+                    )
+                )
+
+        return "\n".join(lines)
+
+    def show(
+        self,
+        *,
+        compact=True,
+        generators=True,
+        max_generators=None,
+        diagnostics=True,
+        color=True,
+    ):
+        """Print the compact STN tableau view.
+
+        This follows Pepsy's ``TreeTensorNetwork.show`` convention: the
+        corresponding ``ascii_tableau`` method returns the drawing as text,
+        while ``show`` prints it and returns ``None``.
+        """
+        print(
+            self.ascii_tableau(
+                compact=compact,
+                color=color,
+                generators=generators,
+                max_generators=max_generators,
+                diagnostics=diagnostics,
+            )
+        )
+
+    def draw(self, *, format="timeline-text"):
+        """Return a Stim circuit diagram for the current tableau.
+
+        ``format="timeline-text"`` is the dependency-free text diagram.
+        Stim's other diagram formats, including ``"timeline-svg"``, are
+        forwarded unchanged.  ``format="circuit"`` returns the underlying
+        :class:`stim.Circuit` instead of rendering it.
+
+        The circuit is a decomposition of the Clifford ``C`` only; it does
+        not include the coefficient-MPS state ``|nu>`` or non-Clifford events.
+        """
+        circuit = self.tableau().to_circuit()
+        normalized = str(format).strip().lower()
+        if normalized in {"circuit", "stim"}:
+            return circuit
+        diagram = circuit.diagram(normalized)
+        # Stim returns a display helper for every diagram format.  Make the
+        # dependency-free text form directly useful with string operations;
+        # keep richer formats (SVG, matching, ...) as their native helpers.
+        return str(diagram) if normalized == "timeline-text" else diagram
 
     def amplitude(self, bits) -> complex:
         """Amplitude ``<bits|psi>`` for a bitstring (str ``'010'`` or 0/1 seq).
@@ -3748,6 +3962,8 @@ class MpsStabOptimizer:
         copied._refresh_layout_map()
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
+        copied._last_fit_diagnostics = deepcopy(self._last_fit_diagnostics)
+        copied._dmrg1_one_site_locked = bool(self._dmrg1_one_site_locked)
         copied._initial_state = copied.state.copy()
         copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         return copied
@@ -5121,10 +5337,10 @@ class MpsStabOptimizer:
 
     def _fit_initial_guess(self, p, mpo, where, *, block_size):
         """Select an isolated FIT guess without changing the live coefficient MPS."""
-        strategy = self.fit_init_strategy
+        strategy = self._resolved_fit_init_strategy(self.fit_init_strategy)
         if (
             mpo is None
-            or block_size not in {2, 3}
+            or block_size not in {1, 2, 3}
             or self.chi is None
             or self.backend == "symmray"
             or p.isfermionic()
@@ -5141,13 +5357,13 @@ class MpsStabOptimizer:
             )
         except (AttributeError, TypeError, ValueError):
             at_target = True
-        if at_target:
+        # The SRC warm-up is also intentional after rank expansion: ordinary
+        # MPS DMRG uses it to prepare the fixed-rank one-site phase. Keep
+        # direct/random policies as no-op warm starts once the active bonds
+        # are already at their attainable ceilings.
+        if at_target and not strategy.startswith("guess_"):
             return p
 
-        if strategy == "auto":
-            strategy = "guess_zipup"
-        if strategy == "svd_guess":
-            strategy = "guess_direct"
         if strategy.startswith("guess_"):
             method = strategy[len("guess_") :]
             guess = p.copy(deep=True)
@@ -5169,11 +5385,156 @@ class MpsStabOptimizer:
             )
         return p
 
-    def _fit_coefficient_target(self, target, where, *, guess_mpo=None):
+    def _fit_window_at_rank_targets(self, p, start, stop):
+        """Return whether all bonds in a DMRG window have reached their cap."""
+        if self.chi is None or stop <= start:
+            return False
+        try:
+            return bool(
+                FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+                    p,
+                    int(start),
+                    int(stop),
+                    self.chi,
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            # A conservative answer keeps the variational growth phase when a
+            # backend cannot expose FIT's rank-ceiling helper.
+            return False
+
+    def _dmrg1_all_bonds_at_rank_targets(self, p):
+        """Return whether every full-chain coefficient bond is at its ceiling."""
+        if self.mode != "dmrg1" or self.chi is None or self.n < 2:
+            return False
+        return self._fit_window_at_rank_targets(p, 0, self.n - 1)
+
+    def _maybe_lock_dmrg1_one_site_phase(self, p=None):
+        """Latch DMRG1 into one-site refinement after full-chain growth."""
+        if self.mode != "dmrg1" or self._dmrg1_one_site_locked:
+            return
+        if p is None:
+            p = self.state.p
+        if self._dmrg1_all_bonds_at_rank_targets(p):
+            self._dmrg1_one_site_locked = True
+
+    @staticmethod
+    def _fit_target_is_layered(target):
+        """Return whether ``target`` still contains an operator layer."""
+        return len(getattr(target, "tensor_map", ())) > int(target.L)
+
+    @staticmethod
+    def _align_fit_submpo_tags(mpo, target, where):
+        """Copy and align sub-MPO site tags with the fitted MPS tags.
+
+        FIT accepts layered targets with several tensors per site, but every
+        target tensor must carry exactly one tag from the fitted MPS site-tag
+        family.  Native STN builders already use matching ``I{site}`` tags;
+        this small alignment step also keeps user/MPO site-tag formatters
+        compatible without mutating the operator retained for the warm start.
+        """
+        mpo = mpo.copy()
+        site_tag = getattr(mpo, "site_tag", None)
+        if not callable(site_tag):
+            raise TypeError("DMRG layered targets require a site-tagged sub-MPO.")
+
+        active_sites = tuple(sorted({int(site) for site in where}))
+        expected_tags = set()
+        for site in active_sites:
+            old_tag = site_tag(site)
+            new_tag = target.site_tag(site)
+            expected_tags.add(new_tag)
+            if old_tag != new_tag:
+                mpo.retag_({old_tag: new_tag})
+
+        for tensor in mpo.tensors:
+            tensor_site_tags = tuple(tag for tag in tensor.tags if tag in expected_tags)
+            if len(tensor_site_tags) != 1:
+                raise ValueError(
+                    "Each layered FIT sub-MPO tensor must carry exactly one "
+                    f"fitted-MPS site tag, got {tuple(tensor.tags)!r}."
+                )
+        return mpo
+
+    def _build_dmrg_fit_target(self, mpo, where):
+        """Build the DMRG target, retaining a lazy sub-MPO when supported.
+
+        Dense backends keep the coefficient sub-MPO as a separate operator
+        layer.  The live MPS is only canonicalized on the active window before
+        the layer is attached, so the target does not pay an intermediate
+        ``chi``-independent MPS materialization cost.  Symmray and fermionic
+        data retain the native materialized target path because their graded
+        operator metadata cannot safely use the generic lazy FIT layer.
+        """
+        start, stop = min(where), max(where)
+        target = self.state.p.copy()
+        target.canonicalize_((start, stop), info={})
+
+        self.backend_info()
+        layered_supported = (
+            self.backend != "symmray"
+            and not target.isfermionic()
+            and not mpo.isfermionic()
+        )
+        if layered_supported:
+            layered_mpo = self._align_fit_submpo_tags(mpo, target, where)
+            target.gate_with_op_lazy_(
+                layered_mpo,
+                inplace=True,
+                inplace_op=False,
+            )
+            return target, "layered"
+
+        # Native graded routes keep a one-tensor-per-site target and use the
+        # existing backend-aware sub-MPO contraction path.
+        target.gate_with_submpo_(
+            mpo,
+            where=where,
+            max_bond=None,
+            cutoff=0.0,
+            info={},
+            inplace_mpo=False,
+        )
+        return target, "mps"
+
+    def _fit_coefficient_target(
+        self,
+        target,
+        where,
+        *,
+        guess_mpo=None,
+        target_strategy=None,
+    ):
         """Fit a coefficient-MPS target with the selected DMRG schedule."""
         p = self.state.p
         start, stop = min(where), max(where)
-        block_size = 3 if self.mode == "dmrg3" else 2
+        span = stop - start + 1
+        if target_strategy is None:
+            target_strategy = (
+                "layered" if self._fit_target_is_layered(target) else "mps"
+            )
+        requested_block_size = 3 if self.mode == "dmrg3" else 2
+        block_size = min(requested_block_size, span)
+        self._maybe_lock_dmrg1_one_site_phase(p)
+        if (
+            self.mode == "dmrg1"
+            and block_size == 2
+            and span > 2
+            and self._dmrg1_one_site_locked
+        ):
+            block_size = 1
+        elif (
+            self.mode == "dmrg1"
+            and block_size == 2
+            and span > 2
+            and self._fit_window_at_rank_targets(p, start, stop)
+        ):
+            block_size = 1
+        # A three-site FIT update cannot be defined on a two-site active
+        # window.  Dense physical gates and mapped Pauli rotations commonly
+        # have exactly this support, so match the ordinary MPS DMRG behavior
+        # and fall back to a two-site update locally rather than rejecting a
+        # valid ``dmrg3`` run.
         fit_guess = self._fit_initial_guess(
             p,
             guess_mpo,
@@ -5189,8 +5550,31 @@ class MpsStabOptimizer:
             inplace=True,
             copy_target=False,
         )
+        adjacent_two_site = span == 2 and block_size == 2
+        growth_sweeps = (
+            0 if block_size == 1 else (1 if adjacent_two_site else 2)
+        )
+        resolved_fit_init_strategy = self._resolved_fit_init_strategy(
+            self.fit_init_strategy
+        )
+        guess_method = (
+            resolved_fit_init_strategy[len("guess_") :]
+            if resolved_fit_init_strategy.startswith("guess_")
+            else None
+        )
+        guess_used = bool(
+            guess_method is not None
+            and guess_mpo is not None
+            and block_size in {1, 2, 3}
+            and self.chi is not None
+            and self.backend != "symmray"
+            and not p.isfermionic()
+        )
         fit.run_gate(
-            n_iter=3,
+            # A two-site gate is already the complete local problem. Match
+            # MpsOptimizer's structural fast path and spend one FIT update on
+            # it; longer windows use two growth sweeps and one-site handoff.
+            n_iter=1 if adjacent_two_site else 3,
             block_size=block_size,
             sweep_sequence="RL",
             max_bond=self.chi,
@@ -5198,30 +5582,49 @@ class MpsStabOptimizer:
             min_iter=1,
             rtol=None,
             patience=1,
-            adaptive_block_sweeps=2,
+            adaptive_block_sweeps=(
+                None if block_size == 1 else growth_sweeps
+            ),
             adaptive_until_rank=False,
-            final_one_site_sweeps=1,
+            # The remaining ``n_iter`` sweep after the two growth sweeps is
+            # FIT's one-site handoff. Do not add a second explicit refinement
+            # sweep on top of that canonical MpsOptimizer schedule.
+            final_one_site_sweeps=0,
             single_pair_fast_path=True,
             collect_split_diagnostics=False,
         )
         self.state.p = fit.p
+        self._maybe_lock_dmrg1_one_site_phase(self.state.p)
+        self._last_fit_diagnostics = {
+            "backend": "fit",
+            "mode": self.mode,
+            "block_size": int(block_size),
+            "growth_sweeps": int(getattr(fit, "adaptive_sweeps_run", growth_sweeps)),
+            "one_site_refinement_sweeps": int(
+                getattr(fit, "one_site_sweeps_run", 0)
+            ),
+            "iterations": int(getattr(fit, "iterations_run", 0)),
+            "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
+            "fit_init_strategy": resolved_fit_init_strategy,
+            "fit_init_strategy_requested": self.fit_init_strategy,
+            "guess_method": guess_method,
+            "guess_used": guess_used,
+            "target_strategy": target_strategy,
+        }
         center = fit.final_center_site
         if center is None:
             center = stop
         self.state.info["cur_orthog"] = (int(center), int(center))
 
     def _evolve_p_dmrg(self, mpo, where):
-        """Build a lossless MPO target and compress it with coefficient FIT."""
-        target = self.state.p.copy()
-        target.gate_with_submpo_(
-            mpo,
-            where=where,
-            max_bond=None,
-            cutoff=self.cutoff,
-            info={},
-            inplace_mpo=False,
+        """Build a layered target and compress it with coefficient FIT."""
+        target, target_strategy = self._build_dmrg_fit_target(mpo, where)
+        self._fit_coefficient_target(
+            target,
+            where,
+            guess_mpo=mpo,
+            target_strategy=target_strategy,
         )
-        self._fit_coefficient_target(target, where, guess_mpo=mpo)
 
     # ------------------------------------------------------------------ #
     # Measurement (Lemma 3; non-unitary |nu> update)
@@ -5787,9 +6190,43 @@ class MpsStabOptimizer:
         *non-Clifford* and has ``phi`` a multiple of ``pi/4`` (so the injection
         correction is Clifford).  Clifford-angle ``Rz`` (multiple of ``pi/2``) is
         left for the free tableau path, and non-``pi/4`` angles for the normal
-        rotation path; both return ``None``.
+        rotation path; both return ``None``.  The matrix form also accepts
+        Pepsy's public gate constructors, e.g. ``(pepsy.t(), q)`` and
+        ``(pepsy.tdg(), q)``.  A global phase is ignored, as it is physically
+        irrelevant to the injection gadget.
         """
-        if not (isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], str)):
+        if not isinstance(entry, (list, tuple)) or not entry:
+            return None
+
+        # Pepsy's gate API represents T and T-dagger as explicit matrices, and
+        # ordinary MPS streams commonly use ``(gate, q)`` entries.  Classify a
+        # diagonal unitary by its relative phase rather than by object identity
+        # so qarrays, rank-4 gate tensors, and globally phased copies work too.
+        if not isinstance(entry[0], str):
+            if len(entry) != 2:
+                return None
+            try:
+                where = _normalize_sites(entry[1])
+                matrix = _as_gate_matrix(entry[0], 1)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if len(where) != 1 or matrix.shape != (2, 2) or not _is_unitary(matrix):
+                return None
+            scale = max(float(np.max(np.abs(matrix))), 1.0)
+            off_diagonal = matrix - np.diag(np.diag(matrix))
+            if not np.allclose(off_diagonal, 0.0, rtol=1e-8, atol=1e-9 * scale):
+                return None
+            diagonal = np.diag(matrix)
+            if min(abs(diagonal[0]), abs(diagonal[1])) <= 1e-12:
+                return None
+            relative_phase = diagonal[1] / diagonal[0]
+            k = np.angle(relative_phase) / (math.pi / 4)
+            nearest_k = int(round(k))
+            if abs(k - nearest_k) > 1e-8 or nearest_k % 2 == 0:
+                return None
+            return int(where[0]), nearest_k * (math.pi / 4)
+
+        if len(entry) < 2:
             return None
         name = entry[0].strip().lower()
         if name == "t":
@@ -6492,6 +6929,16 @@ class MpsStabOptimizer:
         k = len(where)
         # Validate support before either the complexity guard or decomposition.
         pauli_string(("I",) * k, where, self.n)
+        if k == 4:
+            warnings.warn(
+                "Applying a 4-qubit dense physical gate requires a 256-term "
+                "Pauli decomposition; this is deliberately expensive and is "
+                "preferably expressed as smaller supported gates. The default "
+                "max_pauli_decomposition_qubits=3 will reject it unless the "
+                "limit is raised explicitly.",
+                UserWarning,
+                stacklevel=3,
+            )
         limit = self.max_pauli_decomposition_qubits
         if limit is not None and k > limit:
             raise ValueError(

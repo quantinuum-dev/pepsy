@@ -395,6 +395,18 @@ class STNState:
     # Backward-compatible alias.
     nu_frame_pauli = frame_pauli
 
+    def tableau(self):
+        """Return a fresh :class:`stim.Tableau` for the live basis Clifford.
+
+        The STN representation is ``|psi> = C |p>``.  Stim exposes the
+        simulator's inverse tableau, so this method returns its inverse: the
+        tableau for ``C`` itself, with ``x_output(i)`` giving destabilizer
+        ``d_i`` and ``z_output(i)`` giving stabilizer ``s_i``.  A fresh tableau
+        is returned so display or circuit-conversion code cannot mutate the
+        live simulator through this readout helper.
+        """
+        return self._sim.current_inverse_tableau().inverse()
+
     # ------------------------------------------------------------------ #
     # Clifford update (basis only; |nu> unchanged)
     # ------------------------------------------------------------------ #

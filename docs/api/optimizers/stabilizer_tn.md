@@ -8,27 +8,40 @@ update only the tableau (free, `|nu>` unchanged); non-Clifford gates and
 measurements update `|nu>`.
 
 General physical matrices use the exact coefficient-frame Pauli mapping when
-their explicit budget is raised beyond the default two qubits. Set
-`max_pauli_decomposition_qubits=3` (or `max_operator_qubits=3` for TreeStab)
-and keep `max_pauli_terms` bounded; both guards are checked before the operator
-sum is applied. `chi=None` remains exact up to the configured cutoff, while a
-finite `chi` compresses the mapped operator with the normal diagnostics. The
-coefficient-MPS compression backend is selected with `mode="mpo"` (the
-default), `"dmrg"`/`"dmrg1"`/`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`,
-`"perm"`, or `"exact"`. `mode="exact"` forces `chi=None`; Clifford tableau
-updates remain free in every mode. Canonical Quimb compression names use
-`mode="quimb-<method>"`, with `"quimb"` as the direct alias. The historical
-`"mpo-<method>"` and `"mpo"` names remain supported. Methods include
-`direct`, `dm`, `zipup`, SRC/SRCMPS variants, and the Quimb `fit-*`
-variants.
+their explicit budget is within the default three qubits. Set
+`max_pauli_decomposition_qubits=4` only when accepting the 256-term cost of a
+four-qubit dense gate; such gates emit a warning and are rejected by default.
+Set `max_pauli_terms` separately to bound the retained decomposition. `chi=None`
+remains exact up to the configured cutoff, while a finite `chi` compresses the
+mapped operator with the normal diagnostics. The coefficient-MPS compression
+backend uses the same bare method names as `MpsOptimizer`: `mode="direct"`
+(the default), `"dm"`, `"zipup"`, `"src"`, their `*-first` and
+`*-oversample` variants, and the `fit-*` variants. `"dmrg"`/`"dmrg1"`/
+`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`, `"perm"`, and `"exact"` remain
+available. Historical `"quimb-*"` and `"mpo-*"` spellings are accepted only
+as deprecated aliases. `mode="exact"` forces `chi=None`; Clifford tableau
+updates remain free in every mode.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
-Quimb-compressed FIT guess before active bonds reach their `chi` ceilings;
-`"guess-zipup"` is the default. `"direct"`, `"random"`,
+native-compressed FIT guess before active bonds reach their `chi` ceilings;
+`"guess-src"` is the default SRC warm-up and continues into the fixed-rank
+one-site phase after expansion. `"auto"` resolves to `"guess-src"`.
+`"direct"`, `"random"`,
 `"random_expand"`, and `"svd_guess"` are also supported. The underscore
 spelling, for example `"guess_zipup"`, remains a compatibility alias. Set
 `compression_seed` separately from the STN measurement `seed` for randomized
-Quimb methods.
+native methods. The STN DMRG wrapper grows with a two-site FIT target for
+`dmrg`, `dmrg1`, and `dmrg2`, and a three-site target for `dmrg3` when the
+active frame window spans at least three sites; `dmrg3` falls back to two-site
+FIT for the common two-qubit window. Each update finishes with a one-site
+refinement on multi-site windows, while the SRC guess is kept isolated from
+the exact target construction. On dense backends, the exact coefficient
+sub-MPO is retained as a tagged lazy FIT target layer: the active MPS window
+is canonicalized first, then FIT contracts the MPS and sub-MPO tensors without
+absorbing the operator into an intermediate target MPS. Symmray and fermionic
+routes retain the materialized backend-safe target fallback.
+`get_fit_diagnostics()` reports the selected block size, growth/refinement
+sweeps, SRC guess method, target representation, and the DMRG1 one-site latch.
 
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are
@@ -140,10 +153,48 @@ constructs a dense `2**n`-by-`2**n` Clifford matrix. `to_physical_statevector()`
 remains a compatibility alias for `to_statevector()`. For a non-dense physical
 representation, use `sim.to_mps(mode="exact")`. This replays the tableau gate
 stream into a new ordinary MPS with unlimited bond and zero cutoff. For
-controlled approximation, use `mode="mpo"` or `mode="dmrg"` with `chi=...`
+controlled approximation, use a bare native mode such as `mode="src"` or
+`mode="dmrg"` with `chi=...`
 and `cutoff=...`; `logical_order=True` (the default) returns sites in logical
 qubit order, even when a static STN coefficient layout is installed.
 `to_physical_mps()` remains a compatibility alias for `to_mps()`.
+
+## Tableau inspection
+
+The STN basis Clifford is available as a read-only Stim tableau.  It is the
+`C` in `|psi> = C|nu>`; `x_output(i)` gives destabilizer `d_i` and
+`z_output(i)` gives stabilizer `s_i`:
+
+```python
+tableau = sim.tableau()
+print(tableau)
+```
+
+For a compact Pepsy-style summary, use `ascii_tableau()` to obtain text or
+`show()` to print it.  The default sparse generator format reports only the
+non-identity support, while `compact=False` uses Stim's full-width Pauli
+strings.  `max_generators=` is useful for large registers:
+
+```python
+sim.show(max_generators=12, color=True)
+text = sim.ascii_tableau(compact=False, color=False)
+```
+
+`draw()` returns a Stim circuit diagram of the current Clifford frame without
+materializing the dense Clifford matrix.  The default is a text timeline;
+the default text form is returned as a string.  Stim formats such as
+`timeline-svg` are forwarded as Stim diagram helper objects, and
+`format="circuit"` returns the underlying `stim.Circuit`:
+
+```python
+print(sim.draw())
+svg = str(sim.draw(format="timeline-svg"))
+circuit = sim.draw(format="circuit")
+```
+
+These views show the tableau/frame `C` only.  Non-Clifford evolution remains
+in the coefficient MPS `|nu>` and is summarized by the bond and norm fields in
+`show()`.
 
 Shot ensembles can use the same optimizer-level MPI API as ordinary MPS
 optimization:
@@ -300,7 +351,8 @@ records such as `NormEventRecord`, `ImmediateProjectionRecord`,
   the MPS SVD `cutoff`. With `operator_tol=None`, the threshold is relative to
   the matrix scale and input dtype; an explicit value is an absolute tolerance.
 - Fallback Pauli decomposition is limited by
-  `max_pauli_decomposition_qubits=2` before its `4**k` enumeration begins.
+  `max_pauli_decomposition_qubits=3` before its `4**k` enumeration begins.
+  Four-qubit dense attempts warn and require an explicit limit of at least `4`.
   Set a larger integer, or `None`, only when accepting that cost explicitly.
   Clifford matrices and one-qubit unitaries use specialized paths and bypass
   this fallback limit. After decomposition and frame mapping, sparse Pauli sums
@@ -319,8 +371,9 @@ records such as `NormEventRecord`, `ImmediateProjectionRecord`,
 
 Tree sampling shares work for repeated prefixes, but high-entropy states can
 still generate a number of live branches proportional to the shot count.
-Fallback dense matrices use a `4**k` Pauli decomposition and are limited to two
-qubits by default. Sparse results such as `I + XX`, `I + YY`, `I + ZZ`, or
+Fallback dense matrices use a `4**k` Pauli decomposition and are limited to
+three qubits by default. Four-qubit attempts warn and are rejected unless the
+limit is raised explicitly. Sparse results such as `I + XX`, `I + YY`, `I + ZZ`, or
 small mixtures of those terms are applied as a single exact sub-MPO; dense
 results are combined with a balanced, streaming MPS sum. This improves
 reduction depth but does not remove the exponential number of candidate Paulis.
