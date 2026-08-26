@@ -3251,7 +3251,7 @@ def test_mps_optimizer_fit_defaults_are_adaptive_and_fixed_pair_sweeps():
 
 @pytest.mark.parametrize(
     ("dtype", "expected"),
-    [("complex64", 1.0e-5), ("complex128", 1.0e-8)],
+    [("complex64", 1.0e-5), ("complex128", 1.0e-9)],
 )
 def test_mps_optimizer_auto_fit_rtol_tracks_state_dtype(dtype, expected):
     """The automatic FIT tolerance follows the live MPS precision."""

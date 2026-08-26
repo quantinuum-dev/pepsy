@@ -4404,7 +4404,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_rtol : {"auto"} | float | None, default="auto"
             Relative tolerance for DMRG FIT early stopping. ``"auto"``
             selects a dtype-aware tolerance: ``1e-3`` for 16-bit data,
-            ``1e-5`` for 32-bit/``complex64`` data, and ``1e-8`` for higher
+            ``1e-5`` for 32-bit/``complex64`` data, and ``1e-9`` for higher
             precision data. Early stopping compares changes in the retained
             canonical-center norm ``A``. ``None`` disables early stopping and
             restores fixed ``n_iter`` behavior.
@@ -8152,7 +8152,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 return 1e-3
             if "32" in dtype or "complex64" in dtype:
                 return 1e-5
-            return 1e-8
+            return 1e-9
         if value is None:
             return None
         try:
