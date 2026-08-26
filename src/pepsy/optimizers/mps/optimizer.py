@@ -1186,7 +1186,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         directly with one-site sweeps. ``"dmrg2"`` uses two-site updates
         for the required warm-up (two sweeps by default), then one-site
         refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
-        three-site updates before one-site refinement.
+        three-site updates before one-site refinement. ``"mix"`` defaults to
+        a direct/MPO warm-up on under-capacity active bonds, followed by
+        transactional one-site DMRG/FIT; explicit ``fit_block_size=2`` or
+        ``3`` opts into mixed block-FIT transactions.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -4219,7 +4222,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_min_iter=2,
         fit_rtol=1.0e-8,
         fit_patience=2,
-        fit_block_size=2,
+        fit_block_size=None,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         fit_layer_size=None,
@@ -4236,7 +4239,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_stabilize_unitary=_DEPRECATED_OPTION,
         timing=False,
         timing_sync_device=False,
-        quality_check_every=None,
+        quality_check_every=False,
         quality_check_repair=True,
         shots=1,
         error_model=None,
@@ -4383,8 +4386,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             The default of two stops after one stable comparison between two
             one-site sweeps. Rank-adaptive DMRG still performs its minimum
             adaptive warm-up before this criterion can stop a run.
-        fit_block_size : {1, 2, 3}, default=2
+        fit_block_size : {1, 2, 3} | None, default=None
             Number of neighboring MPS tensors optimized by each FIT update.
+            ``None`` selects two-site FIT for ordinary DMRG and one-site FIT
+            for ``mode="mix"``. In mixed mode, the one-site default first
+            uses direct/MPO updates to warm under-capacity active bonds, then
+            hands later eligible gates to transactional DMRG1.
             Two-site FIT is recommended: it forms both physical legs and the
             two outer virtual legs, then uses a native SVD on the middle bond,
             allowing active bonds to grow up to ``chi``. One-site FIT is kept
@@ -4409,7 +4416,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             attainable ceilings are reached. For ``mode="dmrg2"`` and
             ``mode="dmrg3"``, this sets the required two- or three-site
             warm-up length. The value is clipped to ``n_iter`` and ignored
-            for ``fit_block_size=1``; the default is two sweeps.
+            for ``fit_block_size=1``; the default is two sweeps. Mixed mode's
+            one-site path does not use this value as a two-site warm-up.
         fit_sweep_sequence : str, default="RL"
             Cyclic FIT sweep directions. ``"R"`` is left-to-right, ``"L"``
             is right-to-left, and ``"RL"`` alternates. Alternating sweeps avoid
@@ -4498,7 +4506,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             at timing boundaries so reported values include device kernels.
             The accelerator route is resolved once; CPU data needs no barrier.
             Leave disabled for the lowest-overhead timing run.
-        quality_check_every : int | bool | None, default=None
+        quality_check_every : int | bool | None, default=False
             If set, periodically check finite tensor data and canonical-gauge
             coverage after replay steps. ``True`` checks every step.
         quality_check_repair : bool, default=True
@@ -4625,6 +4633,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.quality_checks = []
         if mode is not None:
             self.set_mode(mode)
+
+        # Mixed mode is intentionally a direct/MPO warm-up followed by
+        # one-site DMRG. Keep the ordinary DMRG default at two-site FIT, while
+        # allowing callers to opt into mixed two- or three-site transactions
+        # explicitly with ``fit_block_size=2`` or ``3``.
+        if fit_block_size is None:
+            fit_block_size = 1 if self.mode == "mix" else 2
 
         # Keep the caller's omission distinct from an explicit cutoff mode.
         # Most Pepsy paths use rsum2, while Quimb's density-matrix compressor
@@ -7685,8 +7700,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             compression_seed=compression_seed,
             stabilize_unitary=stabilize_unitary,
         )
-        if not self._mps_data_is_finite(self.p):
-            raise FloatingPointError("MPO batch produced non-finite MPS tensor data.")
+        active_where = (
+            min(site for where in where_seq for site in where),
+            max(site for where in where_seq for site in where),
+        )
+        self._validate_mix_norm(active_where, operation="MPO batch")
 
     def _run_mix_dmrg(self, *args, fit_block_size, **kwargs):
         """Run mixed DMRG with a stable named FIT schedule when available.
@@ -7699,7 +7717,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         requested_block_size = int(fit_block_size)
         schedule_alias = {
-            1: ("dmrg2", 2),
+            1: ("dmrg1", 1),
             2: ("dmrg2", 2),
             3: ("dmrg3", 3),
         }.get(requested_block_size)
@@ -7764,8 +7782,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_single_pair_fast_path=fit_single_pair_fast_path,
             stabilize_unitary=stabilize_unitary,
         )
-        if not self._mps_data_is_finite(self.p):
-            raise FloatingPointError("DMRG step produced non-finite MPS tensor data.")
+        self._validate_mix_norm(where, operation="DMRG step")
 
     def _run_mix_dmrg_batch(
         self,
@@ -7816,8 +7833,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_single_pair_fast_path=fit_single_pair_fast_path,
             stabilize_unitary=stabilize_unitary,
         )
-        if not self._mps_data_is_finite(self.p):
-            raise FloatingPointError("DMRG batch produced non-finite MPS tensor data.")
+        active_where = (
+            min(site for where in where_seq for site in where),
+            max(site for where in where_seq for site in where),
+        )
+        self._validate_mix_norm(active_where, operation="DMRG batch")
         if self._effective_max_bond(self.p) > int(self.chi):
             raise RuntimeError(
                 "DMRG batch exceeded the mixed-mode chi bond limit."
@@ -7921,6 +7941,33 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 left_inds=tensor.left_inds,
             )
         return trial_p, sites
+
+    def _validate_mix_norm(self, where, *, operation):
+        """Validate the cheap retained norm used by mixed-mode commits.
+
+        Mixed replay already leaves a tracked canonical center after each
+        compression. Reading that center's Frobenius norm is sufficient for
+        the normal health check and avoids scanning every tensor payload on
+        every transaction. Full tensor-data checks remain available through
+        ``quality_check_every``.
+        """
+        try:
+            retained_norm, _ = self._retained_center_norm(self.p, where)
+            norm_value = self._real_float(ar.do("abs", retained_norm))
+            exponent = float(getattr(self.p, "exponent", 0.0))
+        except Exception as exc:
+            raise FloatingPointError(
+                f"{operation} retained norm could not be validated: {exc}"
+            ) from exc
+        if (
+            norm_value <= 0.0
+            or not np.isfinite(norm_value)
+            or not np.isfinite(exponent)
+        ):
+            raise FloatingPointError(
+                f"{operation} produced a zero or non-finite retained norm."
+            )
+        return norm_value
 
     def _restore_mix_state(self, snapshot):
         """Restore a mixed-mode transaction without changing caller identity."""
@@ -8273,9 +8320,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Apply transactional FIT with an MPO fallback.
 
-        Block FIT grows active bonds directly. When the caller explicitly
-        selects one-site FIT, the MPO rank warm-up hands off to a DMRG2-style
-        two-site phase followed by one-site refinement. Non-unitary trajectory
+        Block FIT grows active bonds directly. Mixed mode's one-site default
+        uses direct/MPO updates as a rank warm-up, then hands later eligible
+        gates to one-site DMRG/FIT. Explicit block sizes 2 and 3 retain their
+        corresponding mixed block-FIT schedules. Non-unitary trajectory
         branches use the explicit MPO fallback because mixed FIT is defined
         only for unitary working-norm updates.
         """
@@ -8350,17 +8398,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 pbar.update(len(entries))
 
         mpo_state_needs_check = False
+        mpo_state_check_where = None
 
         def check_pending_mpo_state():
             """Validate one completed contiguous MPO warm-up block."""
-            nonlocal mpo_state_needs_check
+            nonlocal mpo_state_needs_check, mpo_state_check_where
             if not mpo_state_needs_check:
                 return
-            if not self._mps_data_is_finite(self.p):
-                raise FloatingPointError(
-                    "MPO warm-up produced non-finite MPS tensor data."
-                )
+            self._validate_mix_norm(
+                mpo_state_check_where,
+                operation="MPO warm-up",
+            )
             mpo_state_needs_check = False
+            mpo_state_check_where = None
 
         idx = 0
         try:
@@ -8377,8 +8427,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 active_bond_is_short = self._mix_active_bond_is_short(
                     where, target_sizes=target_sizes
                 )
-                # Block FIT can grow the active bonds itself. The historical
-                # MPO warm-up remains only for fixed-rank one-site FIT.
+                # Block FIT can grow the active bonds itself. The mixed
+                # one-site path uses direct/MPO warm-up first so that the
+                # subsequent one-site FIT has the required bond support.
                 needs_rank_warmup = fit_block_size == 1 and (
                     start_bond < target_bond or active_bond_is_short
                 )
@@ -8401,6 +8452,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     mpo_steps += 1
                     mpo_state_needs_check = True
+                    mpo_state_check_where = where
                     if len(where) == 1:
                         reason = "one_site_exact"
                     elif self._mix_dmrg_disabled_reason is not None:

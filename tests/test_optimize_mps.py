@@ -1524,8 +1524,8 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
-def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
-    """MPO rank warm-up should feed the DMRG2 two-site/one-site schedule."""
+def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg1():
+    """Direct warm-up should feed the default mixed one-site DMRG schedule."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1539,7 +1539,6 @@ def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
         progbar=False,
         cutoff=1e-12,
         n_iter=3,
-        fit_block_size=1,
         fit_rtol=None,
         timing=True,
     )
@@ -1552,10 +1551,10 @@ def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
         "dmrg",
     ]
     fit_steps = opt.get_run_timing()["fit_steps"]
-    assert [record["block_size"] for record in fit_steps] == [2, 2, 1]
+    assert [record["block_size"] for record in fit_steps] == [1, 1, 1]
     diagnostics = opt.get_fit_diagnostics()
-    assert diagnostics["adaptive_sweeps"] == 2
-    assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["one_site_refinement_sweeps"] == 3
     assert opt.last_mix_summary["mpo_steps"] == 3
     assert opt.last_mix_summary["dmrg_steps"] == 1
 
@@ -1634,9 +1633,9 @@ def test_mps_optimizer_mix_history_accumulates_control_segments():
     opt.run(progbar=False, seed=7)
 
     assert [event["step"] for event in opt.mix_history] == [1, 2]
-    assert [event["backend"] for event in opt.mix_history] == ["mpo", "dmrg"]
-    assert opt.last_mix_summary["mpo_steps"] == 1
-    assert opt.last_mix_summary["dmrg_steps"] == 1
+    assert [event["backend"] for event in opt.mix_history] == ["mpo", "mpo"]
+    assert opt.last_mix_summary["mpo_steps"] == 2
+    assert opt.last_mix_summary["dmrg_steps"] == 0
 
 
 def test_mps_optimizer_mix_one_site_is_exact_at_target_bond():
@@ -1661,8 +1660,9 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
 
     def nonfinite_dmrg(self, *args, **kwargs):
         original_run_dmrg(self, *args, **kwargs)
-        data = np.asarray(self.p[0].data)
-        self.p[0].modify(data=np.full_like(data, np.nan))
+        center = self._current_orthog(self.p)[0]
+        data = np.asarray(self.p[center].data)
+        self.p[center].modify(data=np.full_like(data, np.nan))
 
     monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", nonfinite_dmrg)
     opt = py.MpsOptimizer(p0, gates=gates, chi=2, mode="mix", inplace=True)
@@ -3194,6 +3194,7 @@ def test_new_fit_configuration_is_keyword_only():
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["cutoff"].default == "auto"
     assert run_parameters["fit_rtol"].default == pytest.approx(1.0e-8)
+    assert run_parameters["quality_check_every"].default is False
     for name in (
         "fit_min_iter",
         "fit_rtol",
@@ -5386,8 +5387,8 @@ def test_mps_optimizer_dmrg_mode_aliases_select_block_size(mode, expected_blocks
     ] == expected_blocks
 
 
-def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
-    """Successful mixed FIT sweeps should share one full pre-commit check."""
+def test_mps_optimizer_mix_uses_norm_guard_without_full_scan(monkeypatch):
+    """Successful mixed FIT should avoid a full post-update data scan."""
     original_check = py.MpsOptimizer._mps_data_is_finite
     checks = 0
 
@@ -5413,11 +5414,11 @@ def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
     opt.run(progbar=False, n_iter=3, fit_rtol=None)
 
     assert opt.mix_history[0]["backend"] == "dmrg"
-    assert checks == 1
+    assert checks == 0
 
 
-def test_mps_optimizer_mix_full_checks_once_per_mpo_warmup(monkeypatch):
-    """Consecutive MPO warm-up gates should share one final full-state check."""
+def test_mps_optimizer_mix_uses_norm_guard_after_mpo_warmup(monkeypatch):
+    """MPO warm-up should avoid a full post-update data scan."""
     original_check = py.MpsOptimizer._mps_data_is_finite
     checks = 0
 
@@ -5445,7 +5446,7 @@ def test_mps_optimizer_mix_full_checks_once_per_mpo_warmup(monkeypatch):
     opt.run(progbar=False, fit_block_size=1)
 
     assert [entry["backend"] for entry in opt.mix_history] == ["mpo"] * 3
-    assert checks == 1
+    assert checks == 0
 
 
 def test_mps_optimizer_mix_stops_fit_adaptively():
@@ -5470,9 +5471,9 @@ def test_mps_optimizer_mix_stops_fit_adaptively():
 
     event = opt.mix_history[0]
     assert event["backend"] == "dmrg"
-    # The adaptive warm-up is mandatory; tolerance stopping then gets a
-    # separate one-site refinement phase.
-    assert event["fit_iterations"] == 4
+    # Mixed mode's default is one-site FIT, so there is no separate block
+    # warm-up phase before tolerance stopping.
+    assert event["fit_iterations"] == 2
     assert event["fit_converged"] is True
     assert event["fit_relative_change"] <= 1e9
 
