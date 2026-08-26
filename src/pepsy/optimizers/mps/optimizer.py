@@ -151,6 +151,13 @@ _MPO_METHODS_NEED_INTERIOR_WORKAROUND = frozenset(
         "fit-projector",
     }
 )
+# Keep these method groups separate because they answer different questions:
+# ``IGNORE_CUTOFF`` describes methods whose rank is fixed by ``max_bond``;
+# ``USE_SEED`` describes methods whose randomized initial projection can be
+# replayed; and ``NEED_INTERIOR_WORKAROUND`` describes Quimb wrappers that
+# otherwise try to permute a partitioned, non-full-chain site-tag sequence.
+# Combining them would make a valid option for one method family leak into a
+# different family (for example, forwarding a seed as a contraction option).
 _QUIMB_SEED_LOCK = threading.RLock()
 _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
@@ -1283,7 +1290,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mode_norm = str(mode).strip().lower()
         # ``fit`` names the algorithm while ``dmrg`` preserves the historical
         # mode spelling. DMRG1/2/3 are readable block-size aliases that share
-        # the same implementation and are normalized to ``dmrg``.
+        # the same implementation and are normalized to ``dmrg``. The alias
+        # is recorded by the constructor before this function runs, so the
+        # shared implementation can still select the requested schedule.
         if mode_norm == "fit" or mode_norm in cls._DMRG_MODE_ALIASES:
             mode_norm = "dmrg"
         elif mode_norm in _MPO_COMPRESSION_METHODS:
@@ -1360,6 +1369,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Return compression options for a sub-MPO method."""
         opts = {}
+        # ``cutoff`` controls discarded singular weight for ordinary methods.
+        # SRC/SRCMPS are rank-controlled randomized projections, so Quimb
+        # intentionally ignores a singular-value cutoff for those methods.
         opts["cutoff"] = (
             0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
         )
@@ -1375,6 +1387,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             opts["canonize"] = False
         if method == "direct":
             return opts
+        # Quimb's ``auto`` paths already choose their own contraction tree.
+        # Only forward an explicit optimizer so this wrapper does not turn a
+        # harmless default into an unsupported nested contraction option.
         optimize = self.contraction_opt
         if optimize is None:
             return opts
@@ -2501,6 +2516,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target = p.copy()
         target.canonicalize_((start, stop), info={})
 
+        # Target representation and FIT initial guess are independent knobs:
+        # the target must preserve the exact operator action, while the guess
+        # only affects how quickly the variational solve finds that target.
+        # Layering is safe for dense data because each operator tensor keeps
+        # its site tag; native graded data must stay on the materialized route
+        # so charge sectors and dummy-mode metadata are not discarded.
         layered_supported = not (
             self._has_symmray_data(target)
             or target.isfermionic()
@@ -2608,6 +2629,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             guess_method = None
 
         if guess_method is not None:
+            # An explicit ``guess-*`` request is a warm-start policy, not a
+            # request to grow rank. Apply it even after the active bonds reach
+            # their attainable size; otherwise the one-site phase would use a
+            # different initial state from the growth phase.
             fit_guess = p.copy()
             opts = self._submpo_compress_opts(
                 guess_method,
@@ -4766,6 +4791,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("normalize_every requires non_unitary=True.")
             if normalize_final:
                 raise ValueError("normalize_final requires non_unitary=True.")
+        # This is the public-to-backend policy boundary. Validate the stream
+        # and layout first, then resolve sentinels once so every mode receives
+        # the same numeric cutoff and normalization contract. In particular,
+        # ``None`` means Pepsy's default for ordinary paths but remains
+        # observable as an omission for Quimb's method-specific MPO defaults.
         normalize_every = self._normalize_every_interval(
             normalize_every,
             non_unitary=non_unitary,
@@ -5258,6 +5288,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             event_seq,
         )
 
+        # Dispatch only after payload preparation. The mode implementations
+        # share the same validated stream but have different state contracts:
+        # DMRG owns local variational targets, MPO owns Quimb compression,
+        # swap/perm own endpoint movement, and exact/SU deliberately bypass
+        # canonical-center bookkeeping. Keeping the branches here prevents a
+        # control-event caller from accidentally selecting a gate-only kernel.
         if self.mode == "dmrg":
             self._timed_call("dmrg.prepare", self._prepare_dmrg_state)
             self._timed_call(
@@ -5468,6 +5504,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seg_event = []
 
         def flush():
+            # A control event is a state boundary: all preceding gates must be
+            # committed before its expectation/probability is evaluated, and
+            # all following gates must see the collapsed/reset/capped state.
+            # Therefore segments are intentionally never allowed to cross a
+            # control event, even when the active mode could batch the gates.
             if seg_G:
                 self._execute_mode(
                     list(seg_G),
@@ -5487,6 +5528,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ):
             if event_type in _CONTROL_EVENT_NAMES:
                 flush()
+                # ``where`` may already be physical when a persistent layout
+                # is active. ``record_where`` remains logical so measurements
+                # and feed-forward records use the user's labels.
                 self._apply_control_event(
                     event_type,
                     payload,
@@ -5939,6 +5983,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
         )
+        # The direct API is preferred for a full-chain or ordinary local
+        # payload. A partitioned interior payload needs the local workaround
+        # only for wrappers whose nested call assumes every chain site has a
+        # matching tag; keeping the partition local avoids both tag failures
+        # and unnecessary full-chain contraction work.
         if (
             method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
             and _is_interior_submpo_span(p, where)
@@ -6112,6 +6161,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         if record_where is None:
             record_where = where
+        # Compute the physical Born probability before constructing or applying
+        # any localizer. The localizer is a Clifford change of Pauli frame; it
+        # can make the same observable look simpler, but its post-frame
+        # expectation is not the probability of the original branch.
         exp = self._state_expectation(pauli, where)
         p_plus = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
         if outcome is None:
@@ -6137,6 +6190,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             m,
         )
         if projector_submpo is not None:
+            # Dense multi-site projectors stay as a bond-two MPO. DMRG receives
+            # it as a lazy exact target; other MPS modes use their selected
+            # Quimb compression method directly. This keeps target formation
+            # separate from output compression and avoids a dense 2**k matrix.
             submpo, span = projector_submpo
             if self.mode == "dmrg" and mode_kwargs is not None:
                 projected_norm, collapse_center = self._run_dmrg_measurement(
@@ -6201,6 +6258,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             projected_norm = self._real_float(ar.do("abs", self.p.norm()))
         self._record_norm_event(
             norm_kind,
+            # ``prob`` is the physical branch factor, while ``projected_norm``
+            # is the norm after the selected approximate compression route.
+            # The norm event records both effects without counting the branch
+            # probability as compression infidelity.
             expected_norm=input_norm * math.sqrt(float(prob)),
             observed_norm=projected_norm,
             where=where,
@@ -8824,6 +8885,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         _ = target_cutoff  # lazy targets are kept exact until FIT compression
 
         try:
+            # Keep the projected state unnormalized throughout FIT. The final
+            # center norm is the branch-amplitude measurement used by the
+            # caller; renormalization belongs only to the post-collapse finish
+            # so a DMRG approximation cannot replace the physical branch
+            # probability with a post-localizer value.
             p_target = self._timed_call(
                 "dmrg.target",
                 self._build_lazy_submpo_target,
@@ -8881,6 +8947,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 collect_split_diagnostics=False,
             )
         except Exception as exc:  # retain the direct compressed fallback
+            # FIT failures are transactional for this multi-site window.
+            # Restore both tensor data and canonical metadata before using the
+            # direct MPO fallback; otherwise partial variational writeback
+            # could be silently combined with the fallback target.
             fit_error = exc
 
         fit_norm = None if fit is None else fit.final_norm
@@ -9035,6 +9105,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_target_strategy
         )
         if fit_target_strategy == "auto":
+            # Layered targets retain exact operator factors without building a
+            # growing target MPS, but they rely on ordinary dense site tags.
+            # Native Symmray/fermionic states therefore stay on their graded
+            # materialized route, where charge and dummy-mode metadata survive.
             fit_target_strategy = (
                 "mps"
                 if self._has_symmray_data(self.p) or self.p.isfermionic()
@@ -9171,6 +9245,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
 
                     if is_submpo:
+                        # An explicit sub-MPO is already the operator target;
+                        # keep it as a lazy layer rather than densifying it or
+                        # applying it to the live MPS before FIT.
                         p_g, active_target_strategy = self._timed_call(
                             "dmrg.target",
                             self._build_submpo_fit_target,
@@ -9183,6 +9260,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         )
                         native_fermionic_warm_start = False
                     else:
+                        # Ordinary gates use the same target policy, but the
+                        # native fermionic warm start is allowed to open charge
+                        # sectors before FIT. That warm start is a disposable
+                        # preparation step and never substitutes for ``p_g``.
                         active_target_strategy = fit_target_strategy
                         p_g = self._timed_call(
                             "dmrg.target",
@@ -9847,6 +9928,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if cutoff_mode is None
             else cutoff_mode
         )
+        # ``mpo_cutoff_mode`` is intentionally resolved by ``run`` before
+        # entering this backend: ``None`` means keep Quimb's native default
+        # for methods such as ``dm``. One-site gates do not invoke that MPO
+        # compressor, so they use the ordinary Pepsy cutoff policy here.
         mpo_compress_opts = self._submpo_compress_opts(
             mpo_method,
             cutoff=cutoff,
@@ -9888,6 +9973,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             gate = G_seq[idx]
             event_type = event_seq[idx]
             if event_type == "submpo":
+                # The payload is already an exact operator representation.
+                # Apply it through ``gate_with_submpo_`` so the selected
+                # compressor sees the original MPO; do not densify it merely
+                # to reuse the ordinary gate branch.
                 submpo_count += 1
                 xmin, xmax = min(where), max(where)
                 if (
@@ -10077,6 +10166,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         the current ``self.qubits`` mapping translates them to physical sites,
         and the right endpoint remains at the left endpoint's neighbour.
         """
+        # ``swap_back`` is the semantic switch: ``swap`` restores the input
+        # logical order after each nonlocal gate, while ``perm`` leaves the
+        # physical order changed and updates ``self.qubits`` for later gates
+        # and logical readout.
         p = self.p
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
         if not non_unitary and self._unitary_previous_norm is None:
@@ -10234,6 +10327,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         MPS data use quimb's block-aware auto-swap split path by default as a
         conservative choice for block-sparse edge cases.
         """
+        # SVD mode deliberately exposes the local gate-split algorithm. It is
+        # useful as a transparent reference, whereas MPO/DMRG modes retain a
+        # full operator target and can choose more global compression schemes.
         p = self.p
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
         if not non_unitary and self._unitary_previous_norm is None:

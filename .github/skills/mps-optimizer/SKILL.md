@@ -10,6 +10,43 @@ Use this skill for `pepsy.MpsOptimizer` and its implementation in
 [`docs/api/optimizers/mps.md`](../../../docs/api/optimizers/mps.md) and the closest
 tests before editing.
 
+## Decision guide
+
+Make decisions in this order; each choice owns a different invariant:
+
+1. **State contract.** Use `exact` for a dense reference or cyclic input,
+   `su` for gate-only simple-update evolution, and a canonical open-boundary
+   MPS mode for local norms, controls, and DMRG. Do not make a cyclic MPS look
+   canonical by scanning it—the missing loop environment makes a one-center
+   norm invalid.
+2. **Compression route.** Use `dmrg2` for the normal variational production
+   path, `dmrg1` when the fixed two-site-growth/one-site-refinement schedule is
+   required, and `dmrg3` when a three-site warm-up is useful. Use
+   `quimb-<method>` (or its bare method alias) when benchmarking a specific
+   Quimb compressor, `svd` for a transparent local split reference, and
+   `swap`/`perm` when endpoint movement is the intended representation.
+3. **Target versus guess.** `fit_target_strategy` decides how the exact
+   operator-applied target is represented (`layered` dense factors versus
+   materialized/native MPS). `fit_init_strategy` decides only the disposable
+   starting point for FIT (`direct`, random expansion, or `guess-*`). Never
+   replace the exact target with the guess, and do not disable an explicit
+   `guess-*` merely because the active bonds already reached `chi`.
+4. **Cutoff and seed.** `target_cutoff` controls optional target
+   materialization, while `cutoff` controls output compression. SRC/SRCMPS
+   choose rank through `max_bond` and ignore singular-value cutoff. Forward an
+   explicit `compression_seed`/`fit_init_seed` only to the randomized policy;
+   never leak it into a contraction-option dictionary.
+5. **Control boundaries.** Flush the preceding gate segment before
+   `measure`, `reset`, `measure_reset`, `cap`, or feed-forward dispatch. A
+   measurement probability belongs to the pre-collapse physical state; a
+   post-collapse norm is a separate compression/branch diagnostic. Preserve
+   logical site labels in records even when a persistent layout executes on
+   physical positions.
+
+When reviewing a change, ask which decision above it changes. If it changes
+more than one, keep the conversion or bookkeeping boundary explicit rather
+than hiding policy in a mode-specific helper.
+
 ## Execution modes
 
 - `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
@@ -182,6 +219,28 @@ retained one-center norm read, and scalar log-fidelity bookkeeping in timing
 records. In SVD mode measure the non-unitary target before the routed gate
 split so both that cutoff and the final chi compression contribute to reported
 loss.
+
+## Implementation review checklist
+
+Before changing `optimizer.py`, verify the following ownership boundaries:
+
+- `_normalize_mode` may canonicalize public aliases, but the DMRG alias must
+  remain available to select its schedule.
+- `_execute_mode` receives backend-prepared payloads and dispatches only gate
+  or sub-MPO events. `_run_segmented` owns control-event boundaries.
+- DMRG builds an isolated exact target, an isolated initial guess, and a
+  transactional snapshot before FIT. A fallback must restore both tensor data
+  and `info_c` before direct MPO replay.
+- `_apply_measure_event` computes the Born probability before any frame
+  localizer and records compression survival separately. A dense multi-site
+  projector should remain a bond-two sub-MPO; native graded states retain
+  their metadata-safe route.
+- `info_c["cur_orthog"]`, `p.exponent`, and raw unitary norm baselines are
+  updated together after every replacement, normalization, layout reorder, or
+  control event.
+- `where` has one meaning per layer: logical stream locations at the public
+  API, mapped physical locations during execution, and logical locations again
+  in user-facing measurement/feed-forward records.
 
 ## Validation
 
