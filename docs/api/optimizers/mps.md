@@ -11,7 +11,7 @@ import pepsy
 svd_policy = pepsy.TorchLinalgConfig(
     mode="complex",
     stabilized=False,       # native Torch forward and backward
-    svd_driver="auto",     # CUDA: let Torch select its default driver
+    svd_driver="gesvd",    # CUDA: Pepsy's exact fast default
     cpu_svd="torch",       # CPU: Torch's native LAPACK path
     svd_fallback="auto",   # no fallback for native mode
 )
@@ -20,7 +20,8 @@ print(svd_policy.describe())
 ```
 
 `svd_driver` applies only to CUDA and accepts `"auto"`, `"gesvdj"`,
-`"gesvda"`, or `"gesvd"`. `gesvda` is approximate and requires
+`"gesvda"`, or `"gesvd"`. Pepsy defaults to the exact `"gesvd"` route;
+`"auto"` and `"gesvdj"` remain explicit alternatives. `gesvda` is approximate and requires
 `allow_approximate=True`. `cpu_svd` accepts `"torch"`, `"scipy_gesdd"`, or
 `"scipy_gesvd"`; the SciPy choices are intended for explicit forward-only
 CPU experiments when `stabilized=False`, or for stabilized autodiff when
@@ -28,9 +29,9 @@ CPU experiments when `stabilized=False`, or for stabilized autodiff when
 and SciPy `gesvd` for stabilized mode.
 
 The non-approximate choices are CUDA `gesvdj` and `gesvd`, plus CPU Torch,
-SciPy `gesdd`, and SciPy `gesvd`. For `complex64`, try CUDA `gesvdj` first;
-on CPU, benchmark `scipy_gesdd` against the native Torch path. `gesvd` is a
-robust fallback rather than the speed choice. The approximate CUDA `gesvda`
+SciPy `gesdd`, and SciPy `gesvd`. For `complex64`, benchmark CUDA
+`gesvdj` against the default `gesvd` route on your hardware; on CPU,
+benchmark `scipy_gesdd` against the native Torch path. The approximate CUDA `gesvda`
 driver is never selected unless `allow_approximate=True` is passed, and the
 policy exposes this decision as `policy.exact` and `policy.approximate`.
 
@@ -45,8 +46,8 @@ pepsy.TorchLinalgConfig(
 ```
 
 On CUDA, select the exact Jacobi driver explicitly with
-`svd_driver="gesvdj"`. These settings do not change the tensor dtype; they
-change only the underlying SVD implementation.
+`svd_driver="gesvdj"` when it is faster on your hardware. These settings do
+not change the tensor dtype; they change only the underlying SVD implementation.
 
 For ordinary MPS simulation, native mode is the recommended default. The
 regularized mode exists for finite SVD gradients and difficult autodiff
@@ -120,6 +121,12 @@ re-discovers the centre, canonicalizes to one site, and refreshes
 
 Streams may also include control events. `("measure", pauli, where[, outcome])`
 collapses onto a Pauli eigenvalue and records `(pauli, where, outcome, prob)`.
+For dense MPS states, a multi-site Pauli measurement uses a bond-two windowed
+sub-MPO for the projector `(I + outcome * P) / 2`, so the measurement does not
+form a dense `2**k`-by-`2**k` operator. In DMRG modes, that sub-MPO becomes an
+exact lazy FIT target on the endpoint span and the normal `guess-src` warm-start
+is reused. Native Symmray and fermionic states retain their metadata-safe dense
+projector path.
 `("reset", where[, basis])` resets each target to the `+1` eigenstate of
 `basis` (`"Z"` by default, so the legacy form resets to `|0>`); the internal
 measurement is not recorded. `("measure_reset", basis, where[, outcome])`
@@ -269,7 +276,8 @@ schedule for local windows. For a long-range window that is wider than the
 selected FIT block, it uses the corresponding fixed block handoff so the
 terminal canonical center remains authoritative for unitary norm tracking;
 the randomized FIT initialization is unchanged. `mode="mix"` is the
-transactional unitary variant.
+transactional unitary variant and defaults to one-site DMRG/FIT after a
+direct/MPO warm-up of under-capacity active bonds.
 With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
 to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
 not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
@@ -287,13 +295,12 @@ or `guess-<method>` compressed by Quimb. The available methods are
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).
 Native Symmray and fermionic paths use their graded sector-growth route without
-dense random padding. `fit_block_size=1` retains
-the fixed-rank compatibility algorithm, for which mixed mode still warms short
-active bonds through MPO. After that warm-up, mixed mode hands off to the
-`dmrg2` schedule: two two-site sweeps followed by one-site refinement.
-Mixed two-site and three-site FIT transactions likewise use the named
-`dmrg2` and `dmrg3` schedules, respectively, so every mixed transaction has
-the same canonical handoff.
+dense random padding. `fit_block_size=1` selects the fixed-rank compatibility
+algorithm. In mixed mode, it first applies eligible gates through the
+direct/MPO path while active bonds are under capacity, then hands later
+eligible gates to one-site DMRG/FIT through a transactional commit. Mixed
+two-site and three-site FIT transactions remain available explicitly with
+`fit_block_size=2` and `3`, respectively.
 Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
 the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive
@@ -364,12 +371,13 @@ repeated identical sweeps.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
 when `fit_rtol="auto"`, while an explicit numeric tolerance enables
-adaptive stopping there too. Mixed DMRG additionally performs one full tensor
-check before committing a trial, while consecutive MPO warm-up steps share one
-full check at the next DMRG handoff or at the end of the segment. A
-transactional MPO fallback is checked before commit. Torch and CuPy full
-checks process one tensor at a time, combine scalar results on the device, and
-transfer one Boolean to the host.
+adaptive stopping there too. Mixed DMRG and direct/MPO warm-up transactions
+validate the retained canonical-center norm and represented exponent before
+commit. The normal path therefore avoids a full tensor-data scan; enable
+`quality_check_every=N` when periodic full finite-data and canonical-gauge
+checks are needed. A transactional MPO fallback is still norm-checked before
+commit. Torch and CuPy quality checks process one tensor at a time, combine
+scalar results on the device, and transfer one Boolean to the host.
 
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
@@ -488,7 +496,8 @@ broken canonical projection metadata rather than ordinary truncation loss.
 for 16-bit data, `1e-6` for 32-bit/complex64 data, and `1e-12` for 64-bit
 data. Explicit numeric cutoffs are unchanged.
 Set `quality_check_every=N` to record finite-data and canonical-gauge health in
-`opt.get_quality_checks()`. Checks are disabled by default; when enabled,
+`opt.get_quality_checks()`. Its default is `False`, so checks are disabled by
+default; when enabled,
 `quality_check_repair=True` re-canonicalizes if canonical coverage is lost.
 
 Mixed-mode DMRG trials isolate only the active FIT window and the canonicalization

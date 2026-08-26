@@ -37,8 +37,9 @@ tests before editing.
   `fit-oversample`.
 - `svd`: local SVD compression; `swap`: swap-and-split with swap-back.
 - `perm`: swap-and-split with lazy logical-to-physical tracking.
-- `mix`: transactional FIT with per-step MPO fallback. Two-site FIT grows
-  active bonds directly; fixed-rank one-site FIT retains MPO rank warm-up.
+- `mix`: transactional direct/MPO warm-up followed by one-site FIT by default,
+  with per-step MPO fallback. Explicit `fit_block_size=2` or `3` opts into
+  mixed block-FIT transactions.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
 
 Keep `exact` separate from MPS code. When switching from exact to an MPS mode,
