@@ -3610,6 +3610,40 @@ def test_tree_two_site_numpy_mpo_is_coerced_to_cupy_state_backend():
         np.testing.assert_array_equal(tensor.data, original)
 
 
+def test_tree_two_site_cupy_gate_does_not_unwrap_memory_pointer():
+    """A CuPy dense gate reaches TreeMPO factorization as an array."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    n = 4
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    state.apply_to_arrays(
+        lambda array: cupy.asarray(array, dtype=cupy.complex128)
+    )
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    gate = cupy.asarray(np.kron(x, x), dtype=cupy.complex128)
+    opt = TreeOptimizer(
+        [(gate, (0, 1))],
+        n=n,
+        tree=plan,
+        state=state,
+        chi=8,
+        cutoff=0.0,
+        run=False,
+    )
+
+    opt.run(progbar=False)
+
+    expected = np.zeros(2**n, dtype=np.complex128)
+    expected[12] = 1.0
+    np.testing.assert_allclose(opt.to_dense(), expected, atol=1e-12)
+
+
 def test_tree_expectation_mpo_is_batched_and_non_mutating():
     """A structured MPO expectation uses one tree pass and preserves state."""
     h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)

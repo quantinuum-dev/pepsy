@@ -204,9 +204,9 @@ def _svd_forward(
     kwargs = {"full_matrices": False}
     if A.is_cuda:
         if driver == "auto":
-            # Preserve the historical stabilized path's robust CUDA choice,
-            # while native Torch keeps its own default (currently gesvdj with
-            # a gesvd fallback in supported CUDA builds).
+            # Preserve the historical stabilized path's robust CUDA choice;
+            # the public Pepsy default passes an explicit gesvd driver, while
+            # driver="auto" intentionally retains Torch's own selection.
             if stabilized:
                 kwargs["driver"] = "gesvd"
         else:
@@ -925,7 +925,7 @@ def reset_torch_linalg_registrations():
     """Restore native Torch SVD/QR mappings and clear Pepsy's cache."""
     _REGISTERED_FUNCTIONS.clear()
     _configure_qr_rank_policy()
-    reg_native_svd_torch()
+    reg_native_svd_torch(svd_driver="gesvd")
     reg_complex_qr_torch()
 
 
