@@ -1069,9 +1069,8 @@ def _apply_dense_gate_with_method(
             # bonds. The projector fit remains valid without that optional
             # pre-gauge and Quimb's own implementation supports this path.
             opts["canonize"] = False
-        if method in _MPO_METHODS_USE_SEED:
-            opts["seed"] = seed
-        return _run_seeded_quimb(None, p.gate_nonlocal_, gate, where, **opts)
+        quimb_seed = seed if method in _MPO_METHODS_USE_SEED else None
+        return _run_seeded_quimb(quimb_seed, p.gate_nonlocal_, gate, where, **opts)
 
     submpo = qtn.MatrixProductOperator.from_dense(
         gate,
