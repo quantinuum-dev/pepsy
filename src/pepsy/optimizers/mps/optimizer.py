@@ -51,6 +51,12 @@ after every replay step, normalizes that center tensor, and accumulates the
 removed scale into ``p.exponent``. Quimb includes that exponent in ``p.norm()``,
 so ``p.norm()`` still reports the represented state norm; inspect a copy with
 ``exponent=0`` to see the rescaled data norm.
+
+On dense MPS states, a multi-site Pauli measurement is represented as a
+bond-two windowed sub-MPO for ``(I + m P) / 2``. DMRG modes attach that operator
+to an exact lazy target and use the regular FIT schedule and SRC warm-start to
+compress the post-measurement state. Native Symmray and fermionic states keep
+their dense projector fallback so charge and dummy-mode metadata are preserved.
 """
 
 from __future__ import annotations
@@ -976,7 +982,6 @@ def _apply_submpo_with_interior_workaround_impl(
                 "canonize": guess_method != "projector",
                 "permute_arrays": False,
             },
-            seed=seed,
             **{
                 key: value
                 for key, value in common.items()
@@ -5477,6 +5482,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     measure_renormalize=measure_renormalize,
+                    mode_kwargs=mode_kwargs,
                 )
             else:
                 seg_G.append(payload)
@@ -5513,6 +5519,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         measure_renormalize,
+        mode_kwargs=None,
     ):
         """Apply one measure/cap/reset control event to ``self.p``."""
         if record_where is None:
@@ -5551,6 +5558,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     measure_renormalize=measure_renormalize,
+                    mode_kwargs=mode_kwargs,
                 )
             else:
                 physical_where = (
@@ -5584,6 +5592,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 renormalize=measure_renormalize,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                mode_kwargs=mode_kwargs,
             )
         elif name == "cap":
             logical_site = int(where[0])
@@ -5609,6 +5618,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 record_where=record_where,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                mode_kwargs=mode_kwargs,
             )
         else:  # pragma: no cover - guarded by parsing
             raise ValueError(f"Unknown control event {name!r}.")
@@ -5832,6 +5842,124 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"unknown Pauli axis in {pauli!r}.") from exc
         return op
 
+    def _build_pauli_projector_submpo(self, pauli, where, outcome):
+        """Build ``(I + outcome * P) / 2`` as a bond-two windowed sub-MPO.
+
+        The dense projector is retained for native Symmray/fermionic states,
+        where a dense MPO cannot carry the target charge and dummy-mode
+        metadata. Dense MPS states use the two product branches directly:
+        ``0.5 * I`` and ``0.5 * outcome * P``.
+        """
+        if len(where) < 2:
+            return None
+        if self._has_symmray_data(self.p) or self.p.isfermionic():
+            return None
+
+        chars = [c for c in str(pauli).upper() if not c.isspace()]
+        sites = tuple(int(site) for site in where)
+        if len(chars) != len(sites):
+            raise ValueError(
+                f"pauli string {pauli!r} has {len(chars)} axes but where "
+                f"{where!r} has {len(sites)} site(s)."
+            )
+        if len(set(sites)) != len(sites):
+            raise ValueError("measurement sites must be unique.")
+        if any(axis not in _PAULI_1Q for axis in chars):
+            raise ValueError(f"unknown Pauli axis in {pauli!r}.")
+
+        axes_by_site = dict(zip(sites, chars))
+        span = tuple(range(min(sites), max(sites) + 1))
+        dtype_name = str(self.backend_dtype).lower()
+        dtype = np.complex64 if "complex64" in dtype_name else np.complex128
+        identity = np.eye(2, dtype=dtype)
+        arrays = []
+
+        for position, site in enumerate(span):
+            local = np.asarray(
+                _PAULI_1Q[axes_by_site.get(site, "I")],
+                dtype=dtype,
+            )
+            if position == 0:
+                tensor = np.zeros((2, 2, 2), dtype=dtype)
+                tensor[0] = identity
+                tensor[1] = local
+            elif position == len(span) - 1:
+                tensor = np.zeros((2, 2, 2), dtype=dtype)
+                tensor[0] = 0.5 * identity
+                tensor[1] = 0.5 * int(outcome) * local
+            else:
+                tensor = np.zeros((2, 2, 2, 2), dtype=dtype)
+                tensor[0, 0] = identity
+                tensor[1, 1] = local
+            arrays.append(self._to_state_backend(tensor))
+
+        submpo = qtn.MatrixProductOperator(
+            arrays,
+            sites=span,
+            L=int(self.p.L),
+            shape="lrud",
+            upper_ind_id=self.ind_id,
+            lower_ind_id="b{}",
+            site_tag_id="I{}",
+        )
+        return submpo, span
+
+    def _apply_submpo_with_method(
+        self,
+        p,
+        submpo,
+        where,
+        *,
+        method,
+        cutoff,
+        cutoff_mode,
+        info=None,
+        seed=None,
+    ):
+        """Apply and compress a sub-MPO using the selected Quimb method."""
+        if info is None:
+            info = self._info_for_state(p)
+        method = self._normalize_submpo_method(method)
+        compress_opts = self._submpo_compress_opts(
+            method,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+        )
+        if (
+            method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
+            and _is_interior_submpo_span(p, where)
+        ):
+            _apply_submpo_with_interior_workaround(
+                p,
+                submpo,
+                where,
+                chi=self.chi,
+                method=method,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                info=info,
+                inplace_mpo=False,
+                seed=seed,
+                **{
+                    key: value
+                    for key, value in compress_opts.items()
+                    if key == "optimize"
+                },
+            )
+        else:
+            _run_seeded_quimb(
+                seed,
+                p.gate_with_submpo_,
+                submpo,
+                where=where,
+                method=method,
+                max_bond=self.chi,
+                info=info,
+                inplace_mpo=False,
+                **compress_opts,
+            )
+        return p
+
     def _apply_dense_operator(self, p, op, where, *, max_bond, cutoff, cutoff_mode, info=None):
         """Apply a dense operator ``op`` on ``where`` sites of MPS ``p`` in place.
 
@@ -5930,6 +6058,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if hasattr(self.p, "exponent"):
             self.p.exponent = 0.0
 
+    def _finish_measurement_center(self, site, *, renormalize):
+        """Track and optionally normalize a post-measurement center."""
+        site = int(site)
+        current = self._current_orthog(self.p)
+        if current != (site, site):
+            self.p.canonize(
+                [site],
+                cur_orthog=current,
+                info=self.info_c,
+            )
+        self.info_c["cur_orthog"] = (site, site)
+        if not renormalize:
+            return
+        center = self.p[self.p.site_tag(site)]
+        norm = self._real_float(center.norm())
+        if norm > 0.0:
+            center.modify(data=center.data / norm)
+        if hasattr(self.p, "exponent"):
+            self.p.exponent = 0.0
+
     def _apply_measure_event(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         pauli,
@@ -5941,6 +6089,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         norm_kind="measure",
+        mode_kwargs=None,
     ):
         """Measure Pauli ``pauli`` on ``where``, collapse, and record the result.
 
@@ -5960,24 +6109,82 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 f"forced measure outcome {outcome} has ~0 probability ({prob:.2e})."
             )
-        op = self._pauli_operator(pauli, where)
-        dim = op.shape[0]
-        projector = 0.5 * (np.eye(dim, dtype=complex) + m * op)
         # Move the orthogonality centre to the (anchor) collapse site so the
         # projector acts at the centre and truncation/renormalization stay
         # local and exactly tracked.
         anchor = min(int(site) for site in where)
         self.canonize_mps(self.p, anchor)
         input_norm = self._real_float(ar.do("abs", self.p.norm()))
-        self._apply_dense_operator(
-            self.p,
-            projector,
+
+        collapse_center = None
+        projector_submpo = self._build_pauli_projector_submpo(
+            pauli,
             where,
-            max_bond=self.chi,
-            cutoff=cutoff,
-            cutoff_mode=cutoff_mode,
+            m,
         )
-        projected_norm = self._real_float(ar.do("abs", self.p.norm()))
+        if projector_submpo is not None:
+            submpo, span = projector_submpo
+            if self.mode == "dmrg" and mode_kwargs is not None:
+                projected_norm, collapse_center = self._run_dmrg_measurement(
+                    submpo,
+                    span,
+                    n_iter=mode_kwargs["n_iter"],
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fit_min_iter=mode_kwargs["fit_min_iter"],
+                    fit_rtol=mode_kwargs["fit_rtol"],
+                    fit_patience=mode_kwargs["fit_patience"],
+                    fit_block_size=mode_kwargs["fit_block_size"],
+                    fit_adaptive_sweeps=mode_kwargs["fit_adaptive_sweeps"],
+                    fit_sweep_sequence=mode_kwargs["fit_sweep_sequence"],
+                    target_cutoff=mode_kwargs["target_cutoff"],
+                    fit_target_strategy=mode_kwargs["fit_target_strategy"],
+                    fit_mpo_guess=mode_kwargs["fit_mpo_guess"],
+                    fit_init_strategy=mode_kwargs["fit_init_strategy"],
+                    fit_init_rand_strength=mode_kwargs["fit_init_rand_strength"],
+                    fit_init_seed=mode_kwargs["fit_init_seed"],
+                    fit_single_pair_fast_path=mode_kwargs[
+                        "fit_single_pair_fast_path"
+                    ],
+                    measurement_index=len(self.measurements),
+                )
+            else:
+                method = (
+                    self._mode_mpo_method(self.mode)
+                    if self._is_mpo_mode(self.mode)
+                    else "direct"
+                )
+                method_cutoff_mode = cutoff_mode
+                if mode_kwargs is not None and self._is_mpo_mode(self.mode):
+                    method_cutoff_mode = mode_kwargs.get(
+                        "mpo_cutoff_mode",
+                        cutoff_mode,
+                    )
+                self._apply_submpo_with_method(
+                    self.p,
+                    submpo,
+                    span,
+                    method=method,
+                    cutoff=cutoff,
+                    cutoff_mode=method_cutoff_mode,
+                    info=self.info_c,
+                )
+                projected_norm = self._real_float(
+                    ar.do("abs", self.p.norm())
+                )
+        else:
+            op = self._pauli_operator(pauli, where)
+            dim = op.shape[0]
+            projector = 0.5 * (np.eye(dim, dtype=complex) + m * op)
+            self._apply_dense_operator(
+                self.p,
+                projector,
+                where,
+                max_bond=self.chi,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+            projected_norm = self._real_float(ar.do("abs", self.p.norm()))
         self._record_norm_event(
             norm_kind,
             expected_norm=input_norm * math.sqrt(float(prob)),
@@ -5987,7 +6194,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             physical_boundary=True,
             renormalized=renormalize,
         )
-        self._recanonize_center(anchor, renormalize=renormalize)
+        self._finish_measurement_center(
+            anchor if collapse_center is None else collapse_center,
+            renormalize=renormalize,
+        )
         self.measurements.append(
             (str(pauli), tuple(int(site) for site in record_where), int(m), float(prob))
         )
@@ -6058,6 +6268,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         record_where,
         cutoff,
         cutoff_mode,
+        mode_kwargs=None,
     ):
         """Measure each target, record it, then reset it to the + Pauli eigenstate."""
         record_sites = tuple(int(site) for site in record_where)
@@ -6074,6 +6285,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 norm_kind="measure_reset",
+                mode_kwargs=mode_kwargs,
             )
             if m < 0:
                 self._apply_basis_flip(
@@ -6723,6 +6935,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return p_target
 
+    @staticmethod
+    def _build_lazy_submpo_target(p, submpo, where, *, copy=True):
+        """Build an exact lazy target by attaching a sub-MPO to ``p``."""
+        p_target = p.copy() if copy else p
+        p_target.gate_with_submpo_(
+            submpo,
+            where=where,
+            method="lazy",
+            inplace_mpo=False,
+        )
+        return p_target
+
     def _build_compression_fit_guess(
         self,
         p,
@@ -6746,6 +6970,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cutoff_mode=cutoff_mode,
             seed=seed,
         )
+
+    def _build_compression_submpo_fit_guess(
+        self,
+        p,
+        submpo,
+        where,
+        *,
+        method,
+        cutoff,
+        cutoff_mode,
+        seed=None,
+    ):
+        """Build a disposable compressed FIT guess from a sub-MPO."""
+        guess_mps = p.copy(deep=True)
+        self._apply_submpo_with_method(
+            guess_mps,
+            submpo,
+            where,
+            method=method,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            info={},
+            seed=seed,
+        )
+        return guess_mps
 
     def _build_compression_batch_fit_guess(
         self,
@@ -6938,6 +7187,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed,
         cutoff,
         cutoff_mode,
+        submpo=False,
     ):
         """Select the disposable FIT guess without changing the live MPS."""
         requested_strategy = self._validate_fit_init_strategy(strategy)
@@ -7010,15 +7260,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if guess_method is not None:
             if len(gates) == 1:
-                fit_guess = self._build_compression_fit_guess(
-                    p,
-                    gates[0],
-                    wheres[0],
-                    method=guess_method,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    seed=seed,
-                )
+                if submpo:
+                    fit_guess = self._build_compression_submpo_fit_guess(
+                        p,
+                        gates[0],
+                        wheres[0],
+                        method=guess_method,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        seed=seed,
+                    )
+                else:
+                    fit_guess = self._build_compression_fit_guess(
+                        p,
+                        gates[0],
+                        wheres[0],
+                        method=guess_method,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        seed=seed,
+                    )
             else:
                 fit_guess = self._build_compression_batch_fit_guess(
                     p,
@@ -8426,6 +8687,258 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 record["fit_index"] = fit_index
                 record["record_index"] = len(self._timing_state["fit_steps"])
                 self._timing_state["fit_steps"].append(record)
+
+    def _run_dmrg_measurement(
+        self,
+        submpo,
+        where,
+        *,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
+        fit_block_size,
+        fit_adaptive_sweeps,
+        fit_sweep_sequence,
+        target_cutoff,
+        fit_target_strategy,
+        fit_mpo_guess,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+        fit_single_pair_fast_path,
+        measurement_index,
+    ):
+        """Apply a multi-site projective measurement through DMRG FIT.
+
+        The unnormalized post-measurement state is first attached as a lazy
+        sub-MPO target. FIT then compresses that target on the measurement
+        span, using the same block schedule and SRC warm-start policy as an
+        ordinary DMRG gate. The target remains unnormalized so the caller can
+        record the Born-branch norm before renormalizing the live state.
+        """
+        p = self.p
+        # ``where`` is the full support of the Pauli string for the sub-MPO,
+        # while the DMRG/FIT window is represented by its endpoint span.
+        where_sites = tuple(int(site) for site in where)
+        span = (min(where_sites), max(where_sites))
+        requested_block_size = min(
+            int(fit_block_size),
+            span[1] - span[0] + 1,
+        )
+        self._validate_dmrg1_iteration_budget(
+            p,
+            span,
+            n_iter=n_iter,
+            block_size=requested_block_size,
+        )
+        self._prepare_fit_window(span, block_size=fit_block_size)
+        self.canonize_mps(p, span)
+        state_snapshot = p.copy(deep=True)
+        info_snapshot = dict(self.info_c)
+
+        fit = None
+        fit_error = None
+        fit_initialization = {
+            "strategy": "direct",
+            "requested_strategy": fit_init_strategy,
+            "guess_method": None,
+            "guess_used": False,
+            "svd_guess_used": False,
+            "random_initialization": {
+                "enabled": False,
+                "reason": "direct",
+            },
+        }
+        active_fit_block_size = self._dmrg_fit_block_size(
+            p,
+            span,
+            fit_block_size,
+        )
+        adaptive_sweeps = (
+            2 if self._dmrg_mode_alias == "dmrg1" else int(fit_adaptive_sweeps)
+        )
+        adaptive_rank_schedule = self._dmrg_mode_alias not in {
+            "dmrg1",
+            "dmrg2",
+            "dmrg3",
+        } and not (
+            self._dmrg_mode_alias is None
+            and active_fit_block_size in {2, 3}
+            and span[1] - span[0] + 1 > active_fit_block_size
+        )
+        target_strategy = self._validate_fit_target_strategy(fit_target_strategy)
+        _ = target_cutoff  # lazy targets are kept exact until FIT compression
+
+        try:
+            p_target = self._timed_call(
+                "dmrg.target",
+                self._build_lazy_submpo_target,
+                p,
+                submpo,
+                span,
+            )
+            fit_initialization = self._timed_call(
+                "dmrg.fit_guess",
+                self._prepare_fit_initial_guess,
+                p,
+                (submpo,),
+                (span,),
+                block_size=active_fit_block_size,
+                strategy=fit_init_strategy,
+                fit_mpo_guess=fit_mpo_guess,
+                rand_strength=fit_init_rand_strength,
+                seed=(
+                    int(fit_init_seed)
+                    + 1000003 * int(measurement_index)
+                    + 1009 * int(span[0])
+                    + int(span[1])
+                ),
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                submpo=True,
+            )
+            fit = FIT(
+                p_target,
+                p=fit_initialization["fit_guess"],
+                cutoffs=cutoff,
+                contraction_opt=self.contraction_opt,
+                retag=False,
+                range_int=[span[0], span[1]],
+                inplace=True,
+                copy_target=False,
+            )
+            self._run_fit_gate(
+                fit,
+                n_iter=n_iter,
+                verbose=False,
+                min_iter=fit_min_iter,
+                rtol=fit_rtol,
+                patience=fit_patience,
+                finite_check=True,
+                block_size=active_fit_block_size,
+                sweep_sequence=fit_sweep_sequence,
+                max_bond=self.chi,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                single_pair_fast_path=fit_single_pair_fast_path,
+                adaptive_block_sweeps=adaptive_sweeps,
+                adaptive_until_rank=adaptive_rank_schedule,
+                final_one_site_sweeps=0,
+                collect_split_diagnostics=False,
+            )
+        except Exception as exc:  # retain the direct compressed fallback
+            fit_error = exc
+
+        fit_norm = None if fit is None else fit.final_norm
+        fit_center = None if fit is None else fit.final_center_site
+        if fit_error is not None:
+            self.p = self._install_represented_norm(state_snapshot)
+            self.info_c = info_snapshot
+            try:
+                self._apply_submpo_with_method(
+                    self.p,
+                    submpo,
+                    span,
+                    method="direct",
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    info=self.info_c,
+                )
+            except Exception:
+                raise fit_error.with_traceback(fit_error.__traceback__)
+            current_span = self._current_orthog(self.p)
+            center = (
+                int(current_span[0])
+                if current_span[0] == current_span[1]
+                else int(span[1])
+            )
+            if current_span[0] != current_span[1]:
+                self.canonize_mps(self.p, center)
+            projected_norm = self._real_float(
+                ar.do("abs", self.p[center].norm())
+            )
+            self._last_dmrg_fit_diagnostics = {
+                "iterations": 0 if fit is None else int(fit.iterations_run),
+                "converged": False if fit is None else bool(fit.converged),
+                "convergence_reason": (
+                    None if fit is None else fit.convergence_reason
+                ),
+                "relative_change": (
+                    None if fit is None else fit.last_relative_change
+                ),
+                "center_site": center,
+                "block_size": int(active_fit_block_size),
+                "adaptive_sweeps": 0 if fit is None else int(fit.adaptive_sweeps_run),
+                "one_site_refinement_sweeps": (
+                    0 if fit is None else int(fit.one_site_sweeps_run)
+                ),
+                "native_fermionic_warm_start": False,
+                "mpo_fit_guess_used": False,
+                "svd_guess_used": False,
+                "guess_used": False,
+                "guess_method": None,
+                "fit_init_strategy": "direct",
+                "fit_init_strategy_requested": fit_init_strategy,
+                "random_initialization": fit_initialization.get(
+                    "random_initialization"
+                ),
+                "target_strategy": target_strategy,
+                "target_representation": "lazy_submpo",
+                "backend": "mpo",
+                "fallback": True,
+                "fallback_reason": "fit_exception",
+                "fallback_error": f"{type(fit_error).__name__}: {fit_error}",
+                "fit_overlap_fidelity": None,
+                "fit_overlap_infidelity": None,
+                "fit_overlap_error": None,
+            }
+            return projected_norm, center
+
+        self.p = self._install_represented_norm(fit.p)
+        center = int(fit_center) if fit_center is not None else int(span[1])
+        if fit_center is None:
+            self.canonize_mps(self.p, center)
+        self._record_orthog_span(self.p, (center, center))
+        projected_norm = (
+            self._real_float(ar.do("abs", fit_norm))
+            if fit_norm is not None
+            else self._real_float(ar.do("abs", self.p[center].norm()))
+        )
+        fit_overlap = self._fit_overlap_diagnostics(p_target, fit.p)
+        self._last_dmrg_fit_diagnostics = {
+            "iterations": int(fit.iterations_run),
+            "converged": bool(fit.converged),
+            "convergence_reason": fit.convergence_reason,
+            "relative_change": fit.last_relative_change,
+            "center_site": center,
+            "block_size": int(active_fit_block_size),
+            "adaptive_sweeps": int(fit.adaptive_sweeps_run),
+            "one_site_refinement_sweeps": int(fit.one_site_sweeps_run),
+            "native_fermionic_warm_start": False,
+            "mpo_fit_guess_used": bool(fit_initialization["svd_guess_used"]),
+            "svd_guess_used": bool(fit_initialization["svd_guess_used"]),
+            "guess_used": bool(fit_initialization["guess_used"]),
+            "guess_method": fit_initialization["guess_method"],
+            "fit_init_strategy": fit_initialization["strategy"],
+            "fit_init_strategy_requested": fit_initialization[
+                "requested_strategy"
+            ],
+            "random_initialization": fit_initialization[
+                "random_initialization"
+            ],
+            "target_strategy": target_strategy,
+            "target_representation": "lazy_submpo",
+            "fit_overlap_fidelity": fit_overlap.get("fit_overlap_fidelity"),
+            "fit_overlap_infidelity": fit_overlap.get("fit_overlap_infidelity"),
+            "fit_overlap_error": fit_overlap.get("fit_overlap_error"),
+            "backend": "fit",
+            "fallback": False,
+        }
+        self._maybe_lock_dmrg1_one_site_phase()
+        return projected_norm, center
 
     def _run_dmrg(
         self,

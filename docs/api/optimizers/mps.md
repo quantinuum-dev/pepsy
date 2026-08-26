@@ -120,6 +120,12 @@ re-discovers the centre, canonicalizes to one site, and refreshes
 
 Streams may also include control events. `("measure", pauli, where[, outcome])`
 collapses onto a Pauli eigenvalue and records `(pauli, where, outcome, prob)`.
+For dense MPS states, a multi-site Pauli measurement uses a bond-two windowed
+sub-MPO for the projector `(I + outcome * P) / 2`, so the measurement does not
+form a dense `2**k`-by-`2**k` operator. In DMRG modes, that sub-MPO becomes an
+exact lazy FIT target on the endpoint span and the normal `guess-src` warm-start
+is reused. Native Symmray and fermionic states retain their metadata-safe dense
+projector path.
 `("reset", where[, basis])` resets each target to the `+1` eigenstate of
 `basis` (`"Z"` by default, so the legacy form resets to `|0>`); the internal
 measurement is not recorded. `("measure_reset", basis, where[, outcome])`
