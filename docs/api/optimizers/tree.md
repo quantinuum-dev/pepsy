@@ -595,9 +595,10 @@ cheap canonical-centre norm ledger and its progress-bar readout. It does not
 enable spectrum probes.
 
 Warnings are reserved for an actionable behavior change: enabling
-`track_truncation=True` emits one diagnostic-performance warning, explicit
-backend/dtype/device conversion emits one compatibility warning per conversion
-signature, and legacy mode selectors emit deprecation warnings. Dense and
+`track_truncation=True` emits one diagnostic-performance warning, while
+legacy mode selectors emit deprecation warnings. Explicit user stream
+backend/device mismatches and incompatible dtypes are errors, not implicit
+conversions. Dense and
 native paths share the direct one-edge contraction, path-cache, routing, and
 proof-reuse optimizations. Only the QR phase safeguard and graded reduced-core
 SVD are native Symmray specializations; dense arrays continue through Quimb's
@@ -1210,18 +1211,21 @@ state. Entangled MPS inputs are rejected rather than implicitly converted.
 The live TTN has one array contract: every tensor must have the same backend,
 dtype, and device. `backend_info()` reports that contract. Construct the full
 initial state and every user-supplied gate/operator with the same converter.
-If a gate, sub-MPO, observable, or cap vector does not match, TreeOptimizer
-converts it for compatibility but emits one warning per source/target
-combination; this makes an unintended CPU/GPU transfer or dtype cast visible.
+Every user gate and every tensor in every queued sub-MPO/TreeMPO must match the
+state backend and device. Non-NumPy payloads must also match dtype, while
+NumPy-to-NumPy dtype promotion is compatible. A mismatch raises `TypeError` at construction,
+`set_gates`, `add_gates`, or replacement-state installation, before replay or
+tensor work. Prepare a payload explicitly with `opt.to_backend(payload)` (or
+the same converter used to build the state). Internal Pauli/projector tensors
+follow the state backend automatically.
 Mixed-backend initial states fail immediately because there is no unambiguous
-safe execution backend. Internal Pauli/projector tensors follow the state
-backend automatically.
+safe execution backend.
 
 The same diagnostic is reflected by the state-derived `backend`,
 `backend_dtype`, `backend_device`, and `array_backend` attributes. The
-complete gate stream is checked before replay, including every tensor in each
-sub-MPO; mismatches are converted on execution copies and warned about without
-mutating queued inputs. Native Symmray states report `backend="symmray"` plus
+complete gate stream is checked once at its boundary, including every tensor in
+each sub-MPO; replay uses the accepted payload objects without a second scan or
+implicit transfer. Native Symmray states report `backend="symmray"` plus
 the underlying NumPy, Torch, or CuPy `array_backend`, preserving U1/U1U1 charge
 and fermionic metadata.
 

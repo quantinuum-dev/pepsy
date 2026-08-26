@@ -77,6 +77,7 @@ import quimb.tensor as qtn
 
 from ...backends import (
     backend_infer,
+    backend_signatures_compatible,
     infer_backend_converter_from_sample,
     infer_backend_signature,
 )
@@ -1180,6 +1181,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         are also accepted. They are replayed through the shot runner when
         :meth:`run` is called, so state-dependent channels, measurements, and
         feed-forward actions are sampled independently per trajectory.
+        Ordinary gate and sub-MPO payloads must already match the MPS backend
+        and device. Mismatches are rejected with preparation guidance;
+        use an explicit converter before constructing the optimizer or calling
+        :meth:`set_gates`.
     chi : int
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
@@ -1864,7 +1869,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # the constructor follows the same path as set_gates/add_gates.
         self._shared_backend_cache = False
         self._backend_cache_plan = None
-        self._install_stream_plan(_prepare_gate_stream(gates))
+        plan = _prepare_gate_stream(gates)
+        normalized_queue = self._normalize_stream_plan_queue(plan)
+        self._validate_normalized_gate_queue(normalized_queue)
+        self._install_stream_plan(plan, normalized_queue=normalized_queue)
         self.chi = int(chi)
         mode_name = str(mode).strip().lower()
         self._dmrg_mode_alias = (
@@ -1917,7 +1925,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.measurements = []
         self._rng = np.random.default_rng()
         self._unitary_previous_norm = None
-        self._backend_conversion_warnings = set()
         self.backend = None
         self.backend_dtype = None
         self.backend_device = None
@@ -2910,6 +2917,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # Validate before replacing the live state so a mixed-backend input
         # cannot leave this optimizer half-updated after a failed assignment.
         self._state_backend_info_for(new_p)
+        self._validate_normalized_gate_queue(
+            (self.G, self.where, self.event_types),
+            state=new_p,
+        )
         self.p = new_p
         self._initial_p = self.p.copy()
         self._unitary_previous_norm = None
@@ -2930,7 +2941,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._su_gauges_state = None
         self._su_force_regauge = self.mode == "su"
         self.p_ungauged = None
-        self._backend_conversion_warnings = set()
         self.backend_info()
         self._init_canonicalization()
 
@@ -3126,9 +3136,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         copied.measurements = deepcopy(self.measurements)
         copied._unitary_previous_norm = self._unitary_previous_norm
-        copied._backend_conversion_warnings = set(
-            self._backend_conversion_warnings
-        )
         copied._trajectory_diagnostics = deepcopy(
             getattr(self, "_trajectory_diagnostics", None)
         )
@@ -3355,10 +3362,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Whether this optimizer owns a stream requiring shot replay."""
         return bool(self._has_trajectory_events)
 
-    def _install_stream_plan(self, plan):
-        """Install a compiled stream plan and rebuild the single-state queue."""
+    @staticmethod
+    def _normalize_stream_plan_queue(plan):
+        """Normalize a plan once for validation and single-state replay."""
+        if plan.has_trajectory_events:
+            return [], [], []
+        return _normalize_gate_queue(plan.entries)
+
+    def _validate_normalized_gate_queue(self, normalized_queue, *, state=None):
+        """Validate an already-normalized queue without normalizing again."""
+        gates, _wheres, event_types = normalized_queue
+        self._validate_gate_stream_backend(gates, event_types, state=state)
+
+    def _install_stream_plan(self, plan, *, normalized_queue=None):
+        """Install a compiled plan and its already-normalized replay queue."""
         if not isinstance(plan, _MpsStreamPlan):
             raise TypeError("plan must be an internal MPS stream plan.")
+        if normalized_queue is None:
+            normalized_queue = self._normalize_stream_plan_queue(plan)
         self._stream_plan = plan
         self._gate_stream = plan.entries
         self._has_trajectory_events = plan.has_trajectory_events
@@ -3370,9 +3391,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # They cannot be normalized into the single-state queue here.
             self.G, self.where, self.event_types = [], [], []
         else:
-            self.G, self.where, self.event_types = _normalize_gate_queue(
-                plan.entries
-            )
+            self.G, self.where, self.event_types = normalized_queue
 
     def _shot_factory(self):
         """Build fresh optimizers from this instance's initial state."""
@@ -3701,8 +3720,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         After calling this, ``run(...)`` applies only this new list
         (unless you call :meth:`add_gates` before running).
         """
+        plan = _prepare_gate_stream(gates)
+        normalized_queue = self._normalize_stream_plan_queue(plan)
+        self._validate_normalized_gate_queue(normalized_queue)
         self._shared_backend_cache = False
-        self._install_stream_plan(_prepare_gate_stream(gates))
+        self._install_stream_plan(plan, normalized_queue=normalized_queue)
         return self
 
     def add_gates(self, gates):
@@ -3712,9 +3734,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         new ones.
         """
         new_plan = _prepare_gate_stream(gates)
-        self._install_stream_plan(
-            _prepare_gate_stream(self._gate_stream + new_plan.entries)
-        )
+        plan = _prepare_gate_stream(self._gate_stream + new_plan.entries)
+        normalized_queue = self._normalize_stream_plan_queue(plan)
+        self._validate_normalized_gate_queue(normalized_queue)
+        self._install_stream_plan(plan, normalized_queue=normalized_queue)
         return self
 
     @staticmethod
@@ -5276,20 +5299,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``event_seq`` must contain only ``"gate"``/``"submpo"`` events. Control
         events (measure/cap/reset) are handled by :meth:`_run_segmented`.
         """
-        # Prepare gate and sub-MPO payloads once per executable segment. The
-        # converter returns already-compatible arrays/networks unchanged,
-        # while foreign payloads are moved to the backend owned by the live
-        # MPS. This keeps exact, simple-update, and compressed modes on one
-        # backend contract.
-        G_seq = self._timed_call(
-            "gate_stream.prepare",
-            self._prepare_gate_stream_backend,
-            G_seq,
-            event_seq,
-        )
-
-        # Dispatch only after payload preparation. The mode implementations
-        # share the same validated stream but have different state contracts:
+        # The stream-install boundary already normalized and validated these
+        # payloads. Do not repeat that work for each control-delimited segment.
+        # Dispatch directly to the mode implementations, which share the same
+        # validated stream but have different state contracts:
         # DMRG owns local variational targets, MPO owns Quimb compression,
         # swap/perm own endpoint movement, and exact/SU deliberately bypass
         # canonical-center bookkeeping. Keeping the branches here prevents a
@@ -5738,9 +5751,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _state_backend_like(self):
         """Return a representative backend array from ``self.p`` tensor data."""
-        for tensor in getattr(self.p, "tensors", ()):
-            return tensor.data
-        return None
+        return self._state_backend_like_for(self.p)
 
     @staticmethod
     def _state_backend_info_for(state):
@@ -5756,22 +5767,111 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.array_backend = info.get("array_backend", info["backend"])
         return info
 
-    def _warn_backend_conversion(self, source_signature, target_signature, *, kind):
-        """Warn once for one explicit stream source/target conversion."""
-        warning_key = (kind, source_signature, target_signature)
-        if (
-            source_signature[0] != "builtins"
-            and warning_key not in self._backend_conversion_warnings
-        ):
-            self._backend_conversion_warnings.add(warning_key)
-            warnings.warn(
-                f"MpsOptimizer converted a {kind} payload from "
-                f"backend/dtype/device {source_signature!r} to the live MPS "
-                f"backend/dtype/device {target_signature!r}; provide matching "
-                f"{kind} payloads to avoid this conversion.",
-                UserWarning,
-                stacklevel=3,
+    @staticmethod
+    def _state_backend_like_for(state):
+        """Return a representative raw array from an MPS-like state."""
+        for tensor in getattr(state, "tensors", ()):
+            return tensor.data
+        return None
+
+    @staticmethod
+    def _backend_mismatch_hint(target_signature):
+        """Return concise guidance for preparing a stream payload."""
+        if target_signature[0] == "symmray":
+            return (
+                "Native Symmray states require native Symmray gates with the "
+                "matching charge and fermionic metadata; a dense gate cannot "
+                "be made safe by a generic cast."
             )
+        return (
+            "Convert the payload yourself with the same converter used for the "
+            "MPS, for example `gate = to_backend(gate)`, before passing it to "
+            "MpsOptimizer or set_gates."
+        )
+
+    @staticmethod
+    def _backend_signatures_compatible(source_signature, target_signature):
+        """Return whether two payloads can be used without backend transfer."""
+        return backend_signatures_compatible(source_signature, target_signature)
+
+    def _validate_gate_stream_backend(
+        self,
+        gates,
+        event_types,
+        *,
+        state=None,
+        path_prefix="stream",
+    ):
+        """Require user-supplied gate payloads to match the live MPS backend.
+
+        Backend conversion is intentionally an explicit caller operation. This
+        validation runs at every public stream/state boundary, while the
+        execution path only receives payloads that are already compatible.
+        Control events are excluded because their internal dense operators are
+        deliberately created and mapped by the optimizer itself. Conditional
+        gate actions are checked recursively.
+        """
+        if not gates:
+            return
+        if len(gates) != len(event_types):
+            raise ValueError(
+                "MpsOptimizer backend validation requires payloads and event "
+                "types to have the same length."
+            )
+        state = self.p if state is None else state
+        like = self._state_backend_like_for(state)
+        if like is None:
+            return
+        target_signature = _array_backend_signature(like)
+        mismatches = []
+        for index, (payload, event_type) in enumerate(zip(gates, event_types)):
+            path = f"{path_prefix}[{index}]"
+            if event_type == "gate":
+                source_signature = _array_backend_signature(payload)
+                if not self._backend_signatures_compatible(
+                    source_signature, target_signature
+                ):
+                    mismatches.append((path, "gate", source_signature))
+            elif event_type == "submpo":
+                tensors = tuple(getattr(payload, "tensors", ()))
+                source_signatures = {
+                    _array_backend_signature(tensor.data) for tensor in tensors
+                }
+                for source_signature in sorted(
+                    (
+                        source_signature
+                        for source_signature in source_signatures
+                        if not self._backend_signatures_compatible(
+                            source_signature, target_signature
+                        )
+                    ),
+                    key=repr,
+                ):
+                    mismatches.append((path, "sub-MPO", source_signature))
+            elif event_type == "conditional":
+                action = payload.get("action")
+                action_gates, _, action_types = _normalize_gate_queue((action,))
+                self._validate_gate_stream_backend(
+                    action_gates,
+                    action_types,
+                    state=state,
+                    path_prefix=f"{path}.action",
+                )
+
+        if not mismatches:
+            return
+        details = "; ".join(
+            f"{path} ({kind}) has {source!r}"
+            for path, kind, source in mismatches[:8]
+        )
+        if len(mismatches) > 8:
+            details += f"; ... and {len(mismatches) - 8} more"
+        raise TypeError(
+            "MpsOptimizer requires every gate and sub-MPO payload to match the "
+            f"MPS backend/device and required dtype {target_signature!r} "
+            "before use; "
+            f"{details}. {self._backend_mismatch_hint(target_signature)}"
+        )
 
     def _to_state_backend(self, array):
         """Return ``array`` cast to the backend and dtype owned by ``self.p``."""
@@ -5812,77 +5912,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         automatically changes the target backend without stale converter state.
         """
         return self._to_state_backend(array)
-
-    def _prepare_gate_stream_backend(self, gates, event_types):
-        """Prepare gate and sub-MPO payloads for the live MPS backend lazily.
-
-        Gate streams are commonly authored as NumPy arrays even when the live
-        MPS uses Torch, JAX, CuPy, or a Symmray block backend. Every ordinary
-        gate and every tensor in every sub-MPO is checked; matching payloads
-        are returned by identity, while foreign payloads are copied or cast
-        without mutating the public queue.
-        """
-        if not gates:
-            return gates
-        like = self._state_backend_like()
-        if like is None:
-            return gates
-        target_signature = _array_backend_signature(like)
-        prepared = []
-        stream_converter = infer_backend_converter_from_sample(like)
-        cache_plan = self._backend_cache_plan
-        for gate, event_type in zip(gates, event_types):
-            if event_type == "gate":
-                source_signature = _array_backend_signature(gate)
-                if source_signature != target_signature:
-                    self._warn_backend_conversion(
-                        source_signature, target_signature, kind="gate"
-                    )
-                    cache_key = ("gate", id(gate), repr(target_signature))
-                    gate = cache_plan.get_or_create_backend_payload(
-                        cache_key,
-                        gate,
-                        lambda gate=gate: self.to_backend(gate),
-                    )
-            elif event_type == "submpo":
-                # ``apply_to_arrays`` changes only the raw tensor payloads,
-                # unlike rebuilding an MPO, which can lose custom labels or
-                # operator bonds. Keep the caller's stream immutable by
-                # applying it to a shallow network copy.
-                tensors = tuple(getattr(gate, "tensors", ()))
-                source_signatures = {
-                    _array_backend_signature(tensor.data) for tensor in tensors
-                }
-                if source_signatures and source_signatures != {target_signature}:
-                    for source_signature in source_signatures:
-                        if source_signature != target_signature:
-                            self._warn_backend_conversion(
-                                source_signature, target_signature, kind="sub-MPO"
-                            )
-                    source_gate = gate
-                    cache_key = ("submpo", id(source_gate), repr(target_signature))
-
-                    def convert_submpo():
-                        converted = source_gate.copy()
-                        apply_to_arrays = getattr(converted, "apply_to_arrays", None)
-                        if not callable(apply_to_arrays):
-                            raise TypeError(
-                                "sub-MPO payloads must provide apply_to_arrays() "
-                                "for backend conversion."
-                            )
-                        apply_to_arrays(stream_converter or self.to_backend)
-                        return converted
-
-                    # A sub-MPO may be mutated by a downstream compression
-                    # routine, so cache a converted template but give each
-                    # execution its own shallow network copy.
-                    gate = cache_plan.get_or_create_backend_payload(
-                        cache_key,
-                        source_gate,
-                        convert_submpo,
-                    ).copy()
-            prepared.append(gate)
-        return prepared
 
     def _pauli_operator(self, pauli, where):
         """Return the dense Pauli operator (numpy) for ``pauli`` on ``where``."""

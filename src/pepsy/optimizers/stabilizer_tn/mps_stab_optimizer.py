@@ -61,6 +61,7 @@ import quimb.tensor as qtn
 
 from ...backends import (
     backend_infer,
+    backend_signatures_compatible,
     infer_backend_converter_from_sample,
     infer_backend_signature,
 )
@@ -758,10 +759,12 @@ class MpsStabOptimizer:
         self._clifford_rot_cache: dict = {}
         self._localizer_cache: dict = {}
         if to_backend is not None:
-            # Place the coefficient MPS |nu> on the requested backend; gate/MPO
-            # arrays are converted on the fly by the _bk* helpers below.
+            # Place the coefficient MPS |nu> on the requested backend. User
+            # stream gates/MPOs must be prepared explicitly; _bk* conversion
+            # remains for internal generated operators and dtype alignment.
             self.state.p.apply_to_arrays(to_backend)
-        self.backend_info()
+        if self._backend_signature is None:
+            self.backend_info()
 
         self._queue: List[object] = []
         self._gate_stream = ()
@@ -965,7 +968,11 @@ class MpsStabOptimizer:
 
         # Local imports keep Stim optional and avoid coupling the STN core to
         # the generic trajectory module during ordinary construction.
-        from ..noise import compile_stim_circuit, sample_stim_circuit
+        from ..noise import (
+            _stream_on_optimizer_backend,
+            compile_stim_circuit,
+            sample_stim_circuit,
+        )
 
         plan = compile_stim_circuit(circuit)
         sample = sample_stim_circuit(plan, seed=seed)
@@ -974,7 +981,10 @@ class MpsStabOptimizer:
             if stream_transform is None
             else stream_transform(sample.gate_stream)
         )
-        optimizer = cls(plan.num_qubits, gates=gates, seed=seed, **kwargs)
+        # Stim emits NumPy matrices. Convert this library-generated stream once
+        # before it crosses the strict user-stream boundary.
+        optimizer = cls(plan.num_qubits, seed=seed, **kwargs)
+        optimizer.set_gates(_stream_on_optimizer_backend(gates, optimizer))
         optimizer.stim_plan = plan
         optimizer.stim_sample = sample
         return optimizer
@@ -1015,12 +1025,87 @@ class MpsStabOptimizer:
         )
 
         plan = compile_trajectory_stream(tuple(entries))
+        self._validate_gate_stream_backend(plan.entries)
         self._trajectory_plan = plan
         self._gate_stream = tuple(plan.entries)
         self._has_trajectory_events = bool(
             plan.has_trajectory_events or plan.has_leakage
         )
         self._queue = list(plan.entries)
+
+    def _validate_gate_stream_backend(self, entries, *, path_prefix="stream"):
+        """Require user matrix and MPO entries to match the live MPS backend.
+
+        The check runs once while a compiled stream is installed. Stateful
+        trajectory and leakage entries are intentionally skipped: the shared
+        runner selects their matrix outcomes and prepares those generated
+        payloads on the optimizer backend before installing the replay stream.
+        """
+        from ..noise import TrajectoryEvent, _leakage_event_parts
+
+        if self._backend_signature is None:
+            self.backend_info()
+        target_signature = self._backend_signature
+        mismatches = []
+
+        def check_entry(entry, path):
+            if isinstance(entry, TrajectoryEvent) or _leakage_event_parts(entry):
+                return
+
+            conditional = conditional_event_parts(entry)
+            if conditional is not None:
+                action = conditional[1]["action"]
+                check_entry(action, f"{path}.action")
+                return
+
+            submpo = submpo_event_parts(entry, normalize_where=True)
+            if submpo is not None:
+                mpo, _where = submpo
+                for tensor_index, tensor in enumerate(
+                    getattr(mpo, "tensors", ())
+                ):
+                    source_signature = infer_backend_signature(tensor.data)
+                    if not backend_signatures_compatible(
+                        source_signature, target_signature
+                    ):
+                        mismatches.append(
+                            (
+                                f"{path}.tensor[{tensor_index}]",
+                                "sub-MPO",
+                                source_signature,
+                            )
+                        )
+                return
+
+            if (
+                isinstance(entry, (tuple, list))
+                and len(entry) == 2
+                and not isinstance(entry[0], str)
+            ):
+                source_signature = infer_backend_signature(entry[0])
+                if not backend_signatures_compatible(
+                    source_signature, target_signature
+                ):
+                    mismatches.append((path, "gate", source_signature))
+
+        for index, entry in enumerate(entries):
+            check_entry(entry, f"{path_prefix}[{index}]")
+
+        if not mismatches:
+            return
+        details = "; ".join(
+            f"{path} ({kind}) has {source!r}"
+            for path, kind, source in mismatches[:8]
+        )
+        if len(mismatches) > 8:
+            details += f"; ... and {len(mismatches) - 8} more"
+        raise TypeError(
+            "MpsStabOptimizer requires every gate and sub-MPO payload to "
+            f"match the coefficient-MPS backend/device and required dtype "
+            f"{target_signature!r} "
+            f"before use; {details}. Prepare each payload explicitly with "
+            "the live backend converter before passing it to the gate stream."
+        )
 
     def gate_stream(self):
         """Return the immutable, compiled stream owned by this optimizer."""
@@ -4334,15 +4419,6 @@ class MpsStabOptimizer:
             return converter(array)
         return ar.do("array", array, like=like)
 
-    def _diagnose_gate_backend(self, gate):
-        """Warn if an explicit stream matrix is foreign to the live MPS."""
-        self.backend_info()
-        source_signature = infer_backend_signature(gate)
-        if source_signature != self._backend_signature:
-            self._warn_backend_conversion(
-                source_signature, self._backend_signature, kind="gate"
-            )
-
     def _bk(self, mat):
         """Backend copy of an internally generated gate matrix."""
         arr = np.asarray(mat, dtype=self.dtype)
@@ -4367,10 +4443,19 @@ class MpsStabOptimizer:
         source_signatures = {
             infer_backend_signature(tensor.data) for tensor in tensors
         }
-        if source_signatures == {target_signature}:
-            return mpo
+        if source_signatures and all(
+            backend_signatures_compatible(source, target_signature)
+            for source in source_signatures
+        ):
+            if source_signatures == {target_signature}:
+                return mpo
+            # Backend/device already match; only normalize an execution copy's
+            # dtype when the operator implementation requires it.
         for source_signature in source_signatures:
-            if source_signature != target_signature and warn:
+            if (
+                not backend_signatures_compatible(source_signature, target_signature)
+                and warn
+            ):
                 self._warn_backend_conversion(
                     source_signature, target_signature, kind="sub-MPO"
                 )
@@ -4694,7 +4779,9 @@ class MpsStabOptimizer:
         parts = submpo_event_parts(entry, normalize_where=True)
         if parts is not None:
             mpo, where = parts
-            self._apply_submpo(mpo, where)
+            # The complete stream was checked at installation. Do not scan or
+            # recast this user MPO again while replaying the accepted queue.
+            self._apply_submpo(mpo, where, _validate_backend=False)
             return
 
         if isinstance(entry, (list, tuple)) and len(entry) >= 1:
@@ -4753,7 +4840,6 @@ class MpsStabOptimizer:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             # matrix form: (gate_tensor, where)
             gate, where = entry
-            self._diagnose_gate_backend(gate)
             where = _normalize_sites(where)
             self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
             return
@@ -7118,7 +7204,7 @@ class MpsStabOptimizer:
             mpo.retag_(retag_to_final)
         return mpo
 
-    def _apply_submpo(self, mpo, where) -> None:
+    def _apply_submpo(self, mpo, where, *, _validate_backend=True) -> None:
         """Apply a user MPO to the coefficient MPS ``p`` (coefficient frame).
 
         The MPO acts directly on ``p`` (any MPO, unitary or not); it is *not*
@@ -7128,7 +7214,9 @@ class MpsStabOptimizer:
         logical_where = _normalize_sites(where)
         mps_where = self._mps_sites(logical_where)
         mapped_mpo = self._copy_submpo_for_layout(mpo, logical_where)
-        self._evolve_p(self._bk_mpo(mapped_mpo), mps_where)
+        if _validate_backend:
+            mapped_mpo = self._bk_mpo(mapped_mpo)
+        self._evolve_p(mapped_mpo, mps_where)
         self._invalidate_infidelity()
         self._record()
 

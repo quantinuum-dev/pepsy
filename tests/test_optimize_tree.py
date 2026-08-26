@@ -4417,8 +4417,8 @@ def test_tree_warns_once_when_a_gate_does_not_match_the_state_backend():
     assert opt.backend_info()["backend"] == "torch"
 
 
-def test_tree_gate_stream_backend_preparation_is_stream_level():
-    """One representative gate decides conversion for the whole stream."""
+def test_tree_gate_stream_backend_requires_explicit_preparation():
+    """Every stream gate must already match the live TTN backend."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
@@ -4430,19 +4430,15 @@ def test_tree_gate_stream_backend_preparation_is_stream_level():
     ]
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend(gates, ["gate", "gate"])
-
-    assert all(torch.is_tensor(gate) for gate in prepared)
     assert all(isinstance(gate, np.ndarray) for gate in gates)
 
     matching = [to_backend(gate) for gate in gates]
-    untouched = opt._prepare_gate_stream_backend(matching, ["gate", "gate"])
-    assert untouched[0] is matching[0]
-    assert untouched[1] is matching[1]
+    opt.set_gates([(matching[0], 0), (matching[1], 1)])
+    with pytest.raises(TypeError, match=r"stream\[1\].*gate"):
+        opt.set_gates([(matching[0], 0), (gates[1], 1)])
 
 
-def test_tree_gate_stream_backend_preparation_checks_late_payloads():
+def test_tree_gate_stream_backend_checks_late_payloads():
     """A matching first gate cannot hide a later backend mismatch."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
@@ -4453,12 +4449,10 @@ def test_tree_gate_stream_backend_preparation_checks_late_payloads():
     foreign = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend(
+    with pytest.raises(TypeError, match=r"stream\[1\].*gate"):
+        opt._validate_gate_stream_backend(
             [matching, foreign], ["gate", "gate"]
         )
-    assert prepared[0] is matching
-    assert isinstance(prepared[1], torch.Tensor)
 
 
 def test_tree_optimizer_reports_symmray_block_backend():
@@ -4492,8 +4486,8 @@ def test_tree_optimizer_reports_symmray_block_backend():
     }
 
 
-def test_tree_submpo_stream_backend_preparation_preserves_input():
-    """A mismatched stream sub-MPO is copied and converted by its arrays."""
+def test_tree_submpo_stream_backend_requires_explicit_preparation():
+    """Every stream sub-MPO tensor must match the live TTN backend."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
@@ -4502,16 +4496,16 @@ def test_tree_submpo_stream_backend_preparation_preserves_input():
     submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend([submpo], ["submpo"])[0]
-
-    assert prepared is not submpo
-    assert all(torch.is_tensor(tensor.data) for tensor in prepared.tensors)
+    with pytest.raises(TypeError, match=r"stream\[0\].*sub-MPO"):
+        opt.set_gates([opt.submpo_event(submpo, (0, 1))])
     assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
 
+    prepared = opt.to_backend(submpo)
+    opt.set_gates([opt.submpo_event(prepared, (0, 1))])
 
-def test_tree_treemppo_stream_backend_preparation_preserves_input():
-    """A TreeMPO stream payload is converted without mutating its source."""
+
+def test_tree_treemppo_stream_backend_requires_explicit_preparation():
+    """Every TreeMPO tensor must match the live TTN backend."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
@@ -4525,12 +4519,10 @@ def test_tree_treemppo_stream_backend_preparation_preserves_input():
     )
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend(
-            [tree_mpo], ["subtreempo"]
-        )[0]
+    with pytest.raises(TypeError, match=r"stream\[0\].*TreeMPO"):
+        opt.set_gates([opt.subtreempo_event(tree_mpo, (0, 1))])
 
-    assert prepared is not tree_mpo
+    prepared = opt.to_backend(tree_mpo)
     assert all(
         torch.is_tensor(tensor.data)
         for network in prepared.tree_networks
@@ -4541,7 +4533,8 @@ def test_tree_treemppo_stream_backend_preparation_preserves_input():
         for network in tree_mpo.tree_networks
         for tensor in network
     )
-    opt.apply_subtreempo(prepared, track_norm=False)
+    opt.set_gates([opt.subtreempo_event(prepared, (0, 1))])
+    opt.run()
     np.testing.assert_allclose(opt.to_dense(), [1.0, 0.0, 0.0, 0.0])
     assert opt.tn.validate(check_canonical=True) is opt.tn
 

@@ -173,6 +173,26 @@ gates through backend-compatible split/auto-swap paths; never force a dense
 NumPy identity into a Symmray contraction. Keep optional Symmray coverage
 guarded with `pytest.importorskip("symmray")`.
 
+The MPS gate-stream backend boundary is explicit and single-pass:
+
+- `MpsOptimizer` requires user-supplied gates and sub-MPO tensor data to use
+  the same array backend and device as the state. Non-NumPy payloads must also
+  match the state dtype because their contractions reject mixed dtypes;
+  dense NumPy-to-NumPy dtype promotion remains compatible. Backend/device
+  mismatches, and incompatible dtypes, raise a location-specific `TypeError`.
+- Constructor, `set_gates`, and `add_gates` normalize a stream once, validate
+  that normalized queue once, and install that same queue. `set_p()` validates
+  the existing normalized queue against the replacement state before mutation.
+  Do not normalize or validate the whole stream again for each replay segment.
+- `_execute_mode` receives the already validated payloads and must dispatch
+  directly. Do not add a per-segment conversion or `gate_stream.prepare` stage.
+  Internal control operators remain the optimizer's responsibility, while
+  library-generated trajectory outcomes are converted by the shot runner before
+  calling `set_gates`.
+- `MpsOptimizer.to_backend(...)` is an explicit caller helper for preparing a
+  payload before installing it. Native Symmray gates must retain their charge
+  and fermionic metadata; a dense gate cannot be generically promoted.
+
 Native fermionic FIT environments must use graph-planned contraction directly
 on the Symmray arrays so dummy-mode conjugate pairs and graded phases determine
 the contraction order; do not replace this with an arbitrary pairwise loop or

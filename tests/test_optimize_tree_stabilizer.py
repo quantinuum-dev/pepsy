@@ -602,8 +602,16 @@ def test_tree_stab_torch_backend_matches_numpy():
     assert inherited.backend == "torch"
     assert inherited.backend_dtype == "complex128"
     assert inherited.backend_device == "cpu"
-    with pytest.warns(UserWarning, match="gate/operator payload"):
-        inherited.apply([(np.diag([1.0, np.exp(0.1j)]), 0)])
+    matching = backend(np.eye(2, dtype=complex))
+    foreign = np.diag([1.0, np.exp(0.1j)])
+    with pytest.raises(TypeError, match=r"stream\[1\].*gate"):
+        inherited.apply([(matching, 0), (foreign, 1)])
+    inherited.apply([(matching, 0), (backend(foreign), 1)])
+    mpo = qtn.MatrixProductOperator.from_dense(
+        np.eye(4, dtype=complex), dims=(2, 2), sites=(0, 1), L=3,
+    )
+    with pytest.raises(TypeError, match=r"stream\[0\].*sub-MPO"):
+        inherited.set_gates([("submpo", mpo, (0, 1))])
     inherited.cap(1, [1.0, 0.0])
     assert inherited.backend_info()["backend"] == "torch"
     assert inherited.validate_isometry_metadata() is inherited

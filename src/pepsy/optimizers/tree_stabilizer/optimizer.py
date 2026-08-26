@@ -921,6 +921,7 @@ class TreeStabOptimizer:
         self.stim_plan = None
         self.stim_sample = None
         self.backend_info()
+        self._validate_gate_stream_backend(stream_plan.entries)
 
     @classmethod
     def from_bits(cls, bits, **kwargs):
@@ -984,7 +985,11 @@ class TreeStabOptimizer:
             )
         if stream_transform is not None and not callable(stream_transform):
             raise TypeError("stream_transform must be callable or None.")
-        from ..noise import compile_stim_circuit, sample_stim_circuit
+        from ..noise import (
+            _stream_on_optimizer_backend,
+            compile_stim_circuit,
+            sample_stim_circuit,
+        )
 
         plan = compile_stim_circuit(circuit)
         sample = sample_stim_circuit(plan, seed=seed)
@@ -993,7 +998,10 @@ class TreeStabOptimizer:
             if stream_transform is None
             else stream_transform(sample.gate_stream)
         )
-        optimizer = cls(plan.num_qubits, gates=gates, seed=seed, **kwargs)
+        # Stim emits NumPy matrices. Convert this library-generated stream once
+        # before it crosses the strict user-stream boundary.
+        optimizer = cls(plan.num_qubits, seed=seed, **kwargs)
+        optimizer.set_gates(_stream_on_optimizer_backend(gates, optimizer))
         optimizer.stim_plan = plan
         optimizer.stim_sample = sample
         return optimizer
@@ -1176,6 +1184,7 @@ class TreeStabOptimizer:
     def _install_stream_plan(self, gates):
         """Install the normalized trajectory plan owned by the queue."""
         plan = _compile_stream_plan(gates)
+        self._validate_gate_stream_backend(plan.entries)
         self._trajectory_plan = plan
         self._gate_stream = tuple(plan.entries)
         self._has_trajectory_events = bool(
@@ -1186,6 +1195,54 @@ class TreeStabOptimizer:
     def gate_stream(self):
         """Return the immutable compiled stream owned by this optimizer."""
         return self._gate_stream
+
+    def _validate_gate_stream_backend(self, entries, *, path_prefix="stream"):
+        """Validate all user matrix/MPO payloads before queue installation."""
+        from ..noise import TrajectoryEvent, _leakage_event_parts
+
+        payloads = []
+        event_types = []
+        paths = []
+
+        def collect(entry, path):
+            if isinstance(entry, TrajectoryEvent) or _leakage_event_parts(entry):
+                return
+            conditional = conditional_event_parts(entry)
+            if conditional is not None:
+                collect(conditional[1]["action"], f"{path}.action")
+                return
+            tree_mpo_parts = _tree_mpo_event_parts(entry)
+            if tree_mpo_parts is not None:
+                payloads.append(tree_mpo_parts[0])
+                event_types.append("subtreempo")
+                paths.append(path)
+                return
+            submpo_parts = submpo_event_parts(entry, normalize_where=True)
+            if submpo_parts is not None:
+                payloads.append(submpo_parts[0])
+                event_types.append("submpo")
+                paths.append(path)
+                return
+            if (
+                isinstance(entry, (tuple, list))
+                and len(entry) == 2
+                and not isinstance(entry[0], str)
+            ):
+                payloads.append(entry[0])
+                event_types.append("gate")
+                paths.append(path)
+
+        for index, entry in enumerate(entries):
+            collect(entry, f"{path_prefix}[{index}]")
+        if not payloads:
+            return
+        self._tree._validate_gate_stream_backend(
+            payloads,
+            event_types,
+            path_prefix=path_prefix,
+            paths=paths,
+            target_signature=infer_backend_signature(self._tree._state_like()),
+        )
 
     @property
     def has_trajectory_events(self):
@@ -2000,18 +2057,12 @@ class TreeStabOptimizer:
                 max_bond=self._tree.chi,
                 cutoff=self._tree.cutoff,
                 track_norm=False,
+                _validate_backend=False,
             )
             return
         submpo_parts = submpo_event_parts(entry, normalize_where=True)
         if submpo_parts is not None:
             mpo, where = submpo_parts
-            # Convert every operator tensor once at the stream boundary. The
-            # ordinary TreeOptimizer helper copies foreign MPOs, preserving
-            # caller ownership and avoiding repeated per-tensor conversions in
-            # the native subtree path.
-            mpo = self._tree._prepare_gate_stream_backend(
-                [mpo], ["submpo"]
-            )[0]
             # A caller-supplied coefficient MPO has no unitary certificate.
             # Keep its physical norm change out of the compression ledger,
             # matching MpsStabOptimizer's sub-MPO contract.
@@ -2109,22 +2160,9 @@ class TreeStabOptimizer:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             gate = entry[0]
             where = _normalize_sites(entry[1])
-            self._diagnose_gate_backend(gate)
             self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
             return
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-
-    def _diagnose_gate_backend(self, gate):
-        """Warn when an explicit matrix is foreign to the coefficient TTN."""
-        target = self._tree._state_like()
-        if target is None:
-            return
-        source_signature = infer_backend_signature(gate)
-        target_signature = infer_backend_signature(target)
-        if source_signature != target_signature:
-            self._tree._warn_backend_conversion(
-                source_signature, target_signature
-            )
 
     def _apply_matrix(self, gate, where):
         where = _normalize_sites(where)
@@ -4165,6 +4203,10 @@ class TreeStabOptimizer:
         self.array_backend = info.get("array_backend", info["backend"])
         self.dtype = info["dtype"]
         return info
+
+    def _to_state_backend(self, array):
+        """Convert a generated array to the live coefficient TTN backend."""
+        return self._tree._as_state_backend(array, warn=False)
 
     def normalize(self):
         """Normalize the coefficient TTN and return ``self``.

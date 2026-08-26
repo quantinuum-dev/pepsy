@@ -218,9 +218,13 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
   Pauli-branch operator sum without normalization. Only a matrix verified unitary can emit
   a norm-loss sample. For larger physical-frame operators, prefer supported gate/rotation
   decompositions; `submpo` is coefficient-frame only and carries no unitarity declaration.
-- **Backend conversion** → stim/tableau classification remains NumPy/CPU; coefficient MPS,
-  local gates, and MPO arrays use `to_backend`. Convert user matrix entries to NumPy for
-  classification before converting coefficient-side operations back to the chosen backend.
+- **Backend conversion** → Stim/tableau classification remains NumPy/CPU, but every
+  user matrix and every tensor in a user coefficient-frame MPO must already match
+  the live coefficient state's backend and device when the stream is installed. Non-NumPy
+  payloads must also match its dtype; NumPy-to-NumPy dtype promotion is compatible. A
+  mismatch raises `TypeError`; callers explicitly prepare it with the same
+  `to_backend` converter used for the state. The shared trajectory runner converts
+  library-generated sampled matrices before they cross this boundary.
 
 ## Cooling and magic-injection policy
 

@@ -177,62 +177,45 @@ def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
 @pytest.mark.parametrize(
     "mode", ["dmrg", "mpo", "svd", "swap", "perm", "mix", "su", "exact"]
 )
-def test_mps_optimizer_casts_numpy_gate_stream_to_torch_state_backend(mode):
-    """Backend conversion should happen only when a gate payload mismatches p."""
+def test_mps_optimizer_rejects_mismatched_gate_stream_backend(mode):
+    """Mismatched user gates must be prepared before optimizer construction."""
     torch = pytest.importorskip("torch")
 
     state = qtn.MPS_computational_state("00", dtype="complex128")
     state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
     gate = qu.CNOT()  # ordinary NumPy gate stream
-    optimizer = py.MpsOptimizer(
-        state,
-        gates=[(gate, (0, 1))],
-        chi=2,
-        mode=mode,
-        inplace=True,
-    )
-
-    with pytest.warns(UserWarning, match="converted a gate payload"):
-        optimizer.run(progbar=False, n_iter=2)
-
-    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
-    dense = np.asarray(py.MpsOptimizer._real_float(optimizer.p.norm()))
-    assert dense == pytest.approx(1.0)
-
-    matching_gate = torch.as_tensor(np.array(gate, copy=True), dtype=torch.complex128)
-    assert optimizer.to_backend(matching_gate) is matching_gate
+    with pytest.raises(TypeError, match="requires every gate"):
+        py.MpsOptimizer(
+            state,
+            gates=[(gate, (0, 1))],
+            chi=2,
+            mode=mode,
+            inplace=True,
+        )
 
 
-def test_mps_optimizer_casts_submpo_stream_arrays_to_torch_state_backend():
-    """Sub-MPO conversion preserves the network structure and input stream."""
+def test_mps_optimizer_rejects_mismatched_submpo_stream_backend():
+    """Mismatched sub-MPO tensors must be prepared before replay."""
     torch = pytest.importorskip("torch")
 
     state = qtn.MPS_computational_state("00", dtype="complex128")
     state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
     submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
-    original_inds = tuple(submpo.outer_inds())
     optimizer = py.MpsOptimizer(
         state,
-        gates=[py.MpsOptimizer.submpo_event(submpo, (0, 1))],
+        gates=[],
         chi=2,
         mode="mpo",
         inplace=True,
     )
 
-    with pytest.warns(UserWarning, match="converted a sub-MPO payload"):
-        optimizer.run(progbar=False, n_iter=2)
-
-    # ``run`` prepares a local executable segment, leaving the public queue
-    # unchanged. Re-run the same helper to inspect the converted payload.
-    converted = optimizer._prepare_gate_stream_backend([submpo], ["submpo"])[0]
-    assert converted is not submpo
-    assert tuple(converted.outer_inds()) == original_inds
-    assert all(isinstance(tensor.data, torch.Tensor) for tensor in converted.tensors)
+    with pytest.raises(TypeError, match="sub-MPO"):
+        optimizer.set_gates([py.MpsOptimizer.submpo_event(submpo, (0, 1))])
     assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
 
 
-def test_mps_optimizer_backend_diagnostics_and_late_gate_conversion():
+def test_mps_optimizer_backend_diagnostics_check_every_gate():
     """Backend checks inspect every gate, not only the first stream payload."""
     torch = pytest.importorskip("torch")
 
@@ -255,12 +238,25 @@ def test_mps_optimizer_backend_diagnostics_and_late_gate_conversion():
         "device": "cpu",
     }
     assert optimizer.backend == "torch"
-    with pytest.warns(UserWarning, match="converted a gate payload"):
-        prepared = optimizer._prepare_gate_stream_backend(
+    with pytest.raises(TypeError, match=r"stream\[1\]"):
+        optimizer._validate_gate_stream_backend(
             [matching, foreign], ["gate", "gate"]
         )
-    assert prepared[0] is matching
-    assert isinstance(prepared[1], torch.Tensor)
+
+
+def test_mps_optimizer_accepts_explicitly_prepared_gate():
+    """Callers can prepare a payload explicitly before installing it."""
+    torch = pytest.importorskip("torch")
+
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="svd")
+
+    gate = optimizer.to_backend(qu.CNOT())
+    optimizer.set_gates([(gate, (0, 1))])
+    optimizer.run(progbar=False)
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
 
 
 def test_mps_optimizer_rejects_mixed_state_backends():
@@ -301,8 +297,8 @@ def test_mps_optimizer_reports_symmray_block_backend():
     }
 
 
-def test_mps_optimizer_converts_symmray_submpo_blocks_to_state_backend():
-    """Symmray sub-MPO copies preserve charge metadata while changing blocks."""
+def test_mps_optimizer_rejects_dense_symmray_submpo_blocks():
+    """Dense sub-MPO blocks cannot be promoted into a native Symmray MPS."""
     pytest.importorskip("symmray")
     torch = pytest.importorskip("torch")
 
@@ -327,12 +323,8 @@ def test_mps_optimizer_converts_symmray_submpo_blocks_to_state_backend():
     )
     optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="mpo")
 
-    with pytest.warns(UserWarning, match="converted a sub-MPO payload"):
-        converted = optimizer._prepare_gate_stream_backend(
-            [submpo], ["submpo"]
-        )[0]
-    assert converted is not submpo
-    assert all(tensor.data.backend == "torch" for tensor in converted.tensors)
+    with pytest.raises(TypeError, match="sub-MPO"):
+        optimizer._validate_gate_stream_backend([submpo], ["submpo"])
     assert all(tensor.data.backend == "numpy" for tensor in submpo.tensors)
 
 

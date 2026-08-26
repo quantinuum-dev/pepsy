@@ -100,13 +100,20 @@ contracted result back to an MPS mode rebuilds an open MPS.
 `MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
 from every live MPS tensor; the same values are also available as the
 state-derived `backend`, `backend_dtype`, and `backend_device` attributes.
-Every gate and every tensor in a sub-MPO is checked against that signature
-before replay. Explicit mismatches are converted on an execution copy with a
-`UserWarning`; the queued payloads remain unchanged. Native Symmray MPS data
-reports `backend="symmray"` and includes `array_backend` for the underlying
-NumPy, Torch, or CuPy charge-sector blocks. Dense payloads cannot be promoted
-to native Symmray gates because that would lose charge and fermionic metadata;
-construct those gates with the matching Symmray convention instead.
+Every gate and every tensor in a sub-MPO is checked for matching backend and
+device at construction, `set_gates`, `add_gates`, and `set_p`; non-NumPy
+payloads must also match dtype, while NumPy-to-NumPy dtype promotion is
+compatible. A
+mismatch raises a `TypeError` with the stream location and preparation guidance;
+`MpsOptimizer` does not silently copy or cast user payloads. Use the same
+explicit converter used to build the state, for example
+`gate = to_backend(gate)`, before passing the gate stream to the optimizer.
+Library-generated trajectory outcomes are prepared by the shot runner before
+they are installed. Native Symmray MPS data reports `backend="symmray"` and
+includes `array_backend` for the underlying NumPy, Torch, or CuPy charge-sector
+blocks. Dense payloads cannot be promoted to native Symmray gates because that
+would lose charge and fermionic metadata; construct those gates with the
+matching Symmray convention instead.
 
 Canonical metadata and observable readout are deliberately separate. Internal
 mid-circuit `measure`, `reset`, and Kraus paths pass the live `info_c` mapping
@@ -542,8 +549,8 @@ timing is disabled, so the normal mixed path performs no profiling clock
 reads. The measured replay interval begins after argument validation and any
 temporary layout setup; it ends before temporary layout restoration and
 before `get_run_timing()` makes its defensive result copy.
-It also contains inclusive `stages` totals for `gate_stream.prepare`, the
-active mode replay, `canonicalize`, `gate.apply`, `dmrg.target`, `dmrg.fit`,
+It also contains inclusive `stages` totals for the active mode replay,
+`canonicalize`, `gate.apply`, `dmrg.target`, `dmrg.fit`,
 `normalization`, `control.<event>`, and (when enabled)
 `<mode>.stabilize`. Stage totals can overlap with the mode replay total; use
 them to identify the dominant work, not to add into a second total. DMRG and

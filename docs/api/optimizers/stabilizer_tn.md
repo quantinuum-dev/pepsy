@@ -430,8 +430,9 @@ to remove round-off-sized values and expose the lower bond dimension.
 
 Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,
 device="cuda")`, `pepsy.backend_cupy(...)`, `pepsy.backend_jax(...)`) to the
-constructor or `with_injection`.  The coefficient MPS `|nu>` and every gate/MPO
-applied to it are then placed on that backend, so the heavy MPS contractions
+constructor or `with_injection`. The coefficient MPS `|nu>` is placed on that
+backend, and user gates/MPOs must be prepared with the same converter before
+they are queued, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on that array backend.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
 cached per backend; expectation/fidelity scalars are converted back to Python
@@ -448,11 +449,14 @@ When an existing coefficient MPS is supplied, the stabilizer optimizer infers
 its common `backend`, `dtype`, and `device` automatically, even when
 `to_backend` is omitted. `backend_info()` returns the live mapping and refreshes
 the public `backend`, `backend_dtype`, and `backend_device` attributes. Explicit
-matrix gates and coefficient-frame sub-MPOs are checked against that signature;
-foreign payloads emit one warning per source/target combination. Sub-MPOs are
-copied to the live backend without mutating the caller's MPO; dense physical
-matrices use a temporary NumPy view for Stim/Pauli classification and their
-coefficient contractions remain on the inferred backend.
+matrix gates and every tensor in coefficient-frame sub-MPOs are checked against
+that backend and device at the stream boundary; non-NumPy payloads must also
+match dtype, while NumPy-to-NumPy dtype promotion is compatible. A foreign payload raises
+`TypeError`; prepare it explicitly with the same converter used for the
+coefficient state. Stim gate classification still uses a temporary NumPy view,
+while coefficient contractions remain on the inferred backend. Stim and
+trajectory-generated matrices are converted by the library before they enter
+this user-stream boundary.
 
 
 > API details are maintained as handwritten Markdown in this page.

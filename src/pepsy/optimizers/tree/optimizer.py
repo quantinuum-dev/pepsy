@@ -52,6 +52,7 @@ import quimb.tensor as qtn
 
 from ...backends import (
     backend_infer,
+    backend_signatures_compatible,
     infer_backend_converter_from_sample,
     infer_backend_signature,
     to_float,
@@ -518,7 +519,8 @@ class TreeOptimizer:
     state : TreeTensorNetwork or product MatrixProductState, optional
         Explicit alias for ``tn``. All initial-state tensors must share one
         backend, dtype, and device. User-provided gates/operators should use
-        that same backend; a mismatch is converted with a one-time warning.
+        that same backend; stream payload mismatches raise before replay and
+        must be prepared explicitly.
     run : bool
         Whether to replay ``gates`` immediately (default ``True``).
 
@@ -880,6 +882,11 @@ class TreeOptimizer:
         self._attach_profile_sink()
         self._thread_ind = None
         self.backend_info()
+        self._validate_gate_stream_backend(
+            self.G,
+            self.event_types,
+            target_signature=_array_backend_signature(self._state_like()),
+        )
         self.cutoff = self._resolve_cutoff(cutoff)
         self.cutoff_mode = self._resolve_cutoff_mode(cutoff_mode)
 
@@ -1242,113 +1249,137 @@ class TreeOptimizer:
             return ar.to_numpy(array)
         return self._backend_converter(like)(array)
 
-    def _prepare_gate_stream_backend(self, payloads, event_types):
-        """Prepare one executable gate/sub-MPO stream for the live backend.
+    def to_backend(self, array):
+        """Prepare one user array or operator network on the live backend."""
+        if hasattr(array, "tree_networks"):
+            return self._coerce_tree_mpo_backend(array)
+        if hasattr(array, "tensors") or hasattr(array, "tensor_map"):
+            return self._coerce_tensor_network_backend(
+                array.copy(), warn=False
+            )
+        return self._as_state_backend(array, warn=False)
 
-        Every ordinary gate and every tensor in every sub-MPO is checked;
-        matching payloads are returned by identity. Foreign sub-MPOs use
-        ``apply_to_arrays`` on a copied network, preserving the caller's
-        labels and operator bonds.
+    def _validate_gate_stream_backend(
+        self, payloads, event_types, *, path_prefix="stream", paths=None,
+        state=None, target_signature=None
+    ):
+        """Require every user gate/MPO payload to match the live TTN backend.
+
+        This is a stream-boundary check. Replay receives the original payloads
+        unchanged; internal operators created by the optimizer may still use
+        ``_as_state_backend`` explicitly when they are constructed.
         """
         if not payloads:
-            return payloads
+            return
+        if len(payloads) != len(event_types):
+            raise ValueError(
+                "TreeOptimizer backend validation requires payloads and event "
+                "types to have the same length."
+            )
+        if paths is not None and len(paths) != len(payloads):
+            raise ValueError(
+                "TreeOptimizer backend validation requires one path per payload."
+            )
+        state = self.tn if state is None else state
+        if target_signature is None:
+            backend_infer(state)
+            target_like = next(iter(state.tensor_map.values())).data
+            target_signature = _array_backend_signature(target_like)
+        mismatches = []
 
-        like = self._state_like()
-        self.backend_info()
-        target_signature = _array_backend_signature(like)
-        converter = None
-        prepared = list(payloads)
-
-        for index, (payload, event_type) in enumerate(
-            zip(payloads, event_types)
-        ):
-            if event_type != "gate":
-                continue
-            try:
-                source_signature = _array_backend_signature(payload)
-            except (AttributeError, KeyError, TypeError, ValueError):
-                source_signature = None
-            if source_signature == target_signature:
-                continue
-            if source_signature is not None:
-                self._warn_backend_conversion(source_signature, target_signature)
-            prepared[index] = self._as_state_backend(payload)
-
-        for index, (payload, event_type) in enumerate(
-            zip(payloads, event_types)
-        ):
-            if event_type != "submpo":
-                continue
-            tensors = tuple(getattr(payload, "tensors", ()))
-            if not tensors:
-                continue
-            source_signatures = {
-                _array_backend_signature(tensor.data) for tensor in tensors
-            }
-            if source_signatures == {target_signature}:
-                continue
-            for source_signature in source_signatures:
-                if source_signature != target_signature:
-                    self._warn_backend_conversion(
-                        source_signature, target_signature
+        def check_entry(items, types, prefix):
+            for index, (payload, event_type) in enumerate(zip(items, types)):
+                path = (
+                    paths[index]
+                    if paths is not None and prefix == path_prefix
+                    else f"{prefix}[{index}]"
+                )
+                if event_type == "gate":
+                    source = _array_backend_signature(payload)
+                    if not backend_signatures_compatible(source, target_signature):
+                        mismatches.append((path, "gate", source))
+                elif event_type == "submpo":
+                    for tensor_index, tensor in enumerate(
+                        getattr(payload, "tensors", ())
+                    ):
+                        source = _array_backend_signature(tensor.data)
+                        if not backend_signatures_compatible(
+                            source, target_signature
+                        ):
+                            mismatches.append(
+                                (f"{path}.tensor[{tensor_index}]", "sub-MPO", source)
+                            )
+                elif event_type == "subtreempo":
+                    for network_index, network in enumerate(
+                        getattr(payload, "tree_networks", ())
+                    ):
+                        for tensor_index, tensor in enumerate(network):
+                            source = _array_backend_signature(tensor.data)
+                            if not backend_signatures_compatible(
+                                source, target_signature
+                            ):
+                                mismatches.append(
+                                    (
+                                        f"{path}.network[{network_index}]"
+                                        f".tensor[{tensor_index}]",
+                                        "TreeMPO",
+                                        source,
+                                    )
+                                )
+                elif event_type == "conditional":
+                    action = payload.get("action")
+                    action_payloads, _, action_types = self._normalize_gate_queue(
+                        (action,)
                     )
-            if converter is None:
-                converter = self._backend_converter(like)
-            copied = payload.copy()
-            apply_to_arrays = getattr(copied, "apply_to_arrays", None)
-            if callable(apply_to_arrays):
-                apply_to_arrays(converter)
-            else:
-                tensor_map = getattr(copied, "tensor_map", None)
-                if tensor_map is None:
-                    # Opaque payloads are lowered later and will be coerced
-                    # when their dense operator is materialized.
-                    continue
-                for op_tensor in tensor_map.values():
-                    op_tensor.modify(data=self._as_state_backend(op_tensor.data))
-            prepared[index] = copied
+                    check_entry(action_payloads, action_types, f"{path}.action")
 
-        for index, (payload, event_type) in enumerate(
-            zip(payloads, event_types)
-        ):
-            if event_type != "subtreempo":
-                continue
-            networks = tuple(getattr(payload, "tree_networks", ()))
-            if not networks:
-                continue
-            source_signatures = {
-                _array_backend_signature(tensor.data)
-                for network in networks
-                for tensor in network
-            }
-            if source_signatures == {target_signature}:
-                continue
-            for source_signature in source_signatures:
-                if source_signature != target_signature:
-                    self._warn_backend_conversion(
-                        source_signature, target_signature
-                    )
-            if converter is None:
-                converter = self._backend_converter(like)
-            copied = payload.copy()
-            for network in copied.tree_networks:
-                apply_to_arrays = getattr(network, "apply_to_arrays", None)
-                if callable(apply_to_arrays):
-                    apply_to_arrays(converter)
-                    continue
-                for op_tensor in network.tensor_map.values():
-                    op_tensor.modify(
-                        data=self._as_state_backend(op_tensor.data)
-                    )
-            prepared[index] = copied
-
-        return prepared
+        check_entry(payloads, event_types, path_prefix)
+        if not mismatches:
+            return
+        details = "; ".join(
+            f"{path} ({kind}) has {source!r}"
+            for path, kind, source in mismatches[:8]
+        )
+        if len(mismatches) > 8:
+            details += f"; ... and {len(mismatches) - 8} more"
+        raise TypeError(
+            "TreeOptimizer requires every gate and MPO payload to match the "
+            f"TTN backend/device and required dtype {target_signature!r} "
+            f"before use; {details}. "
+            "Prepare each payload explicitly with the live backend converter "
+            "before passing it to the gate stream."
+        )
 
     def _coerce_tensor_network_backend(self, tn, *, warn=True):
         """Convert every tensor of an operator TN to the live state backend."""
         for tensor in tn.tensor_map.values():
             tensor.modify(data=self._as_state_backend(tensor.data, warn=warn))
         return tn
+
+    def _coerce_tree_mpo_backend(self, tree_mpo):
+        """Convert an internally generated TreeMPO without warning."""
+        networks = tuple(getattr(tree_mpo, "tree_networks", ()))
+        if not networks:
+            return tree_mpo
+        target_signature = _array_backend_signature(self._state_like())
+        if all(
+            backend_signatures_compatible(
+                _array_backend_signature(tensor.data), target_signature
+            )
+            for network in networks
+            for tensor in network
+        ):
+            return tree_mpo
+        copied = tree_mpo.copy()
+        converter = self._backend_converter(self._state_like())
+        for network in copied.tree_networks:
+            apply_to_arrays = getattr(network, "apply_to_arrays", None)
+            if callable(apply_to_arrays):
+                apply_to_arrays(converter)
+            else:
+                for tensor in network.tensor_map.values():
+                    tensor.modify(data=self._as_state_backend(tensor.data, warn=False))
+        return copied
 
     def _tag(self, nid):
         return self.tn.node_tag(nid)
@@ -1528,6 +1559,9 @@ class TreeOptimizer:
         """Replace the live tree state with a canonical independent copy."""
         if not isinstance(tn, TreeTensorNetwork):
             raise TypeError("tn must be a TreeTensorNetwork.")
+        self._validate_gate_stream_backend(
+            self.G, self.event_types, state=tn
+        )
         self._install_tn(tn)
         self.truncation_history.clear()
         self.update_history.clear()
@@ -2756,6 +2790,7 @@ class TreeOptimizer:
                 max_bond=self.chi,
                 cutoff=self.cutoff,
                 track_norm=track_norm,
+                _validate_backend=False,
             )
             if renormalize:
                 self.normalize()
@@ -3201,16 +3236,15 @@ class TreeOptimizer:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         if gates is not None:
-            self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+            normalized = self._normalize_gate_queue(gates)
+            self._validate_gate_stream_backend(normalized[0], normalized[2])
+            self.G, self.where, self.event_types = normalized
             self._gate_factor_cache.clear()
         self._validate_event_stream_for_run()
         self._validate_mode_for_stream()
-        # Prepare the executable payloads without mutating the public queue.
-        # Matching streams retain their original objects; mismatched ordinary
-        # gates and sub-MPOs are converted to the live TTN backend once here.
-        payloads = self._prepare_gate_stream_backend(
-            self.G, self.event_types
-        )
+        # The complete stream was validated at installation. Replay therefore
+        # uses the caller's payload objects without a second scan or cast.
+        payloads = self.G
         pbar = None
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
@@ -3260,6 +3294,7 @@ class TreeOptimizer:
                         support,
                         max_bond=self.chi,
                         cutoff=self.cutoff,
+                        _validate_backend=False,
                     )
                     multi_qubit_count += 1
                 elif event_type == "submpo":
@@ -3346,13 +3381,16 @@ class TreeOptimizer:
 
     def set_gates(self, gates):
         """Replace the queued gate stream and return ``self``."""
-        self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+        normalized = self._normalize_gate_queue(gates)
+        self._validate_gate_stream_backend(normalized[0], normalized[2])
+        self.G, self.where, self.event_types = normalized
         self._gate_factor_cache.clear()
         return self
 
     def add_gates(self, gates):
         """Append gates to the queued stream and return ``self``."""
         G_new, where_new, event_types_new = self._normalize_gate_queue(gates)
+        self._validate_gate_stream_backend(G_new, event_types_new)
         self.G.extend(G_new)
         self.where.extend(where_new)
         self.event_types.extend(event_types_new)
@@ -4882,6 +4920,7 @@ class TreeOptimizer:
         max_bond=None,
         cutoff=None,
         track_norm=True,
+        _validate_backend=True,
     ):
         """Apply a complete TreeMPO/TTNO without lowering it to a chain MPO.
 
@@ -4895,11 +4934,13 @@ class TreeOptimizer:
         """
         self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
-        # Direct calls, like stream replay, must cross the live state backend
-        # boundary without mutating the caller's operator tensors.
-        tree_mpo = self._prepare_gate_stream_backend(
-            [tree_mpo], ["subtreempo"]
-        )[0]
+        # Direct TreeMPO calls obey the same no-implicit-transfer boundary as
+        # stream replay. Generated internal operators use explicit coercion at
+        # their construction sites instead.
+        if _validate_backend:
+            self._validate_gate_stream_backend([tree_mpo], ["subtreempo"])
+        else:
+            tree_mpo = self._coerce_tree_mpo_backend(tree_mpo)
         plan = getattr(tree_mpo, "plan", None)
         networks = getattr(tree_mpo, "tree_networks", None)
         if plan is None or networks is None:
@@ -5374,6 +5415,7 @@ class TreeOptimizer:
             tree_mpo,
             tree_mpo.operator_support,
             track_norm=True,
+            _validate_backend=False,
         )
 
     def apply_pauli_sum(
@@ -5431,6 +5473,7 @@ class TreeOptimizer:
             max_bond=max_bond,
             cutoff=cutoff,
             track_norm=track_norm,
+            _validate_backend=False,
         )
 
     def expectation_pauli(self, pauli, where, *, sign=1.0):

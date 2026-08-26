@@ -219,11 +219,15 @@ TreeStab derives `backend`, `dtype`, and `device` from every live coefficient
 TTN tensor, including a caller-supplied Torch, JAX, or CuPy tree when
 `to_backend` is omitted. `backend_info()` refreshes the same public
 `backend`, `backend_dtype`, `backend_device`, and `array_backend` attributes.
-Explicit matrix gates and sub-MPO payloads are checked at the stream boundary;
-foreign arrays warn once and sub-MPOs are copied before conversion, preserving
-the caller's operator and the TTN's canonical/isometry metadata. Stim gate
-classification remains a NumPy-side operation, while TreeOptimizer applies
-the coefficient update on the inferred backend.
+Explicit matrix gates, every tensor in coefficient-frame sub-MPOs, and native
+TreeMPO tensors are checked at the stream boundary. A foreign backend or device
+payload raises; non-NumPy dtype mismatches also raise, while NumPy-to-NumPy
+dtype promotion remains compatible.
+`TypeError`; prepare it explicitly with the same converter used for the
+coefficient TTN. Stim gate classification remains a NumPy-side operation,
+while TreeOptimizer applies the coefficient update on the inferred backend.
+Stim and trajectory-generated matrices are converted by the library before
+they enter this user-stream boundary.
 
 TreeStab's `norm_diagnostics()` keeps two coefficient-state diagnostics
 separate. `local_fidelity` and `cumulative_fidelity` are cheap
