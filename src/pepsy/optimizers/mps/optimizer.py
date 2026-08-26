@@ -4218,7 +4218,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
-        n_iter=5,
+        n_iter=8,
         progbar=False,
         cutoff="auto",
         cutoff_mode="auto",
@@ -4245,7 +4245,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_sticky_nonfinite=True,
         *,
         fit_min_iter=2,
-        fit_rtol=1.0e-8,
+        fit_rtol="auto",
         fit_patience=2,
         fit_block_size=None,
         fit_adaptive_sweeps=2,
@@ -4293,7 +4293,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         Parameters
         ----------
-        n_iter : int, default=5
+        n_iter : int, default=8
             Inner iterations for DMRG local fits. In ``dmrg`` and ``mix``
             modes this is the maximum number of sweeps when adaptive FIT
             stopping is enabled; pass ``fit_rtol=None`` for fixed
@@ -4401,12 +4401,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Minimum FIT sweeps before adaptive convergence can stop in
             ``dmrg`` or ``mix`` mode. Values above ``n_iter`` are clamped to
             ``n_iter``.
-        fit_rtol : {"auto"} | float | None, default=1e-8
-            Relative tolerance for DMRG FIT early stopping. The default
-            ``1e-8`` uses relative change in the retained canonical-center
-            norm ``A``. Early stopping compares changes in ``A``. ``"auto"``
-            selects a dtype-aware tolerance explicitly; ``None`` disables
-            early stopping and restores fixed ``n_iter`` behavior.
+        fit_rtol : {"auto"} | float | None, default="auto"
+            Relative tolerance for DMRG FIT early stopping. ``"auto"``
+            selects a dtype-aware tolerance: ``1e-3`` for 16-bit data,
+            ``1e-5`` for 32-bit/``complex64`` data, and ``1e-8`` for higher
+            precision data. Early stopping compares changes in the retained
+            canonical-center norm ``A``. ``None`` disables early stopping and
+            restores fixed ``n_iter`` behavior.
         fit_patience : int, default=2
             Number of same-phase sweep-norm samples in the convergence window.
             The default of two stops after one stable comparison between two
@@ -4809,7 +4810,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_rtol = self._resolve_legacy_fit_option(
             canonical_name="fit_rtol",
             canonical_value=fit_rtol,
-            canonical_default=1.0e-8,
+            canonical_default="auto",
             legacy_name="mix_fit_rtol",
             legacy_value=mix_fit_rtol,
         )

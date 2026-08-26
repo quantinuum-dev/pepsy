@@ -343,11 +343,11 @@ re-raised.
 For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
 control adaptive stopping from FIT's final retained-center norm change. The
-public `MpsOptimizer.run` default is `fit_rtol=1e-8`, which compares that norm
-between sweeps. `fit_rtol="auto"` remains an explicit
-dtype-aware option selecting `1e-3`, `1e-5`, or `1e-8` for 16-,
-32-/complex64-, or higher-precision data. Pass `fit_rtol=None` for fixed
-iterations. `fit_patience` counts same-phase sweep-norm samples in the
+public `MpsOptimizer.run` defaults are `n_iter=8` and `fit_rtol="auto"`.
+The automatic tolerance selects `1e-3`, `1e-5`, or `1e-8` for 16-,
+32-/complex64-, or higher-precision data. Pass an explicit numeric tolerance
+to choose another threshold, or `fit_rtol=None` for fixed iterations.
+`fit_patience` counts same-phase sweep-norm samples in the
 convergence window, so the default `fit_patience=2` stops after one stable
 comparison between two one-site samples; `fit_min_iter` still sets the
 minimum completed-sweep count. The old

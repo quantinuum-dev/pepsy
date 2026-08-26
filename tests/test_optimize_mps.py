@@ -3210,9 +3210,10 @@ def test_new_fit_configuration_is_keyword_only():
     run_parameters = inspect.signature(py.MpsOptimizer.run).parameters
 
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["n_iter"].default == 8
     assert run_parameters["cutoff"].default == "auto"
     assert run_parameters["cutoff_mode"].default == "auto"
-    assert run_parameters["fit_rtol"].default == pytest.approx(1.0e-8)
+    assert run_parameters["fit_rtol"].default == "auto"
     assert run_parameters["quality_check_every"].default is False
     for name in (
         "fit_min_iter",
@@ -3244,8 +3245,24 @@ def test_mps_optimizer_fit_defaults_are_adaptive_and_fixed_pair_sweeps():
         "fit_single_pair_fast_path"
     ]
 
-    assert fit_rtol.default == pytest.approx(1.0e-8)
+    assert fit_rtol.default == "auto"
     assert fast_path.default is False
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [("complex64", 1.0e-5), ("complex128", 1.0e-8)],
+)
+def test_mps_optimizer_auto_fit_rtol_tracks_state_dtype(dtype, expected):
+    """The automatic FIT tolerance follows the live MPS precision."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype=dtype),
+        gates=[],
+        chi=2,
+        mode="dmrg",
+    )
+
+    assert optimizer._resolve_fit_rtol("auto") == pytest.approx(expected)
 
 
 def test_mps_optimizer_default_runs_requested_adjacent_pair_sweeps():
