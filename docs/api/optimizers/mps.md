@@ -321,11 +321,13 @@ clear name for
 block. For `fit_block_size=2`, an active window spanning at least three sites
 uses the generic adaptive schedule for local windows and the fixed canonical
 handoff described above for long-range windows; an ordinary two-site gate window
-uses exactly one two-site update because that effective tensor already solves
-the complete local problem. In particular, `dmrg1`, `dmrg2`, and `dmrg3`
-immediately advance to the next gate after that update: they do not repeat
-their warm-up or enter one-site refinement, regardless of `n_iter` or
-`fit_rtol`.
+has a complete local variational problem, but by default it honors the
+requested FIT sweeps and convergence controls. With
+`fit_single_pair_fast_path=True`, `dmrg1`, `dmrg2`, and `dmrg3` immediately
+advance to the next gate after one exact update instead of repeating their
+warm-up or entering one-site refinement.
+The named `dmrg2` schedule is an exception for an adjacent two-site gate: it
+uses one exact update by default, regardless of the general fast-path default.
 `fit_three_site_sweeps` remains a deprecated alias for
 `fit_adaptive_sweeps`.
 `fit_max_span="auto"` also limits the spatial width of a batched
@@ -364,10 +366,9 @@ updates.
 At least two adaptive block sweeps are required whenever the active window
 needs rank growth, regardless of `fit_rtol`; an adjacent two-site interval is
 a structural special case whose only pair is
-the complete variational problem, so the default
-`fit_single_pair_fast_path=True` stops after one effective-tensor SVD even when
-`fit_rtol=None`. Set it to `False` only when intentionally benchmarking
-repeated identical sweeps.
+the complete variational problem. The default
+`fit_single_pair_fast_path=False` honors `n_iter` and `fit_rtol`; set it to
+`True` to stop after one effective-tensor SVD, even when `fit_rtol=None`.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
 when `fit_rtol="auto"`, while an explicit numeric tolerance enables

@@ -4259,7 +4259,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
-        fit_single_pair_fast_path=True,
+        fit_single_pair_fast_path=False,
         stabilize_unitary=False,
         fit_stabilize_unitary=_DEPRECATED_OPTION,
         timing=False,
@@ -4503,10 +4503,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             The gate position is mixed into the
             per-window stream so repeated runs are reproducible without
             sharing a global RNG.
-        fit_single_pair_fast_path : bool, default=True
+        fit_single_pair_fast_path : bool, default=False
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
-            disable it only for diagnostics that deliberately repeat sweeps.
+            enable it when deliberately choosing the one-update fast path.
         stabilize_unitary : bool, default=False
             By default, retain the raw norm change after each unitary FIT or
             mixed/MPO/swap/permutation/SVD compression so norm loss remains
@@ -5265,7 +5265,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
-        fit_single_pair_fast_path=True,
+        fit_single_pair_fast_path=False,
         stabilize_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
@@ -7814,7 +7814,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
-        fit_single_pair_fast_path=True,
+        fit_single_pair_fast_path=False,
         stabilize_unitary=False,
     ):
         """Apply one mixed-mode step through the DMRG backend."""
@@ -7865,7 +7865,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
-        fit_single_pair_fast_path=True,
+        fit_single_pair_fast_path=False,
         stabilize_unitary=False,
     ):
         """Apply a contiguous two-site batch through the DMRG backend."""
@@ -8373,7 +8373,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
-        fit_single_pair_fast_path=True,
+        fit_single_pair_fast_path=False,
         stabilize_unitary=False,
         non_unitary=False,
         quality_check_every=None,
@@ -9089,7 +9089,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
-        fit_single_pair_fast_path=True,
+        fit_single_pair_fast_path=False,
         stabilize_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
@@ -9156,6 +9156,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         else:
             pbar = None
 
+        def use_single_pair_fast_path(xmin, xmax, active_block_size):
+            """Apply the named DMRG2 adjacent-pair schedule exception."""
+            return bool(fit_single_pair_fast_path) or (
+                self._dmrg_mode_alias == "dmrg2"
+                and int(xmax) == int(xmin) + 1
+                and int(active_block_size) == 2
+            )
+
         idx = 0
         while idx < len(G_seq):
             compressed = False
@@ -9214,6 +9222,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     active_fit_block_size = min(
                         fit_block_size,
                         xmax - xmin + 1,
+                    )
+                    active_single_pair_fast_path = use_single_pair_fast_path(
+                        xmin,
+                        xmax,
+                        active_fit_block_size,
                     )
                     self._validate_dmrg1_iteration_budget(
                         p,
@@ -9376,7 +9389,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             max_bond=self.chi,
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
-                            single_pair_fast_path=fit_single_pair_fast_path,
+                            single_pair_fast_path=active_single_pair_fast_path,
                             adaptive_block_sweeps=active_adaptive_sweeps,
                             adaptive_until_rank=active_adaptive_rank_schedule,
                             final_one_site_sweeps=0,
@@ -9580,6 +9593,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         (xmin, xmax),
                         fit_block_size,
                     )
+                    active_single_pair_fast_path = use_single_pair_fast_path(
+                        xmin,
+                        xmax,
+                        active_fit_block_size,
+                    )
                     fit_initialization = self._timed_call(
                         "dmrg.fit_guess",
                         self._prepare_fit_initial_guess,
@@ -9637,7 +9655,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             max_bond=self.chi,
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
-                            single_pair_fast_path=fit_single_pair_fast_path,
+                            single_pair_fast_path=active_single_pair_fast_path,
                             adaptive_block_sweeps=active_adaptive_sweeps,
                             adaptive_until_rank=active_adaptive_rank_schedule,
                             final_one_site_sweeps=0,

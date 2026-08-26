@@ -3218,15 +3218,47 @@ def test_new_fit_configuration_is_keyword_only():
         assert run_parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_mps_optimizer_fit_defaults_are_adaptive_and_single_pair_fast():
-    """The public DMRG defaults use the safe local fast paths."""
+def test_mps_optimizer_fit_defaults_are_adaptive_and_fixed_pair_sweeps():
+    """The public DMRG defaults retain requested adjacent-pair sweeps."""
     fit_rtol = inspect.signature(py.MpsOptimizer.run).parameters["fit_rtol"]
     fast_path = inspect.signature(py.MpsOptimizer.run).parameters[
         "fit_single_pair_fast_path"
     ]
 
     assert fit_rtol.default == pytest.approx(1.0e-8)
-    assert fast_path.default is True
+    assert fast_path.default is False
+
+
+def test_mps_optimizer_default_runs_requested_adjacent_pair_sweeps():
+    """The default MPS optimizer path does not stop after one pair update."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(progbar=False, n_iter=2, fit_rtol=None, timing=True)
+
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["iterations"] == 2
+    assert diagnostics["convergence_reason"] != "single_pair_exact"
+
+
+def test_mps_optimizer_dmrg2_adjacent_pair_defaults_to_one_update():
+    """Named DMRG2 keeps its one-update schedule for neighboring gates."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    optimizer.run(progbar=False, n_iter=8, fit_rtol=None, timing=True)
+
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["iterations"] == 1
+    assert diagnostics["convergence_reason"] == "single_pair_exact"
 
 
 def test_fit_two_site_single_pair_fast_path_is_structurally_converged():
@@ -3267,7 +3299,13 @@ def test_dmrg_modes_advance_after_one_update_per_two_site_window(mode):
         mode=mode,
     )
 
-    optimizer.run(progbar=False, n_iter=8, fit_rtol=None, timing=True)
+    optimizer.run(
+        progbar=False,
+        n_iter=8,
+        fit_rtol=None,
+        fit_single_pair_fast_path=True,
+        timing=True,
+    )
 
     records = optimizer.get_run_timing()["fit_steps"]
     assert [record["fit_index"] for record in records] == [0, 1]
