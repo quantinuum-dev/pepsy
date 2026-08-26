@@ -525,6 +525,7 @@ def test_tree_stab_parity_advice_runner_ghz_and_rank():
     )
     assert advice.settings["max_operator_qubits"] == 2
     assert advice.settings["track_infidelity"] is True
+    assert "stabilize_unitary" not in advice.settings
     assert "track_truncation" not in advice.settings
     result = pepsy.TreeStabOptimizer.run_stream(
         [("h", 0), ("t", 0)], n_qubits=1, settings={"chi": None}
@@ -965,6 +966,17 @@ def test_tree_stab_nonclifford_one_qubit_matrix_matches_dense():
     expected = _apply_local(expected, _rz(theta), (1,), 2)
     _assert_same_state(opt.to_statevector(), expected)
     assert opt.norm() == pytest.approx(1.0)
+
+
+def test_tree_stab_float32_nonclifford_unitary_keeps_norm_tracking():
+    gate = np.asarray(_rzz(0.37), dtype=np.complex64)
+    opt = pepsy.TreeStabOptimizer(2, chi=1).apply([(gate, (0, 1))])
+
+    assert opt.norm() == pytest.approx(1.0, abs=1e-7)
+    assert opt.get_norm_events()
+    assert opt.get_norm_events()[-1]["local_fidelity"] == pytest.approx(
+        1.0, abs=1e-6
+    )
 
 
 def test_tree_stab_nonclifford_two_qubit_matrix_matches_dense():

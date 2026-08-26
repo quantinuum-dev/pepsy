@@ -17,17 +17,20 @@ The public simulator types are exported at top level (`import pepsy`); see
 
 - **Create a simulator**: `sim = pepsy.StabilizerMpsSimulator(n, gates=None, chi=None,
   cutoff=1e-12, operator_tol=None, max_pauli_decomposition_qubits=2,
-  track_infidelity=False, exact_cooling=True, seed=None, to_backend=None)`. It owns an
+  exact_cooling=True, stabilize_unitary=False, seed=None, to_backend=None)`. It owns an
   `STNState`; `sim.p` / `sim.state.p` is the coefficient MPS and `sim.nu` is an alias.
   `MpsStabOptimizer` is the compatibility alias for the same class. `STNState`
   constructs the initial product MPS with `pepsy.ps_to_mps(n)`.
 - **Exact/approximate control**:
   - `chi=None` is exact evolution; keep a small `cutoff` to remove numerically redundant
     Schmidt values introduced by bond-dimension-2 operators.
-  - `chi=cap` bounds the coefficient bond. Add `track_infidelity=True` to record cumulative
-    `1 - ||p||^2` after compressed unitary updates. The norm comes from the tracked
-    canonical centre, with no uncapped target or overlap contraction. Non-unitary updates
-    emit no sample. Read `.infidelities` and `.bond_history`, but do not align or zip them:
+  - `chi=cap` bounds the coefficient bond. Fidelity tracking is automatic and records
+    local and cumulative compression survival after compressed unitary updates. The norm
+    comes from the tracked canonical centre, with no uncapped target or overlap
+    contraction. `stabilize_unitary=True` restores the pre-compression working norm after
+    recording the same ledger; it does not make the fidelity loss disappear. Non-unitary
+    updates emit no unitary sample. Read `.infidelities` and `.bond_history`, but do not
+    align or zip them:
     the former is sparse while the latter records ordinary simulator bookkeeping.
 - **Named physical stream entries**:
   - Clifford: `("h"|"s"|"sdg"|"x"|"y"|"z", q)`,

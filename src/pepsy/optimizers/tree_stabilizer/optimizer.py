@@ -37,7 +37,11 @@ from ..stabilizer_tn.records import (
     StabilizerMpsSettingsAdvice,
     StabilizerTreeRunResult,
 )
-from ..stabilizer_tn.dense import _as_gate_matrix, _tableau_from_exact_unitary
+from ..stabilizer_tn.dense import (
+    _as_gate_matrix,
+    _is_unitary,
+    _tableau_from_exact_unitary,
+)
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
 from ..mps.optimizer import conditional_event_parts, submpo_event_parts
@@ -1032,6 +1036,11 @@ class TreeStabOptimizer:
         mps_advice = MpsStabOptimizer.recommend_settings(gates, **kwargs)
         settings = dict(mps_advice.settings)
         settings.pop("layout_report", None)
+        # MPS-only stabilization is not a TreeStab constructor option. Tree's
+        # retained-norm ledger remains opt-in/out through its own historical
+        # ``track_infidelity`` flag, whose default is enabled.
+        settings.pop("stabilize_unitary", None)
+        settings.setdefault("track_infidelity", True)
         settings.setdefault(
             "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
         )
@@ -2128,12 +2137,7 @@ class TreeStabOptimizer:
             raise ValueError(
                 f"Gate shape {gate.shape} does not match where={where!r}."
             )
-        unitary = np.allclose(
-            gate.conj().T @ gate,
-            np.eye(dim, dtype=gate.dtype),
-            rtol=1e-10,
-            atol=1e-12,
-        )
+        unitary = _is_unitary(gate)
         tableau = _tableau_from_exact_unitary(gate)
         if tableau is not None:
             self.state.do_tableau(tableau, where)

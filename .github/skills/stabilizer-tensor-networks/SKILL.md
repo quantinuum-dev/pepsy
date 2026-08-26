@@ -40,9 +40,11 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 - **Exact vs approximate (bounded-$\chi$) mode** is selected on `MpsStabOptimizer`:
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
     numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
-  - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
-  unitary update can record cumulative norm loss `1 - ||p||^2`; bounded evolution does
-  not renormalize `p`, so compression loss remains visible.
+  - *Approximate*: `MpsStabOptimizer(..., chi=cap)`. Fidelity tracking is automatic:
+    each compressed unitary update records local and cumulative norm-survival loss.
+    By default bounded evolution keeps the raw coefficient-MPS norm so compression
+    loss remains visible; `stabilize_unitary=True` restores the pre-compression working
+    norm after recording the same diagnostic loss.
 - **Coefficient-MPS compression methods** use the same bare native method names
   as `MpsOptimizer` (`direct`, `zipup`, `src`, `fit-*`, and variants).
   Historical `quimb-*` and `mpo-*` spellings remain supported with deprecation
@@ -75,8 +77,9 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 
 ## Diagnostic contract
 
-- Treat `track_infidelity` as the canonical ``infidelity`` API. For unitary
-  updates it is the normalized norm-loss proxy; for compressed dense
+- Treat fidelity tracking as an unconditional part of the `MpsStabOptimizer` API;
+  there is no `track_infidelity` switch. For unitary updates the diagnostic is the
+  normalized norm-loss proxy; for compressed dense
   non-unitary matrices the retained norm ratio is measured against the local
   physical ``G^dagger G`` target. It is not a general ideal-circuit overlap
   calculation.
@@ -96,10 +99,14 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 - Projective measurement/reset boundaries are recorded separately in `.norm_events`.
   Each event snapshots the pre-collapse unitary segment norm, the physical Born branch
   probability, the actual projected norm before renormalization, and the post-normalized
-  norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
-  projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
-  product/geometric summaries that multiply unitary and projector compression-survival
-  factors, but never measurement probabilities. Prefer `local_fidelity`,
+  norm. For fixed-basis projection, compare `projected_norm_sq` to
+  `pre_norm_sq * branch_probability` to get the projector-compression proxy
+  `projector_infidelity`. For basis-updating projection, a finite-chi localizer can
+  change the conditional probability; `projector_branch_probability` is recorded for
+  the post-localizer projector check while `branch_probability` remains the physical
+  pre-localizer probability. Use `norm_diagnostics()` for product/geometric summaries
+  that multiply unitary and projector compression-survival factors, but never
+  measurement probabilities. Prefer `local_fidelity`,
   `local_infidelity`, `cumulative_fidelity`, `cumulative_infidelity`,
   `norm_survival`, and `norm`; the older `total_*_proxy` keys are compatibility
   aliases. `geometric_mean_norm`
@@ -201,8 +208,10 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
   apply `(I + mM)/2`, reject zero-probability forced outcomes, and normalize at the tracked
   centre. The tableau is unchanged.
 - **Basis-updating measurement** → localize `M` to signed `Z_k` with a median-pivot
-  Clifford `V`, apply `V` to `p`, absorb `V^dagger` into `C`, project site `k`, and normalize
-  there. This is the reset/injection primitive.
+  Clifford `V`, apply `V` to `p` through the selected compression backend, absorb
+  `V^dagger` into `C`, project site `k`, and normalize there. The physical outcome
+  probability is computed before any finite-chi localizer compression. This is the
+  reset/injection primitive.
 - **Explicit matrix** → check true unitarity *before* asking stim whether it is Clifford;
   stim does not reject all non-unitary near-Clifford matrices. Non-Clifford 1q unitaries use
   ZYZ; remaining matrices within `max_pauli_decomposition_qubits` use a balanced

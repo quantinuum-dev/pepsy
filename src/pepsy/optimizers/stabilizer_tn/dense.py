@@ -24,8 +24,15 @@ def _as_gate_matrix(gate, n_qubits: int) -> np.ndarray:
     )
 
 
-def _is_unitary(gate: np.ndarray, tol: float = 1e-9) -> bool:
-    """Return whether ``gate`` is unitary within the STN tolerance."""
+def _is_unitary(gate: np.ndarray, tol: float = 1e-7) -> bool:
+    """Return whether ``gate`` is unitary within the STN tolerance.
+
+    Gate payloads are normalized to complex128 by :func:`_as_gate_matrix`, so
+    the original precision is not available here. The slightly relaxed
+    default accommodates the roundoff of float32 Clifford matrices emitted by
+    Stim while remaining far below the tolerance used to treat a meaningful
+    non-unitary channel as a unitary gate.
+    """
     gate = np.asarray(gate, dtype=complex)
     if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
         return False

@@ -78,7 +78,7 @@ rotations, other non-Clifford rotations, dense matrices, coefficient-frame
 sub-MPOs, measurements, resets, caps, touched qubits, and warnings. Then
 `MpsStabOptimizer.recommend_settings(gates, goal="run" | "validate" |
 "benchmark", ...)` returns a typed `StabilizerMpsSettingsAdvice` containing
-constructor settings (`chi`, `cutoff`, `track_infidelity`, `exact_cooling`),
+constructor settings (`chi`, `cutoff`, `exact_cooling`, `stabilize_unitary`),
 an explicit execution method (`apply`, `with_injection`, or
 `with_deferred_injection`), ancilla requirements, warnings, and a
 human-readable `message`.
@@ -382,14 +382,16 @@ rotations. A `submpo` event is appropriate only when the MPO is already
 expressed in the coefficient frame. Clifford-angle Pauli rotations are
 synthesized directly as linear-size Stim basis-change and parity circuits, then
 cached; they do not form a `2**k x 2**k` dense matrix. Prefer structured
-coefficient-frame sub-MPOs where applicable. `track_infidelity=True` performs
-no reference-state copy or overlap contraction. For normalized unitary
+coefficient-frame sub-MPOs where applicable. Fidelity tracking is automatic and
+performs no reference-state copy or overlap contraction. For normalized unitary
 evolution it records the cumulative proxy `1 - ||nu||**2` after compressed
 coefficient-MPS updates, reading the norm from the tracked one-site canonical
 centre. `get_compression_norm_events()` exposes each update's local retained
 norm ratio, while `norm_diagnostics()["local_fidelity"]` is the latest such
-ratio and `cumulative_fidelity` is the stable cumulative proxy.
-Unitary updates are not renormalized, so lost norm remains visible.
+ratio and `cumulative_fidelity` is the stable cumulative proxy. By default
+unitary updates are not renormalized, so lost norm remains visible;
+`stabilize_unitary=True` restores the pre-compression working norm after recording
+the same local and cumulative ledger.
 For dense multi-qubit non-unitary matrices, the target norm is measured from
 the local physical `G†G` expectation and the retained norm ratio is reported as
 `infidelity`. Coefficient-frame sub-MPOs and arbitrary physical maps without a
@@ -400,10 +402,15 @@ historical, is not index-aligned with `bond_history`, and must not be summed.
 Projective measurement/reset boundaries do preserve the current segment before
 normalization in `norm_events`: the event records the pre-collapse norm,
 `1 - ||nu||**2` for that segment, the Born branch probability separately, and
-the actual post-projector norm before renormalization. Comparing the actual
-post-projector norm with `pre_norm**2 * branch_probability` gives a separate
-`projector_infidelity` proxy for compression done while applying the projector.
-The post-collapse state is then normalized. Use `norm_diagnostics()` to form
+the actual post-projector norm before renormalization. For fixed-basis projection,
+comparing the actual post-projector norm with
+`pre_norm**2 * branch_probability` gives a separate `projector_infidelity` proxy
+for compression done while applying the projector. Basis-updating projection
+computes the physical `branch_probability` before its localizer; if the localizer
+is compressed at finite `chi`, `projector_branch_probability` records the
+post-localizer conditional probability used to isolate the final one-site
+projector loss. The post-collapse state is then normalized. Use
+`norm_diagnostics()` to form
 product/geometric-mean survival summaries across completed segments plus the
 current open segment; these summaries multiply unitary- and projector-
 compression survival factors, but not measurement probabilities. The preferred

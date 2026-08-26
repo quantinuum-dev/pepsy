@@ -657,7 +657,7 @@ def test_stabilizer_mps_transactional_run_restores_state_and_queue():
 def test_simulator_submpo_event_in_nu_frame():
     # A sub-MPO event acts directly on the coefficient MPS p; from |0...0> the
     # basis is identity so it also equals the physical operator.
-    sim = MpsStabOptimizer(3, track_infidelity=True)
+    sim = MpsStabOptimizer(3)
     mpo = pauli_rotation_mpo(0.8, ["X", "I", "Z"], sign=1.0)
     exact = mpo.apply(sim.state.p).to_dense().reshape(-1)
     sim.apply([("submpo", mpo, (0, 1, 2))])
@@ -677,13 +677,53 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
         a, b = rng.choice(n, size=2, replace=False)
         stream.append(("cnot", int(a), int(b)))
         stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
-    sim = MpsStabOptimizer(n, chi=4, track_infidelity=True).apply(stream)
+    sim = MpsStabOptimizer(n, chi=4).apply(stream)
     assert sim.state.max_bond() <= 4
     assert all(0.0 <= inf <= 1.0 for inf in sim.infidelities)
     assert np.all(np.diff(sim.infidelities) >= -1e-10)
     assert max(sim.infidelities) > 0.0  # truncation actually occurred
     assert sim.infidelities[-1] == pytest.approx(
         1.0 - sim.norm() ** 2, abs=1e-10
+    )
+
+
+def test_stn_fidelity_tracking_is_automatic_without_legacy_flag():
+    sim = MpsStabOptimizer(2, chi=1)
+
+    assert sim.norm_diagnostics()["tracking"] is True
+    assert not hasattr(sim, "track_infidelity")
+    with pytest.raises(TypeError, match="track_infidelity"):
+        MpsStabOptimizer(2, chi=1, track_infidelity=True)
+
+
+def test_stn_stabilize_unitary_preserves_norm_but_not_fidelity_ledger():
+    stream = [("rxx", 0.73, 0, 2), ("rxx", 0.51, 0, 2)]
+    raw = MpsStabOptimizer(
+        3, chi=1, exact_cooling=False, stabilize_unitary=False
+    ).apply(stream)
+    stabilized = MpsStabOptimizer(
+        3, chi=1, exact_cooling=False, stabilize_unitary=True
+    ).apply(stream)
+
+    raw_events = raw.get_compression_norm_events()
+    stable_events = stabilized.get_compression_norm_events()
+    assert len(raw_events) == len(stable_events) == 2
+    assert stabilized.norm() == pytest.approx(1.0, abs=1e-10)
+    assert raw.norm() < 1.0
+    for raw_event, stable_event in zip(raw_events, stable_events):
+        assert stable_event["stabilized"] is True
+        assert stable_event["local_fidelity"] == pytest.approx(
+            raw_event["local_fidelity"], abs=1e-10
+        )
+        assert stable_event["cumulative_fidelity"] == pytest.approx(
+            raw_event["cumulative_fidelity"], abs=1e-10
+        )
+    expected = np.prod([event["local_fidelity"] for event in stable_events])
+    assert stabilized.norm_diagnostics()["cumulative_fidelity"] == pytest.approx(
+        expected, abs=1e-10
+    )
+    assert stabilized.norm_diagnostics()["infidelity"] == pytest.approx(
+        1.0 - expected, abs=1e-10
     )
 
 
@@ -699,7 +739,7 @@ def test_stabilizer_mps_exposes_per_update_norm_ratios():
             ("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))),
         ])
 
-    sim = MpsStabOptimizer(n, chi=2, track_infidelity=True).apply(stream)
+    sim = MpsStabOptimizer(n, chi=2).apply(stream)
     events = sim.get_compression_norm_events()
     diagnostics = sim.norm_diagnostics()
 
@@ -730,7 +770,7 @@ def test_nonunitary_dense_gate_reports_gdagger_g_infidelity():
     """Non-unitary compression is normalized by the exact G-dagger-G norm."""
     gate = np.diag([1.0, 1.0, 1.0, 0.2]).astype(complex)
     sim = MpsStabOptimizer(
-        2, chi=1, track_infidelity=True, exact_cooling=False
+        2, chi=1, exact_cooling=False
     )
     sim.apply([("h", 0), ("h", 1)])
     target_norm = np.linalg.norm(gate @ sim.to_statevector())
@@ -763,7 +803,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
         stream.append(("cnot", int(a), int(b)))
         stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
 
-    sim = MpsStabOptimizer(n, chi=4, track_infidelity=True).apply(stream)
+    sim = MpsStabOptimizer(n, chi=4).apply(stream)
     pre_loss = sim.infidelities[-1]
     pre_norm = sim.norm()
 
@@ -829,7 +869,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
 
 def test_norm_events_mark_reset_boundaries():
     sim = MpsStabOptimizer(
-        2, chi=1, track_infidelity=True, exact_cooling=False
+        2, chi=1, exact_cooling=False
     ).apply([("rxx", 0.8, 0, 1)])
     pre_loss = sim.infidelities[-1]
 
@@ -846,7 +886,7 @@ def test_norm_events_mark_reset_boundaries():
 
 
 def test_norm_events_track_projector_compression_loss_separately():
-    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True)
+    sim = MpsStabOptimizer(2, chi=1)
 
     sim.measure("XX", (0, 1), outcome=+1)
 
@@ -898,7 +938,7 @@ def test_norm_progress_reports_entry_part_and_infidelity(monkeypatch):
             pass
 
     monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
-    sim = MpsStabOptimizer(1, chi=1, track_infidelity=True, seed=7)
+    sim = MpsStabOptimizer(1, chi=1, seed=7)
     sim.apply([("h", 0), ("t", 0), ("measure", "Z", 0)], progbar=True)
 
     progress = progress_instances[-1]
@@ -1407,7 +1447,7 @@ def test_dense_cap_budget_validation(value, error):
 
 
 def test_zero_operator_produces_valid_zero_mps():
-    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True).apply(
+    sim = MpsStabOptimizer(2, chi=1).apply(
         [(np.zeros((2, 2), dtype=complex), 0)]
     )
 
@@ -1985,6 +2025,94 @@ def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
     m_abs = a.measure(pauli, where, outcome=outcome, absorb_basis=True)  # basis-updating
     assert m_abs == m_ref
     assert _fidelity(a.to_statevector(), ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_measure_absorb_tracks_localizer_compression_and_pre_probability():
+    # A finite-chi localizing CNOT can itself truncate an entangled coefficient
+    # MPS. The physical branch probability must be sampled before that unitary
+    # approximation, while the final one-site projector uses the post-localizer
+    # probability to isolate its own compression loss.
+    p = qtn.MPS_rand_state(5, bond_dim=2, seed=0, dtype="complex128")
+    p /= (p.H @ p) ** 0.5
+    sim = MpsStabOptimizer.from_mps(p, chi=2, exact_cooling=False)
+    sim.apply([
+        ("rxx", 0.3, 0, 2),
+        ("ryy", 0.4, 1, 3),
+        ("rzz", 0.2, 2, 4),
+    ])
+    physical_probability = 0.5 * (1.0 + sim.expectation("XX", (0, 4)))
+
+    sim.measure("XX", (0, 4), outcome=+1, absorb_basis=True)
+
+    event = sim.norm_events[-1]
+    compression_events = sim.get_compression_norm_events()
+    localizer_events = [
+        item
+        for item in compression_events
+        if item["kind"] == "measurement_localizer"
+    ]
+    assert localizer_events
+    assert any(item["local_infidelity"] > 1e-6 for item in localizer_events)
+    assert event["branch_probability"] == pytest.approx(
+        physical_probability, abs=1e-12
+    )
+    assert event["projector_branch_probability"] != pytest.approx(
+        event["branch_probability"], abs=1e-6
+    )
+    assert event["expected_projected_norm_sq"] == pytest.approx(
+        event["pre_norm_sq"] * event["projector_branch_probability"],
+        abs=1e-12,
+    )
+    assert event["projector_survival"] == pytest.approx(1.0, abs=1e-12)
+    expected_segment_fidelity = np.prod(
+        [item["local_fidelity"] for item in compression_events]
+    )
+    assert event["segment_fidelity"] == pytest.approx(
+        expected_segment_fidelity, abs=1e-12
+    )
+
+
+@pytest.mark.parametrize("mode", ("dmrg1", "dmrg2", "dmrg3"))
+def test_measure_absorb_localizer_uses_selected_dmrg_backend(mode):
+    p = qtn.MPS_rand_state(5, bond_dim=2, seed=0, dtype="complex128")
+    p /= (p.H @ p) ** 0.5
+    sim = MpsStabOptimizer.from_mps(
+        p,
+        chi=2,
+        mode=mode,
+        exact_cooling=False,
+        compression_seed=7,
+    )
+    sim.apply([
+        ("rxx", 0.3, 0, 2),
+        ("ryy", 0.4, 1, 3),
+        ("rzz", 0.2, 2, 4),
+    ])
+    physical_probability = 0.5 * (1.0 + sim.expectation("XX", (0, 4)))
+
+    sim.measure("XX", (0, 4), outcome=+1, absorb_basis=True)
+
+    localizer_events = [
+        item
+        for item in sim.get_compression_norm_events()
+        if item["kind"] == "measurement_localizer"
+    ]
+    assert localizer_events
+    assert sim.norm_events[-1]["branch_probability"] == pytest.approx(
+        physical_probability, abs=1e-12
+    )
+    diagnostics = sim.get_fit_diagnostics()
+    assert diagnostics["target_strategy"] == "layered"
+    assert diagnostics["guess_method"] == "src"
+
+
+def test_measure_absorb_rejects_impossible_forced_identity_outcome():
+    sim = MpsStabOptimizer(2)
+
+    with pytest.raises(ValueError, match="zero probability"):
+        sim.measure("II", (0, 1), outcome=-1, absorb_basis=True)
+
+    assert sim.measure("II", (0, 1), outcome=+1, absorb_basis=True) == 1
 
 
 def test_measure_absorb_forced_outcome_matches_dense_projector():
@@ -2658,6 +2786,29 @@ def test_magic_strategy_recognizes_stim_style_clifford_matrices():
     assert report["is_clifford_t_like"]
 
 
+def test_stream_advisors_use_exact_clifford_matrix_classification():
+    near_identity_rotation = np.diag([1.0, np.exp(1j * 1e-6)])
+    analysis = MpsStabOptimizer.analyze_stream(
+        [(near_identity_rotation, 0)], n_qubits=1
+    )
+    assert analysis.other_nonclifford_entries == 1
+    assert analysis.clifford_entries == 0
+
+    report = MpsStabOptimizer.recommend_magic_strategy(
+        [(near_identity_rotation, 0)]
+    )
+    assert report["other_nonclifford_entries"] == 1
+    assert report["clifford_entries"] == 0
+
+
+def test_magic_strategy_recognizes_matrix_form_t_as_injectable():
+    report = MpsStabOptimizer.recommend_magic_strategy([(np.asarray(_T), 0)])
+
+    assert report["recommended_mode"] == "immediate"
+    assert report["injectable_entries"] == 1
+    assert report["is_clifford_t_like"]
+
+
 def test_stream_analysis_summarizes_pepsy_native_design():
     stream = [
         ("h", 0),
@@ -2716,7 +2867,7 @@ def test_recommend_settings_wraps_magic_strategy_and_settings():
     assert advice.settings["chi"] == 64
     assert advice.settings["layout"] == "auto"
     assert advice.settings["layout_report"] is False
-    assert advice["settings"]["track_infidelity"] is True
+    assert advice["settings"]["stabilize_unitary"] is False
     assert advice.deferred_ancillas_required == 2
     assert advice.analysis.injectable_entries == 2
     assert advice.magic_strategy["recommended_mode"] == "deferred"
@@ -2731,7 +2882,7 @@ def test_recommend_settings_validate_goal_prefers_exact_reference():
     )
 
     assert advice.settings["chi"] is None
-    assert advice.settings["track_infidelity"] is False
+    assert advice.settings["stabilize_unitary"] is False
     assert advice.recommended_mode == "immediate"
     assert advice.execution_method == "with_injection"
 

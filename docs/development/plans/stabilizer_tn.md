@@ -192,8 +192,9 @@ new simulator features.
   frame; any MPO, unitary or not), matching the `MpsOptimizer` contract. A
   *physical*-frame few-qubit operator goes through a dense `(matrix, where)`
   entry instead (frame-mapped automatically).
-- Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, `track_infidelity`,
-  `infidelities`, `bond_history`, `set_gates`/`add_gates`/`run`/`apply`).
+- Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, automatic fidelity
+  tracking, `stabilize_unitary`, `infidelities`, `bond_history`,
+  `set_gates`/`add_gates`/`run`/`apply`).
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
   matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current

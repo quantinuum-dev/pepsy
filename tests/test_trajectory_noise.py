@@ -1088,7 +1088,7 @@ def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
         ("rxx", 0.8, 0, 1),
     ]
     result = pepsy.run_trajectory_shots(
-        lambda: pepsy.MpsStabOptimizer(2, chi=1, track_infidelity=True),
+        lambda: pepsy.MpsStabOptimizer(2, chi=1),
         stream,
         shots=1,
         seed=7,
