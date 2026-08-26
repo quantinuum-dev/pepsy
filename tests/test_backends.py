@@ -149,9 +149,9 @@ def test_torch_linalg_config_is_public_and_reports_runtime():
     config = pepsy.TorchLinalgConfig(
         mode="complex",
         stabilized=False,
-        svd_driver="auto",
         cpu_svd="torch",
     )
+    assert config.svd_driver == "gesvd"
     assert config.resolved_svd_fallback == "none"
     assert config.approximate is False
     assert config.exact is True
@@ -782,10 +782,7 @@ def test_register_torch_linalg_complex_uses_native_defaults(monkeypatch):
 
     registered = {args[1]: args[2] for args, _kwargs in calls}
     assert linalg_torch._same_callable(registered["linalg.qr"], torch.linalg.qr)
-    assert linalg_torch._same_callable(
-        registered["linalg.svd"],
-        linalg_torch._native_svd,
-    )
+    assert registered["linalg.svd"].__name__ == "native_svd_gesvd_torch"
 
 
 def test_register_torch_linalg_stabilized_real_is_opt_in(monkeypatch):
@@ -893,10 +890,7 @@ def test_reset_linalg_registrations_restores_native_torch(monkeypatch):
         linalg_torch._REGISTERED_FUNCTIONS.update(original_registered)
 
     registered = {args[1]: args[2] for args, _kwargs in calls}
-    assert linalg_torch._same_callable(
-        registered["linalg.svd"],
-        linalg_torch._native_svd,
-    )
+    assert registered["linalg.svd"].__name__ == "native_svd_gesvd_torch"
     assert linalg_torch._same_callable(registered["linalg.qr"], torch.linalg.qr)
 
 

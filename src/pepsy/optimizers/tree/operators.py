@@ -3945,7 +3945,9 @@ def _dense_operator_array(operator, *, dtype=None):
     """Extract one ordinary dense operator array."""
     if hasattr(operator, "to_dense"):
         operator = operator.to_dense()
-    elif hasattr(operator, "data"):
+    elif hasattr(operator, "data") and not hasattr(operator, "shape"):
+        # Backend arrays expose ``.data`` too, but for CuPy that is the raw
+        # MemoryPointer rather than an array that Autoray can convert.
         operator = operator.data
     return _as_numpy(operator, dtype=dtype)
 

@@ -12,7 +12,7 @@
 policy = pepsy.TorchLinalgConfig(
     mode="complex",
     stabilized=True,
-    svd_driver="auto",
+    svd_driver="gesvd",
 )
 optimizer = pepsy.PepsEnergyOptimizer(
     state,

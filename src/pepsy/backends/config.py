@@ -51,10 +51,12 @@ class TorchLinalgConfig:
         rank-deficient tensor-network splits. The default keeps native Torch
         forward and backward behavior and is the recommended setting for
         ordinary non-differentiable simulation.
-    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="auto"
-        CUDA cuSOLVER driver. ``"auto"`` leaves the choice to Torch. The
-        approximate ``"gesvda"`` driver requires ``allow_approximate=True``.
-        This option has no effect on CPU tensors.
+    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="gesvd"
+        CUDA cuSOLVER driver. Pepsy defaults to the exact ``"gesvd"`` route;
+        ``"auto"`` leaves the choice to Torch and ``"gesvdj"`` remains an
+        explicit exact alternative. The approximate ``"gesvda"`` driver
+        requires ``allow_approximate=True``. This option has no effect on
+        CPU tensors.
     cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
         CPU forward SVD implementation. SciPy choices are useful for explicit
         LAPACK experimentation and forward-only MPS runs. With
@@ -86,7 +88,7 @@ class TorchLinalgConfig:
 
     mode: str = "complex"
     stabilized: bool = False
-    svd_driver: str = "auto"
+    svd_driver: str = "gesvd"
     cpu_svd: str = "torch"
     svd_fallback: str = "auto"
     allow_approximate: bool = False
@@ -96,7 +98,7 @@ class TorchLinalgConfig:
 
     def __post_init__(self):
         mode = str(self.mode).strip().lower()
-        svd_driver = "auto" if self.svd_driver is None else str(self.svd_driver)
+        svd_driver = "gesvd" if self.svd_driver is None else str(self.svd_driver)
         cpu_svd = "torch" if self.cpu_svd is None else str(self.cpu_svd)
         svd_fallback = "auto" if self.svd_fallback is None else str(self.svd_fallback)
         qr_rank_policy = str(self.qr_rank_policy).strip().lower()
@@ -619,7 +621,7 @@ def register_torch_linalg(
     mode="complex",
     *,
     stabilized=False,
-    svd_driver="auto",
+    svd_driver="gesvd",
     cpu_svd="torch",
     svd_fallback="auto",
     allow_approximate=False,
@@ -640,8 +642,9 @@ def register_torch_linalg(
     stabilized : bool, default=False
         Keep native Torch SVD/QR by default. Set this to ``True`` to install
         Pepsy's relative-regularized SVD and validated real-QR rules.
-    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="auto"
-        CUDA cuSOLVER driver. ``"gesvda"`` is approximate and requires
+    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="gesvd"
+        CUDA cuSOLVER driver. Pepsy defaults to the exact ``"gesvd"`` route.
+        ``"gesvda"`` is approximate and requires
         ``allow_approximate=True``. CPU tensors ignore this option.
     cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
         CPU SVD implementation. SciPy choices are forward-only for native
@@ -754,7 +757,7 @@ def reg_native_svd_torch():
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
-    lr.reg_native_svd_torch()
+    lr.reg_native_svd_torch(svd_driver="gesvd")
     global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
     _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig()
 
