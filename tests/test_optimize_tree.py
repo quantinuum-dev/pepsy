@@ -252,13 +252,13 @@ def test_tree_cutoff_mode_controls_edge_truncation_and_copy():
     assert relative_sum2.copy().cutoff_mode == "rsum2"
 
 
-def test_tree_cutoff_defaults_match_quimb_open_mps_submpo_path():
-    """TreeOptimizer defaults match Quimb's open-chain MPO compression."""
+def test_tree_cutoff_defaults_are_dtype_aware():
+    """TreeOptimizer defaults resolve from the default complex128 state."""
     opt = TreeOptimizer(None, n=2, run=False)
 
-    assert opt.cutoff == pytest.approx(1e-10)
+    assert opt.cutoff == pytest.approx(1e-12)
     assert opt.cutoff_mode == "rsum2"
-    assert opt.copy().cutoff == pytest.approx(1e-10)
+    assert opt.copy().cutoff == pytest.approx(1e-12)
     assert opt.copy().cutoff_mode == "rsum2"
 
 
@@ -1761,8 +1761,27 @@ def test_optimizer_defaults_to_congestion_layout_for_replay_performance():
     assert opt.subtree_workers == 1
     assert opt.track_truncation is False
     assert opt.track_infidelity is True
+    assert inspect.signature(TreeOptimizer).parameters["cutoff"].default == "auto"
+    assert inspect.signature(TreeOptimizer).parameters["cutoff_mode"].default == "auto"
+    assert opt.cutoff == pytest.approx(1e-12)
     assert opt.cutoff_mode == "rsum2"
     assert opt.profile is False
+
+
+def test_tree_optimizer_auto_cutoff_tracks_state_dtype():
+    """Automatic tree cutoffs use the live TTN precision."""
+    opt = TreeOptimizer(
+        None,
+        n=3,
+        dtype="complex64",
+        cutoff="auto",
+        cutoff_mode="auto",
+        run=False,
+    )
+
+    assert opt.backend_info()["dtype"] == "complex64"
+    assert opt.cutoff == pytest.approx(1e-6)
+    assert opt.cutoff_mode == "rsum2"
 
 
 def test_tree_state_compression_default_matches_optimizer():

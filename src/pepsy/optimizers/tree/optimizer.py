@@ -319,8 +319,8 @@ _PAULI_1Q = {
     "Z": np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
 }
 _RESET_FLIP_AXES = {"X": "Z", "Y": "X", "Z": "X"}
-_DEFAULT_CUTOFF = 1e-10
-_DEFAULT_CUTOFF_MODE = "rsum2"
+_DEFAULT_CUTOFF = "auto"
+_DEFAULT_CUTOFF_MODE = "auto"
 _DEFAULT_MAX_OPERATOR_QUBITS = 8
 _DEFAULT_MAX_SUBTREE_NODES = 128
 
@@ -390,13 +390,15 @@ class TreeOptimizer:
         Maximum virtual bond dimension enforced during two-qubit threading.
         ``None`` leaves the bond uncapped; the singular-value ``cutoff`` still
         applies.
-    cutoff : float
+    cutoff : float | {"auto"}
         Singular-value cutoff for truncations, interpreted according to
-        ``cutoff_mode``.
-    cutoff_mode : str
-        Quimb singular-value cutoff mode. The default ``"rsum2"`` matches
-        Quimb's open-boundary ``MatrixProductState.gate_with_submpo`` path;
-        use ``"rel"`` for a relative largest-singular-value threshold.
+        ``cutoff_mode``. ``"auto"`` selects a dtype-aware value: ``1e-6``
+        for 32-bit data and ``1e-12`` for 64-bit data.
+    cutoff_mode : str | None | {"auto"}
+        Quimb singular-value cutoff mode. ``"auto"`` (and the compatibility
+        spelling ``None``) selects Pepsy's relative discarded-squared-weight
+        convention, ``"rsum2"``. Use ``"rel"`` for a relative
+        largest-singular-value threshold.
     mode : {"auto", "direct", "mpo", "submpo"}
         Implementation used for two-site gates and explicit operator streams.
         ``"direct"`` uses the specialised gate-SVD/QR path. ``"mpo"`` first
@@ -549,6 +551,34 @@ class TreeOptimizer:
         if max_bond < 1:
             raise ValueError("max_bond must be a positive integer or None.")
         return max_bond
+
+    def _resolve_cutoff(self, value):
+        """Return a validated truncation cutoff, including ``"auto"``."""
+        if value == "auto":
+            dtype = str(self.backend_dtype).lower()
+            if "16" in dtype:
+                return 1.0e-3
+            if "32" in dtype or "complex64" in dtype:
+                return 1.0e-6
+            return 1.0e-12
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cutoff must be 'auto' or a non-negative number."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        return value
+
+    @staticmethod
+    def _resolve_cutoff_mode(value):
+        """Resolve ``cutoff_mode='auto'`` to Pepsy's default convention."""
+        if value is None or (
+            isinstance(value, str) and value.strip().lower() == "auto"
+        ):
+            return "rsum2"
+        return value
 
     def __init__(self, gates=None, n=None, *, chi=64,
                  cutoff=_DEFAULT_CUTOFF,
@@ -717,9 +747,7 @@ class TreeOptimizer:
         self._logical_positions = {q: q for q in self._logical_qubits}
 
         self.chi = self._normalize_max_bond(chi)
-        self.cutoff = float(cutoff)
-        if self.cutoff < 0.0:
-            raise ValueError("cutoff must be non-negative.")
+        self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
         self.mode = self._normalize_mode(mode)
         if two_site_mode is not None:
@@ -852,6 +880,8 @@ class TreeOptimizer:
         self._attach_profile_sink()
         self._thread_ind = None
         self.backend_info()
+        self.cutoff = self._resolve_cutoff(cutoff)
+        self.cutoff_mode = self._resolve_cutoff_mode(cutoff_mode)
 
         if run and self.G:
             if (

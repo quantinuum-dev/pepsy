@@ -1251,7 +1251,11 @@ def test_mps_optimizer_interior_submpo_oversampled_methods(method):
     assert all(np.isfinite(np.asarray(tensor.data)).all() for tensor in out.tensors)
 
 
-def test_mps_optimizer_dm_uses_native_cutoff_mode_by_default(monkeypatch):
+@pytest.mark.parametrize("cutoff_mode", [None, "auto"])
+def test_mps_optimizer_dm_uses_native_cutoff_mode_by_default(
+    monkeypatch,
+    cutoff_mode,
+):
     """The MPO density-matrix method keeps Quimb's native rsum1 default."""
     calls = []
 
@@ -1272,7 +1276,11 @@ def test_mps_optimizer_dm_uses_native_cutoff_mode_by_default(monkeypatch):
         chi=2,
         mode="quimb-dm",
     )
-    optimizer.run(progbar=False, stabilize_unitary=False)
+    optimizer.run(
+        progbar=False,
+        stabilize_unitary=False,
+        cutoff_mode=cutoff_mode,
+    )
     assert "cutoff_mode" not in calls[-1]
 
     optimizer.run(
@@ -3042,10 +3050,18 @@ def test_fit_auto_cutoff_is_dtype_aware():
     assert fit.info["cutoff_resolved"] == pytest.approx(1.0e-6)
 
 
-def test_mps_optimizer_default_cutoff_is_dtype_aware(monkeypatch):
+@pytest.mark.parametrize(
+    ("dtype", "expected_cutoff"),
+    [("complex64", 1.0e-6), ("complex128", 1.0e-12)],
+)
+def test_mps_optimizer_default_cutoff_policy_is_dtype_aware(
+    monkeypatch,
+    dtype,
+    expected_cutoff,
+):
     """An omitted MPS run cutoff resolves from the live tensor dtype."""
     optimizer = py.MpsOptimizer(
-        qtn.MPS_computational_state("0", dtype="complex64"),
+        qtn.MPS_computational_state("0", dtype=dtype),
         gates=[(qu.hadamard(), (0,))],
         chi=2,
         mode="svd",
@@ -3059,7 +3075,9 @@ def test_mps_optimizer_default_cutoff_is_dtype_aware(monkeypatch):
     monkeypatch.setattr(optimizer, "_execute_mode", record_execute)
     optimizer.run(progbar=False)
 
-    assert calls["cutoff"] == pytest.approx(1.0e-6)
+    assert calls["cutoff"] == pytest.approx(expected_cutoff)
+    assert calls["cutoff_mode"] == "rsum2"
+    assert calls["mpo_cutoff_mode"] == "rsum2"
 
 
 def test_fit_retag_resolves_environment_and_preserves_info_object():
@@ -3193,6 +3211,7 @@ def test_new_fit_configuration_is_keyword_only():
 
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["cutoff"].default == "auto"
+    assert run_parameters["cutoff_mode"].default == "auto"
     assert run_parameters["fit_rtol"].default == pytest.approx(1.0e-8)
     assert run_parameters["quality_check_every"].default is False
     for name in (

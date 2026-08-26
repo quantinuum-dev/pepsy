@@ -4221,7 +4221,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter=5,
         progbar=False,
         cutoff="auto",
-        cutoff_mode=None,
+        cutoff_mode="auto",
         mode=None,
         k_2q_batch=1,
         non_unitary=False,
@@ -4310,12 +4310,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Truncation cutoff used in gate application and local fitting.
             The default ``"auto"`` selects a conservative dtype-aware value;
             pass an explicit number to preserve a fixed cutoff.
-        cutoff_mode : str | None, default=None
+        cutoff_mode : str | None | {"auto"}, default="auto"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
-            ``tensor_network_1d_compress``. ``None`` uses ``"rsum2"`` for
-            Pepsy's ordinary compression paths while preserving Quimb's
-            method-specific native default for the MPO path, notably
-            ``"rsum1"`` for ``method="dm"``. Pass a string to override it.
+            ``tensor_network_1d_compress``. ``"auto"`` (and compatibility
+            value ``None``) uses ``"rsum2"`` for Pepsy's ordinary compression
+            paths while preserving Quimb's method-specific native default for
+            the MPO path, notably ``"rsum1"`` for ``method="dm"``. Pass a
+            string to override it.
         mode : {"fit", "dmrg", "dmrg1", "dmrg2", "dmrg3", "<quimb-method>", "quimb-<method>", "quimb", "mpo-<method>", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
@@ -4650,15 +4651,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         timing = bool(timing)
         timing_sync_device = bool(timing_sync_device)
+        if mode is not None:
+            self.set_mode(mode)
         cutoff = self._resolve_cutoff(cutoff)
         quality_check_every = self._resolve_quality_check_every(
             quality_check_every
         )
         quality_check_repair = bool(quality_check_repair)
         self.quality_checks = []
-        if mode is not None:
-            self.set_mode(mode)
-
         # Mixed mode is intentionally a direct/MPO warm-up followed by
         # one-site DMRG. Keep the ordinary DMRG default at two-site FIT, while
         # allowing callers to opt into mixed two- or three-site transactions
@@ -4666,15 +4666,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if fit_block_size is None:
             fit_block_size = 1 if self.mode == "mix" else 2
 
-        # Keep the caller's omission distinct from an explicit cutoff mode.
-        # Most Pepsy paths use rsum2, while Quimb's density-matrix compressor
-        # intentionally defaults to rsum1 in the squared singular-value space.
-        mpo_cutoff_mode = cutoff_mode
-        cutoff_mode = (
-            _DEFAULT_CUTOFF_MODE
-            if cutoff_mode is None
-            else cutoff_mode
+        # ``auto`` (and the legacy ``None``) uses Pepsy's relative squared
+        # weight policy for ordinary paths. MPO paths retain Quimb's native
+        # method default when auto is selected, notably rsum1 for ``dm``.
+        mpo_cutoff_mode = self._resolve_cutoff_mode(
+            cutoff_mode,
+            preserve_mpo_default=self._is_mpo_mode(self.mode),
         )
+        cutoff_mode = self._resolve_cutoff_mode(cutoff_mode)
 
         if seed is not None:
             self._rng = np.random.default_rng(seed)
@@ -8184,6 +8183,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ) from exc
         if not np.isfinite(value) or value < 0.0:
             raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        return value
+
+    @staticmethod
+    def _resolve_cutoff_mode(value, *, preserve_mpo_default=False):
+        """Resolve ``cutoff_mode='auto'`` without leaking it to Quimb.
+
+        Ordinary Pepsy compression uses relative discarded squared weight,
+        which is the natural state-fidelity metric. Quimb MPO methods retain
+        their own defaults when requested through ``auto``; this matters for
+        the density-matrix compressor, whose native default is ``rsum1``.
+        ``None`` remains a compatibility spelling for the same policy.
+        """
+        if value is None or (
+            isinstance(value, str) and value.strip().lower() == "auto"
+        ):
+            if preserve_mpo_default:
+                return None
+            return _DEFAULT_CUTOFF_MODE
         return value
 
     @staticmethod

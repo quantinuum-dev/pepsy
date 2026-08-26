@@ -32,8 +32,8 @@ opt = TreeOptimizer(
     gates,
     tree=plan,
     chi=64,
-    cutoff=1e-10,
-    cutoff_mode="rsum2",
+    cutoff="auto",
+    cutoff_mode="auto",
 )
 assert opt.plan.node_of_qubit[4] == opt.plan.root
 assert set(opt.tn.node_tensor(opt.plan.root).inds) >= {"k4"}
@@ -574,13 +574,13 @@ The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
 
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
-Tree-edge SVD. Its defaults, `cutoff=1e-10` and `cutoff_mode="rsum2"`, match
-Quimb's open-boundary `MatrixProductState.gate_with_submpo` compression path.
-`"rel"` remains available as a relative largest-singular-value threshold.
-The same defaults are used by the lower-level
-`TreeTensorNetwork.compress_edge_` API, so constructing the state directly and
-replaying it through `TreeOptimizer` does not silently change the truncation
-criterion.
+Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
+once from the live state dtype: `1e-6` for 32-bit data and `1e-12` for 64-bit
+data, with `"rsum2"` as the automatic cutoff mode. `"rel"` remains available
+as a relative largest-singular-value threshold.
+The lower-level `TreeTensorNetwork.compress_edge_` API retains explicit
+numeric defaults (`1e-10` and `"rsum2"`); pass its cutoff controls directly
+when using that lower-level interface.
 
 ### Performance-oriented defaults and warnings
 

@@ -236,10 +236,11 @@ remain accepted as aliases. The bare `fit` name is reserved for DMRG; use
 Oversampled methods retain Quimb's two-stage structure: an intermediate larger
 bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
-bonds; its projector guess and variational FIT remain native. If `run()` does
-not receive `cutoff_mode`, ordinary Pepsy paths use `rsum2` while MPO `dm`
-keeps Quimb's native `rsum1` default. Passing a string explicitly overrides
-that method default.
+bonds; its projector guess and variational FIT remain native. If `run()`
+receives `cutoff_mode="auto"` (now the default), ordinary Pepsy paths use
+`rsum2` while MPO methods keep their Quimb-native defaults. In particular,
+MPO `dm` keeps `rsum1`. Passing a concrete string explicitly overrides that
+method default. `None` remains a compatibility alias for `"auto"`.
 
 For example, `mode="quimb-src"` applies each gate with Quimb's Successive
 Randomized Compression, while `fit_init_strategy="guess-src"` uses SRC to
@@ -493,7 +494,8 @@ for low-precision data (for example, `complex64` uses a bounded multiple of
 float32 machine epsilon). A larger overshoot still raises because it indicates
 broken canonical projection metadata rather than ordinary truncation loss.
 
-`MpsOptimizer.run()` now defaults to `cutoff="auto"`. This selects `1e-3`
+`MpsOptimizer.run()` now defaults to `cutoff="auto", cutoff_mode="auto"`.
+The cutoff selects `1e-3`
 for 16-bit data, `1e-6` for 32-bit/complex64 data, and `1e-12` for 64-bit
 data. Explicit numeric cutoffs are unchanged.
 Set `quality_check_every=N` to record finite-data and canonical-gauge health in
