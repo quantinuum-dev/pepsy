@@ -1,0 +1,1282 @@
+"""A PEPS-like tensor state whose virtual graph is a spanning tree."""
+
+from __future__ import annotations
+
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from numbers import Integral
+
+import numpy as np
+import quimb.tensor as qtn
+
+from .plan import TreePepsPlan
+
+__all__ = ["TreePeps"]
+
+
+class TreePeps(qtn.TensorNetworkGenVector):
+    """A lattice-aware tensor network with a tree of virtual bonds.
+
+    Every lattice site owns one tensor and one physical index.  The retained
+    virtual bonds are described by :class:`TreePepsPlan` and form a spanning
+    tree of the underlying 2D or 3D lattice.  Tags intentionally expose both
+    coordinate and logical identities, for example ``I1,2``, ``I7``, and
+    ``N7``.  The physical index is a single coordinate-style ``k1,2`` index;
+    :meth:`site_ind_1d` is an alias for looking it up by logical id.
+
+    This initial implementation uses Quimb's generic tensor-network engine,
+    which keeps the representation compatible with PEPS-style tags without
+    imposing the rectangular PEPS bond pattern on a tree state.
+    """
+
+    _EXTRA_PROPS = (
+        "_tree_peps_plan",
+        "_coord_site_tag_id",
+        "_coord_site_ind_id",
+        "_logical_site_tag_id",
+        "_node_tag_id",
+        "_tree_bond_id",
+        "_canonical_region",
+    )
+
+    def __init__(
+        self,
+        ts=(),
+        *,
+        plan: TreePepsPlan | None = None,
+        coord_site_tag_id: str | None = None,
+        coord_site_ind_id: str | None = None,
+        logical_site_tag_id: str = "I{}",
+        node_tag_id: str = "N{}",
+        tree_bond_id: str = "_tpb{}_{}",
+        canonical_region=None,
+        **tn_opts,
+    ) -> None:
+        if isinstance(ts, TreePeps):
+            if plan is None:
+                plan = ts.plan
+            if coord_site_tag_id is None:
+                coord_site_tag_id = ts._coord_site_tag_id
+            if coord_site_ind_id is None:
+                coord_site_ind_id = ts._coord_site_ind_id
+            logical_site_tag_id = ts._logical_site_tag_id
+            node_tag_id = ts._node_tag_id
+            tree_bond_id = ts._tree_bond_id
+            if canonical_region is None:
+                canonical_region = ts._canonical_region
+        if plan is None:
+            raise TypeError("TreePeps requires a TreePepsPlan")
+        if not isinstance(plan, TreePepsPlan):
+            raise TypeError("plan must be a TreePepsPlan")
+
+        if coord_site_tag_id is None:
+            coord_site_tag_id = _default_format("I", plan.ndim)
+        if coord_site_ind_id is None:
+            coord_site_ind_id = _default_format("k", plan.ndim)
+
+        # Quimb passes ``virtual`` back to the constructor when copying a
+        # TensorNetwork.  TreePeps always owns physical site indices, so keep
+        # the generic vector in non-virtual mode and consume that copy hint.
+        tn_opts.pop("virtual", None)
+        super().__init__(ts, virtual=False, **tn_opts)
+        self._tree_peps_plan = plan
+        self._coord_site_tag_id = str(coord_site_tag_id)
+        self._coord_site_ind_id = str(coord_site_ind_id)
+        self._logical_site_tag_id = str(logical_site_tag_id)
+        self._node_tag_id = str(node_tag_id)
+        self._tree_bond_id = str(tree_bond_id)
+        self._canonical_region = (
+            None
+            if canonical_region is None
+            else frozenset(plan.resolve_site(site) for site in canonical_region)
+        )
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: TreePepsPlan,
+        *,
+        phys_dim: int | Sequence[int] | Mapping = 2,
+        dtype=complex,
+        **tn_opts,
+    ) -> "TreePeps":
+        """Create a product-state tree with all virtual bond dimensions one."""
+
+        dims = _site_dimensions(plan, phys_dim, name="phys_dim")
+        tensors = []
+        for q in range(plan.size):
+            shape = (dims[q],) + (1,) * len(plan.neighbors(q))
+            data = np.zeros(shape, dtype=dtype)
+            data[(0,) * len(shape)] = 1
+            tensors.append(
+                qtn.Tensor(
+                    data=data,
+                    inds=(cls._site_ind_for_plan(plan, q),)
+                    + tuple(cls._bond_ind_for_plan(plan, q, n) for n in plan.neighbors(q)),
+                    tags=cls._tags_for_plan(plan, q),
+                )
+            )
+        state = cls(tensors, plan=plan, **tn_opts)
+        state._canonical_region = frozenset({plan.root})
+        state._set_isometry_metadata_from_region({plan.root})
+        state.validate()
+        return state
+
+    @classmethod
+    def rand(
+        cls,
+        plan: TreePepsPlan,
+        *,
+        bond_dim: int = 2,
+        phys_dim: int | Sequence[int] | Mapping = 2,
+        dtype=complex,
+        seed=None,
+        canonicalize: bool = False,
+        **tn_opts,
+    ) -> "TreePeps":
+        """Create a random tree state with uniform virtual bond dimensions."""
+
+        if not isinstance(bond_dim, Integral) or int(bond_dim) < 1:
+            raise ValueError("bond_dim must be a positive integer")
+        bond_dim = int(bond_dim)
+        dims = _site_dimensions(plan, phys_dim, name="phys_dim")
+        dtype = np.dtype(dtype)
+        rng = np.random.default_rng(seed)
+        tensors = []
+        for q in range(plan.size):
+            shape = (dims[q],) + (bond_dim,) * len(plan.neighbors(q))
+            data = rng.standard_normal(shape)
+            if np.issubdtype(dtype, np.complexfloating):
+                data = data + 1j * rng.standard_normal(shape)
+            data = data.astype(dtype, copy=False)
+            tensors.append(
+                qtn.Tensor(
+                    data=data,
+                    inds=(cls._site_ind_for_plan(plan, q),)
+                    + tuple(cls._bond_ind_for_plan(plan, q, n) for n in plan.neighbors(q)),
+                    tags=cls._tags_for_plan(plan, q),
+                )
+            )
+        state = cls(tensors, plan=plan, **tn_opts)
+        if canonicalize:
+            state.canonize_to(plan.root, inplace=True)
+        else:
+            state.validate()
+        return state
+
+    @property
+    def plan(self) -> TreePepsPlan:
+        """The lattice and spanning-tree plan for this state."""
+
+        return self._tree_peps_plan
+
+    @property
+    def plan_signature(self):
+        """Immutable geometry signature used by state/operator adapters."""
+
+        return (
+            self.plan.shape,
+            self.plan.coordinates,
+            self.plan.tree_edges,
+            self.plan.root,
+            self.plan.max_virtual_degree,
+            self.plan.order,
+            self.plan.boundary,
+        )
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.plan.shape
+
+    @property
+    def ndim(self) -> int:
+        return self.plan.ndim
+
+    @property
+    def sites(self) -> tuple[int, ...]:
+        """Logical site ids in stable one-dimensional order."""
+
+        return tuple(range(self.plan.size))
+
+    @property
+    def coordinates(self) -> tuple[tuple[int, ...], ...]:
+        return self.plan.coordinates
+
+    @property
+    def canonical_region(self):
+        """The region most recently used as a canonical center, if known."""
+
+        return self._canonical_region
+
+    @canonical_region.setter
+    def canonical_region(self, region):
+        if region is None:
+            self._canonical_region = None
+            return
+        if isinstance(region, Integral):
+            region = (region,)
+        region = frozenset(self.plan.resolve_site(site) for site in region)
+        if not region or not self.plan.is_connected(region):
+            raise ValueError("canonical_region must be a non-empty connected subtree")
+        self._canonical_region = region
+
+    @property
+    def orthogonality_center(self):
+        """The unique canonical center site, or ``None`` for a region."""
+
+        if self._canonical_region is not None and len(self._canonical_region) == 1:
+            return next(iter(self._canonical_region))
+        return None
+
+    @orthogonality_center.setter
+    def orthogonality_center(self, site):
+        if site is None:
+            self._canonical_region = None
+        else:
+            self._canonical_region = frozenset({self.plan.resolve_site(site)})
+
+    def coordinate(self, site, *rest) -> tuple[int, ...]:
+        return self.plan.coordinate(self.plan.resolve_site(site, *rest))
+
+    def logical_site(self, *coordinate) -> int:
+        if len(coordinate) == 1 and isinstance(coordinate[0], (tuple, list)):
+            coordinate = tuple(coordinate[0])
+        return self.plan.logical_site(tuple(coordinate))
+
+    def site_tag(self, site, *rest) -> str:
+        """Return the Quimb-style coordinate site tag ``I{x},{y[,z]}``."""
+
+        coordinate = self.coordinate(site, *rest)
+        return self._coord_site_tag_id.format(*coordinate)
+
+    @property
+    def site_tags(self) -> tuple[str, ...]:
+        """Coordinate site tags in logical one-dimensional order."""
+
+        return tuple(self.site_tag(q) for q in self.sites)
+
+    @property
+    def x_tag_id(self) -> str:
+        return "X{}"
+
+    @property
+    def y_tag_id(self) -> str:
+        return "Y{}"
+
+    @property
+    def z_tag_id(self) -> str:
+        return "Z{}"
+
+    def x_tag(self, x: int) -> str:
+        """Return the Quimb-style x-axis tag for a lattice coordinate."""
+
+        return self.x_tag_id.format(int(x))
+
+    def y_tag(self, y: int) -> str:
+        """Return the Quimb-style y-axis tag for a lattice coordinate."""
+
+        return self.y_tag_id.format(int(y))
+
+    def z_tag(self, z: int) -> str:
+        """Return the z-axis tag for a 3D lattice coordinate."""
+
+        if self.ndim != 3:
+            raise ValueError("z_tag is only available for a 3D TreePeps")
+        return self.z_tag_id.format(int(z))
+
+    def axis_tags(self, site) -> tuple[str, ...]:
+        """Return coordinate-axis tags carried by the site's tensor."""
+
+        coordinate = self.coordinate(site)
+        tags = [self.x_tag(coordinate[0]), self.y_tag(coordinate[1])]
+        if self.ndim == 3:
+            tags.append(self.z_tag(coordinate[2]))
+        return tuple(tags)
+
+    def logical_site_tag(self, site) -> str:
+        """Return the stable one-dimensional logical site tag ``I{q}``."""
+
+        q = self.plan.resolve_site(site)
+        return self._logical_site_tag_id.format(q)
+
+    def node_tag(self, site) -> str:
+        """Return the structural tree tag ``N{q}``."""
+
+        q = self.plan.resolve_site(site)
+        return self._node_tag_id.format(q)
+
+    def site_ind(self, site, *rest) -> str:
+        """Return the single physical index for a coordinate or logical site."""
+
+        coordinate = self.coordinate(site, *rest)
+        return self._coord_site_ind_id.format(*coordinate)
+
+    @property
+    def site_inds(self) -> tuple[str, ...]:
+        """Physical indices in logical one-dimensional order."""
+
+        return tuple(self.site_ind_1d(q) for q in self.sites)
+
+    def site_ind_1d(self, site) -> str:
+        """Return the same physical index addressed by logical id ``q``."""
+
+        return self.site_ind(self.plan.resolve_site(site))
+
+    def tree_bond_ind(self, site0, site1) -> str:
+        """Return the initial virtual index name for a tree edge."""
+
+        q0 = self.plan.resolve_site(site0)
+        q1 = self.plan.resolve_site(site1)
+        if q1 not in self.plan.neighbors(q0):
+            raise ValueError(f"sites {q0} and {q1} are not adjacent in the tree")
+        return self._tree_bond_id.format(*sorted((q0, q1)))
+
+    def node_tid(self, site) -> int:
+        """Return the live tensor id for a logical or coordinate site."""
+
+        q = self.plan.resolve_site(site)
+        cache = self.__dict__.get("_tree_peps_tid_cache")
+        if cache is None:
+            cache = self.__dict__["_tree_peps_tid_cache"] = {}
+        tid = cache.get(q)
+        if tid is not None and tid in self.tensor_map:
+            return tid
+        tid = next(iter(self.tag_map[self.node_tag(q)]))
+        cache[q] = tid
+        return tid
+
+    def node_tensor(self, site):
+        """Return the live tensor at a logical or coordinate site."""
+
+        return self.tensor_map[self.node_tid(site)]
+
+    def bond(self, site0, site1) -> str:
+        """Return the live shared virtual index for an adjacent tree edge."""
+
+        q0 = self.plan.resolve_site(site0)
+        q1 = self.plan.resolve_site(site1)
+        if q1 not in self.plan.neighbors(q0):
+            raise ValueError(f"sites {q0} and {q1} are not adjacent in the tree")
+        shared = qtn.bonds(self.node_tensor(q0), self.node_tensor(q1))
+        if len(shared) != 1:
+            raise ValueError(f"sites {q0} and {q1} must share exactly one bond; found {shared}")
+        return next(iter(shared))
+
+    def neighbors(self, site):
+        return self.plan.neighbors(site)
+
+    def path(self, site0, site1):
+        return self.plan.path(site0, site1)
+
+    def validate(self, *, check_canonical=False, tol=1e-9):
+        """Validate tags, physical legs, and the live virtual tree graph."""
+
+        physical_counts = Counter()
+        virtual_counts = Counter()
+        for q in self.sites:
+            tensor = self.node_tensor(q)
+            required_tags = {
+                self.site_tag(q),
+                self.logical_site_tag(q),
+                self.node_tag(q),
+                *self.axis_tags(q),
+            }
+            if not required_tags.issubset(tensor.tags):
+                raise ValueError(f"tensor at site {q} is missing TreePeps tags")
+            physical = self.site_ind_1d(q)
+            if physical not in tensor.inds:
+                raise ValueError(f"tensor at site {q} is missing physical index {physical}")
+            physical_counts[physical] += 1
+            for index in tensor.inds:
+                if index != physical:
+                    virtual_counts[index] += 1
+
+        if (
+            any(count != 1 for count in physical_counts.values())
+            or len(physical_counts) != self.plan.size
+        ):
+            raise ValueError("each TreePeps site must have exactly one physical index")
+        if any(count != 2 for count in virtual_counts.values()):
+            raise ValueError("every TreePeps virtual index must connect exactly two tensors")
+
+        for q0, q1 in self.plan.tree_edges:
+            if len(qtn.bonds(self.node_tensor(q0), self.node_tensor(q1))) != 1:
+                raise ValueError(f"tree edge ({q0}, {q1}) is not a single live bond")
+        for q0 in self.sites:
+            for q1 in range(q0 + 1, self.plan.size):
+                shared = qtn.bonds(self.node_tensor(q0), self.node_tensor(q1))
+                if q1 not in self.plan.neighbors(q0) and shared:
+                    raise ValueError(f"non-tree sites ({q0}, {q1}) share a virtual bond")
+        if self.canonical_region is not None:
+            if not self.canonical_region or not self.plan.is_connected(self.canonical_region):
+                raise ValueError("canonical_region must be a connected subtree")
+            if check_canonical:
+                self.validate_isometry_metadata()
+                if not self.is_subtree_canonical_form(tol=tol):
+                    raise ValueError(
+                        "tracked canonical_region does not satisfy its isometry checks"
+                    )
+        return True
+
+    def isometry_direction(self, site):
+        """Return the neighbor toward which a site is currently isometric."""
+
+        q = self.plan.resolve_site(site)
+        tensor = self.node_tensor(q)
+        left_inds = tensor.left_inds
+        if left_inds is None:
+            return None
+        left_inds = set(left_inds)
+        for neighbor in self.plan.neighbors(q):
+            bond = self.bond(q, neighbor)
+            if bond not in left_inds and left_inds == set(tensor.inds) - {bond}:
+                return neighbor
+        return None
+
+    def isometry_map(self, region=None):
+        """Return the live outward-to-region isometry directions."""
+
+        if region is None:
+            region = self.canonical_region
+        if region is None:
+            region = frozenset()
+        else:
+            region = frozenset(self.plan.resolve_site(site) for site in region)
+        result = {}
+        for q in self.sites:
+            result[q] = None if q in region else self.isometry_direction(q)
+        return result
+
+    def _set_isometry_metadata_from_region(self, region):
+        """Record ``left_inds`` after a completed canonicalization sweep."""
+
+        region = frozenset(self.plan.resolve_site(site) for site in region)
+        if not region or not self.plan.is_connected(region):
+            raise ValueError("canonical region must be a non-empty connected subtree")
+        for q in self.sites:
+            tensor = self.node_tensor(q)
+            if q in region:
+                tensor.modify(left_inds=None)
+                continue
+            toward = self._toward_region(q, region)
+            bond = self.bond(q, toward)
+            tensor.modify(left_inds=tuple(ind for ind in tensor.inds if ind != bond))
+        return self
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate the local ``left_inds`` proofs against a canonical region."""
+
+        if region is None:
+            region = self.canonical_region
+        else:
+            region = frozenset(self.plan.resolve_site(site) for site in region)
+            if not region or not self.plan.is_connected(region):
+                raise ValueError("region must be a non-empty connected subtree")
+
+        for q in self.sites:
+            tensor = self.node_tensor(q)
+            direction = self.isometry_direction(q)
+            if tensor.left_inds is not None and direction is None:
+                raise ValueError(f"site {q} has left_inds that do not identify one tree direction")
+            if region is not None and q not in region:
+                expected = self._toward_region(q, region)
+                if direction != expected:
+                    raise ValueError(
+                        f"site {q} must be isometric toward {expected}, "
+                        f"but left_inds point toward {direction}"
+                    )
+        return self
+
+    def can_skip_canonize(self, site0, site1, *, absorb="right"):
+        """Whether ``left_inds`` proves that an edge QR can be skipped."""
+
+        if absorb not in {"left", "right"}:
+            raise ValueError("absorb must be 'left' or 'right'")
+        q0 = self.plan.resolve_site(site0)
+        q1 = self.plan.resolve_site(site1)
+        bond = self.bond(q0, q1)
+        q = q0 if absorb == "right" else q1
+        tensor = self.node_tensor(q)
+        if tensor.left_inds is None:
+            return False
+        return set(tensor.left_inds) == set(tensor.inds) - {bond}
+
+    def _toward_region(self, site, region):
+        q = self.plan.resolve_site(site)
+        region = frozenset(region)
+        if q in region:
+            return None
+        target = min(region, key=lambda candidate: len(self.plan.path(q, candidate)))
+        return self.plan.path(q, target)[1]
+
+    def _isometry_toward(self, site, toward, tol=1e-9):
+        """Check ``T.conj().T`` on all non-toward legs numerically."""
+
+        tensor = self.node_tensor(site)
+        bond = self.bond(site, toward)
+        other_inds = [ind for ind in tensor.inds if ind != bond]
+        bond_axis = tensor.inds.index(bond)
+        other_axes = [tensor.inds.index(ind) for ind in other_inds]
+        data = np.asarray(tensor.data)
+        matrix = data.transpose(*other_axes, bond_axis).reshape(-1, data.shape[bond_axis])
+        gram = matrix.conj().T @ matrix
+        return np.allclose(
+            gram,
+            np.eye(data.shape[bond_axis], dtype=gram.dtype),
+            atol=tol,
+            rtol=tol,
+        )
+
+    def is_subtree_canonical_form(self, sites=None, *, span=False, tol=1e-9):
+        """Check the defining isometry condition outside a canonical region."""
+
+        if sites is None:
+            region = self.canonical_region
+            if region is None:
+                return False
+        else:
+            if isinstance(sites, Integral):
+                sites = (sites,)
+            region = (
+                self.plan.subtree_span(sites)
+                if span
+                else frozenset(self.plan.resolve_site(site) for site in sites)
+            )
+        if not region or not self.plan.is_connected(region):
+            return False
+        return all(
+            self._isometry_toward(q, self._toward_region(q, region), tol=tol)
+            for q in self.sites
+            if q not in region
+        )
+
+    def is_canonical_form(self, center=None, *, tol=1e-9):
+        """Check whether the tree is in one-site canonical form."""
+
+        if center is None:
+            center = self.orthogonality_center
+        if center is None:
+            return False
+        return self.is_subtree_canonical_form({self.plan.resolve_site(center)}, tol=tol)
+
+    def invalidate_canonical_form(self):
+        """Forget canonical metadata after direct tensor mutation."""
+
+        self._canonical_region = None
+        for q in self.sites:
+            self.node_tensor(q).modify(left_inds=None)
+        return self
+
+    def _sync_info_c(self, info_c):
+        if info_c is None:
+            return None
+        if not hasattr(info_c, "__setitem__"):
+            raise TypeError("info_c must be a mutable mapping when supplied")
+        center = self.orthogonality_center
+        info_c["cur_orthog"] = None if center is None else (center, center)
+        info_c["canonical_region"] = self.canonical_region
+        info_c["isometry_map"] = self.isometry_map()
+        info_c["left_inds"] = {
+            q: None
+            if self.node_tensor(q).left_inds is None
+            else tuple(self.node_tensor(q).left_inds)
+            for q in self.sites
+        }
+        return info_c
+
+    def gate_inds_(self, *args, **kwargs):
+        """Apply a Quimb gate and invalidate canonical metadata."""
+
+        result = qtn.TensorNetworkGenVector.gate_inds_(self, *args, **kwargs)
+        self.invalidate_canonical_form()
+        return self if result is None else result
+
+    def canonize_between(self, *args, **kwargs):
+        """Canonicalize one live edge and invalidate tracked metadata."""
+
+        qtn.TensorNetworkGenVector.canonize_between(self, *args, **kwargs)
+        self.invalidate_canonical_form()
+        return self
+
+    def compress_between(self, *args, **kwargs):
+        """Compress through Quimb and invalidate tracked metadata."""
+
+        qtn.TensorNetworkGenVector.compress_between(self, *args, **kwargs)
+        self.invalidate_canonical_form()
+        return self
+
+    def canonize_around_(self, *args, **kwargs):
+        """Canonicalize around tags through Quimb and invalidate metadata."""
+
+        qtn.TensorNetworkGenVector.canonize_around_(self, *args, **kwargs)
+        self.invalidate_canonical_form()
+        return self
+
+    def canonize_to(
+        self,
+        site,
+        *,
+        absorb="right",
+        inplace=False,
+        info_c=None,
+        _force_full=False,
+        **canonize_opts,
+    ):
+        """Canonicalize the full tree around one site."""
+
+        q = self.plan.resolve_site(site)
+        work = self if inplace else self.copy()
+        if work.canonical_region is not None and not canonize_opts and not _force_full:
+            if absorb not in {"left", "right"}:
+                raise ValueError("canonical movement requires absorb='left' or 'right'")
+            return work.shift_orthogonality_center(
+                q,
+                absorb=absorb,
+                info_c=info_c,
+            )
+        opts = {"method": "qr", "cutoff": 0.0}
+        opts.update(canonize_opts)
+        work.canonize_around_([work.node_tag(q)], which="any", absorb=absorb, **opts)
+        work._canonical_region = frozenset({q})
+        work._set_isometry_metadata_from_region({q})
+        work.validate()
+        work._sync_info_c(info_c)
+        return work
+
+    def canonicalize(self, center=None, *, inplace=True, info_c=None, **canonize_opts):
+        """Canonicalize the tree around ``center`` like a Quimb MPS."""
+
+        target = self if inplace else self.copy()
+        if center is None:
+            center = target.orthogonality_center
+            if center is None:
+                center = target.plan.root
+        return target.canonize_to(
+            center,
+            inplace=True,
+            info_c=info_c,
+            **canonize_opts,
+        )
+
+    def canonicalize_(self, center=None, *, info_c=None, **canonize_opts):
+        """In-place alias for :meth:`canonicalize`."""
+
+        return self.canonicalize(
+            center=center,
+            inplace=True,
+            info_c=info_c,
+            **canonize_opts,
+        )
+
+    canonize = canonicalize_
+
+    def _canonicalize_region_fast(self, region, *, absorb="right", **canonize_opts):
+        """Canonicalize only the branches outside ``region``.
+
+        The tree is peeled from the farthest leaves inward.  A tensor whose
+        live ``left_inds`` already prove the required isometry is left
+        untouched, so moving between compatible canonical regions can avoid
+        all QR work on their common exterior.
+        """
+
+        if absorb not in {"left", "right"}:
+            raise ValueError("canonical region movement requires absorb='left' or 'right'")
+        region = frozenset(region)
+        order = sorted(
+            (q for q in self.sites if q not in region),
+            key=lambda q: (
+                -len(self.plan.path(q, min(region, key=lambda r: len(self.plan.path(q, r))))),
+                q,
+            ),
+        )
+        for q in order:
+            toward = self._toward_region(q, region)
+            if absorb == "right":
+                source, target = q, toward
+            else:
+                source, target = toward, q
+            if self.can_skip_canonize(source, target, absorb=absorb):
+                continue
+            self.canonize_edge_(
+                source,
+                target,
+                absorb=absorb,
+                **canonize_opts,
+            )
+        self._canonical_region = region
+        self._set_isometry_metadata_from_region(region)
+        return self
+
+    def _recover_center_from_region(self, region, target, *, absorb="right"):
+        """Peel a tracked canonical region down to one site."""
+
+        region = set(region)
+        target = self.plan.resolve_site(target)
+        if target not in region:
+            raise ValueError("target center must lie inside canonical_region")
+        if absorb not in {"left", "right"}:
+            raise ValueError("canonical movement requires absorb='left' or 'right'")
+
+        remaining = set(region)
+        while len(remaining) > 1:
+            leaves = [
+                q
+                for q in remaining
+                if q != target
+                and sum(neighbor in remaining for neighbor in self.plan.neighbors(q)) == 1
+            ]
+            if not leaves:
+                raise ValueError("canonical_region is not a connected tree")
+            q = min(leaves)
+            neighbor = next(
+                neighbor for neighbor in self.plan.neighbors(q) if neighbor in remaining
+            )
+            if absorb == "right":
+                source, destination = q, neighbor
+            else:
+                source, destination = neighbor, q
+            self.canonize_edge_(
+                source,
+                destination,
+                absorb=absorb,
+                _isometry_proven=self.can_skip_canonize(source, destination, absorb=absorb),
+            )
+            remaining.remove(q)
+        self._canonical_region = frozenset({target})
+        self._set_isometry_metadata_from_region({target})
+        return self
+
+    def canonize_subtree(
+        self,
+        sites,
+        *,
+        span=False,
+        absorb="right",
+        inplace=False,
+        info_c=None,
+        **canonize_opts,
+    ):
+        """Canonicalize around a connected tree region."""
+
+        if isinstance(sites, Integral):
+            sites = (sites,)
+        sites = tuple(self.plan.resolve_site(site) for site in sites)
+        region = self.plan.subtree_span(sites) if span else frozenset(sites)
+        if not region or not self.plan.is_connected(region):
+            raise ValueError("sites must form a connected subtree, or pass span=True")
+        work = self if inplace else self.copy()
+        opts = {"method": "qr", "cutoff": 0.0}
+        opts.update(canonize_opts)
+        work._canonicalize_region_fast(region, absorb=absorb, **opts)
+        work._canonical_region = frozenset(region)
+        work._set_isometry_metadata_from_region(region)
+        work.validate(check_canonical=True)
+        work._sync_info_c(info_c)
+        return work
+
+    def canonize_subtree_(self, sites, *, span=False, absorb="right", info_c=None, **canonize_opts):
+        """In-place alias for :meth:`canonize_subtree`."""
+
+        return self.canonize_subtree(
+            sites,
+            span=span,
+            absorb=absorb,
+            inplace=True,
+            info_c=info_c,
+            **canonize_opts,
+        )
+
+    def shift_orthogonality_center(self, site, *, absorb="right", info_c=None, **canonize_opts):
+        """Move a known one-site canonical center along the tree."""
+
+        q = self.plan.resolve_site(site)
+        current = self.orthogonality_center
+        if current == q:
+            self._sync_info_c(info_c)
+            return self
+        if current is None:
+            region = self.canonical_region
+            if region:
+                if q in region:
+                    self._recover_center_from_region(region, q, absorb=absorb)
+                    self._sync_info_c(info_c)
+                    return self
+                entry = min(
+                    region,
+                    key=lambda candidate: len(self.plan.path(candidate, q)),
+                )
+                self._recover_center_from_region(region, entry, absorb=absorb)
+                current = entry
+            else:
+                return self.canonize_to(
+                    q,
+                    absorb=absorb,
+                    inplace=True,
+                    info_c=info_c,
+                    _force_full=True,
+                    **canonize_opts,
+                )
+        path = self.plan.path(current, q)
+        for site0, site1 in zip(path, path[1:]):
+            if absorb == "right":
+                source, target = site0, site1
+            elif absorb == "left":
+                source, target = site1, site0
+            else:
+                raise ValueError("absorb must be 'right' or 'left'")
+            self.canonize_edge_(source, target, absorb=absorb, **canonize_opts)
+        self._canonical_region = frozenset({q})
+        self.validate()
+        self._sync_info_c(info_c)
+        return self
+
+    def canonize_edge_(
+        self,
+        site0,
+        site1,
+        absorb="right",
+        *,
+        info_c=None,
+        _isometry_proven=False,
+        **canonize_opts,
+    ):
+        """Canonicalize one tree edge in place and move a known center."""
+
+        q0 = self.plan.resolve_site(site0)
+        q1 = self.plan.resolve_site(site1)
+        if q1 not in self.plan.neighbors(q0):
+            raise ValueError(f"sites {q0} and {q1} are not adjacent in the tree")
+        if absorb not in {"left", "right", "both"}:
+            raise ValueError("absorb must be 'left', 'right', or 'both'")
+        previous = self.orthogonality_center
+        if _isometry_proven or self.can_skip_canonize(q0, q1, absorb=absorb):
+            if absorb == "right" and previous in {q0, q1}:
+                self._canonical_region = frozenset({q1})
+            elif absorb == "left" and previous in {q0, q1}:
+                self._canonical_region = frozenset({q0})
+            else:
+                self._canonical_region = None
+            self._sync_info_c(info_c)
+            return self
+        opts = {"method": "qr", "cutoff": 0.0}
+        opts.update(canonize_opts)
+        qtn.TensorNetworkGenVector.canonize_between(
+            self,
+            self.node_tag(q0),
+            self.node_tag(q1),
+            absorb=absorb,
+            **opts,
+        )
+        if absorb == "right" and previous in {q0, q1}:
+            self._canonical_region = frozenset({q1})
+        elif absorb == "left" and previous in {q0, q1}:
+            self._canonical_region = frozenset({q0})
+        else:
+            self._canonical_region = None
+        bond = self.bond(q0, q1)
+        if absorb == "right":
+            self.node_tensor(q0).modify(
+                left_inds=tuple(ind for ind in self.node_tensor(q0).inds if ind != bond)
+            )
+            if self.orthogonality_center == q1:
+                self.node_tensor(q1).modify(left_inds=None)
+        elif absorb == "left":
+            self.node_tensor(q1).modify(
+                left_inds=tuple(ind for ind in self.node_tensor(q1).inds if ind != bond)
+            )
+            if self.orthogonality_center == q0:
+                self.node_tensor(q0).modify(left_inds=None)
+        self._sync_info_c(info_c)
+        return self
+
+    def compress_edge(
+        self,
+        site0,
+        site1,
+        *,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        absorb="right",
+        reduced=True,
+        inplace=False,
+        info_c=None,
+        **compress_opts,
+    ):
+        """Compress one tree edge using Quimb's generic tree contraction."""
+
+        q0 = self.plan.resolve_site(site0)
+        q1 = self.plan.resolve_site(site1)
+        if q1 not in self.plan.neighbors(q0):
+            raise ValueError(f"sites {q0} and {q1} are not adjacent in the tree")
+        work = self if inplace else self.copy()
+        work.compress_edge_(
+            q0,
+            q1,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            absorb=absorb,
+            reduced=reduced,
+            info_c=info_c,
+            **compress_opts,
+        )
+        return work
+
+    def compress_edge_(
+        self,
+        site0,
+        site1,
+        *,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        absorb="right",
+        reduced=True,
+        info_c=None,
+        **compress_opts,
+    ):
+        """In-place compression of one edge with canonical-center tracking."""
+
+        return self._compress_edge_inplace(
+            site0,
+            site1,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            absorb=absorb,
+            reduced=reduced,
+            info_c=info_c,
+            **compress_opts,
+        )
+
+    def _compress_edge_inplace(
+        self,
+        site0,
+        site1,
+        *,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        absorb="right",
+        reduced=True,
+        info_c=None,
+        **compress_opts,
+    ):
+        q0 = self.plan.resolve_site(site0)
+        q1 = self.plan.resolve_site(site1)
+        if q1 not in self.plan.neighbors(q0):
+            raise ValueError(f"sites {q0} and {q1} are not adjacent in the tree")
+        if absorb not in {"left", "right", "both"}:
+            raise ValueError("absorb must be 'left', 'right', or 'both'")
+        if cutoff is None:
+            cutoff = 1e-10
+        cutoff = float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative")
+        if max_bond is not None:
+            max_bond = int(max_bond)
+            if max_bond < 1:
+                raise ValueError("max_bond must be at least one")
+
+        bond = self.bond(q0, q1)
+        before_bond = int(self.ind_size(bond))
+        if cutoff == 0.0 and (max_bond is None or before_bond <= max_bond):
+            return self.canonize_edge_(
+                q0,
+                q1,
+                absorb=absorb,
+                info_c=info_c,
+                **compress_opts,
+            )
+
+        previous = self.orthogonality_center
+        qtn.TensorNetworkGenVector.compress_between(
+            self,
+            self.node_tag(q0),
+            self.node_tag(q1),
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            absorb=absorb,
+            reduced=reduced,
+            **compress_opts,
+        )
+        self._track_edge_center(q0, q1, absorb, previous=previous)
+        self._sync_info_c(info_c)
+        self.validate()
+        return self
+
+    def _track_edge_center(self, q0, q1, absorb, *, previous):
+        if absorb == "right" and previous in {q0, q1}:
+            self._canonical_region = frozenset({q1})
+        elif absorb == "left" and previous in {q0, q1}:
+            self._canonical_region = frozenset({q0})
+        else:
+            self._canonical_region = None
+
+    def compress(
+        self,
+        form=None,
+        *,
+        center=None,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        reduced=True,
+        info_c=None,
+    ):
+        """Compress the tree inward toward a selected canonical center."""
+
+        if form is not None:
+            if center is not None:
+                raise TypeError("specify either form or center, not both")
+            if isinstance(form, Integral):
+                center = form
+            elif form in {"right", "left"}:
+                center = self.plan.root
+            else:
+                raise ValueError("TreePeps form must be None, 'right', 'left', or a site id")
+        if center is None:
+            center = self.orthogonality_center
+            if center is None:
+                center = self.plan.root
+        center = self.plan.resolve_site(center)
+        self.shift_orthogonality_center(center, info_c=info_c)
+
+        order = sorted(
+            (q for q in self.sites if q != center),
+            key=lambda q: (-len(self.plan.path(q, center)), q),
+        )
+        for q in order:
+            toward = self.plan.path(q, center)[1]
+            self._compress_edge_inplace(
+                q,
+                toward,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                reduced=reduced,
+            )
+        # The inward sweep has already established the defining isometries.
+        # Record the final center directly instead of running a second full
+        # QR sweep over the tree.
+        self._canonical_region = frozenset({center})
+        self._set_isometry_metadata_from_region({center})
+        self.validate(check_canonical=True)
+        self._sync_info_c(info_c)
+        return self
+
+    def _bond_dim(self, site0, site1):
+        """Return a live tree-bond dimension for display."""
+
+        try:
+            return int(self.ind_size(self.bond(site0, site1)))
+        except ValueError:
+            return 1
+
+    def ascii_lattice(self, *, bond_dims=True, node_ids=False):
+        """Return a PEPS-style coordinate drawing of the retained tree bonds."""
+
+        def label(q):
+            return f"N{q}" if node_ids else "●"
+
+        def draw_layer(z=None):
+            coords = (
+                (x, y) if z is None else (x, y, z)
+                for x in range(self.shape[0])
+                for y in range(self.shape[1])
+            )
+            qs = {coordinate: self.plan.logical_site(coordinate) for coordinate in coords}
+            width = max(len(label(q)) for q in qs.values())
+            horizontal_width = max(7, width + 4)
+            lines = []
+            for x in range(self.shape[0]):
+                row = []
+                for y in range(self.shape[1]):
+                    q = qs[(x, y) if z is None else (x, y, z)]
+                    row.append(label(q).center(width))
+                    if y + 1 < self.shape[1]:
+                        q1 = qs[(x, y + 1) if z is None else (x, y + 1, z)]
+                        segment = " " * horizontal_width
+                        if q1 in self.plan.neighbors(q):
+                            edge = self._bond_dim(q, q1) if bond_dims else ""
+                            segment = f"--{edge}--".center(horizontal_width, "─")
+                        row.append(segment)
+                lines.append("".join(row).rstrip())
+
+                if x + 1 < self.shape[0]:
+                    row = []
+                    for y in range(self.shape[1]):
+                        q = qs[(x, y) if z is None else (x, y, z)]
+                        q1 = qs[(x + 1, y) if z is None else (x + 1, y, z)]
+                        segment = " " * width
+                        if q1 in self.plan.neighbors(q):
+                            edge = self._bond_dim(q, q1) if bond_dims else ""
+                            segment = f"│{edge}│".center(width, "│")
+                        row.append(segment)
+                        if y + 1 < self.shape[1]:
+                            row.append(" " * horizontal_width)
+                    lines.append("".join(row).rstrip())
+            return lines
+
+        if self.ndim == 2:
+            return "\n".join(draw_layer())
+
+        lines = []
+        for z in range(self.shape[2]):
+            if lines:
+                lines.append("")
+            lines.append(f"z={z}")
+            lines.extend(draw_layer(z))
+            if z + 1 < self.shape[2]:
+                z_edges = []
+                for x in range(self.shape[0]):
+                    for y in range(self.shape[1]):
+                        q = self.plan.logical_site((x, y, z))
+                        q1 = self.plan.logical_site((x, y, z + 1))
+                        if q1 in self.plan.neighbors(q):
+                            dim = self._bond_dim(q, q1) if bond_dims else ""
+                            z_edges.append(f"({x},{y},{z})│{dim}│({x},{y},{z + 1})")
+                if z_edges:
+                    lines.append("z-bonds: " + ", ".join(z_edges))
+        return "\n".join(lines)
+
+    def show(
+        self,
+        *,
+        bond_dims=True,
+        node_ids=False,
+        color=False,
+        show_lower=False,
+        show_upper=False,
+    ):
+        """Print a PEPS-style coordinate schematic of this tree state.
+
+        ``show_lower`` and ``show_upper`` are accepted for compatibility with
+        :meth:`quimb.tensor.PEPS.show`; tree states have no separate lower or
+        upper PEPS bond layers, so they do not alter the drawing.
+        """
+
+        del color, show_lower, show_upper
+        print(self.ascii_lattice(bond_dims=bond_dims, node_ids=node_ids))
+
+    def norm(self, output_inds=None, squared=False, strip_exponent=False, **contract_opts):
+        """Return the exact Frobenius norm using Quimb's vector semantics."""
+
+        return super().norm(
+            output_inds=output_inds,
+            squared=squared,
+            strip_exponent=strip_exponent,
+            **contract_opts,
+        )
+
+    def to_dense(self, *inds_seq, **contract_opts):
+        """Contract to a dense tensor in logical one-dimensional site order."""
+
+        if inds_seq:
+            output_inds = tuple(inds_seq)
+        else:
+            output_inds = tuple(self.site_ind_1d(q) for q in self.sites)
+        return self.contract(all, output_inds=output_inds, **contract_opts)
+
+    def local_expectation(
+        self,
+        operator,
+        where,
+        *,
+        normalized=True,
+        **contract_opts,
+    ):
+        """Evaluate an exact one- or multi-site observable."""
+
+        if isinstance(where, Integral):
+            where = (int(where),)
+        else:
+            where = tuple(where)
+        sites = tuple(self.plan.resolve_site(site) for site in where)
+        if not sites or len(set(sites)) != len(sites):
+            raise ValueError("where must contain distinct TreePeps sites")
+        physical = [self.site_ind_1d(q) for q in sites]
+        dims = [
+            self.node_tensor(q).shape[self.node_tensor(q).inds.index(ind)]
+            for q, ind in zip(sites, physical)
+        ]
+        operator = _reshape_operator(operator, dims)
+        gate = qtn.Tensor(
+            operator,
+            inds=tuple(ind + "*" for ind in physical) + tuple(physical),
+        )
+        bra = self.H.reindex({ind: ind + "*" for ind in physical})
+        numerator = (bra & gate & self).contract(all, output_inds=[], **contract_opts)
+        if not normalized:
+            return numerator
+        denominator = (self.H & self).contract(all, output_inds=[], **contract_opts)
+        return numerator / denominator
+
+    @staticmethod
+    def _site_ind_for_plan(plan: TreePepsPlan, q: int) -> str:
+        return _default_format("k", plan.ndim).format(*plan.coordinate(q))
+
+    @staticmethod
+    def _bond_ind_for_plan(plan: TreePepsPlan, q0: int, q1: int) -> str:
+        return f"_tpb{min(q0, q1)}_{max(q0, q1)}"
+
+    @staticmethod
+    def _tags_for_plan(plan: TreePepsPlan, q: int) -> tuple[str, ...]:
+        coordinate = plan.coordinate(q)
+        tags = [
+            _default_format("I", plan.ndim).format(*coordinate),
+            f"X{coordinate[0]}",
+            f"Y{coordinate[1]}",
+        ]
+        if plan.ndim == 3:
+            tags.append(f"Z{coordinate[2]}")
+        tags.extend((f"I{q}", f"N{q}"))
+        return tuple(tags)
+
+    def __repr__(self) -> str:
+        return (
+            f"TreePeps(shape={self.shape!r}, sites={self.plan.size}, "
+            f"tree_edges={len(self.plan.tree_edges)})"
+        )
+
+
+def _default_format(prefix: str, ndim: int) -> str:
+    return prefix + ",".join("{}" for _ in range(ndim))
+
+
+def _site_dimensions(plan: TreePepsPlan, dimensions, *, name: str) -> dict[int, int]:
+    if isinstance(dimensions, Integral):
+        dimensions = int(dimensions)
+        if dimensions < 1:
+            raise ValueError(f"{name} must be positive")
+        return {q: dimensions for q in range(plan.size)}
+    if isinstance(dimensions, Mapping):
+        result = {}
+        for site, dimension in dimensions.items():
+            q = plan.resolve_site(site)
+            if not isinstance(dimension, Integral) or int(dimension) < 1:
+                raise ValueError(f"{name} entries must be positive integers")
+            result[q] = int(dimension)
+        if set(result) != set(range(plan.size)):
+            raise ValueError(f"{name} mapping must specify every site")
+        return result
+    dimensions = tuple(dimensions)
+    if len(dimensions) != plan.size or any(
+        not isinstance(dimension, Integral) or int(dimension) < 1 for dimension in dimensions
+    ):
+        raise ValueError(f"{name} must be one integer or one positive integer per site")
+    return {q: int(dimension) for q, dimension in enumerate(dimensions)}
+
+
+def _reshape_operator(operator, dims):
+    expected = tuple(dims) + tuple(dims)
+    shape = tuple(getattr(operator, "shape", np.shape(operator)))
+    if shape == expected:
+        return operator
+    matrix_shape = (int(np.prod(dims)),) * 2
+    if shape != matrix_shape:
+        raise ValueError(f"operator shape {shape} is incompatible with site dimensions {dims}")
+    return np.reshape(operator, expected)

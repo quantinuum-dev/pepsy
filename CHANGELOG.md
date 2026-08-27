@@ -12,6 +12,20 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+### Added
+
+- Added the initial `TreePepsPlan` and `TreePeps` state API for PEPS-like
+  tensor networks with 2D/3D coordinate tags, stable 1D logical tags, and
+  validated spanning-tree virtual bonds, including PEPS-style `show`, tree
+  canonical-center movement, `info_c` synchronization, and compression hooks.
+- Added `left_inds`-backed isometry metadata to `TreePeps`, with canonical
+  region recovery, path-only center movement, QR-free canonical edge moves,
+  and a center-oriented compression sweep that avoids a redundant full QR.
+- Added tree-native `TreePepo` and `TreeSubPepo` operators with separate
+  input/output legs, support/span metadata, exact dense-factorized gates,
+  term sums, tree-bond fusion on application, expectation values, and
+  optional canonical compression.
+
 ## [0.4.1] - 2026-08-27
 
 This patch release consolidates the recent sampling, optimizer, operator,
