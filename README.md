@@ -10,7 +10,7 @@ projected entangled-pair states while leaving room for PePsY’s broader MPS,
 circuit, sampling, stabilizer, and VMC workflows. Use **PePsY** for the
 project name and `pepsy` for the Python package and import name.
 
-Current package version: `0.4.0` (from `pyproject.toml` / `pepsy.__version__`).
+Current package version: `0.4.1` (from `pyproject.toml` / `pepsy.__version__`).
 See the [changelog](CHANGELOG.md) for release history and versioned changes.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test profiles.
 
