@@ -22,30 +22,72 @@ def test_tree_peps_plan_keeps_coordinate_and_logical_views():
     assert plan.coordinates[1] == (0, 1)
     assert plan.logical_site((1, 2)) == 5
     assert len(plan.tree_edges) == plan.size - 1
-    assert plan.max_degree <= 2
+    assert plan.max_degree == 3
+    assert plan.max_tensor_rank == 4
+    assert plan.is_branching
+    assert not plan.is_mps_topology
     assert all(edge in plan.lattice_edges for edge in plan.tree_edges)
 
 
 def test_tree_peps_plan_traversal_seeds_build_legal_trees():
     snake = TreePepsPlan.from_shape((4, 4))
     row_major = TreePepsPlan.from_shape((4, 4), tree_order="row-major")
+    col_major = TreePepsPlan.from_shape((4, 4), tree_order="col-major")
     hilbert = TreePepsPlan.from_shape((4, 4), tree_order="hilbert")
     inside_out = TreePepsPlan.from_shape((4, 4), tree_order="inside-out")
 
-    assert snake.max_degree == 2
-    assert hilbert.max_degree == 2
+    assert snake.max_degree == 3
+    assert hilbert.max_degree == 3
     assert row_major.max_degree == 3
+    assert col_major.max_degree == 3
     assert inside_out.coordinate(inside_out.root) == (1, 1)
-    assert inside_out.max_degree <= 3
-    assert inside_out.tree_edges != snake.tree_edges
-    for plan in (row_major, hilbert, inside_out):
+    assert inside_out.max_degree == 3
+    assert len({
+        plan.tree_edges
+        for plan in (snake, row_major, col_major, hilbert, inside_out)
+    }) == 5
+    for plan in (row_major, col_major, hilbert, inside_out):
         assert len(plan.tree_edges) == plan.size - 1
         assert set(plan.tree_edges).issubset(set(plan.lattice_edges))
         assert plan.is_connected(range(plan.size))
 
 
+def test_tree_peps_row_and_column_major_are_oriented_combs():
+    row_major = TreePepsPlan.from_shape(
+        (4, 3), order="row-major", tree_order="row-major"
+    )
+    col_major = TreePepsPlan.from_shape(
+        (4, 3), order="row-major", tree_order="col-major"
+    )
+
+    def edge(plan, coord0, coord1):
+        return tuple(sorted((plan.logical_site(coord0), plan.logical_site(coord1))))
+
+    expected_row = {
+        edge(row_major, (x, y), (x + 1, y))
+        for y in range(3)
+        for x in range(3)
+    }
+    expected_row.update(
+        edge(row_major, (0, y), (0, y + 1)) for y in range(2)
+    )
+    expected_col = {
+        edge(col_major, (x, y), (x, y + 1))
+        for x in range(4)
+        for y in range(2)
+    }
+    expected_col.update(
+        edge(col_major, (x, 0), (x + 1, 0)) for x in range(3)
+    )
+
+    assert set(row_major.tree_edges) == expected_row
+    assert set(col_major.tree_edges) == expected_col
+    assert row_major.tree_edges != col_major.tree_edges
+    assert row_major.max_degree == col_major.max_degree == 3
+
+
 def test_tree_peps_has_one_physical_leg_and_dual_tags():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = TreePepsPlan.from_shape((2, 2), topology="path")
     state = TreePeps.from_plan(plan)
 
     assert state.site_tag(0, 1) == "I0,1"
@@ -73,6 +115,10 @@ def test_tree_peps_tree_topology_and_batch_readout_match_ttn_names():
     state = TreePeps.from_plan(plan)
     z = np.diag([1.0, -1.0])
 
+    assert state.topology == "tree"
+    assert state.is_branching
+    assert not state.is_mps_topology
+    assert state.max_rank == 4
     assert state.node_path(0, 5) == state.path(0, 5)
     assert state.tree_distance(0, 5) == len(state.path(0, 5)) - 1
     assert state.parent(1) == 0
@@ -85,7 +131,9 @@ def test_tree_peps_tree_topology_and_batch_readout_match_ttn_names():
 
 
 def test_tree_peps_normalize_preserves_canonical_tree_metadata():
-    state = TreePeps.rand(TreePepsPlan.from_shape((2, 2)), seed=19)
+    state = TreePeps.rand(
+        TreePepsPlan.from_shape((2, 2), topology="path"), seed=19
+    )
     old_norm = state.normalize()
 
     assert float(abs(old_norm)) > 1.0
@@ -104,7 +152,9 @@ def test_tree_peps_canonical_center_norm_matches_dense_norm():
 
 
 def test_tree_peps_show_and_canonical_info(capsys):
-    state = TreePeps.rand(TreePepsPlan.from_shape((2, 2)), bond_dim=2, seed=11)
+    state = TreePeps.rand(
+        TreePepsPlan.from_shape((2, 2), topology="path"), bond_dim=2, seed=11
+    )
 
     assert state.show(color=False) is None
     output = capsys.readouterr().out
@@ -120,7 +170,7 @@ def test_tree_peps_show_and_canonical_info(capsys):
 
 
 def test_tree_peps_exact_readout_canonicalization_and_compression():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = TreePepsPlan.from_shape((2, 2), topology="path")
     state = TreePeps.rand(plan, bond_dim=2, seed=11)
     identity = np.eye(2)
 
@@ -157,7 +207,7 @@ def test_tree_peps_moves_from_canonical_region_using_left_inds():
 
 
 def test_tree_peps_supports_three_dimensional_coordinate_tags():
-    plan = TreePepsPlan.from_shape((2, 1, 2))
+    plan = TreePepsPlan.from_shape((2, 1, 2), topology="path")
     state = TreePeps.from_plan(plan)
 
     assert state.site_tag(1, 0, 1) == "I1,0,1"
@@ -178,6 +228,16 @@ def test_tree_peps_plan_rejects_non_lattice_or_cyclic_edges():
 def test_tree_peps_hard_limits_virtual_degree_to_three():
     with pytest.raises(ValueError, match="at most 3"):
         TreePepsPlan.from_shape((2, 2), max_virtual_degree=4)
+
+
+def test_tree_peps_requires_explicit_path_topology_for_non_branching_geometry():
+    with pytest.raises(ValueError, match="requires at least one site"):
+        TreePepsPlan.from_shape((2, 2))
+
+    path = TreePepsPlan.from_shape((2, 2), topology="path")
+    assert path.is_mps_topology
+    assert not path.is_branching
+    assert path.topology == "path"
 
 
 def test_tree_peps_layout_finder_returns_a_plan_for_all_consumers():

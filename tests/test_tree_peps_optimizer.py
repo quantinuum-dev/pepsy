@@ -29,11 +29,18 @@ def _cnot():
     )
 
 
+def _path_plan(shape, **kwargs):
+    """Make the explicit MPS-compatible geometry used by chain tests."""
+
+    kwargs.setdefault("topology", "path")
+    return TreePepsPlan.from_shape(shape, **kwargs)
+
+
 def test_chain_compression_matches_mps_svd_when_cap_is_sufficient():
     """A TreePeps path must use the same optimal sweep as an MPS."""
 
     n = 6
-    plan = TreePepsPlan.from_shape((1, n), order="row-major", tree_order="snake")
+    plan = _path_plan((1, n), order="row-major", tree_order="snake")
     gates = [
         (qu.hadamard(), (0,)),
         (qu.CNOT(), (0, 5)),
@@ -110,14 +117,14 @@ def test_sub_treepepo_optimizer_fuses_then_compresses_only_the_span():
 
 
 def test_optimizer_modes_and_plan_validation_are_explicit():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = _path_plan((2, 2))
     state = TreePeps.from_plan(plan)
     subop = TreeSubPepo.from_operator(plan, np.eye(4), support=(0, 3))
 
     with pytest.raises(TypeError, match="requires a TreeSubPepo"):
         TreePepsOptimizer(state, mode="sub_treepepo").apply(np.eye(4), (0, 3))
 
-    other = TreePeps.from_plan(TreePepsPlan.from_shape((2, 2), order="row-major"))
+    other = TreePeps.from_plan(_path_plan((2, 2), order="row-major"))
     with pytest.raises(ValueError, match="same tree plan"):
         TreePepsOptimizer(other, plan=plan)
 
@@ -131,7 +138,7 @@ def test_optimizer_modes_and_plan_validation_are_explicit():
 
 
 def test_direct_optimizer_promotes_real_state_for_complex_gates():
-    plan = TreePepsPlan.from_shape((1, 2))
+    plan = _path_plan((1, 2))
     state = TreePeps.from_plan(plan, dtype=float)
     optimizer = TreePepsOptimizer(state, chi=None, cutoff=0.0)
     optimizer.apply_gate(np.diag([1.0, 1.0j]), 0)
@@ -140,7 +147,7 @@ def test_direct_optimizer_promotes_real_state_for_complex_gates():
 
 
 def test_dm_compression_uses_the_fused_tree_pepo_state_network():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = _path_plan((2, 2))
     state = TreePeps.rand(plan, bond_dim=2, seed=21)
     gate = _cnot()
 
@@ -164,7 +171,7 @@ def test_dm_compression_uses_the_fused_tree_pepo_state_network():
 
 
 def test_dm_mode_is_a_shorthand_for_direct_tree_pepo_routing():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = _path_plan((2, 2))
     optimizer = TreePepsOptimizer(
         TreePeps.from_plan(plan), mode="dm", chi=1, cutoff=0.0
     )
@@ -174,7 +181,7 @@ def test_dm_mode_is_a_shorthand_for_direct_tree_pepo_routing():
 
 
 def test_dm_compression_is_used_for_tree_sub_treepepo_updates():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = _path_plan((2, 2))
     operator = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 3))
     optimizer = TreePepsOptimizer(
         TreePeps.rand(plan, bond_dim=2, seed=22),
@@ -192,7 +199,7 @@ def test_dm_compression_is_used_for_tree_sub_treepepo_updates():
 
 
 def test_optimizer_owns_a_persistent_stream_and_supports_replacement():
-    plan = TreePepsPlan.from_shape((1, 2))
+    plan = _path_plan((1, 2))
     state = TreePeps.from_plan(plan)
     x = np.array([[0, 1], [1, 0]], dtype=complex)
     z = np.diag([1.0, -1.0]).astype(complex)
@@ -225,11 +232,11 @@ def test_optimizer_owns_a_persistent_stream_and_supports_replacement():
     assert optimizer.history == []
 
     with pytest.raises(ValueError, match="same tree plan"):
-        optimizer.set_state(TreePeps.from_plan(TreePepsPlan.from_shape((1, 3))))
+        optimizer.set_state(TreePeps.from_plan(_path_plan((1, 3))))
 
 
 def test_optimizer_stream_event_forms_and_common_aliases():
-    plan = TreePepsPlan.from_shape((1, 3))
+    plan = _path_plan((1, 3))
     state = TreePeps.from_plan(plan)
     x = np.array([[0, 1], [1, 0]], dtype=complex)
     identity = TreePepo.identity(plan)
@@ -267,7 +274,7 @@ def test_optimizer_stream_event_forms_and_common_aliases():
 
 def test_optimizer_rejects_queued_backend_mismatches_atomically():
     torch = pytest.importorskip("torch")
-    plan = TreePepsPlan.from_shape((1, 2))
+    plan = _path_plan((1, 2))
     optimizer = TreePepsOptimizer(TreePeps.from_plan(plan), run=False)
 
     with pytest.raises(TypeError, match="backend/device"):
@@ -276,7 +283,7 @@ def test_optimizer_rejects_queued_backend_mismatches_atomically():
 
 
 def test_optimizer_matches_ttn_state_aliases_and_readout_helpers():
-    plan = TreePepsPlan.from_shape((1, 3))
+    plan = _path_plan((1, 3))
     optimizer = TreePepsOptimizer(TreePeps.rand(plan, seed=31), run=False)
 
     assert optimizer.p is optimizer.state
@@ -298,7 +305,7 @@ def test_optimizer_matches_ttn_state_aliases_and_readout_helpers():
 
 
 def test_optimizer_estimate_and_preflight_report_conservative_tree_bonds():
-    plan = TreePepsPlan.from_shape((1, 3))
+    plan = _path_plan((1, 3))
     optimizer = TreePepsOptimizer(TreePeps.from_plan(plan), chi=1, run=False)
 
     estimate = optimizer.estimate_bonds([(_cnot(), (0, 2))])
@@ -314,7 +321,7 @@ def test_optimizer_estimate_and_preflight_report_conservative_tree_bonds():
 
 
 def test_optimizer_truncation_report_and_normalize_are_available():
-    plan = TreePepsPlan.from_shape((1, 2))
+    plan = _path_plan((1, 2))
     optimizer = TreePepsOptimizer(
         TreePeps.rand(plan, bond_dim=2, seed=37),
         chi=1,
@@ -331,7 +338,7 @@ def test_optimizer_truncation_report_and_normalize_are_available():
 
 
 def test_optimizer_canonicalization_and_info_c_are_state_owned():
-    plan = TreePepsPlan.from_shape((2, 2), tree_order="row-major")
+    plan = _path_plan((2, 2), tree_order="row-major")
     info_c = {}
     optimizer = TreePepsOptimizer(
         TreePeps.rand(plan, bond_dim=2, seed=41),
@@ -379,7 +386,7 @@ def test_optimizer_compresses_only_the_requested_span_and_reports_scope():
 
 
 def test_optimizer_run_supports_norm_controls_and_profile_report():
-    plan = TreePepsPlan.from_shape((1, 2))
+    plan = _path_plan((1, 2))
     scale = np.diag([2.0, 1.0])
     optimizer = TreePepsOptimizer(
         TreePeps.from_plan(plan),
@@ -398,7 +405,7 @@ def test_optimizer_run_supports_norm_controls_and_profile_report():
 
 
 def test_optimizer_layout_preflight_and_convergence_helpers():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = _path_plan((2, 2))
     layout = TreePepsOptimizer.find_tree_layout(
         plan,
         interactions=[(np.eye(4), (0, 3))],

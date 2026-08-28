@@ -21,7 +21,7 @@ def _cnot():
 
 
 def test_tree_pepo_identity_and_product_operators_are_tree_valid():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = TreePepsPlan.from_shape((2, 2), topology="path")
     identity = TreePepo.identity(plan)
     product = TreePepo.from_product(plan, {0: np.diag([1.0, -1.0])})
 
@@ -36,9 +36,18 @@ def test_tree_sub_pepo_reports_support_span_and_attachments():
     subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 4))
 
     assert subop.support == (0, 4)
-    assert subop.span == frozenset({0, 1, 2, 3, 4})
-    assert subop.boundary_edges == ((4, 5),)
-    assert subop.attachment_map == {4: (5,)}
+    assert subop.span == plan.subtree_span(subop.support)
+    assert subop.boundary_edges == tuple(
+        (inside, outside)
+        for inside in sorted(subop.span)
+        for outside in plan.neighbors(inside)
+        if outside not in subop.span
+    )
+    assert subop.attachment_map == {
+        inside: tuple(outside for left, outside in subop.boundary_edges if left == inside)
+        for inside in sorted(subop.span)
+        if any(left == inside for left, _ in subop.boundary_edges)
+    }
     assert subop.operator.validate()
 
 
@@ -76,8 +85,10 @@ def test_tree_pepo_operator_canonicalization_and_compression_track_metadata():
 
 
 def test_tree_sub_pepo_rejects_a_different_tree_plan():
-    plan = TreePepsPlan.from_shape((2, 2))
-    other_plan = TreePepsPlan.from_shape((2, 2), order="row-major")
+    plan = TreePepsPlan.from_shape((2, 2), topology="path")
+    other_plan = TreePepsPlan.from_shape(
+        (2, 2), order="row-major", topology="path"
+    )
     state = TreePeps.from_plan(other_plan)
     subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 3))
 
@@ -86,7 +97,7 @@ def test_tree_sub_pepo_rejects_a_different_tree_plan():
 
 
 def test_tree_sub_pepo_can_wrap_an_existing_operator_and_guard_dense_size():
-    plan = TreePepsPlan.from_shape((2, 2))
+    plan = TreePepsPlan.from_shape((2, 2), topology="path")
     operator = TreePepo.from_operator(plan, _cnot(), support=(0, 3))
 
     wrapped = TreeSubPepo.from_operator(operator, support=(0, 3))

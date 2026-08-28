@@ -20,8 +20,8 @@ dense term sums, support/span/attachment metadata, exact tree-bond fusion on
 application, expectation values, and optional post-application compression.
 `TreePepsLayoutFinder` adds deterministic bounded-degree spanning-tree search
 over the physical lattice. It scores minimal gate spans and weighted routed
-edge loads, compares source, row-major, Hilbert, inside-out, and weighted
-growth seeds (or an explicitly selected `seed_modes` set), then returns an
+edge loads, compares source, row-major, col-major, Hilbert, inside-out, and
+weighted growth seeds (or an explicitly selected `seed_modes` set), then returns an
 ordinary `TreePepsPlan` accepted by all existing TreePeps consumers. The
 shared `OneDMap` now also exposes the center-out ordering for 2D and 3D
 lattices, while the plan turns non-path orderings into legal lattice trees.
@@ -58,6 +58,7 @@ E_T is a subset of E_lat
 T is connected and acyclic
 |E_T| = |V| - 1
 degree_T(site) <= 3
+topology='tree' => max_site degree_T(site) = 3
 ```
 
 Every site tensor has one physical index and one virtual index for each
@@ -65,6 +66,13 @@ incident edge in `E_T`. The physical index dimension is arbitrary and is not
 counted as a virtual degree. Therefore a `TreePeps` tensor has rank at most
 four in the first design (`one physical + at most three virtual`), even when
 the lattice is embedded in 2D or 3D.
+
+The normal `TreePeps` contract is explicitly branching: at least one site has
+three virtual bonds and therefore rank four including its physical leg. A
+finite tree still has leaves, so this is a maximum-degree invariant rather
+than a requirement on every site. One-dimensional or otherwise
+non-branching geometries use `topology="path"` explicitly when an MPS-like
+control is desired.
 
 The important distinction is that “2D” or “3D” describes the embedding and
 the source lattice, not the contraction topology. The tensor graph is a tree,

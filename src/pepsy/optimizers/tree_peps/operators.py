@@ -1364,6 +1364,7 @@ def plan_signature(plan):
         plan.max_virtual_degree,
         plan.order,
         plan.tree_order,
+        plan.topology,
         plan.boundary,
     )
 

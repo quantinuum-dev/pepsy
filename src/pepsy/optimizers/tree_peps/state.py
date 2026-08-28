@@ -211,6 +211,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             self.plan.max_virtual_degree,
             self.plan.order,
             self.plan.tree_order,
+            self.plan.topology,
             self.plan.boundary,
         )
 
@@ -251,6 +252,24 @@ class TreePeps(qtn.TensorNetworkGenVector):
         """The largest number of retained virtual bonds at one site."""
 
         return self.plan.max_degree
+
+    @property
+    def topology(self) -> str:
+        """The virtual topology contract, ``'tree'`` or explicit ``'path'``."""
+
+        return self.plan.topology
+
+    @property
+    def is_branching(self) -> bool:
+        """Whether this state has a rank-four, three-virtual-bond site."""
+
+        return self.plan.is_branching
+
+    @property
+    def is_mps_topology(self) -> bool:
+        """Whether the retained virtual graph is MPS-like."""
+
+        return self.plan.is_mps_topology
 
     @property
     def max_rank(self) -> int:
@@ -532,6 +551,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
             ),
             "n_bonds": len(dimensions),
             "n_tensors": self.num_tensors,
+            "topology": self.topology,
+            "is_branching": self.is_branching,
             "max_virtual_degree": self.max_virtual_degree,
             "max_tensor_rank": self.max_tensor_rank,
             "bond_sizes": bond_sizes,
@@ -1767,7 +1788,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
     def __repr__(self) -> str:
         return (
             f"TreePeps(shape={self.shape!r}, sites={self.plan.size}, "
-            f"tree_edges={len(self.plan.tree_edges)})"
+            f"tree_edges={len(self.plan.tree_edges)}, "
+            f"topology={self.topology!r})"
         )
 
 

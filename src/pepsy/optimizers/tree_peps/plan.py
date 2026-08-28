@@ -11,6 +11,27 @@ from ...tensors.maps import OneDMap
 __all__ = ["TreePepsPlan", "TreePepsGeometry"]
 
 _MAX_TREE_PEPS_VIRTUAL_DEGREE = 3
+_TOPOLOGY_ALIASES = {
+    "tree": "tree",
+    "branching": "tree",
+    "non-mps": "tree",
+    "non_mps": "tree",
+    "path": "path",
+    "chain": "path",
+    "mps": "path",
+}
+
+
+def _normalize_topology(topology: str) -> str:
+    """Normalize the explicit TreePeps virtual-topology contract."""
+
+    normalized = str(topology).strip().lower().replace("_", "-")
+    try:
+        return _TOPOLOGY_ALIASES[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "topology must be 'tree' (branching) or 'path' (explicit MPS mode)"
+        ) from exc
 
 
 def _normalize_shape(shape: Sequence[int]) -> tuple[int, ...]:
@@ -32,7 +53,9 @@ class TreePepsPlan:
     Sites are addressed in two compatible ways: by a stable one-dimensional
     logical id ``q`` and by their lattice coordinate ``(x, y[, z])``.  The
     tree edges are stored using logical ids, while the coordinate maps remain
-    available for PEPS-style tags and layout code.
+    available for PEPS-style tags and layout code. The default ``tree``
+    topology is required to branch at least once; an MPS-like path is only
+    accepted when ``topology="path"`` is explicit.
     """
 
     def __init__(
@@ -47,6 +70,7 @@ class TreePepsPlan:
         max_virtual_degree: int = 3,
         order: str = "snake",
         tree_order: str = "explicit",
+        topology: str = "tree",
         boundary: str = "open",
     ) -> None:
         self.shape = _normalize_shape(shape)
@@ -54,6 +78,7 @@ class TreePepsPlan:
         self.size = _product(self.shape)
         self.order = str(order)
         self.tree_order = str(tree_order)
+        self.topology = _normalize_topology(topology)
         self.boundary = str(boundary)
         if self.boundary != "open":
             raise NotImplementedError("TreePepsPlan currently supports open boundaries only")
@@ -91,6 +116,14 @@ class TreePepsPlan:
         if any(len(neighbors) > self.max_virtual_degree for neighbors in adjacency.values()):
             raise ValueError(f"tree degree exceeds max_virtual_degree={self.max_virtual_degree}")
         self._adjacency = {q: tuple(sorted(neighbors)) for q, neighbors in adjacency.items()}
+        if self.topology == "tree" and self.max_degree < 3:
+            raise ValueError(
+                "topology='tree' requires at least one site with three virtual "
+                "bonds (a rank-four tensor); use topology='path' explicitly "
+                "for MPS-like or geometrically non-branching layouts"
+            )
+        if self.topology == "path" and self.max_degree > 2:
+            raise ValueError("topology='path' permits at most two virtual bonds per site")
         self._parent, self._children = self._root_tree()
 
     @classmethod
@@ -103,22 +136,22 @@ class TreePepsPlan:
         tree_edges: Iterable[tuple[int, int]] | None = None,
         root: int | tuple[int, ...] | str | None = None,
         max_virtual_degree: int = 3,
+        topology: str = "tree",
         boundary: str = "open",
     ) -> "TreePepsPlan":
         """Build a plan from a 2D or 3D open regular lattice.
 
         ``order`` controls logical ids. ``tree_order`` independently selects
-        the deterministic seed used to construct the retained virtual tree.
-        ``snake`` remains the default lattice-adjacent path. Other fixed
-        traversals (including ``row-major`` and ``hilbert``) are interpreted
-        as growth priorities and connected through legal lattice edges. The
-        ``inside-out`` traversal grows from the geometric center outward;
-        this center is selected automatically unless another root is passed.
-        Custom trees may be supplied with endpoints expressed as logical ids
-        or coordinates.
+        the deterministic growth priority used to construct the retained
+        virtual tree. ``topology='tree'`` is the default and requires a
+        genuine branching site with three virtual bonds. ``topology='path'``
+        is an explicit MPS-compatible mode for one-dimensional or otherwise
+        non-branching geometries. Custom trees may be supplied with endpoints
+        expressed as logical ids or coordinates.
         """
 
         shape = _normalize_shape(shape)
+        topology = _normalize_topology(topology)
         if tree_order is None:
             tree_order = "snake"
         tree_mapper = OneDMap(*shape, mode=tree_order)
@@ -162,23 +195,41 @@ class TreePepsPlan:
             fallback_order_q = tuple(
                 coord_to_one_d[tuple(snake_map[q])] for q in range(len(snake_map))
             )
-            lattice_edge_set = {tuple(sorted(edge)) for edge in lattice_edges}
             ordered_edges = tuple(
                 tuple(sorted((q0, q1)))
                 for q0, q1 in zip(tree_order_q, tree_order_q[1:])
             )
-            if set(ordered_edges).issubset(lattice_edge_set):
-                # Preserve a genuine Hamiltonian traversal when one exists.
-                # In particular this keeps the historical default snake plan
-                # a path instead of turning it into a branching growth tree.
-                tree_edges = ordered_edges
+            lattice_edge_set = {tuple(sorted(edge)) for edge in lattice_edges}
+            if topology == "path":
+                # A path is intentionally opt-in. Prefer the requested
+                # traversal when it is lattice adjacent, otherwise use the
+                # canonical snake path as a deterministic valid path.
+                path_order = (
+                    tree_order_q
+                    if set(ordered_edges).issubset(lattice_edge_set)
+                    else fallback_order_q
+                )
+                tree_edges = tuple(
+                    tuple(sorted((q0, q1)))
+                    for q0, q1 in zip(path_order, path_order[1:])
+                )
+            elif len(shape) == 2 and tree_order in {"row-major", "col-major"}:
+                # In two dimensions these names describe the orientation of
+                # the retained tree, not merely its growth priority. This is
+                # the PEPS-like comb/rake shown in the layout documentation:
+                # rows (columns) are long teeth joined by one column (row)
+                # backbone. It remains a spanning tree with max degree 3.
+                tree_edges = _comb_tree_edges(
+                    shape,
+                    coord_to_one_d,
+                    orientation=("row" if tree_order == "row-major" else "column"),
+                )
             else:
                 tree_edges = _tree_edges_from_order(
                     tree_order_q,
                     lattice_edges,
                     root=root_q,
                     max_virtual_degree=max_virtual_degree,
-                    fallback_order=fallback_order_q,
                 )
         else:
             tree_edges = tuple(
@@ -199,6 +250,7 @@ class TreePepsPlan:
             max_virtual_degree=max_virtual_degree,
             order=order,
             tree_order=(tree_order if generated_tree else "explicit"),
+            topology=topology,
             boundary=boundary,
         )
 
@@ -237,6 +289,18 @@ class TreePepsPlan:
         """The largest local tensor rank including its physical leg."""
 
         return 1 + self.max_degree
+
+    @property
+    def is_branching(self) -> bool:
+        """Whether the retained virtual tree is genuinely non-MPS-like."""
+
+        return self.max_degree >= 3
+
+    @property
+    def is_mps_topology(self) -> bool:
+        """Whether the retained virtual graph is a path or a singleton."""
+
+        return self.max_degree <= 2
 
     def tensor_rank(self, site: int | tuple[int, ...]) -> int:
         """Return ``1 +`` the virtual degree at ``site``."""
@@ -348,7 +412,7 @@ class TreePepsPlan:
         return (
             f"TreePepsPlan(shape={self.shape!r}, size={self.size}, "
             f"root={self.root}, max_degree={self.max_degree}, "
-            f"tree_order={self.tree_order!r})"
+            f"tree_order={self.tree_order!r}, topology={self.topology!r})"
         )
 
 
@@ -362,21 +426,94 @@ def _product(values: Sequence[int]) -> int:
     return result
 
 
+def _comb_tree_edges(
+    shape: Sequence[int],
+    coord_to_one_d: dict[tuple[int, ...], int],
+    *,
+    orientation: str,
+) -> tuple[tuple[int, int], ...]:
+    """Build an oriented 2D comb spanning tree.
+
+    For ``orientation="row"``, each fixed-``y`` row is a horizontal tooth
+    and the ``x=0`` column is the backbone. For ``orientation="column"``,
+    each fixed-``x`` column is a vertical tooth and the ``y=0`` row is the
+    backbone. The construction uses only nearest-neighbor lattice edges and
+    has exactly one fewer edge than sites.
+    """
+    if len(shape) != 2:
+        raise ValueError("oriented comb layouts are defined only for 2D shapes")
+    if orientation not in {"row", "column"}:
+        raise ValueError("comb orientation must be 'row' or 'column'")
+
+    lx, ly = shape
+    edges = []
+    if orientation == "row":
+        for y in range(ly):
+            for x in range(lx - 1):
+                edges.append(
+                    tuple(
+                        sorted(
+                            (
+                                coord_to_one_d[(x, y)],
+                                coord_to_one_d[(x + 1, y)],
+                            )
+                        )
+                    )
+                )
+        for y in range(ly - 1):
+            edges.append(
+                tuple(
+                    sorted(
+                        (
+                            coord_to_one_d[(0, y)],
+                            coord_to_one_d[(0, y + 1)],
+                        )
+                    )
+                )
+            )
+    else:
+        for x in range(lx):
+            for y in range(ly - 1):
+                edges.append(
+                    tuple(
+                        sorted(
+                            (
+                                coord_to_one_d[(x, y)],
+                                coord_to_one_d[(x, y + 1)],
+                            )
+                        )
+                    )
+                )
+        for x in range(lx - 1):
+            edges.append(
+                tuple(
+                    sorted(
+                        (
+                            coord_to_one_d[(x, 0)],
+                            coord_to_one_d[(x + 1, 0)],
+                        )
+                    )
+                )
+            )
+
+    return tuple(sorted(set(edges)))
+
+
 def _tree_edges_from_order(
     order: Sequence[int],
     lattice_edges: Iterable[tuple[int, int]],
     *,
     root: int,
     max_virtual_degree: int,
-    fallback_order: Sequence[int] = (),
 ) -> tuple[tuple[int, int], ...]:
     """Grow a legal tree by attaching sites in a prescribed order.
 
     The order is deliberately not assumed to be a Hamiltonian path. This is
-    what lets row-major and center-out traversals produce branching trees
-    while retaining the physical lattice as the only source of virtual
-    bonds. A canonical snake path is used as a safe fallback when a greedy
-    degree-bounded growth order paints itself into a corner.
+    what lets snake, row-major, Hilbert, and center-out traversals produce
+    distinct branching trees while retaining the physical lattice as the only
+    source of virtual bonds. Parent selection first grows from the currently
+    most-connected available frontier site, then uses traversal priority for
+    deterministic tie-breaking.
     """
     order = tuple(int(q) for q in order)
     if not order or len(set(order)) != len(order):
@@ -404,10 +541,12 @@ def _tree_edges_from_order(
             for parent in sorted(adjacency[child] & visited):
                 if degree[parent] >= max_virtual_degree:
                     continue
-                candidates.append((rank[child], rank[parent], child, parent))
+                candidates.append(
+                    (rank[child], -degree[parent], -rank[parent], child, parent)
+                )
         if not candidates:
             break
-        _, _, child, parent = min(candidates)
+        _, _, _, child, parent = min(candidates)
         edge = tuple(sorted((parent, child)))
         edges.append(edge)
         degree[parent] += 1
@@ -416,24 +555,6 @@ def _tree_edges_from_order(
 
     if len(visited) == len(order):
         return tuple(sorted(edges))
-
-    # Any lattice-adjacent snake is a valid degree-two spanning tree. It is a
-    # useful deterministic recovery for restrictive caps such as two, while
-    # center-out and other modes still control the normal degree-three path.
-    fallback_order = tuple(int(q) for q in fallback_order)
-    if max_virtual_degree >= 2 and len(fallback_order) == len(order):
-        fallback_edges = tuple(
-            tuple(sorted((q0, q1)))
-            for q0, q1 in zip(fallback_order, fallback_order[1:])
-        )
-        lattice_edge_set = {
-            tuple(sorted(edge)) for edge in lattice_edges
-        }
-        if (
-            len(set(fallback_order)) == len(order)
-            and set(fallback_edges).issubset(lattice_edge_set)
-        ):
-            return tuple(sorted(fallback_edges))
 
     raise ValueError(
         "could not grow a connected spanning tree within "

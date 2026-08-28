@@ -501,6 +501,7 @@ class TreePepsOptimizer:
             "root_coordinate": self.plan.coordinate(self.plan.root),
             "order": self.plan.order,
             "tree_order": self.plan.tree_order,
+            "topology": self.plan.topology,
             "tree_edges": self.plan.tree_edges,
             "max_virtual_degree": self.plan.max_virtual_degree,
             "max_degree": self.plan.max_degree,
@@ -528,12 +529,15 @@ class TreePepsOptimizer:
         seed_modes=None,
         tree_orders=None,
         root=None,
+        topology=None,
     ):
         """Return a workload-aware :class:`TreePepsPlan`.
 
         This convenience constructor mirrors ``TreeOptimizer.find_tree_layout``
-        while retaining the lattice and rank-three TreePeps constraints. The
-        returned plan can be passed directly as ``plan=`` or ``layout=`` to
+        while retaining the lattice and rank-four branching TreePeps
+        constraint. Pass ``topology="path"`` explicitly for an MPS-compatible
+        control geometry. The returned plan can be passed directly as
+        ``plan=`` or ``layout=`` to
         the state, TreePePO constructors, and this optimizer.
         """
 
@@ -556,6 +560,7 @@ class TreePepsOptimizer:
             seed_modes=seed_modes,
             tree_orders=tree_orders,
             root=root,
+            topology=topology,
         )
         return finder.run(refine=refine)
 

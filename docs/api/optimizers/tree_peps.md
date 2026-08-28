@@ -20,8 +20,11 @@ state.site_ind_1d(7)       # "k1,2" (the same physical leg)
 
 The retained tree degree is capped at three virtual bonds per site. Thus a
 state tensor has at most rank four: one physical leg plus at most three
-virtual legs. `state.max_virtual_degree`, `state.tensor_rank(site)`, and
-`state.max_rank` expose these diagnostics.
+virtual legs. A normal `topology="tree"` plan also requires at least one
+three-virtual-bond site (a rank-four tensor), so it cannot silently degenerate
+to an MPS. `state.max_virtual_degree`, `state.tensor_rank(site)`,
+`state.max_rank`, `state.topology`, and `state.is_branching` expose these
+diagnostics.
 
 The physical index is intentionally present only once. The logical 1D
 address is represented by an additional tag, not by a second physical leg.
@@ -56,7 +59,7 @@ loads, degree, and rank diagnostics.
 The finder compares the source tree with deterministic `OneDMap` seeds and
 workload-weighted growth. Use `seed_modes` (or its aliases `tree_orders` and
 the singular `tree_order`) to choose candidates such as `"row-major"`,
-`"hilbert"`, `"inside-out"`, `"diag"`, or `"snake"`. Supplying
+`"col-major"`, `"hilbert"`, `"inside-out"`, `"diag"`, or `"snake"`. Supplying
 `root="center"` selects the geometric center for a finder constructed from a
 shape. The selected seed, candidate count, and seed modes are recorded in
 `finder.report`.
@@ -66,14 +69,26 @@ Unicode lattice bonds and bond dimensions, while omitted lattice edges remain
 visible as gaps because only the selected virtual tree is drawn. Three-
 dimensional states use the same coordinate schematic layer-by-layer.
 
-`TreePepsPlan.from_shape` uses a canonical lattice-adjacent snake path by
-default, so the default tree has virtual degree at most two. The logical
-site order (`order`) and retained-tree seed (`tree_order`) are independent.
-For example, `tree_order="row-major"` creates a legal branching tree guided
-by row-major growth, while `tree_order="hilbert"` keeps a Hilbert path where
-the traversal is lattice-adjacent. `tree_order="inside-out"` starts at the
-geometric center and grows toward the boundary; aliases include
+`TreePepsPlan.from_shape` uses a branching spanning tree by default. The
+logical site order (`order`) and retained-tree growth priority (`tree_order`)
+are independent. For a 2D shape `(Lx, Ly)`, `tree_order="row-major"`
+selects a horizontal row-comb: every fixed-`y` row is a tooth and the
+`x=0` column is the backbone. `tree_order="col-major"` selects the transpose:
+every fixed-`x` column is a vertical tooth and the `y=0` row is the backbone.
+These are spanning trees with maximum virtual degree three, matching the
+horizontal/vertical layouts used by `.show()` and the gallery notebook.
+`"snake"`, `"hilbert"`, and `"inside-out"` remain traversal-priority
+branching growth modes rather than Hamiltonian paths; `"inside-out"` starts
+at the geometric center and grows toward the boundary. Aliases include
 `"center-out"` and `"outward"`.
+
+One-dimensional and geometrically non-branching lattices must opt into their
+MPS-compatible path topology explicitly:
+
+```python
+path_plan = TreePepsPlan.from_shape((1, 16), topology="path")
+assert path_plan.is_mps_topology
+```
 
 ```python
 plan = TreePepsPlan.from_shape(
@@ -98,8 +113,13 @@ plan = TreePepsPlan.from_shape(
         ((1, 0, 1), (0, 0, 1)),
     ],
     max_virtual_degree=3,
+    topology="path",
 )
 ```
+
+This particular custom edge list is a Hamiltonian path, so it is marked
+explicitly as `topology="path"`. A custom branching edge list can keep the
+default `topology="tree"`.
 
 The state API includes exact `norm`, `to_dense`, and local observable readout,
 together with `show`, `canonicalize`, `canonize_subtree`, and `compress`.

@@ -12,7 +12,7 @@ import numpy as np
 
 from ...tensors.maps import OneDMap
 from .operators import TreePepo, TreeSubPepo
-from .plan import TreePepsPlan
+from .plan import TreePepsPlan, _normalize_topology
 
 __all__ = ["TreePepsLayoutFinder"]
 
@@ -41,6 +41,10 @@ class TreePepsLayoutFinder:
     :class:`TreePepsPlan`, ready for ``TreePeps``, ``TreePepo``, and
     ``TreePepsOptimizer``.
 
+    ``topology="tree"`` is the default and requires a rank-four branching
+    site. Use ``topology="path"`` explicitly for one-dimensional or other
+    MPS-compatible control geometries.
+
     ``interactions`` accepts dense stream entries ``(gate, where)``, explicit
     supports, ``TreePepo``/``TreeSubPepo`` objects, or mappings containing
     ``where``/``support`` and optional ``weight`` and ``schmidt_rank`` fields.
@@ -61,7 +65,7 @@ class TreePepsLayoutFinder:
     def _normalize_seed_modes(seed_modes):
         """Normalize fixed traversal and stochastic seed spellings."""
         if seed_modes is None:
-            seed_modes = ("row-major", "hilbert", "inside-out")
+            seed_modes = ("row-major", "col-major", "hilbert", "inside-out")
         elif isinstance(seed_modes, (str, bytes)):
             seed_modes = (seed_modes,)
         else:
@@ -115,6 +119,7 @@ class TreePepsLayoutFinder:
         seed_modes=None,
         tree_orders=None,
         root=None,
+        topology=None,
     ):
         if supports is not None:
             if interactions is not None:
@@ -142,6 +147,10 @@ class TreePepsLayoutFinder:
 
         if isinstance(geometry, TreePepsPlan):
             source_geometry = geometry
+            if topology is None:
+                topology = geometry.topology
+            elif _normalize_topology(topology) != geometry.topology:
+                raise ValueError("topology cannot override a TreePepsPlan topology")
             if order is not None and str(order) != geometry.order:
                 raise ValueError("order cannot override the order of a TreePepsPlan")
             if max_virtual_degree is None:
@@ -157,11 +166,13 @@ class TreePepsLayoutFinder:
                     max_virtual_degree=geometry.max_virtual_degree,
                     order=geometry.order,
                     tree_order=geometry.tree_order,
+                    topology=geometry.topology,
                     boundary=geometry.boundary,
                 )
         else:
             if max_virtual_degree is None:
                 max_virtual_degree = 3
+            topology = "tree" if topology is None else _normalize_topology(topology)
             source_root = root
             if source_root is None and explicit_seed_modes and "inside-out" in self.seed_modes:
                 source_root = "center"
@@ -170,6 +181,7 @@ class TreePepsLayoutFinder:
                 order="snake" if order is None else order,
                 max_virtual_degree=max_virtual_degree,
                 root=source_root,
+                topology=topology,
             )
 
         if not isinstance(max_virtual_degree, Integral) or isinstance(
@@ -202,7 +214,10 @@ class TreePepsLayoutFinder:
             # cap is the physical plan contract unless the caller asks for a
             # smaller value.
             max_virtual_degree = source_geometry.max_virtual_degree
+        if topology == "path":
+            max_virtual_degree = min(max_virtual_degree, 2)
         self.geometry = source_geometry
+        self.topology = topology
         self.max_virtual_degree = max_virtual_degree
         self.objective = objective
         self.seed = seed
@@ -388,6 +403,7 @@ class TreePepsLayoutFinder:
             tree_order=(
                 self.geometry.tree_order if tree_order is None else tree_order
             ),
+            topology=self.topology,
             boundary=self.geometry.boundary,
         )
 
@@ -546,6 +562,7 @@ class TreePepsLayoutFinder:
             root=self.geometry.root,
             max_virtual_degree=self.max_virtual_degree,
             boundary=self.geometry.boundary,
+            topology=self.topology,
         )
         # Constructing through TreePepsPlan keeps the shared OneDMap growth
         # ordering and all degree/fallback rules in one place.
@@ -564,6 +581,7 @@ class TreePepsLayoutFinder:
                 root=self.geometry.root,
                 max_virtual_degree=self.max_virtual_degree,
                 boundary=self.geometry.boundary,
+                topology=self.topology,
             )
         candidates = [base]
         candidate_modes = {base.tree_edges: "source"}
@@ -647,6 +665,7 @@ class TreePepsLayoutFinder:
             "max_edge_load": details["max_edge_load"],
             "interactions": details["interactions"],
             "seed_modes": self.seed_modes,
+            "topology": selected.topology,
             "selected_seed": self._candidate_modes.get(
                 selected.tree_edges, "refined"
             ),
