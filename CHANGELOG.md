@@ -14,6 +14,37 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added the initial `TreePepsPlan` and `TreePeps` state API for PEPS-like
+  tensor networks with 2D/3D coordinate tags, stable 1D logical tags, and
+  validated spanning-tree virtual bonds, including PEPS-style `show`, tree
+  canonical-center movement, `info_c` synchronization, and compression hooks.
+- Added `left_inds`-backed isometry metadata to `TreePeps`, with canonical
+  region recovery, path-only center movement, QR-free canonical edge moves,
+  and a center-oriented compression sweep that avoids a redundant full QR.
+- Added tree-native `TreePepo` and `TreeSubPepo` operators with separate
+  input/output legs, support/span metadata, exact dense-factorized gates,
+  term sums, tree-bond fusion on application, expectation values, and
+  optional canonical compression.
+
+## [0.4.1] - 2026-08-27
+
+This patch release consolidates the recent sampling, optimizer, operator,
+backend, and documentation improvements developed on `develop`.
+
+### Added
+
+- `MpsStabSampler` now supports shared-prefix branch sampling, direct
+  tableau/coefficient-MPS construction, basis-absorbing measurements, explicit
+  physical/MPS qubit orders, probability queries, and branch diagnostics while
+  preserving the coefficient-MPS backend for batched outputs.
+- `PepsSampler` now provides exact, Quimb-MPS, and DMRG/FIT boundary proposal
+  engines with conditioned ket boundaries, future marginal environments,
+  prefix-grouped batches, and compact-row transfer caching.
+- MPI shot-ensemble execution now includes checkpoint-aware orchestration,
+  progress reporting, robust reductions, and native MPS/tree entry points.
+- The documentation build now includes a generated API reference site, and
+  the Guppy gate-stream adapter is available through the public interoperability
+  API.
 - MPO cluster expansions now expose a reusable compiled topology for ordered
   `exp(A) @ exp(B) @ exp(C)` products, explicit local `max_bond` control, and
   stabilized Torch/JAX autodiff factorization paths.
@@ -69,6 +100,20 @@ Changes for the next release should be added here before the version is bumped.
   `cutoff_mode`, allowing Tree truncations to use the same Quimb
   singular-value cutoff conventions as MPS truncations.
 
+### Changed
+
+- MPS and tree optimizer truncation defaults now use dtype-aware automatic
+  cutoffs and explicit automatic cutoff-mode resolution. MPS DMRG/FIT defaults
+  now use adaptive schedules, tighter automatic fit tolerances, and a
+  two-site pair policy that can be overridden explicitly.
+- MPS quality checks are opt-in, and optimizer seed handling no longer leaks
+  MPS sampling seeds into contraction options.
+- Torch linear-algebra defaults now select the exact SVD path, with the
+  configured backend policy preserved across optimizer workflows.
+- MPS, tree, and stabilizer optimizer streams now enforce backend, device, and
+  applicable dtype compatibility at their stream boundaries; callers must use
+  an explicit backend converter for intentional cross-backend payloads.
+
 ### Deprecated
 
 - Backend helpers imported from `pepsy.tensors` now warn and direct callers to
@@ -120,6 +165,11 @@ Changes for the next release should be added here before the version is bumped.
 - `TreeOptimizer` non-unitary scale control now preserves removed normalization
   in the TTN exponent, and fast centre-based norm reads include that exponent,
   so `normalize_every=True` no longer changes the represented state.
+- Stabilizer optimizer and sampler branch state handling now keeps temporary
+  conditional branches isolated from the live optimizer and separates Born
+  probabilities from compression-fidelity diagnostics.
+- CuPy-backed tree gate application and recent stabilizer optimizer routes now
+  preserve their backend and consistency contracts.
 
 ## [0.4.0] - 2026-07-27
 

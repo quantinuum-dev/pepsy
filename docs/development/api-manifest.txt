@@ -115,6 +115,11 @@ TreeMPO
 TreeNoisy
 TreeOptimizer
 TreePlan
+TreePeps
+TreePepsGeometry
+TreePepsPlan
+TreePepo
+TreeSubPepo
 TreeSampleResult
 TreeSampler
 TreeStabOptimizer

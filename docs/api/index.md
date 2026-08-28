@@ -57,6 +57,7 @@ reference when you need every method, property, overload, or source location.
 - [Stabilizer tensor networks](optimizers/stabilizer_tn.md)
 - [Symmetry-aware DMRG](optimizers/sym_dmrg.md)
 - [Tree tensor networks](optimizers/tree.md)
+- [Tree PEPS states](optimizers/tree_peps.md)
 - [Tree stabilizer optimization](optimizers/tree_stabilizer.md)
 - [VMC](vmc.md)
 
@@ -102,6 +103,7 @@ optimizers/planning
 optimizers/stabilizer_tn
 optimizers/sym_dmrg
 optimizers/tree
+optimizers/tree_peps
 optimizers/tree_stabilizer
 vmc
 ```
