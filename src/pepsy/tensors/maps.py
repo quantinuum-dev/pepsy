@@ -37,6 +37,9 @@ class OneDMap:
         "folded-snake-row-major",
         "row-major",
         "col-major",
+        "alternate-x",
+        "alternate-y",
+        "alternate-z",
         "hilbert",
         "hilbert-row-major",
         "inside-out",
@@ -67,6 +70,12 @@ class OneDMap:
         "torus-snake-row-major": "folded-snake-row-major",
         "row-major": "row-major",
         "col-major": "col-major",
+        "alternate-x": "alternate-x",
+        "alternate-y": "alternate-y",
+        "alternate-z": "alternate-z",
+        "alt-x": "alternate-x",
+        "alt-y": "alternate-y",
+        "alt-z": "alternate-z",
         "hilbert": "hilbert",
         "hilbert-curve": "hilbert",
         "hilbert-col": "hilbert",
@@ -490,6 +499,43 @@ class OneDMap:
                 coords.append((x, y, z))
         return coords
 
+    @classmethod
+    def _coords_alternate_x_3d(cls, L_x, L_y, L_z):
+        """Return a 3D path that alternates the x direction.
+
+        Each ``y`` row snakes in x, and successive z layers are traversed
+        in the opposite direction so the path remains nearest-neighbour
+        across all three axes.
+        """
+        return cls._coords_snake_3d(L_x, L_y, L_z, major="row")
+
+    @classmethod
+    def _coords_alternate_y_3d(cls, L_x, L_y, L_z):
+        """Return a 3D path that alternates the y direction."""
+        return cls._coords_snake_3d(L_x, L_y, L_z, major="col")
+
+    @staticmethod
+    def _coords_alternate_z_3d(L_x, L_y, L_z):
+        """Return a 3D path with z as the alternating inner direction.
+
+        The x-y lines use row-major snake order. The z direction flips for
+        each successive line, including when a row changes, so every step
+        stays on a nearest-neighbour edge of the 3D lattice.
+        """
+        coords = []
+        line = 0
+        for y in range(L_y):
+            x_iter = range(L_x) if y % 2 == 0 else range(L_x - 1, -1, -1)
+            for x in x_iter:
+                z_iter = (
+                    range(L_z)
+                    if line % 2 == 0
+                    else range(L_z - 1, -1, -1)
+                )
+                coords.extend((x, y, z) for z in z_iter)
+                line += 1
+        return coords
+
     @staticmethod
     def _coords_to_maps(coords):
         one_d_to_lattice = {idx: coord for idx, coord in enumerate(coords)}
@@ -675,6 +721,24 @@ class OneDMap:
                 if Lz is None
                 else cls._coords_col_major_3d(Lx, Ly, Lz)
             )
+        elif mode_norm == "alternate-x":
+            coords = (
+                cls._coords_snake_2d(Lx, Ly, major="row")
+                if Lz is None
+                else cls._coords_alternate_x_3d(Lx, Ly, Lz)
+            )
+        elif mode_norm == "alternate-y":
+            coords = (
+                cls._coords_snake_2d(Lx, Ly, major="col")
+                if Lz is None
+                else cls._coords_alternate_y_3d(Lx, Ly, Lz)
+            )
+        elif mode_norm == "alternate-z":
+            if Lz is None:
+                raise ValueError(
+                    "alternate-z mode requires a 3D lattice with Lz provided."
+                )
+            coords = cls._coords_alternate_z_3d(Lx, Ly, Lz)
         elif mode_norm == "hilbert":
             if Lz is not None:
                 raise NotImplementedError("hilbert mode is currently implemented only for 2D lattices.")

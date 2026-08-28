@@ -157,7 +157,7 @@ returns a bond-one TTNO that can be applied directly to a native
 `TreeTensorNetwork`; dense identities remain ordinary dense TTNOs.
 `OneDMap` is the shared source of truth for regular 2D/3D coordinate layouts;
 the tree and MPS geometric layout finders consume its row/column, snake,
-folded-snake, and generalized Hilbert traversals directly.
+alternate-x/y/z, folded-snake, and generalized Hilbert traversals directly.
 
 `TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, in the same way that
 `TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
@@ -922,8 +922,9 @@ three-virtual-bond root convention described above. `TreePlan.max_arity()` and
 strict two-child-at-every-internal-node predicate.
 
 `TreeLayoutFinder` also provides the same regular-lattice baseline vocabulary
-as `OneDMap`. Pass `lattice_shape=(Lx, Ly)` once, then use named `order` presets
-for exact tree coarsenings of the corresponding leaf traversal:
+as `OneDMap`. Pass `lattice_shape=(Lx, Ly)` or
+`lattice_shape=(Lx, Ly, Lz)` once, then use named `order` presets for exact
+tree coarsenings of the corresponding leaf traversal:
 
 ```python
 finder = TreeLayoutFinder(
@@ -942,19 +943,42 @@ tree_coarse = finder.run(order="coarse-alternate-x")
 tree_quality = finder.run(order="quality")
 ```
 
-The supported geometric presets include `"row-major"`, `"snake"`,
+The supported 2D geometric presets include `"row-major"`, `"snake"`,
 `"alternate-x"`, `"alternate-y"`, `"folded-snake"`, and `"hilbert"`, plus
-the corresponding `coarse-*` variants. A coarse preset first partitions the
-`(Lx, Ly)` lattice into blocks, follows the selected base traversal on the
-coarse grid, and then expands each block back to its physical qubits. The
-default `coarse_grain=(2, 1)` groups two neighboring x sites; use
-`coarse_grain=(1, 2)` for y-oriented blocks. `coarse-alternate-x` and
-`coarse-alternate-y` are explicit row/column zigzags. Preset orders use a
-balanced recursive tree so the leaf sequence and every higher tree layer are
-preserved as contiguous intervals of that traversal; `"quality"` remains the
-independent interaction-aware TreeLayoutFinder search. The default logical
-label is `x * Ly + y`; pass `lattice_site=lambda x, y: ...` when the gate
-stream uses a different coordinate-to-qubit convention.
+their `coarse-*` variants. In 3D, use `"row-major"`, `"col-major"`,
+`"snake"`, `"snake-row-major"`, `"alternate-x"`, `"alternate-y"`, or
+`"alternate-z"`, together with their supported `coarse-*` variants.
+`alternate-x` and `alternate-y` snake within each xy layer and reverse the
+layer direction along z; `alternate-z` makes z the alternating inner line.
+The 3D folded-snake and Hilbert presets remain intentionally 2D-only because
+`OneDMap` does not define a 3D version of those paths.
+
+A coarse preset first partitions the lattice into blocks, follows the selected
+base traversal on the coarse grid, and then expands each block back to its
+physical qubits. The default `coarse_grain=(2, 1)` groups two neighboring x
+sites in 2D and `(2, 1, 1)` does the same in 3D; pass `(1, 2)` or `(1, 2, 1)`
+for y-oriented blocks, or `(1, 1, 2)` for z-oriented blocks. Edge blocks may
+be smaller. Coarse modes change only the leaf traversal order and never merge
+physical tensors. Preset orders use a balanced recursive tree so the leaf
+sequence and every higher tree layer are preserved as contiguous intervals of
+that traversal; `"quality"` remains the independent interaction-aware
+TreeLayoutFinder search. The default logical label is
+`x * Ly + y` in 2D and `x * Ly * Lz + y * Lz + z` in 3D; pass a
+`lattice_site` callable when the gate stream uses a different convention.
+
+For example, a 3D Tree layout can use the same handoff through
+`TreeOptimizer`:
+
+```python
+finder3d = TreeLayoutFinder(
+    gates,
+    n=4 * 4 * 3,
+    lattice_shape=(4, 4, 3),
+    coarse_grain=(2, 2, 1),
+)
+tree3d = finder3d.run(order="coarse-alternate-z")
+opt3d = TreeOptimizer(gates, tree=tree3d, chi=32)
+```
 
 The lower-level helper is useful when constructing a `TreePlan` directly:
 
@@ -968,6 +992,11 @@ tree_plan = TreePlan.from_order(
     max_arity=2,
     top_arity=3,
 )
+
+zigzag3d = TreeLayoutFinder.lattice_order(
+    4, 4, 3, "coarse-alternate-z", grain=(1, 1, 2)
+)
+tree_plan3d = TreePlan.from_order(zigzag3d, structure="balanced")
 ```
 
 Both layout finders still accept an explicit site permutation as `order` for a

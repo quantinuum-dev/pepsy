@@ -214,6 +214,7 @@ def _normalize_layout_order(order):
         "hilbert_row": "hilbert-row-major",
         "alternate_x": "alternate-x",
         "alternate_y": "alternate-y",
+        "alternate_z": "alternate-z",
         "coarse_row": "coarse-row-major",
         "coarse_row_major": "coarse-row-major",
         "coarse_col": "coarse-col-major",
@@ -227,6 +228,7 @@ def _normalize_layout_order(order):
         "coarse_snake_col_major": "coarse-snake",
         "coarse_alternate_x": "coarse-alternate-x",
         "coarse_alternate_y": "coarse-alternate-y",
+        "coarse_alternate_z": "coarse-alternate-z",
         "coarse_folded_snake": "coarse-folded-snake",
         "coarse_folded_snake_row": "coarse-folded-snake-row-major",
         "coarse_folded_snake_row_major": "coarse-folded-snake-row-major",
@@ -246,6 +248,7 @@ def _normalize_layout_order(order):
         "folded_snake_row_major": "folded-snake-row-major",
         "alternate_x": "alternate-x",
         "alternate_y": "alternate-y",
+        "alternate_z": "alternate-z",
         "coarse-row-major": "coarse-row-major",
         "coarse-col-major": "coarse-col-major",
         "coarse-snake": "coarse-snake",
@@ -256,6 +259,7 @@ def _normalize_layout_order(order):
         "coarse-hilbert-row-major": "coarse-hilbert-row-major",
         "coarse-alternate-x": "coarse-alternate-x",
         "coarse-alternate-y": "coarse-alternate-y",
+        "coarse-alternate-z": "coarse-alternate-z",
         "hilbert": "hilbert",
         "hilbert_row_major": "hilbert-row-major",
     }
@@ -266,25 +270,32 @@ def _normalize_layout_order(order):
     raise ValueError(
         "order must be None, 'quality', a geometric lattice preset "
         "('row-major', 'col-major', 'snake', 'alternate-x', "
-        "'alternate-y', 'folded-snake', 'hilbert', or a coarse-* variant), "
+        "'alternate-y', 'alternate-z', 'folded-snake', 'hilbert', "
+        "or a coarse-* variant), "
         "or an explicit site permutation."
     )
 
 
 def _normalize_lattice_shape(shape):
-    """Return a validated two-dimensional ``(Lx, Ly)`` lattice shape."""
+    """Return a validated 2D or 3D ``(Lx, Ly[, Lz])`` lattice shape."""
     if shape is None:
         return None
     if isinstance(shape, (str, bytes)):
-        raise TypeError("lattice_shape must be a two-item (Lx, Ly) sequence.")
+        raise TypeError(
+            "lattice_shape must be a two- or three-item (Lx, Ly[, Lz]) "
+            "sequence."
+        )
     try:
         shape = tuple(shape)
     except TypeError as exc:
         raise TypeError(
-            "lattice_shape must be a two-item (Lx, Ly) sequence."
+            "lattice_shape must be a two- or three-item (Lx, Ly[, Lz]) "
+            "sequence."
         ) from exc
-    if len(shape) != 2:
-        raise ValueError("lattice_shape must contain exactly (Lx, Ly).")
+    if len(shape) not in {2, 3}:
+        raise ValueError(
+            "lattice_shape must contain exactly (Lx, Ly) or (Lx, Ly, Lz)."
+        )
     if any(isinstance(value, bool) for value in shape):
         raise ValueError("lattice_shape dimensions must be positive integers.")
     try:
@@ -307,32 +318,44 @@ _COARSE_LAYOUT_BASE_MODES = {
     "coarse-folded-snake-row-major": "folded-snake-row-major",
     "coarse-hilbert": "hilbert",
     "coarse-hilbert-row-major": "hilbert-row-major",
-    "coarse-alternate-x": "snake-row-major",
-    "coarse-alternate-y": "snake",
+    "coarse-alternate-x": "alternate-x",
+    "coarse-alternate-y": "alternate-y",
+    "coarse-alternate-z": "alternate-z",
 }
 
 
-def _normalize_coarse_grain(grain):
-    """Normalize a 2D coarse block size, defaulting to two along x."""
+def _normalize_coarse_grain(grain, ndim=2):
+    """Normalize a 2D/3D coarse block size, defaulting to two along x."""
+    if ndim not in {2, 3}:
+        raise ValueError("coarse_grain is only defined for 2D or 3D layouts.")
+    default = (2,) + (1,) * (ndim - 1)
+    axes = "gx, gy" if ndim == 2 else "gx, gy, gz"
+    sequence_description = (
+        "two-item" if ndim == 2 else "two- or three-item"
+    )
     if grain is None:
-        return (2, 1)
+        return default
     if isinstance(grain, bool):
         raise ValueError("coarse_grain must contain positive integers.")
     if isinstance(grain, Integral):
-        grain = (int(grain), 1)
+        grain = (int(grain),) + (1,) * (ndim - 1)
     elif isinstance(grain, (str, bytes)):
         raise TypeError(
-            "coarse_grain must be a positive integer or a two-item sequence."
+            "coarse_grain must be a positive integer or a "
+            f"{sequence_description} sequence."
         )
     else:
         try:
             grain = tuple(grain)
         except TypeError as exc:
             raise TypeError(
-                "coarse_grain must be a positive integer or a two-item sequence."
+                "coarse_grain must be a positive integer or a "
+                f"{sequence_description} sequence."
             ) from exc
-    if len(grain) != 2:
-        raise ValueError("coarse_grain must contain exactly (gx, gy).")
+    if len(grain) == 2 and ndim == 3:
+        grain = (*grain, 1)
+    if len(grain) != ndim:
+        raise ValueError(f"coarse_grain must contain exactly ({axes}).")
     if any(isinstance(value, bool) for value in grain):
         raise ValueError("coarse_grain entries must be positive integers.")
     try:
@@ -344,52 +367,142 @@ def _normalize_coarse_grain(grain):
     return grain
 
 
-def _coarse_lattice_coordinates(Lx, Ly, mode, *, grain):
-    """Return fine coordinates in a block-traversal order."""
+def _build_lattice_coordinates(shape, mode):
+    """Build coordinates through the shared 2D/3D :class:`OneDMap` API."""
+    if len(shape) == 2:
+        one_d_to_lattice, _ = OneDMap.build(*shape, mode=mode)
+    else:
+        one_d_to_lattice, _ = OneDMap.build(
+            shape[0], shape[1], Lz=shape[2], mode=mode
+        )
+    return tuple(one_d_to_lattice.values())
+
+
+def _coarse_mirror_axes(mode, block_coord, block_shape):
+    """Return axes to mirror for a 3D coarse block.
+
+    The block traversal and its local traversal use the same path. Mirroring
+    the local path at the corresponding block boundaries preserves the
+    alternating direction through each coarse layer while still allowing
+    partial edge blocks.
+    """
+    block_x, block_y, block_z = block_coord
+    blocks_x, _blocks_y, _blocks_z = block_shape
+    mirror = set()
+
+    def toggle(axis):
+        if axis in mirror:
+            mirror.remove(axis)
+        else:
+            mirror.add(axis)
+
+    if mode in {"coarse-alternate-x", "coarse-snake-row-major"}:
+        if block_y % 2:
+            toggle("x")
+        if block_z % 2:
+            toggle("x")
+            toggle("y")
+    elif mode in {"coarse-snake", "coarse-alternate-y"}:
+        if block_x % 2:
+            toggle("y")
+        if block_z % 2:
+            toggle("x")
+            toggle("y")
+    elif mode == "coarse-alternate-z":
+        if block_y % 2:
+            toggle("x")
+        line = block_y * blocks_x
+        if block_y % 2:
+            line += blocks_x - 1 - block_x
+        else:
+            line += block_x
+        if line % 2:
+            toggle("z")
+    return mirror
+
+
+def _coarse_lattice_coordinates(Lx, Ly, mode, *, Lz=None, grain=(2, 1)):
+    """Return fine coordinates in a 2D/3D block-traversal order."""
+    shape = (Lx, Ly) if Lz is None else (Lx, Ly, Lz)
+    ndim = len(shape)
     base_mode = _COARSE_LAYOUT_BASE_MODES[mode]
-    gx, gy = _normalize_coarse_grain(grain)
-    blocks_x = (Lx + gx - 1) // gx
-    blocks_y = (Ly + gy - 1) // gy
-    block_order, _ = OneDMap.build(blocks_x, blocks_y, mode=base_mode)
+    grain = _normalize_coarse_grain(grain, ndim=ndim)
+    block_shape = tuple(
+        (length + block - 1) // block
+        for length, block in zip(shape, grain)
+    )
+    block_order = _build_lattice_coordinates(block_shape, base_mode)
     coordinates = []
-    for block_x, block_y in block_order.values():
-        width = min(gx, Lx - block_x * gx)
-        height = min(gy, Ly - block_y * gy)
-        local_order, _ = OneDMap.build(width, height, mode=base_mode)
-        mirror_axis = None
-        if mode in {"coarse-alternate-x", "coarse-snake-row-major"} and block_y % 2:
-            mirror_axis = "x"
-        elif mode in {"coarse-snake", "coarse-alternate-y"} and block_x % 2:
-            mirror_axis = "y"
-        for local_x, local_y in local_order.values():
-            if mirror_axis == "x":
-                local_x = width - 1 - local_x
-            elif mirror_axis == "y":
-                local_y = height - 1 - local_y
-            coordinates.append((block_x * gx + local_x, block_y * gy + local_y))
+    for block_coord in block_order:
+        block_extent = tuple(
+            min(block, length - block_coord[axis] * block)
+            for axis, (length, block) in enumerate(zip(shape, grain))
+        )
+        local_order = _build_lattice_coordinates(block_extent, base_mode)
+        if ndim == 2:
+            block_x, block_y = block_coord
+            width, height = block_extent
+            mirror_axis = None
+            if (
+                mode in {"coarse-alternate-x", "coarse-snake-row-major"}
+                and block_y % 2
+            ):
+                mirror_axis = "x"
+            elif (
+                mode in {"coarse-snake", "coarse-alternate-y"}
+                and block_x % 2
+            ):
+                mirror_axis = "y"
+            for local_x, local_y in local_order:
+                if mirror_axis == "x":
+                    local_x = width - 1 - local_x
+                elif mirror_axis == "y":
+                    local_y = height - 1 - local_y
+                coordinates.append(
+                    (block_x * grain[0] + local_x,
+                     block_y * grain[1] + local_y)
+                )
+            continue
+
+        mirror_axes = _coarse_mirror_axes(mode, block_coord, block_shape)
+        for local_coord in local_order:
+            local_coord = list(local_coord)
+            for axis, name in enumerate(("x", "y", "z")):
+                if name in mirror_axes:
+                    local_coord[axis] = block_extent[axis] - 1 - local_coord[axis]
+            coordinates.append(tuple(
+                block_coord[axis] * grain[axis] + local_coord[axis]
+                for axis in range(3)
+            ))
     return tuple(coordinates)
 
 
-def _lattice_site_order(Lx, Ly, mode, *, site=None, grain=(2, 1)):
-    """Build a logical-qubit permutation from a regular 2D layout mode."""
+def _lattice_site_order(
+    Lx, Ly, mode, *, Lz=None, site=None, grain=(2, 1)
+):
+    """Build a logical-qubit permutation from a regular 2D/3D mode."""
+    shape = (Lx, Ly) if Lz is None else (Lx, Ly, Lz)
     if mode in _COARSE_LAYOUT_BASE_MODES:
         coordinates = _coarse_lattice_coordinates(
-            Lx, Ly, mode, grain=grain
+            *shape[:2], Lz=shape[2] if len(shape) == 3 else None,
+            mode=mode, grain=grain,
         )
     else:
-        base_mode = {
-            "alternate-x": "snake-row-major",
-            "alternate-y": "snake",
-        }.get(mode, mode)
-        one_d_to_lattice, _ = OneDMap.build(Lx, Ly, mode=base_mode)
-        coordinates = tuple(one_d_to_lattice.values())
+        coordinates = _build_lattice_coordinates(shape, mode)
     if site is None:
-        # Match OneDMap's logical 2D labels: (x, y) -> x * Ly + y.
-        site = lambda x, y: x * Ly + y
+        if len(shape) == 2:
+            # Match OneDMap's logical 2D labels: (x, y) -> x * Ly + y.
+            site = lambda x, y: x * shape[1] + y
+        else:
+            # Match the natural x-major flattening of a 3D PEPS lattice.
+            site = lambda x, y, z: (
+                x * shape[1] * shape[2] + y * shape[2] + z
+            )
     if not callable(site):
         raise TypeError("lattice_site must be callable or None.")
     order = tuple(int(site(*coord)) for coord in coordinates)
-    return normalize_fixed_order(order, range(Lx * Ly), name="lattice order")
+    size = int(np.prod(shape))
+    return normalize_fixed_order(order, range(size), name="lattice order")
 
 
 def _nevergrad_available():
@@ -1581,24 +1694,26 @@ class TreeLayoutFinder:
         Optional high-quality offline mode. `"quality"` means
         `objective="full_tree"` and enables bounded greedy leaf refinement,
         all-scale subtree topology refinement, and hybrid
-        Nevergrad/annealing search. Named two-dimensional lattice presets
-        (`"row-major"`, `"snake"`, `"alternate-x"`, `"alternate-y"`,
-        `"folded-snake"`, and `"hilbert"`, plus their `coarse-*` variants)
-        require `lattice_shape=` and build an exact balanced tree over that
-        traversal. Omitted keeps the fast deterministic objective selected by
-        `objective`. An explicit site permutation builds a fixed tree without
-        refinement.
-    lattice_shape : pair of int, optional
-        The `(Lx, Ly)` shape used by named geometric `order` presets. The
-        product must equal `n`.
+        Nevergrad/annealing search. Named two- or three-dimensional lattice
+        presets (`"row-major"`, `"snake"`, `"alternate-x"`,
+        `"alternate-y"`, `"alternate-z"`, `"folded-snake"`, and
+        `"hilbert"`, plus their supported `coarse-*` variants) require
+        `lattice_shape=` and build an exact balanced tree over that traversal.
+        Omitted keeps the fast deterministic objective selected by `objective`.
+        An explicit site permutation builds a fixed tree without refinement.
+    lattice_shape : pair or triple of int, optional
+        The `(Lx, Ly)` or `(Lx, Ly, Lz)` shape used by named geometric `order`
+        presets. The product must equal `n`.
     lattice_site : callable, optional
-        Optional `(x, y) -> qubit` mapper for named geometric presets. The
-        default is `x * Ly + y`, matching :class:`OneDMap` logical labels.
-    coarse_grain : int or pair of int, optional
-        Fine sites per coarse traversal block for `coarse-*` orders. A scalar
-        `g` means `(g, 1)`; the default `(2, 1)` groups neighboring x sites.
-        Edge blocks are allowed to be smaller. This changes only the leaf
-        traversal order; it never merges tensors.
+        Optional `(x, y) -> qubit` or `(x, y, z) -> qubit` mapper for named
+        geometric presets. The default is `x * Ly + y` in 2D and
+        `x * Ly * Lz + y * Lz + z` in 3D.
+    coarse_grain : int or pair/triple of int, optional
+        Fine sites per coarse traversal block for `coarse-*` orders. In 2D a
+        scalar `g` means `(g, 1)`; in 3D it means `(g, 1, 1)`. A 3D pair
+        `(gx, gy)` is accepted as `(gx, gy, 1)`. The default groups two
+        neighboring x sites. Edge blocks are allowed to be smaller. This
+        changes only the leaf traversal order; it never merges tensors.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -1727,20 +1842,25 @@ class TreeLayoutFinder:
         )
         self.lattice_shape = _normalize_lattice_shape(lattice_shape)
         if self.lattice_shape is not None:
-            if self.lattice_shape[0] * self.lattice_shape[1] != self.n:
+            lattice_size = int(np.prod(self.lattice_shape))
+            if lattice_size != self.n:
+                dims = " * ".join(str(dim) for dim in self.lattice_shape)
                 raise ValueError(
                     "lattice_shape product must equal n; got "
-                    f"{self.lattice_shape[0]} * {self.lattice_shape[1]} "
-                    f"!= {self.n}."
+                    f"{dims} != {self.n}."
                 )
         if lattice_site is not None and not callable(lattice_site):
             raise TypeError("lattice_site must be callable or None.")
         if lattice_site is not None and self.lattice_shape is None:
             raise ValueError(
-                "lattice_site requires lattice_shape=(Lx, Ly)."
+                "lattice_site requires lattice_shape=(Lx, Ly) or "
+                "(Lx, Ly, Lz)."
             )
         self.lattice_site = lattice_site
-        self.coarse_grain = _normalize_coarse_grain(coarse_grain)
+        self.coarse_grain = _normalize_coarse_grain(
+            coarse_grain,
+            ndim=2 if self.lattice_shape is None else len(self.lattice_shape),
+        )
         self.max_arity, self.arity_candidates = _normalize_arity_candidates(
             max_arity
         )
@@ -1865,45 +1985,81 @@ class TreeLayoutFinder:
         )
 
     @classmethod
-    def lattice_order(cls, Lx, Ly, mode="row-major", *, site=None,
+    def lattice_order(cls, Lx, Ly, *args, mode=None, Lz=None, site=None,
                       grain=(2, 1)):
-        """Return a logical-qubit order from a two-dimensional layout mode.
+        """Return a logical-qubit order from a 2D or 3D layout mode.
 
         This is the reusable order-only counterpart to passing a named
         geometric preset to :meth:`run`:
 
-        ``TreeLayoutFinder.lattice_order(16, 16, "folded-snake")``.
+        ``TreeLayoutFinder.lattice_order(16, 16, "folded-snake")`` or
+        ``TreeLayoutFinder.lattice_order(4, 4, 3, "alternate-z")``.
+
+        The 2D calling convention keeps the mode as the third positional
+        argument. For 3D, either pass ``Lz`` as a keyword or use
+        ``(Lx, Ly, Lz, mode)`` positionally.
 
         Parameters
         ----------
         Lx, Ly : int
-            Two-dimensional lattice dimensions.
+            First two lattice dimensions.
+        Lz : int, optional
+            Third lattice dimension. Supplying this selects 3D traversal.
         mode : str
-            Any supported 2D lattice mode, including ``"row-major"``,
-            ``"snake"``, ``"alternate-x"``, ``"alternate-y"``,
-            ``"folded-snake"``, ``"hilbert"``, and the `coarse-*` variants.
-        grain : int or pair of int, optional
+            Any supported 2D lattice mode, or the 3D modes ``"row-major"``,
+            ``"col-major"``, ``"snake"``, ``"snake-row-major"``,
+            ``"alternate-x"``, ``"alternate-y"``, and ``"alternate-z"``.
+            The corresponding supported `coarse-*` modes are also available.
+        grain : int or pair/triple of int, optional
             Fine sites per coarse block. Used only by `coarse-*` modes;
-            defaults to `(2, 1)`.
+            defaults to `(2, 1)` in 2D and `(2, 1, 1)` in 3D.
         site : callable, optional
-            Optional ``(x, y) -> qubit`` label mapper. The default is
-            ``x * Ly + y``.
+            Optional ``(x, y) -> qubit`` or ``(x, y, z) -> qubit`` label
+            mapper. The default is x-major flattening.
         """
+        if len(args) > 2:
+            raise TypeError(
+                "lattice_order accepts at most Lz and mode as extra "
+                "positional arguments."
+            )
+        if len(args) == 1:
+            value = args[0]
+            if isinstance(value, (str, bytes)):
+                if mode is not None:
+                    raise TypeError("mode was supplied both positionally and by keyword.")
+                mode = value
+            else:
+                if Lz is not None:
+                    raise TypeError("Lz was supplied both positionally and by keyword.")
+                Lz = value
+        elif len(args) == 2:
+            if Lz is not None or mode is not None:
+                raise TypeError(
+                    "Lz and mode must not be repeated in lattice_order()."
+                )
+            Lz, mode = args
+        if mode is None:
+            mode = "row-major"
         normalized = _normalize_layout_order(mode)
         if normalized == "quality" or normalized is None:
             raise ValueError(
                 "lattice_order mode must be a geometric OneDMap preset."
             )
-        Lx, Ly = _normalize_lattice_shape((Lx, Ly))
+        shape = _normalize_lattice_shape(
+            (Lx, Ly) if Lz is None else (Lx, Ly, Lz)
+        )
         return _lattice_site_order(
-            Lx, Ly, normalized, site=site, grain=grain
+            shape[0], shape[1], normalized,
+            Lz=shape[2] if len(shape) == 3 else None,
+            site=site, grain=grain,
         )
 
     def _preset_order(self, mode):
         """Resolve a named geometric preset against this finder's lattice."""
         if self.lattice_shape is None:
             raise ValueError(
-                f"order={mode!r} requires lattice_shape=(Lx, Ly) "
+                f"order={mode!r} requires lattice_shape=(Lx, Ly) or "
+                "(Lx, Ly, Lz) "
                 "when constructing TreeLayoutFinder."
             )
         order = self.lattice_order(

@@ -25,10 +25,13 @@ structure unless a change has a strong reason to split implementation.
 ## Main responsibilities
 
 `OneDMap` maps regular 2D or 3D lattice coordinates onto a 1D path. Supported
-modes include `snake`, `snake-row-major`, `row-major`, `col-major`, `hilbert`,
-`hilbert-row-major`, and `diag`. The additional `finder` mode composes an MPS
-gate-stream layout permutation with a base lattice mode. It analyzes only gate
-supports and does not construct, replay, or truncate an MPS:
+modes include `snake`, `snake-row-major`, `row-major`, `col-major`,
+`alternate-x`, `alternate-y`, `alternate-z`, `hilbert`,
+`hilbert-row-major`, and `diag`. The x/y/z alternating modes are available
+for 3D lattices, with x/y alternating within z layers and z as the inner
+alternating direction. The additional `finder` mode composes an MPS
+gate-stream layout permutation with a base lattice mode. It analyzes only
+gate supports and does not construct, replay, or truncate an MPS:
 
 ```python
 mapper = py.OneDMap(
