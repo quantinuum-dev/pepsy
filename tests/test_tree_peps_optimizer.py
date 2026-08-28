@@ -2,8 +2,11 @@
 
 import numpy as np
 import pytest
+import quimb as qu
+import quimb.tensor as qtn
 
 from pepsy.optimizers import (
+    MpsOptimizer,
     TreePeps,
     TreePepsOptimizer,
     TreePepsPlan,
@@ -24,6 +27,44 @@ def _cnot():
         ],
         dtype=complex,
     )
+
+
+def test_chain_compression_matches_mps_svd_when_cap_is_sufficient():
+    """A TreePeps path must use the same optimal sweep as an MPS."""
+
+    n = 6
+    plan = TreePepsPlan.from_shape((1, n), order="row-major", tree_order="snake")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 5)),
+        (qu.hadamard(), (1,)),
+        (qu.CNOT(), (1, 4)),
+        (qu.CNOT(), (0, 3)),
+    ]
+
+    exact = TreePepsOptimizer(
+        TreePeps.from_plan(plan), gates=gates, chi=None, cutoff=0.0,
+        track_infidelity=False,
+    )
+    tree = TreePepsOptimizer(
+        TreePeps.from_plan(plan), gates=gates, chi=4, cutoff=0.0,
+        track_infidelity=False,
+    )
+    mps = MpsOptimizer(
+        qtn.MPS_computational_state("0" * n, dtype="complex128"),
+        gates=gates,
+        chi=4,
+        mode="svd",
+    )
+    mps.run(progbar=False, cutoff=0.0)
+
+    exact_vector = np.asarray(exact.state.to_statevector()).reshape(-1)
+    tree_vector = np.asarray(tree.state.to_statevector()).reshape(-1)
+    mps_vector = np.asarray(mps.to_dense()).reshape(-1)
+    np.testing.assert_allclose(tree_vector, exact_vector, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(tree_vector, mps_vector, atol=1e-10, rtol=1e-10)
+    assert tree.last_report["truncated"]
+    assert tree.validate(check_canonical=True) is tree
 
 
 def test_direct_optimizer_routes_over_the_tree_geodesic_exactly():

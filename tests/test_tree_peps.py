@@ -93,6 +93,16 @@ def test_tree_peps_normalize_preserves_canonical_tree_metadata():
     assert state.validate(check_canonical=True)
 
 
+def test_tree_peps_canonical_center_norm_matches_dense_norm():
+    state = TreePeps.rand(
+        TreePepsPlan.from_shape((2, 3)), bond_dim=2, seed=23, canonicalize=True
+    )
+    dense_norm = np.linalg.norm(np.asarray(state.to_statevector()))
+
+    assert np.allclose(state.norm(), dense_norm)
+    assert np.allclose(state.norm(squared=True), dense_norm**2)
+
+
 def test_tree_peps_show_and_canonical_info(capsys):
     state = TreePeps.rand(TreePepsPlan.from_shape((2, 2)), bond_dim=2, seed=11)
 

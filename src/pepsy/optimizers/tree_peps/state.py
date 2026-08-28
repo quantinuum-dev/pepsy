@@ -1347,23 +1347,47 @@ class TreePeps(qtn.TensorNetworkGenVector):
             work._set_isometry_metadata_from_region(region)
 
         if len(region) > 1:
+            # Recover a single hub first, then process each branch as a
+            # complete canonical sweep.  Compressing all edges in a flat
+            # leaf-to-hub ordering is not generally optimal: after the first
+            # edge of one branch is truncated, the neighboring tensor is no
+            # longer the canonical boundary needed by the next edge.  The
+            # recursive descent below mirrors TreeOptimizer's subtree sweep:
+            # compress the parent-child edge, finish the child branch, then
+            # QR-canonize that branch back into the parent before moving to
+            # the next sibling.
             work._recover_center_from_region(region, center)
-            order = sorted(
-                (q for q in region if q != center),
-                key=lambda q: (-len(work.plan.path(q, center)), q),
-            )
-            for q in order:
-                toward = work.plan.path(q, center)[1]
-                work._compress_edge_inplace(
-                    q,
-                    toward,
-                    max_bond=max_bond,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    absorb="right",
-                    reduced=reduced,
-                    compression_mode=compression_mode,
+
+            def edge_cutoff(node, child):
+                """Avoid re-cutting a bond that is already within ``max_bond``."""
+
+                if max_bond is not None and work.ind_size(
+                    work.bond(node, child)
+                ) <= max_bond:
+                    return 0.0
+                return cutoff
+
+            def descend(node, parent):
+                children = sorted(
+                    neighbor
+                    for neighbor in work.plan.neighbors(node)
+                    if neighbor in region and neighbor != parent
                 )
+                for child in children:
+                    work._compress_edge_inplace(
+                        node,
+                        child,
+                        max_bond=max_bond,
+                        cutoff=edge_cutoff(node, child),
+                        cutoff_mode=cutoff_mode,
+                        absorb="right",
+                        reduced=reduced,
+                        compression_mode=compression_mode,
+                    )
+                    descend(child, node)
+                    work.canonize_edge_(child, node, absorb="right")
+
+            descend(center, None)
 
         work._canonical_region = frozenset({center})
         work._set_isometry_metadata_from_region({center})
@@ -1575,7 +1599,26 @@ class TreePeps(qtn.TensorNetworkGenVector):
         print(drawing)
 
     def norm(self, output_inds=None, squared=False, strip_exponent=False, **contract_opts):
-        """Return the exact Frobenius norm using Quimb's vector semantics."""
+        """Return the exact Frobenius norm using Quimb's vector semantics.
+
+        When a one-site canonical centre is known, the centre tensor contains
+        the complete represented norm because every other tree tensor is an
+        isometry toward it.  Use that contraction for the optimizer's hot
+        diagnostic path, while retaining Quimb's full contraction for custom
+        output-index, exponent, or contraction-option requests.
+        """
+
+        if (
+            output_inds is None
+            and not strip_exponent
+            and not contract_opts
+            and getattr(self, "exponent", 0.0) == 0.0
+            and self.orthogonality_center is not None
+        ):
+            center = self.node_tensor(self.orthogonality_center)
+            value = qtn.tensor_contract(center.H, center, output_inds=[])
+            value = float(abs(np.asarray(ar.to_numpy(value))))
+            return value if squared else value**0.5
 
         return super().norm(
             output_inds=output_inds,
