@@ -212,6 +212,27 @@ def _normalize_layout_order(order):
         "hilbert_column": "hilbert",
         "hilbert_col_major": "hilbert",
         "hilbert_row": "hilbert-row-major",
+        "alternate_x": "alternate-x",
+        "alternate_y": "alternate-y",
+        "coarse_row": "coarse-row-major",
+        "coarse_row_major": "coarse-row-major",
+        "coarse_col": "coarse-col-major",
+        "coarse_column": "coarse-col-major",
+        "coarse_col_major": "coarse-col-major",
+        "coarse_snake": "coarse-snake",
+        "coarse_snake_row": "coarse-snake-row-major",
+        "coarse_snake_row_major": "coarse-snake-row-major",
+        "coarse_snake_col": "coarse-snake",
+        "coarse_snake_column": "coarse-snake",
+        "coarse_snake_col_major": "coarse-snake",
+        "coarse_alternate_x": "coarse-alternate-x",
+        "coarse_alternate_y": "coarse-alternate-y",
+        "coarse_folded_snake": "coarse-folded-snake",
+        "coarse_folded_snake_row": "coarse-folded-snake-row-major",
+        "coarse_folded_snake_row_major": "coarse-folded-snake-row-major",
+        "coarse_hilbert": "coarse-hilbert",
+        "coarse_hilbert_row": "coarse-hilbert-row-major",
+        "coarse_hilbert_row_major": "coarse-hilbert-row-major",
     }
     name = aliases.get(name, name)
     if name == "quality":
@@ -223,6 +244,18 @@ def _normalize_layout_order(order):
         "snake_row_major": "snake-row-major",
         "folded_snake": "folded-snake",
         "folded_snake_row_major": "folded-snake-row-major",
+        "alternate_x": "alternate-x",
+        "alternate_y": "alternate-y",
+        "coarse-row-major": "coarse-row-major",
+        "coarse-col-major": "coarse-col-major",
+        "coarse-snake": "coarse-snake",
+        "coarse-snake-row-major": "coarse-snake-row-major",
+        "coarse-folded-snake": "coarse-folded-snake",
+        "coarse-folded-snake-row-major": "coarse-folded-snake-row-major",
+        "coarse-hilbert": "coarse-hilbert",
+        "coarse-hilbert-row-major": "coarse-hilbert-row-major",
+        "coarse-alternate-x": "coarse-alternate-x",
+        "coarse-alternate-y": "coarse-alternate-y",
         "hilbert": "hilbert",
         "hilbert_row_major": "hilbert-row-major",
     }
@@ -232,8 +265,9 @@ def _normalize_layout_order(order):
         return geometric[name]
     raise ValueError(
         "order must be None, 'quality', a geometric lattice preset "
-        "('row-major', 'snake', 'folded-snake', or 'hilbert'), or an "
-        "explicit site permutation."
+        "('row-major', 'col-major', 'snake', 'alternate-x', "
+        "'alternate-y', 'folded-snake', 'hilbert', or a coarse-* variant), "
+        "or an explicit site permutation."
     )
 
 
@@ -264,15 +298,97 @@ def _normalize_lattice_shape(shape):
     return shape
 
 
-def _lattice_site_order(Lx, Ly, mode, *, site=None):
-    """Build a logical-qubit permutation from a regular 2D OneDMap mode."""
-    one_d_to_lattice, _ = OneDMap.build(Lx, Ly, mode=mode)
+_COARSE_LAYOUT_BASE_MODES = {
+    "coarse-row-major": "row-major",
+    "coarse-col-major": "col-major",
+    "coarse-snake": "snake",
+    "coarse-snake-row-major": "snake-row-major",
+    "coarse-folded-snake": "folded-snake",
+    "coarse-folded-snake-row-major": "folded-snake-row-major",
+    "coarse-hilbert": "hilbert",
+    "coarse-hilbert-row-major": "hilbert-row-major",
+    "coarse-alternate-x": "snake-row-major",
+    "coarse-alternate-y": "snake",
+}
+
+
+def _normalize_coarse_grain(grain):
+    """Normalize a 2D coarse block size, defaulting to two along x."""
+    if grain is None:
+        return (2, 1)
+    if isinstance(grain, bool):
+        raise ValueError("coarse_grain must contain positive integers.")
+    if isinstance(grain, Integral):
+        grain = (int(grain), 1)
+    elif isinstance(grain, (str, bytes)):
+        raise TypeError(
+            "coarse_grain must be a positive integer or a two-item sequence."
+        )
+    else:
+        try:
+            grain = tuple(grain)
+        except TypeError as exc:
+            raise TypeError(
+                "coarse_grain must be a positive integer or a two-item sequence."
+            ) from exc
+    if len(grain) != 2:
+        raise ValueError("coarse_grain must contain exactly (gx, gy).")
+    if any(isinstance(value, bool) for value in grain):
+        raise ValueError("coarse_grain entries must be positive integers.")
+    try:
+        grain = tuple(int(value) for value in grain)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("coarse_grain entries must be positive integers.") from exc
+    if any(value < 1 for value in grain):
+        raise ValueError("coarse_grain entries must be positive integers.")
+    return grain
+
+
+def _coarse_lattice_coordinates(Lx, Ly, mode, *, grain):
+    """Return fine coordinates in a block-traversal order."""
+    base_mode = _COARSE_LAYOUT_BASE_MODES[mode]
+    gx, gy = _normalize_coarse_grain(grain)
+    blocks_x = (Lx + gx - 1) // gx
+    blocks_y = (Ly + gy - 1) // gy
+    block_order, _ = OneDMap.build(blocks_x, blocks_y, mode=base_mode)
+    coordinates = []
+    for block_x, block_y in block_order.values():
+        width = min(gx, Lx - block_x * gx)
+        height = min(gy, Ly - block_y * gy)
+        local_order, _ = OneDMap.build(width, height, mode=base_mode)
+        mirror_axis = None
+        if mode in {"coarse-alternate-x", "coarse-snake-row-major"} and block_y % 2:
+            mirror_axis = "x"
+        elif mode in {"coarse-snake", "coarse-alternate-y"} and block_x % 2:
+            mirror_axis = "y"
+        for local_x, local_y in local_order.values():
+            if mirror_axis == "x":
+                local_x = width - 1 - local_x
+            elif mirror_axis == "y":
+                local_y = height - 1 - local_y
+            coordinates.append((block_x * gx + local_x, block_y * gy + local_y))
+    return tuple(coordinates)
+
+
+def _lattice_site_order(Lx, Ly, mode, *, site=None, grain=(2, 1)):
+    """Build a logical-qubit permutation from a regular 2D layout mode."""
+    if mode in _COARSE_LAYOUT_BASE_MODES:
+        coordinates = _coarse_lattice_coordinates(
+            Lx, Ly, mode, grain=grain
+        )
+    else:
+        base_mode = {
+            "alternate-x": "snake-row-major",
+            "alternate-y": "snake",
+        }.get(mode, mode)
+        one_d_to_lattice, _ = OneDMap.build(Lx, Ly, mode=base_mode)
+        coordinates = tuple(one_d_to_lattice.values())
     if site is None:
         # Match OneDMap's logical 2D labels: (x, y) -> x * Ly + y.
         site = lambda x, y: x * Ly + y
     if not callable(site):
         raise TypeError("lattice_site must be callable or None.")
-    order = tuple(int(site(*coord)) for coord in one_d_to_lattice.values())
+    order = tuple(int(site(*coord)) for coord in coordinates)
     return normalize_fixed_order(order, range(Lx * Ly), name="lattice order")
 
 
@@ -1466,17 +1582,23 @@ class TreeLayoutFinder:
         `objective="full_tree"` and enables bounded greedy leaf refinement,
         all-scale subtree topology refinement, and hybrid
         Nevergrad/annealing search. Named two-dimensional lattice presets
-        (`"row-major"`, `"snake"`, `"folded-snake"`, and `"hilbert"`, plus
-        their OneDMap row/column aliases) require `lattice_shape=` and build
-        an exact balanced tree over that traversal. Omitted keeps the fast
-        deterministic objective selected by `objective`. An explicit site
-        permutation builds a fixed tree without refinement.
+        (`"row-major"`, `"snake"`, `"alternate-x"`, `"alternate-y"`,
+        `"folded-snake"`, and `"hilbert"`, plus their `coarse-*` variants)
+        require `lattice_shape=` and build an exact balanced tree over that
+        traversal. Omitted keeps the fast deterministic objective selected by
+        `objective`. An explicit site permutation builds a fixed tree without
+        refinement.
     lattice_shape : pair of int, optional
         The `(Lx, Ly)` shape used by named geometric `order` presets. The
         product must equal `n`.
     lattice_site : callable, optional
         Optional `(x, y) -> qubit` mapper for named geometric presets. The
         default is `x * Ly + y`, matching :class:`OneDMap` logical labels.
+    coarse_grain : int or pair of int, optional
+        Fine sites per coarse traversal block for `coarse-*` orders. A scalar
+        `g` means `(g, 1)`; the default `(2, 1)` groups neighboring x sites.
+        Edge blocks are allowed to be smaller. This changes only the leaf
+        traversal order; it never merges tensors.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -1532,7 +1654,7 @@ class TreeLayoutFinder:
                  refine_budget=None, topology_refine=None, topology_budget=None,
                  search=None, search_budget=128, seed=0,
                  nevergrad_optimizer="OnePlusOne", order=None, root_qubit=None,
-                 lattice_shape=None, lattice_site=None,
+                 lattice_shape=None, lattice_site=None, coarse_grain=(2, 1),
                  time_decay=None, time_window=None):
         if (
             _looks_like_tree_tensor_network(gates)
@@ -1618,6 +1740,7 @@ class TreeLayoutFinder:
                 "lattice_site requires lattice_shape=(Lx, Ly)."
             )
         self.lattice_site = lattice_site
+        self.coarse_grain = _normalize_coarse_grain(coarse_grain)
         self.max_arity, self.arity_candidates = _normalize_arity_candidates(
             max_arity
         )
@@ -1742,8 +1865,9 @@ class TreeLayoutFinder:
         )
 
     @classmethod
-    def lattice_order(cls, Lx, Ly, mode="row-major", *, site=None):
-        """Return a logical-qubit order from a two-dimensional OneDMap mode.
+    def lattice_order(cls, Lx, Ly, mode="row-major", *, site=None,
+                      grain=(2, 1)):
+        """Return a logical-qubit order from a two-dimensional layout mode.
 
         This is the reusable order-only counterpart to passing a named
         geometric preset to :meth:`run`:
@@ -1755,9 +1879,12 @@ class TreeLayoutFinder:
         Lx, Ly : int
             Two-dimensional lattice dimensions.
         mode : str
-            Any supported 2D :class:`OneDMap` mode, including ``"row-major"``,
-            ``"snake"``, ``"folded-snake"``, and ``"hilbert"``, together
-            with their row/column aliases.
+            Any supported 2D lattice mode, including ``"row-major"``,
+            ``"snake"``, ``"alternate-x"``, ``"alternate-y"``,
+            ``"folded-snake"``, ``"hilbert"``, and the `coarse-*` variants.
+        grain : int or pair of int, optional
+            Fine sites per coarse block. Used only by `coarse-*` modes;
+            defaults to `(2, 1)`.
         site : callable, optional
             Optional ``(x, y) -> qubit`` label mapper. The default is
             ``x * Ly + y``.
@@ -1768,7 +1895,9 @@ class TreeLayoutFinder:
                 "lattice_order mode must be a geometric OneDMap preset."
             )
         Lx, Ly = _normalize_lattice_shape((Lx, Ly))
-        return _lattice_site_order(Lx, Ly, normalized, site=site)
+        return _lattice_site_order(
+            Lx, Ly, normalized, site=site, grain=grain
+        )
 
     def _preset_order(self, mode):
         """Resolve a named geometric preset against this finder's lattice."""
@@ -1781,6 +1910,7 @@ class TreeLayoutFinder:
             *self.lattice_shape,
             mode=mode,
             site=self.lattice_site,
+            grain=self.coarse_grain,
         )
         if self.root_qubit is not None:
             order = tuple(q for q in order if q != self.root_qubit)
@@ -4339,6 +4469,9 @@ class TreeLayoutFinder:
             "n_qubits": self.n,
             "n_interacting_pairs": n_pairs,
             "objective": self.objective,
+            "order": self.order,
+            "lattice_shape": self.lattice_shape,
+            "coarse_grain": self.coarse_grain,
             "weight_mode": self.weight_mode,
             "time_decay": self.time_decay,
             "time_window": self.time_window,

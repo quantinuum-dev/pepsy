@@ -1302,6 +1302,92 @@ def test_tree_lattice_order_helper_and_missing_shape_error():
         finder.run(order="hilbert")
 
 
+def test_tree_alternating_lattice_orders_and_coarse_blocks():
+    """Coarse presets traverse complete blocks before moving to the next."""
+    shape = (4, 3)
+    row_alternate = TreeLayoutFinder.lattice_order(
+        *shape, "alternate-x"
+    )
+    col_alternate = TreeLayoutFinder.lattice_order(
+        *shape, "alternate-y"
+    )
+    assert row_alternate == (0, 3, 6, 9, 10, 7, 4, 1, 2, 5, 8, 11)
+    assert col_alternate == (0, 1, 2, 5, 4, 3, 6, 7, 8, 11, 10, 9)
+
+    coarse_row = TreeLayoutFinder.lattice_order(
+        *shape, "coarse-row-major", grain=(2, 1)
+    )
+    assert coarse_row == (0, 3, 1, 4, 2, 5, 6, 9, 7, 10, 8, 11)
+
+    coarse_y = TreeLayoutFinder.lattice_order(
+        *shape, "coarse-alternate-y", grain=(1, 2)
+    )
+    assert coarse_y == col_alternate
+
+    for mode in (
+        "coarse-row-major",
+        "coarse-col-major",
+        "coarse-snake",
+        "coarse-snake-row-major",
+        "coarse-folded-snake",
+        "coarse-folded-snake-row-major",
+        "coarse-hilbert",
+        "coarse-hilbert-row-major",
+    ):
+        order = TreeLayoutFinder.lattice_order(
+            5, 4, mode, grain=(2, 2)
+        )
+        assert len(order) == 20
+        assert set(order) == set(range(20))
+
+        coords = [(q // 4, q % 4) for q in order]
+        blocks = [(x // 2, y // 2) for x, y in coords]
+        block_runs = []
+        start = 0
+        while start < len(blocks):
+            block = blocks[start]
+            end = start + 1
+            while end < len(blocks) and blocks[end] == block:
+                end += 1
+            block_runs.append(block)
+            assert all(current == block for current in blocks[start:end])
+            start = end
+        assert len(block_runs) == 6
+        assert len(set(block_runs)) == 6
+
+
+def test_tree_coarse_order_handoff_and_validation():
+    """TreeOptimizer and finder diagnostics retain coarse-layout settings."""
+    finder = TreeLayoutFinder(
+        [],
+        n=12,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(4, 3),
+        order="coarse-alternate-x",
+        coarse_grain=(2, 1),
+    )
+    plan = finder.run()
+    assert plan.mpo_order() == (0, 3, 6, 9, 10, 7, 4, 1, 2, 5, 8, 11)
+    assert finder.report(plan)["coarse_grain"] == (2, 1)
+
+    forwarded = TreeOptimizer.find_tree_layout(
+        [],
+        n=12,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(4, 3),
+        order="coarse-row-major",
+        coarse_grain=2,
+    )
+    assert forwarded.mpo_order() == (0, 3, 1, 4, 2, 5, 6, 9, 7, 10, 8, 11)
+
+    with pytest.raises(ValueError, match="coarse_grain"):
+        TreeLayoutFinder.lattice_order(
+            4, 3, "coarse-snake", grain=(0, 1)
+        )
+
+
 def test_quality_layout_not_worse_than_balanced():
     """Entanglement-adapted structure scores no worse than balanced order."""
     rng = np.random.default_rng(9)

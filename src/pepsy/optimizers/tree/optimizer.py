@@ -7239,6 +7239,7 @@ class TreeOptimizer:
                          root_qubit=None, top_arity=_DEFAULT_TOP_ARITY,
                          max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                          lattice_shape=None, lattice_site=None,
+                         coarse_grain=(2, 1),
                          order=None):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
@@ -7253,6 +7254,7 @@ class TreeOptimizer:
             max_operator_qubits=max_operator_qubits,
             lattice_shape=lattice_shape,
             lattice_site=lattice_site,
+            coarse_grain=coarse_grain,
             order=order,
         ).run()
 

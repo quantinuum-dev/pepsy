@@ -938,24 +938,30 @@ tree_row = finder.run(order="row-major")
 tree_snake = finder.run(order="snake")
 tree_folded = finder.run(order="folded-snake")
 tree_hilbert = finder.run(order="hilbert")
+tree_coarse = finder.run(order="coarse-alternate-x")
 tree_quality = finder.run(order="quality")
 ```
 
 The supported geometric presets include `"row-major"`, `"snake"`,
-`"folded-snake"`, and `"hilbert"`, plus the corresponding OneDMap
-row/column aliases. Preset orders use a balanced recursive tree so the leaf
-sequence and every higher tree layer are preserved as contiguous intervals of
-that traversal, including the root's top children; `"quality"` remains the
-independent interaction-aware TreeLayoutFinder search. The default logical label is
-`x * Ly + y`; pass `lattice_site=lambda x, y: ...` when the gate stream uses a
-different coordinate-to-qubit convention.
+`"alternate-x"`, `"alternate-y"`, `"folded-snake"`, and `"hilbert"`, plus
+the corresponding `coarse-*` variants. A coarse preset first partitions the
+`(Lx, Ly)` lattice into blocks, follows the selected base traversal on the
+coarse grid, and then expands each block back to its physical qubits. The
+default `coarse_grain=(2, 1)` groups two neighboring x sites; use
+`coarse_grain=(1, 2)` for y-oriented blocks. `coarse-alternate-x` and
+`coarse-alternate-y` are explicit row/column zigzags. Preset orders use a
+balanced recursive tree so the leaf sequence and every higher tree layer are
+preserved as contiguous intervals of that traversal; `"quality"` remains the
+independent interaction-aware TreeLayoutFinder search. The default logical
+label is `x * Ly + y`; pass `lattice_site=lambda x, y: ...` when the gate
+stream uses a different coordinate-to-qubit convention.
 
 The lower-level helper is useful when constructing a `TreePlan` directly:
 
 ```python
 from pepsy.optimizers.tree import TreeLayoutFinder, TreePlan
 
-zigzag = TreeLayoutFinder.lattice_order(6, 6, "snake")
+zigzag = TreeLayoutFinder.lattice_order(6, 6, "coarse-alternate-x")
 tree_plan = TreePlan.from_order(
     zigzag,
     structure="balanced",
@@ -971,8 +977,13 @@ geometry using a square-lattice snake order without refinement:
 ```python
 zigzag = py.square_lattice_zigzag(6, 6)
 tree_plan = TreeLayoutFinder(
-    gates, n=36, max_arity=2, top_arity=3,
-).run(order=zigzag)
+    gates,
+    n=36,
+    max_arity=2,
+    top_arity=3,
+    lattice_shape=(6, 6),
+    coarse_grain=(2, 1),
+).run(order="coarse-alternate-x")
 ```
 
 The explicit order must cover every site exactly once and cannot be combined
