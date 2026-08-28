@@ -390,6 +390,66 @@ def test_static_frame_layout_uses_dynamic_tableau_support():
     assert plan["stats"]["max_event_span"] == 1
 
 
+def test_static_frame_layout_defaults_to_operator_schmidt_weights():
+    theta = np.pi / 2.0 + 0.07
+    sim = MpsStabOptimizer(2).set_gates([("rzz", theta, 0, 1)])
+
+    default_plan = sim.current_frame_layout(order="input")
+    count_plan = sim.current_frame_layout(order="input", weight_mode="count")
+
+    assert default_plan["frame_weight_mode"] == "operator_schmidt"
+    assert default_plan["frame_events"][0]["weight"] > 1.4
+    assert default_plan["event_weights"] == (
+        default_plan["frame_events"][0]["weight"],
+    )
+    assert count_plan["frame_weight_mode"] == "count"
+    assert count_plan["frame_events"][0]["weight"] == pytest.approx(1.0)
+    assert default_plan["frame_events"][0]["weight"] > count_plan[
+        "frame_events"
+    ][0]["weight"]
+
+
+def test_static_frame_layout_operator_weight_tracks_rotation_entanglement():
+    weak = MpsStabOptimizer(2).set_gates([("rzz", 0.1, 0, 1)])
+    strong = MpsStabOptimizer(2).set_gates(
+        [("rzz", np.pi / 2.0 + 0.01, 0, 1)]
+    )
+
+    weak_weight = weak.current_frame_layout(order="input")["frame_events"][0][
+        "weight"
+    ]
+    strong_weight = strong.current_frame_layout(order="input")["frame_events"][0][
+        "weight"
+    ]
+
+    assert strong_weight > weak_weight
+
+
+@pytest.mark.parametrize(
+    ("name", "gate"),
+    [
+        ("rxx", lambda py: py.rxx(0.73)),
+        ("ryy", lambda py: py.ryy(0.73)),
+        ("rzz", lambda py: py.rzz(0.73)),
+        ("fsim", lambda py: py.fsim((0.73, 0.29))),
+        ("fsimg", lambda py: py.fsimg((0.73, 0.19, 0.11, 0.37, 0.23))),
+        ("su4", lambda py: py.su4(np.linspace(0.03, 0.45, 15))),
+    ],
+)
+def test_static_frame_layout_operator_weight_covers_pepsy_two_qubit_families(
+    name, gate
+):
+    import pepsy as py
+
+    plan = MpsStabOptimizer(2, [(gate(py), (0, 1))]).current_frame_layout(
+        order="input"
+    )
+
+    assert plan["frame_events"], name
+    assert any(len(event["support"]) == 2 for event in plan["frame_events"])
+    assert all(event["operator_weight"] > 1.0 for event in plan["frame_events"])
+
+
 def test_static_frame_layout_run_matches_unlaid_reference():
     stream = [
         ("h", 0),
@@ -2027,6 +2087,57 @@ def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
     assert _fidelity(a.to_statevector(), ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_measure_disentangle_alias_matches_absorb_basis():
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.37, 1)]
+    legacy = MpsStabOptimizer(2).apply(stream)
+    alias = MpsStabOptimizer(2).apply(stream)
+
+    assert legacy.measure("X", 1, outcome=+1, absorb_basis=True) == alias.measure(
+        "X", 1, outcome=+1, disentangle=True
+    )
+    assert _fidelity(alias.to_statevector(), legacy.to_statevector()) == pytest.approx(
+        1.0, abs=1e-9
+    )
+    assert MpsStabOptimizer.measure_event("Z", 0, disentangle=True) == (
+        "measure", "Z", (0,), None, True
+    )
+
+
+def test_measure_disentangle_alias_validates_conflicts():
+    sim = MpsStabOptimizer(1)
+
+    with pytest.raises(ValueError, match="different measurement modes"):
+        sim.measure("Z", 0, absorb_basis=True, disentangle=False)
+    with pytest.raises(TypeError, match="disentangle must be a boolean"):
+        sim.measure("Z", 0, disentangle="yes")
+
+
+def test_measure_many_uses_adaptive_span_order_and_preserves_result_order():
+    sim = MpsStabOptimizer(4).apply([("cnot", 0, 3)])
+
+    outcomes = sim.measure_many(
+        [("Z", 3, +1), ("Z", 1, +1)],
+    )
+
+    assert outcomes == (+1, +1)
+    assert [event["qubit"] for event in sim.last_measurement_schedule] == [1, 3]
+    assert (
+        sim.last_measurement_schedule[0]["span"]
+        < sim.last_measurement_schedule[1]["span"]
+    )
+
+
+def test_measure_many_accepts_input_order_override():
+    sim = MpsStabOptimizer(4).apply([("cnot", 0, 3)])
+
+    sim.measure_many(
+        [("Z", 3, +1), ("Z", 1, +1)],
+        order="input",
+    )
+
+    assert [event["qubit"] for event in sim.last_measurement_schedule] == [3, 1]
+
+
 def test_measure_absorb_tracks_localizer_compression_and_pre_probability():
     # A finite-chi localizing CNOT can itself truncate an entangled coefficient
     # MPS. The physical branch probability must be sampled before that unitary
@@ -2233,6 +2344,30 @@ def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
     assert isinstance(sim.measurements[0], MeasurementRecord)
     assert sim.measurements[0].pauli == axis
     assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_measure_reset_defaults_to_fixed_basis():
+    sim = MpsStabOptimizer.from_bits("0")
+
+    sim.measure_reset("Z", 0, outcome=+1)
+
+    assert sim.measurements == [("Z", 0, +1)]
+    assert sim.expectation("Z", 0) == pytest.approx(1.0, abs=1e-9)
+    assert all(event.kind == "measure" for event in sim.norm_events)
+
+
+def test_measure_reset_defaults_to_span_order_and_keeps_input_result_order():
+    sim = MpsStabOptimizer(4).apply([("cnot", 0, 3)])
+
+    outcomes = sim.measure_reset(
+        "Z",
+        (3, 1),
+        outcome=(+1, +1),
+    )
+
+    assert outcomes == (+1, +1)
+    assert [event["qubit"] for event in sim.last_measurement_schedule] == [1, 3]
+    assert [record.where for record in sim.measurements] == [1, 3]
 
 
 def test_cap_stream_entry_contracts_physical_qubit_and_shortens():

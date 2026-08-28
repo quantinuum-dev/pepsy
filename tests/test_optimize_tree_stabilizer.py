@@ -756,6 +756,17 @@ def test_tree_stab_basis_updating_measurement_preserves_physical_state():
     assert opt.projection_diagnostics[-1]["basis_updated"] is True
 
 
+def test_tree_stab_measure_disentangle_alias():
+    opt = pepsy.TreeStabOptimizer(2)
+    opt.apply([("h", 0), ("cnot", 0, 1)])
+
+    assert opt.measure("Z", 0, outcome=+1, disentangle=True) == +1
+    assert opt.projection_diagnostics[-1]["basis_updated"] is True
+    assert pepsy.TreeStabOptimizer.measure_event("Z", 0, disentangle=True) == (
+        "measure", "Z", (0,), None, True
+    )
+
+
 def test_tree_stab_basis_updating_measurement_handles_tree_support_order():
     opt = pepsy.TreeStabOptimizer(5)
     opt.apply([("h", 0), ("cnot", 0, 4), ("h", 2), ("cnot", 2, 3)])

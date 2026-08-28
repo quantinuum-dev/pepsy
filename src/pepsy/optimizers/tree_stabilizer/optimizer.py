@@ -32,7 +32,11 @@ from ..stabilizer_tn.mps_stab_optimizer import (
     ImmediateProjectionRecord,
     MeasurementRecord,
 )
-from ..stabilizer_tn.paulis import hermitian_pauli_terms, pauli_string
+from ..stabilizer_tn.paulis import (
+    _resolve_measurement_disentangle,
+    hermitian_pauli_terms,
+    pauli_string,
+)
 from ..stabilizer_tn.records import (
     StabilizerMpsSettingsAdvice,
     StabilizerTreeRunResult,
@@ -1290,7 +1294,9 @@ class TreeStabOptimizer:
     is_sub_treempo_event = is_subtreempo_event
 
     @staticmethod
-    def measure_event(pauli, where, outcome=None, absorb_basis=None):
+    def measure_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
         """Build an MPS-compatible Pauli-measurement event.
 
         The optional ``absorb_basis`` field is retained when explicitly
@@ -1300,6 +1306,12 @@ class TreeStabOptimizer:
         """
         where = _normalize_sites(where)
         _normalize_axes(pauli, where, allow_identity=True)
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=False,
+            )
         if outcome is not None:
             if not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
                 raise ValueError("measure event outcome must be +1 or -1.")
@@ -1333,11 +1345,19 @@ class TreeStabOptimizer:
         return ("reset", where, "".join(axes))
 
     @staticmethod
-    def measure_reset_event(pauli, where, outcome=None, absorb_basis=None):
+    def measure_reset_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
         """Build an MPS-compatible measure-then-reset event."""
         where = _normalize_sites(where)
         axes = _normalize_basis_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=True,
+            )
         if any(value is not None and value not in (-1, 1) for value in outcomes):
             raise ValueError("measure_reset outcomes must be +1 or -1.")
         entry = ("measure_reset", "".join(axes), where)
@@ -3533,8 +3553,21 @@ class TreeStabOptimizer:
             return measured, float(probability), diagnostics
         return measured, float(probability)
 
-    def measure(self, pauli, where, *, outcome=None, absorb_basis=False):
+    def measure(
+        self,
+        pauli,
+        where,
+        *,
+        outcome=None,
+        absorb_basis=None,
+        disentangle=None,
+    ):
         """Measure a physical Pauli, optionally updating the stabilizer basis."""
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         where = _normalize_sites(where)
         physical = pauli_string(
             _normalize_axes(pauli, where, allow_identity=True), where, self.n
@@ -3554,10 +3587,16 @@ class TreeStabOptimizer:
         where,
         outcome=None,
         *,
-        absorb_basis=False,
+        absorb_basis=None,
+        disentangle=None,
         return_diagnostics=False,
     ):
         """Measure a physical Pauli and return outcome/probability."""
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         if not absorb_basis:
             return self._fixed_measure(
                 pauli, where, outcome=outcome,
@@ -3610,9 +3649,15 @@ class TreeStabOptimizer:
         where,
         *,
         outcome=None,
-        absorb_basis=True,
+        absorb_basis=None,
+        disentangle=None,
     ):
         """Measure targets and then reset them to the positive basis state."""
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=True,
+        )
         where = _normalize_sites(where)
         axes = _normalize_basis_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")

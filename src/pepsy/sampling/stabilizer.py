@@ -6,6 +6,7 @@ from copy import deepcopy
 
 import numpy as np
 
+from ..optimizers.stabilizer_tn.paulis import _resolve_measurement_disentangle
 from .samplers import (
     MpsBatchSampleResult,
     _basis_selection_probability,
@@ -32,7 +33,7 @@ class MpsStabSampler:
     local X/Y/Z measurement into a Pauli projector on the coefficient MPS.
     ``strategy="auto"`` currently resolves to this frame-projector path,
     which shares collapsed prefixes between shots just like the native MPS
-    sampler. Set ``absorb_basis=True`` to use the basis-updating Lemma-3
+    sampler. Set ``disentangle=True`` to use the basis-updating Lemma-3
     measurement on each copied branch. The optimizer state is never mutated by
     sampling.
 
@@ -62,6 +63,9 @@ class MpsStabSampler:
         the ``chi``, ``mode``, and ``cutoff`` settings of the underlying
         optimizer. Since the frame changes after every absorbed measurement,
         frame images are recomputed per branch rather than cached globally.
+    disentangle : bool, optional
+        User-facing alias for ``absorb_basis``. If both names are supplied,
+        they must agree.
     backend : {"auto", "native", "numpy", "torch", "cupy"}, default="auto"
         Backend for returned discrete arrays. ``"auto"`` and ``"native"``
         follow the coefficient-MPS backend when it is NumPy, Torch, or CuPy;
@@ -73,7 +77,7 @@ class MpsStabSampler:
     **optimizer_kwargs
         Construction options forwarded to ``MpsStabOptimizer`` when ``state``
         is a tableau and ``nu`` is supplied. For example, use
-        ``MpsStabSampler(C, nu, chi=16, mode="dmrg2", absorb_basis=True)``.
+        ``MpsStabSampler(C, nu, chi=16, mode="dmrg2", disentangle=True)``.
     """
 
     def __init__(
@@ -83,7 +87,8 @@ class MpsStabSampler:
         one_d_to_two_d=None,
         *,
         strategy="auto",
-        absorb_basis=False,
+        absorb_basis=None,
+        disentangle=None,
         backend="auto",
         **optimizer_kwargs,
     ):
@@ -122,9 +127,12 @@ class MpsStabSampler:
             )
         self._optimizer = optimizer
         self.strategy = self._normalize_strategy(strategy)
-        if not isinstance(absorb_basis, (bool, np.bool_)):
-            raise TypeError("absorb_basis must be a boolean.")
-        self.absorb_basis = bool(absorb_basis)
+        self.absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
+        self.disentangle = self.absorb_basis
         self.resolved_strategy = (
             "frame_pauli_absorb" if self.absorb_basis else "frame_pauli"
         )
@@ -980,7 +988,8 @@ class MpsStabSampler:
         *,
         one_d_to_two_d=None,
         strategy="auto",
-        absorb_basis=False,
+        absorb_basis=None,
+        disentangle=None,
         backend="auto",
         **optimizer_kwargs,
     ):
@@ -999,6 +1008,7 @@ class MpsStabSampler:
             one_d_to_two_d=one_d_to_two_d,
             strategy=strategy,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
             backend=backend,
         )
 
