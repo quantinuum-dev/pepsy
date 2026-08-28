@@ -67,7 +67,31 @@ policy. `pepsy.reset_linalg_registrations(backend="torch")` restores native
 Torch and Quimb split registrations.
 
 `MpsOptimizer` consumes canonical bundled gate streams of the form
-`[(gate, where), ...]`. Bare Quimb compression names such as `mode="src"`,
+`[(gate, where), ...]`. It also accepts stabilizer-style symbolic entries
+`("H", site)`, `("CNOT", control, target)`, and
+`("rzz", angle, site_a, site_b)`, along with the matching one- and two-qubit
+rotation forms. Symbolic names are resolved through Pepsy's standard gate
+constructors before replay, so uppercase names are accepted. Pass
+`to_backend=...` to convert those internally generated matrices before the
+strict stream/backend check; if omitted, the converter is inferred from the
+initial MPS. For example:
+
+```python
+import torch
+
+backend = pepsy.backend_torch(dtype=torch.complex64, device="cuda")
+state.apply_to_arrays(backend)
+opt = pepsy.MpsOptimizer(
+    state,
+    [("H", 0), ("rzz", 0.19, 0, 1)],
+    chi=64,
+    mode="dmrg3",
+    to_backend=backend,
+)
+```
+
+Numeric matrix gates and sub-MPO payloads retain the explicit-preparation
+contract described below. Bare Quimb compression names such as `mode="src"`,
 `mode="zipup"`, and `mode="direct"` are accepted; they normalize internally
 to `quimb-<method>`. The qualified `mode="quimb-<method>"` forms, direct alias
 `mode="quimb"`, and legacy `mode="mpo-<method>"` / `mode="mpo"` spellings
@@ -100,10 +124,11 @@ contracted result back to an MPS mode rebuilds an open MPS.
 `MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
 from every live MPS tensor; the same values are also available as the
 state-derived `backend`, `backend_dtype`, and `backend_device` attributes.
-Every gate and every tensor in a sub-MPO is checked for matching backend and
+Every numeric gate and every tensor in a sub-MPO is checked for matching backend and
 device at construction, `set_gates`, `add_gates`, and `set_p`; non-NumPy
 payloads must also match dtype, while NumPy-to-NumPy dtype promotion is
-compatible. A
+compatible. Symbolic gates are generated and converted internally as described
+above. A
 mismatch raises a `TypeError` with the stream location and preparation guidance;
 `MpsOptimizer` does not silently copy or cast user payloads. Use the same
 explicit converter used to build the state, for example
@@ -388,6 +413,15 @@ checks are needed. A transactional MPO fallback is still norm-checked before
 commit. Torch and CuPy quality checks process one tensor at a time, combine
 scalar results on the device, and transfer one Boolean to the host.
 
+The expensive direct FIT-target overlap contraction is opt-in through
+`fit_overlap_diagnostics=True`. Its result is reported in
+`opt.get_fit_diagnostics()` as `fit_overlap_fidelity` and
+`fit_overlap_infidelity`; the default `False` leaves those fields as `None`
+while retaining the ordinary FIT convergence metadata. If enabled, the
+contraction is performed after each successful DMRG FIT update, including
+DMRG1/2/3 schedules. Mixed-mode transactions retain the existing behavior of
+omitting this target-overlap calculation.
+
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
 the effective tensor is built from cached contractions on the left and right,
@@ -481,12 +515,13 @@ fidelity fields describe compression survival, while `state_norm` describes
 the current tensor-network state scale.
 
 DMRG additionally reports `fit_overlap_fidelity` and
-`fit_overlap_infidelity` in `opt.get_fit_diagnostics()` after a successful FIT
-update. Those values contract the final fitted MPS against the disposable exact
-FIT target and are genuine target-overlap diagnostics. They are specific to
-DMRG and must not be substituted for the norm ledger used by the other modes.
-If a backend cannot perform that optional contraction, the values are `None`
-and `fit_overlap_error` explains why; the FIT update itself is not rejected.
+`fit_overlap_infidelity` in `opt.get_fit_diagnostics()` only when
+`fit_overlap_diagnostics=True`. Those values contract the final fitted MPS
+against the disposable exact FIT target and are genuine target-overlap
+diagnostics. They are specific to DMRG and must not be substituted for the
+norm ledger used by the other modes. If a backend cannot perform that optional
+contraction, the values are `None` and `fit_overlap_error` explains why; the
+FIT update itself is not rejected.
 Measurement, reset, and state-dependent Kraus events are also recorded,
 including `branch_probability`, `physical_boundary`, and `renormalized`. Their
 expected norm includes the Born probability, so a normal physical branch has
@@ -587,7 +622,8 @@ DMRG/FIT record or `None` before a FIT update and for modes that do not use
 FIT. The record
 includes the iteration count, convergence reason, relative change, active block
 size, adaptive and one-site sweep counts, and the DMRG1 one-site lock state
-when applicable.
+when applicable. The record also includes `fit_overlap_diagnostics` so callers
+can distinguish a disabled overlap calculation from a backend failure.
 
 Ordinary runs retain no per-gate timer or timing-record overhead. Enabled
 profiling moves its internally owned FIT records into the replay result and
