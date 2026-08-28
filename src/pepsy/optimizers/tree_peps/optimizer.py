@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from collections.abc import Mapping
 from numbers import Integral
@@ -14,6 +15,11 @@ from ...backends import (
     backend_infer,
     backend_signatures_compatible,
     infer_backend_signature,
+)
+from .._fidelity import (
+    fidelity_from_log,
+    infidelity_from_log,
+    log_fidelity_from_norms,
 )
 from .operators import TreePepo, TreeSubPepo, plan_signature
 from .plan import TreePepsPlan
@@ -150,6 +156,10 @@ class TreePepsOptimizer:
         self.inplace = bool(inplace)
         self.history = []
         self.infidelities = [0.0]
+        self.norm_events = []
+        self._norm_log_survival = 0.0
+        self._last_local_fidelity = None
+        self._last_local_infidelity = None
         self.normalizations = []
         self.profile_events = []
         self.state = state if self.inplace else state.copy()
@@ -263,6 +273,10 @@ class TreePepsOptimizer:
         self.state = state if self.inplace else state.copy()
         self.history = []
         self.infidelities = [0.0]
+        self.norm_events = []
+        self._norm_log_survival = 0.0
+        self._last_local_fidelity = None
+        self._last_local_infidelity = None
         self.normalizations = []
         self.profile_events = []
         self.backend_info()
@@ -1049,6 +1063,100 @@ class TreePepsOptimizer:
         if self.state.canonical_region != span or not self.state.is_subtree_canonical_form(span):
             self.state.canonize_subtree(span, inplace=True, info_c=self.info_c)
 
+    @staticmethod
+    def _format_progress_scalar(value):
+        """Format a fidelity value for the replay progress bar."""
+
+        if value is None:
+            return "-"
+        return f"{float(value):.6f}"
+
+    def _cumulative_fidelity(self):
+        """Return cumulative fidelity measured from retained norms."""
+
+        if self._norm_log_survival == -math.inf:
+            return 0.0
+        return float(math.exp(self._norm_log_survival))
+
+    def _cumulative_infidelity(self):
+        """Return cumulative infidelity using stable ``expm1``."""
+
+        if self._norm_log_survival == -math.inf:
+            return 1.0
+        return float(-math.expm1(self._norm_log_survival))
+
+    def _record_norm_fidelity(
+        self,
+        norm_before,
+        norm_after,
+        *,
+        track_norm,
+    ):
+        """Record one update's local and cumulative retained fidelity."""
+
+        if not track_norm or norm_before is None or norm_after is None:
+            self._last_local_fidelity = None
+            self._last_local_infidelity = None
+            return {
+                "valid": False,
+                "expected_norm": None,
+                "observed_norm": None,
+                "fidelity_raw": None,
+                "local_fidelity": None,
+                "local_infidelity": None,
+                "cumulative_fidelity": None,
+                "cumulative_infidelity": None,
+                "cumulative_compression_fidelity": None,
+                "cumulative_compression_infidelity": None,
+            }
+
+        observed_norm = float(abs(norm_after))
+        expected_norm = float(abs(norm_before))
+        if (
+            expected_norm <= 0.0
+            or not np.isfinite(expected_norm)
+            or not np.isfinite(observed_norm)
+        ):
+            self._last_local_fidelity = None
+            self._last_local_infidelity = None
+            return {
+                "valid": False,
+                "expected_norm": None,
+                "observed_norm": None,
+                "fidelity_raw": None,
+                "local_fidelity": None,
+                "local_infidelity": None,
+                "cumulative_fidelity": None,
+                "cumulative_infidelity": None,
+                "cumulative_compression_fidelity": None,
+                "cumulative_compression_infidelity": None,
+            }
+
+        raw = (observed_norm / expected_norm) ** 2
+        log_local = log_fidelity_from_norms(observed_norm, expected_norm)
+        local_fidelity = fidelity_from_log(log_local)
+        local_infidelity = infidelity_from_log(log_local)
+        if local_fidelity == 0.0:
+            self._norm_log_survival = -math.inf
+        elif math.isfinite(self._norm_log_survival):
+            self._norm_log_survival += math.log(local_fidelity)
+        cumulative_fidelity = self._cumulative_fidelity()
+        cumulative_infidelity = self._cumulative_infidelity()
+        self._last_local_fidelity = float(local_fidelity)
+        self._last_local_infidelity = local_infidelity
+        return {
+            "valid": True,
+            "expected_norm": expected_norm,
+            "observed_norm": observed_norm,
+            "fidelity_raw": float(raw),
+            "local_fidelity": float(local_fidelity),
+            "local_infidelity": local_infidelity,
+            "cumulative_fidelity": cumulative_fidelity,
+            "cumulative_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": cumulative_fidelity,
+            "cumulative_compression_infidelity": cumulative_infidelity,
+        }
+
     def _apply_operator(
         self,
         operator,
@@ -1138,6 +1246,11 @@ class TreePepsOptimizer:
             )
 
         norm_after = self.norm() if track_norm else None
+        fidelity_report = self._record_norm_fidelity(
+            norm_before,
+            norm_after_unscaled,
+            track_norm=track_norm,
+        )
 
         after_bonds = self._bond_sizes(self.state, edges)
         truncated = bool(
@@ -1179,6 +1292,7 @@ class TreePepsOptimizer:
             "norm_before_normalize": norm_before_normalize,
             "track_norm": bool(track_norm),
             "track_truncation": bool(self.track_truncation),
+            **fidelity_report,
         }
         if self.track_bond_diagnostics:
             report.update(
@@ -1198,6 +1312,29 @@ class TreePepsOptimizer:
                     "support": tuple(support),
                     "span": tuple(sorted(span)),
                     "seconds": perf_counter() - started,
+                }
+            )
+        if track_norm:
+            self.norm_events.append(
+                {
+                    "kind": "compression",
+                    "mode": mode,
+                    "support": tuple(support),
+                    "span": tuple(sorted(span)),
+                    "path": report["path"],
+                    "norm_before": norm_before,
+                    "norm_after": norm_after,
+                    "norm_after_unscaled": norm_after_unscaled,
+                    "norm_ratio": report["norm_ratio"],
+                    "compressed": bool(compress),
+                    "compression_scope": report["compression_scope"],
+                    "touched_edges": tuple(edges),
+                    "canonical_region_before": canonical_region_before,
+                    "canonical_region_after": self.state.canonical_region,
+                    "renormalized": bool(renormalize),
+                    "norm_before_normalize": norm_before_normalize,
+                    "track_norm": bool(track_norm),
+                    **fidelity_report,
                 }
             )
         if self.record_history:
@@ -1458,6 +1595,7 @@ class TreePepsOptimizer:
         self,
         gates=None,
         *,
+        progbar=False,
         mode=None,
         compression_mode=None,
         non_unitary=False,
@@ -1475,6 +1613,9 @@ class TreePepsOptimizer:
         ``normalize_every`` may be ``True`` (after every event) or a positive
         integer interval. ``non_unitary`` disables norm-ledger collection;
         explicit ``normalize_final`` still normalizes the represented state.
+        ``progbar=True`` shows the active event count, latest local fidelity,
+        cumulative retained fidelity, and live maximum bond. The progress bar
+        intentionally does not display the live state norm.
         """
 
         if gates is not None:
@@ -1491,15 +1632,74 @@ class TreePepsOptimizer:
             track_norm = self.track_infidelity and not non_unitary
         else:
             track_norm = bool(track_infidelity) and not non_unitary
-        for index, entry in enumerate(self._gate_stream, start=1):
-            renormalize = interval is not None and index % interval == 0
-            self._apply_stream_entry(
-                entry,
-                mode=mode,
-                compression_mode=compression_mode,
-                renormalize=renormalize,
-                track_norm=track_norm,
+        pbar = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(
+                total=len(self._gate_stream),
+                desc=self.mode,
+                leave=True,
+                position=0,
+                ascii=True,
+                colour="GREEN",
             )
+
+        two_qubit_count = 0
+        multi_site_count = 0
+        pepo_count = 0
+        try:
+            for index, entry in enumerate(self._gate_stream, start=1):
+                renormalize = interval is not None and index % interval == 0
+                self._apply_stream_entry(
+                    entry,
+                    mode=mode,
+                    compression_mode=compression_mode,
+                    renormalize=renormalize,
+                    track_norm=track_norm,
+                )
+                if pbar is not None:
+                    kind = entry[0]
+                    if kind == "gate":
+                        support = tuple(entry[2])
+                    elif kind == "sub_treepepo":
+                        support = tuple(entry[1].support)
+                    else:
+                        operator = entry[1]
+                        support = tuple(
+                            operator.operator_support or operator.sites
+                        )
+                    if len(support) == 2:
+                        two_qubit_count += 1
+                    elif len(support) > 2:
+                        multi_site_count += 1
+                    if kind != "gate":
+                        pepo_count += 1
+
+                    postfix = {
+                        "2q": two_qubit_count,
+                        "bnd": self.max_bond(),
+                    }
+                    if track_norm:
+                        postfix.update(
+                            {
+                                "F": self._format_progress_scalar(
+                                    self._last_local_fidelity
+                                ),
+                                "~F": self._format_progress_scalar(
+                                    self._cumulative_fidelity()
+                                ),
+                            }
+                        )
+                    if multi_site_count:
+                        postfix["kq"] = multi_site_count
+                    if pepo_count:
+                        postfix["pepo"] = pepo_count
+                    pbar.set_postfix(postfix)
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                pbar.close()
         if normalize_final:
             self.normalize(eps=normalize_eps)
         return self
@@ -2039,34 +2239,9 @@ class TreePepsOptimizer:
         }
 
     def get_norm_events(self):
-        """Return per-update norm and compression-scope records."""
+        """Return retained-norm fidelity records for replay updates."""
 
-        return [
-            {
-                key: value
-                for key, value in event.items()
-                if key
-                in {
-                    "mode",
-                    "support",
-                    "span",
-                    "path",
-                    "norm_before",
-                    "norm_after",
-                    "norm_after_unscaled",
-                    "norm_ratio",
-                    "compressed",
-                    "compression_scope",
-                    "touched_edges",
-                    "canonical_region_before",
-                    "canonical_region_after",
-                    "renormalized",
-                    "norm_before_normalize",
-                    "track_norm",
-                }
-            }
-            for event in self.history
-        ]
+        return deepcopy(self.norm_events)
 
     def get_normalizations(self):
         """Return explicit physical normalizations performed by the optimizer."""
@@ -2074,16 +2249,116 @@ class TreePepsOptimizer:
         return deepcopy(self.normalizations)
 
     def norm_diagnostics(self):
-        """Return represented norm and update-level norm diagnostics."""
+        """Return local/cumulative compression fidelity diagnostics.
 
+        ``local_fidelity`` and ``cumulative_fidelity`` are retained-norm
+        proxies, not directional overlaps with an independently supplied
+        target state. The live represented state norm remains available under
+        ``norm``/``state_norm`` but is deliberately separate from the
+        compression-fidelity values.
+        """
+
+        valid = [event for event in self.norm_events if event.get("valid")]
+        current = valid[-1] if valid else None
+        cumulative_fidelity = (
+            None if not valid else self._cumulative_fidelity()
+        )
+        cumulative_infidelity = (
+            None
+            if cumulative_fidelity is None
+            else self._cumulative_infidelity()
+        )
+        state_norm = self.norm()
+        event_fidelities = [
+            float(event["local_fidelity"]) for event in valid
+        ]
+        event_infidelities = [
+            float(event["local_infidelity"]) for event in valid
+        ]
+        if event_fidelities and any(value <= 0.0 for value in event_fidelities):
+            geometric_fidelity = 0.0
+        elif event_fidelities:
+            geometric_fidelity = float(
+                math.exp(
+                    sum(math.log(value) for value in event_fidelities)
+                    / len(event_fidelities)
+                )
+            )
+        else:
+            geometric_fidelity = None
         return {
             "tracking": bool(self.track_infidelity),
             "norm_tracking": bool(self.track_infidelity),
             "truncation_tracking": bool(self.track_truncation),
-            "state_norm": self.norm(),
-            "norm": self.norm(),
-            "events": len(self.history),
-            "completed_events": len(self.history),
+            "current_valid": current is not None,
+            "events": len(self.norm_events),
+            "completed_events": len(valid),
+            "completed_segments": len(valid),
+            "segments_including_current": len(valid),
+            "completed_segment_norms": [
+                float(max(0.0, value) ** 0.5) for value in event_fidelities
+            ],
+            "completed_segment_infidelities": event_infidelities,
+            "current_event": None if current is None else deepcopy(current),
+            "current_fidelity": (
+                None if current is None else current["local_fidelity"]
+            ),
+            "current_infidelity": (
+                None if current is None else current["local_infidelity"]
+            ),
+            "local_fidelity": (
+                None if current is None else current["local_fidelity"]
+            ),
+            "local_infidelity": (
+                None if current is None else current["local_infidelity"]
+            ),
+            "cumulative_fidelity": cumulative_fidelity,
+            "cumulative_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": cumulative_fidelity,
+            "cumulative_compression_infidelity": cumulative_infidelity,
+            "norm_survival": cumulative_fidelity,
+            "fidelity": cumulative_fidelity,
+            "infidelity": cumulative_infidelity,
+            "norm": state_norm,
+            "state_norm": state_norm,
+            "cumulative_norm": (
+                None
+                if cumulative_fidelity is None
+                else float(cumulative_fidelity**0.5)
+            ),
+            "total_survival_proxy": cumulative_fidelity,
+            "total_infidelity_proxy": cumulative_infidelity,
+            "total_norm_proxy": (
+                None
+                if cumulative_fidelity is None
+                else float(cumulative_fidelity**0.5)
+            ),
+            "geometric_mean_survival": geometric_fidelity,
+            "geometric_mean_norm": (
+                None
+                if geometric_fidelity is None
+                else float(geometric_fidelity**0.5)
+            ),
+            "mean_segment_infidelity": (
+                None
+                if not event_infidelities
+                else float(sum(event_infidelities) / len(event_infidelities))
+            ),
+            "max_segment_infidelity": (
+                None
+                if not valid
+                else max(event["local_infidelity"] for event in valid)
+            ),
+            "segment_infidelities": event_infidelities,
+            "current_event_kind": None if current is None else current["kind"],
+            "current_segment_norm": (
+                None
+                if current is None
+                else float(max(0.0, current["local_fidelity"]) ** 0.5)
+            ),
+            "current_segment_infidelity": (
+                None if current is None else current["local_infidelity"]
+            ),
             "norm_events": self.get_norm_events(),
             "normalizations": self.get_normalizations(),
         }
@@ -2190,6 +2465,10 @@ class TreePepsOptimizer:
         )
         copied.history = [dict(report) for report in self.history]
         copied.infidelities = list(self.infidelities)
+        copied.norm_events = deepcopy(self.norm_events)
+        copied._norm_log_survival = self._norm_log_survival
+        copied._last_local_fidelity = self._last_local_fidelity
+        copied._last_local_infidelity = self._last_local_infidelity
         copied.normalizations = deepcopy(self.normalizations)
         copied.profile_events = deepcopy(self.profile_events)
         copied._gate_stream = tuple(self._gate_stream)

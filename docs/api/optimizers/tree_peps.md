@@ -237,6 +237,15 @@ replay begins. `TreePepsOptimizer.find_tree_layout(...)` and
 `convergence_sweep(...)` provide the corresponding layout and bond-cap
 convenience entry points.
 
+Pass `progbar=True` to `run()` for a replay bar matching the MPS optimizer's
+compression readout. It reports the latest local fidelity as `F`, the
+log-accumulated retained fidelity as `~F`, the live maximum bond as `bnd`, and
+event counts such as `2q`; it does not display the live state norm. `F` and
+`~F` are retained-norm compression proxies, not directional overlaps with a
+target state. They are available after replay as
+`norm_diagnostics()["local_fidelity"]` and
+`norm_diagnostics()["cumulative_fidelity"]`, with matching infidelity fields.
+
 As with the state, TreePeps truncation history records exact bond dimensions;
 it does not claim a scalar discarded-weight fidelity unless a caller performs
 an explicit reference comparison (the convergence sweep does so for small

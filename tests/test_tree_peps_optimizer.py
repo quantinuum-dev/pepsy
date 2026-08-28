@@ -404,6 +404,50 @@ def test_optimizer_run_supports_norm_controls_and_profile_report():
     assert profile["by_kind"]["update"]["count"] == 1
 
 
+def test_optimizer_progress_bar_reports_fidelities_not_live_norm(monkeypatch):
+    import tqdm as tqdm_module
+
+    plan = _path_plan((1, 3))
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    postfixes = []
+    descriptors = []
+
+    class FakeProgress:
+        def __init__(self, *args, **kwargs):
+            del args
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, postfix):
+            postfixes.append(dict(postfix))
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tqdm_module, "tqdm", FakeProgress)
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        gates=[(x, 0), (_cnot(), (0, 2))],
+        run=False,
+        chi=1,
+        cutoff=0.0,
+    )
+
+    optimizer.run(progbar=True)
+
+    assert descriptors == ["direct"]
+    assert len(postfixes) == 2
+    assert all("norm" not in postfix for postfix in postfixes)
+    assert all("F" in postfix and "~F" in postfix for postfix in postfixes)
+    assert all("bnd" in postfix for postfix in postfixes)
+    assert postfixes[-1]["2q"] == 1
+    diagnostics = optimizer.norm_diagnostics()
+    assert diagnostics["local_fidelity"] is not None
+    assert diagnostics["cumulative_fidelity"] is not None
+
+
 def test_optimizer_layout_preflight_and_convergence_helpers():
     plan = _path_plan((2, 2))
     layout = TreePepsOptimizer.find_tree_layout(
