@@ -1388,6 +1388,135 @@ def test_tree_coarse_order_handoff_and_validation():
         )
 
 
+def test_tree_3d_lattice_orders_support_axis_alternation():
+    """Tree presets preserve the shared 3D OneDMap traversal vocabulary."""
+    shape = (3, 2, 2)
+    size = np.prod(shape)
+    coords = {
+        q: (q // (shape[1] * shape[2]),
+            (q // shape[2]) % shape[1],
+            q % shape[2])
+        for q in range(size)
+    }
+    for mode in (
+        "row-major",
+        "col-major",
+        "snake",
+        "snake-row-major",
+        "alternate-x",
+        "alternate-y",
+        "alternate-z",
+    ):
+        expected = tuple(
+            x * shape[1] * shape[2] + y * shape[2] + z
+            for x, y, z in pepsy.OneDMap.build(
+                *shape[:2], Lz=shape[2], mode=mode,
+            )[0].values()
+        )
+        order = TreeLayoutFinder.lattice_order(*shape, mode=mode)
+        assert order == expected
+        assert set(order) == set(range(size))
+
+    # Each non-coarse alternating path is a nearest-neighbor 3D traversal.
+    for mode in ("alternate-x", "alternate-y", "alternate-z"):
+        order = TreeLayoutFinder.lattice_order(*shape, mode=mode)
+        assert all(
+            sum(abs(coords[left][axis] - coords[right][axis]) for axis in range(3))
+            == 1
+            for left, right in zip(order[:-1], order[1:])
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "grain"),
+    [
+        ("coarse-alternate-x", (2, 1, 1)),
+        ("coarse-alternate-y", (1, 2, 1)),
+        ("coarse-alternate-z", (1, 1, 2)),
+    ],
+)
+def test_tree_3d_coarse_alternating_axes_keep_blocks_and_paths(mode, grain):
+    """3D coarse alternation keeps each block contiguous and path-connected."""
+    shape = (4, 3, 3)
+    size = int(np.prod(shape))
+    order = TreeLayoutFinder.lattice_order(*shape, mode=mode, grain=grain)
+    assert len(order) == size
+    assert set(order) == set(range(size))
+
+    coords = {
+        q: (q // (shape[1] * shape[2]),
+            (q // shape[2]) % shape[1],
+            q % shape[2])
+        for q in range(size)
+    }
+    block_ids = [
+        tuple(coords[q][axis] // grain[axis] for axis in range(3))
+        for q in order
+    ]
+    runs = []
+    start = 0
+    while start < len(block_ids):
+        block = block_ids[start]
+        end = start + 1
+        while end < len(block_ids) and block_ids[end] == block:
+            end += 1
+        assert all(block_id == block for block_id in block_ids[start:end])
+        runs.append(block)
+        start = end
+    expected_blocks = int(np.prod([
+        (length + block - 1) // block
+        for length, block in zip(shape, grain)
+    ]))
+    assert len(runs) == len(set(runs)) == expected_blocks
+    assert all(
+        sum(abs(coords[left][axis] - coords[right][axis]) for axis in range(3))
+        == 1
+        for left, right in zip(order[:-1], order[1:])
+    )
+
+
+def test_tree_3d_coarse_order_handoff_and_site_mapper():
+    """Finder and TreeOptimizer retain 3D coarse-layout metadata."""
+    shape = (3, 2, 2)
+    finder = TreeLayoutFinder(
+        [],
+        n=int(np.prod(shape)),
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=shape,
+        order="coarse-alternate-z",
+        coarse_grain=(1, 1, 2),
+    )
+    plan = finder.run()
+    expected = tuple(
+        x * shape[1] * shape[2] + y * shape[2] + z
+        for x, y, z in pepsy.OneDMap.build(
+            *shape[:2], Lz=shape[2], mode="alternate-z",
+        )[0].values()
+    )
+    assert plan.mpo_order() == expected
+    report = finder.report(plan)
+    assert report["lattice_shape"] == shape
+    assert report["coarse_grain"] == (1, 1, 2)
+
+    custom = TreeLayoutFinder.lattice_order(
+        3, 2, 2, "alternate-z",
+        site=lambda x, y, z: z * 6 + y * 3 + x,
+    )
+    assert set(custom) == set(range(12))
+
+    forwarded = TreeOptimizer.find_tree_layout(
+        [],
+        n=12,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=shape,
+        order="coarse-alternate-x",
+        coarse_grain=2,
+    )
+    assert set(forwarded.mpo_order()) == set(range(12))
+
+
 def test_quality_layout_not_worse_than_balanced():
     """Entanglement-adapted structure scores no worse than balanced order."""
     rng = np.random.default_rng(9)
