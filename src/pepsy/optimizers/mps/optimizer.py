@@ -63,7 +63,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from numbers import Integral
 import math
 import threading
@@ -88,6 +88,7 @@ from ...operators.gates import (
     gate as apply_gate,
     gate_simple as apply_gate_simple,
 )
+from ...operators import primitives as _gate_primitives
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
@@ -380,6 +381,48 @@ _PAULI_1Q = {
     "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
     "Z": np.array([[1, 0], [0, -1]], dtype=complex),
 }
+
+_SYMBOLIC_ONE_QUBIT_GATES = {
+    "h": _gate_primitives.h,
+    "hadamard": _gate_primitives.hadamard,
+    "x": _gate_primitives.x,
+    "y": _gate_primitives.y,
+    "z": _gate_primitives.z,
+    "s": _gate_primitives.s,
+    "sdg": _gate_primitives.sdg,
+    "sdag": _gate_primitives.sdg,
+    "t": _gate_primitives.t,
+    "tdg": _gate_primitives.tdg,
+}
+_SYMBOLIC_TWO_QUBIT_GATES = {
+    "cnot": _gate_primitives.cnot,
+    "cx": _gate_primitives.cx,
+    "cy": _gate_primitives.cy,
+    "cz": _gate_primitives.cz,
+    "swap": _gate_primitives.swap,
+    "iswap": _gate_primitives.iswap,
+}
+_SYMBOLIC_ONE_QUBIT_ROTATIONS = {
+    "rx": _gate_primitives.rx,
+    "ry": _gate_primitives.ry,
+    "rz": _gate_primitives.rz,
+}
+_SYMBOLIC_TWO_QUBIT_ROTATIONS = {
+    "rxx": _gate_primitives.rxx,
+    "ryy": _gate_primitives.ryy,
+    "rzz": _gate_primitives.rzz,
+}
+_SYMBOLIC_GATE_NAMES = frozenset(
+    {
+        *_SYMBOLIC_ONE_QUBIT_GATES,
+        *_SYMBOLIC_TWO_QUBIT_GATES,
+        *_SYMBOLIC_ONE_QUBIT_ROTATIONS,
+        *_SYMBOLIC_TWO_QUBIT_ROTATIONS,
+        "sqrt_x",
+        "sqrt_x_dag",
+        "rot",
+    }
+)
 
 
 def _normalize_control_where(where, *, single=False):
@@ -848,7 +891,174 @@ def _normalize_gate_queue(gates):
     )
 
 
-def _prepare_gate_stream(gates):
+def _symbolic_targets(values, *, name, arity):
+    """Normalize positional symbolic gate targets."""
+    if len(values) == arity:
+        targets = values
+    elif len(values) == 1 and isinstance(values[0], (tuple, list)):
+        targets = values[0]
+    else:
+        raise ValueError(
+            f"{name!r} gate expects {arity} target sites, got {len(values)}."
+        )
+    if len(targets) != arity or not all(isinstance(site, Integral) for site in targets):
+        raise TypeError(f"{name!r} gate targets must be integer site indices.")
+    return tuple(int(site) for site in targets)
+
+
+def _symbolic_rotation_gate(theta, paulis):
+    """Build ``exp(-i * theta * P / 2)`` for a Pauli string ``P``."""
+    axes = [axis for axis in str(paulis).upper() if not axis.isspace()]
+    if not axes or any(axis not in _PAULI_1Q for axis in axes):
+        raise ValueError(
+            f"rot Pauli axes must be a non-empty string of I, X, Y, or Z, "
+            f"got {paulis!r}."
+        )
+    pauli = _PAULI_1Q[axes[0]]
+    for axis in axes[1:]:
+        pauli = np.kron(pauli, _PAULI_1Q[axis])
+    theta = float(theta)
+    dimension = pauli.shape[0]
+    return (
+        np.cos(theta / 2.0) * np.eye(dimension, dtype=complex)
+        - 1j * np.sin(theta / 2.0) * pauli
+    )
+
+
+def _symbolic_gate_entry(entry):
+    """Return ``(gate, where)`` for a named gate entry, or ``None``.
+
+    The grammar mirrors the named stream accepted by ``MpsStabOptimizer``:
+    fixed gates use ``(name, site[, site])``, rotations use
+    ``(name, angle, site[, site])``, and ``rot`` uses
+    ``("rot", angle, paulis, sites)``. Unknown names are left untouched so
+    control and stochastic stream parsers can handle them normally.
+    """
+    if not isinstance(entry, (tuple, list)) or not entry:
+        return None
+    name = entry[0]
+    if not isinstance(name, str):
+        return None
+    name = _normalize_event_name(name)
+
+    if name in _SYMBOLIC_ONE_QUBIT_GATES:
+        if len(entry) != 2:
+            raise ValueError(f"{name!r} gate expects one target site.")
+        where = _symbolic_targets((entry[1],), name=name, arity=1)
+        return _SYMBOLIC_ONE_QUBIT_GATES[name](), where[0]
+
+    if name in {"sqrt_x", "sqrt_x_dag"}:
+        if len(entry) != 2:
+            raise ValueError(f"{name!r} gate expects one target site.")
+        where = _symbolic_targets((entry[1],), name=name, arity=1)
+        theta = np.pi / 2.0 if name == "sqrt_x" else -np.pi / 2.0
+        return _gate_primitives.rx(theta), where[0]
+
+    if name in _SYMBOLIC_TWO_QUBIT_GATES:
+        where = _symbolic_targets(entry[1:], name=name, arity=2)
+        return _SYMBOLIC_TWO_QUBIT_GATES[name](), where
+
+    if name in _SYMBOLIC_ONE_QUBIT_ROTATIONS:
+        if len(entry) != 3:
+            raise ValueError(f"{name!r} gate expects an angle and one target site.")
+        where = _symbolic_targets((entry[2],), name=name, arity=1)
+        return _SYMBOLIC_ONE_QUBIT_ROTATIONS[name](entry[1]), where[0]
+
+    if name in _SYMBOLIC_TWO_QUBIT_ROTATIONS:
+        if len(entry) == 4:
+            where = _symbolic_targets(entry[2:], name=name, arity=2)
+        elif len(entry) == 3:
+            where = _symbolic_targets((entry[2],), name=name, arity=2)
+        else:
+            raise ValueError(f"{name!r} gate expects an angle and two target sites.")
+        return _SYMBOLIC_TWO_QUBIT_ROTATIONS[name](entry[1]), where
+
+    if name == "rot":
+        if len(entry) != 4:
+            raise ValueError("'rot' gate expects angle, Pauli axes, and target sites.")
+        where = _symbolic_targets((entry[3],), name=name, arity=len(
+            [axis for axis in str(entry[2]).upper() if not axis.isspace()]
+        ))
+        return _symbolic_rotation_gate(entry[1], entry[2]), where
+
+    return None
+
+
+def _resolve_symbolic_gate_entry(entry, converter):
+    """Resolve one named gate while preserving non-gate stream events."""
+    if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+        name = _normalize_event_name(entry[0])
+        if name in _CONDITIONAL_EVENT_ALIASES and len(entry) == 4:
+            action = _resolve_symbolic_gate_entry(entry[3], converter)
+            if action is not entry[3]:
+                resolved = list(entry)
+                resolved[3] = action
+                return tuple(resolved) if isinstance(entry, tuple) else resolved
+        symbolic = _symbolic_gate_entry(entry)
+        if symbolic is None:
+            return entry
+        gate, where = symbolic
+        if converter is not None:
+            gate = converter(gate)
+        return gate, where
+
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
+        if kind is not _MISSING and _normalize_event_name(kind) in _CONDITIONAL_EVENT_ALIASES:
+            for key in ("then", "action", "gate"):
+                if key in entry:
+                    action = _resolve_symbolic_gate_entry(entry[key], converter)
+                    if action is not entry[key]:
+                        resolved = dict(entry)
+                        resolved[key] = action
+                        return resolved
+        return entry
+
+    return entry
+
+
+def _contains_symbolic_gate(entry):
+    """Return whether an entry (including a conditional action) is named."""
+    if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+        name = _normalize_event_name(entry[0])
+        if name in _SYMBOLIC_GATE_NAMES:
+            return True
+        return (
+            name in _CONDITIONAL_EVENT_ALIASES
+            and len(entry) == 4
+            and _contains_symbolic_gate(entry[3])
+        )
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
+        if kind is _MISSING or _normalize_event_name(kind) not in _CONDITIONAL_EVENT_ALIASES:
+            return False
+        return any(
+            key in entry and _contains_symbolic_gate(entry[key])
+            for key in ("then", "action", "gate")
+        )
+    return False
+
+
+def _resolve_symbolic_gate_stream(entries, *, to_backend=None, backend_sample=None):
+    """Resolve named gate entries and optionally place them on a backend."""
+    converter = to_backend
+    if (
+        converter is None
+        and backend_sample is not None
+        and any(_contains_symbolic_gate(entry) for entry in entries)
+    ):
+        converter = infer_backend_converter_from_sample(backend_sample)
+
+    resolved = []
+    changed = False
+    for entry in entries:
+        item = _resolve_symbolic_gate_entry(entry, converter)
+        resolved.append(item)
+        changed |= item is not entry
+    return tuple(resolved), changed
+
+
+def _prepare_gate_stream(gates, *, to_backend=None, backend_sample=None):
     """Compile a stream snapshot and identify trajectory-aware entries.
 
     The noise module owns the stochastic-entry grammar. Import it lazily here
@@ -864,7 +1074,16 @@ def _prepare_gate_stream(gates):
     )
 
     trajectory_plan = compile_trajectory_stream(gates)
-    entries = trajectory_plan.entries
+    entries, changed = _resolve_symbolic_gate_stream(
+        trajectory_plan.entries,
+        to_backend=to_backend,
+        backend_sample=backend_sample,
+    )
+    if changed:
+        # Symbolic gates are ordinary entries, so resolution cannot change
+        # any trajectory/control boundary. Replace only the immutable payload
+        # tuple and retain the one compilation pass and its metadata.
+        trajectory_plan = replace(trajectory_plan, entries=entries)
     event_types = []
     has_trajectory_events = False
     for entry in entries:
@@ -1158,6 +1377,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         accepted). If omitted, start with an empty queue and use
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
         applied on the ket family only (state evolution), using :func:`pepsy.operators.gates.gate`.
+        Named entries matching the stabilizer stream grammar are also accepted,
+        for example ``("H", 0)`` and ``("rzz", theta, 0, 1)``. They are
+        materialized as ordinary gate matrices before stream validation.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
         For a bare Quimb method such as ``mode="src"`` or the qualified
         ``mode="quimb-<method>"`` (with aliases ``"quimb"`` and legacy
@@ -1181,10 +1403,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         are also accepted. They are replayed through the shot runner when
         :meth:`run` is called, so state-dependent channels, measurements, and
         feed-forward actions are sampled independently per trajectory.
-        Ordinary gate and sub-MPO payloads must already match the MPS backend
-        and device. Mismatches are rejected with preparation guidance;
-        use an explicit converter before constructing the optimizer or calling
-        :meth:`set_gates`.
+        Numeric gate and sub-MPO payloads must already match the MPS backend
+        and device. Named gate entries are generated internally and use
+        ``to_backend`` (or the initial-state backend when it is omitted).
+        Mismatches in user-supplied numeric payloads are rejected with
+        preparation guidance; use an explicit converter before constructing
+        the optimizer or calling :meth:`set_gates`.
     chi : int
         Positive target/max bond dimension used by compressed modes. Mixed mode
         requires the initial MPS to have ``max_bond() <= chi`` and keeps its
@@ -1218,6 +1442,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         is mutated in place and is exposed as :attr:`gauges`. If omitted, the
         optimizer initializes it with ``p.gauge_all_simple_(...)`` before the
         first simple-update gate.
+    to_backend : callable | None, default=None
+        Optional converter for named gate entries. For example,
+        ``to_backend=pepsy.backend_torch(dtype=torch.complex64)`` converts
+        the matrices generated for ``("H", 0)`` and ``("rzz", theta, 0, 1)``
+        before they cross the stream boundary. When omitted, the converter is
+        inferred from the initial MPS for named gates. Existing numeric gate
+        and sub-MPO payloads retain the strict explicit-preparation contract.
     Attributes
     ----------
     measurements : list[tuple]
@@ -1847,6 +2078,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         inplace=False,
         gauges=None,
         _capture_initial=True,
+        to_backend=None,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -1863,13 +2095,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.inplace = bool(inplace)
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
         self._initial_p = self.p.copy() if _capture_initial else None
+        if to_backend is not None and not callable(to_backend):
+            raise TypeError("to_backend must be callable or None.")
+        self._symbolic_gate_to_backend = to_backend
         # A normal optimizer owns its stream cache. Shot-created optimizers
         # explicitly opt into sharing the immutable plan cache after
         # construction; initialize both fields before installing the plan so
         # the constructor follows the same path as set_gates/add_gates.
         self._shared_backend_cache = False
         self._backend_cache_plan = None
-        plan = _prepare_gate_stream(gates)
+        plan = _prepare_gate_stream(
+            gates,
+            to_backend=to_backend,
+            backend_sample=self._state_backend_like_for(self.p),
+        )
         normalized_queue = self._normalize_stream_plan_queue(plan)
         self._validate_normalized_gate_queue(normalized_queue)
         self._install_stream_plan(plan, normalized_queue=normalized_queue)
@@ -3084,6 +3323,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             inplace=True,
             gauges=deepcopy(self.gauges),
             _capture_initial=False,
+            to_backend=self._symbolic_gate_to_backend,
         )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
@@ -3403,6 +3643,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "mode": mode,
             "contraction_opt": self.contraction_opt,
             "ind_id": self.ind_id,
+            "to_backend": self._symbolic_gate_to_backend,
         }
 
         def make_optimizer():
@@ -3720,7 +3961,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         After calling this, ``run(...)`` applies only this new list
         (unless you call :meth:`add_gates` before running).
         """
-        plan = _prepare_gate_stream(gates)
+        plan = _prepare_gate_stream(
+            gates,
+            to_backend=self._symbolic_gate_to_backend,
+            backend_sample=self._state_backend_like(),
+        )
         normalized_queue = self._normalize_stream_plan_queue(plan)
         self._validate_normalized_gate_queue(normalized_queue)
         self._shared_backend_cache = False
@@ -3733,8 +3978,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         This preserves previously queued gates and extends them with
         new ones.
         """
-        new_plan = _prepare_gate_stream(gates)
-        plan = _prepare_gate_stream(self._gate_stream + new_plan.entries)
+        new_plan = _prepare_gate_stream(
+            gates,
+            to_backend=self._symbolic_gate_to_backend,
+            backend_sample=self._state_backend_like(),
+        )
+        plan = _prepare_gate_stream(
+            self._gate_stream + new_plan.entries,
+            to_backend=self._symbolic_gate_to_backend,
+            backend_sample=self._state_backend_like(),
+        )
         normalized_queue = self._normalize_stream_plan_queue(plan)
         self._validate_normalized_gate_queue(normalized_queue)
         self._install_stream_plan(plan, normalized_queue=normalized_queue)
@@ -4283,6 +4536,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         fit_stabilize_unitary=_DEPRECATED_OPTION,
         timing=False,
@@ -4532,6 +4786,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
             enable it when deliberately choosing the one-update fast path.
+        fit_overlap_diagnostics : bool, default=False
+            Contract the final fitted MPS against the disposable exact FIT
+            target and report target-overlap fidelity. This adds an extra
+            tensor-network contraction after each successful DMRG FIT update;
+            when disabled, the overlap fields remain ``None`` while the
+            ordinary FIT convergence metadata is still collected.
         stabilize_unitary : bool, default=False
             By default, retain the raw norm change after each unitary FIT or
             mixed/MPO/swap/permutation/SVD compression so norm loss remains
@@ -4851,6 +5111,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             legacy_name="fit_stabilize_unitary",
             legacy_value=fit_stabilize_unitary,
         )
+        fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
         if stabilize_unitary and not non_unitary:
             # Each stabilized unitary stream needs a fresh raw-norm reference.
             # Mixed mode then carries this working value across its trials.
@@ -5025,6 +5286,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
+            fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=bool(stabilize_unitary),
             quality_check_every=quality_check_every,
             quality_check_repair=quality_check_repair,
@@ -5203,14 +5465,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         The result is ``None`` before a DMRG/FIT update has completed and for
         replay modes that do not use FIT. The returned dictionary is
         independent of the optimizer's internal diagnostic state. Successful
-        FIT updates also include ``fit_overlap_fidelity`` and
-        ``fit_overlap_infidelity``: a direct contraction of the fitted MPS
-        with the disposable exact FIT target. Those fields are target-overlap
-        diagnostics and are intentionally separate from norm-survival fields
-        such as ``cumulative_fidelity``. If the optional contraction is
-        unavailable for a backend, both values are ``None`` and
-        ``fit_overlap_error`` records the diagnostic failure without rejecting
-        the successful FIT update.
+        FIT updates include the ordinary convergence metadata. The optional
+        ``fit_overlap_fidelity`` and ``fit_overlap_infidelity`` fields are
+        populated only when ``run(fit_overlap_diagnostics=True)`` requests a
+        direct contraction of the fitted MPS with the disposable exact FIT
+        target. Those fields are target-overlap diagnostics and are
+        intentionally separate from norm-survival fields such as
+        ``cumulative_fidelity``. If the optional contraction is unavailable
+        for a backend, both values are ``None`` and ``fit_overlap_error``
+        records the diagnostic failure without rejecting the successful FIT
+        update.
         """
         return deepcopy(self._last_dmrg_fit_diagnostics)
 
@@ -5289,6 +5553,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
@@ -5339,6 +5604,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_init_rand_strength=fit_init_rand_strength,
                 fit_init_seed=fit_init_seed,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
                 stabilize_unitary=stabilize_unitary,
                 quality_check_every=quality_check_every,
                 quality_check_repair=quality_check_repair,
@@ -5375,6 +5641,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_init_rand_strength=fit_init_rand_strength,
                 fit_init_seed=fit_init_seed,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
                 stabilize_unitary=stabilize_unitary,
                 non_unitary=non_unitary,
                 quality_check_every=quality_check_every,
@@ -5652,6 +5919,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     normalize_eps=1e-12,
                     non_unitary=False,
                     submpo_method="direct",
+                    fit_overlap_diagnostics=mode_kwargs.get(
+                        "fit_overlap_diagnostics",
+                        False,
+                    ),
                 )
             return
         if name == "measure":
@@ -6245,6 +6516,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit_init_seed=mode_kwargs["fit_init_seed"],
                     fit_single_pair_fast_path=mode_kwargs[
                         "fit_single_pair_fast_path"
+                    ],
+                    fit_overlap_diagnostics=mode_kwargs[
+                        "fit_overlap_diagnostics"
                     ],
                     measurement_index=len(self.measurements),
                 )
@@ -7844,6 +8118,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_overlap_diagnostics=False,
         stabilize_unitary=False,
     ):
         """Apply one mixed-mode step through the DMRG backend."""
@@ -7870,6 +8145,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
+            fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=stabilize_unitary,
         )
         self._validate_mix_norm(where, operation="DMRG step")
@@ -7895,6 +8171,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_overlap_diagnostics=False,
         stabilize_unitary=False,
     ):
         """Apply a contiguous two-site batch through the DMRG backend."""
@@ -7921,6 +8198,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
+            fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=stabilize_unitary,
         )
         active_where = (
@@ -8421,6 +8699,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         non_unitary=False,
         quality_check_every=None,
@@ -8655,6 +8934,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         fit_init_rand_strength=fit_init_rand_strength,
                         fit_init_seed=fit_init_seed,
                         fit_single_pair_fast_path=fit_single_pair_fast_path,
+                        fit_overlap_diagnostics=fit_overlap_diagnostics,
                         stabilize_unitary=stabilize_unitary,
                     )
                     fit_diagnostics = deepcopy(
@@ -8869,6 +9149,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_seed,
         fit_single_pair_fast_path,
         measurement_index,
+        fit_overlap_diagnostics=False,
     ):
         """Apply a multi-site projective measurement through DMRG FIT.
 
@@ -9054,6 +9335,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "random_initialization"
                 ),
                 "target_strategy": target_strategy,
+                "fit_overlap_diagnostics": bool(fit_overlap_diagnostics),
                 "target_representation": "lazy_submpo",
                 "backend": "mpo",
                 "fallback": True,
@@ -9075,7 +9357,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if fit_norm is not None
             else self._real_float(ar.do("abs", self.p[center].norm()))
         )
-        fit_overlap = self._fit_overlap_diagnostics(p_target, fit.p)
+        fit_overlap = (
+            self._fit_overlap_diagnostics(p_target, fit.p)
+            if fit_overlap_diagnostics
+            else {}
+        )
         self._last_dmrg_fit_diagnostics = {
             "iterations": int(fit.iterations_run),
             "converged": bool(fit.converged),
@@ -9098,6 +9384,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "random_initialization"
             ],
             "target_strategy": target_strategy,
+            "fit_overlap_diagnostics": bool(fit_overlap_diagnostics),
             "target_representation": "lazy_submpo",
             "fit_overlap_fidelity": fit_overlap.get("fit_overlap_fidelity"),
             "fit_overlap_infidelity": fit_overlap.get("fit_overlap_infidelity"),
@@ -9137,6 +9424,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=1.0e-1,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_overlap_diagnostics=False,
         stabilize_unitary=False,
         quality_check_every=None,
         quality_check_repair=True,
@@ -9469,6 +9757,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             ],
                             "random_initialization": random_initialization,
                             "target_strategy": active_target_strategy,
+                            "fit_overlap_diagnostics": bool(
+                                fit_overlap_diagnostics
+                            ),
                             # Filled only after FIT succeeds.  This is a
                             # target-overlap diagnostic, not norm survival.
                             "fit_overlap_fidelity": None,
@@ -9556,13 +9847,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             )
                         fit_overlap = (
                             {}
-                            if self.mode == "mix"
+                            if self.mode == "mix" or not fit_overlap_diagnostics
                             else self._fit_overlap_diagnostics(p_g, fit.p)
                         )
                         self._last_dmrg_fit_diagnostics.update(
                             {
                                 "backend": "fit",
                                 "fallback": False,
+                                "fit_overlap_diagnostics": bool(
+                                    fit_overlap_diagnostics
+                                ),
                                 **fit_overlap,
                             }
                         )
@@ -9739,6 +10033,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             ],
                             "random_initialization": random_initialization,
                             "target_strategy": fit_target_strategy,
+                            "fit_overlap_diagnostics": bool(
+                                fit_overlap_diagnostics
+                            ),
                             # Filled only after FIT succeeds.  This is a
                             # target-overlap diagnostic, not norm survival.
                             "fit_overlap_fidelity": None,
@@ -9826,13 +10123,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             )
                         fit_overlap = (
                             {}
-                            if self.mode == "mix"
+                            if self.mode == "mix" or not fit_overlap_diagnostics
                             else self._fit_overlap_diagnostics(p_g, fit.p)
                         )
                         self._last_dmrg_fit_diagnostics.update(
                             {
                                 "backend": "fit",
                                 "fallback": False,
+                                "fit_overlap_diagnostics": bool(
+                                    fit_overlap_diagnostics
+                                ),
                                 **fit_overlap,
                             }
                         )

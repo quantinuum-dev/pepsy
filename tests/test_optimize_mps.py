@@ -546,6 +546,28 @@ def test_mps_optimizer_fit_overlap_diagnostic_failure_is_nonfatal(monkeypatch):
     assert "diagnostic unavailable" in result["fit_overlap_error"]
 
 
+def test_mps_optimizer_fit_overlap_diagnostics_are_opt_in(monkeypatch):
+    """The expensive FIT-target overlap contraction is disabled by default."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("FIT overlap diagnostics should be opt-in")
+
+    monkeypatch.setattr(mps_optimizer_module, "tn_fidelity", fail)
+    optimizer.run(progbar=False, n_iter=2, fit_rtol=None)
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_overlap_diagnostics"] is False
+    assert diagnostics["fit_overlap_fidelity"] is None
+    assert diagnostics["fit_overlap_infidelity"] is None
+    assert diagnostics["fit_overlap_error"] is None
+
+
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd", "dmrg", "mix"])
 def test_mps_optimizer_modes_skip_clocks_when_timing_disabled(
     monkeypatch,
@@ -3207,6 +3229,7 @@ def test_new_fit_configuration_is_keyword_only():
     assert run_parameters["cutoff_mode"].default == "auto"
     assert run_parameters["fit_rtol"].default == "auto"
     assert run_parameters["quality_check_every"].default is False
+    assert run_parameters["fit_overlap_diagnostics"].default is False
     for name in (
         "fit_min_iter",
         "fit_rtol",
@@ -3220,6 +3243,7 @@ def test_new_fit_configuration_is_keyword_only():
         "target_cutoff",
         "fit_target_strategy",
         "fit_single_pair_fast_path",
+        "fit_overlap_diagnostics",
         "stabilize_unitary",
         "fit_stabilize_unitary",
         "timing",
@@ -5971,6 +5995,78 @@ def test_mps_optimizer_accepts_bundled_gate_stream():
     assert opt.where == [(1,), (0, 3)]
 
 
+def test_mps_optimizer_accepts_stabilizer_style_symbolic_gate_stream():
+    """Named entries should resolve to the same matrices as Pepsy primitives."""
+    theta = 0.19
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[("H", 0), ("rzz", theta, 0, 1)],
+        chi=4,
+        mode="svd",
+    )
+
+    assert opt.where == [(0,), (0, 1)]
+    assert opt.G[0].shape == (2, 2)
+    assert opt.G[1].shape == (2, 2, 2, 2)
+
+    expected = p0.copy()
+    expected.gate_(py.h(), 0, contract=True)
+    expected.gate_(py.rzz(theta), (0, 1), contract="split", cutoff=0.0)
+    opt.run(progbar=False, cutoff=1.0e-12)
+
+    np.testing.assert_allclose(
+        np.asarray(opt.p.to_dense()).reshape(-1),
+        np.asarray(expected.to_dense()).reshape(-1),
+        atol=1.0e-10,
+    )
+
+
+def test_mps_optimizer_symbolic_gate_stream_uses_explicit_to_backend():
+    """Named gates should be converted before strict backend validation."""
+    torch = pytest.importorskip("torch")
+
+    backend = py.backend_torch(dtype=torch.complex64, device="cpu")
+    p0 = qtn.MPS_computational_state("000", dtype="complex64")
+    p0.apply_to_arrays(backend)
+    converted = []
+
+    def to_backend(array):
+        converted.append(array)
+        return backend(np.array(array, copy=True))
+
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[("H", 0), ("rzz", 0.19, 0, 1)],
+        chi=4,
+        mode="svd",
+        to_backend=to_backend,
+    )
+
+    assert len(converted) == 2
+    assert all(isinstance(gate, torch.Tensor) for gate in opt.G)
+    assert all(gate.dtype == torch.complex64 for gate in opt.G)
+    opt.run(progbar=False, cutoff=1.0e-7)
+    assert opt.backend_info()["backend"] == "torch"
+
+
+def test_mps_optimizer_symbolic_set_and_add_gates_resolve():
+    """Queue mutation should use the same symbolic resolver as construction."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=4,
+        mode="svd",
+    )
+
+    opt.set_gates([("H", 0)])
+    opt.add_gates([("rzz", 0.2, 0, 1)])
+
+    assert len(opt.G) == 2
+    assert all(isinstance(gate, np.ndarray) for gate in opt.G)
+    opt.run(progbar=False, cutoff=1.0e-12)
+
+
 def test_mps_optimizer_compiles_gate_stream_once(monkeypatch):
     """Repeated replay reuses compiled stream metadata."""
     calls = []
@@ -6646,6 +6742,7 @@ def test_mps_optimizer_dmrg_mode_applies_submpo_as_layered_fit_target():
         cutoff=1.0e-12,
         non_unitary=True,
         normalize_final=False,
+        fit_overlap_diagnostics=True,
     )
     vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
     expected = np.zeros(16, dtype=np.complex128)
@@ -8320,6 +8417,7 @@ def test_mps_norm_names_and_dmrg_target_overlap_are_distinct():
         cutoff=0.0,
         n_iter=3,
         stabilize_unitary=True,
+        fit_overlap_diagnostics=True,
     )
 
     diagnostics = opt.norm_diagnostics()
