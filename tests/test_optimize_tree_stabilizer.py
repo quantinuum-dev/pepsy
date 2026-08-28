@@ -779,6 +779,30 @@ def test_tree_stab_measure_disentangle_alias():
     )
 
 
+def test_tree_stab_measure_many_uses_adaptive_tree_span_order():
+    opt = pepsy.TreeStabOptimizer(4).apply([("cnot", 0, 3)])
+
+    outcomes = opt.measure_many(
+        [("Z", 3, +1), ("Z", 1, +1)],
+    )
+
+    assert outcomes == (+1, +1)
+    assert [event["qubit"] for event in opt.last_measurement_schedule] == [1, 3]
+    assert opt.last_measurement_schedule[0]["span"] == 0
+    assert opt.last_measurement_schedule[1]["span"] > 0
+    assert [record.where[0] for record in opt.measurements] == [1, 3]
+
+
+def test_tree_stab_measure_many_accepts_input_or_target_order_override():
+    opt = pepsy.TreeStabOptimizer(3)
+    opt.measure_many([("Z", 1, +1), ("X", 2, +1)], order="input")
+    assert [event["qubit"] for event in opt.last_measurement_schedule] == [1, 2]
+
+    opt = pepsy.TreeStabOptimizer(3)
+    opt.measure_many([("Z", 1, +1), ("X", 2, +1)], order=[2, 1])
+    assert [event["qubit"] for event in opt.last_measurement_schedule] == [2, 1]
+
+
 def test_tree_stab_basis_updating_measurement_handles_tree_support_order():
     opt = pepsy.TreeStabOptimizer(5)
     opt.apply([("h", 0), ("cnot", 0, 4), ("h", 2), ("cnot", 2, 3)])
@@ -817,6 +841,15 @@ def test_tree_stab_reset_and_measure_reset_recycle_targets():
     assert measured == +1
     _assert_same_state(opt.to_statevector(), np.array([1.0, 0.0, 0.0, 0.0]))
     assert opt.p.max_bond() == 1
+
+
+def test_tree_stab_reset_many_uses_tree_span_order_without_readout_records():
+    opt = pepsy.TreeStabOptimizer(4).apply([("cnot", 0, 3)])
+
+    opt.reset_many((3, 1))
+
+    assert [event["qubit"] for event in opt.last_measurement_schedule] == [1, 3]
+    assert opt.measurements == []
 
 
 def test_tree_stab_basis_update_stream_events_are_supported():

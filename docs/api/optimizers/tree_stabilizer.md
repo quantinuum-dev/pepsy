@@ -66,6 +66,7 @@ The first milestone supports:
   tree-isolated product-stabilizer pivot exists;
 - explicit, caller-scheduled greedy two-qubit Clifford disentangling over
   selected logical qubit pairs;
+- metadata-only tree-span scheduling for independent measurement/reset batches;
 - dynamic frame-layout planning from the queued ``C† P C`` supports;
 - conditional/batched product-Pauli sampling without a ``2**n`` statevector;
 - ``chi=None`` for exact evolution up to the requested singular-value cutoff;
@@ -124,6 +125,18 @@ tree-distance order. The 20 two-qubit Clifford classes are scored by the
 aggregate numerical rank and entropy of the affected tree-geodesic edges.
 Accepted moves apply `D` to `|p>` and absorb `D†` into the tableau, preserving
 the represented physical state while reducing coefficient-tree entanglement.
+
+`measure_many([("Z", 1), ("X", 2)])` and `reset_many((1, 2))` use
+`order="min_span"` by default. The scheduler reads each observable's current
+`C† O C` support and scores its minimal TreePlan Steiner subtree, with the
+tree-geodesic localizer cost as a tie-breaker. It executes the selected
+operation once, then recomputes the remaining metadata costs; it never runs
+trial TreeMPO contractions or truncations merely to choose an order. Results
+from `measure_many` and `measure_reset` remain aligned with the supplied input
+order, while `last_measurement_schedule` exposes the chronological order and
+costs. Use `order="input"` or an explicit permutation to override it. A joint
+multi-qubit `measure(...)` remains one indivisible operation.
+
 Constructive exact cooling is enabled by default for multi-site Pauli rotations: it chooses a
 tree-distance-aware product-stabilizer pivot, applies one local coefficient
 rotation, and absorbs the controlled-Pauli remainder into the tableau. Set
