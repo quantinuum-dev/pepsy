@@ -88,6 +88,40 @@ def _normalize_sites(where):
     return sites
 
 
+def _normalize_measurement_order(order, *, count, targets=None):
+    """Normalize a batch measurement order without touching the tree."""
+    if isinstance(order, str) or order is None:
+        key = "min_span" if order is None else _normalize_name(order)
+        if key in {"auto", "span", "min_span", "shortest"}:
+            return "min_span"
+        if key in {"input", "given", "original"}:
+            return "input"
+        raise ValueError(
+            "measurement order must be 'min_span', 'input', or an explicit "
+            "permutation of the batch entries."
+        )
+    try:
+        requested = tuple(int(index) for index in order)
+    except TypeError as exc:
+        raise TypeError(
+            "measurement order must be a supported string or an entry permutation."
+        ) from exc
+    if len(requested) != int(count) or len(set(requested)) != int(count):
+        raise ValueError(
+            "an explicit measurement order must be a permutation of the batch."
+        )
+    if set(requested) == set(range(int(count))):
+        return requested
+    if targets is not None and len(set(targets)) == int(count):
+        target_to_index = {int(target): index for index, target in enumerate(targets)}
+        if set(requested) == set(target_to_index):
+            return tuple(target_to_index[target] for target in requested)
+    raise ValueError(
+        "an explicit measurement order must contain batch indices or each "
+        "target qubit exactly once."
+    )
+
+
 def _normalize_axes(pauli, where, *, allow_identity=False):
     axes = [axis for axis in str(pauli).upper() if not axis.isspace()]
     if len(axes) != len(where):
@@ -908,6 +942,7 @@ class TreeStabOptimizer:
         self._queue = list(stream_plan.entries)
         self._rng = np.random.default_rng(seed)
         self.measurements = []
+        self.last_measurement_schedule = ()
         self.bond_history = [self._tree.tn.max_bond()]
         self.projection_diagnostics = self._tree.projection_diagnostics
         self._clifford_rotation_cache = {}
@@ -3561,6 +3596,213 @@ class TreeStabOptimizer:
             return measured, float(probability), diagnostics
         return measured, float(probability)
 
+    @staticmethod
+    def _normalize_measurement_batch(measurements):
+        """Normalize independent single-qubit measurements for scheduling."""
+        if isinstance(measurements, (str, bytes)):
+            raise TypeError(
+                "measure_many expects an iterable of (pauli, qubit[, outcome]) "
+                "entries."
+            )
+        try:
+            entries = tuple(measurements)
+        except TypeError as exc:
+            raise TypeError(
+                "measure_many expects an iterable of measurement entries."
+            ) from exc
+
+        operations = []
+        targets = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError(
+                    "measure_many entries must be (pauli, qubit) or "
+                    f"(pauli, qubit, outcome), got entry {index}: {entry!r}."
+                )
+            pauli, where = entry[:2]
+            sites = _normalize_sites(where)
+            if len(sites) != 1:
+                raise ValueError(
+                    "measure_many only schedules independent single-qubit "
+                    f"measurements, got where={where!r}."
+                )
+            (axis,) = _normalize_axes(pauli, sites, allow_identity=False)
+            outcome = entry[2] if len(entry) == 3 else None
+            if outcome is not None:
+                if (
+                    isinstance(outcome, (bool, np.bool_))
+                    or not isinstance(outcome, Integral)
+                    or int(outcome) not in (-1, 1)
+                ):
+                    raise ValueError(
+                        "measure_many outcomes must be exactly +1 or -1."
+                    )
+                outcome = int(outcome)
+            operations.append((axis, sites[0], outcome))
+            targets.append(sites[0])
+
+        if len(set(targets)) != len(targets):
+            raise ValueError(
+                "measure_many requires distinct target qubits so operations can "
+                "be safely reordered."
+            )
+        return tuple(operations)
+
+    def _measurement_span_info(self, axis, qubit, *, absorb_basis):
+        """Return cheap frame/tree-geodesic costs for one candidate."""
+        terms, _sign = self._frame_terms(axis, (qubit,), allow_identity=True)
+        frame_support = tuple(sorted(terms))
+        if not frame_support:
+            return {
+                "frame_support": frame_support,
+                "tree_support": (),
+                "span": 0,
+                "localizer_distance": 0,
+                "pivot": None,
+            }
+
+        tree_support = tuple(
+            int(self.plan.node_of_qubit[site]) for site in frame_support
+        )
+        span = int(len(self.tn.subtree_span(tree_support)) - 1)
+        pivot = min(
+            frame_support,
+            key=lambda site: (
+                sum(self.plan.tree_distance(site, other) for other in frame_support),
+                site,
+            ),
+        )
+        localizer_distance = int(
+            sum(self.plan.tree_distance(site, pivot) for site in frame_support)
+        )
+        return {
+            "frame_support": frame_support,
+            "tree_support": tree_support,
+            "span": span,
+            "localizer_distance": (
+                localizer_distance if absorb_basis else 0
+            ),
+            "pivot": int(pivot),
+        }
+
+    def _run_measurement_batch(
+        self,
+        operations,
+        *,
+        order,
+        absorb_basis,
+        reset=False,
+        reset_after=False,
+    ):
+        """Run a batch using a metadata-only, adaptive tree-span schedule."""
+        if reset and reset_after:
+            raise ValueError("reset and reset_after are mutually exclusive.")
+        operations = tuple(operations)
+        targets = tuple(operation[1] for operation in operations)
+        normalized_order = _normalize_measurement_order(
+            order,
+            count=len(operations),
+            targets=targets,
+        )
+        remaining = list(range(len(operations)))
+        result = [None] * len(operations)
+        schedule = []
+
+        for step in range(len(operations)):
+            if normalized_order == "input":
+                input_index = remaining.pop(0)
+            elif normalized_order == "min_span":
+                candidate_info = {
+                    index: self._measurement_span_info(
+                        operations[index][0],
+                        operations[index][1],
+                        absorb_basis=absorb_basis,
+                    )
+                    for index in remaining
+                }
+                input_index = min(
+                    remaining,
+                    key=lambda index: (
+                        candidate_info[index]["span"],
+                        candidate_info[index]["localizer_distance"],
+                        len(candidate_info[index]["frame_support"]),
+                        index,
+                    ),
+                )
+                remaining.remove(input_index)
+            else:
+                rank = {
+                    index: position
+                    for position, index in enumerate(normalized_order)
+                }
+                input_index = min(remaining, key=rank.__getitem__)
+                remaining.remove(input_index)
+
+            axis, qubit, forced = operations[input_index]
+            info = (
+                candidate_info[input_index]
+                if normalized_order == "min_span"
+                else self._measurement_span_info(
+                    axis,
+                    qubit,
+                    absorb_basis=absorb_basis,
+                )
+            )
+            if reset:
+                physical = pauli_string((axis,), (qubit,), self.n)
+                outcome = self._absorb_measure(
+                    self.state.frame_pauli(physical)
+                )[0]
+            else:
+                outcome = self.measure(
+                    axis,
+                    qubit,
+                    outcome=forced,
+                    absorb_basis=absorb_basis,
+                )
+            if (reset or reset_after) and outcome < 0:
+                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+            result[input_index] = int(outcome)
+            schedule.append({
+                "order": int(step),
+                "input_index": int(input_index),
+                "pauli": str(axis),
+                "qubit": int(qubit),
+                **info,
+            })
+
+        self.last_measurement_schedule = tuple(schedule)
+        return tuple(result)
+
+    def measure_many(
+        self,
+        measurements,
+        *,
+        order="min_span",
+        absorb_basis=None,
+        disentangle=None,
+    ):
+        """Measure independent single-qubit observables in tree-span order.
+
+        ``order="min_span"`` reads current Tableau supports and the fixed
+        TreePlan only. It never runs trial TreeMPO contractions, canonicalizes
+        trial states, or truncates while selecting the next measurement.
+        Outcomes are returned in input order; the chronological execution
+        details are available in :attr:`last_measurement_schedule`.
+        """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
+        operations = self._normalize_measurement_batch(measurements)
+        result = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=absorb_basis,
+        )
+        return result[0] if len(result) == 1 else result
+
     def measure(
         self,
         pauli,
@@ -3633,23 +3875,35 @@ class TreeStabOptimizer:
             return diagnostics
         return self
 
-    def reset(self, where, basis="Z"):
+    def reset(self, where, basis="Z", *, order="min_span"):
         """Reset target qubits to the positive eigenstate of ``basis``.
 
         Each target uses basis-updating measurement so that it leaves the
         coefficient TTN disentangled. A physical anticommuting Clifford then
         flips a ``-1`` outcome into the requested ``+1`` eigenstate.
+        Separate targets are processed with the metadata-only tree-span
+        scheduler by default; use ``order="input"`` to preserve their
+        supplied order.
         """
         where = _normalize_sites(where)
         axes = _normalize_basis_axes(basis, where, event="reset")
-        for axis, q in zip(axes, where):
-            physical = pauli_string((axis,), (q,), self.n)
-            measured, _probability, _diagnostics = self._absorb_measure(
-                self.state.frame_pauli(physical)
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "reset requires distinct target qubits so they can be safely "
+                "reordered."
             )
-            if measured < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
+        operations = tuple((axis, q, None) for axis, q in zip(axes, where))
+        self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=True,
+            reset=True,
+        )
         return self
+
+    def reset_many(self, where, basis="Z", *, order="min_span"):
+        """Reset several independent qubits using the tree-span scheduler."""
+        return self.reset(where, basis=basis, order=order)
 
     def measure_reset(
         self,
@@ -3659,8 +3913,14 @@ class TreeStabOptimizer:
         outcome=None,
         absorb_basis=None,
         disentangle=None,
+        order="min_span",
     ):
-        """Measure targets and then reset them to the positive basis state."""
+        """Measure targets and then reset them to the positive basis state.
+
+        Separate targets are processed with the metadata-only tree-span
+        scheduler by default; returned outcomes remain aligned with the input
+        target order. Use ``order="input"`` to preserve the supplied order.
+        """
         absorb_basis = _resolve_measurement_disentangle(
             absorb_basis,
             disentangle,
@@ -3669,18 +3929,22 @@ class TreeStabOptimizer:
         where = _normalize_sites(where)
         axes = _normalize_basis_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
-        measured = []
-        for axis, q, forced in zip(axes, where, outcomes):
-            value = self.measure(
-                axis,
-                q,
-                outcome=forced,
-                absorb_basis=bool(absorb_basis),
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "measure_reset requires distinct target qubits so they can be "
+                "safely reordered."
             )
-            if value < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
-            measured.append(value)
-        return measured[0] if len(measured) == 1 else tuple(measured)
+        operations = tuple(
+            (axis, q, forced)
+            for axis, q, forced in zip(axes, where, outcomes)
+        )
+        measured = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=bool(absorb_basis),
+            reset_after=True,
+        )
+        return measured[0] if len(measured) == 1 else measured
 
     def sample(self, pauli, where=None, *, shots=1, seed=None):
         """Draw Pauli outcomes without collapsing the coefficient state."""
@@ -4461,6 +4725,7 @@ class TreeStabOptimizer:
         other._rng = np.random.default_rng()
         other._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         other.measurements = list(self.measurements)
+        other.last_measurement_schedule = deepcopy(self.last_measurement_schedule)
         other.bond_history = list(self.bond_history)
         other.projection_diagnostics = other._tree.projection_diagnostics
         other.norm_events = other._tree.norm_events
