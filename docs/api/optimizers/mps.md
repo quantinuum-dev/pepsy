@@ -449,9 +449,11 @@ from FIT's initial state. For a two- or three-site growth window,
 MPS, `random` adds deterministic small noise without changing ranks,
 `random_expand` adds noise while opening only under-capacity active bonds, and
 `guess-<method>` uses an isolated Quimb replay with the selected compression
-method. `fit_init_rand_strength` controls the random scale (default `1e-1`),
+method. `fit_init_rand_strength` controls the random scale (default `0.0`),
 and `fit_init_seed` controls reproducibility, including randomized Quimb
-methods selected through `guess-<method>`.
+methods selected through `guess-<method>`. Because the default is
+`fit_init_strategy="guess-src"`, no random perturbation or random bond
+expansion is used unless a random strategy is selected explicitly.
 FIT never copies the target into `fit.p` and never uses a target warm start.
 Native nonlocal gates retain their graded auto-swap/sector-growth preparation
 and never receive dense random padding.

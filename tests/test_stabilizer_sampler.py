@@ -206,6 +206,15 @@ def test_mps_stab_sampler_records_absorbed_localizer_events():
     assert all(record["projector_infidelity"] is not None for record in first_readout)
 
 
+def test_mps_stab_sampler_disentangle_alias():
+    optimizer = pepsy.MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
+    sampler = pepsy.MpsStabSampler(optimizer, disentangle=True)
+
+    assert sampler.disentangle is True
+    assert sampler.absorb_basis is True
+    assert sampler.resolved_strategy == "frame_pauli_absorb"
+
+
 def test_mps_stab_sampler_absorption_falls_back_if_localizer_zeroes_a_branch():
     # With a deliberately tiny chi, the approximate localizing CNOT can
     # remove a branch that had nonzero pre-localizer Born probability.

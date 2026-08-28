@@ -742,6 +742,7 @@ def test_mps_optimizer_fit_initial_guess_strategy_is_diagnostic(strategy):
         cutoff=1.0e-12,
         fit_rtol=None,
         fit_init_strategy=strategy,
+        fit_init_rand_strength=1.0e-2,
         stabilize_unitary=False,
     )
 
@@ -3230,6 +3231,7 @@ def test_new_fit_configuration_is_keyword_only():
     assert run_parameters["fit_rtol"].default == "auto"
     assert run_parameters["quality_check_every"].default is False
     assert run_parameters["fit_overlap_diagnostics"].default is False
+    assert run_parameters["fit_init_rand_strength"].default == 0.0
     for name in (
         "fit_min_iter",
         "fit_rtol",

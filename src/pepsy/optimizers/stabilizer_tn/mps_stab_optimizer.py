@@ -93,7 +93,11 @@ from .operators import (
     single_qubit_rotation_matrix,
 )
 from .dense import _as_gate_matrix, _is_unitary, _tableau_from_exact_unitary
-from .paulis import hermitian_pauli_terms, pauli_string
+from .paulis import (
+    _resolve_measurement_disentangle,
+    hermitian_pauli_terms,
+    pauli_string,
+)
 from .records import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -207,6 +211,40 @@ def _normalize_sites(where):
     return sites
 
 
+def _normalize_measurement_order(order, *, count, targets=None):
+    """Normalize a batch measurement order without touching the MPS."""
+    if isinstance(order, str) or order is None:
+        key = "min_span" if order is None else _normalize_event_name(order)
+        if key in {"auto", "span", "min_span", "shortest"}:
+            return "min_span"
+        if key in {"input", "given", "original"}:
+            return "input"
+        raise ValueError(
+            "measurement order must be 'min_span', 'input', or an explicit "
+            "permutation of the batch entries."
+        )
+    try:
+        requested = tuple(int(index) for index in order)
+    except TypeError as exc:
+        raise TypeError(
+            "measurement order must be a supported string or an entry permutation."
+        ) from exc
+    if len(requested) != int(count) or len(set(requested)) != int(count):
+        raise ValueError(
+            "an explicit measurement order must be a permutation of the batch."
+        )
+    if set(requested) == set(range(int(count))):
+        return requested
+    if targets is not None and len(set(targets)) == int(count):
+        target_to_index = {int(target): index for index, target in enumerate(targets)}
+        if set(requested) == set(target_to_index):
+            return tuple(target_to_index[target] for target in requested)
+    raise ValueError(
+        "an explicit measurement order must contain batch indices or each "
+        "target qubit exactly once."
+    )
+
+
 def _unique_ordered(items):
     """Return items with duplicates removed while preserving first occurrence."""
     seen = set()
@@ -226,6 +264,74 @@ def _layout_angle_weight(theta):
     except (TypeError, ValueError):
         return 1.0
     return min(1.0, max(0.0, angle)) if np.isfinite(angle) else 1.0
+
+
+def _operator_schmidt_tail_weight(theta):
+    """Return the non-leading Schmidt-weight fraction of a Pauli rotation.
+
+    A Pauli rotation has two operator-Schmidt branches, ``I`` and ``P``.
+    The returned value is zero for a product operator and reaches one half
+    for the maximally balanced two-branch case.  The layout event keeps a
+    unit baseline separately so weak rotations still contribute locality
+    pressure while strongly operator-entangling rotations receive priority.
+    """
+    try:
+        theta = float(theta)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(theta):
+        return 0.0
+    weights = np.asarray(
+        [np.cos(theta / 2.0) ** 2, np.sin(theta / 2.0) ** 2],
+        dtype=float,
+    )
+    total = float(weights.sum())
+    if total <= 0.0:
+        return 0.0
+    return float((total - weights.max()) / total)
+
+
+def _dense_operator_schmidt_layout_weight(gate, n_qubits):
+    """Return a baseline-plus-tail weight for a small dense operator.
+
+    The two-qubit case is evaluated exactly from the operator-Schmidt
+    singular values. Wider matrices retain the unit baseline and are handled
+    by their frame supports, avoiding a potentially large dense reshape in
+    the static layout pre-pass.
+    """
+    if int(n_qubits) != 2:
+        return 1.0
+    try:
+        array = np.asarray(ar.to_numpy(gate))
+        if array.shape != (4, 4):
+            return 1.0
+        reshaped = array.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3)
+        singular_values = np.linalg.svd(
+            reshaped.reshape(4, 4),
+            compute_uv=False,
+        )
+        weights = np.abs(singular_values) ** 2
+        total = float(weights.sum())
+        if total <= 0.0:
+            return 1.0
+        tail = (total - float(weights.max())) / total
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        return 1.0
+    return 1.0 + float(tail)
+
+
+def _submpo_operator_layout_weight(mpo):
+    """Return an MPO-bond-rank proxy for a coefficient-frame sub-MPO."""
+    try:
+        max_bond = int(mpo.max_bond())
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+    if max_bond < 1:
+        return 1.0
+    # A bond-two Pauli-rotation MPO has one unit of operator cut load. Wider
+    # MPOs receive proportionally more priority in the weighted interaction
+    # graph, while rank-one operators retain the locality baseline.
+    return max(1.0, float(np.log2(max_bond)))
 
 
 def _is_axis_string(value):
@@ -307,7 +413,7 @@ def _parse_measure_reset_args(params, *, default_axis=None):
         basis = params[0]
         where = _normalize_sites(params[1])
         outcome = params[2] if len(params) > 2 else None
-        absorb = bool(params[3]) if len(params) > 3 else True
+        absorb = bool(params[3]) if len(params) > 3 else False
         if len(params) > 4:
             raise ValueError('"measure_reset" accepts at most four arguments.')
     else:
@@ -749,6 +855,7 @@ class MpsStabOptimizer:
         self._logical_to_mps = {q: q for q in self.logical_order}
         self.layout_plan = None
         self.last_layout_plan = None
+        self.last_measurement_schedule = ()
 
         self.to_backend = to_backend
         self._explicit_backend_converter = to_backend
@@ -1132,9 +1239,17 @@ class MpsStabOptimizer:
         return is_submpo_event(entry)
 
     @staticmethod
-    def measure_event(pauli, where, outcome=None, absorb_basis=None):
+    def measure_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
         """Build a canonical Pauli-measurement event shared with MPS."""
         where = _normalize_sites(where)
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=False,
+            )
         entry = ("measure", str(pauli), where)
         if absorb_basis is None:
             if outcome is not None:
@@ -1166,11 +1281,19 @@ class MpsStabOptimizer:
         return ("reset", where, "".join(axes))
 
     @staticmethod
-    def measure_reset_event(pauli, where, outcome=None, absorb_basis=None):
+    def measure_reset_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
         """Build a canonical measure-then-reset event."""
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=False,
+            )
         entry = ("measure_reset", "".join(axes), where)
         value = None if outcome is None else (
             outcomes[0] if len(outcomes) == 1 else outcomes
@@ -2095,15 +2218,23 @@ class MpsStabOptimizer:
         nevergrad_optimizer="OnePlusOne",
         kahypar_config_path=None,
         kahypar_seed=0,
-        weight_mode="count",
+        weight_mode="operator_schmidt",
     ):
         """Find a static MPS order from the queued STN frame supports.
 
         The pre-pass replays only tableau-changing events on a temporary copy.
         Each expensive coefficient-frame event contributes the support of its
-        current ``C^dagger O C`` image.  The returned plan is a Pepsy-style
-        layout plan whose ``site_order`` maps MPS positions to logical
-        coefficient qubits.  It does not mutate the simulator.
+        current ``C^dagger O C`` image.  By default, multi-site events are
+        weighted by a baseline locality cost plus an operator-Schmidt
+        entanglement proxy, so stronger two-branch rotations and wider
+        coefficient-frame operators receive more layout priority.  The
+        returned plan is a Pepsy-style layout plan whose ``site_order`` maps
+        MPS positions to logical coefficient qubits.  It does not mutate the
+        simulator.
+
+        ``weight_mode`` accepts ``"operator_schmidt"`` (the default),
+        ``"count"`` for the historical uniform weighting, and ``"angle"`` /
+        ``"auto"`` for angle-based weighting.
         """
         records = self._frame_layout_records(
             self._queue,
@@ -2143,14 +2274,15 @@ class MpsStabOptimizer:
 
     find_frame_layout = current_frame_layout
 
-    def _frame_layout_records(self, entries, *, weight_mode="count"):
+    def _frame_layout_records(self, entries, *, weight_mode="operator_schmidt"):
         """Return weighted logical frame-support records for a stream."""
         mode = str(weight_mode).replace("-", "_").strip().lower()
         if mode in ("unit", "uniform", "none"):
             mode = "count"
-        if mode not in ("count", "angle", "auto"):
+        if mode not in ("count", "angle", "auto", "operator_schmidt"):
             raise ValueError(
-                "STN frame layout weight_mode must be 'count', 'angle', or 'auto'."
+                "STN frame layout weight_mode must be 'operator_schmidt', "
+                "'count', 'angle', or 'auto'."
             )
         dry = self.copy()
         dry._queue = []
@@ -2159,8 +2291,37 @@ class MpsStabOptimizer:
             dry._frame_layout_trace_entry(entry, records, weight_mode=mode)
         return tuple(records)
 
-    def _frame_layout_weight(self, *, weight_mode, theta=None, coeff=None):
+    def _frame_layout_weight(
+        self,
+        *,
+        weight_mode,
+        theta=None,
+        coeff=None,
+        support_size=None,
+        operator_weight=None,
+    ):
         """Return the scalar weight used for one frame-layout record."""
+        if weight_mode == "operator_schmidt":
+            if operator_weight is not None:
+                amplitude = 1.0
+                if coeff is not None:
+                    try:
+                        amplitude = max(abs(complex(coeff)), 1.0e-12)
+                    except (TypeError, ValueError):
+                        amplitude = 1.0
+                return max(1.0e-12, float(operator_weight) * amplitude)
+            if theta is not None:
+                if support_size is not None and int(support_size) < 2:
+                    return 1.0
+                # Keep a unit locality baseline and add the non-leading
+                # operator-Schmidt weight of the I/P rotation branches.
+                return 1.0 + _operator_schmidt_tail_weight(theta)
+            if coeff is not None:
+                try:
+                    return max(abs(complex(coeff)), 1.0e-12)
+                except (TypeError, ValueError):
+                    return 1.0
+            return 1.0
         if coeff is not None:
             try:
                 return float(abs(complex(coeff)))
@@ -2192,12 +2353,14 @@ class MpsStabOptimizer:
                 weight = self._frame_layout_weight(
                     weight_mode=weight_mode,
                     theta=theta,
+                    support_size=len(support),
                 )
             records.append({
                 "kind": kind,
                 "entry": entry,
                 "support": support,
                 "weight": float(weight),
+                "operator_weight": float(weight),
                 "absorbs_basis": bool(absorb_basis),
             })
         if absorb_basis and support:
@@ -2219,14 +2382,17 @@ class MpsStabOptimizer:
         terms, _sign = hermitian_pauli_terms(m_pauli)
         support = tuple(sorted(terms))
         if support:
+            weight = self._frame_layout_weight(
+                weight_mode=weight_mode,
+                theta=theta,
+                support_size=len(support),
+            )
             records.append({
                 "kind": "rotation",
                 "entry": entry,
                 "support": support,
-                "weight": self._frame_layout_weight(
-                    weight_mode=weight_mode,
-                    theta=theta,
-                ),
+                "weight": float(weight),
+                "operator_weight": float(weight),
                 "absorbs_basis": False,
             })
 
@@ -2240,6 +2406,12 @@ class MpsStabOptimizer:
             raise ValueError(f"Gate matrix must be square 2^k x 2^k, got {gate.shape}.")
         if len(where) != nq:
             raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
+
+        dense_operator_weight = (
+            _dense_operator_schmidt_layout_weight(gate, nq)
+            if weight_mode == "operator_schmidt"
+            else None
+        )
 
         tableau = _tableau_from_exact_unitary(gate)
         gate_is_unitary = _is_unitary(gate)
@@ -2283,13 +2455,20 @@ class MpsStabOptimizer:
             frame_terms, _sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
             support = tuple(sorted(frame_terms))
             if support:
+                weight = self._frame_layout_weight(
+                    weight_mode=weight_mode,
+                    coeff=coeff,
+                    operator_weight=dense_operator_weight,
+                )
                 records.append({
                     "kind": "matrix_branch",
                     "entry": entry,
                     "support": support,
-                    "weight": self._frame_layout_weight(
-                        weight_mode=weight_mode,
-                        coeff=coeff,
+                    "weight": float(weight),
+                    "operator_weight": (
+                        float(dense_operator_weight)
+                        if dense_operator_weight is not None
+                        else float(weight)
                     ),
                     "absorbs_basis": False,
                 })
@@ -2305,14 +2484,20 @@ class MpsStabOptimizer:
             )
         parts = submpo_event_parts(entry, normalize_where=True)
         if parts is not None:
-            _mpo, where = parts
+            mpo, where = parts
             support = tuple(sorted(_unique_ordered(where)))
             if support:
+                weight = (
+                    _submpo_operator_layout_weight(mpo)
+                    if weight_mode == "operator_schmidt"
+                    else 1.0
+                )
                 records.append({
                     "kind": "submpo",
                     "entry": entry,
                     "support": support,
-                    "weight": 1.0,
+                    "weight": float(weight),
+                    "operator_weight": float(weight),
                     "absorbs_basis": False,
                 })
             return
@@ -4118,6 +4303,7 @@ class MpsStabOptimizer:
         copied._refresh_layout_map()
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
+        copied.last_measurement_schedule = deepcopy(self.last_measurement_schedule)
         copied._last_fit_diagnostics = deepcopy(self._last_fit_diagnostics)
         copied._dmrg1_one_site_locked = bool(self._dmrg1_one_site_locked)
         copied._initial_state = copied.state.copy()
@@ -4601,12 +4787,17 @@ class MpsStabOptimizer:
         shuffle: bool = True,
         packed: bool = False,
         basis="Z",
-        absorb_basis: bool = False,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ) -> np.ndarray:
         """Compatibility delegate to :class:`pepsy.MpsStabSampler`."""
         from ...sampling.stabilizer import MpsStabSampler
 
-        return MpsStabSampler(self, absorb_basis=absorb_basis).sample_bits(
+        return MpsStabSampler(
+            self,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        ).sample_bits(
             shots,
             seed=seed,
             order=order,
@@ -4628,7 +4819,8 @@ class MpsStabOptimizer:
         shuffle: bool = True,
         packed: bool = False,
         basis="Z",
-        absorb_basis: bool = False,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ) -> np.ndarray:
         """Compatibility alias for :meth:`sample_bits`."""
         return self.sample_bits(
@@ -4639,15 +4831,27 @@ class MpsStabOptimizer:
             packed=packed,
             basis=basis,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
         )
 
     def probability_bits(
-        self, bits, *, order=None, basis="Z", seed=None, absorb_basis=False
+        self,
+        bits,
+        *,
+        order=None,
+        basis="Z",
+        seed=None,
+        absorb_basis=None,
+        disentangle=None,
     ) -> float:
         """Compatibility delegate for one product-basis probability."""
         from ...sampling.stabilizer import MpsStabSampler
 
-        return MpsStabSampler(self, absorb_basis=absorb_basis).probability_bits(
+        return MpsStabSampler(
+            self,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        ).probability_bits(
             bits,
             order=order,
             basis=basis,
@@ -4661,7 +4865,8 @@ class MpsStabOptimizer:
         order=None,
         basis="Z",
         seed=None,
-        absorb_basis=False,
+        absorb_basis=None,
+        disentangle=None,
     ) -> np.ndarray:
         """Compatibility delegate for many product-basis probabilities."""
         from ...sampling.stabilizer import MpsStabSampler
@@ -4669,6 +4874,7 @@ class MpsStabOptimizer:
         return MpsStabSampler(
             self,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
         ).probability_bits_many(
             bitstrings,
             order=order,
@@ -4677,7 +4883,14 @@ class MpsStabOptimizer:
         )
 
     def bitstring_probability(
-        self, bits, *, order=None, basis="Z", seed=None, absorb_basis=False
+        self,
+        bits,
+        *,
+        order=None,
+        basis="Z",
+        seed=None,
+        absorb_basis=None,
+        disentangle=None,
     ) -> float:
         """Compatibility alias for :meth:`probability_bits`."""
         return self.probability_bits(
@@ -4686,6 +4899,7 @@ class MpsStabOptimizer:
             basis=basis,
             seed=seed,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
         )
 
     def bitstring_probabilities(
@@ -4695,7 +4909,8 @@ class MpsStabOptimizer:
         order=None,
         basis="Z",
         seed=None,
-        absorb_basis=False,
+        absorb_basis=None,
+        disentangle=None,
     ) -> np.ndarray:
         """Compatibility alias for :meth:`probability_bits_many`."""
         return self.probability_bits_many(
@@ -4704,6 +4919,7 @@ class MpsStabOptimizer:
             basis=basis,
             seed=seed,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
         )
 
     def iter_sample_bits(
@@ -4716,7 +4932,8 @@ class MpsStabOptimizer:
         shuffle: bool = True,
         packed: bool = False,
         basis="Z",
-        absorb_basis: bool = False,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ):
         """Compatibility delegate for chunked bit sampling."""
         from ...sampling.stabilizer import MpsStabSampler
@@ -4724,6 +4941,7 @@ class MpsStabOptimizer:
         yield from MpsStabSampler(
             self,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
         ).iter_sample_bits(
             shots,
             chunk_size=chunk_size,
@@ -4744,7 +4962,8 @@ class MpsStabOptimizer:
         shuffle: bool = True,
         packed: bool = False,
         basis="Z",
-        absorb_basis: bool = False,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ):
         """Compatibility alias for :meth:`iter_sample_bits`."""
         yield from self.iter_sample_bits(
@@ -4756,6 +4975,7 @@ class MpsStabOptimizer:
             packed=packed,
             basis=basis,
             absorb_basis=absorb_basis,
+            disentangle=disentangle,
         )
 
     # ------------------------------------------------------------------ #
@@ -5737,8 +5957,221 @@ class MpsStabOptimizer:
         rng = self._rng if seed is None else np.random.default_rng(seed)
         return np.where(rng.random(int(shots)) < p_plus, 1, -1)
 
-    def measure(self, pauli, where, *, outcome: Optional[int] = None,
-                absorb_basis: bool = False):
+    @staticmethod
+    def _normalize_measurement_batch(measurements):
+        """Normalize independent single-qubit measurements for scheduling."""
+        if isinstance(measurements, (str, bytes)):
+            raise TypeError(
+                "measure_many expects an iterable of (pauli, qubit[, outcome]) "
+                "entries."
+            )
+        try:
+            entries = tuple(measurements)
+        except TypeError as exc:
+            raise TypeError(
+                "measure_many expects an iterable of measurement entries."
+            ) from exc
+
+        operations = []
+        targets = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError(
+                    "measure_many entries must be (pauli, qubit) or "
+                    f"(pauli, qubit, outcome), got entry {index}: {entry!r}."
+                )
+            pauli, where = entry[:2]
+            sites = _normalize_sites(where)
+            if len(sites) != 1:
+                raise ValueError(
+                    "measure_many only schedules independent single-qubit "
+                    f"measurements, got where={where!r}."
+                )
+            (axis,) = _normalize_pauli_axes(
+                pauli,
+                sites,
+                event="measure_many",
+            )
+            outcome = entry[2] if len(entry) == 3 else None
+            outcome = MpsStabOptimizer._validate_outcome(outcome)
+            operations.append((axis, sites[0], outcome))
+            targets.append(sites[0])
+
+        if len(set(targets)) != len(targets):
+            raise ValueError(
+                "measure_many requires distinct target qubits so operations can "
+                "be safely reordered."
+            )
+        return tuple(operations)
+
+    def _measurement_span_info(self, axis, qubit, *, absorb_basis):
+        """Return cheap Tableau/MPS-layout costs for one measurement candidate."""
+        terms, _sign = self._frame_terms(axis, qubit)
+        frame_support = tuple(sorted(terms))
+        mps_support = tuple(sorted(self._mps_site(site) for site in frame_support))
+        if not mps_support:
+            return {
+                "frame_support": frame_support,
+                "mps_support": mps_support,
+                "span": 0,
+                "localizer_distance": 0,
+                "pivot": None,
+            }
+
+        span = int(max(mps_support) - min(mps_support))
+        ordered_support = sorted(
+            frame_support,
+            key=lambda site: (self._mps_site(site), int(site)),
+        )
+        pivot = ordered_support[len(ordered_support) // 2]
+        pivot_position = self._mps_site(pivot)
+        localizer_distance = int(
+            sum(
+                abs(self._mps_site(site) - pivot_position)
+                for site in frame_support
+            )
+        )
+        return {
+            "frame_support": frame_support,
+            "mps_support": mps_support,
+            "span": span,
+            "localizer_distance": (
+                localizer_distance if absorb_basis else 0
+            ),
+            "pivot": int(pivot),
+        }
+
+    def _run_measurement_batch(
+        self,
+        operations,
+        *,
+        order,
+        absorb_basis,
+        reset=False,
+        reset_after=False,
+    ):
+        """Run a batch using a metadata-only, adaptive span schedule."""
+        if reset and reset_after:
+            raise ValueError("reset and reset_after are mutually exclusive.")
+        operations = tuple(operations)
+        targets = tuple(operation[1] for operation in operations)
+        normalized_order = _normalize_measurement_order(
+            order,
+            count=len(operations),
+            targets=targets,
+        )
+        remaining = list(range(len(operations)))
+        result = [None] * len(operations)
+        schedule = []
+
+        for step in range(len(operations)):
+            if normalized_order == "input":
+                input_index = remaining.pop(0)
+            elif normalized_order == "min_span":
+                candidate_info = {
+                    index: self._measurement_span_info(
+                        operations[index][0],
+                        operations[index][1],
+                        absorb_basis=absorb_basis,
+                    )
+                    for index in remaining
+                }
+                input_index = min(
+                    remaining,
+                    key=lambda index: (
+                        candidate_info[index]["span"],
+                        candidate_info[index]["localizer_distance"],
+                        len(candidate_info[index]["frame_support"]),
+                        index,
+                    ),
+                )
+                remaining.remove(input_index)
+            else:
+                rank = {
+                    index: position
+                    for position, index in enumerate(normalized_order)
+                }
+                input_index = min(remaining, key=rank.__getitem__)
+                remaining.remove(input_index)
+
+            axis, qubit, forced = operations[input_index]
+            info = (
+                candidate_info[input_index]
+                if normalized_order == "min_span"
+                else self._measurement_span_info(
+                    axis,
+                    qubit,
+                    absorb_basis=absorb_basis,
+                )
+            )
+            if reset:
+                m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
+                outcome = self._absorb_measure(
+                    m_pauli,
+                    None,
+                    norm_event_kind="reset",
+                )
+            else:
+                outcome = self.measure(
+                    axis,
+                    qubit,
+                    outcome=forced,
+                    absorb_basis=absorb_basis,
+                )
+            if (reset or reset_after) and outcome < 0:
+                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+                self._record()
+            result[input_index] = int(outcome)
+            schedule.append({
+                "order": int(step),
+                "input_index": int(input_index),
+                "pauli": str(axis),
+                "qubit": int(qubit),
+                **info,
+            })
+
+        self.last_measurement_schedule = tuple(schedule)
+        return tuple(result)
+
+    def measure_many(
+        self,
+        measurements,
+        *,
+        order="min_span",
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
+    ):
+        """Measure independent single-qubit observables in a cheap span order.
+
+        ``order="min_span"`` is metadata-only: it reads current Tableau frame
+        supports and the logical-to-MPS layout, but never runs trial MPS
+        contractions or truncations.  Outcomes are returned in input order;
+        :attr:`last_measurement_schedule` records execution order and costs.
+        Use ``order="input"`` to preserve the supplied order, or pass an
+        explicit permutation of batch indices/target qubits.
+        """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
+        operations = self._normalize_measurement_batch(measurements)
+        result = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=absorb_basis,
+        )
+        return result[0] if len(result) == 1 else result
+
+    def measure(
+        self,
+        pauli,
+        where,
+        *,
+        outcome: Optional[int] = None,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
+    ):
         """Measure a Pauli observable, collapse ``|nu>``, and return ``+1``/``-1``.
 
         Parameters
@@ -5761,12 +6194,20 @@ class MpsStabOptimizer:
             the key primitive for magic-state injection (see :meth:`inject_t`).
             The default (``False``) keeps the cheaper fixed-basis projector
             ``(I +- M)/2`` applied directly to ``|nu>``.
+        disentangle : bool, optional
+            User-facing alias for ``absorb_basis``. If both names are supplied,
+            they must agree.
 
         Returns
         -------
         int
             The measured eigenvalue ``+1`` or ``-1``.
         """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         if absorb_basis:
             m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
             m = self._absorb_measure(
@@ -5803,7 +6244,7 @@ class MpsStabOptimizer:
         self.measurements.append(MeasurementRecord(pauli, where, int(m)))
         return m
 
-    def reset(self, where, basis="Z") -> "MpsStabOptimizer":
+    def reset(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
         """Reset qubit(s) to the ``+1`` eigenstate of ``basis``.
 
         Each target is measured with the basis-updating path (so it
@@ -5812,17 +6253,29 @@ class MpsStabOptimizer:
         ``basis="Z"`` form returns qubits to ``|0>``.  Available in a gate
         stream as ``("reset", where)`` or ``("reset", where, basis)``.  The
         internal measurements are *not* appended to :attr:`measurements` (a
-        reset is an operation, not a recorded readout).
+        reset is an operation, not a recorded readout).  By default, separate
+        targets are processed with the metadata-only ``min_span`` scheduler;
+        use ``order="input"`` to preserve their supplied order.
         """
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(basis, where, event="reset")
-        for axis, q in zip(axes, where):
-            m_pauli = self.state.frame_pauli(self._phys_pauli(axis, q))
-            m = self._absorb_measure(m_pauli, None, norm_event_kind="reset")
-            if m < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
-                self._record()
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "reset requires distinct target qubits so they can be safely "
+                "reordered."
+            )
+        operations = tuple((axis, q, None) for axis, q in zip(axes, where))
+        self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=True,
+            reset=True,
+        )
         return self
+
+    def reset_many(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
+        """Reset several independent qubits using the metadata-only span scheduler."""
+        return self.reset(where, basis=basis, order=order)
 
     def measure_reset(
         self,
@@ -5830,31 +6283,45 @@ class MpsStabOptimizer:
         where,
         *,
         outcome=None,
-        absorb_basis: bool = True,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
+        order="min_span",
     ):
         """Measure target qubit(s), record outcomes, then reset to ``+pauli``.
 
         ``pauli`` is one X/Y/Z axis per target, or one axis broadcast across all
         targets.  Unlike :meth:`reset`, the measurement outcomes are appended to
-        :attr:`measurements`.  The default uses the basis-updating measurement
-        path so the reset target leaves the coefficient MPS compactly.
+        :attr:`measurements`.  The default uses the fixed-basis projector; pass
+        ``disentangle=True`` to use the basis-updating path so each reset target
+        leaves the coefficient MPS compactly.  Separate targets are processed
+        with the metadata-only ``min_span`` scheduler by default; use
+        ``order="input"`` to preserve their supplied order.  Returned outcomes
+        remain aligned with the input target order.
         """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
-        measured = []
-        for axis, q, forced in zip(axes, where, outcomes):
-            m = self.measure(
-                axis,
-                q,
-                outcome=forced,
-                absorb_basis=absorb_basis,
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "measure_reset requires distinct target qubits so they can be "
+                "safely reordered."
             )
-            if m < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
-                self._record()
-            measured.append(m)
-        return measured[0] if len(measured) == 1 else tuple(measured)
+        operations = tuple(
+            (axis, q, forced)
+            for axis, q, forced in zip(axes, where, outcomes)
+        )
+        measured = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=absorb_basis,
+            reset_after=True,
+        )
+        return measured[0] if len(measured) == 1 else measured
 
     def cap(self, where, vec, *, absorb="left") -> "MpsStabOptimizer":
         """Contract one physical qubit with ``vec`` and shorten the simulator.

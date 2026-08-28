@@ -4533,7 +4533,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_target_strategy="auto",
         fit_mpo_guess=True,
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
-        fit_init_rand_strength=1.0e-1,
+        fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
         fit_overlap_diagnostics=False,
@@ -4768,13 +4768,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``"guess-src"`` in both expansion and reached-chi phases. The
             underscore spelling ``"guess_<method>"`` remains accepted as a
             compatibility alias.
-        fit_init_rand_strength : float, default=1e-1
+        fit_init_rand_strength : float, default=0.0
             For dense two- and three-site FIT growth windows that are below
             their attainable physical/``chi`` bond ceilings, seed a
             disposable copy of the current MPS with random entries on only
             those active bonds. The exact FIT target is still built from the
-            unmodified current MPS. Set to ``0`` to disable this
-            initialization. Native Symmray and fermionic routes ignore it.
+            unmodified current MPS. The default ``fit_init_strategy`` is
+            ``"guess-src"``, so this strength is unused unless a random
+            strategy is selected explicitly. Set it to a positive value to
+            enable random initialization. Native Symmray and fermionic
+            routes ignore it.
         fit_init_seed : int, default=0
             Deterministic seed for ``"random"`` and ``"random_expand"`` FIT
             guesses and randomized Quimb methods selected through
@@ -5550,7 +5553,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_target_strategy="auto",
         fit_mpo_guess=True,
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
-        fit_init_rand_strength=1.0e-1,
+        fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
         fit_overlap_diagnostics=False,
@@ -8115,7 +8118,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
-        fit_init_rand_strength=1.0e-1,
+        fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
         fit_overlap_diagnostics=False,
@@ -8168,7 +8171,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
-        fit_init_rand_strength=1.0e-1,
+        fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
         fit_overlap_diagnostics=False,
@@ -8696,7 +8699,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
-        fit_init_rand_strength=1.0e-1,
+        fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
         fit_overlap_diagnostics=False,
@@ -9421,7 +9424,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_target_strategy="auto",
         fit_mpo_guess=True,
         fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
-        fit_init_rand_strength=1.0e-1,
+        fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
         fit_overlap_diagnostics=False,

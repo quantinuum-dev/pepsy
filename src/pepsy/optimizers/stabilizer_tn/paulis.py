@@ -9,8 +9,35 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, Tuple
 
+import numpy as np
+
 _AXIS_CODE = {"i": 0, "x": 1, "y": 2, "z": 3}
 _CODE_AXIS = {1: "X", 2: "Y", 3: "Z"}
+
+
+def _resolve_measurement_disentangle(
+    absorb_basis,
+    disentangle,
+    *,
+    default: bool,
+) -> bool:
+    """Normalize the measurement basis-update compatibility options."""
+    if absorb_basis is None:
+        resolved = bool(default)
+    elif not isinstance(absorb_basis, (bool, np.bool_)):
+        raise TypeError("absorb_basis must be a boolean.")
+    else:
+        resolved = bool(absorb_basis)
+
+    if disentangle is None:
+        return resolved
+    if not isinstance(disentangle, (bool, np.bool_)):
+        raise TypeError("disentangle must be a boolean.")
+    if absorb_basis is not None and bool(disentangle) != resolved:
+        raise ValueError(
+            "absorb_basis and disentangle specify different measurement modes."
+        )
+    return bool(disentangle)
 
 
 def single_pauli(axis: str, q: int, n: int):

@@ -146,7 +146,9 @@ corrections at their original stream locations, then performs final
 basis-updating projections in `input`, `middle_out`, explicit, or greedy
 `min_span` order. Basis-updating measurement uses a tree-distance-aware
 Clifford localizer before absorbing the inverse Clifford into the tableau;
-`absorb_basis=True` is never silently treated as a fixed-basis projector.
+`disentangle=True` selects the basis-updating measurement path; the legacy
+`absorb_basis=True` keyword remains accepted as an alias and is never silently
+treated as a fixed-basis projector.
 
 The safe MPS naming compatibility surface includes `from_mps`,
 `from_tableau_and_nu`, `run(..., progbar=True)`, `apply(..., progbar=True)`,

@@ -246,6 +246,20 @@ injection runners also accept `layout="auto"`; they build a synthetic layout
 stream from the magic-ancilla gadgets and final projections, rather than using
 the original data-only stream.
 
+STN frame layout uses `weight_mode="operator_schmidt"` by default. Each
+multi-site frame event keeps a unit locality baseline and receives an
+operator-complexity premium: Pauli rotations use the exact two-branch
+operator-Schmidt tail for their angle, dense two-qubit matrices use their
+operator-Schmidt singular values, and explicit sub-MPOs use their maximum MPO
+bond as a conservative rank proxy. This covers the built-in `pepsy.rxx`,
+`pepsy.ryy`, `pepsy.rzz`, `pepsy.fsim`, `pepsy.fsimg`, and `pepsy.su4`
+constructors, as well as arbitrary user-supplied two-qubit matrices. It
+prioritizes long-range operators that would put more pressure on coefficient-
+MPS compression while retaining
+`weight_mode="count"` for the historical uniform score. `"angle"` and
+`"auto"` remain available for angle-based weighting. The weight is a static
+operator proxy, not a prediction of the evolving state's exact entanglement.
+
 For measurement/feed-forward circuits, use
 `("if", record, bit, action)`. `record=-1` means the latest measurement,
 negative records are Stim-style offsets, and `bit` is the computational
@@ -257,15 +271,31 @@ outside the quantum replay contract.
 
 ## Measurement, reset, and magic-state injection
 
-- `measure(pauli, where, *, outcome=None, absorb_basis=False)` — fixed-basis
-  projector `(I +- M)/2` by default; `absorb_basis=True` uses the basis-updating
+- `measure(pauli, where, *, outcome=None, disentangle=False)` — fixed-basis
+  projector `(I +- M)/2` by default; `disentangle=True` uses the basis-updating
   (canonical Lemma-3) form that disentangles the measured qubit from `|nu>`.
-- `reset(where)` — return qubit(s) to `|0>` (measure-`Z` absorb + conditional
-  `X`), disentangling them so ancillas can be recycled. Pass `basis="X"` or
-  `"Y"` to reset to the corresponding `+1` Pauli eigenstate.
-- `measure_reset(pauli, where, *, outcome=None, absorb_basis=True)` — record a
-  Pauli measurement, then reset the same qubit(s) to the `+1` eigenstate of
-  that basis. Stream aliases `mrx`, `mry`, and `mrz` are accepted.
+  The legacy `absorb_basis` keyword remains accepted as an alias.
+- `reset(where, basis="Z", *, order="min_span")` — return qubit(s) to `|0>`
+  (measure-`Z` absorb + conditional `X`), disentangling them so ancillas can
+  be recycled. Pass `basis="X"` or `"Y"` to reset to the corresponding `+1`
+  Pauli eigenstate. Separate targets use the metadata-only span scheduler by
+  default; pass `order="input"` to preserve the supplied order.
+- `measure_reset(pauli, where, *, outcome=None, disentangle=False,
+  order="min_span")` — record a Pauli measurement, then reset the same
+  qubit(s) to the `+1` eigenstate of that basis. Separate targets use the
+  metadata-only span scheduler by default. Pass `order="input"` to preserve
+  their supplied order and `disentangle=True` for the basis-updating path.
+  Returned outcomes remain aligned with the input target order. The legacy
+  `absorb_basis` keyword remains accepted as an alias. Stream aliases `mrx`,
+  `mry`, and `mrz` are accepted.
+- `measure_many(measurements, *, order="min_span", disentangle=False)` —
+  measure independent single-qubit entries such as
+  `[ ("Z", 1), ("X", 2) ]`. The span scheduler reads Tableau supports and
+  MPS layout metadata only; it never performs trial MPS contractions or
+  truncations. Outcomes are returned in input order and the selected schedule
+  is available as `last_measurement_schedule`.
+- `reset_many(where, basis="Z", *, order="min_span")` — batch alias for
+  `reset()` with the same span-ordering behavior.
 - `cap(where, vec, *, absorb="left")` — contract a physical qubit with `vec`
   and rebuild an `(n - 1)`-qubit identity-frame STN. This is a dense fallback
   guarded by `max_dense_cap_qubits`; for scalable DEM-style capping, use the

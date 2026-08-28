@@ -32,7 +32,7 @@ configs, probs = sampler.sample_arrays(4096, chunk_size=1024)
 
 Construction options for the coefficient-MPS optimizer can be supplied
 directly when passing ``(C, nu)``. ``chi``, ``mode``, and ``cutoff`` then
-control compression of copied measurement branches. Set ``absorb_basis=True``
+control compression of copied measurement branches. Set ``disentangle=True``
 to localize each measured frame Pauli to ``+/- Z_k`` and update the tableau on
 that branch:
 
@@ -43,12 +43,13 @@ sampler = pepsy.MpsStabSampler(
     chi=16,
     mode="dmrg2",
     cutoff=1e-12,
-    absorb_basis=True,
+    disentangle=True,
 )
 ```
 
-The default ``absorb_basis=False`` applies the frame projector directly as a
-sub-MPO. With absorption enabled, the frame changes independently on each
+The default ``disentangle=False`` applies the frame projector directly as a
+sub-MPO. The legacy ``absorb_basis`` keyword remains accepted as an alias.
+With disentangling enabled, the frame changes independently on each
 collapsed branch, so later frame images are recomputed for that branch. In
 both modes the original optimizer, tableau, and coefficient MPS remain
 unchanged; ``chi`` is taken from the underlying optimizer.
