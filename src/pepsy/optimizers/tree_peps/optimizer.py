@@ -1025,12 +1025,20 @@ class TreePepsOptimizer:
         }
 
     def _state_dtype(self):
-        return np.asarray(self.state.node_tensor(self.plan.root).data).dtype
+        data = self.state.node_tensor(self.plan.root).data
+        try:
+            return np.asarray(data).dtype
+        except (TypeError, ValueError):
+            return np.dtype(ar.get_dtype_name(data))
 
     def _gate_dtype(self, gate):
         candidate = gate.to_dense() if hasattr(gate, "to_dense") else gate
         candidate = getattr(candidate, "data", candidate)
-        return np.result_type(self._state_dtype(), np.asarray(candidate).dtype)
+        try:
+            gate_dtype = np.asarray(candidate).dtype
+        except (TypeError, ValueError):
+            gate_dtype = np.dtype(ar.get_dtype_name(candidate))
+        return np.result_type(self._state_dtype(), gate_dtype)
 
     def _region_center(self, region, preferred=None):
         region = frozenset(region)
@@ -1375,12 +1383,16 @@ class TreePepsOptimizer:
         self._validate_backend_payload(gate, path="gate")
         operator = TreePepo.from_operator(
             self.plan,
-            gate,
+            ar.to_numpy(gate),
             support,
             dims=self._physical_dims(),
             dtype=self._gate_dtype(gate),
             max_operator_sites=self.max_operator_sites,
         )
+        # Dense TreePepo factorization currently uses host-side NumPy
+        # decompositions. Convert the resulting operator back to the live
+        # state's backend before the strict operator validation boundary.
+        operator = self.to_backend(operator)
         return self._apply_operator(
             operator,
             support,

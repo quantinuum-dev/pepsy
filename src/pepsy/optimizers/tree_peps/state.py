@@ -715,9 +715,12 @@ class TreePeps(qtn.TensorNetworkGenVector):
         other_inds = [ind for ind in tensor.inds if ind != bond]
         bond_axis = tensor.inds.index(bond)
         other_axes = [tensor.inds.index(ind) for ind in other_inds]
-        data = np.asarray(tensor.data)
+        data = np.asarray(ar.to_numpy(tensor.data))
         matrix = data.transpose(*other_axes, bond_axis).reshape(-1, data.shape[bond_axis])
         gram = matrix.conj().T @ matrix
+        real_dtype = np.asarray(data).real.dtype
+        if np.issubdtype(real_dtype, np.inexact):
+            tol = max(float(tol), 64.0 * np.finfo(real_dtype).eps)
         return np.allclose(
             gram,
             np.eye(data.shape[bond_axis], dtype=gram.dtype),

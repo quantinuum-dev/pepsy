@@ -146,6 +146,23 @@ def test_direct_optimizer_promotes_real_state_for_complex_gates():
     assert np.issubdtype(optimizer.state.node_tensor(0).data.dtype, np.complexfloating)
 
 
+def test_direct_optimizer_converts_factorized_operator_to_torch_backend():
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    plan = TreePepsPlan.from_shape((3, 3), order="row-major", tree_order="row-major")
+    to_torch = backend_torch(dtype=torch.complex64, device="cpu")
+    state = TreePeps.from_plan(plan, dtype=np.complex64)
+    state.apply_to_arrays(to_torch)
+    gate = to_torch(np.diag([1.0, 1.0j]).astype(np.complex64))
+
+    optimizer = TreePepsOptimizer(state, chi=None, cutoff=0.0, run=False)
+    optimizer.apply_gate(gate, 0)
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.state.tensors)
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
 def test_dm_compression_uses_the_fused_tree_pepo_state_network():
     plan = _path_plan((2, 2))
     state = TreePeps.rand(plan, bond_dim=2, seed=21)
