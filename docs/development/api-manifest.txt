@@ -117,6 +117,7 @@ TreeOptimizer
 TreePlan
 TreePeps
 TreePepsGeometry
+TreePepsLayoutFinder
 TreePepsPlan
 TreePepsOptimizer
 TreePepo

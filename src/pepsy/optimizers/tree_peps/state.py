@@ -8,6 +8,7 @@ from numbers import Integral
 
 import numpy as np
 import quimb.tensor as qtn
+import autoray as ar
 
 from .plan import TreePepsPlan
 
@@ -54,6 +55,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
     """
 
     _EXTRA_PROPS = (
+        "_sites",
         "_tree_peps_plan",
         "_coord_site_tag_id",
         "_coord_site_ind_id",
@@ -104,6 +106,9 @@ class TreePeps(qtn.TensorNetworkGenVector):
         tn_opts.pop("virtual", None)
         super().__init__(ts, virtual=False, **tn_opts)
         self._tree_peps_plan = plan
+        # Quimb's inherited ``nsites`` property and related helpers read this
+        # storage-level site list directly. Keep it with the copied metadata.
+        self._sites = tuple(range(plan.size))
         self._coord_site_tag_id = str(coord_site_tag_id)
         self._coord_site_ind_id = str(coord_site_ind_id)
         self._logical_site_tag_id = str(logical_site_tag_id)
@@ -205,6 +210,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             self.plan.root,
             self.plan.max_virtual_degree,
             self.plan.order,
+            self.plan.tree_order,
             self.plan.boundary,
         )
 
@@ -215,6 +221,76 @@ class TreePeps(qtn.TensorNetworkGenVector):
     @property
     def ndim(self) -> int:
         return self.plan.ndim
+
+    @property
+    def nqubits(self) -> int:
+        """Number of physical lattice sites (TTN name-parity alias)."""
+
+        return self.plan.size
+
+    @property
+    def nsites(self) -> int:
+        """Number of physical lattice sites."""
+
+        return self.plan.size
+
+    @property
+    def root(self) -> int:
+        """Logical site used as the root of the retained virtual tree."""
+
+        return self.plan.root
+
+    @property
+    def top_arity(self) -> int:
+        """Number of virtual child bonds entering the rooted site."""
+
+        return len(self.plan.children[self.plan.root])
+
+    @property
+    def max_virtual_degree(self) -> int:
+        """The largest number of retained virtual bonds at one site."""
+
+        return self.plan.max_degree
+
+    @property
+    def max_rank(self) -> int:
+        """The largest local tensor rank, including its one physical leg."""
+
+        return self.plan.max_tensor_rank
+
+    @property
+    def max_tensor_rank(self) -> int:
+        """TTN name-parity alias for :attr:`max_rank`."""
+
+        return self.max_rank
+
+    def is_binary(self, *, allow_ternary_root=True) -> bool:
+        """Whether the rooted TreePeps has at most two children per site.
+
+        A degree-three root is allowed by default, matching the binary-tree
+        convention used by :class:`TreeTensorNetwork` while retaining the
+        TreePeps hard limit of three total virtual bonds.
+        """
+
+        root = self.plan.root
+        if not allow_ternary_root and len(self.plan.children[root]) > 2:
+            return False
+        return all(
+            len(children) <= 2
+            for site, children in self.plan.children.items()
+            if site != root
+        )
+
+    @property
+    def rank(self) -> int:
+        """Compatibility spelling for the maximum local tensor rank."""
+
+        return self.max_rank
+
+    def tensor_rank(self, site) -> int:
+        """Return the local tensor rank at a logical site or coordinate."""
+
+        return self.plan.tensor_rank(site)
 
     @property
     def sites(self) -> tuple[int, ...]:
@@ -392,8 +468,80 @@ class TreePeps(qtn.TensorNetworkGenVector):
     def path(self, site0, site1):
         return self.plan.path(site0, site1)
 
+    def node_path(self, site0, site1):
+        """TTN name-parity alias for the unique site path."""
+
+        return self.path(site0, site1)
+
+    def tree_distance(self, site0, site1) -> int:
+        """Return the number of retained tree bonds between two sites."""
+
+        return len(self.path(site0, site1)) - 1
+
+    def is_leaf(self, site) -> bool:
+        """Whether ``site`` is a leaf in the tree rooted at ``root``."""
+
+        q = self.plan.resolve_site(site)
+        return not self.plan.children[q]
+
+    def parent(self, site):
+        """Return the parent site in the rooted retained tree."""
+
+        q = self.plan.resolve_site(site)
+        return self.plan.parent[q]
+
+    def children(self, site):
+        """Return the child sites in the rooted retained tree."""
+
+        q = self.plan.resolve_site(site)
+        return self.plan.children[q]
+
+    def steiner_nodes(self, sites):
+        """Return the minimal connected tree span of ``sites``."""
+
+        return self.plan.subtree_span(sites)
+
+    def subtree_span(self, sites):
+        """Return the minimal connected tree span of ``sites``."""
+
+        return self.plan.subtree_span(sites)
+
+    def max_bond(self) -> int:
+        """Return the largest live virtual bond dimension."""
+
+        return max(self.bond_sizes().values(), default=1)
+
+    def bond_sizes(self) -> dict[tuple[int, int], int]:
+        """Return live dimensions keyed by undirected tree edge."""
+
+        return {
+            tuple(sorted((q0, q1))): int(self.ind_size(self.bond(q0, q1)))
+            for q0, q1 in self.plan.tree_edges
+        }
+
+    def bond_report(self) -> dict[str, object]:
+        """Return a compact health report for the retained virtual bonds."""
+
+        bond_sizes = self.bond_sizes()
+        dimensions = tuple(bond_sizes.values())
+        return {
+            "max_bond": max(dimensions, default=1),
+            "mean_bond": (
+                float(sum(dimensions) / len(dimensions))
+                if dimensions else 1.0
+            ),
+            "n_bonds": len(dimensions),
+            "n_tensors": self.num_tensors,
+            "max_virtual_degree": self.max_virtual_degree,
+            "max_tensor_rank": self.max_tensor_rank,
+            "bond_sizes": bond_sizes,
+        }
+
     def validate(self, *, check_canonical=False, tol=1e-9):
         """Validate tags, physical legs, and the live virtual tree graph."""
+
+        if self.plan.max_virtual_degree > 3 or self.plan.max_degree > 3:
+            raise ValueError("TreePeps tensors may have at most three virtual bonds")
 
         physical_counts = Counter()
         virtual_counts = Counter()
@@ -407,6 +555,11 @@ class TreePeps(qtn.TensorNetworkGenVector):
             }
             if not required_tags.issubset(tensor.tags):
                 raise ValueError(f"tensor at site {q} is missing TreePeps tags")
+            if len(tensor.inds) > 4:
+                raise ValueError(
+                    f"tensor at site {q} exceeds TreePeps rank four "
+                    "(one physical leg plus three virtual bonds)"
+                )
             physical = self.site_ind_1d(q)
             if physical not in tensor.inds:
                 raise ValueError(f"tensor at site {q} is missing physical index {physical}")
@@ -804,6 +957,44 @@ class TreePeps(qtn.TensorNetworkGenVector):
         return self.canonize_subtree(
             sites,
             span=span,
+            absorb=absorb,
+            inplace=True,
+            info_c=info_c,
+            **canonize_opts,
+        )
+
+    def canonize_around_qubits(
+        self,
+        sites,
+        *,
+        absorb="right",
+        inplace=False,
+        info_c=None,
+        **canonize_opts,
+    ):
+        """Canonicalize around the minimal tree span of physical sites."""
+
+        return self.canonize_subtree(
+            sites,
+            span=True,
+            absorb=absorb,
+            inplace=inplace,
+            info_c=info_c,
+            **canonize_opts,
+        )
+
+    def canonize_around_qubits_(
+        self,
+        sites,
+        *,
+        absorb="right",
+        info_c=None,
+        **canonize_opts,
+    ):
+        """In-place alias for :meth:`canonize_around_qubits`."""
+
+        return self.canonize_around_qubits(
+            sites,
             absorb=absorb,
             inplace=True,
             info_c=info_c,
@@ -1283,6 +1474,77 @@ class TreePeps(qtn.TensorNetworkGenVector):
                     lines.append("z-bonds: " + ", ".join(z_edges))
         return "\n".join(lines)
 
+    def _quimb_ascii_2d(
+        self,
+        *,
+        bond_dims=True,
+        node_ids=False,
+        show_lower=False,
+        show_upper=False,
+    ):
+        """Render a 2D tree using Quimb ``PEPS.show`` spacing conventions."""
+
+        def label(q):
+            return f"N{q}" if node_ids else "●"
+
+        node_width = max(3, max(len(label(q)) for q in self.sites))
+        connector_width = max(4, node_width + 1)
+
+        def horizontal_dimension(row):
+            pieces = []
+            for y in range(self.shape[1]):
+                q = self.plan.logical_site((row, y))
+                pieces.append(" " * node_width)
+                if y + 1 < self.shape[1]:
+                    q1 = self.plan.logical_site((row, y + 1))
+                    retained = q1 in self.plan.neighbors(q)
+                    dimension = self._bond_dim(q, q1) if retained and bond_dims else ""
+                    prefix = "╱" if show_upper and retained else " "
+                    pieces.append(
+                        (prefix + str(dimension)).center(connector_width)
+                        if retained
+                        else " " * connector_width
+                    )
+            return "".join(pieces).rstrip()
+
+        def node_row(row):
+            pieces = []
+            for y in range(self.shape[1]):
+                q = self.plan.logical_site((row, y))
+                pieces.append(label(q).center(node_width))
+                if y + 1 < self.shape[1]:
+                    q1 = self.plan.logical_site((row, y + 1))
+                    retained = q1 in self.plan.neighbors(q)
+                    pieces.append(
+                        "━" * connector_width
+                        if retained
+                        else " " * connector_width
+                    )
+            return "".join(pieces).rstrip()
+
+        def vertical_row(row):
+            pieces = []
+            for y in range(self.shape[1]):
+                q = self.plan.logical_site((row, y))
+                q1 = self.plan.logical_site((row + 1, y))
+                retained = q1 in self.plan.neighbors(q)
+                dimension = self._bond_dim(q, q1) if retained and bond_dims else ""
+                text = ("╱" if show_lower and retained else " ")
+                text += "┃" if retained else " "
+                text += str(dimension) if retained else ""
+                pieces.append(text.center(node_width))
+                if y + 1 < self.shape[1]:
+                    pieces.append(" " * connector_width)
+            return "".join(pieces).rstrip()
+
+        lines = [horizontal_dimension(0)]
+        for row in range(self.shape[0]):
+            lines.append(node_row(row))
+            if row + 1 < self.shape[0]:
+                lines.append(vertical_row(row))
+                lines.append(horizontal_dimension(row + 1))
+        return "\n".join(lines)
+
     def show(
         self,
         *,
@@ -1295,12 +1557,22 @@ class TreePeps(qtn.TensorNetworkGenVector):
         """Print a PEPS-style coordinate schematic of this tree state.
 
         ``show_lower`` and ``show_upper`` are accepted for compatibility with
-        :meth:`quimb.tensor.PEPS.show`; tree states have no separate lower or
-        upper PEPS bond layers, so they do not alter the drawing.
+        :meth:`quimb.tensor.PEPS.show`; for 2D trees they add the same diagonal
+        visual markers, while the tree-specific drawing omits non-retained
+        lattice edges.
         """
 
-        del color, show_lower, show_upper
-        print(self.ascii_lattice(bond_dims=bond_dims, node_ids=node_ids))
+        del color
+        if self.ndim == 2:
+            drawing = self._quimb_ascii_2d(
+                bond_dims=bond_dims,
+                node_ids=node_ids,
+                show_lower=show_lower,
+                show_upper=show_upper,
+            )
+        else:
+            drawing = self.ascii_lattice(bond_dims=bond_dims, node_ids=node_ids)
+        print(drawing)
 
     def norm(self, output_inds=None, squared=False, strip_exponent=False, **contract_opts):
         """Return the exact Frobenius norm using Quimb's vector semantics."""
@@ -1321,15 +1593,33 @@ class TreePeps(qtn.TensorNetworkGenVector):
             output_inds = tuple(self.site_ind_1d(q) for q in self.sites)
         return self.contract(all, output_inds=output_inds, **contract_opts)
 
+    def to_statevector(self, order=None):
+        """Return a host NumPy statevector in the requested site order."""
+
+        if order is None:
+            order = self.sites
+        order = tuple(self.plan.resolve_site(site) for site in order)
+        if len(order) != self.plan.size or set(order) != set(self.sites):
+            raise ValueError("order must contain every TreePeps site exactly once")
+        dense = self.to_dense(*(self.site_ind_1d(site) for site in order))
+        return ar.to_numpy(dense.data).reshape(-1)
+
     def local_expectation(
         self,
         operator,
         where,
         *,
         normalized=True,
+        max_bond=None,
+        optimize=None,
         **contract_opts,
     ):
         """Evaluate an exact one- or multi-site observable."""
+
+        # These names are accepted for parity with TreeTensorNetwork and
+        # MPS readout. TreePeps uses an exact tree contraction here, so there
+        # is no approximate max-bond path to select.
+        del max_bond, optimize
 
         if isinstance(where, Integral):
             where = (int(where),)
@@ -1354,6 +1644,61 @@ class TreePeps(qtn.TensorNetworkGenVector):
             return numerator
         denominator = (self.H & self).contract(all, output_inds=[], **contract_opts)
         return numerator / denominator
+
+    def local_expectations(
+        self,
+        terms,
+        *,
+        normalized=True,
+        max_bond=None,
+        optimize=None,
+        **contract_opts,
+    ):
+        """Evaluate a mapping of local observables in iteration order.
+
+        This mirrors ``TreeTensorNetwork.local_expectations`` while retaining
+        the TreePeps coordinate/logical site selectors accepted by
+        :meth:`local_expectation`.
+        """
+
+        if not hasattr(terms, "items"):
+            raise TypeError("terms must be a mapping of support to operators")
+        return {
+            where: self.local_expectation(
+                operator,
+                where,
+                normalized=normalized,
+                max_bond=max_bond,
+                optimize=optimize,
+                **contract_opts,
+            )
+            for where, operator in terms.items()
+        }
+
+    def normalize(self, eps=1e-15, insert=None):
+        """Normalize the state in place and return its previous norm.
+
+        ``insert`` is accepted for MPS/TTN API compatibility. TreePeps has no
+        distinguished insertion site, so normalization is applied to the
+        current canonical center or to the root after one lossless
+        canonicalization.
+        """
+
+        del insert
+        eps = float(eps)
+        if eps < 0.0:
+            raise ValueError("eps must be non-negative")
+        old_norm = self.norm()
+        magnitude = float(abs(np.asarray(ar.to_numpy(old_norm))))
+        if magnitude <= eps or not np.isfinite(magnitude):
+            return old_norm
+        center = self.orthogonality_center
+        if center is None:
+            self.canonize_to(self.plan.root, inplace=True)
+            center = self.plan.root
+        tensor = self.node_tensor(center)
+        tensor.modify(data=tensor.data / magnitude)
+        return old_norm
 
     @staticmethod
     def _site_ind_for_plan(plan: TreePepsPlan, q: int) -> str:

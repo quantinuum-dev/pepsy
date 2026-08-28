@@ -10,6 +10,8 @@ from ...tensors.maps import OneDMap
 
 __all__ = ["TreePepsPlan", "TreePepsGeometry"]
 
+_MAX_TREE_PEPS_VIRTUAL_DEGREE = 3
+
 
 def _normalize_shape(shape: Sequence[int]) -> tuple[int, ...]:
     """Validate and normalize a finite two- or three-dimensional shape."""
@@ -44,18 +46,25 @@ class TreePepsPlan:
         root: int = 0,
         max_virtual_degree: int = 3,
         order: str = "snake",
+        tree_order: str = "explicit",
         boundary: str = "open",
     ) -> None:
         self.shape = _normalize_shape(shape)
         self.ndim = len(self.shape)
         self.size = _product(self.shape)
         self.order = str(order)
+        self.tree_order = str(tree_order)
         self.boundary = str(boundary)
         if self.boundary != "open":
             raise NotImplementedError("TreePepsPlan currently supports open boundaries only")
         if not isinstance(max_virtual_degree, Integral) or max_virtual_degree < 1:
             raise ValueError("max_virtual_degree must be a positive integer")
         self.max_virtual_degree = int(max_virtual_degree)
+        if self.max_virtual_degree > _MAX_TREE_PEPS_VIRTUAL_DEGREE:
+            raise ValueError(
+                "TreePeps virtual degree must be at most "
+                f"{_MAX_TREE_PEPS_VIRTUAL_DEGREE}"
+            )
 
         self.one_d_to_coord = tuple(tuple(coord) for coord in one_d_to_coord)
         if len(self.one_d_to_coord) != self.size:
@@ -90,23 +99,30 @@ class TreePepsPlan:
         shape: Sequence[int],
         *,
         order: str = "snake",
+        tree_order: str | None = None,
         tree_edges: Iterable[tuple[int, int]] | None = None,
-        root: int | tuple[int, ...] = 0,
+        root: int | tuple[int, ...] | str | None = None,
         max_virtual_degree: int = 3,
         boundary: str = "open",
     ) -> "TreePepsPlan":
         """Build a plan from a 2D or 3D open regular lattice.
 
-        The default tree is the path induced by a canonical snake traversal.
-        The requested ``order`` controls logical ids independently, so even a
-        row-major or Hilbert logical ordering still gets a legal lattice path.
-        This is deliberately conservative: every virtual edge is a physical
-        lattice edge and the resulting tree has virtual degree at most two.
+        ``order`` controls logical ids. ``tree_order`` independently selects
+        the deterministic seed used to construct the retained virtual tree.
+        ``snake`` remains the default lattice-adjacent path. Other fixed
+        traversals (including ``row-major`` and ``hilbert``) are interpreted
+        as growth priorities and connected through legal lattice edges. The
+        ``inside-out`` traversal grows from the geometric center outward;
+        this center is selected automatically unless another root is passed.
         Custom trees may be supplied with endpoints expressed as logical ids
         or coordinates.
         """
 
         shape = _normalize_shape(shape)
+        if tree_order is None:
+            tree_order = "snake"
+        tree_mapper = OneDMap(*shape, mode=tree_order)
+        tree_order = tree_mapper.mode
         mapper = OneDMap(*shape, mode=order)
         one_d_to_coord_map, coord_to_one_d = mapper.build()
         one_d_to_coord = tuple(tuple(one_d_to_coord_map[q]) for q in range(len(one_d_to_coord_map)))
@@ -120,13 +136,50 @@ class TreePepsPlan:
                 if neighbor in coord_to_one_d:
                     lattice_edges.append((coord_to_one_d[coord], coord_to_one_d[neighbor]))
 
+        generated_tree = tree_edges is None
+        if root is None:
+            if tree_order == "inside-out":
+                center = tuple((extent - 1) // 2 for extent in shape)
+                root_q = coord_to_one_d[center]
+            else:
+                root_q = 0
+        elif isinstance(root, str):
+            if root.strip().lower().replace("_", "-") != "center":
+                raise ValueError("root string must be 'center'")
+            center = tuple((extent - 1) // 2 for extent in shape)
+            root_q = coord_to_one_d[center]
+        elif isinstance(root, Integral):
+            root_q = int(root)
+        else:
+            root_q = _resolve_endpoint(root, coord_to_one_d, len(one_d_to_coord), len(shape))
+
         if tree_edges is None:
-            snake_map, _ = OneDMap(*shape, mode="snake").build()
-            snake_coords = tuple(tuple(snake_map[q]) for q in range(len(snake_map)))
-            tree_edges = tuple(
-                (coord_to_one_d[c0], coord_to_one_d[c1])
-                for c0, c1 in zip(snake_coords, snake_coords[1:])
+            tree_map, _ = tree_mapper.build()
+            tree_order_q = tuple(
+                coord_to_one_d[tuple(tree_map[q])] for q in range(len(tree_map))
             )
+            snake_map, _ = OneDMap(*shape, mode="snake").build()
+            fallback_order_q = tuple(
+                coord_to_one_d[tuple(snake_map[q])] for q in range(len(snake_map))
+            )
+            lattice_edge_set = {tuple(sorted(edge)) for edge in lattice_edges}
+            ordered_edges = tuple(
+                tuple(sorted((q0, q1)))
+                for q0, q1 in zip(tree_order_q, tree_order_q[1:])
+            )
+            if set(ordered_edges).issubset(lattice_edge_set):
+                # Preserve a genuine Hamiltonian traversal when one exists.
+                # In particular this keeps the historical default snake plan
+                # a path instead of turning it into a branching growth tree.
+                tree_edges = ordered_edges
+            else:
+                tree_edges = _tree_edges_from_order(
+                    tree_order_q,
+                    lattice_edges,
+                    root=root_q,
+                    max_virtual_degree=max_virtual_degree,
+                    fallback_order=fallback_order_q,
+                )
         else:
             tree_edges = tuple(
                 (
@@ -136,10 +189,6 @@ class TreePepsPlan:
                 for edge in tree_edges
             )
 
-        if isinstance(root, Integral):
-            root_q = int(root)
-        else:
-            root_q = _resolve_endpoint(root, coord_to_one_d, len(one_d_to_coord), len(shape))
         return cls(
             shape,
             one_d_to_coord=one_d_to_coord,
@@ -149,6 +198,7 @@ class TreePepsPlan:
             root=root_q,
             max_virtual_degree=max_virtual_degree,
             order=order,
+            tree_order=(tree_order if generated_tree else "explicit"),
             boundary=boundary,
         )
 
@@ -181,6 +231,17 @@ class TreePepsPlan:
         """The largest number of virtual bonds incident on one site."""
 
         return max((len(neighbors) for neighbors in self._adjacency.values()), default=0)
+
+    @property
+    def max_tensor_rank(self) -> int:
+        """The largest local tensor rank including its physical leg."""
+
+        return 1 + self.max_degree
+
+    def tensor_rank(self, site: int | tuple[int, ...]) -> int:
+        """Return ``1 +`` the virtual degree at ``site``."""
+
+        return 1 + len(self.neighbors(site))
 
     def _resolve_site(self, site: int | tuple[int, ...]) -> int:
         return _resolve_endpoint(site, self.coord_to_one_d, self.size, self.ndim)
@@ -286,7 +347,8 @@ class TreePepsPlan:
     def __repr__(self) -> str:
         return (
             f"TreePepsPlan(shape={self.shape!r}, size={self.size}, "
-            f"root={self.root}, max_degree={self.max_degree})"
+            f"root={self.root}, max_degree={self.max_degree}, "
+            f"tree_order={self.tree_order!r})"
         )
 
 
@@ -298,6 +360,85 @@ def _product(values: Sequence[int]) -> int:
     for value in values:
         result *= int(value)
     return result
+
+
+def _tree_edges_from_order(
+    order: Sequence[int],
+    lattice_edges: Iterable[tuple[int, int]],
+    *,
+    root: int,
+    max_virtual_degree: int,
+    fallback_order: Sequence[int] = (),
+) -> tuple[tuple[int, int], ...]:
+    """Grow a legal tree by attaching sites in a prescribed order.
+
+    The order is deliberately not assumed to be a Hamiltonian path. This is
+    what lets row-major and center-out traversals produce branching trees
+    while retaining the physical lattice as the only source of virtual
+    bonds. A canonical snake path is used as a safe fallback when a greedy
+    degree-bounded growth order paints itself into a corner.
+    """
+    order = tuple(int(q) for q in order)
+    if not order or len(set(order)) != len(order):
+        raise ValueError("tree growth order must be a non-empty site permutation")
+    if root not in order:
+        raise ValueError("tree growth root must be present in the site order")
+    if max_virtual_degree < 1:
+        raise ValueError("max_virtual_degree must be positive")
+
+    adjacency = {q: set() for q in order}
+    for q0, q1 in lattice_edges:
+        if q0 in adjacency and q1 in adjacency:
+            adjacency[q0].add(q1)
+            adjacency[q1].add(q0)
+
+    rank = {q: index for index, q in enumerate(order)}
+    visited = {root}
+    degree = {q: 0 for q in order}
+    edges = []
+    while len(visited) < len(order):
+        candidates = []
+        for child in order:
+            if child in visited or degree[child] >= max_virtual_degree:
+                continue
+            for parent in sorted(adjacency[child] & visited):
+                if degree[parent] >= max_virtual_degree:
+                    continue
+                candidates.append((rank[child], rank[parent], child, parent))
+        if not candidates:
+            break
+        _, _, child, parent = min(candidates)
+        edge = tuple(sorted((parent, child)))
+        edges.append(edge)
+        degree[parent] += 1
+        degree[child] += 1
+        visited.add(child)
+
+    if len(visited) == len(order):
+        return tuple(sorted(edges))
+
+    # Any lattice-adjacent snake is a valid degree-two spanning tree. It is a
+    # useful deterministic recovery for restrictive caps such as two, while
+    # center-out and other modes still control the normal degree-three path.
+    fallback_order = tuple(int(q) for q in fallback_order)
+    if max_virtual_degree >= 2 and len(fallback_order) == len(order):
+        fallback_edges = tuple(
+            tuple(sorted((q0, q1)))
+            for q0, q1 in zip(fallback_order, fallback_order[1:])
+        )
+        lattice_edge_set = {
+            tuple(sorted(edge)) for edge in lattice_edges
+        }
+        if (
+            len(set(fallback_order)) == len(order)
+            and set(fallback_edges).issubset(lattice_edge_set)
+        ):
+            return tuple(sorted(fallback_edges))
+
+    raise ValueError(
+        "could not grow a connected spanning tree within "
+        f"max_virtual_degree={max_virtual_degree} from the requested order"
+    )
 
 
 def _resolve_endpoint(

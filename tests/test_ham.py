@@ -321,6 +321,31 @@ def test_map_builder_supports_3d_snake():
     assert all(map_inv[coord] == idx for idx, coord in map_.items())
 
 
+def test_map_builder_supports_inside_out_mode():
+    """inside-out should be a complete deterministic center-to-edge order."""
+    map_, map_inv = OneDMap.build(4, 4, mode="center-out")
+
+    assert map_[0] == (1, 1)
+    assert {index: map_[index] for index in range(1, 4)} == {
+        1: (1, 2),
+        2: (2, 1),
+        3: (2, 2),
+    }
+    assert len(map_) == len(map_inv) == 16
+    assert set(map_.values()) == {(x, y) for x in range(4) for y in range(4)}
+
+
+def test_map_builder_supports_inside_out_3d_mode():
+    """inside-out should also cover all sites in a 3D lattice."""
+    map_, map_inv = OneDMap.build(3, 3, Lz=3, mode="inside-out")
+
+    assert map_[0] == (1, 1, 1)
+    assert len(map_) == len(map_inv) == 27
+    assert set(map_.values()) == {
+        (x, y, z) for x in range(3) for y in range(3) for z in range(3)
+    }
+
+
 def test_map_builder_supports_row_major_snake_mode():
     """snake-row-major should snake along x within each y row."""
     map_, map_inv = OneDMap.build(3, 2, mode="snake-row-major")

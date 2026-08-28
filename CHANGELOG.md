@@ -18,6 +18,9 @@ Changes for the next release should be added here before the version is bumped.
   tensor networks with 2D/3D coordinate tags, stable 1D logical tags, and
   validated spanning-tree virtual bonds, including PEPS-style `show`, tree
   canonical-center movement, `info_c` synchronization, and compression hooks.
+- Added a hard three-virtual-bond TreePeps rank invariant, explicit local and
+  maximum tensor-rank diagnostics, a workload-aware `TreePepsLayoutFinder`,
+  and Quimb-style 2D Unicode state schematics that show retained tree bonds.
 - Added `left_inds`-backed isometry metadata to `TreePeps`, with canonical
   region recovery, path-only center movement, QR-free canonical edge moves,
   and a center-oriented compression sweep that avoids a redundant full QR.
@@ -27,12 +30,26 @@ Changes for the next release should be added here before the version is bumped.
   optional canonical compression.
 - Added `TreePepsOptimizer` with direct tree-geodesic gate replay and
   `sub_treepepo` span replay, lossless routing, `left_inds`-aware canonical
-  preparation, localized compression, and per-update bond reports.
+  preparation, localized compression, per-update bond reports, persistent
+  `set_gates`/`add_gates` streams, common one-/two-/multi-site aliases, and
+  validated state replacement.
+- Added TreePeps parity helpers for rooted topology traversal, bond-growth
+  estimates and preflight, batched local expectations, dense state-vector
+  conversion, normalization, optimizer state aliases, and truncation reports.
+- Completed TreePeps optimizer parity for state canonicalization aliases,
+  span-local explicit compression, normalization controls, intermediate-bond
+  preflight, profile and transient-bond diagnostics, layout convenience, and
+  chi convergence sweeps with optional dense-reference fidelity.
 - Added `compression_mode="dm"` to the tree, TreePeps, and TreeStab optimizer
   families. It applies Quimb's density-matrix-equivalent local `svd:eig`
   decomposition after the complete state/operator network is fused; the
   existing direct SVD mode remains the default and native fermionic trees keep
   their graded direct-compression path.
+- Added `OneDMap` center-out/inside-out traversal aliases and independent
+  `TreePepsPlan.tree_order` seeds. Row-major, Hilbert, diagonal, and
+  center-out orders can now guide legal degree-bounded virtual trees, and
+  `TreePepsLayoutFinder` compares those deterministic seeds with weighted
+  growth and reports the selected seed.
 
 ## [0.4.1] - 2026-08-27
 

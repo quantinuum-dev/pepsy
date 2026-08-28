@@ -39,6 +39,7 @@ class OneDMap:
         "col-major",
         "hilbert",
         "hilbert-row-major",
+        "inside-out",
         "diag",
         "finder",
     )
@@ -74,6 +75,12 @@ class OneDMap:
         "hilbert-column-major": "hilbert",
         "hilbert-row": "hilbert-row-major",
         "hilbert-row-major": "hilbert-row-major",
+        "inside-out": "inside-out",
+        "insideout": "inside-out",
+        "center-out": "inside-out",
+        "centerout": "inside-out",
+        "center": "inside-out",
+        "outward": "inside-out",
         "diag": "diag",
         "diagonal": "diag",
         "diag-snake": "diag",
@@ -261,6 +268,52 @@ class OneDMap:
     @staticmethod
     def _coords_col_major_3d(L_x, L_y, L_z):
         return [(x, y, z) for z in range(L_z) for y in range(L_y) for x in range(L_x)]
+
+    @staticmethod
+    def _coords_inside_out_2d(L_x, L_y):
+        """Return a deterministic center-to-boundary site ordering.
+
+        This is a *growth ordering*, rather than a Hamiltonian path. Sites
+        are grouped by Manhattan shells around the geometric center and use
+        row-major order to break shell ties. The ordering therefore remains
+        useful for rectangular lattices and for tree builders that attach
+        each new site through an available nearest-neighbor edge.
+        """
+        center_x = L_x - 1
+        center_y = L_y - 1
+        coords = [(x, y) for x in range(L_x) for y in range(L_y)]
+        return sorted(
+            coords,
+            key=lambda coord: (
+                abs(2 * coord[0] - center_x) + abs(2 * coord[1] - center_y),
+                coord[0],
+                coord[1],
+            ),
+        )
+
+    @staticmethod
+    def _coords_inside_out_3d(L_x, L_y, L_z):
+        """Return a deterministic center-to-boundary ordering in 3D."""
+        center_x = L_x - 1
+        center_y = L_y - 1
+        center_z = L_z - 1
+        coords = [
+            (x, y, z)
+            for x in range(L_x)
+            for y in range(L_y)
+            for z in range(L_z)
+        ]
+        return sorted(
+            coords,
+            key=lambda coord: (
+                abs(2 * coord[0] - center_x)
+                + abs(2 * coord[1] - center_y)
+                + abs(2 * coord[2] - center_z),
+                coord[0],
+                coord[1],
+                coord[2],
+            ),
+        )
 
     @staticmethod
     def _coords_snake_2d(L_x, L_y, *, major="col"):
@@ -630,6 +683,12 @@ class OneDMap:
             if Lz is not None:
                 raise NotImplementedError("hilbert mode is currently implemented only for 2D lattices.")
             coords = cls._coords_hilbert_2d(Lx, Ly, major="row")
+        elif mode_norm == "inside-out":
+            coords = (
+                cls._coords_inside_out_2d(Lx, Ly)
+                if Lz is None
+                else cls._coords_inside_out_3d(Lx, Ly, Lz)
+            )
         elif mode_norm == "diag":
             if Lz is not None:
                 raise NotImplementedError("diag mode is currently implemented only for 2D lattices.")

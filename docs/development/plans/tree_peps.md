@@ -2,11 +2,11 @@
 
 ## Status
 
-Geometry/state slice and the first dense operator slice are implemented,
-including `left_inds`-aware canonical movement and compression,
-`TreePepo`, and `TreeSubPepo`. The first `TreePepsOptimizer` replay layer is
-implemented; structured operator backends, layout optimization, and the
-stabilizer optimizer remain planned.
+Geometry/state slice, bounded-degree workload layout, the first dense operator
+slice, and the first optimizer replay layer are implemented, including
+`left_inds`-aware canonical movement and compression, `TreePepo`, and
+`TreeSubPepo`. Structured operator backends and the stabilizer optimizer
+remain planned.
 
 The current implementation provides `TreePepsPlan.from_shape` and
 `TreePeps.from_plan` / `TreePeps.rand` for finite open 2D/3D lattices,
@@ -18,8 +18,26 @@ workflow below remains the implementation roadmap. The current operator
 slice adds exact small dense factorization, product and identity operators,
 dense term sums, support/span/attachment metadata, exact tree-bond fusion on
 application, expectation values, and optional post-application compression.
+`TreePepsLayoutFinder` adds deterministic bounded-degree spanning-tree search
+over the physical lattice. It scores minimal gate spans and weighted routed
+edge loads, compares source, row-major, Hilbert, inside-out, and weighted
+growth seeds (or an explicitly selected `seed_modes` set), then returns an
+ordinary `TreePepsPlan` accepted by all existing TreePeps consumers. The
+shared `OneDMap` now also exposes the center-out ordering for 2D and 3D
+lattices, while the plan turns non-path orderings into legal lattice trees.
 `TreePepsOptimizer` adds direct dense-gate replay and complete `TreeSubPepo`
-replay with span-local compression and update reports.
+replay with span-local compression and update reports. Its stream contract is
+MPS-like: `set_gates` replaces a persistent normalized queue, `add_gates`
+extends it, and `run()` replays it without requiring a new iterable. The
+queue accepts dense one-/multi-site events and explicit `TreePepo`/
+`TreeSubPepo` events, while `set_state` validates plan and backend/device
+compatibility before installing a replacement state.
+The dense state/optimizer also cover the reusable TreeTensorNetwork parity
+surface: rooted topology queries, bond diagnostics, batched local readout,
+state-vector conversion, normalization, canonical-center aliases, conservative
+bond-growth preflight, and replay truncation reports. TTN-specific measurement,
+reset, capping, TreeMPO, native symmetry/fermion, and stabilizer paths remain
+separate phases because their physical-space and topology contracts differ.
 
 This plan defines a new tree-embedded PEPS family for finite 2D and 3D
 lattices. It deliberately does not change the existing `TreeTensorNetwork`,
