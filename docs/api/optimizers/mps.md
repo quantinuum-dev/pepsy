@@ -274,11 +274,12 @@ receives `cutoff_mode="auto"` (now the default), ordinary Pepsy paths use
 MPO `dm` keeps `rsum1`. Passing a concrete string explicitly overrides that
 method default. `None` remains a compatibility alias for `"auto"`.
 
-For example, `mode="quimb-src"` applies each gate with Quimb's Successive
+For dense MPS, `mode="quimb-src"` applies each gate with Quimb's Successive
 Randomized Compression, while `fit_init_strategy="guess-src"` uses SRC to
-build the disposable DMRG/FIT initial guess. The default DMRG policy is now
-`guess-src`, including the one-site phase after the active bonds reach `chi`,
-so FIT always receives the SRC-prepared guess. The equivalent
+build the disposable DMRG/FIT initial guess. For native Symmray/fermionic MPS,
+the default and an explicit `fit_init_strategy="guess-src"` use Symmray's
+sector-preserving randomized SVD (`svd:rand`) instead, so the guess remains
+native and never enters dense SRC. The equivalent
 `fit_init_strategy="guess_src"` spelling is accepted as a compatibility alias
 and is normalized internally to `guess_src`. Set `compression_seed` for reproducible randomized
 MPO replay; `fit_init_seed` controls randomized disposable FIT guesses.
@@ -298,8 +299,9 @@ schedules are unchanged. The strategy can be `direct`, `random`,
 `random_expand`, or `guess-<method>`, where `<method>` is one of the Quimb
 compression methods listed below. The underscore spelling remains accepted for
 compatibility. `auto` selects `guess-src` in both the rank-expansion and
-reached-chi phases. Native Symmray and fermionic states retain their native
-warm-start path. The legacy `fit_mpo_guess=False` switch still disables the
+reached-chi phases. Native Symmray and fermionic states use the native
+sector-preserving randomized guess by default as well. The legacy
+`fit_mpo_guess=False` switch still disables the
 default named-mode guess. Both the target and the guess remain separate from
 the live MPS. The fixed expansion handoff remains two two-site sweeps followed
 by one one-site sweep; a window already at its attainable `chi` ceiling uses
@@ -320,7 +322,9 @@ two-site gate span automatically falls back to `fit_block_size=2`. Both block
 sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
 optimizer's `fit_init_strategy` chooses whether a disposable FIT guess is
 direct, randomly perturbed at fixed rank, randomly expanded on active bonds,
-or `guess-<method>` compressed by Quimb. The available methods are
+or `guess-<method>` compressed by Quimb. For native Symmray/fermionic states,
+`guess-src` is implemented by native randomized SVD while the other
+Quimb-specific guess methods retain their native direct fallback. The available methods are
 `direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
 `src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
@@ -455,8 +459,9 @@ methods selected through `guess-<method>`. Because the default is
 `fit_init_strategy="guess-src"`, no random perturbation or random bond
 expansion is used unless a random strategy is selected explicitly.
 FIT never copies the target into `fit.p` and never uses a target warm start.
-Native nonlocal gates retain their graded auto-swap/sector-growth preparation
-and never receive dense random padding.
+Native nonlocal gates retain their graded auto-swap/sector-growth preparation;
+the native `guess-src` path adds only sector-preserving randomized SVD on a
+disposable copy and never uses dense random padding.
 
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate

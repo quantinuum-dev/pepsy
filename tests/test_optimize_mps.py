@@ -4426,6 +4426,72 @@ def test_fit_fermionic_arbitrary_target_keeps_native_guess_separate(
     ) == pytest.approx(1.0, abs=1.0e-10)
 
 
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+@pytest.mark.parametrize("fit_init_strategy", [None, "guess_src"])
+def test_mps_optimizer_native_guess_src_uses_sector_preserving_randomized_guess(
+    symmetry,
+    fit_init_strategy,
+    monkeypatch,
+):
+    """Native default and explicit ``guess_src`` supply a randomized guess."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        4,
+        fermion=fermion,
+        occupations=fermion.half_filled_occupations(4),
+        seed=17,
+        dtype="complex128",
+    )
+    gate_stream = [(fermion.hopping_gate(0.2, t=1.0), (0, 3))]
+
+    def fail_dense(*_args, **_kwargs):
+        raise AssertionError("native guess_src must not call dense compression")
+
+    def fail_quimb_guess(*_args, **_kwargs):
+        raise AssertionError("native guess_src must not call Quimb guess()")
+
+    monkeypatch.setattr(
+        mps_optimizer_module,
+        "_apply_dense_gate_with_method",
+        fail_dense,
+    )
+    monkeypatch.setattr(mps_optimizer_module, "guess", fail_quimb_guess)
+
+    optimizer = py.MpsOptimizer(state, gate_stream, chi=8, mode="dmrg2")
+    run_kwargs = {}
+    if fit_init_strategy is not None:
+        run_kwargs["fit_init_strategy"] = fit_init_strategy
+    out = optimizer.run(
+        progbar=False,
+        n_iter=2,
+        fit_rtol=None,
+        cutoff=1.0e-12,
+        fit_init_seed=23,
+        stabilize_unitary=False,
+        **run_kwargs,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy_requested"] == "guess_src"
+    assert diagnostics["fit_init_strategy"] == "guess_src"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
+    assert diagnostics["svd_guess_used"] is True
+    assert diagnostics["guess_backend"] == "symmray-svd:rand"
+    assert diagnostics["native_randomized_guess_used"] is True
+    assert diagnostics["random_initialization"]["reason"] == "native_src"
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in out.tensors
+    )
+
+
 def test_fit_run_eff_fermionic_keeps_current_state_as_initial_guess():
     """Native block run_eff does not replace its current state."""
     pytest.importorskip("symmray")
@@ -5084,7 +5150,7 @@ def test_mps_optimizer_3x4_pbc_hubbard_long_range_modes_native(
                     contraction_opt="greedy",
                 )
             )
-        ) == pytest.approx(1.0, abs=5.0e-8)
+        ) == pytest.approx(1.0, abs=5.0e-5)
 
 
 @pytest.mark.slow

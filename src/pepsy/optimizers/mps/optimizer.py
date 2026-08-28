@@ -2522,6 +2522,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         max_bond=None,
         info=None,
         swap_back=True,
+        method=None,
+        seed=None,
     ):
         """Apply a Symmray two-site gate through quimb's block-aware swaps."""
         cutoff, cutoff_mode = self._symmray_structural_zero_cutoff(
@@ -2535,6 +2537,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         }
         if max_bond is not None:
             compress_opts["max_bond"] = max_bond
+        if method is not None:
+            compress_opts["method"] = method
+        if seed is not None:
+            compress_opts["seed"] = seed
         if info is None:
             info = self.info_c
         if not self._native_needs_safe_qr(p):
@@ -4756,18 +4762,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``"guess-src"`` policy. New code should use
             ``fit_init_strategy`` explicitly. Dense DMRG uses the disposable
             SRC guess in both the expansion and one-site/reached-chi phases.
-            This does not replace the exact FIT target or live MPS. Native
-            Symmray and fermionic routes retain their native warm-start path.
+            Native Symmray and fermionic routes use a disposable
+            sector-preserving randomized guess for the ``guess-src`` policy;
+            this does not replace the exact FIT target or live MPS.
         fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}, default="guess-src"
             Select the disposable FIT initial guess. ``"direct"`` uses the
             current MPS, ``"random"`` perturbs existing tensors without
             changing bond dimensions, ``"random_expand"`` adds seeded
             directions on under-capacity active bonds, and
             ``"guess-<method>"`` uses the corresponding Quimb compression
-            method on an isolated copy. ``"auto"`` and the default select
-            ``"guess-src"`` in both expansion and reached-chi phases. The
-            underscore spelling ``"guess_<method>"`` remains accepted as a
-            compatibility alias.
+            method on an isolated copy. For native Symmray/fermionic states,
+            ``"guess-src"`` instead uses Symmray's sector-preserving
+            randomized SVD on an isolated copy; other Quimb guess methods
+            retain the native direct fallback. ``"auto"`` and the default
+            select ``"guess-src"`` in both expansion and reached-chi phases.
+            On native Symmray/fermionic states this is the sector-preserving
+            randomized guess. The underscore spelling ``"guess_<method>"``
+            remains accepted as a compatibility alias.
         fit_init_rand_strength : float, default=0.0
             For dense two- and three-site FIT growth windows that are below
             their attainable physical/``chi`` bond ceilings, seed a
@@ -4781,7 +4792,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_seed : int, default=0
             Deterministic seed for ``"random"`` and ``"random_expand"`` FIT
             guesses and randomized Quimb methods selected through
-            ``"guess-<method>"``. The underscore spelling is also accepted.
+            ``"guess-<method>"``. Native ``guess-src`` uses the same seed for
+            Symmray randomized SVD. The underscore spelling is also accepted.
             The gate position is mixed into the
             per-window stream so repeated runs are reproducible without
             sharing a global RNG.
@@ -7405,6 +7417,89 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         return guess_mps
 
+    def _native_src_fit_guess_enabled(
+        self,
+        strategy,
+        fit_mpo_guess,
+    ):
+        """Return whether the native Symmray SRC-style guess is requested."""
+        requested_strategy = self._validate_fit_init_strategy(strategy)
+        if requested_strategy == "auto":
+            requested_strategy = _DEFAULT_FIT_INIT_STRATEGY
+        if requested_strategy != "guess_src":
+            return False
+        if (
+            not fit_mpo_guess
+            and self._dmrg_mode_alias in {"dmrg1", "dmrg3"}
+            and str(strategy).strip().lower() in {"auto", _DEFAULT_FIT_INIT_STRATEGY}
+        ):
+            return False
+        return True
+
+    def _build_native_randomized_fit_guess(
+        self,
+        p,
+        gates,
+        wheres,
+        *,
+        cutoff,
+        cutoff_mode,
+        seed,
+    ):
+        """Build a native Symmray SRC-style FIT guess.
+
+        Quimb's dense SRC compressor cannot preserve Symmray charge sectors or
+        fermionic dummy-mode metadata. Symmray does expose a native randomized
+        truncated SVD, however, so apply the gate sequence on a disposable
+        native MPS using ``svd:rand`` at every two-site split. This provides the
+        same randomized compressed warm-start role without constructing a dense
+        gate, MPO, or random dense tensor.
+        """
+        if not (self._has_symmray_data(p) and p.isfermionic()):
+            raise TypeError(
+                "native randomized FIT guesses require native Symmray "
+                "fermionic data."
+            )
+
+        guess_mps = p.copy(deep=True)
+        guess_info = {}
+        for index, (gate, where) in enumerate(zip(gates, wheres)):
+            where = tuple(int(site) for site in where)
+            if len(where) == 1:
+                self._apply_gate(
+                    guess_mps,
+                    gate,
+                    where,
+                    contract=True,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    inplace=True,
+                )
+            elif len(where) == 2:
+                self._apply_symmray_auto_swap_gate(
+                    guess_mps,
+                    gate,
+                    where,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    max_bond=self.chi,
+                    info=guess_info,
+                    method="svd:rand",
+                    seed=int(seed) + index,
+                )
+            else:
+                raise ValueError(
+                    "Native randomized FIT guesses support one- or two-site "
+                    "gates only."
+                )
+
+        return guess_mps, {
+            "backend": "symmray",
+            "method": "svd:rand",
+            "seed": int(seed),
+            "gate_count": len(gates),
+        }
+
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
         """Generate deterministic random data and convert it to ``data``'s backend."""
@@ -7569,6 +7664,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         submpo=False,
+        native_source=None,
     ):
         """Select the disposable FIT guess without changing the live MPS."""
         requested_strategy = self._validate_fit_init_strategy(strategy)
@@ -7587,9 +7683,37 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "guess_method": None,
             "guess_used": False,
             "svd_guess_used": False,
+            "guess_backend": None,
+            "native_randomized_guess_used": False,
             "random_initialization": info,
         }
         if self._has_symmray_data(p) or p.isfermionic():
+            if (
+                not submpo
+                and native_source is not None
+                and self._native_src_fit_guess_enabled(
+                    requested_strategy,
+                    fit_mpo_guess,
+                )
+            ):
+                fit_guess, native_info = self._build_native_randomized_fit_guess(
+                    native_source,
+                    gates,
+                    wheres,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    seed=seed,
+                )
+                info.update(native_info)
+                info["reason"] = "native_src"
+                result["fit_guess"] = fit_guess
+                result["strategy"] = "guess_src"
+                result["guess_method"] = "src"
+                result["guess_used"] = True
+                result["svd_guess_used"] = True
+                result["guess_backend"] = "symmray-svd:rand"
+                result["native_randomized_guess_used"] = True
+                return result
             info["reason"] = (
                 "native_sector_growth"
                 if int(block_size) in {2, 3}
@@ -9594,6 +9718,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         if fit_state_snapshot is not None
                         else None
                     )
+                    native_fit_guess_source = None
+                    if (
+                        not is_submpo
+                        and self._has_symmray_data(p)
+                        and self._native_src_fit_guess_enabled(
+                            fit_init_strategy,
+                            fit_mpo_guess,
+                        )
+                    ):
+                        native_fit_guess_source = (
+                            fit_state_snapshot
+                            if fit_state_snapshot is not None
+                            else p.copy(deep=True)
+                        )
 
                     if is_submpo:
                         # An explicit sub-MPO is already the operator target;
@@ -9675,6 +9813,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             seed=fit_guess_seed,
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
+                            native_source=native_fit_guess_source,
                         )
                     fit_guess = fit_initialization["fit_guess"]
                     svd_guess_used = fit_initialization["svd_guess_used"]
@@ -9754,6 +9893,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "svd_guess_used": bool(svd_guess_used),
                             "guess_used": bool(fit_initialization["guess_used"]),
                             "guess_method": fit_initialization["guess_method"],
+                            "guess_backend": fit_initialization.get(
+                                "guess_backend"
+                            ),
+                            "native_randomized_guess_used": bool(
+                                fit_initialization.get(
+                                    "native_randomized_guess_used", False
+                                )
+                            ),
                             "fit_init_strategy": fit_initialization["strategy"],
                             "fit_init_strategy_requested": fit_initialization[
                                 "requested_strategy"
@@ -9913,6 +10060,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         if fit_state_snapshot is not None
                         else None
                     )
+                    native_fit_guess_source = None
+                    if (
+                        self._has_symmray_data(p)
+                        and self._native_src_fit_guess_enabled(
+                            fit_init_strategy,
+                            fit_mpo_guess,
+                        )
+                    ):
+                        native_fit_guess_source = (
+                            fit_state_snapshot
+                            if fit_state_snapshot is not None
+                            else p.copy(deep=True)
+                        )
                     p_g = self._timed_call(
                         "dmrg.target",
                         self._build_dmrg_batch_target,
@@ -9960,6 +10120,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         ),
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
+                        native_source=native_fit_guess_source,
                     )
                     fit_guess = fit_initialization["fit_guess"]
                     random_initialization = fit_initialization[
@@ -10030,6 +10191,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             ),
                             "guess_used": bool(fit_initialization["guess_used"]),
                             "guess_method": fit_initialization["guess_method"],
+                            "guess_backend": fit_initialization.get(
+                                "guess_backend"
+                            ),
+                            "native_randomized_guess_used": bool(
+                                fit_initialization.get(
+                                    "native_randomized_guess_used", False
+                                )
+                            ),
                             "fit_init_strategy": fit_initialization["strategy"],
                             "fit_init_strategy_requested": fit_initialization[
                                 "requested_strategy"
