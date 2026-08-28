@@ -70,5 +70,31 @@ value = gate.expectation(state)
 legs. `TreeSubPepo` records the physical support and its connected tree span;
 applying it fuses operator bonds into the state tree before optional
 canonical compression. The full design and the future
-`TreePepsOptimizer`/`TreePepsStabOptimizer` interfaces are documented in the
-development plan.
+`TreePepsStabOptimizer` interface are documented in the development plan.
+
+`TreePepsOptimizer` owns a state copy by default and supports the two update
+paths:
+
+```python
+from pepsy.optimizers import TreePepsOptimizer
+
+direct = TreePepsOptimizer(state, mode="direct", chi=16)
+direct.apply_gate(dense_gate, where=(0, 5))
+
+subtree = TreePepsOptimizer(state, mode="sub_treepepo", chi=16)
+subtree.apply(subop)
+```
+
+Direct gates are factorized over the unique tree path between their sites.
+`TreeSubPepo` updates fuse the complete connected span before one localized
+leaf-to-center compression sweep. Both paths keep intermediate routing
+lossless and use `left_inds`-aware canonical movement.
+
+Compression is selected independently from the operator route with
+`compression_mode="direct"` (the default SVD decomposition) or
+`compression_mode="dm"` (Quimb's density-matrix-equivalent `svd:eig`
+decomposition of the local fused compression core). In either case the state
+is canonicalized around the active span first, the PEPO is fused locally with
+the state, and only then are the combined tree bonds truncated. No global
+dense lattice state is formed. For convenience, `mode="dm"` is accepted as a
+shorthand for direct TreePepo routing with `compression_mode="dm"`.

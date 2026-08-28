@@ -18,6 +18,13 @@ reuse TreeOptimizer's Quimb MPO tag lookup, lossless QR routing, and one final
 subtree compression sweep; a payload without that MPO interface is the only
 case that uses the bounded dense fallback.
 
+TreeStab also forwards `compression_mode="direct"` or `"dm"` to its coefficient
+`TreeOptimizer`. DM mode selects the density-matrix-equivalent local
+`svd:eig` decomposition after the complete coefficient operator and tree
+state have been fused. It does not canonicalize or compress the operator
+separately, and it does not build a global dense state. `mode="dm"` remains a
+convenience shorthand for automatic coefficient routing with DM compression.
+
 Dense non-Clifford gates are Pauli-decomposed through ``C† G C`` in the
 coefficient frame, then compiled into compact Tree-native ``TreeMPO``/TTNO
 operators. The same applies to one-site, two-site, and wider coefficient-frame

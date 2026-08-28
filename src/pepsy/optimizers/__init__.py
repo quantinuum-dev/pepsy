@@ -56,6 +56,7 @@ _SYMBOL_MODULES = {
     "TreePepsGeometry": ".tree_peps",
     "TreePepo": ".tree_peps",
     "TreeSubPepo": ".tree_peps",
+    "TreePepsOptimizer": ".tree_peps",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",
     "CoalescedMeasurementRecord": ".noise",

@@ -25,6 +25,14 @@ Changes for the next release should be added here before the version is bumped.
   input/output legs, support/span metadata, exact dense-factorized gates,
   term sums, tree-bond fusion on application, expectation values, and
   optional canonical compression.
+- Added `TreePepsOptimizer` with direct tree-geodesic gate replay and
+  `sub_treepepo` span replay, lossless routing, `left_inds`-aware canonical
+  preparation, localized compression, and per-update bond reports.
+- Added `compression_mode="dm"` to the tree, TreePeps, and TreeStab optimizer
+  families. It applies Quimb's density-matrix-equivalent local `svd:eig`
+  decomposition after the complete state/operator network is fused; the
+  existing direct SVD mode remains the default and native fermionic trees keep
+  their graded direct-compression path.
 
 ## [0.4.1] - 2026-08-27
 

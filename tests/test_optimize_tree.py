@@ -262,6 +262,46 @@ def test_tree_cutoff_defaults_are_dtype_aware():
     assert opt.copy().cutoff_mode == "rsum2"
 
 
+def test_tree_dm_compression_uses_the_fused_operator_state_network():
+    """DM mode changes the local truncating decomposition, not routing."""
+    plan = TreePlan.from_order(range(2), structure="balanced", top_arity=2)
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    stream = [(hadamard, 0), (cnot, (0, 1))]
+
+    direct = TreeOptimizer(
+        stream,
+        n=2,
+        tree=plan,
+        chi=1,
+        cutoff=0.0,
+        compression_mode="direct",
+    )
+    dm = TreeOptimizer(
+        stream,
+        n=2,
+        tree=plan,
+        chi=1,
+        cutoff=0.0,
+        compression_mode="dm",
+    )
+
+    np.testing.assert_allclose(direct.to_dense(), dm.to_dense(), atol=1e-10)
+    assert dm.compression_mode == "dm"
+    assert dm.copy().compression_mode == "dm"
+    assert dm.tn.validate(check_canonical=True) is dm.tn
+
+
+def test_tree_dm_mode_is_a_shorthand_for_direct_routing():
+    opt = TreeOptimizer(None, n=2, mode="dm", run=False)
+
+    assert opt.mode == "auto"
+    assert opt.compression_mode == "dm"
+
+
 def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
     """Every dense path-thread Q keeps its toward-destination isometry."""
     rng = np.random.default_rng(919)

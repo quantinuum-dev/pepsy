@@ -118,6 +118,7 @@ TreePlan
 TreePeps
 TreePepsGeometry
 TreePepsPlan
+TreePepsOptimizer
 TreePepo
 TreeSubPepo
 TreeSampleResult

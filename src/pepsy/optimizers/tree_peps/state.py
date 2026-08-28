@@ -14,6 +14,30 @@ from .plan import TreePepsPlan
 __all__ = ["TreePeps"]
 
 
+def _normalize_compression_mode(mode):
+    """Normalize the local bond-compression decomposition mode."""
+
+    mode = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "svd": "direct",
+        "eigh": "dm",
+        "density_matrix": "dm",
+        "densitymatrix": "dm",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"direct", "dm"}:
+        raise ValueError(
+            "compression_mode must be 'direct' or 'dm'."
+        )
+    return mode
+
+
+def _compression_method(mode):
+    """Return the Quimb decomposition used by a compression mode."""
+
+    return "svd:eig" if _normalize_compression_mode(mode) == "dm" else "svd"
+
+
 class TreePeps(qtn.TensorNetworkGenVector):
     """A lattice-aware tensor network with a tree of virtual bonds.
 
@@ -899,6 +923,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         cutoff_mode="rsum2",
         absorb="right",
         reduced=True,
+        compression_mode="direct",
         inplace=False,
         info_c=None,
         **compress_opts,
@@ -918,6 +943,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             cutoff_mode=cutoff_mode,
             absorb=absorb,
             reduced=reduced,
+            compression_mode=compression_mode,
             info_c=info_c,
             **compress_opts,
         )
@@ -933,10 +959,16 @@ class TreePeps(qtn.TensorNetworkGenVector):
         cutoff_mode="rsum2",
         absorb="right",
         reduced=True,
+        compression_mode="direct",
         info_c=None,
         **compress_opts,
     ):
-        """In-place compression of one edge with canonical-center tracking."""
+        """In-place compression of one edge with canonical-center tracking.
+
+        ``compression_mode="direct"`` uses SVD and ``"dm"`` uses the
+        density-matrix-equivalent local ``svd:eig`` decomposition after the
+        state has been brought into the required tree gauge.
+        """
 
         return self._compress_edge_inplace(
             site0,
@@ -946,6 +978,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             cutoff_mode=cutoff_mode,
             absorb=absorb,
             reduced=reduced,
+            compression_mode=compression_mode,
             info_c=info_c,
             **compress_opts,
         )
@@ -960,6 +993,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         cutoff_mode="rsum2",
         absorb="right",
         reduced=True,
+        compression_mode="direct",
         info_c=None,
         **compress_opts,
     ):
@@ -979,6 +1013,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
             if max_bond < 1:
                 raise ValueError("max_bond must be at least one")
 
+        compression_mode = _normalize_compression_mode(compression_mode)
+
         bond = self.bond(q0, q1)
         before_bond = int(self.ind_size(bond))
         if cutoff == 0.0 and (max_bond is None or before_bond <= max_bond):
@@ -990,6 +1026,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 **compress_opts,
             )
 
+        compress_opts.setdefault("method", _compression_method(compression_mode))
         previous = self.orthogonality_center
         qtn.TensorNetworkGenVector.compress_between(
             self,
@@ -1024,6 +1061,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         cutoff=1e-10,
         cutoff_mode="rsum2",
         reduced=True,
+        compression_mode="direct",
         info_c=None,
     ):
         """Compress the tree inward toward a selected canonical center."""
@@ -1058,6 +1096,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb="right",
                 reduced=reduced,
+                compression_mode=compression_mode,
             )
         # The inward sweep has already established the defining isometries.
         # Record the final center directly instead of running a second full
@@ -1067,6 +1106,107 @@ class TreePeps(qtn.TensorNetworkGenVector):
         self.validate(check_canonical=True)
         self._sync_info_c(info_c)
         return self
+
+    def compress_subtree(
+        self,
+        sites,
+        *,
+        span=False,
+        center=None,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        reduced=True,
+        compression_mode="direct",
+        inplace=False,
+        info_c=None,
+    ):
+        """Compress only the connected region spanned by ``sites``.
+
+        Tensors outside the region are first made isometric towards it, using
+        the existing ``left_inds`` proofs whenever possible.  Internal region
+        edges are then compressed once in a leaf-to-center sweep.  Exterior
+        branches and their boundary bonds are not touched.
+        """
+
+        if isinstance(sites, Integral):
+            sites = (sites,)
+        sites = tuple(self.plan.resolve_site(site) for site in sites)
+        region = self.plan.subtree_span(sites) if span else frozenset(sites)
+        if not region or not self.plan.is_connected(region):
+            raise ValueError("sites must form a connected subtree, or pass span=True")
+
+        work = self if inplace else self.copy()
+        if center is None:
+            center = min(
+                region,
+                key=lambda q: (
+                    max(len(work.plan.path(q, other)) for other in region),
+                    sum(len(work.plan.path(q, other)) for other in region),
+                    q,
+                ),
+            )
+        center = work.plan.resolve_site(center)
+        if center not in region:
+            raise ValueError("center must lie inside the compressed subtree")
+
+        if work.canonical_region != frozenset(region) or not work.is_subtree_canonical_form(region):
+            work._canonicalize_region_fast(region)
+            work._canonical_region = frozenset(region)
+            work._set_isometry_metadata_from_region(region)
+
+        if len(region) > 1:
+            work._recover_center_from_region(region, center)
+            order = sorted(
+                (q for q in region if q != center),
+                key=lambda q: (-len(work.plan.path(q, center)), q),
+            )
+            for q in order:
+                toward = work.plan.path(q, center)[1]
+                work._compress_edge_inplace(
+                    q,
+                    toward,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    absorb="right",
+                    reduced=reduced,
+                    compression_mode=compression_mode,
+                )
+
+        work._canonical_region = frozenset({center})
+        work._set_isometry_metadata_from_region({center})
+        work.validate(check_canonical=True)
+        work._sync_info_c(info_c)
+        return work
+
+    def compress_subtree_(
+        self,
+        sites,
+        *,
+        span=False,
+        center=None,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        reduced=True,
+        compression_mode="direct",
+        info_c=None,
+    ):
+        """In-place alias for :meth:`compress_subtree`."""
+
+        return self.compress_subtree(
+            sites,
+            span=span,
+            center=center,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            reduced=reduced,
+            compression_mode=compression_mode,
+            inplace=True,
+            info_c=info_c,
+        )
 
     def _bond_dim(self, site0, site1):
         """Return a live tree-bond dimension for display."""

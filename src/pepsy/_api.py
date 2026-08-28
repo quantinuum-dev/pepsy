@@ -183,6 +183,7 @@ _SYMBOL_MODULES = {
     "TreePepsGeometry": ".optimizers",
     "TreePepo": ".optimizers",
     "TreeSubPepo": ".optimizers",
+    "TreePepsOptimizer": ".optimizers",
     "build_tree_operator": ".optimizers",
     "square_lattice_zigzag": ".optimizers",
     "TreeStabOptimizer": ".optimizers",

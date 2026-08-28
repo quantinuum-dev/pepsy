@@ -4,8 +4,9 @@
 
 Geometry/state slice and the first dense operator slice are implemented,
 including `left_inds`-aware canonical movement and compression,
-`TreePepo`, and `TreeSubPepo`. Structured operator backends, layout
-optimization, and the optimizer family remain planned.
+`TreePepo`, and `TreeSubPepo`. The first `TreePepsOptimizer` replay layer is
+implemented; structured operator backends, layout optimization, and the
+stabilizer optimizer remain planned.
 
 The current implementation provides `TreePepsPlan.from_shape` and
 `TreePeps.from_plan` / `TreePeps.rand` for finite open 2D/3D lattices,
@@ -17,6 +18,8 @@ workflow below remains the implementation roadmap. The current operator
 slice adds exact small dense factorization, product and identity operators,
 dense term sums, support/span/attachment metadata, exact tree-bond fusion on
 application, expectation values, and optional post-application compression.
+`TreePepsOptimizer` adds direct dense-gate replay and complete `TreeSubPepo`
+replay with span-local compression and update reports.
 
 This plan defines a new tree-embedded PEPS family for finite 2D and 3D
 lattices. It deliberately does not change the existing `TreeTensorNetwork`,
@@ -384,6 +387,15 @@ alias for the existing `TreeMPO`, whose geometry is currently tied to
 - state replacement and copy semantics with no implicit lossy relayout;
 - backend/device/dtype validation at stream boundaries;
 - norm, bond, compression, and timing diagnostics.
+
+Its compression selector is separate from the operator route: the default
+`compression_mode="direct"` uses local SVD truncation, while
+`compression_mode="dm"` uses Quimb's density-matrix-equivalent `svd:eig`
+decomposition on the fused state/PEPO compression core. The optimizer must
+canonicalize the state around the active span, fuse the complete operator,
+and only then choose the truncation decomposition. It must never
+canonicalize the PEPO independently as a substitute for canonicalizing the
+combined network, and it must not materialize a global dense state.
 
 Its central method should accept a single protocol rather than a collection
 of special cases:

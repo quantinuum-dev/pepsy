@@ -77,7 +77,11 @@ from .layout import (
     _normalize_time_window,
     _submpo_schmidt_rank_bound,
 )
-from .ttn import TreeTensorNetwork, _contract_two_tensors
+from .ttn import (
+    TreeTensorNetwork,
+    _contract_two_tensors,
+    _normalize_compression_mode,
+)
 
 __all__ = ["TreeOptimizer"]
 
@@ -400,7 +404,7 @@ class TreeOptimizer:
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
         convention, ``"rsum2"``. Use ``"rel"`` for a relative
         largest-singular-value threshold.
-    mode : {"auto", "direct", "mpo", "submpo"}
+    mode : {"auto", "direct", "mpo", "submpo", "dm"}
         Implementation used for two-site gates and explicit operator streams.
         ``"direct"`` uses the specialised gate-SVD/QR path. ``"mpo"`` first
         factorises ordinary two-site gates with Quimb into a two-tensor
@@ -410,7 +414,13 @@ class TreeOptimizer:
         entries and replays the MPO payloads natively.
         Explicit sub-MPO entries are also accepted in the other modes for
         backward compatibility. ``"auto"`` (the default) selects direct
-        threading for ordinary two-site gates.
+        threading for ordinary two-site gates. ``"dm"`` is a shorthand for
+        ``mode="auto", compression_mode="dm"``.
+    compression_mode : {"direct", "dm"}
+        Decomposition used when truncating the already fused state/operator
+        network. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
+        density-matrix-equivalent ``svd:eig`` decomposition on the local
+        canonical compression core. This does not build a global dense state.
     structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
     max_arity : int, None, or iterable of ints
@@ -543,6 +553,12 @@ class TreeOptimizer:
         return mode
 
     @staticmethod
+    def _normalize_compression_mode(mode):
+        """Validate the decomposition used for fused-network truncation."""
+
+        return _normalize_compression_mode(mode)
+
+    @staticmethod
     def _normalize_max_bond(max_bond):
         """Validate an optional per-update bond cap."""
         if max_bond is None:
@@ -585,6 +601,7 @@ class TreeOptimizer:
     def __init__(self, gates=None, n=None, *, chi=64,
                  cutoff=_DEFAULT_CUTOFF,
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
+                 compression_mode="direct",
                  two_site_mode=None,
                  structure="quality", max_arity=2,
                  top_arity=_DEFAULT_TOP_ARITY,
@@ -748,10 +765,22 @@ class TreeOptimizer:
         self._logical_qubits = list(range(self.n))
         self._logical_positions = {q: q for q in self._logical_qubits}
 
+        compression_mode = self._normalize_compression_mode(compression_mode)
+        raw_mode = str(mode).strip().lower().replace("-", "_")
+        if raw_mode == "dm":
+            if compression_mode not in {"direct", "dm"}:
+                raise ValueError(
+                    "mode='dm' cannot be combined with a different "
+                    "compression_mode."
+                )
+            compression_mode = "dm"
+            raw_mode = "auto"
+
         self.chi = self._normalize_max_bond(chi)
         self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
-        self.mode = self._normalize_mode(mode)
+        self.mode = self._normalize_mode(raw_mode)
+        self.compression_mode = compression_mode
         if two_site_mode is not None:
             legacy_mode = self._normalize_mode(two_site_mode)
             if self.mode != "auto" and self.mode != legacy_mode:
@@ -1946,6 +1975,7 @@ class TreeOptimizer:
             cutoff=self.cutoff,
             cutoff_mode=self.cutoff_mode,
             mode=self.mode,
+            compression_mode=self.compression_mode,
             structure=self.structure,
             max_arity=self.max_arity,
             top_arity=self.top_arity,
@@ -3069,6 +3099,7 @@ class TreeOptimizer:
         *,
         progbar=False,
         mode=None,
+        compression_mode=None,
         non_unitary=False,
         normalize_every=False,
         normalize_final=False,
@@ -3110,12 +3141,16 @@ class TreeOptimizer:
             truncation proxy ``1 - (norm / reference_norm)**2``; the reference
             is established at run start and reset after control/non-unitary
             events.
-        mode : {"auto", "direct", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
+        mode : {"auto", "direct", "mpo", "submpo", "dm"} | {"tree", "ttn"} | None, default=None
             Optional persistent gate/sub-MPO replay selection: a supplied
             value updates :attr:`mode` before replay and remains active for
             future runs and copies. ``"submpo"`` validates an explicit MPO
             stream; ``"tree"``/``"ttn"`` are deprecated no-op compatibility
             selectors for shared coefficient frontends.
+            ``"dm"`` selects automatic gate routing with density-matrix
+            compression.
+        compression_mode : {"direct", "dm"} | None, default=None
+            Persistent decomposition used for fused-network truncation.
         non_unitary : bool, default=False
             Mark the stream as non-unitary when using automatic working-scale
             control.
@@ -3159,7 +3194,15 @@ class TreeOptimizer:
                     stacklevel=2,
                 )
             else:
-                self.mode = self._normalize_mode(requested_mode)
+                if requested_mode == "dm":
+                    self.mode = "auto"
+                    self.compression_mode = "dm"
+                else:
+                    self.mode = self._normalize_mode(requested_mode)
+        if compression_mode is not None:
+            self.compression_mode = self._normalize_compression_mode(
+                compression_mode
+            )
         non_unitary = bool(non_unitary)
         if track_infidelity is not None:
             self.track_infidelity = bool(track_infidelity)
@@ -3204,6 +3247,8 @@ class TreeOptimizer:
                 child_kwargs = dict(run_kwargs or {})
             if mode is not None:
                 child_kwargs.setdefault("mode", mode)
+            if compression_mode is not None:
+                child_kwargs.setdefault("compression_mode", compression_mode)
             child_kwargs.setdefault("track_infidelity", track_infidelity)
             child_kwargs.setdefault("progbar", progbar)
             stream = self._trajectory_gate_stream() if gates is None else gates
@@ -4465,7 +4510,7 @@ class TreeOptimizer:
 
     def _compress_edge_with_diagnostics(
         self, u, v, *, max_bond=None, cutoff=None, reduced=True,
-        reduction_proven=False,
+        reduction_proven=False, compression_mode=None,
     ):
         """Compress one live tree edge and record its truncation diagnostics."""
         profile_started = time.perf_counter() if self.profile else None
@@ -4473,6 +4518,9 @@ class TreeOptimizer:
             self.chi if max_bond is None else self._normalize_max_bond(max_bond)
         )
         cutoff = self.cutoff if cutoff is None else float(cutoff)
+        compression_mode = self._normalize_compression_mode(
+            self.compression_mode if compression_mode is None else compression_mode
+        )
         bond_before = self.tn.bond(u, v)
         before_bond = int(self.tn.ind_size(bond_before))
         lossless = (
@@ -4521,6 +4569,7 @@ class TreeOptimizer:
         self.tn.compress_edge_(
             u, v, max_bond=max_bond, cutoff=cutoff, absorb="right",
             cutoff_mode=self.cutoff_mode, reduced=reduced,
+            compression_mode=compression_mode,
             _reduction_proven=reduction_proven,
         )
         bond_after = self.tn.bond(u, v)
@@ -4563,8 +4612,14 @@ class TreeOptimizer:
                 or parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in parameters
             )
+            supports_compression_mode = any(
+                parameter.name == "compression_mode"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
         except (TypeError, ValueError):
             supports_proof = True
+            supports_compression_mode = True
         kwargs = {
             "max_bond": max_bond,
             "cutoff": cutoff,
@@ -4572,6 +4627,8 @@ class TreeOptimizer:
         }
         if supports_proof:
             kwargs["reduction_proven"] = reduction_proven
+        if supports_compression_mode:
+            kwargs["compression_mode"] = self.compression_mode
         return method(u, v, **kwargs)
 
     def _metadata_aware_reduction(self, u, v):
@@ -6907,6 +6964,7 @@ class TreeOptimizer:
             cutoff=self.cutoff,
             cutoff_mode=self.cutoff_mode,
             mode=self.mode,
+            compression_mode=self.compression_mode,
             structure=self.structure,
             max_arity=self.max_arity,
             top_arity=self.top_arity,
@@ -7298,5 +7356,6 @@ class TreeOptimizer:
     def __repr__(self):
         return (
             f"TreeOptimizer(n={self.n}, chi={self.chi}, "
+            f"compression_mode={self.compression_mode!r}, "
             f"max_bond={self.max_bond()}, gates={len(self.G)})"
         )

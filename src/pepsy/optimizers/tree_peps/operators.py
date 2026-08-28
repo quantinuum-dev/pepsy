@@ -1063,6 +1063,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         cutoff=1e-10,
         cutoff_mode="rsum2",
         reduced=True,
+        _active_sites=None,
     ):
         """Apply this operator and return a valid ``TreePeps`` state.
 
@@ -1081,8 +1082,21 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             raise ValueError("TreePepo and TreePeps must use the same tree plan")
         self.validate()
         state.validate()
+        if _active_sites is None:
+            active_sites = frozenset(state.sites)
+        else:
+            active_sites = frozenset(
+                _normalize_sites(state.plan, _active_sites, name="active_sites")
+            )
+            if self.operator_span is None:
+                active_sites = frozenset(state.sites)
+            elif not self.operator_span.issubset(active_sites):
+                raise ValueError("active_sites must contain the complete operator span")
         tensors = []
         for q in state.sites:
+            if q not in active_sites:
+                tensors.append(state.node_tensor(q).copy())
+                continue
             state_tensor = state.node_tensor(q)
             operator_tensor = self.node_tensor(q)
             state_phys = state.site_ind(q)

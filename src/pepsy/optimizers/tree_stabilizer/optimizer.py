@@ -48,7 +48,6 @@ from ..mps.optimizer import conditional_event_parts, submpo_event_parts
 from ..tree.layout import TreeLayoutFinder, TreePlan, _DEFAULT_TOP_ARITY
 from ..tree.optimizer import (
     TreeOptimizer,
-    _DEFAULT_CUTOFF,
     _DEFAULT_CUTOFF_MODE,
     _tree_mpo_event_parts,
 )
@@ -657,7 +656,7 @@ class TreeStabOptimizer:
         *,
         n=None,
         chi=None,
-        cutoff=_DEFAULT_CUTOFF,
+        cutoff=1e-10,
         cutoff_mode=_DEFAULT_CUTOFF_MODE,
         tree=None,
         layout=None,
@@ -667,6 +666,7 @@ class TreeStabOptimizer:
         layout_objective="path",
         layout_weight_mode="count",
         mode="auto",
+        compression_mode="direct",
         dtype=complex,
         threads=1,
         seed=None,
@@ -863,6 +863,7 @@ class TreeStabOptimizer:
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             mode=mode,
+            compression_mode=compression_mode,
             structure=structure,
             max_arity=max_arity,
             top_arity=top_arity,
@@ -1142,6 +1143,12 @@ class TreeStabOptimizer:
     @property
     def center(self):
         return self._tree.center
+
+    @property
+    def compression_mode(self):
+        """Compression decomposition used by the coefficient tree."""
+
+        return self._tree.compression_mode
 
     def isometry_direction(self, node):
         """Return the coefficient-tree neighbour proven by ``left_inds``."""
@@ -1709,6 +1716,7 @@ class TreeStabOptimizer:
             cutoff=self._tree.cutoff,
             cutoff_mode=self._tree.cutoff_mode,
             mode=self._tree.mode,
+            compression_mode=self._tree.compression_mode,
             structure=self._tree.structure,
             max_arity=self._tree.max_arity,
             top_arity=selected.top_arity,
@@ -4150,6 +4158,7 @@ class TreeStabOptimizer:
             cutoff=old_tree.cutoff,
             cutoff_mode=old_tree.cutoff_mode,
             mode=old_tree.mode,
+            compression_mode=old_tree.compression_mode,
             structure=old_tree.structure,
             max_arity=old_tree.max_arity,
             community_frac=old_tree.community_frac,
@@ -4430,6 +4439,7 @@ class TreeStabOptimizer:
     def __repr__(self):  # pragma: no cover - cosmetic
         return (
             f"TreeStabOptimizer(n={self.n}, chi={self._tree.chi}, "
+            f"compression_mode={self._tree.compression_mode!r}, "
             f"max_bond={self.p.max_bond()}, "
             f"max_pauli_terms={self.max_pauli_terms}, "
             f"max_dense_cap_qubits={self.max_dense_cap_qubits})"

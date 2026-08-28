@@ -573,6 +573,15 @@ the optimizer's selected two-site mode for that run, later runs, and copies.
 The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
 
+The decomposition used for truncation is independent of the routing mode.
+Pass `compression_mode="direct"` for the default SVD path or
+`compression_mode="dm"` for Quimb's density-matrix-equivalent `svd:eig`
+decomposition on the local fused state/operator compression core. The latter
+does not form a global dense state and is currently restricted to dense tree
+tensors; native fermionic trees retain their graded direct compression path.
+For the common automatic routing case, `mode="dm"` is a shorthand for
+`mode="auto", compression_mode="dm"`.
+
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
 Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
 once from the live state dtype: `1e-6` for 32-bit data and `1e-12` for 64-bit

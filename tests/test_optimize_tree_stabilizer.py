@@ -103,6 +103,18 @@ def test_tree_stab_cutoff_defaults_match_tree_quimb_path():
     assert opt.tree_optimizer.cutoff_mode == "rsum2"
 
 
+def test_tree_stab_forwards_density_matrix_compression_mode():
+    opt = pepsy.TreeStabOptimizer(2, compression_mode="dm")
+    shorthand = pepsy.TreeStabOptimizer(2, mode="dm")
+
+    assert opt.compression_mode == "dm"
+    assert opt.tree_optimizer.compression_mode == "dm"
+    assert shorthand.compression_mode == "dm"
+    assert shorthand.tree_optimizer.mode == "auto"
+    opt.apply([("rzz", 0.37, 0, 1)])
+    assert opt.p.validate(check_canonical=True) is opt.p
+
+
 def test_tree_stab_coefficient_route_uses_lossless_qr_before_compression(
     monkeypatch,
 ):

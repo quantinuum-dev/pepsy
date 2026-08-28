@@ -54,6 +54,28 @@ from .layout import TreePlan, _DEFAULT_TOP_ARITY
 __all__ = ["TreeTensorNetwork"]
 
 
+def _normalize_compression_mode(mode):
+    """Normalize the local tree-bond compression decomposition mode."""
+
+    mode = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "svd": "direct",
+        "eigh": "dm",
+        "density_matrix": "dm",
+        "densitymatrix": "dm",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"direct", "dm"}:
+        raise ValueError("compression_mode must be 'direct' or 'dm'.")
+    return mode
+
+
+def _compression_method(mode):
+    """Return the dense Quimb split method for a compression mode."""
+
+    return "svd:eig" if _normalize_compression_mode(mode) == "dm" else "svd"
+
+
 def _native_rank_safe_qr(array, backend):
     """Factor a finite complex64 block with safe backend QR."""
     if backend == "torch":
@@ -2119,6 +2141,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         cutoff_mode="rsum2",
         absorb="right",
         reduced=True,
+        compression_mode="direct",
         _reduction_proven=False,
     ):
         """Compress the tree edge ``a -> b`` in place.
@@ -2138,7 +2161,19 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         when node ``b`` is already isometric on its non-shared legs; native
         trees use the same proof, with the zero-sector-safe QR policy retained
         for the two-sided reduced path.
+        ``compression_mode="direct"`` uses the standard SVD, while
+        ``compression_mode="dm"`` uses Quimb's density-matrix-equivalent
+        ``svd:eig`` decomposition on the local canonical core. The latter is
+        currently available for dense trees only.
         """
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode == "dm" and self.fermionic:
+            raise NotImplementedError(
+                "compression_mode='dm' is currently available for dense "
+                "tree tensors only; use compression_mode='direct' for "
+                "native fermionic trees."
+            )
+
         bond = self.bond(a, b)
         before_bond = int(self.ind_size(bond))
         if cutoff == 0.0 and (
@@ -2170,6 +2205,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb=absorb,
                 reduced=reduced,
+                method=_compression_method(compression_mode),
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
@@ -2183,6 +2219,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         cutoff_mode="rsum2",
         center=None,
         reduced=True,
+        compression_mode="direct",
     ):
         """Compress the complete tree with a centre-oriented SVD sweep.
 
@@ -2259,6 +2296,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb="right",
                 reduced=reduced,
+                compression_mode=compression_mode,
             )
 
         # ``compress_edge_`` conservatively clears the global centre when the
