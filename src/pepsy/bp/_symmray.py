@@ -43,9 +43,61 @@ def is_symmray_array(value) -> bool:
     )
 
 
+def install_quimb_symmray_compat() -> None:
+    """Patch only Quimb's old scalar-vector inverse path for Symmray.
+
+    Quimb releases before the corresponding upstream fix call
+    ``xp.max(x, axis=-1)`` for a one-dimensional Symmray ``BlockVector``.
+    Symmray's reduction is intentionally scalar-only, so this raises a
+    ``TypeError`` during projector compression.  The compatibility wrapper
+    below preserves Quimb's implementation for every other input and uses the
+    same formula with a scalar maximum for that one narrow case.  It is an
+    in-memory compatibility hook; it never modifies the installed package.
+    """
+    try:
+        import quimb.tensor.decomp as qd
+    except ImportError:  # pragma: no cover - quimb is a required dependency
+        return
+
+    if getattr(qd, "_pepsy_symmray_safe_inverse", False):
+        return
+
+    original = qd.safe_inverse
+
+    def safe_inverse(x, cutoff=None, power=1.0):
+        if not (is_symmray_array(x) and getattr(x, "ndim", None) == 1):
+            return original(x, cutoff=cutoff, power=power)
+
+        xmax = x.max()
+        try:
+            xmax_is_zero = float(xmax) <= 0.0
+        except (TypeError, ValueError):  # pragma: no cover - backend scalar
+            xmax_is_zero = False
+        if xmax_is_zero:
+            xmax = 1.0
+
+        if cutoff is None:
+            try:
+                c = np.finfo(x.dtype).eps
+            except (AttributeError, TypeError, ValueError):
+                c = np.finfo(np.float64).eps
+        else:
+            c = cutoff / xmax
+
+        y = x / xmax
+        q = power + 1.0
+        return y / ((y**q + c**q) * xmax**power)
+
+    qd.safe_inverse = safe_inverse
+    qd._pepsy_symmray_safe_inverse = True
+
+
 def uses_symmray(tn) -> bool:
     """Return whether any tensor in ``tn`` stores native Symmray data."""
-    return any(is_symmray_array(tensor.data) for tensor in tn.tensors)
+    result = any(is_symmray_array(tensor.data) for tensor in tn.tensors)
+    if result:
+        install_quimb_symmray_compat()
+    return result
 
 
 def restore_fermionic_dummy_modes(tn):

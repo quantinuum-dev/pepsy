@@ -802,6 +802,31 @@ def test_mps_optimizer_mpo_method_modes(method):
     assert optimizer.mode == f"quimb-{method}"
 
 
+@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
+def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
+    """New SDC modes never silently fall back on older Quimb installations."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=f"quimb-{method}",
+    )
+    supported = mps_optimizer_module._quimb_compression_method_available(method)
+
+    if not supported:
+        with pytest.raises(NotImplementedError, match="sdc compressor"):
+            optimizer.run(progbar=False, cutoff=1.0e-12)
+        return
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+    assert out.max_bond() <= 2
+    assert optimizer.mode == f"quimb-{method}"
+
+
 @pytest.mark.parametrize(
     "mode, method",
     [

@@ -351,6 +351,17 @@ def test_ps_to_peps_builds_product_state():
     assert int(peps.max_bond()) == 1
 
 
+@pytest.mark.parametrize("shape", [(1, 2), (2, 1), (2, 2)])
+def test_ps_to_peps_cyclic_small_dimensions_keep_valid_topology(shape):
+    """Cyclic PEPS construction remains valid when a dimension is tiny."""
+    peps = ps_to_peps(*shape, dtype="complex128", cyclic=True)
+
+    assert (peps.Lx, peps.Ly) == shape
+    assert len(peps.tensors) == shape[0] * shape[1]
+    assert int(peps.max_bond()) == 1
+    assert np.isfinite(float(np.real(peps.norm())))
+
+
 def test_ps_to_3dpeps_builds_product_state():
     """ps_to_3dpeps should build a valid bond-dimension-1 PEPS3D."""
     peps = ps_to_3dpeps(2, 3, 2, dtype="complex128", theta=0.123)
@@ -359,6 +370,17 @@ def test_ps_to_3dpeps_builds_product_state():
     assert peps.Lz == 2
     assert peps.site_ind(1, 2, 1) in peps.outer_inds()
     assert int(peps.max_bond()) == 1
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 1), (2, 1, 2), (2, 2, 1)])
+def test_ps_to_3dpeps_cyclic_small_dimensions_keep_valid_topology(shape):
+    """Cyclic PEPS3D construction remains valid for dimensions one and two."""
+    peps = ps_to_3dpeps(*shape, dtype="complex128", cyclic=True)
+
+    assert (peps.Lx, peps.Ly, peps.Lz) == shape
+    assert len(peps.tensors) == shape[0] * shape[1] * shape[2]
+    assert int(peps.max_bond()) == 1
+    assert np.isfinite(float(np.real(peps.norm())))
 
 
 def test_apply_2dtn_one_site_inplace():
@@ -531,6 +553,25 @@ def test_gates_tn_1d_applies_mixed_site_specs():
 
     out = apply_gate(mps, gates, contract="split-gate", inplace=True)
     assert out is mps
+
+
+@pytest.mark.parametrize("transform", ("dagger", "transpose"))
+def test_gate_forwards_gate_transform_to_quimb(transform):
+    """Gate transforms affect the user gate while preserving the route."""
+    mps = qtn.MPS_computational_state("01", dtype=np.complex128)
+    gate = np.arange(16, dtype=float).reshape(2, 2, 2, 2) + 1j
+    transform_opts = {transform: True}
+
+    actual = apply_gate(
+        mps.copy(), gate, (0, 1), contract="split", inplace=True,
+        **transform_opts,
+    )
+    expected = qtn.tensor_network_gate_inds(
+        mps.copy(), gate, ["k0", "k1"], contract="split", inplace=True,
+        **transform_opts,
+    )
+
+    np.testing.assert_allclose(actual.to_dense(), expected.to_dense())
 
 
 def test_gate_dispatches_to_1d_for_mps_two_site_where(monkeypatch):

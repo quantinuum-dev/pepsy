@@ -107,12 +107,65 @@ def test_tree_stab_forwards_density_matrix_compression_mode():
     opt = pepsy.TreeStabOptimizer(2, compression_mode="dm")
     shorthand = pepsy.TreeStabOptimizer(2, mode="dm")
 
+    assert opt.mode == "tree_mpo_dm"
     assert opt.compression_mode == "dm"
     assert opt.tree_optimizer.compression_mode == "dm"
+    assert shorthand.mode == "tree_mpo_dm"
     assert shorthand.compression_mode == "dm"
     assert shorthand.tree_optimizer.mode == "auto"
     opt.apply([("rzz", 0.37, 0, 1)])
     assert opt.p.validate(check_canonical=True) is opt.p
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ("tree_mpo_direct", "tree-mpo-direct", "tree_mpo", "tree_mpo_svd"),
+)
+def test_tree_stab_tree_mpo_direct_mode_aliases(requested):
+    opt = pepsy.TreeStabOptimizer(2, mode=requested)
+
+    assert opt.mode == "tree_mpo_direct"
+    assert opt.tree_optimizer.mode == "tree_mpo_direct"
+    assert opt.compression_mode == "direct"
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ("tree_mpo_dm", "tree-mpo-dm", "tree_mpo_dem", "treempo_dem"),
+)
+def test_tree_stab_tree_mpo_dm_mode_aliases(requested):
+    opt = pepsy.TreeStabOptimizer(2, mode=requested)
+
+    assert opt.mode == "tree_mpo_dm"
+    assert opt.tree_optimizer.mode == "tree_mpo_dm"
+    assert opt.compression_mode == "dm"
+
+
+def test_tree_stab_c_basis_updates_use_tree_mpo_active_span(monkeypatch):
+    from pepsy.optimizers.tree import TreeMPO
+
+    opt = pepsy.TreeStabOptimizer(3, mode="tree-mpo-dm")
+    calls = []
+    apply_subtreempo = opt.tree_optimizer.apply_subtreempo
+
+    def traced_apply_subtreempo(tree_mpo, where=None, **kwargs):
+        calls.append((tree_mpo, tuple(where)))
+        return apply_subtreempo(tree_mpo, where, **kwargs)
+
+    monkeypatch.setattr(
+        opt.tree_optimizer, "apply_subtreempo", traced_apply_subtreempo
+    )
+    opt.apply([
+        ("h", 0),
+        ("cnot", 0, 2),
+        ("rz", 0.37, 1),
+    ])
+
+    assert calls
+    assert all(isinstance(tree_mpo, TreeMPO) for tree_mpo, _where in calls)
+    assert opt.mode == "tree_mpo_dm"
+    assert opt.compression_mode == "dm"
+    assert opt.validate_isometry_metadata() is opt
 
 
 def test_tree_stab_coefficient_route_uses_lossless_qr_before_compression(

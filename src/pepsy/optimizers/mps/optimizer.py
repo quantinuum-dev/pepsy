@@ -82,6 +82,11 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ..._internal.quimb import (
+    quimb_1d_compression_method_available as _quimb_compression_method_available,  # noqa: F401
+    quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
+    require_quimb_1d_compression_method as _require_quimb_compression_method,
+)
 from ...tensors.core import tn_fidelity
 from ...operators.gates import (
     _normalize_gate_entries,
@@ -125,6 +130,8 @@ _MPO_COMPRESSION_METHODS = frozenset(
         "srcmps",
         "srcmps-first",
         "srcmps-oversample",
+        "sdc",
+        "sdc-oversample",
         "fit",
         "fit-zipup",
         "fit-projector",
@@ -1114,13 +1121,17 @@ def _is_interior_submpo_span(p, where):
 def _run_seeded_quimb(random_seed, function, *args, **kwargs):
     """Run a Quimb randomized operation with an isolated reproducibility seed.
 
-    Quimb's current SRC/SRCMPS implementations use its process-global random
-    generator and do not accept a ``seed`` compression option. Seed the public
-    Quimb generator immediately before the complete operation instead of
-    leaking that option into Cotengra or linear-algebra calls. The lock keeps
-    seeded shot replay deterministic when optimizers run concurrently.
+    Newer Quimb compressors accept ``seed`` directly and use an autoray random
+    generator that matches the tensor backend. Older releases use Quimb's
+    process-global random generator instead, so retain that fallback without
+    leaking a ``seed`` option into unrelated contraction calls. The lock keeps
+    the fallback deterministic when optimizers run concurrently.
     """
     if random_seed is None:
+        return function(*args, **kwargs)
+    method = kwargs.get("method")
+    if _quimb_compression_method_supports_seed(method):
+        kwargs.setdefault("seed", int(random_seed))
         return function(*args, **kwargs)
     with _QUIMB_SEED_LOCK:
         quimb.seed_rand(int(random_seed))
@@ -1344,6 +1355,7 @@ def guess(
     method = str(method).strip().lower()
     if method not in _MPO_COMPRESSION_METHODS:
         raise ValueError(f"Unknown compression guess method: {method}")
+    _require_quimb_compression_method(method)
     guess = p if inplace else p.copy(deep=True)
     _apply_dense_gate_with_method(
         guess,
@@ -1594,6 +1606,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         method_norm = str(method).strip().lower()
         if method_norm not in cls._ALLOWED_SUBMPO_METHODS:
             raise ValueError(f"Unknown subMPO method: {method}")
+        _require_quimb_compression_method(method_norm)
         return method_norm
 
     def _submpo_compress_opts(
@@ -4633,7 +4646,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Optional compression-method override for the MPO family. If
             omitted, a bare Quimb method such as ``mode="src"`` or the
             qualified ``mode="quimb-<method>"`` selects the method;
-            ``mode="quimb"`` selects ``"direct"``. The legacy
+            ``mode="quimb"`` selects ``"direct"``. The opt-in
+            ``"sdc"`` and ``"sdc-oversample"`` methods require a Quimb build
+            that provides those compressors; they never replace an existing
+            default. The legacy
             ``mode="mpo-<method>"`` / ``mode="mpo"`` spellings remain valid.
             The method
             is forwarded to Quimb for both dense gates and explicit sub-MPO
@@ -6078,6 +6094,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _backend_signatures_compatible(source_signature, target_signature):
         """Return whether two payloads can be used without backend transfer."""
+        if source_signature[:1] == target_signature[:1] == ("symmray",):
+            # A real native gate is safe to apply to a complex native state:
+            # the contraction promotes the result while preserving charge and
+            # fermionic metadata. Requiring an exact dtype here rejected
+            # ordinary imaginary-time streams whose gates are real-valued.
+            return (
+                source_signature[0] == target_signature[0]
+                and source_signature[2:] == target_signature[2:]
+                and np.can_cast(
+                    np.dtype(source_signature[1]),
+                    np.dtype(target_signature[1]),
+                    casting="safe",
+                )
+            )
         return backend_signatures_compatible(source_signature, target_signature)
 
     def _validate_gate_stream_backend(
@@ -7455,10 +7485,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         same randomized compressed warm-start role without constructing a dense
         gate, MPO, or random dense tensor.
         """
-        if not (self._has_symmray_data(p) and p.isfermionic()):
+        if not self._has_symmray_data(p):
             raise TypeError(
-                "native randomized FIT guesses require native Symmray "
-                "fermionic data."
+                "native randomized FIT guesses require native Symmray data."
             )
 
         guess_mps = p.copy(deep=True)

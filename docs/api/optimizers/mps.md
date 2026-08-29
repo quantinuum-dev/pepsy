@@ -96,7 +96,11 @@ contract described below. Bare Quimb compression names such as `mode="src"`,
 to `quimb-<method>`. The qualified `mode="quimb-<method>"` forms, direct alias
 `mode="quimb"`, and legacy `mode="mpo-<method>"` / `mode="mpo"` spellings
 remain supported. The bare name `fit` remains the DMRG alias, so Quimb's
-`fit` compression method is selected as `mode="quimb-fit"`.
+`fit` compression method is selected as `mode="quimb-fit"`. Quimb's newer
+successive deterministic compressors are available explicitly as
+`mode="quimb-sdc"` and `mode="quimb-sdc-oversample"` when the installed Quimb
+build provides them. These modes are opt-in and do not change existing
+defaults.
 These events represent already-factorized nonlocal operators:
 
 ```python
@@ -328,7 +332,9 @@ Quimb-specific guess methods retain their native direct fallback. The available 
 `direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
 `src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`. `auto` selects `guess-src` in both phases;
+`fit-projector`, `fit-oversample`, `sdc`, and `sdc-oversample`. The latter two
+require a Quimb build containing the corresponding successive deterministic
+compressor. `auto` selects `guess-src` in both phases;
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).
 Native Symmray and fermionic paths use their graded sector-growth route without

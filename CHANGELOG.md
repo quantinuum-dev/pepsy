@@ -14,6 +14,18 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added opt-in Quimb `sdc` and `sdc-oversample` MPS compression mode names
+  with execution-time capability checks; existing compression defaults and
+  modes are unchanged.
+- Updated randomized MPS compression to use Quimb's explicit `seed` support
+  when available, while retaining a compatibility fallback for older builds.
+- Added opt-in fourth-order Suzuki-Yoshida gate streams to the symmetric
+  Hamiltonian and fermion helpers. Existing first- and second-order streams
+  retain their previous construction.
+- Added a narrow Symmray compatibility path for older Quimb projector
+  compression builds whose `safe_inverse` incorrectly passes an axis to a
+  one-dimensional block vector.
+
 - Added the initial `TreePepsPlan` and `TreePeps` state API for PEPS-like
   tensor networks with 2D/3D coordinate tags, stable 1D logical tags, and
   validated spanning-tree virtual bonds, including PEPS-style `show`, tree
@@ -50,11 +62,21 @@ Changes for the next release should be added here before the version is bumped.
   than lowering gates to a chain sub-MPO; `auto` now promotes gates wider than
   four qubits to the TreeMPO route, while bounded dense direct gates fail with
   an actionable mode recommendation.
+- Updated `TreeStabOptimizer` to use true TreeMPO active-span routing for
+  coefficient-frame gates, Pauli sums, projections, localizers, and exact
+  cooling. Its canonical modes are `tree_mpo_direct` and `tree_mpo_dm`, with
+  `tree-mpo-dm` and `tree_mpo_dem` accepted as aliases.
 - Added `OneDMap` center-out/inside-out traversal aliases and independent
   `TreePepsPlan.tree_order` seeds. Row-major, Hilbert, diagonal, and
   center-out orders can now guide legal degree-bounded virtual trees, and
   `TreePepsLayoutFinder` compares those deterministic seeds with weighted
   growth and reports the selected seed.
+- Centralized execution-time Quimb capability checks for optional MPS
+  compressors and gate transforms. `gate` and `gate_simple` now forward
+  `dagger`/`transpose` to the user gate while leaving routing SWAPs unchanged.
+- Added `gloop_opts` to the scalar and 2-norm loop-cluster entry points so
+  newer Quimb generalized-loop generator controls can be used without
+  changing existing defaults.
 
 ## [0.4.1] - 2026-08-27
 

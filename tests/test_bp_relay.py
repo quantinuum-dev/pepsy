@@ -10,7 +10,7 @@ import warnings
 qtn = pytest.importorskip("quimb.tensor")
 from quimb.tensor.belief_propagation import D1BP  # noqa: E402
 
-from pepsy.bp import RelayBPResult, one_norm_bp, relay_bp  # noqa: E402
+from pepsy.bp import RelayBPResult, ScalarClusterCache, one_norm_bp, relay_bp  # noqa: E402
 from pepsy.bp.relay import _relay_message_sources  # noqa: E402
 
 
@@ -61,6 +61,29 @@ def _polarized_messages(tn):
         key: np.array([1.0, 0.0])
         for key in D1BP(tn, update="parallel").messages
     }
+
+
+def test_scalar_cluster_cache_forwards_generalized_loop_options(monkeypatch):
+    """Scalar loop geometry should expose Quimb's generator controls."""
+    tn = _scalar_three_site_chain()
+    calls = []
+
+    def fake_gen_gloops(**opts):
+        calls.append(opts)
+        return ()
+
+    monkeypatch.setattr(tn, "gen_gloops", fake_gen_gloops)
+    cache = ScalarClusterCache()
+    regions = cache.regions_for(
+        tn,
+        None,
+        gloop_opts={"max_size": 2, "join_overlap": 1},
+    )
+
+    assert calls == [{"max_size": 2, "join_overlap": 1}]
+    assert regions
+    with pytest.raises(ValueError, match="max_size"):
+        cache.regions_for(tn, 2, gloop_opts={"max_size": 3})
 
 
 def test_one_norm_bp_close_to_exact_on_small_grid():

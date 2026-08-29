@@ -12,18 +12,21 @@ where `C` is a Stim tableau Clifford and `|p>` is a dense two-level
 
 TreeStab forwards `cutoff` and `cutoff_mode` to that same coefficient
 optimizer. The defaults are `cutoff=1e-10` and `cutoff_mode="rsum2"`, matching
-Quimb's open-boundary `gate_with_submpo` compression convention. Its
-`mode="mpo"` path and explicit coefficient-frame `submpo` events therefore
-reuse TreeOptimizer's Quimb MPO tag lookup, lossless QR routing, and one final
-subtree compression sweep; a payload without that MPO interface is the only
-case that uses the bounded dense fallback.
+Quimb's open-boundary `gate_with_submpo` compression convention. TreeStab's
+canonical coefficient-update modes are `mode="tree_mpo_direct"` and
+`mode="tree_mpo_dm"` (the default is the former). Both build a true
+`TreeMPO` over the active TreePlan span and apply it with
+`TreeOptimizer.apply_subtreempo`; the suffix selects direct SVD or
+density-matrix compression. Hyphenated spellings such as
+`mode="tree-mpo-dm"`, and the compatibility alias `mode="tree_mpo_dem"`, are
+accepted.
 
 TreeStab also forwards `compression_mode="direct"` or `"dm"` to its coefficient
 `TreeOptimizer`. DM mode selects the density-matrix-equivalent local
 `svd:eig` decomposition after the complete coefficient operator and tree
 state have been fused. It does not canonicalize or compress the operator
 separately, and it does not build a global dense state. `mode="dm"` remains a
-convenience shorthand for automatic coefficient routing with DM compression.
+compatibility shorthand for TreeMPO-DM routing.
 
 Dense non-Clifford gates are Pauli-decomposed through ``C† G C`` in the
 coefficient frame, then compiled into compact Tree-native ``TreeMPO``/TTNO
@@ -32,18 +35,19 @@ Pauli sums: branches use Tree virtual channels only on the union of their
 minimal Steiner subtrees, and TreeOptimizer performs the final canonical
 compression. Separated supports therefore never become a fictitious
 contiguous MPS window. Explicit ``mode="submpo"`` and caller-supplied
-MPS-style ``submpo`` events retain their compatibility behavior.
+MPS-style ``submpo`` events remain compatibility-only interfaces; new TreeStab
+code should use `tree_mpo_direct` or `tree_mpo_dm` and
+`subtreempo_event(...)`.
 
 Canonical and compression state has the same single owner as ordinary tree
 simulation: local isometry proofs live on the coefficient tensors'
 ``left_inds`` and are interpreted by ``TreeTensorNetwork``. TreeStab delegates
 ``isometry_direction()``, ``isometry_map()``, ``can_skip_canonize()``, and
 ``validate_isometry_metadata()`` to its coefficient ``TreeOptimizer``; it does
-not keep another map. Direct, MPO, and coefficient-frame sub-MPO routes
-therefore reuse proven path/subtree Q tensors and select one-sided SVD
-compression only when the live proof is valid. Backend conversion and dense
-cap reconstruction preserve or install those proofs rather than forcing a
-second canonicalization sweep.
+not keep another map. TreeMPO coefficient updates reuse proven path/subtree Q
+tensors and select one-sided SVD compression only when the live proof is
+valid. Backend conversion and dense cap reconstruction preserve or install
+those proofs rather than forcing a second canonicalization sweep.
 State-evolution measurements use the coefficient tree's state-owned canonical
 centre. After lower-level direct access to the coefficient TTN,
 ``sync_canonicalization()`` explicitly rebuilds that centre before replay

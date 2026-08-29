@@ -674,9 +674,10 @@ require a model-native observable or projector.
 MPS execution modes such as `svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`, and
 `mix` are chain algorithms and are intentionally not copied into
 `TreeOptimizer`. Tree layout is part of the TTN geometry and is selected with
-`tree=`/`layout=` at construction. `TreeStabOptimizer` now delegates its first
-milestone of numerical coefficient updates to this class while keeping tableau
-state and stabilizer-specific bookkeeping above it. See the
+`tree=`/`layout=` at construction. `TreeStabOptimizer` uses
+`tree_mpo_direct` or `tree_mpo_dm` for its numerical coefficient updates,
+delegating the active-span TreeMPO contraction to this class while keeping
+tableau state and stabilizer-specific bookkeeping above it. See the
 [TreeStabOptimizer API](tree_stabilizer.md) for the supported fixed-basis,
 basis-updating, immediate, and deferred magic-injection
 Clifford/rotation/measurement paths, bounded dense matrix dispatch, and the

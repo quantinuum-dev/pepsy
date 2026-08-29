@@ -68,6 +68,14 @@ def _require_symmray():
             "SymMPS and SymPEPS require the optional dependency `symmray`. "
             "Install it with `pip install symmray`."
         ) from exc
+    # Symmetric states can be handed directly to Quimb boundary, PEPS, and
+    # projector-compression routines, so install the narrow compatibility
+    # hook as soon as the optional backend is actually in use. This keeps the
+    # dense Quimb path untouched while covering callers that do not pass
+    # through one of Pepsy's BP wrappers first.
+    from ..bp._symmray import install_quimb_symmray_compat
+
+    install_quimb_symmray_compat()
     _register_symmray_autoray_compat()
     return sr
 
@@ -3878,6 +3886,34 @@ class SymGateStream(tuple):
         )
 
 
+_YOSHIDA4_A = 1.0 / (2.0 - 2.0 ** (1.0 / 3.0))
+_YOSHIDA4_B = -2.0 ** (1.0 / 3.0) * _YOSHIDA4_A
+_YOSHIDA4_COEFFICIENTS = (_YOSHIDA4_A, _YOSHIDA4_B, _YOSHIDA4_A)
+
+
+def _yoshida4_stream(second_order_factory, dt, *, imaginary=False, hamiltonian=None):
+    """Compose three symmetric second-order streams into a fourth-order step.
+
+    The middle coefficient is negative, as required by the Suzuki-Yoshida
+    triple jump. This helper only combines already validated local gates; it
+    does not alter the existing first- or second-order stream construction.
+    """
+    streams = tuple(
+        second_order_factory(coefficient * dt)
+        for coefficient in _YOSHIDA4_COEFFICIENTS
+    )
+    if hamiltonian is None:
+        hamiltonian = getattr(streams[0], "hamiltonian", None)
+    entries = tuple(entry for stream in streams for entry in stream)
+    return SymGateStream(
+        entries,
+        hamiltonian=hamiltonian,
+        dt=dt,
+        imaginary=imaginary,
+        order=4,
+    )
+
+
 @dataclass(frozen=True)
 class FermionLatticeSetup:
     """Metadata for a spinful half-filled rectangular fermion lattice.
@@ -4081,14 +4117,32 @@ def fermi_hubbard_u1u1_gate_stream(
     """Return a native fermionic ``U1U1`` Fermi-Hubbard Trotter stream.
 
     ``order=1`` returns a Lie step ``U_int(dt) U_hop(dt)``. ``order=2``
-    returns the Strang step ``U_int(dt/2) U_hop(dt) U_int(dt/2)``. The onsite
-    and hopping gates are exact fermionic Symmray arrays, so no spin/qubit
-    mapping is introduced.
+    returns the Strang step ``U_int(dt/2) U_hop(dt) U_int(dt/2)``. ``order=4``
+    applies the Suzuki-Yoshida triple jump to the second-order stream. The
+    onsite and hopping gates are exact fermionic Symmray arrays, so no
+    spin/qubit mapping is introduced.
     """
-    if order not in {1, 2}:
-        raise ValueError("order must be 1 or 2.")
+    if order not in {1, 2, 4}:
+        raise ValueError("order must be 1, 2, or 4.")
     edges = _as_edges(edges)
     sites = _sites_from_edges(edges, sites)
+    if order == 4:
+        return _yoshida4_stream(
+            lambda sub_dt: fermi_hubbard_u1u1_gate_stream(
+                edges,
+                sub_dt,
+                sites=sites,
+                t=t,
+                U=U,
+                peierls_angle=peierls_angle,
+                imaginary=imaginary,
+                order=2,
+                dtype=dtype,
+                to_backend=to_backend,
+            ),
+            dt,
+            imaginary=imaginary,
+        )
     if order == 1:
         entries = (
             tuple(
@@ -4371,13 +4425,33 @@ def fermi_hubbard_u1u1_jw_gate_stream(
     Bosonic (Jordan-Wigner spin-picture) counterpart of
     :func:`fermi_hubbard_u1u1_gate_stream`. ``order=1`` returns a Lie step
     ``U_int(dt) U_hop(dt)``; ``order=2`` returns the Strang step
-    ``U_int(dt/2) U_hop(dt) U_int(dt/2)``. All gates are bosonic Symmray arrays
-    that act on a Jordan-Wigner MPS; hopping bonds must be nearest-neighbour.
+    ``U_int(dt/2) U_hop(dt) U_int(dt/2)``. ``order=4`` applies the
+    Suzuki-Yoshida triple jump to the second-order stream. All gates are
+    bosonic Symmray arrays that act on a Jordan-Wigner MPS; hopping bonds must
+    be nearest-neighbour.
     """
-    if order not in {1, 2}:
-        raise ValueError("order must be 1 or 2.")
+    if order not in {1, 2, 4}:
+        raise ValueError("order must be 1, 2, or 4.")
     edges = _as_edges(edges)
     sites = _sites_from_edges(edges, sites)
+    if order == 4:
+        return _yoshida4_stream(
+            lambda sub_dt: fermi_hubbard_u1u1_jw_gate_stream(
+                edges,
+                sub_dt,
+                sites=sites,
+                t=t,
+                U=U,
+                mu=mu,
+                peierls_angle=peierls_angle,
+                imaginary=imaginary,
+                order=2,
+                dtype=dtype,
+                to_backend=to_backend,
+            ),
+            dt,
+            imaginary=imaginary,
+        )
     if order == 1:
         entries = (
             tuple(
@@ -7055,8 +7129,25 @@ class SymHamiltonian:
         edges, sites, params = self._resolve_jw_fermi_hubbard(
             mapper=mapper, idx2coo=idx2coo, coo2idx=coo2idx
         )
-        if order not in {1, 2}:
-            raise ValueError("order must be 1 or 2.")
+        if order not in {1, 2, 4}:
+            raise ValueError("order must be 1, 2, or 4.")
+        if order == 4:
+            return _yoshida4_stream(
+                lambda sub_dt: self.jw_trotter_gates(
+                    sub_dt,
+                    mapper=mapper,
+                    idx2coo=idx2coo,
+                    coo2idx=coo2idx,
+                    order=2,
+                    imaginary=imaginary,
+                    peierls_angle=peierls_angle,
+                    dtype=dtype,
+                    to_backend=to_backend,
+                ),
+                dt,
+                imaginary=imaginary,
+                hamiltonian=self,
+            )
         dtype = "complex128" if dtype is None else np.dtype(dtype)
         return fermi_hubbard_u1u1_jw_gate_stream(
             edges,
@@ -7213,8 +7304,19 @@ class SymHamiltonian:
 
     def trotter_gates(self, dt, *, imaginary=False, order=1):
         """Return local gate entries ``[(gate, edge), ...]`` for one Trotter step."""
-        if order not in {1, 2}:
-            raise ValueError("order must be 1 or 2.")
+        if order not in {1, 2, 4}:
+            raise ValueError("order must be 1, 2, or 4.")
+        if order == 4:
+            return _yoshida4_stream(
+                lambda sub_dt: self.trotter_gates(
+                    sub_dt,
+                    imaginary=imaginary,
+                    order=2,
+                ),
+                dt,
+                imaginary=imaginary,
+                hamiltonian=self,
+            )
         entries = list(self.terms.items())
         if order == 1:
             gates = [(_gate_from_term(term, dt, imaginary=imaginary), edge) for edge, term in entries]
@@ -9988,8 +10090,8 @@ class Fermion:
         pairing_phase=0.0,
     ):
         """Return a canonical fermion gate stream with explicit couplings."""
-        if order not in {1, 2}:
-            raise ValueError("order must be 1 or 2.")
+        if order not in {1, 2, 4}:
+            raise ValueError("order must be 1, 2, or 4.")
         if t is None:
             raise TypeError("gate_stream requires explicit t=... .")
         if self.spinful and U is None:
@@ -10001,6 +10103,28 @@ class Fermion:
             )
         edges = _as_edges(edges)
         sites = _sites_from_edges(edges, sites)
+
+        if order == 4:
+            return _yoshida4_stream(
+                lambda sub_dt: self.strang_gate_stream(
+                    edges,
+                    sub_dt,
+                    sites=sites,
+                    peierls_angle=peierls_angle,
+                    imaginary=imaginary,
+                    t=t,
+                    U=U,
+                    V=V,
+                    mu=mu,
+                    field_x=field_x,
+                    field_y=field_y,
+                    field_z=field_z,
+                    pairing=pairing,
+                    pairing_phase=pairing_phase,
+                ),
+                dt,
+                imaginary=imaginary,
+            )
 
         if order == 2:
             return self.strang_gate_stream(

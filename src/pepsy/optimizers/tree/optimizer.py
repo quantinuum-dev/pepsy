@@ -5593,7 +5593,9 @@ class TreeOptimizer:
             self._finish_update()
         return self
 
-    def apply_pauli_rotation(self, theta, pauli, where, *, sign=1.0):
+    def apply_pauli_rotation(
+        self, theta, pauli, where, *, sign=1.0, _force_tree_mpo=False
+    ):
         """Apply ``exp(-i theta * sign * P / 2)`` on a Pauli support.
 
         The operator is represented as a compact TreeMPO on the true support
@@ -5614,7 +5616,7 @@ class TreeOptimizer:
         terms = dict(zip(where, axes))
         c = np.cos(float(theta) / 2.0)
         coef = -1j * sign * np.sin(float(theta) / 2.0)
-        if self.mode == "submpo":
+        if self.mode == "submpo" and not _force_tree_mpo:
             mpo, mpo_where = pauli_combo_submpo(
                 c, coef, terms, self.n, dtype=self.dtype,
                 compact_support=True,
@@ -5637,7 +5639,8 @@ class TreeOptimizer:
         )
 
     def apply_pauli_sum(
-        self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True
+        self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True,
+        _force_tree_mpo=False,
     ):
         """Apply a weighted sum of Pauli products as one native TreeMPO.
 
@@ -5662,7 +5665,7 @@ class TreeOptimizer:
                     for q, axis in term.items()
                 },
             ))
-        if self.mode == "submpo":
+        if self.mode == "submpo" and not _force_tree_mpo:
             from ..stabilizer_tn.operators import pauli_sum_submpo
 
             mpo, where = pauli_sum_submpo(
@@ -5708,7 +5711,7 @@ class TreeOptimizer:
 
     def project_pauli(self, pauli, where, outcome, *, sign=1.0,
                       renormalize=True, normalize=None,
-                      return_diagnostics=False):
+                      return_diagnostics=False, _force_tree_mpo=False):
         """Project onto a product-Pauli eigenvalue.
 
         By default the post-projection state is normalized.  Set
@@ -5734,6 +5737,7 @@ class TreeOptimizer:
             renormalize=bool(renormalize),
             return_diagnostics=return_diagnostics,
             logical_support=logical_where,
+            _force_tree_mpo=_force_tree_mpo,
         )
         return diagnostics if return_diagnostics else self
 
@@ -6224,6 +6228,7 @@ class TreeOptimizer:
     def _apply_product_pauli_projector(
         self, axes, where, outcome, *, renormalize=True,
         return_diagnostics=False, logical_support=None, probability=None,
+        _force_tree_mpo=False,
     ):
         """Apply a product-Pauli parity projector without dense materialization."""
         # Callers of this private helper have already resolved logical labels
@@ -6251,6 +6256,7 @@ class TreeOptimizer:
                 max_bond=self.chi,
                 cutoff=self.cutoff,
                 track_norm=False,
+                _force_tree_mpo=_force_tree_mpo,
             )
             if renormalize:
                 self.normalize()

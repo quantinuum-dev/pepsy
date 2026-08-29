@@ -167,6 +167,10 @@ def test_jw_gate_stream_structure_and_orientation():
     assert len(order2) == 3 + 2 + 3
     assert order2.order == 2
 
+    order4 = fermi_hubbard_u1u1_jw_gate_stream(edges, dt, order=4)
+    assert order4.order == 4
+    assert len(order4) == 3 * len(order2)
+
     # a reversed edge is normalized to ascending (lo, hi) orientation.
     reversed_stream = fermi_hubbard_u1u1_jw_hopping_gate_stream([(2, 1)], dt)
     assert reversed_stream[0][1] == (1, 2)
@@ -201,6 +205,10 @@ def test_jw_trotter_gates_matches_low_level_wiring():
     for (gate_m, where_m), (gate_l, where_l) in zip(method, manual):
         assert where_m == where_l
         assert np.allclose(_dense(gate_m), _dense(gate_l), atol=1e-12)
+
+    fourth = ham.jw_trotter_gates(dt, order=4)
+    assert fourth.order == 4
+    assert len(fourth) == 3 * len(method)
 
 
 def test_jw_trotter_gates_spectrum_consistent_with_to_mpo():
@@ -246,7 +254,7 @@ def test_jw_trotter_gates_guards():
     # Only the spinful U1U1 Fermi-Hubbard model has a Jordan-Wigner gate path.
     with pytest.raises(NotImplementedError):
         SymHamiltonian.from_edges("heisenberg", "U1", [(0, 1)]).jw_trotter_gates(dt)
-    # Only Lie/Strang Trotter orders are defined.
+    # Fourth-order Trotter is available, but unsupported orders remain errors.
     with pytest.raises(ValueError):
         SymHamiltonian.from_edges(
             "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from copy import deepcopy
 from collections.abc import Mapping
 from itertools import combinations
@@ -72,6 +73,46 @@ _CNOT = np.array(
     dtype=complex,
 )
 _RESET_FLIP_CLIFFORDS = {"X": "z", "Y": "x", "Z": "x"}
+
+
+def _normalize_tree_stab_mode(mode):
+    """Normalize the TreeStab coefficient-update route.
+
+    TreeStab's numerical coefficient updates are naturally represented by a
+    compact TreeMPO on the active tree span.  Keep the older TreeOptimizer
+    names accepted for stream compatibility, but make the two explicit
+    TreeMPO modes the canonical TreeStab interface.
+    """
+    if mode is None:
+        return "tree_mpo_direct"
+    requested = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "tree_mpo": "tree_mpo_direct",
+        "treempo": "tree_mpo_direct",
+        "treempo_direct": "tree_mpo_direct",
+        "tree_mpo_svd": "tree_mpo_direct",
+        "treempo_dm": "tree_mpo_dm",
+        "treempo_dem": "tree_mpo_dm",
+        "tree_mpo_dem": "tree_mpo_dm",
+        "tree_mpo_eig": "tree_mpo_dm",
+        "dem": "dm",
+    }
+    requested = aliases.get(requested, requested)
+    if requested in {"tree_mpo_direct", "tree_mpo_dm", "dm"}:
+        return requested
+    if requested in {"auto", "direct", "mpo", "submpo"}:
+        warnings.warn(
+            f"TreeStabOptimizer mode={mode!r} is a legacy compatibility "
+            "route; use mode='tree_mpo_direct' or mode='tree_mpo_dm'.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return requested
+    raise ValueError(
+        "TreeStabOptimizer mode must be 'tree_mpo_direct' or "
+        "'tree_mpo_dm' (hyphenated spellings and 'tree_mpo_dem' are "
+        f"accepted), got {mode!r}."
+    )
 
 
 def _normalize_sites(where):
@@ -685,6 +726,10 @@ class TreeStabOptimizer:
     APIs remain separate. Dense non-Clifford matrices are supported only up to
     ``max_operator_qubits`` through bounded Pauli decomposition. Set
     ``exact_cooling=False`` to exercise the ordinary multi-site rotation path.
+    Coefficient-side numerical updates use the tree-native
+    ``tree_mpo_direct`` or ``tree_mpo_dm`` route; ``tree_mpo_dem`` and
+    hyphenated spellings are accepted aliases. Older ``TreeOptimizer`` mode
+    names remain compatibility aliases for existing streams.
     """
 
     def __init__(
@@ -703,7 +748,7 @@ class TreeStabOptimizer:
         top_arity=_DEFAULT_TOP_ARITY,
         layout_objective="path",
         layout_weight_mode="count",
-        mode="auto",
+        mode="tree_mpo_direct",
         compression_mode="direct",
         dtype=complex,
         threads=1,
@@ -726,6 +771,19 @@ class TreeStabOptimizer:
     ):
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
+        mode = _normalize_tree_stab_mode(mode)
+        compression_mode = TreeOptimizer._normalize_compression_mode(
+            compression_mode
+        )
+        # Keep the historical ``compression_mode="dm"`` spelling useful with
+        # the new TreeMPO default, while an explicit ``tree_mpo_dm`` suffix
+        # remains the unambiguous canonical form.
+        if mode == "tree_mpo_direct" and compression_mode == "dm":
+            mode = "tree_mpo_dm"
+        # TreeOptimizer's legacy ``dm`` shorthand intentionally remains
+        # available for old callers and records ``mode='auto'`` internally.
+        # TreeStab still exposes it as the canonical TreeMPO-DM mode below.
+        tree_mode = "dm" if mode == "dm" else mode
         if max_pauli_decomposition_qubits is not None:
             if max_operator_qubits != DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS:
                 raise ValueError(
@@ -900,7 +958,7 @@ class TreeStabOptimizer:
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            mode=mode,
+            mode=tree_mode,
             compression_mode=compression_mode,
             structure=structure,
             max_arity=max_arity,
@@ -1188,6 +1246,102 @@ class TreeStabOptimizer:
         """Compression decomposition used by the coefficient tree."""
 
         return self._tree.compression_mode
+
+    @property
+    def mode(self):
+        """Canonical coefficient-update route.
+
+        The public TreeStab modes are ``tree_mpo_direct`` and
+        ``tree_mpo_dm``.  Legacy TreeOptimizer routes remain visible when
+        explicitly requested so existing stream code can inspect its original
+        compatibility choice; the ``dm`` shorthand is reported canonically.
+        """
+        if self._tree.mode == "auto" and self._tree.compression_mode == "dm":
+            return "tree_mpo_dm"
+        return self._tree.mode
+
+    def _apply_tree_gate(
+        self, gate, where, *, renormalize=False, track_norm=True
+    ):
+        """Apply one coefficient-side gate through a true TreeMPO.
+
+        This helper is used for stabilizer-frame localizers and exact-cooling
+        pivots as well as ordinary matrix entries. Keeping canonical TreeStab
+        modes on this helper avoids silently falling back to a dense local
+        kernel. The explicit legacy ``mode='mpo'`` compatibility route is
+        handled separately below.
+        """
+        if self._tree.mode == "mpo":
+            # Preserve the historical explicit ``mode='mpo'`` contract for
+            # callers that still inspect its two-factor kernel. New TreeStab
+            # modes below never take this branch.
+            logical_where = _normalize_sites(where)
+            gate = self._tree._as_state_backend(gate, warn=False)
+            if len(logical_where) == 1:
+                self._tree.apply_1q(
+                    gate,
+                    logical_where[0],
+                    renormalize=renormalize,
+                    track_norm=track_norm,
+                )
+                return self
+            if len(logical_where) == 2:
+                self._tree.apply_2q(
+                    gate,
+                    logical_where[0],
+                    logical_where[1],
+                    track_norm=track_norm,
+                )
+                if renormalize:
+                    self._tree.normalize()
+                return self
+            raise ValueError("legacy mode='mpo' supports at most two sites.")
+        from ..tree.operators import TreeMPO
+
+        logical_where = _normalize_sites(where)
+        compact_where = self._tree._validate_support(logical_where)
+        gate = self._tree._as_state_backend(gate, warn=False)
+        tree_mpo = TreeMPO.from_gate(
+            self.plan,
+            gate,
+            compact_where,
+            fermionic=bool(getattr(self.p, "fermionic", False)),
+            symmetry=getattr(self.p, "symmetry", None),
+            dtype=self._tree.backend_dtype,
+        )
+        self._tree.apply_subtreempo(
+            tree_mpo,
+            tree_mpo.operator_support,
+            max_bond=self._tree.chi,
+            cutoff=self._tree.cutoff,
+            track_norm=track_norm,
+            _validate_backend=False,
+        )
+        if renormalize:
+            self._tree.normalize()
+        return self
+
+    def _apply_tree_pauli_sum(
+        self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True
+    ):
+        """Apply a coefficient-frame Pauli sum through TreeMPO routing."""
+        return self._tree.apply_pauli_sum(
+            weighted_terms,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            track_norm=track_norm,
+            _force_tree_mpo=True,
+        )
+
+    def _apply_tree_pauli_rotation(self, theta, pauli, where, *, sign=1.0):
+        """Apply a coefficient-frame Pauli rotation through TreeMPO routing."""
+        return self._tree.apply_pauli_rotation(
+            theta,
+            pauli,
+            where,
+            sign=sign,
+            _force_tree_mpo=True,
+        )
 
     def isometry_direction(self, node):
         """Return the coefficient-tree neighbour proven by ``left_inds``."""
@@ -2277,14 +2431,14 @@ class TreeStabOptimizer:
             # A zero matrix, or an explicitly over-toleranced decomposition,
             # annihilates the state. Keep this on the same native TreeMPO
             # route as nonzero coefficient branches.
-            self._tree.apply_pauli_sum(
+            self._apply_tree_pauli_sum(
                 [(0.0, {})],
                 max_bond=self._tree.chi,
                 cutoff=self._tree.cutoff,
                 track_norm=unitary,
             )
             return
-        self._tree.apply_pauli_sum(
+        self._apply_tree_pauli_sum(
             branches,
             max_bond=self._tree.chi,
             cutoff=self._tree.cutoff,
@@ -2672,17 +2826,11 @@ class TreeStabOptimizer:
         """Apply the coefficient-side localizer through TreeOptimizer."""
         for name, targets in ops:
             if name == "h":
-                self._tree.apply_1q(self._tree._as_state_backend(_H, warn=False), targets[0])
+                self._apply_tree_gate(_H, targets[0])
             elif name == "sdg":
-                self._tree.apply_1q(
-                    self._tree._as_state_backend(_SDG, warn=False), targets[0]
-                )
+                self._apply_tree_gate(_SDG, targets[0])
             elif name == "cnot":
-                self._tree.apply_2q(
-                    self._tree._as_state_backend(_CNOT, warn=False),
-                    targets[0],
-                    targets[1],
-                )
+                self._apply_tree_gate(_CNOT, targets)
             else:  # pragma: no cover - localizer construction is closed above
                 raise RuntimeError(f"unknown localizer operation {name!r}.")
 
@@ -2737,6 +2885,7 @@ class TreeStabOptimizer:
             z_value,
             renormalize=True,
             return_diagnostics=True,
+            _force_tree_mpo=True,
         )
         diagnostics.update({
             "basis_updated": True,
@@ -2807,7 +2956,7 @@ class TreeStabOptimizer:
             return self
         support = tuple(sorted(terms))
         frame_axes = "".join(terms[q] for q in support)
-        self._tree.apply_pauli_rotation(
+        self._apply_tree_pauli_rotation(
             theta, frame_axes, support, sign=float(sign)
         )
         return self
@@ -2941,9 +3090,7 @@ class TreeStabOptimizer:
                 - 1j * float(sign) * np.sin(float(theta) / 2.0)
                 * pauli_matrix(rotation_axis)
             )
-            self._tree.apply_1q(
-                self._tree._as_state_backend(local_rotation, warn=False), pivot
-            )
+            self._apply_tree_gate(local_rotation, pivot)
             # The coefficient state received the local rotation. The
             # controlled-Pauli remainder is represented for free in C.
             self.state.absorb_basis_clifford(cascade.inverse())
@@ -3589,6 +3736,7 @@ class TreeStabOptimizer:
                 sign=float(sign),
                 renormalize=True,
                 return_diagnostics=True,
+                _force_tree_mpo=True,
             )
             diagnostics["probability"] = float(probability)
         self.measurements.append(MeasurementRecord(pauli, where, measured))
@@ -4073,7 +4221,7 @@ class TreeStabOptimizer:
             # uses the compact TreeMPO route. This keeps sampling and
             # multi-site projection on the same Tree-native canonical/
             # compression implementation.
-            self._tree.apply_pauli_sum(
+            self._apply_tree_pauli_sum(
                 [
                     (0.5, {}),
                     (0.5 * outcome * float(sign), dict(terms)),
@@ -4749,6 +4897,7 @@ class TreeStabOptimizer:
     def __repr__(self):  # pragma: no cover - cosmetic
         return (
             f"TreeStabOptimizer(n={self.n}, chi={self._tree.chi}, "
+            f"mode={self.mode!r}, "
             f"compression_mode={self._tree.compression_mode!r}, "
             f"max_bond={self.p.max_bond()}, "
             f"max_pauli_terms={self.max_pauli_terms}, "
