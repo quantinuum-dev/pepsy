@@ -3953,6 +3953,28 @@ def _sites_from_edges(edges, sites):
     return tuple(out)
 
 
+def _edge_coloring_layers(edges):
+    """Partition edges into deterministic vertex-disjoint layers."""
+    layers = []
+    occupied_sites = []
+    for edge in _as_edges(edges):
+        if edge[0] == edge[1]:
+            raise ValueError(
+                "A hopping edge must connect distinct sites; "
+                f"got {edge!r}."
+            )
+        endpoints = frozenset(edge)
+        for layer, occupied in zip(layers, occupied_sites):
+            if endpoints.isdisjoint(occupied):
+                layer.append(edge)
+                occupied.update(endpoints)
+                break
+        else:
+            layers.append([edge])
+            occupied_sites.append(set(endpoints))
+    return tuple(tuple(layer) for layer in layers)
+
+
 def _edge_angle_parameter(value, left, right):
     """Return an oriented edge angle, negating reversed mapping lookups."""
     if callable(value):
@@ -4170,6 +4192,7 @@ def fermi_hubbard_u1u1_gate_stream(
         return SymGateStream(entries, dt=dt, imaginary=imaginary, order=order)
 
     half = dt / 2
+    layers = _edge_coloring_layers(edges)
     entries = (
         tuple(
             fermi_hubbard_u1u1_interaction_gate_stream(
@@ -4182,9 +4205,24 @@ def fermi_hubbard_u1u1_gate_stream(
             )
         )
         + tuple(
-            fermi_hubbard_u1u1_hopping_gate_stream(
-                edges,
-                dt,
+            gate_entry
+            for layer in layers
+            for gate_entry in fermi_hubbard_u1u1_hopping_gate_stream(
+                layer,
+                half,
+                t=t,
+                peierls_angle=peierls_angle,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        + tuple(
+            gate_entry
+            for layer in reversed(layers)
+            for gate_entry in fermi_hubbard_u1u1_hopping_gate_stream(
+                tuple(reversed(layer)),
+                half,
                 t=t,
                 peierls_angle=peierls_angle,
                 imaginary=imaginary,
@@ -4480,6 +4518,7 @@ def fermi_hubbard_u1u1_jw_gate_stream(
         return SymGateStream(entries, dt=dt, imaginary=imaginary, order=order)
 
     half = dt / 2
+    layers = _edge_coloring_layers(edges)
     entries = (
         tuple(
             fermi_hubbard_u1u1_jw_interaction_gate_stream(
@@ -4493,9 +4532,24 @@ def fermi_hubbard_u1u1_jw_gate_stream(
             )
         )
         + tuple(
-            fermi_hubbard_u1u1_jw_hopping_gate_stream(
-                edges,
-                dt,
+            gate_entry
+            for layer in layers
+            for gate_entry in fermi_hubbard_u1u1_jw_hopping_gate_stream(
+                layer,
+                half,
+                t=t,
+                peierls_angle=peierls_angle,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        + tuple(
+            gate_entry
+            for layer in reversed(layers)
+            for gate_entry in fermi_hubbard_u1u1_jw_hopping_gate_stream(
+                tuple(reversed(layer)),
+                half,
                 t=t,
                 peierls_angle=peierls_angle,
                 imaginary=imaginary,
@@ -10050,25 +10104,7 @@ class Fermion:
     @staticmethod
     def edge_coloring_layers(edges):
         """Partition edges into deterministic vertex-disjoint layers."""
-        edges = _as_edges(edges)
-        layers = []
-        occupied_sites = []
-        for edge in edges:
-            if edge[0] == edge[1]:
-                raise ValueError(
-                    "A hopping edge must connect distinct sites; "
-                    f"got {edge!r}."
-                )
-            endpoints = frozenset(edge)
-            for layer, occupied in zip(layers, occupied_sites):
-                if endpoints.isdisjoint(occupied):
-                    layer.append(edge)
-                    occupied.update(endpoints)
-                    break
-            else:
-                layers.append([edge])
-                occupied_sites.append(set(endpoints))
-        return tuple(tuple(layer) for layer in layers)
+        return _edge_coloring_layers(edges)
 
     def gate_stream(
         self,

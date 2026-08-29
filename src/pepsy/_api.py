@@ -86,6 +86,7 @@ _SYMBOL_MODULES = {
     "fsim": ".operators",
     "fsimg": ".operators",
     "gate": ".operators",
+    "gate_mpo_auto_swap": ".operators",
     "gate_simple": ".operators",
     "h": ".operators",
     "hadamard": ".operators",

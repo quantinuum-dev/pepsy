@@ -66,6 +66,7 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ..._internal.random import backend_random_array
 from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
@@ -5440,23 +5441,18 @@ class MpsStabOptimizer:
         dtype_name = str(getattr(data, "dtype", "float64"))
         if "complex64" in dtype_name:
             random_dtype = np.complex64
-            real_dtype = np.float32
         elif "complex" in dtype_name:
             random_dtype = np.complex128
-            real_dtype = np.float64
         elif "float32" in dtype_name:
             random_dtype = np.float32
-            real_dtype = np.float32
         else:
             random_dtype = np.float64
-            real_dtype = np.float64
-        values = rng.normal(size=tuple(shape)).astype(real_dtype)
-        if np.issubdtype(random_dtype, np.complexfloating):
-            values = values + 1j * rng.normal(size=tuple(shape)).astype(real_dtype)
-        return ar.do(
-            "array",
-            (float(strength) * values).astype(random_dtype),
+        return backend_random_array(
+            shape,
             like=data,
+            dtype=random_dtype,
+            scale=float(strength),
+            rng=rng,
         )
 
     def _fit_randomized_guess(self, p, where, *, block_size, expand):

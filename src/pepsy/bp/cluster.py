@@ -82,6 +82,12 @@ from ._symmray import (
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
+from .._internal.quimb import (
+    quimb_bp_class as _quimb_bp_class,
+    quimb_bp_constructor_option_supported as _quimb_bp_constructor_option_supported,
+    quimb_bp_constructor_options as _quimb_bp_constructor_options,
+    quimb_bp_run_options as _quimb_bp_run_options,
+)
 
 __all__ = [
     "BPCandidateScore",
@@ -113,9 +119,9 @@ def _cluster_bp_class(norm: str):
         raise ValueError(
             f"norm must be one of {sorted(_CLUSTER_BP_CLASSES)}; got {norm!r}"
         )
-    from quimb.tensor import belief_propagation as _bp
-
-    return key, getattr(_bp, _CLUSTER_BP_CLASSES[key])
+    return key, _quimb_bp_class(
+        "d2bp" if key == "2norm" else "d1bp"
+    )
 
 
 _GAUGE_INIT_ONLY_BP_OPTS = {
@@ -154,15 +160,16 @@ def _run_plain_bp(
         # Symmray messages cannot be packed by Quimb's dense DIIS
         # vectorizer; sequential D2BP remains native and convergent.
         diis = False
-    bp.run(
-        max_iterations=max_iterations,
-        tol=tol,
-        tol_abs=tol_abs,
-        tol_rolling_diff=tol_rolling_diff,
-        diis=diis,
-        info=info,
-        progbar=progbar,
-    )
+    run_opts = {
+        "max_iterations": max_iterations,
+        "tol": tol,
+        "tol_abs": tol_abs,
+        "tol_rolling_diff": tol_rolling_diff,
+        "diis": diis,
+        "info": info,
+        "progbar": progbar,
+    }
+    bp.run(**_quimb_bp_run_options(bp, run_opts))
     info["quimb_converged"] = bool(info.get("converged", False))
     info["converged"] = _strict_converged(info, tol, tol_abs)
     return info
@@ -914,7 +921,12 @@ def linked_cluster_expand(
 
         from .relay import _set_messages
 
-        bp = D1BP(tn, damping=damping, update=update, **bp_opts)
+        bp = D1BP(
+            tn,
+            **_quimb_bp_constructor_options(
+                "d1bp", {"damping": damping, "update": update, **bp_opts}
+            ),
+        )
         if messages is not None:
             _set_messages(bp, messages)
         bp_converged = None
@@ -1336,8 +1348,10 @@ def loop_cluster_expand(
         if key == "2norm":
             # only D2BP takes an optimize kwarg at construction time.
             ctor["optimize"] = optimize
+        if _quimb_bp_constructor_option_supported(key, "diis"):
+            ctor["diis"] = diis
         ctor.update(bp_opts)
-        bp = bp_cls(tn, **ctor)
+        bp = bp_cls(tn, **_quimb_bp_constructor_options(key, ctor))
 
         if run_bp:
             info = _run_plain_bp(

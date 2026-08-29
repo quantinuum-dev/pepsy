@@ -169,6 +169,20 @@ def test_tree_peps_show_and_canonical_info(capsys):
     assert state.validate(check_canonical=True)
 
 
+def test_tree_peps_exponent_survives_quimb_interoperability_and_show(capsys):
+    """Dense readout and visualization respect Quimb's stored exponent."""
+    state = TreePeps.from_plan(
+        TreePepsPlan.from_shape((2, 2), topology="path")
+    )
+    state.exponent = 2.0
+    copied = state.copy()
+
+    assert copied.exponent == 2.0
+    assert np.linalg.norm(np.asarray(state.to_dense().data)) == pytest.approx(100.0)
+    assert state.show(color=False) is None
+    assert "●" in capsys.readouterr().out
+
+
 def test_tree_peps_exact_readout_canonicalization_and_compression():
     plan = TreePepsPlan.from_shape((2, 2), topology="path")
     state = TreePeps.rand(plan, bond_dim=2, seed=11)

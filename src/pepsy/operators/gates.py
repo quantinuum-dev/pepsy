@@ -16,7 +16,10 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from .._internal.quimb import require_quimb_gate_option
+from .._internal.quimb import (
+    quimb_mpo_auto_swap_function,
+    require_quimb_gate_option,
+)
 
 
 # Symmray's cutoff-based block-SVD keeps every singular value tied with the
@@ -170,6 +173,7 @@ from ..tensors.core import OneDMap, add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
+    "gate_mpo_auto_swap",
     "gate_loop_cluster",
     "gate_simple",
     "renorm_gauge",
@@ -212,6 +216,44 @@ __all__ = [
     "fsim",
     "fsimg",
 ]
+
+
+def gate_mpo_auto_swap(
+    mpo,
+    G,
+    where,
+    *,
+    dagger=False,
+    swap_back=True,
+    strip_exponent=False,
+    contract="split",
+    inplace=False,
+    **compress_opts,
+):
+    """Prototype wrapper for Quimb's MPO auto-swap gate sandwich.
+
+    This is deliberately separate from :func:`gate` and the MPS optimizer:
+    Quimb applies the operator sandwich to an MPO, tracks its canonical form,
+    and optionally swaps a long-range pair back. The wrapper performs no
+    fallback or dense conversion, so unsupported Quimb versions fail at the
+    explicit opt-in call rather than changing existing gate behavior.
+    """
+    function = quimb_mpo_auto_swap_function(mpo)
+    if function is None:
+        raise NotImplementedError(
+            "The installed Quimb build does not provide "
+            "MatrixProductOperator.gate_sandwich_with_auto_swap()."
+        )
+    return function(
+        G,
+        where,
+        dagger=bool(dagger),
+        swap_back=bool(swap_back),
+        strip_exponent=bool(strip_exponent),
+        contract=contract,
+        inplace=bool(inplace),
+        **compress_opts,
+    )
 
 
 def _stop_gradient(x):

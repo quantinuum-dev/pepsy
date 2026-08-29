@@ -10,6 +10,7 @@ from importlib import import_module
 
 _GATE_EXPORTS = [
     "gate",
+    "gate_mpo_auto_swap",
     "gate_loop_cluster",
     "gate_simple",
     "renorm_gauge",

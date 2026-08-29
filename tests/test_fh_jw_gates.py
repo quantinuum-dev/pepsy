@@ -12,6 +12,7 @@ import pytest
 
 from pepsy.tensors import (
     SymGateStream,
+    SymHamiltonian,
     fermi_hubbard_u1u1_jw_gate_stream,
     fermi_hubbard_u1u1_jw_hopping_gate_stream,
     fermi_hubbard_u1u1_jw_interaction_gate_stream,
@@ -27,6 +28,25 @@ def _dense_operator(arr):
     """Dense NumPy operator from a Symmray gate or MPO (double densify)."""
     out = arr.to_dense()
     return np.asarray(out.to_dense() if hasattr(out, "to_dense") else out)
+
+
+def _embed_local_gate(gate, where, length, dim=4):
+    """Embed a one- or adjacent two-site gate into a dense site-major space."""
+    if isinstance(where, (int, np.integer)):
+        where = (int(where),)
+    if len(where) == 1:
+        (site,) = where
+        return np.kron(
+            np.kron(np.eye(dim**site), gate.reshape(dim, dim)),
+            np.eye(dim ** (length - site - 1)),
+        )
+    left, right = sorted(where)
+    if right != left + 1:
+        raise ValueError("the dense test helper only embeds adjacent two-site gates")
+    return np.kron(
+        np.kron(np.eye(dim**left), gate.reshape(dim * dim, dim * dim)),
+        np.eye(dim ** (length - right - 1)),
+    )
 
 
 def _dense_jw_two_site(*, t=1.0, U=0.0, mu=0.0):
@@ -163,8 +183,8 @@ def test_jw_gate_stream_structure_and_orientation():
     order2 = fermi_hubbard_u1u1_jw_gate_stream(edges, dt, order=2)
     # order 1: onsite (3 sites) + hopping (2 bonds)
     assert len(order1) == 3 + 2
-    # order 2 Strang: onsite half + hopping + onsite half
-    assert len(order2) == 3 + 2 + 3
+    # order 2 Strang: onsite half + symmetric hopping layers + onsite half
+    assert len(order2) == 3 + 2 * 2 + 3
     assert order2.order == 2
 
     order4 = fermi_hubbard_u1u1_jw_gate_stream(edges, dt, order=4)
@@ -234,6 +254,71 @@ def test_jw_trotter_gates_spectrum_consistent_with_to_mpo():
     gate_spectrum = np.sort(-np.angle(np.linalg.eigvals(gate)) / dt)
     mpo_spectrum = np.sort(np.linalg.eigvalsh(mpo_ham))
     assert np.allclose(gate_spectrum, mpo_spectrum, atol=1e-8)
+
+
+def test_jw_fourth_order_stream_is_numerically_fourth_order():
+    """The fourth-order stream improves the corrected overlapping-bond schedule."""
+    pytest.importorskip("symmray")
+    sla = pytest.importorskip("scipy.linalg")
+    from pepsy.tensors import symmetric as sym
+
+    length = 3
+    dt = 0.05
+    t, U, mu = 1.3, 5.0, 0.4
+    onsite = _dense(sym._fh_u1u1_jw_onsite_term(U=U, mu=mu)).reshape(4, 4)
+    hopping = _dense(sym._fh_u1u1_jw_hopping_term(t=t)).reshape(16, 16)
+    hamiltonian = sum(
+        _embed_local_gate(onsite, site, length)
+        for site in range(length)
+    ) + sum(
+        _embed_local_gate(hopping, (site, site + 1), length)
+        for site in range(length - 1)
+    )
+    exact = sla.expm(-1j * dt * hamiltonian)
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1), (1, 2)],
+        t=t,
+        U=U,
+        mu=mu,
+    )
+
+    errors = {}
+    for order in (2, 4):
+        approximate = np.eye(4**length, dtype=complex)
+        for gate, where in ham.jw_trotter_gates(dt, order=order):
+            approximate = (
+                _embed_local_gate(_dense(gate), where, length) @ approximate
+            )
+        errors[order] = sla.norm(approximate - exact)
+
+    assert errors[4] < 0.1 * errors[2]
+
+
+def test_cyclic_mpo_orientation_is_invariant_under_edge_reversal():
+    """Wrapping bonds retain the same MPO operator when input orientation flips."""
+    pytest.importorskip("symmray")
+    forward = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1), (1, 2), (2, 3), (0, 3)],
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+    )
+    reversed_edges = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(1, 0), (2, 1), (3, 2), (3, 0)],
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+    )
+    forward_mpo = _dense_operator(forward.to_mpo(L=4, compress=False))
+    reversed_mpo = _dense_operator(reversed_edges.to_mpo(L=4, compress=False))
+
+    np.testing.assert_allclose(forward_mpo, reversed_mpo, atol=1e-12, rtol=1e-12)
 
 
 def test_jw_trotter_gates_guards():

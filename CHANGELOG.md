@@ -21,7 +21,8 @@ Changes for the next release should be added here before the version is bumped.
   when available, while retaining a compatibility fallback for older builds.
 - Added opt-in fourth-order Suzuki-Yoshida gate streams to the symmetric
   Hamiltonian and fermion helpers. Existing first- and second-order streams
-  retain their previous construction.
+  retain their public behavior, with overlapping hopping terms now arranged in
+  a symmetric edge-colored half-step schedule before the fourth-order lift.
 - Added a narrow Symmray compatibility path for older Quimb projector
   compression builds whose `safe_inverse` incorrectly passes an axis to a
   one-dimensional block vector.
@@ -77,6 +78,10 @@ Changes for the next release should be added here before the version is bumped.
 - Added `gloop_opts` to the scalar and 2-norm loop-cluster entry points so
   newer Quimb generalized-loop generator controls can be used without
   changing existing defaults.
+- Added capability-gated BP constructor/run forwarding, Autoray-native random
+  FIT initialization, Quimb `LatticeBondMap` periodic-bond naming, and an
+  explicit opt-in MPO auto-swap wrapper. These integrations preserve existing
+  defaults and fail locally when an optional Quimb capability is unavailable.
 
 ## [0.4.1] - 2026-08-27
 

@@ -188,6 +188,7 @@ fermion_interaction_param_gen
 fsim
 fsimg
 gate
+gate_mpo_auto_swap
 gate_simple
 gauge_all
 gauge_all_simple

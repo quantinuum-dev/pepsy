@@ -82,6 +82,7 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_method_available as _quimb_compression_method_available,  # noqa: F401
     quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
@@ -7531,27 +7532,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
-        """Generate deterministic random data and convert it to ``data``'s backend."""
+        """Generate deterministic random data on ``data``'s backend."""
         dtype_name = str(getattr(data, "dtype", "float64"))
         if "complex64" in dtype_name:
             random_dtype = np.complex64
-            real_dtype = np.float32
         elif "complex" in dtype_name:
             random_dtype = np.complex128
-            real_dtype = np.float64
         elif "float32" in dtype_name:
             random_dtype = np.float32
-            real_dtype = np.float32
         else:
             random_dtype = np.float64
-            real_dtype = np.float64
-        random_data = rng.normal(size=tuple(shape)).astype(real_dtype)
-        if np.issubdtype(random_dtype, np.complexfloating):
-            random_data = random_data + 1j * rng.normal(
-                size=tuple(shape)
-            ).astype(real_dtype)
-        random_data = (float(strength) * random_data).astype(random_dtype)
-        return ar.do("array", random_data, like=data)
+        return backend_random_array(
+            shape,
+            like=data,
+            dtype=random_dtype,
+            scale=float(strength),
+            rng=rng,
+        )
 
     def _build_randomized_fit_guess(
         self,
