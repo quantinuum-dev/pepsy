@@ -328,6 +328,11 @@ _DEFAULT_CUTOFF = "auto"
 _DEFAULT_CUTOFF_MODE = "auto"
 _DEFAULT_MAX_OPERATOR_QUBITS = 8
 _DEFAULT_MAX_SUBTREE_NODES = 128
+# Dense local gate factorization is deliberately kept small. Wider operators
+# should use the TreeMPO route, which factorizes on the active Steiner subtree
+# without first creating one large local dense factorization in the update
+# kernel.
+_DIRECT_GATE_MAX_QUBITS = 4
 
 
 def _normalize_control_where(where):
@@ -404,18 +409,21 @@ class TreeOptimizer:
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
         convention, ``"rsum2"``. Use ``"rel"`` for a relative
         largest-singular-value threshold.
-    mode : {"auto", "direct", "mpo", "submpo", "dm"}
-        Implementation used for two-site gates and explicit operator streams.
-        ``"direct"`` uses the specialised gate-SVD/QR path. ``"mpo"`` first
-        factorises ordinary two-site gates with Quimb into a two-tensor
-        sub-MPO. ``"submpo"`` declares that the stream is already made of
-        explicit :meth:`submpo_event` entries (with ordinary one-site gates
-        allowed for singleton supports); it rejects ordinary multi-site gate
-        entries and replays the MPO payloads natively.
-        Explicit sub-MPO entries are also accepted in the other modes for
-        backward compatibility. ``"auto"`` (the default) selects direct
-        threading for ordinary two-site gates. ``"dm"`` is a shorthand for
-        ``mode="auto", compression_mode="dm"``.
+    mode : {"auto", "direct", "dm", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
+        Gate/operator route and state-compression method. ``"direct"`` uses
+        dense local factorization and the specialised gate-SVD/QR path;
+        ``"dm"`` is its density-matrix-compression shorthand. These dense
+        routes accept at most four-qubit gate entries. ``"tree_mpo_direct"``
+        and ``"tree_mpo_dm"`` build a true :class:`TreeMPO` on the active
+        Steiner subtree and apply it with :meth:`apply_subtreempo`; the
+        suffix selects direct SVD or density-matrix compression. ``"auto"``
+        uses the dense route through four qubits and promotes wider gates to
+        ``"tree_mpo_direct"``. ``"submpo"`` declares that the stream is
+        already made of explicit chain-MPO entries. ``"mpo"`` remains the
+        legacy two-site chain-MPO factorization mode. Explicit sub-MPO
+        entries are accepted in the other legacy modes for compatibility.
+        Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
+        ``"tree_mpo_dem"`` and ``"tree_mpo"`` compatibility spellings.
     compression_mode : {"direct", "dm"}
         Decomposition used when truncating the already fused state/operator
         network. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
@@ -545,12 +553,59 @@ class TreeOptimizer:
     @staticmethod
     def _normalize_mode(mode):
         """Validate and normalize the gate or sub-MPO replay mode."""
-        mode = str(mode).strip().lower()
-        if mode not in {"auto", "direct", "mpo", "submpo"}:
+        mode = str(mode).strip().lower().replace("-", "_")
+        aliases = {
+            "dem": "dm",
+            "tree_mpo": "tree_mpo_direct",
+            "treempo": "tree_mpo_direct",
+            "treempo_direct": "tree_mpo_direct",
+            "treempo_dm": "tree_mpo_dm",
+            "treempo_dem": "tree_mpo_dm",
+            "tree_mpo_dem": "tree_mpo_dm",
+            "tree_mpo_svd": "tree_mpo_direct",
+            "tree_mpo_eig": "tree_mpo_dm",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {
+            "auto", "direct", "dm", "mpo", "submpo",
+            "tree_mpo_direct", "tree_mpo_dm",
+        }:
             raise ValueError(
-                "mode must be 'auto', 'direct', 'mpo', or 'submpo'."
+                "mode must be one of 'auto', 'direct', 'dm', 'mpo', "
+                "'submpo', 'tree_mpo_direct', or 'tree_mpo_dm'."
             )
         return mode
+
+    def _gate_route(self, width):
+        """Return the implementation route for an ordinary dense gate.
+
+        ``mode`` is intentionally resolved here rather than at construction:
+        automatic replay can choose the small dense kernel for local gates and
+        the geometry-aware TreeMPO kernel for wider supports.
+        """
+        if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+            return "treempo"
+        if self.mode == "auto":
+            return "dense" if width <= _DIRECT_GATE_MAX_QUBITS else "treempo"
+        if self.mode == "submpo":
+            return "submpo"
+        return "dense"
+
+    def _compression_for_mode(self, mode, compression_mode):
+        """Resolve a mode's optional compression suffix.
+
+        The combined TreeMPO names own their compression method. A conflicting
+        explicit ``compression_mode`` is rejected rather than silently
+        changing the meaning of a mode name.
+        """
+        if mode not in {"tree_mpo_direct", "tree_mpo_dm"}:
+            return compression_mode
+        expected = "dm" if mode == "tree_mpo_dm" else "direct"
+        if compression_mode not in {expected, "direct"}:
+            raise ValueError(
+                f"mode={mode!r} requires compression_mode={expected!r}."
+            )
+        return expected
 
     @staticmethod
     def _normalize_compression_mode(mode):
@@ -766,7 +821,7 @@ class TreeOptimizer:
         self._logical_positions = {q: q for q in self._logical_qubits}
 
         compression_mode = self._normalize_compression_mode(compression_mode)
-        raw_mode = str(mode).strip().lower().replace("-", "_")
+        raw_mode = self._normalize_mode(mode)
         if raw_mode == "dm":
             if compression_mode not in {"direct", "dm"}:
                 raise ValueError(
@@ -775,6 +830,9 @@ class TreeOptimizer:
                 )
             compression_mode = "dm"
             raw_mode = "auto"
+        compression_mode = self._compression_for_mode(
+            raw_mode, compression_mode
+        )
 
         self.chi = self._normalize_max_bond(chi)
         self.cutoff = cutoff
@@ -1127,8 +1185,23 @@ class TreeOptimizer:
                 )
 
     def _validate_mode_for_stream(self):
-        """Validate the explicit ``mode='submpo'`` stream declaration."""
-        if self.mode != "submpo" or not self.G:
+        """Validate mode-specific stream declarations before replay."""
+        if not self.G:
+            return
+        if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+            chain_events = [
+                step for step, event_type in enumerate(self.event_types, 1)
+                if event_type == "submpo"
+            ]
+            if chain_events:
+                raise ValueError(
+                    f"mode={self.mode!r} requires TreeMPO/TTNO events; "
+                    "chain sub-MPO event(s) found at step(s) "
+                    f"{chain_events!r}. Use mode='submpo' for chain MPOs or "
+                    "TreeOptimizer.subtreempo_event(...) for TreeMPOs."
+                )
+            return
+        if self.mode != "submpo":
             return
         # ``output_replay='submpo'`` still represents singleton supports as
         # ordinary one-site gates. They do not introduce a competing
@@ -1147,7 +1220,8 @@ class TreeOptimizer:
                 "mode='submpo' requires explicit sub-MPO events for "
                 "multi-site operations; ordinary multi-site gate event(s) "
                 f"found at step/width {ordinary!r}. "
-                "Use mode='direct' or mode='mpo' for dense gate streams."
+                "Use mode='direct', mode='dm', or a tree_mpo_* mode for "
+                "dense gate streams."
             )
         if "submpo" not in self.event_types:
             raise ValueError(
@@ -2770,6 +2844,53 @@ class TreeOptimizer:
             self._finish_update()
         return result
 
+    def _apply_gate_tree_mpo_impl(
+        self, gate, logical_where, where, *, renormalize=False, track_norm=True
+    ):
+        """Apply an ordinary gate through a true TreeMPO active span."""
+        from .operators import TreeMPO
+
+        gate = self._as_state_backend(gate)
+        factor_started = (
+            self._profile_phase_start() if len(logical_where) > 1 else None
+        )
+        tree_mpo = TreeMPO.from_gate(
+            self.plan,
+            gate,
+            where,
+            fermionic=bool(getattr(self.tn, "fermionic", False)),
+            symmetry=getattr(self.tn, "symmetry", None),
+            dtype=self.backend_dtype,
+        )
+        self._profile_phase_event(
+            "gate_factorization",
+            factor_started,
+            route="treempo",
+            support=tuple(logical_where),
+            operator_bond=tree_mpo.max_bond(),
+        )
+        self.apply_subtreempo(
+            tree_mpo,
+            tree_mpo.operator_support,
+            max_bond=self.chi,
+            cutoff=self.cutoff,
+            track_norm=track_norm,
+            _validate_backend=False,
+        )
+        if renormalize:
+            self.normalize()
+        return self
+
+    def _check_direct_gate_width(self, width):
+        """Reject wide dense gates from the bounded local direct route."""
+        if width > _DIRECT_GATE_MAX_QUBITS:
+            raise ValueError(
+                f"mode={self.mode!r} supports dense direct gates on at most "
+                f"{_DIRECT_GATE_MAX_QUBITS} qubits; got {width}. Use "
+                "mode='tree_mpo_direct' or mode='tree_mpo_dm' for a wider "
+                "gate, or supply an explicit TreeMPO event."
+            )
+
     def _apply_gate_impl(
         self, gate, where, *, renormalize=False, track_norm=True
     ):
@@ -2787,44 +2908,23 @@ class TreeOptimizer:
                 "A multi-qubit gate needs distinct qubits; "
                 f"got where={logical_where}."
             )
-        if self.mode != "submpo":
-            # Dense gates use the same complete TreeMPO representation as
-            # scheduled TTNO events. This keeps layout routing, backend
-            # conversion, QR canonicalization, and the final compression
-            # sweep in one native Tree path for one-, two-, and multi-site
-            # operators. Explicit ``mode='submpo'`` remains the opt-in MPS
-            # compatibility mode.
-            from .operators import TreeMPO
-
-            factor_started = (
-                self._profile_phase_start() if len(logical_where) > 1 else None
-            )
-            tree_mpo = TreeMPO.from_gate(
-                self.plan,
+        route = self._gate_route(len(logical_where))
+        if route == "treempo":
+            return self._apply_gate_tree_mpo_impl(
                 gate,
+                logical_where,
                 where,
-                fermionic=bool(getattr(self.tn, "fermionic", False)),
-                symmetry=getattr(self.tn, "symmetry", None),
-                dtype=self.dtype,
-            )
-            self._profile_phase_event(
-                "gate_factorization",
-                factor_started,
-                route="treempo",
-                support=tuple(logical_where),
-                operator_bond=tree_mpo.max_bond(),
-            )
-            self.apply_subtreempo(
-                tree_mpo,
-                tree_mpo.operator_support,
-                max_bond=self.chi,
-                cutoff=self.cutoff,
+                renormalize=renormalize,
                 track_norm=track_norm,
-                _validate_backend=False,
             )
-            if renormalize:
-                self.normalize()
-            return self
+        if route == "dense" and self.mode == "direct":
+            self._check_direct_gate_width(len(logical_where))
+        if route == "submpo" and len(logical_where) > 1:
+            raise ValueError(
+                "mode='submpo' accepts explicit sub-MPO stream events, not "
+                "ordinary dense gates; use mode='direct', mode='dm', or a "
+                "tree_mpo_* mode."
+            )
         with self._thread_ctx():
             if len(where) == 1:
                 self.apply_1q(
@@ -3141,12 +3241,13 @@ class TreeOptimizer:
             truncation proxy ``1 - (norm / reference_norm)**2``; the reference
             is established at run start and reset after control/non-unitary
             events.
-        mode : {"auto", "direct", "mpo", "submpo", "dm"} | {"tree", "ttn"} | None, default=None
+        mode : {"auto", "direct", "dm", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
             Optional persistent gate/sub-MPO replay selection: a supplied
             value updates :attr:`mode` before replay and remains active for
-            future runs and copies. ``"submpo"`` validates an explicit MPO
-            stream; ``"tree"``/``"ttn"`` are deprecated no-op compatibility
-            selectors for shared coefficient frontends.
+            future runs and copies. ``"submpo"`` validates an explicit chain
+            MPO stream; ``"tree_mpo_direct"`` and ``"tree_mpo_dm"`` require
+            TreeMPO routing. ``"tree"``/``"ttn"`` are deprecated no-op
+            compatibility selectors for shared coefficient frontends.
             ``"dm"`` selects automatic gate routing with density-matrix
             compression.
         compression_mode : {"direct", "dm"} | None, default=None
@@ -3184,25 +3285,63 @@ class TreeOptimizer:
         """
         self._warn_track_truncation_slow()
         if mode is not None:
-            requested_mode = str(mode).strip().lower()
-            if requested_mode in {"tree", "ttn", "tree_tensor_network"}:
+            requested_mode_raw = str(mode).strip().lower().replace("-", "_")
+            if requested_mode_raw in {"tree", "ttn", "tree_tensor_network"}:
                 warnings.warn(
                     "run(mode='tree'/'ttn') is a deprecated no-op; use "
-                    "mode='auto', 'direct', 'mpo', or 'submpo' to select "
+                    "mode='auto', 'direct', 'dm', 'tree_mpo_direct', "
+                    "'tree_mpo_dm', 'mpo', or 'submpo' to select "
                     "a gate/sub-MPO implementation.",
                     DeprecationWarning,
                     stacklevel=2,
                 )
             else:
+                requested_mode = self._normalize_mode(requested_mode_raw)
                 if requested_mode == "dm":
                     self.mode = "auto"
                     self.compression_mode = "dm"
                 else:
-                    self.mode = self._normalize_mode(requested_mode)
+                    requested_compression = (
+                        None if compression_mode is None
+                        else self._normalize_compression_mode(compression_mode)
+                    )
+                    if requested_mode in {
+                        "tree_mpo_direct", "tree_mpo_dm"
+                    }:
+                        expected = (
+                            "dm" if requested_mode == "tree_mpo_dm"
+                            else "direct"
+                        )
+                        if (
+                            requested_compression is not None
+                            and requested_compression != expected
+                        ):
+                            raise ValueError(
+                                f"mode={requested_mode!r} requires "
+                                f"compression_mode={expected!r}."
+                            )
+                        self.mode = requested_mode
+                        self.compression_mode = expected
+                    else:
+                        self.mode = self._normalize_mode(requested_mode)
         if compression_mode is not None:
-            self.compression_mode = self._normalize_compression_mode(
-                compression_mode
-            )
+            if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+                normalized_compression = self._normalize_compression_mode(
+                    compression_mode
+                )
+                expected = (
+                    "dm" if self.mode == "tree_mpo_dm" else "direct"
+                )
+                if normalized_compression not in {expected, "direct"}:
+                    raise ValueError(
+                        f"mode={self.mode!r} requires "
+                        f"compression_mode={expected!r}."
+                    )
+                self.compression_mode = expected
+            else:
+                self.compression_mode = self._normalize_compression_mode(
+                    compression_mode
+                )
         non_unitary = bool(non_unitary)
         if track_infidelity is not None:
             self.track_infidelity = bool(track_infidelity)
@@ -3646,15 +3785,30 @@ class TreeOptimizer:
         right into leaf ``b``, threading the virtual bond *exactly* through the
         intermediate nodes along the tree geodesic.  Only once **both** factors
         are present is a single canonical compression sweep run back along the
-        path, so every bond truncation sees the complete gate.
+        path, so every bond truncation sees the complete gate. ``tree_mpo_direct``
+        and ``tree_mpo_dm`` instead construct a true TreeMPO and route its
+        active Steiner subtree; the mode choice is honored for direct API calls
+        as well as bundled streams.
         """
         self._invalidate_state_norm_cache()
+        logical_where = _normalize_where((qa, qb))
+        where = self._validate_support(logical_where)
+        if logical_where[0] == logical_where[1]:
+            raise ValueError("A two-qubit gate needs two distinct qubits.")
         started = self._begin_update(
-            "gate", (int(qa), int(qb)), track_norm=track_norm
+            "gate", logical_where, track_norm=track_norm
         )
         try:
             with self._thread_ctx():
-                result = self._apply_2q_impl(gate, qa, qb)
+                if self._gate_route(2) == "treempo":
+                    result = self._apply_gate_tree_mpo_impl(
+                        gate,
+                        logical_where,
+                        where,
+                        track_norm=track_norm,
+                    )
+                else:
+                    result = self._apply_2q_impl(gate, *logical_where)
         except Exception:
             if started:
                 self._abort_update()
@@ -3690,15 +3844,22 @@ class TreeOptimizer:
 
         ``mode='direct'`` splits the gate locally and ``mode='mpo'`` lets Quimb
         make the equivalent two-tensor MPO. Both immediately enter the same
-        two-factor attach/QR-thread/compress kernel. ``'auto'`` selects direct
-        factorization for every backend; use ``'mpo'`` explicitly to select
-        Quimb's operator-TN factorization. ``'submpo'`` is reserved for
-        explicit sub-MPO stream events and cannot be used with a dense gate.
+        two-factor attach/QR-thread/compress kernel. ``'auto'`` and ``'dm'``
+        select local direct factorization. The ``tree_mpo_*`` modes are handled
+        by :meth:`_apply_gate_tree_mpo_impl` so they never fall through to the
+        chain-MPO implementation. ``'submpo'`` is reserved for explicit
+        sub-MPO stream events and cannot be used with a dense gate.
         """
         if self.mode == "submpo":
             raise ValueError(
                 "mode='submpo' accepts explicit sub-MPO stream events, not "
                 "ordinary dense gates; use mode='direct' or mode='mpo'."
+            )
+        if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+            logical_where = _normalize_where((qa, qb))
+            where = self._validate_support(logical_where)
+            return self._apply_gate_tree_mpo_impl(
+                gate, logical_where, where, track_norm=True
             )
         gate = self._as_state_backend(gate)
         if self.mode in {"auto", "direct"}:
@@ -7358,6 +7519,7 @@ class TreeOptimizer:
     def __repr__(self):
         return (
             f"TreeOptimizer(n={self.n}, chi={self.chi}, "
+            f"mode={self.mode!r}, "
             f"compression_mode={self.compression_mode!r}, "
             f"max_bond={self.max_bond()}, gates={len(self.G)})"
         )

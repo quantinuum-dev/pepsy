@@ -302,6 +302,130 @@ def test_tree_dm_mode_is_a_shorthand_for_direct_routing():
     assert opt.compression_mode == "dm"
 
 
+@pytest.mark.parametrize(
+    ("mode", "normalized", "compression"),
+    [
+        ("tree_mpo_direct", "tree_mpo_direct", "direct"),
+        ("tree-mpo-dm", "tree_mpo_dm", "dm"),
+        ("tree_mpo_dem", "tree_mpo_dm", "dm"),
+        ("tree_mpo", "tree_mpo_direct", "direct"),
+    ],
+)
+def test_tree_mpo_modes_normalize_to_explicit_tree_routes(
+    mode, normalized, compression,
+):
+    """TreeMPO mode names retain both their route and compression contract."""
+    opt = TreeOptimizer(None, n=2, mode=mode, run=False)
+
+    assert opt.mode == normalized
+    assert opt.compression_mode == compression
+
+
+def test_tree_mpo_gate_modes_use_tree_mpo_not_chain_submpo(monkeypatch):
+    """Named TreeMPO modes use the active TreePlan span, never a chain MPO."""
+    rng = np.random.default_rng(921)
+    support = (0, 3, 7)
+    gate = _rand_unitary(len(support), rng)
+    opt = TreeOptimizer(
+        None,
+        n=8,
+        chi=64,
+        cutoff=0.0,
+        mode="tree_mpo_direct",
+        profile=True,
+        run=False,
+    )
+    routed = []
+    apply_subtreempo = opt.apply_subtreempo
+
+    def traced_apply_subtreempo(tree_mpo, *args, **kwargs):
+        routed.append(tree_mpo)
+        return apply_subtreempo(tree_mpo, *args, **kwargs)
+
+    def no_chain_mpo(*args, **kwargs):
+        raise AssertionError("TreeMPO gate route used a chain sub-MPO")
+
+    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    monkeypatch.setattr(qtn.MatrixProductOperator, "from_dense", no_chain_mpo)
+    opt.apply_gate(gate, support)
+
+    assert routed
+    assert isinstance(routed[0], TreeMPO)
+    path_events = [
+        event.get("kind") == "gate_factorization"
+        and event.get("route") == "treempo"
+        for event in opt.profile_events
+    ]
+    assert any(path_events)
+    metadata = [
+        event for event in opt.profile_events
+        if event.get("kind") == "metadata_path"
+        and event.get("route") == "subtreempo"
+    ]
+    assert metadata
+    assert metadata[-1]["support"] == support
+    assert metadata[-1]["subtree_nodes"] == len(
+        opt._steiner_nodes([opt.plan.node_of_qubit[q] for q in support])
+    )
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_direct_gate_mode_stays_dense_for_four_qubits(monkeypatch):
+    """The bounded direct route does not promote a four-qubit gate to TreeMPO."""
+    rng = np.random.default_rng(922)
+    opt = TreeOptimizer(None, n=6, chi=64, cutoff=0.0, mode="direct", run=False)
+
+    def unexpected_tree_mpo(*args, **kwargs):
+        raise AssertionError("direct gate route unexpectedly built a TreeMPO")
+
+    monkeypatch.setattr(opt, "_apply_gate_tree_mpo_impl", unexpected_tree_mpo)
+    opt.apply_gate(_rand_unitary(4, rng), (0, 2, 4, 5))
+
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_direct_gate_mode_rejects_wider_dense_gate():
+    """Wide dense gates provide an actionable TreeMPO route recommendation."""
+    opt = TreeOptimizer(None, n=5, mode="direct", run=False)
+
+    with pytest.raises(ValueError, match="tree_mpo_direct"):
+        opt.apply_gate(np.eye(32, dtype=complex), tuple(range(5)))
+
+
+def test_tree_mpo_run_mode_updates_route_and_compression():
+    """run(mode=...) persists the combined TreeMPO mode contract."""
+    opt = TreeOptimizer(None, n=3, mode="direct", run=False)
+
+    opt.run(mode="tree-mpo-dm")
+    assert opt.mode == "tree_mpo_dm"
+    assert opt.compression_mode == "dm"
+
+    opt.run(mode="tree_mpo_direct")
+    assert opt.mode == "tree_mpo_direct"
+    assert opt.compression_mode == "direct"
+
+
+def test_tree_mpo_dm_uses_density_matrix_compression_after_tree_routing():
+    """The TreeMPO density-matrix mode reaches the tree compression core."""
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        [(hadamard, 0), (cnot, (0, 1))],
+        n=2,
+        chi=1,
+        cutoff=0.0,
+        mode="tree_mpo_dm",
+        track_truncation=True,
+    )
+
+    assert opt.compression_mode == "dm"
+    assert any(event["kind"] == "compress" for event in opt.truncation_history)
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
     """Every dense path-thread Q keeps its toward-destination isometry."""
     rng = np.random.default_rng(919)

@@ -45,6 +45,11 @@ Changes for the next release should be added here before the version is bumped.
   decomposition after the complete state/operator network is fused; the
   existing direct SVD mode remains the default and native fermionic trees keep
   their graded direct-compression path.
+- Added explicit `TreeOptimizer` `tree_mpo_direct` and `tree_mpo_dm` modes.
+  These build and route a true TreeMPO over the active Steiner subtree rather
+  than lowering gates to a chain sub-MPO; `auto` now promotes gates wider than
+  four qubits to the TreeMPO route, while bounded dense direct gates fail with
+  an actionable mode recommendation.
 - Added `OneDMap` center-out/inside-out traversal aliases and independent
   `TreePepsPlan.tree_order` seeds. Row-major, Hilbert, diagonal, and
   center-out orders can now guide legal degree-bounded virtual trees, and

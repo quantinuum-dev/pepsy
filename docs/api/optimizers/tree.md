@@ -235,14 +235,22 @@ rank-four tensor. `TreePlan.is_binary()` accepts this ternary-root convention,
 while `TreePlan.is_strictly_binary()` requests two children at every internal
 node.
 
-Gates are absorbed into the tree:
+Gates are absorbed into the tree according to the selected optimizer mode:
 
-- **dense gates and operators** are compiled into a complete `TreeMPO`, including
-  one-, two-, and multi-qubit gates. The operator is factorized on the minimal
-  Steiner subtree, its virtual bonds are QR-routed to a hub, and one final
-  canonical compression sweep applies the configured `chi` / `cutoff`. The
-  direct `apply_subtree_operator` primitive remains available for compatibility
-  callers that explicitly want dense factorization without a TreeMPO object.
+- **`direct` / `dm`** use the bounded dense local route for ordinary gate
+  entries. One- and two-qubit gates use the specialised gate factorization and
+  exact QR threading; three- and four-qubit gates use the recursive dense tree
+  factorization. A direct gate entry wider than four qubits raises an actionable
+  error recommending a `tree_mpo_*` mode. `dm` selects the same route with
+  density-matrix (`svd:eig`) state compression.
+- **`tree_mpo_direct` / `tree_mpo_dm`** build a true `TreeMPO` with
+  `TreeMPO.from_gate`, factorized on the minimal TreePlan Steiner subtree, and
+  apply it with `apply_subtreempo`. The suffix selects direct SVD or
+  density-matrix compression. This route never constructs a chain `sub_mpo`.
+- **`auto`** uses the dense route through four qubits and promotes wider
+  ordinary gates to `tree_mpo_direct`. The direct `apply_subtree_operator`
+  primitive remains available for callers that explicitly want dense tree
+  factorization without a `TreeMPO` object.
 - **stream events** -- MPS-compatible `measure`, `cap`, `reset`, and
   `measure_reset` entries can be mixed into the stream. Measurements use Pauli
   eigenvalue outcomes (`+1`/`-1`) and are appended to `measurements`;
@@ -548,39 +556,41 @@ minimal Steiner subtree/geodesic before QR routing and compression. The shared
 constructors retain their contiguous-window default for the one-dimensional
 MPS backend, whose compression domain is a chain interval.
 
-Both two-site implementations preserve native Symmray gates and their
-block-sparse fermionic grading. Direct mode splits the rank-four gate; MPO mode
-asks Quimb to make the equivalent two-tensor sub-MPO. The resulting two factors
-then enter the *same* TTN kernel: attach one factor, QR-thread its shared
-operator bond along the unique path, attach the other, then make one final
-compression sweep. Neither path converts the gate to a dense qubit array or
-splits it into base-2 legs.
+The two explicit two-site families preserve native Symmray gates and their
+block-sparse fermionic grading. `direct` splits the rank-four gate locally;
+`tree_mpo_direct` builds the corresponding TreeMPO and contracts its internal
+operator bonds on the TreePlan. Both defer state truncation until the complete
+gate has reached the affected path/span. The legacy `mode="mpo"` remains
+available when Quimb's chain-MPO factorization is specifically desired, and
+`mode="submpo"` remains the explicit chain-MPO stream mode.
 
-For an ordinary two-site gate, choose `mode="direct"` to use the
-specialised gate-SVD/QR threading implementation, or `mode="mpo"` to
-use the same Quimb gate-to-sub-MPO route. `mode="auto"` is the default:
-it selects direct factorization for every backend, including native Symmray
-fermionic gates. Select `mode="mpo"` explicitly to inspect or benchmark
-Quimb's operator-TN factorization. Direct and MPO share the update kernel and
-defer truncation until the complete gate has reached the affected path, so at
-an exact `chi` they differ only by the factorization gauge and numerical
-roundoff. MPO replay also uses the cap-aware cutoff rule: already-within-cap
-path bonds take lossless QR, while expanded bonds use the configured cutoff
-mode.
+For an ordinary gate stream, choose `mode="direct"` (or `mode="direct",
+compression_mode="dm"`) for the bounded dense route. Choose
+`mode="tree_mpo_direct"` or `mode="tree_mpo_dm"` when the operator should be
+represented and routed as a true TreeMPO. `mode="tree_mpo"` is an alias for
+`tree_mpo_direct`; hyphenated names are accepted, and `tree_mpo_dem` is kept as
+a compatibility spelling for `tree_mpo_dm`. `mode="auto"` uses direct dense
+factorization for supports up to four qubits and the TreeMPO route for wider
+supports. The combined `tree_mpo_*` names own their compression suffix, so a
+conflicting `compression_mode` is rejected.
 
 `run(mode=...)` has the same persistent semantics as `MpsOptimizer`: it updates
-the optimizer's selected two-site mode for that run, later runs, and copies.
+the optimizer's selected gate route and compression method for that run, later
+runs, and copies.
 The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
 
-The decomposition used for truncation is independent of the routing mode.
-Pass `compression_mode="direct"` for the default SVD path or
-`compression_mode="dm"` for Quimb's density-matrix-equivalent `svd:eig`
-decomposition on the local fused state/operator compression core. The latter
-does not form a global dense state and is currently restricted to dense tree
-tensors; native fermionic trees retain their graded direct compression path.
-For the common automatic routing case, `mode="dm"` is a shorthand for
-`mode="auto", compression_mode="dm"`.
+For the legacy `auto`, `direct`, and `mpo` routes, the decomposition used for
+truncation can still be selected independently with
+`compression_mode="direct"` (SVD) or `compression_mode="dm"` (Quimb's
+density-matrix-equivalent `svd:eig` decomposition on the local fused
+state/operator compression core). The latter does not form a global dense
+state and is currently restricted to dense tree tensors; native fermionic
+trees retain their graded direct compression path. `mode="dm"` is the
+automatic-routing shorthand for `mode="auto", compression_mode="dm"`.
+The combined `tree_mpo_direct` and `tree_mpo_dm` names select both the true
+TreeMPO route and its compression method, so a conflicting explicit
+`compression_mode` is rejected.
 
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
 Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
@@ -594,7 +604,8 @@ when using that lower-level interface.
 ### Performance-oriented defaults and warnings
 
 The default replay configuration is intended for production evolution:
-`mode="auto"` uses the direct routed two-site kernel, `threads=1` avoids
+`mode="auto"` uses dense local factorization through four-qubit supports and
+the true TreeMPO route for wider supports, while `threads=1` avoids
 oversubscribing the small tree contractions, `subtree_workers=1` keeps the
 serial path allocation-free, `profile=False` avoids timing overhead, and
 `track_truncation=False` avoids full-spectrum diagnostic SVDs, while
