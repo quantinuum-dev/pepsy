@@ -185,6 +185,28 @@ def _apply_tableau_circuit_to_statevector(state, circuit, n, *, site_order=None)
     return out
 
 
+def _clean_statevector_roundoff(state, *, operation_count):
+    """Remove only floating-point cancellation noise from dense Clifford readout."""
+    state = np.asarray(state)
+    if not np.all(np.isfinite(state)):
+        return state
+    scale = float(np.max(np.abs(state), initial=0.0))
+    if scale == 0.0:
+        return state
+    real_dtype = np.empty((), dtype=state.dtype).real.dtype
+    eps = np.finfo(real_dtype).eps
+    # Tableau replay uses exact Clifford identities such as H @ H = I. A
+    # bounded multiple of machine epsilon removes their cancellation residue
+    # without acting as a physical amplitude cutoff.
+    tolerance = 32.0 * max(1, int(operation_count)) * eps * scale
+    small = np.abs(state) <= tolerance
+    if not np.any(small):
+        return state
+    cleaned = state.copy()
+    cleaned[small] = 0
+    return cleaned
+
+
 class STNState:
     """A stabilizer tensor-network state.
 
@@ -373,6 +395,18 @@ class STNState:
     # Backward-compatible alias.
     nu_frame_pauli = frame_pauli
 
+    def tableau(self):
+        """Return a fresh :class:`stim.Tableau` for the live basis Clifford.
+
+        The STN representation is ``|psi> = C |p>``.  Stim exposes the
+        simulator's inverse tableau, so this method returns its inverse: the
+        tableau for ``C`` itself, with ``x_output(i)`` giving destabilizer
+        ``d_i`` and ``z_output(i)`` giving stabilizer ``s_i``.  A fresh tableau
+        is returned so display or circuit-conversion code cannot mutate the
+        live simulator through this readout helper.
+        """
+        return self._sim.current_inverse_tableau().inverse()
+
     # ------------------------------------------------------------------ #
     # Clifford update (basis only; |nu> unchanged)
     # ------------------------------------------------------------------ #
@@ -503,11 +537,13 @@ class STNState:
         if self.is_identity_frame():
             return p_dense
         tableau = self._sim.current_inverse_tableau().inverse()
-        return _apply_tableau_circuit_to_statevector(
-            p_dense,
-            tableau.to_circuit(),
-            self.n,
-            site_order=site_order,
+        circuit = tableau.to_circuit()
+        state = _apply_tableau_circuit_to_statevector(
+            p_dense, circuit, self.n, site_order=site_order
+        )
+        return _clean_statevector_roundoff(
+            state,
+            operation_count=len(circuit),
         )
 
     def to_statevector(self) -> np.ndarray:

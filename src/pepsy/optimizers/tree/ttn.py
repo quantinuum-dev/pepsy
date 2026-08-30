@@ -7,9 +7,9 @@ a thin, geometry-owning subclass of ``quimb``'s arbitrary-geometry vector class
 binary), a configurable physical-index /
 site-tag / node-tag naming scheme, and deterministic tree-edge bond names, so
 that higher-level code (notably :class:`~pepsy.optimizers.tree.TreeOptimizer`)
-can talk in *node ids* and *qubit labels* while all the heavy lifting --
-canonicalisation, bond compression, gate application, dense read-out, copying --
-is inherited unchanged from ``quimb``.
+can talk in *node ids* and *qubit labels*. Arbitrary-geometry readout and
+low-level tensor operations remain Quimb-backed, while canonicalization,
+whole-tree compression, and canonical metadata are owned by this Tree class.
 
 Layout of a tree state
 ----------------------
@@ -52,6 +52,28 @@ from ...backends import to_float
 from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
+
+
+def _normalize_compression_mode(mode):
+    """Normalize the local tree-bond compression decomposition mode."""
+
+    mode = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "svd": "direct",
+        "eigh": "dm",
+        "density_matrix": "dm",
+        "densitymatrix": "dm",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"direct", "dm"}:
+        raise ValueError("compression_mode must be 'direct' or 'dm'.")
+    return mode
+
+
+def _compression_method(mode):
+    """Return the dense Quimb split method for a compression mode."""
+
+    return "svd:eig" if _normalize_compression_mode(mode) == "dm" else "svd"
 
 
 def _native_rank_safe_qr(array, backend):
@@ -442,6 +464,10 @@ def _native_qr_options_for_tensor(tensor):
 def _native_qr_split_tensor(tensor, **kwargs):
     """Split one tree tensor using the native graded QR policy."""
     kwargs.update(_native_qr_options_for_tensor(tensor))
+    # QR is a lossless gauge move. Keep it independent from the optimizer's
+    # truncating SVD cutoff even though Quimb's shared split signature exposes
+    # a nonzero cutoff default.
+    kwargs.setdefault("cutoff", 0.0)
     if _is_symmray_array(tensor.data):
         kwargs.setdefault("fn", _native_qr_block_scaled)
     kwargs.setdefault("method", "qr")
@@ -460,22 +486,6 @@ def _is_native_mpo(value):
         return any(_is_symmray_array(tensor.data) for tensor in tensors)
     except (AttributeError, TypeError):
         return None
-
-
-def _tree_plan_signature(plan):
-    """Return the structural identity used by source-aware tree MPOs."""
-    return (
-        int(plan.root),
-        tuple(
-            (int(node), tuple(int(child) for child in children))
-            for node, children in sorted(plan.children.items())
-        ),
-        tuple(
-            (int(node), int(qubit))
-            for node, qubit in sorted(plan.qubit_of_leaf.items())
-        ),
-        None if plan.root_qubit is None else int(plan.root_qubit),
-    )
 
 
 def _contract_two_tensors(left, right, *, shared_ind=None):
@@ -1067,13 +1077,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Contract ``<psi|MPO|psi>`` without applying or compressing the TTN.
 
         The tree, a private ket view, and the MPO remain separate tensor
-        networks. A :class:`TreeMPO` or an MPO created by :func:`tree_mpo`
-        supplies a TreePlan-labelled operator representation, contracted as
-        ``tree.H | tree_operator | tree``; its optional chain MPO is never
-        moved into the tree, applied, densified, or compressed. For an
-        unannotated MPO, the lower physical legs are connected to fresh
-        copies of the ket physical legs, while its upper physical legs
-        connect to the bra, and the complete doubled network is contracted.
+        networks. The lower physical legs are connected to fresh copies of
+        the ket physical legs, while the upper physical legs connect to the
+        bra, and the complete doubled network is contracted. A native
+        :class:`TreeMPO` uses its own ``expectation`` method for tree-native
+        contraction.
 
         ``mpo`` must expose Quimb's regular MPO site interface. Its active site
         labels must match ``where``. For a native fermionic TTN the MPO must
@@ -1101,71 +1109,6 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 normalized=normalized,
                 optimize=optimize,
             )
-
-        tree_operator = getattr(mpo, "pepsy_tree_operator", None)
-        if tree_operator is not None:
-            if getattr(mpo, "pepsy_tree_plan_signature", None) != (
-                _tree_plan_signature(self.plan)
-            ):
-                raise ValueError(
-                    "tree MPO embedding was built for a different TreePlan."
-                )
-            all_sites = tuple(sorted(self.plan.node_of_qubit))
-            if tuple(sorted(where)) != all_sites:
-                raise ValueError(
-                    "a TreePlan MPO embedding must be evaluated on all tree "
-                    "sites so its identity legs remain explicit."
-                )
-            if hasattr(tree_operator, "expectation"):
-                return tree_operator.expectation(
-                    self,
-                    normalized=normalized,
-                    optimize=optimize,
-                )
-            if not self.fermionic:
-                raise TypeError(
-                    "native TreePlan MPO embeddings require a native "
-                    "fermionic TreeTensorNetwork."
-                )
-
-            operators = (
-                tree_operator
-                if isinstance(tree_operator, (tuple, list))
-                else (tree_operator,)
-            )
-            numerator = 0.0
-            for operator in operators:
-                ket = self.copy()
-                operator_work = operator.copy()
-                ket_reindex = {}
-                operator_reindex = {}
-                for site in all_sites:
-                    physical = self.site_ind(site)
-                    upper = f"k{site}"
-                    lower = f"b{site}"
-                    if upper not in operator_work.ind_map:
-                        raise ValueError(
-                            "TreePlan MPO embedding is missing physical site "
-                            f"{site!r}."
-                        )
-                    if lower not in operator_work.ind_map:
-                        raise ValueError(
-                            "TreePlan MPO embedding is missing lower physical "
-                            f"site {site!r}."
-                        )
-                    fresh = qtn.rand_uuid()
-                    ket_reindex[physical] = fresh
-                    operator_reindex[lower] = fresh
-                ket.reindex_(ket_reindex)
-                operator_work.reindex_(operator_reindex)
-                numerator = numerator + (self.H | operator_work | ket).contract(
-                    all,
-                    optimize=optimize,
-                )
-            if not normalized:
-                return numerator
-            denominator = (self.H | self).contract(all, optimize=optimize)
-            return numerator / denominator
 
         required = (
             "gen_sites_present", "site_tag", "upper_ind_id", "lower_ind_id",
@@ -1230,6 +1173,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 )
             fresh = qtn.rand_uuid()
             ket_reindex[physical] = fresh
+            mpo_reindex[upper] = physical
             mpo_reindex[lower] = fresh
 
         # This is the key orientation: bra <- MPO upper, MPO lower -> ket.
@@ -2197,6 +2141,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         cutoff_mode="rsum2",
         absorb="right",
         reduced=True,
+        compression_mode="direct",
         _reduction_proven=False,
     ):
         """Compress the tree edge ``a -> b`` in place.
@@ -2216,7 +2161,19 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         when node ``b`` is already isometric on its non-shared legs; native
         trees use the same proof, with the zero-sector-safe QR policy retained
         for the two-sided reduced path.
+        ``compression_mode="direct"`` uses the standard SVD, while
+        ``compression_mode="dm"`` uses Quimb's density-matrix-equivalent
+        ``svd:eig`` decomposition on the local canonical core. The latter is
+        currently available for dense trees only.
         """
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode == "dm" and self.fermionic:
+            raise NotImplementedError(
+                "compression_mode='dm' is currently available for dense "
+                "tree tensors only; use compression_mode='direct' for "
+                "native fermionic trees."
+            )
+
         bond = self.bond(a, b)
         before_bond = int(self.ind_size(bond))
         if cutoff == 0.0 and (
@@ -2248,10 +2205,107 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb=absorb,
                 reduced=reduced,
+                method=_compression_method(compression_mode),
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
+
+    def compress(
+        self,
+        *,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        center=None,
+        reduced=True,
+        compression_mode="direct",
+    ):
+        """Compress the complete tree with a centre-oriented SVD sweep.
+
+        This is the high-level Tree analogue of an MPS ``compress`` call. The
+        tree has no left-to-right direction, so ``center`` selects the final
+        canonical node and every edge is compressed from the outer leaves
+        inward along its unique geodesic to that node. ``max_bond`` and
+        ``cutoff`` are applied by :meth:`compress_edge_` on each edge.
+
+        Canonicalization itself is always lossless QR. A truncating sweep uses
+        native edge SVDs and then records the selected node as the canonical
+        centre. Thus direct ``TreeTensorNetwork`` users get the same metadata
+        guarantees as :class:`TreeOptimizer`, without needing an optimizer or
+        a separate ``info_c`` mapping.
+
+        Parameters
+        ----------
+        max_bond : int, optional
+            Maximum virtual bond dimension. ``None`` keeps every retained
+            singular direction.
+        cutoff : float, optional
+            Singular-value cutoff. ``0.0`` requests a lossless QR gauge move
+            whenever no finite ``max_bond`` requires an SVD.
+        cutoff_mode : str, optional
+            Quimb cutoff convention, normally ``"rsum2"`` or ``"rel"``.
+        center : int, optional
+            TreePlan node at which to leave the final canonical centre. By
+            default, the current centre is retained, or the plan root is used
+            when no centre is known.
+        reduced : bool, optional
+            Use the reduced two-sided edge compression path where available.
+
+        Returns
+        -------
+        TreeTensorNetwork
+            ``self``, after compression and canonical metadata validation.
+        """
+        if cutoff is None:
+            cutoff = 1e-10
+        cutoff = float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        if max_bond is not None:
+            max_bond = int(max_bond)
+            if max_bond < 1:
+                raise ValueError("max_bond must be at least one.")
+
+        if center is None:
+            center = self.orthogonality_center
+            if center is None:
+                center = self._plan.root
+        if center not in self._plan.children:
+            raise ValueError(f"{center!r} is not a node of the tree.")
+
+        # Establish a known centre once. The subsequent post-order traversal
+        # then compresses each edge exactly after all of its outward branches
+        # have been reduced, so the final sweep has a valid tree-canonical
+        # gauge without a second full canonicalization pass.
+        self.shift_orthogonality_center(center)
+        order = sorted(
+            (node for node in self._plan.nodes() if node != center),
+            key=lambda node: (
+                -len(self._plan.node_path(node, center)),
+                int(node),
+            ),
+        )
+        for node in order:
+            neighbor = self._plan.node_path(node, center)[1]
+            self.compress_edge_(
+                node,
+                neighbor,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                reduced=reduced,
+                compression_mode=compression_mode,
+            )
+
+        # ``compress_edge_`` conservatively clears the global centre when the
+        # prior centre is not the source endpoint. The traversal above has
+        # nevertheless established the defining outward isometries, so record
+        # the proven final region explicitly and verify it before returning.
+        self._canonical_region = frozenset({center})
+        self._set_isometry_metadata_from_region({center})
+        return self.validate(check_canonical=True)
 
     def canonize_around_node_(self, nid):
         """Canonicalise the whole tree around node ``nid`` and track it as centre.

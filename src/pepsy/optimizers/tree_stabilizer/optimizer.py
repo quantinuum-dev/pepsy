@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
+from copy import deepcopy
 from collections.abc import Mapping
 from itertools import combinations
 from numbers import Integral
@@ -31,10 +33,19 @@ from ..stabilizer_tn.mps_stab_optimizer import (
     ImmediateProjectionRecord,
     MeasurementRecord,
 )
-from ..stabilizer_tn.paulis import hermitian_pauli_terms, pauli_string
+from ..stabilizer_tn.paulis import (
+    _resolve_measurement_disentangle,
+    hermitian_pauli_terms,
+    pauli_string,
+)
 from ..stabilizer_tn.records import (
     StabilizerMpsSettingsAdvice,
     StabilizerTreeRunResult,
+)
+from ..stabilizer_tn.dense import (
+    _as_gate_matrix,
+    _is_unitary,
+    _tableau_from_exact_unitary,
 )
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
@@ -42,8 +53,8 @@ from ..mps.optimizer import conditional_event_parts, submpo_event_parts
 from ..tree.layout import TreeLayoutFinder, TreePlan, _DEFAULT_TOP_ARITY
 from ..tree.optimizer import (
     TreeOptimizer,
-    _DEFAULT_CUTOFF,
     _DEFAULT_CUTOFF_MODE,
+    _tree_mpo_event_parts,
 )
 from ..tree.ttn import TreeTensorNetwork
 
@@ -64,6 +75,46 @@ _CNOT = np.array(
 _RESET_FLIP_CLIFFORDS = {"X": "z", "Y": "x", "Z": "x"}
 
 
+def _normalize_tree_stab_mode(mode):
+    """Normalize the TreeStab coefficient-update route.
+
+    TreeStab's numerical coefficient updates are naturally represented by a
+    compact TreeMPO on the active tree span.  Keep the older TreeOptimizer
+    names accepted for stream compatibility, but make the two explicit
+    TreeMPO modes the canonical TreeStab interface.
+    """
+    if mode is None:
+        return "tree_mpo_direct"
+    requested = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "tree_mpo": "tree_mpo_direct",
+        "treempo": "tree_mpo_direct",
+        "treempo_direct": "tree_mpo_direct",
+        "tree_mpo_svd": "tree_mpo_direct",
+        "treempo_dm": "tree_mpo_dm",
+        "treempo_dem": "tree_mpo_dm",
+        "tree_mpo_dem": "tree_mpo_dm",
+        "tree_mpo_eig": "tree_mpo_dm",
+        "dem": "dm",
+    }
+    requested = aliases.get(requested, requested)
+    if requested in {"tree_mpo_direct", "tree_mpo_dm", "dm"}:
+        return requested
+    if requested in {"auto", "direct", "mpo", "submpo"}:
+        warnings.warn(
+            f"TreeStabOptimizer mode={mode!r} is a legacy compatibility "
+            "route; use mode='tree_mpo_direct' or mode='tree_mpo_dm'.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return requested
+    raise ValueError(
+        "TreeStabOptimizer mode must be 'tree_mpo_direct' or "
+        "'tree_mpo_dm' (hyphenated spellings and 'tree_mpo_dem' are "
+        f"accepted), got {mode!r}."
+    )
+
+
 def _normalize_sites(where):
     if isinstance(where, Integral):
         return (int(where),)
@@ -76,6 +127,40 @@ def _normalize_sites(where):
     if len(set(sites)) != len(sites):
         raise ValueError(f"where must contain distinct qubits, got {sites!r}.")
     return sites
+
+
+def _normalize_measurement_order(order, *, count, targets=None):
+    """Normalize a batch measurement order without touching the tree."""
+    if isinstance(order, str) or order is None:
+        key = "min_span" if order is None else _normalize_name(order)
+        if key in {"auto", "span", "min_span", "shortest"}:
+            return "min_span"
+        if key in {"input", "given", "original"}:
+            return "input"
+        raise ValueError(
+            "measurement order must be 'min_span', 'input', or an explicit "
+            "permutation of the batch entries."
+        )
+    try:
+        requested = tuple(int(index) for index in order)
+    except TypeError as exc:
+        raise TypeError(
+            "measurement order must be a supported string or an entry permutation."
+        ) from exc
+    if len(requested) != int(count) or len(set(requested)) != int(count):
+        raise ValueError(
+            "an explicit measurement order must be a permutation of the batch."
+        )
+    if set(requested) == set(range(int(count))):
+        return requested
+    if targets is not None and len(set(targets)) == int(count):
+        target_to_index = {int(target): index for index, target in enumerate(targets)}
+        if set(requested) == set(target_to_index):
+            return tuple(target_to_index[target] for target in requested)
+    raise ValueError(
+        "an explicit measurement order must contain batch indices or each "
+        "target qubit exactly once."
+    )
 
 
 def _normalize_axes(pauli, where, *, allow_identity=False):
@@ -142,19 +227,6 @@ def _looks_like_single_entry(gates):
     return len(gates) == 2 and _is_matrix_like(gates[0])
 
 
-def _is_unitary(gate):
-    """Return whether a dense gate is unitary to the STN tolerance."""
-    gate = np.asarray(ar.to_numpy(gate))
-    if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
-        return False
-    return np.allclose(
-        gate.conj().T @ gate,
-        np.eye(gate.shape[0], dtype=gate.dtype),
-        rtol=1e-10,
-        atol=1e-12,
-    )
-
-
 def _apply_dense_gate(state, gate, where, n):
     """Apply a small gate to a dense state in logical big-endian order."""
     where = tuple(int(q) for q in where)
@@ -177,6 +249,18 @@ def _apply_dense_gate(state, gate, where, n):
 def _as_entries(gates):
     if gates is None:
         return []
+    # Keep the trajectory objects opaque to the tree layout code, but treat a
+    # single event/compiled plan as one stream entry.  The generic iterable
+    # fallback would otherwise either reject a TrajectoryEvent or misclassify
+    # ``[TrajectoryEvent(...)]`` as a bundled gate.
+    try:
+        from ..noise import TrajectoryEvent, TrajectoryStreamPlan
+    except ImportError:  # pragma: no cover - optional import cycle guard
+        TrajectoryEvent = TrajectoryStreamPlan = ()
+    if isinstance(gates, TrajectoryStreamPlan):
+        return list(gates.entries)
+    if isinstance(gates, TrajectoryEvent):
+        return [gates]
     if _looks_like_single_entry(gates):
         return [gates]
     if isinstance(gates, (str, bytes)):
@@ -187,8 +271,34 @@ def _as_entries(gates):
         raise TypeError("gates must be a gate entry or an iterable of entries.") from exc
 
 
+def _compile_stream_plan(gates):
+    """Compile trajectory/stochastic entries before tree-layout discovery."""
+    from ..noise import compile_trajectory_stream
+
+    return compile_trajectory_stream(_as_entries(gates))
+
+
 def _entry_support(entry):
     """Extract a physical support for automatic tree layout construction."""
+    from ..noise import (
+        TrajectoryEvent,
+        _leakage_event_parts,
+        _trajectory_event_from_stochastic_entry,
+    )
+
+    if isinstance(entry, TrajectoryEvent):
+        return _normalize_sites(entry.where)
+    leakage = _leakage_event_parts(entry)
+    if leakage is not None:
+        _kind, _payload, where = leakage
+        return tuple(int(site) for site in where)
+    trajectory_event = _trajectory_event_from_stochastic_entry(entry)
+    if trajectory_event is not None:
+        return _normalize_sites(trajectory_event.where)
+    tree_mpo_parts = _tree_mpo_event_parts(entry)
+    if tree_mpo_parts is not None:
+        _tree_mpo, where = tree_mpo_parts
+        return _normalize_sites(where)
     submpo_parts = submpo_event_parts(entry, normalize_where=True)
     if submpo_parts is not None:
         _submpo, where = submpo_parts
@@ -612,10 +722,14 @@ class TreeStabOptimizer:
     Parameters are intentionally close to ``TreeOptimizer`` and
     ``MpsStabOptimizer``. ``gates`` are queued at construction and consumed by
     :meth:`run`; :meth:`apply` queues and immediately replays a stream.
-    Noisy trajectories and MPS-specific layout/noise APIs remain separate
-    milestones. Dense non-Clifford matrices are supported only up to
+    Noisy trajectories use the shared Pepsy shot runner; MPS-specific layout
+    APIs remain separate. Dense non-Clifford matrices are supported only up to
     ``max_operator_qubits`` through bounded Pauli decomposition. Set
     ``exact_cooling=False`` to exercise the ordinary multi-site rotation path.
+    Coefficient-side numerical updates use the tree-native
+    ``tree_mpo_direct`` or ``tree_mpo_dm`` route; ``tree_mpo_dem`` and
+    hyphenated spellings are accepted aliases. Older ``TreeOptimizer`` mode
+    names remain compatibility aliases for existing streams.
     """
 
     def __init__(
@@ -625,7 +739,7 @@ class TreeStabOptimizer:
         *,
         n=None,
         chi=None,
-        cutoff=_DEFAULT_CUTOFF,
+        cutoff=1e-10,
         cutoff_mode=_DEFAULT_CUTOFF_MODE,
         tree=None,
         layout=None,
@@ -634,12 +748,14 @@ class TreeStabOptimizer:
         top_arity=_DEFAULT_TOP_ARITY,
         layout_objective="path",
         layout_weight_mode="count",
-        mode="auto",
+        mode="tree_mpo_direct",
+        compression_mode="direct",
         dtype=complex,
         threads=1,
         seed=None,
         inplace=True,
         track_truncation=False,
+        track_infidelity=True,
         max_operator_qubits=DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS,
         max_pauli_decomposition_qubits=None,
         max_pauli_terms=256,
@@ -655,6 +771,19 @@ class TreeStabOptimizer:
     ):
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
+        mode = _normalize_tree_stab_mode(mode)
+        compression_mode = TreeOptimizer._normalize_compression_mode(
+            compression_mode
+        )
+        # Keep the historical ``compression_mode="dm"`` spelling useful with
+        # the new TreeMPO default, while an explicit ``tree_mpo_dm`` suffix
+        # remains the unambiguous canonical form.
+        if mode == "tree_mpo_direct" and compression_mode == "dm":
+            mode = "tree_mpo_dm"
+        # TreeOptimizer's legacy ``dm`` shorthand intentionally remains
+        # available for old callers and records ``mode='auto'`` internally.
+        # TreeStab still exposes it as the canonical TreeMPO-DM mode below.
+        tree_mode = "dm" if mode == "dm" else mode
         if max_pauli_decomposition_qubits is not None:
             if max_operator_qubits != DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS:
                 raise ValueError(
@@ -712,7 +841,8 @@ class TreeStabOptimizer:
             if candidate and not isinstance(state, (Integral, TreeTensorNetwork)):
                 state, gates = None, candidate
 
-        entries = _as_entries(gates)
+        stream_plan = _compile_stream_plan(gates)
+        entries = list(stream_plan.entries)
         coefficient_state = state
         if isinstance(state, Integral):
             state_n = int(state)
@@ -828,7 +958,8 @@ class TreeStabOptimizer:
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            mode=mode,
+            mode=tree_mode,
+            compression_mode=compression_mode,
             structure=structure,
             max_arity=max_arity,
             top_arity=top_arity,
@@ -842,6 +973,7 @@ class TreeStabOptimizer:
             run=False,
             tn=coefficient_state,
             track_truncation=track_truncation,
+            track_infidelity=track_infidelity,
             max_operator_qubits=max_operator_qubits,
             max_subtree_nodes=max_subtree_nodes,
         )
@@ -857,15 +989,24 @@ class TreeStabOptimizer:
         self.operator_tol = operator_tol
         self.max_dense_sample_qubits = max_dense_sample_qubits
         self.max_dense_cap_qubits = max_dense_cap_qubits
+        self.track_infidelity = bool(track_infidelity)
         self.exact_cooling = bool(exact_cooling)
         self.state = _TreeStabilizerFrame(self._tree.n)
-        self._queue = list(entries)
+        self._trajectory_plan = stream_plan
+        self._gate_stream = tuple(stream_plan.entries)
+        self._has_trajectory_events = bool(
+            stream_plan.has_trajectory_events or stream_plan.has_leakage
+        )
+        self._queue = list(stream_plan.entries)
         self._rng = np.random.default_rng(seed)
         self.measurements = []
+        self.last_measurement_schedule = ()
         self.bond_history = [self._tree.tn.max_bond()]
         self.projection_diagnostics = self._tree.projection_diagnostics
         self._clifford_rotation_cache = {}
-        self.norm_events = []
+        # Keep the wrapper's historical public list live as the Tree ledger is
+        # appended to during direct coefficient updates.
+        self.norm_events = self._tree.norm_events
         self.exact_cooling_events = []
         self.disentangle_events = []
         self.immediate_projection_events = []
@@ -878,6 +1019,7 @@ class TreeStabOptimizer:
         self.stim_plan = None
         self.stim_sample = None
         self.backend_info()
+        self._validate_gate_stream_backend(stream_plan.entries)
 
     @classmethod
     def from_bits(cls, bits, **kwargs):
@@ -886,7 +1028,8 @@ class TreeStabOptimizer:
         optimizer = cls(len(values), **kwargs)
         for q, bit in enumerate(values):
             if bit:
-                optimizer._tree.apply_1q(_X, q)
+                # This is state construction, not replay compression.
+                optimizer._tree.apply_1q(_X, q, track_norm=False)
         return optimizer
 
     @classmethod
@@ -940,7 +1083,11 @@ class TreeStabOptimizer:
             )
         if stream_transform is not None and not callable(stream_transform):
             raise TypeError("stream_transform must be callable or None.")
-        from ..noise import compile_stim_circuit, sample_stim_circuit
+        from ..noise import (
+            _stream_on_optimizer_backend,
+            compile_stim_circuit,
+            sample_stim_circuit,
+        )
 
         plan = compile_stim_circuit(circuit)
         sample = sample_stim_circuit(plan, seed=seed)
@@ -949,7 +1096,10 @@ class TreeStabOptimizer:
             if stream_transform is None
             else stream_transform(sample.gate_stream)
         )
-        optimizer = cls(plan.num_qubits, gates=gates, seed=seed, **kwargs)
+        # Stim emits NumPy matrices. Convert this library-generated stream once
+        # before it crosses the strict user-stream boundary.
+        optimizer = cls(plan.num_qubits, seed=seed, **kwargs)
+        optimizer.set_gates(_stream_on_optimizer_backend(gates, optimizer))
         optimizer.stim_plan = plan
         optimizer.stim_sample = sample
         return optimizer
@@ -984,23 +1134,26 @@ class TreeStabOptimizer:
         """Return stream-based TreeStab settings advice.
 
         Stream classification and magic scheduling are shared with the MPS
-        frontend. Constructor names are translated to TreeOptimizer's
-        terminology while retaining the same advisory semantics.
+        frontend. The cheap retained-norm flag remains ``track_infidelity``;
+        the expensive Tree-only spectrum flag is ``track_truncation``.
         """
         from ..stabilizer_tn.mps_stab_optimizer import MpsStabOptimizer
 
         mps_advice = MpsStabOptimizer.recommend_settings(gates, **kwargs)
         settings = dict(mps_advice.settings)
-        if "track_infidelity" in settings:
-            settings["track_truncation"] = settings.pop("track_infidelity")
         settings.pop("layout_report", None)
+        # MPS-only stabilization is not a TreeStab constructor option. Tree's
+        # retained-norm ledger remains opt-in/out through its own historical
+        # ``track_infidelity`` flag, whose default is enabled.
+        settings.pop("stabilize_unitary", None)
+        settings.setdefault("track_infidelity", True)
         settings.setdefault(
             "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
         )
         warnings = list(mps_advice.warnings)
         warnings.append(
-            "TreeStab reports TTN truncation survival; it is not an MPS "
-            "overlap fidelity proxy."
+            "TreeStab keeps retained-norm tracking separate from optional "
+            "TTN truncation-spectrum diagnostics; neither is an overlap fidelity."
         )
         return StabilizerMpsSettingsAdvice(
             goal=mps_advice.goal,
@@ -1088,6 +1241,108 @@ class TreeStabOptimizer:
     def center(self):
         return self._tree.center
 
+    @property
+    def compression_mode(self):
+        """Compression decomposition used by the coefficient tree."""
+
+        return self._tree.compression_mode
+
+    @property
+    def mode(self):
+        """Canonical coefficient-update route.
+
+        The public TreeStab modes are ``tree_mpo_direct`` and
+        ``tree_mpo_dm``.  Legacy TreeOptimizer routes remain visible when
+        explicitly requested so existing stream code can inspect its original
+        compatibility choice; the ``dm`` shorthand is reported canonically.
+        """
+        if self._tree.mode == "auto" and self._tree.compression_mode == "dm":
+            return "tree_mpo_dm"
+        return self._tree.mode
+
+    def _apply_tree_gate(
+        self, gate, where, *, renormalize=False, track_norm=True
+    ):
+        """Apply one coefficient-side gate through a true TreeMPO.
+
+        This helper is used for stabilizer-frame localizers and exact-cooling
+        pivots as well as ordinary matrix entries. Keeping canonical TreeStab
+        modes on this helper avoids silently falling back to a dense local
+        kernel. The explicit legacy ``mode='mpo'`` compatibility route is
+        handled separately below.
+        """
+        if self._tree.mode == "mpo":
+            # Preserve the historical explicit ``mode='mpo'`` contract for
+            # callers that still inspect its two-factor kernel. New TreeStab
+            # modes below never take this branch.
+            logical_where = _normalize_sites(where)
+            gate = self._tree._as_state_backend(gate, warn=False)
+            if len(logical_where) == 1:
+                self._tree.apply_1q(
+                    gate,
+                    logical_where[0],
+                    renormalize=renormalize,
+                    track_norm=track_norm,
+                )
+                return self
+            if len(logical_where) == 2:
+                self._tree.apply_2q(
+                    gate,
+                    logical_where[0],
+                    logical_where[1],
+                    track_norm=track_norm,
+                )
+                if renormalize:
+                    self._tree.normalize()
+                return self
+            raise ValueError("legacy mode='mpo' supports at most two sites.")
+        from ..tree.operators import TreeMPO
+
+        logical_where = _normalize_sites(where)
+        compact_where = self._tree._validate_support(logical_where)
+        gate = self._tree._as_state_backend(gate, warn=False)
+        tree_mpo = TreeMPO.from_gate(
+            self.plan,
+            gate,
+            compact_where,
+            fermionic=bool(getattr(self.p, "fermionic", False)),
+            symmetry=getattr(self.p, "symmetry", None),
+            dtype=self._tree.backend_dtype,
+        )
+        self._tree.apply_subtreempo(
+            tree_mpo,
+            tree_mpo.operator_support,
+            max_bond=self._tree.chi,
+            cutoff=self._tree.cutoff,
+            track_norm=track_norm,
+            _validate_backend=False,
+        )
+        if renormalize:
+            self._tree.normalize()
+        return self
+
+    def _apply_tree_pauli_sum(
+        self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True
+    ):
+        """Apply a coefficient-frame Pauli sum through TreeMPO routing."""
+        return self._tree.apply_pauli_sum(
+            weighted_terms,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            track_norm=track_norm,
+            _force_tree_mpo=True,
+        )
+
+    def _apply_tree_pauli_rotation(self, theta, pauli, where, *, sign=1.0):
+        """Apply a coefficient-frame Pauli rotation through TreeMPO routing."""
+        return self._tree.apply_pauli_rotation(
+            theta,
+            pauli,
+            where,
+            sign=sign,
+            _force_tree_mpo=True,
+        )
+
     def isometry_direction(self, node):
         """Return the coefficient-tree neighbour proven by ``left_inds``."""
         return self._tree.isometry_direction(node)
@@ -1105,6 +1360,10 @@ class TreeStabOptimizer:
         self._tree.validate_isometry_metadata(region)
         return self
 
+    def sync_canonicalization(self, center=None):
+        """Rebuild the tracked coefficient-tree centre after external access."""
+        return self._tree.sync_canonicalization(center)
+
     @property
     def tree_optimizer(self):
         """Return the coefficient-side ``TreeOptimizer``."""
@@ -1115,12 +1374,198 @@ class TreeStabOptimizer:
         return self.state.simulator
 
     def set_gates(self, gates):
-        self._queue = _as_entries(gates)
+        self._install_stream_plan(gates)
         return self
 
     def add_gates(self, gates):
-        self._queue.extend(_as_entries(gates))
+        self._install_stream_plan(tuple(self._queue) + tuple(_as_entries(gates)))
         return self
+
+    def _install_stream_plan(self, gates):
+        """Install the normalized trajectory plan owned by the queue."""
+        plan = _compile_stream_plan(gates)
+        self._validate_gate_stream_backend(plan.entries)
+        self._trajectory_plan = plan
+        self._gate_stream = tuple(plan.entries)
+        self._has_trajectory_events = bool(
+            plan.has_trajectory_events or plan.has_leakage
+        )
+        self._queue = list(plan.entries)
+
+    def gate_stream(self):
+        """Return the immutable compiled stream owned by this optimizer."""
+        return self._gate_stream
+
+    def _validate_gate_stream_backend(self, entries, *, path_prefix="stream"):
+        """Validate all user matrix/MPO payloads before queue installation."""
+        from ..noise import TrajectoryEvent, _leakage_event_parts
+
+        payloads = []
+        event_types = []
+        paths = []
+
+        def collect(entry, path):
+            if isinstance(entry, TrajectoryEvent) or _leakage_event_parts(entry):
+                return
+            conditional = conditional_event_parts(entry)
+            if conditional is not None:
+                collect(conditional[1]["action"], f"{path}.action")
+                return
+            tree_mpo_parts = _tree_mpo_event_parts(entry)
+            if tree_mpo_parts is not None:
+                payloads.append(tree_mpo_parts[0])
+                event_types.append("subtreempo")
+                paths.append(path)
+                return
+            submpo_parts = submpo_event_parts(entry, normalize_where=True)
+            if submpo_parts is not None:
+                payloads.append(submpo_parts[0])
+                event_types.append("submpo")
+                paths.append(path)
+                return
+            if (
+                isinstance(entry, (tuple, list))
+                and len(entry) == 2
+                and not isinstance(entry[0], str)
+            ):
+                payloads.append(entry[0])
+                event_types.append("gate")
+                paths.append(path)
+
+        for index, entry in enumerate(entries):
+            collect(entry, f"{path_prefix}[{index}]")
+        if not payloads:
+            return
+        self._tree._validate_gate_stream_backend(
+            payloads,
+            event_types,
+            path_prefix=path_prefix,
+            paths=paths,
+            target_signature=infer_backend_signature(self._tree._state_like()),
+        )
+
+    @property
+    def has_trajectory_events(self):
+        """Whether the queue requires the shared shot/trajectory runner."""
+        return bool(self._has_trajectory_events)
+
+    @staticmethod
+    def submpo_event(mpo, where):
+        """Return the canonical coefficient-frame sub-MPO event."""
+        return ("submpo", mpo, _normalize_sites(where))
+
+    @staticmethod
+    def submpo_event_parts(entry, *, normalize_where=False):
+        """Return ``(mpo, where)`` for a sub-MPO event."""
+        return submpo_event_parts(entry, normalize_where=normalize_where)
+
+    @staticmethod
+    def is_submpo_event(entry):
+        """Return whether ``entry`` is a sub-MPO event."""
+        return submpo_event_parts(entry) is not None
+
+    @staticmethod
+    def subtreempo_event(tree_mpo, where=None):
+        """Build a Tree-native TreeMPO/TTNO event."""
+        return TreeOptimizer.subtreempo_event(tree_mpo, where=where)
+
+    subttno_event = subtreempo_event
+    sub_treempo_event = subtreempo_event
+    sub_tree_mpo_event = subtreempo_event
+
+    @staticmethod
+    def subtreempo_event_parts(entry):
+        """Return ``(TreeMPO, declared_support)`` for a TreeMPO event."""
+        return _tree_mpo_event_parts(entry)
+
+    subttno_event_parts = subtreempo_event_parts
+    sub_treempo_event_parts = subtreempo_event_parts
+
+    @staticmethod
+    def is_subtreempo_event(entry):
+        """Return whether ``entry`` is a Tree-native TreeMPO event."""
+        return _tree_mpo_event_parts(entry) is not None
+
+    is_subttno_event = is_subtreempo_event
+    is_sub_treempo_event = is_subtreempo_event
+
+    @staticmethod
+    def measure_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
+        """Build an MPS-compatible Pauli-measurement event.
+
+        The optional ``absorb_basis`` field is retained when explicitly
+        supplied.  This keeps event tuples portable between the MPS and Tree
+        stabilizer frontends while the Tree dispatcher still owns the actual
+        tree-native measurement implementation.
+        """
+        where = _normalize_sites(where)
+        _normalize_axes(pauli, where, allow_identity=True)
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=False,
+            )
+        if outcome is not None:
+            if not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
+                raise ValueError("measure event outcome must be +1 or -1.")
+            outcome = int(outcome)
+        entry = ("measure", str(pauli), where)
+        if absorb_basis is None:
+            if outcome is not None:
+                entry += (outcome,)
+        else:
+            entry += (outcome, bool(absorb_basis))
+        return entry
+
+    @staticmethod
+    def cap_event(where, vec, absorb="left"):
+        """Build an MPS-compatible physical cap event."""
+        sites = _normalize_sites(where)
+        if len(sites) != 1:
+            raise ValueError("cap event where must reference exactly one site.")
+        absorb = str(absorb).strip().lower()
+        if absorb not in {"left", "right"}:
+            raise ValueError("cap absorb direction must be 'left' or 'right'.")
+        return ("cap", int(sites[0]), np.asarray(vec, dtype=complex).ravel(), absorb)
+
+    @staticmethod
+    def reset_event(where, basis="Z"):
+        """Build an MPS-compatible reset event."""
+        where = _normalize_sites(where)
+        axes = _normalize_basis_axes(basis, where, event="reset")
+        if all(axis == "Z" for axis in axes):
+            return ("reset", where)
+        return ("reset", where, "".join(axes))
+
+    @staticmethod
+    def measure_reset_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
+        """Build an MPS-compatible measure-then-reset event."""
+        where = _normalize_sites(where)
+        axes = _normalize_basis_axes(pauli, where, event="measure_reset")
+        outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=True,
+            )
+        if any(value is not None and value not in (-1, 1) for value in outcomes):
+            raise ValueError("measure_reset outcomes must be +1 or -1.")
+        entry = ("measure_reset", "".join(axes), where)
+        value = None if outcome is None else (
+            outcomes[0] if len(outcomes) == 1 else outcomes
+        )
+        if absorb_basis is None:
+            if outcome is not None:
+                entry += (value,)
+        else:
+            entry += (value, bool(absorb_basis))
+        return entry
 
     @classmethod
     def _build_frame_layout(
@@ -1273,28 +1718,34 @@ class TreeStabOptimizer:
                     "absorbs_basis": False,
                 })
             return
+        tree_mpo_parts = _tree_mpo_event_parts(entry)
+        if tree_mpo_parts is not None:
+            _tree_mpo, where = tree_mpo_parts
+            support = tuple(sorted(_normalize_sites(where)))
+            if support:
+                records.append({
+                    "kind": "subtreempo",
+                    "entry": entry,
+                    "support": support,
+                    "weight": 1.0,
+                    "absorbs_basis": False,
+                })
+            return
         if not (isinstance(entry, (tuple, list)) and entry):
             raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
         head = entry[0]
         if not isinstance(head, str):
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            gate = np.asarray(ar.to_numpy(entry[0]))
             where = _normalize_sites(entry[1])
+            gate = _as_gate_matrix(entry[0], len(where))
             if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
                 raise ValueError(f"Gate matrix must be square, got {gate.shape}.")
             dim = int(gate.shape[0])
             nq = int(round(math.log2(dim)))
             if 2 ** nq != dim or len(where) != nq:
                 raise ValueError(f"Gate shape {gate.shape} does not match where={where!r}.")
-            import stim
-
-            tableau = None
-            if _is_unitary(gate):
-                try:
-                    tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-                except (ValueError, RuntimeError):
-                    tableau = None
+            tableau = _tableau_from_exact_unitary(gate)
             if tableau is not None:
                 self.state.do_tableau(tableau, where)
                 return
@@ -1474,6 +1925,7 @@ class TreeStabOptimizer:
             cutoff=self._tree.cutoff,
             cutoff_mode=self._tree.cutoff_mode,
             mode=self._tree.mode,
+            compression_mode=self._tree.compression_mode,
             structure=self._tree.structure,
             max_arity=self._tree.max_arity,
             top_arity=selected.top_arity,
@@ -1486,6 +1938,7 @@ class TreeStabOptimizer:
             run=False,
             tn=self.p,
             track_truncation=self._tree.track_truncation,
+            track_infidelity=self._tree.track_infidelity,
             max_operator_qubits=self._tree.max_operator_qubits,
             max_subtree_nodes=self._tree.max_subtree_nodes,
             record_history=self._tree.record_history,
@@ -1533,12 +1986,6 @@ class TreeStabOptimizer:
         if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
             raise ValueError("shots must be a nonnegative integer.")
         strategy = str(strategy).strip().lower()
-        if strategy == "auto":
-            strategy = "independent"
-        if strategy != "independent":
-            raise ValueError(
-                "TreeStabOptimizer shot replay supports strategy='independent' only."
-            )
         mpi_enabled = mpi is not None and mpi is not False
         if not mpi_enabled and any(
             value is not None for value in (observable, checkpoint_path)
@@ -1648,6 +2095,11 @@ class TreeStabOptimizer:
                     **common,
                 )
             else:
+                if self._has_trajectory_events:
+                    raise ValueError(
+                        "do not combine stream-local trajectory events with "
+                        "error_model; use one noise representation per stream."
+                    )
                 raw = run_noisy_shots(
                     factory,
                     stream,
@@ -1699,12 +2151,14 @@ class TreeStabOptimizer:
 
         ``progbar`` is accepted for parity with ``MpsStabOptimizer``. The
         displayed infidelity is the tree truncation proxy, when tracked.
-        ``shots`` and ``mpi`` use the shared independent trajectory/MPI runner
-        and leave this optimizer's tableau, coefficient tree, and queue
-        unchanged.
+        ``shots`` uses the shared trajectory runner. Local ``strategy='auto'``
+        may use exact branch coalescing; MPI ``strategy='auto'`` resolves to
+        independent replay for rank-count-invariant shot seeds. Shot replay
+        leaves this optimizer's tableau, coefficient tree, and queue unchanged.
         """
         shot_requested = bool(
-            error_model is not None
+            self._has_trajectory_events
+            or error_model is not None
             or isinstance(shots, bool)
             or not isinstance(shots, Integral)
             or int(shots) != 1
@@ -1766,11 +2220,16 @@ class TreeStabOptimizer:
                 self.bond_history.append(self.p.max_bond())
                 if pbar is not None:
                     pbar.update(1)
-                    infidelity = self._tree.get_infidelities()[-1]
-                    formatted = self._format_progress_infidelity(infidelity)
+                    diagnostics = self.norm_diagnostics()
+                    infidelity = diagnostics["cumulative_infidelity"]
+                    truncation_infidelity = diagnostics["truncation_infidelity"]
                     pbar.set_postfix(
-                        infidelity=formatted,
-                        norm_infidelity=formatted,
+                        infidelity=self._format_progress_infidelity(
+                            infidelity
+                        ),
+                        truncation_infidelity=self._format_progress_infidelity(
+                            truncation_infidelity
+                        ),
                     )
         finally:
             if pbar is not None:
@@ -1806,17 +2265,25 @@ class TreeStabOptimizer:
         if conditional is not None:
             self._apply_conditional_entry(entry)
             return
+        tree_mpo_parts = _tree_mpo_event_parts(entry)
+        if tree_mpo_parts is not None:
+            tree_mpo, where = tree_mpo_parts
+            self._tree.apply_subtreempo(
+                tree_mpo,
+                where,
+                max_bond=self._tree.chi,
+                cutoff=self._tree.cutoff,
+                track_norm=False,
+                _validate_backend=False,
+            )
+            return
         submpo_parts = submpo_event_parts(entry, normalize_where=True)
         if submpo_parts is not None:
             mpo, where = submpo_parts
-            # Convert every operator tensor once at the stream boundary. The
-            # ordinary TreeOptimizer helper copies foreign MPOs, preserving
-            # caller ownership and avoiding repeated per-tensor conversions in
-            # the native subtree path.
-            mpo = self._tree._prepare_gate_stream_backend(
-                [mpo], ["submpo"]
-            )[0]
-            self._tree.apply_submpo(mpo, where)
+            # A caller-supplied coefficient MPO has no unitary certificate.
+            # Keep its physical norm change out of the compression ledger,
+            # matching MpsStabOptimizer's sub-MPO contract.
+            self._tree.apply_submpo(mpo, where, track_norm=False)
             return
         if isinstance(entry, (tuple, list)) and entry:
             head = entry[0]
@@ -1909,26 +2376,14 @@ class TreeStabOptimizer:
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             gate = entry[0]
-            self._diagnose_gate_backend(gate)
-            self._apply_matrix(gate, entry[1])
+            where = _normalize_sites(entry[1])
+            self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
             return
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
 
-    def _diagnose_gate_backend(self, gate):
-        """Warn when an explicit matrix is foreign to the coefficient TTN."""
-        target = self._tree._state_like()
-        if target is None:
-            return
-        source_signature = infer_backend_signature(gate)
-        target_signature = infer_backend_signature(target)
-        if source_signature != target_signature:
-            self._tree._warn_backend_conversion(
-                source_signature, target_signature
-            )
-
     def _apply_matrix(self, gate, where):
         where = _normalize_sites(where)
-        gate = np.asarray(ar.to_numpy(gate), dtype=complex)
+        gate = _as_gate_matrix(gate, len(where))
         if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
             raise ValueError(f"Gate matrix must be square, got shape {gate.shape}.")
         dim = int(gate.shape[0])
@@ -1937,17 +2392,8 @@ class TreeStabOptimizer:
             raise ValueError(
                 f"Gate shape {gate.shape} does not match where={where!r}."
             )
-        import stim
-
-        gate_is_unitary = _is_unitary(gate)
-        tableau = None
-        if gate_is_unitary:
-            # Stim does not verify unitarity itself, so this route is guarded
-            # explicitly before attempting Clifford recognition.
-            try:
-                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-            except (ValueError, RuntimeError):
-                tableau = None
+        unitary = _is_unitary(gate)
+        tableau = _tableau_from_exact_unitary(gate)
         if tableau is not None:
             self.state.do_tableau(tableau, where)
             return
@@ -1960,7 +2406,7 @@ class TreeStabOptimizer:
                 f"max_operator_qubits={limit} (at most {4**limit} terms)."
             )
 
-        from ..stabilizer_tn.operators import pauli_decomposition, pauli_matrix
+        from ..stabilizer_tn.operators import pauli_decomposition
 
         branches = []
         for term_index, (labels, coeff) in enumerate(
@@ -1983,29 +2429,20 @@ class TreeStabOptimizer:
 
         if not branches:
             # A zero matrix, or an explicitly over-toleranced decomposition,
-            # annihilates the state. Applying a zero one-site operator is the
-            # tree-native way to represent that result without a fake branch.
-            zero = np.zeros((2, 2), dtype=complex)
-            self._tree.apply_1q(zero, where[0])
+            # annihilates the state. Keep this on the same native TreeMPO
+            # route as nonzero coefficient branches.
+            self._apply_tree_pauli_sum(
+                [(0.0, {})],
+                max_bond=self._tree.chi,
+                cutoff=self._tree.cutoff,
+                track_norm=unitary,
+            )
             return
-        coefficient_support = {
-            int(site) for _weight, terms in branches for site in terms
-        }
-        if len(coefficient_support) <= 1:
-            # ``pauli_sum_submpo`` intentionally has a multi-site MPO shape;
-            # lower a one-site coefficient-frame sum directly instead. The
-            # frame image may be a different single site from the physical
-            # matrix target, so use the mapped support when one exists.
-            q = next(iter(coefficient_support), where[0])
-            operator = np.zeros((2, 2), dtype=complex)
-            for weight, terms in branches:
-                operator += weight * pauli_matrix(terms.get(q, "I"))
-            self._tree.apply_1q(operator, q)
-            return
-        self._tree.apply_pauli_sum(
+        self._apply_tree_pauli_sum(
             branches,
             max_bond=self._tree.chi,
             cutoff=self._tree.cutoff,
+            track_norm=unitary,
         )
 
     def _dense_gate_target_norm(self, gate, where):
@@ -2389,17 +2826,11 @@ class TreeStabOptimizer:
         """Apply the coefficient-side localizer through TreeOptimizer."""
         for name, targets in ops:
             if name == "h":
-                self._tree.apply_1q(self._tree._as_state_backend(_H, warn=False), targets[0])
+                self._apply_tree_gate(_H, targets[0])
             elif name == "sdg":
-                self._tree.apply_1q(
-                    self._tree._as_state_backend(_SDG, warn=False), targets[0]
-                )
+                self._apply_tree_gate(_SDG, targets[0])
             elif name == "cnot":
-                self._tree.apply_2q(
-                    self._tree._as_state_backend(_CNOT, warn=False),
-                    targets[0],
-                    targets[1],
-                )
+                self._apply_tree_gate(_CNOT, targets)
             else:  # pragma: no cover - localizer construction is closed above
                 raise RuntimeError(f"unknown localizer operation {name!r}.")
 
@@ -2454,6 +2885,7 @@ class TreeStabOptimizer:
             z_value,
             renormalize=True,
             return_diagnostics=True,
+            _force_tree_mpo=True,
         )
         diagnostics.update({
             "basis_updated": True,
@@ -2524,7 +2956,7 @@ class TreeStabOptimizer:
             return self
         support = tuple(sorted(terms))
         frame_axes = "".join(terms[q] for q in support)
-        self._tree.apply_pauli_rotation(
+        self._apply_tree_pauli_rotation(
             theta, frame_axes, support, sign=float(sign)
         )
         return self
@@ -2658,9 +3090,7 @@ class TreeStabOptimizer:
                 - 1j * float(sign) * np.sin(float(theta) / 2.0)
                 * pauli_matrix(rotation_axis)
             )
-            self._tree.apply_1q(
-                self._tree._as_state_backend(local_rotation, warn=False), pivot
-            )
+            self._apply_tree_gate(local_rotation, pivot)
             # The coefficient state received the local rotation. The
             # controlled-Pauli remainder is represented for free in C.
             self.state.absorb_basis_clifford(cascade.inverse())
@@ -3306,6 +3736,7 @@ class TreeStabOptimizer:
                 sign=float(sign),
                 renormalize=True,
                 return_diagnostics=True,
+                _force_tree_mpo=True,
             )
             diagnostics["probability"] = float(probability)
         self.measurements.append(MeasurementRecord(pauli, where, measured))
@@ -3313,8 +3744,228 @@ class TreeStabOptimizer:
             return measured, float(probability), diagnostics
         return measured, float(probability)
 
-    def measure(self, pauli, where, *, outcome=None, absorb_basis=False):
+    @staticmethod
+    def _normalize_measurement_batch(measurements):
+        """Normalize independent single-qubit measurements for scheduling."""
+        if isinstance(measurements, (str, bytes)):
+            raise TypeError(
+                "measure_many expects an iterable of (pauli, qubit[, outcome]) "
+                "entries."
+            )
+        try:
+            entries = tuple(measurements)
+        except TypeError as exc:
+            raise TypeError(
+                "measure_many expects an iterable of measurement entries."
+            ) from exc
+
+        operations = []
+        targets = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError(
+                    "measure_many entries must be (pauli, qubit) or "
+                    f"(pauli, qubit, outcome), got entry {index}: {entry!r}."
+                )
+            pauli, where = entry[:2]
+            sites = _normalize_sites(where)
+            if len(sites) != 1:
+                raise ValueError(
+                    "measure_many only schedules independent single-qubit "
+                    f"measurements, got where={where!r}."
+                )
+            (axis,) = _normalize_axes(pauli, sites, allow_identity=False)
+            outcome = entry[2] if len(entry) == 3 else None
+            if outcome is not None:
+                if (
+                    isinstance(outcome, (bool, np.bool_))
+                    or not isinstance(outcome, Integral)
+                    or int(outcome) not in (-1, 1)
+                ):
+                    raise ValueError(
+                        "measure_many outcomes must be exactly +1 or -1."
+                    )
+                outcome = int(outcome)
+            operations.append((axis, sites[0], outcome))
+            targets.append(sites[0])
+
+        if len(set(targets)) != len(targets):
+            raise ValueError(
+                "measure_many requires distinct target qubits so operations can "
+                "be safely reordered."
+            )
+        return tuple(operations)
+
+    def _measurement_span_info(self, axis, qubit, *, absorb_basis):
+        """Return cheap frame/tree-geodesic costs for one candidate."""
+        terms, _sign = self._frame_terms(axis, (qubit,), allow_identity=True)
+        frame_support = tuple(sorted(terms))
+        if not frame_support:
+            return {
+                "frame_support": frame_support,
+                "tree_support": (),
+                "span": 0,
+                "localizer_distance": 0,
+                "pivot": None,
+            }
+
+        tree_support = tuple(
+            int(self.plan.node_of_qubit[site]) for site in frame_support
+        )
+        span = int(len(self.tn.subtree_span(tree_support)) - 1)
+        pivot = min(
+            frame_support,
+            key=lambda site: (
+                sum(self.plan.tree_distance(site, other) for other in frame_support),
+                site,
+            ),
+        )
+        localizer_distance = int(
+            sum(self.plan.tree_distance(site, pivot) for site in frame_support)
+        )
+        return {
+            "frame_support": frame_support,
+            "tree_support": tree_support,
+            "span": span,
+            "localizer_distance": (
+                localizer_distance if absorb_basis else 0
+            ),
+            "pivot": int(pivot),
+        }
+
+    def _run_measurement_batch(
+        self,
+        operations,
+        *,
+        order,
+        absorb_basis,
+        reset=False,
+        reset_after=False,
+    ):
+        """Run a batch using a metadata-only, adaptive tree-span schedule."""
+        if reset and reset_after:
+            raise ValueError("reset and reset_after are mutually exclusive.")
+        operations = tuple(operations)
+        targets = tuple(operation[1] for operation in operations)
+        normalized_order = _normalize_measurement_order(
+            order,
+            count=len(operations),
+            targets=targets,
+        )
+        remaining = list(range(len(operations)))
+        result = [None] * len(operations)
+        schedule = []
+
+        for step in range(len(operations)):
+            if normalized_order == "input":
+                input_index = remaining.pop(0)
+            elif normalized_order == "min_span":
+                candidate_info = {
+                    index: self._measurement_span_info(
+                        operations[index][0],
+                        operations[index][1],
+                        absorb_basis=absorb_basis,
+                    )
+                    for index in remaining
+                }
+                input_index = min(
+                    remaining,
+                    key=lambda index: (
+                        candidate_info[index]["span"],
+                        candidate_info[index]["localizer_distance"],
+                        len(candidate_info[index]["frame_support"]),
+                        index,
+                    ),
+                )
+                remaining.remove(input_index)
+            else:
+                rank = {
+                    index: position
+                    for position, index in enumerate(normalized_order)
+                }
+                input_index = min(remaining, key=rank.__getitem__)
+                remaining.remove(input_index)
+
+            axis, qubit, forced = operations[input_index]
+            info = (
+                candidate_info[input_index]
+                if normalized_order == "min_span"
+                else self._measurement_span_info(
+                    axis,
+                    qubit,
+                    absorb_basis=absorb_basis,
+                )
+            )
+            if reset:
+                physical = pauli_string((axis,), (qubit,), self.n)
+                outcome = self._absorb_measure(
+                    self.state.frame_pauli(physical)
+                )[0]
+            else:
+                outcome = self.measure(
+                    axis,
+                    qubit,
+                    outcome=forced,
+                    absorb_basis=absorb_basis,
+                )
+            if (reset or reset_after) and outcome < 0:
+                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+            result[input_index] = int(outcome)
+            schedule.append({
+                "order": int(step),
+                "input_index": int(input_index),
+                "pauli": str(axis),
+                "qubit": int(qubit),
+                **info,
+            })
+
+        self.last_measurement_schedule = tuple(schedule)
+        return tuple(result)
+
+    def measure_many(
+        self,
+        measurements,
+        *,
+        order="min_span",
+        absorb_basis=None,
+        disentangle=None,
+    ):
+        """Measure independent single-qubit observables in tree-span order.
+
+        ``order="min_span"`` reads current Tableau supports and the fixed
+        TreePlan only. It never runs trial TreeMPO contractions, canonicalizes
+        trial states, or truncates while selecting the next measurement.
+        Outcomes are returned in input order; the chronological execution
+        details are available in :attr:`last_measurement_schedule`.
+        """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
+        operations = self._normalize_measurement_batch(measurements)
+        result = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=absorb_basis,
+        )
+        return result[0] if len(result) == 1 else result
+
+    def measure(
+        self,
+        pauli,
+        where,
+        *,
+        outcome=None,
+        absorb_basis=None,
+        disentangle=None,
+    ):
         """Measure a physical Pauli, optionally updating the stabilizer basis."""
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         where = _normalize_sites(where)
         physical = pauli_string(
             _normalize_axes(pauli, where, allow_identity=True), where, self.n
@@ -3334,10 +3985,16 @@ class TreeStabOptimizer:
         where,
         outcome=None,
         *,
-        absorb_basis=False,
+        absorb_basis=None,
+        disentangle=None,
         return_diagnostics=False,
     ):
         """Measure a physical Pauli and return outcome/probability."""
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         if not absorb_basis:
             return self._fixed_measure(
                 pauli, where, outcome=outcome,
@@ -3366,23 +4023,35 @@ class TreeStabOptimizer:
             return diagnostics
         return self
 
-    def reset(self, where, basis="Z"):
+    def reset(self, where, basis="Z", *, order="min_span"):
         """Reset target qubits to the positive eigenstate of ``basis``.
 
         Each target uses basis-updating measurement so that it leaves the
         coefficient TTN disentangled. A physical anticommuting Clifford then
         flips a ``-1`` outcome into the requested ``+1`` eigenstate.
+        Separate targets are processed with the metadata-only tree-span
+        scheduler by default; use ``order="input"`` to preserve their
+        supplied order.
         """
         where = _normalize_sites(where)
         axes = _normalize_basis_axes(basis, where, event="reset")
-        for axis, q in zip(axes, where):
-            physical = pauli_string((axis,), (q,), self.n)
-            measured, _probability, _diagnostics = self._absorb_measure(
-                self.state.frame_pauli(physical)
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "reset requires distinct target qubits so they can be safely "
+                "reordered."
             )
-            if measured < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
+        operations = tuple((axis, q, None) for axis, q in zip(axes, where))
+        self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=True,
+            reset=True,
+        )
         return self
+
+    def reset_many(self, where, basis="Z", *, order="min_span"):
+        """Reset several independent qubits using the tree-span scheduler."""
+        return self.reset(where, basis=basis, order=order)
 
     def measure_reset(
         self,
@@ -3390,24 +4059,40 @@ class TreeStabOptimizer:
         where,
         *,
         outcome=None,
-        absorb_basis=True,
+        absorb_basis=None,
+        disentangle=None,
+        order="min_span",
     ):
-        """Measure targets and then reset them to the positive basis state."""
+        """Measure targets and then reset them to the positive basis state.
+
+        Separate targets are processed with the metadata-only tree-span
+        scheduler by default; returned outcomes remain aligned with the input
+        target order. Use ``order="input"`` to preserve the supplied order.
+        """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=True,
+        )
         where = _normalize_sites(where)
         axes = _normalize_basis_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
-        measured = []
-        for axis, q, forced in zip(axes, where, outcomes):
-            value = self.measure(
-                axis,
-                q,
-                outcome=forced,
-                absorb_basis=bool(absorb_basis),
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "measure_reset requires distinct target qubits so they can be "
+                "safely reordered."
             )
-            if value < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
-            measured.append(value)
-        return measured[0] if len(measured) == 1 else tuple(measured)
+        operations = tuple(
+            (axis, q, forced)
+            for axis, q, forced in zip(axes, where, outcomes)
+        )
+        measured = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=bool(absorb_basis),
+            reset_after=True,
+        )
+        return measured[0] if len(measured) == 1 else measured
 
     def sample(self, pauli, where=None, *, shots=1, seed=None):
         """Draw Pauli outcomes without collapsing the coefficient state."""
@@ -3447,6 +4132,33 @@ class TreeStabOptimizer:
         }
 
     @staticmethod
+    def _resolve_sample_basis(basis, n, rng):
+        """Normalize a global, per-site, or random Pauli basis policy."""
+        # Keep the public basis contract shared with MpsStabOptimizer and the
+        # standalone stabilizer sampler.  The import is local to avoid making
+        # the optimizer module part of the sampling-module import cycle.
+        from ...sampling.samplers import _resolve_measurement_basis
+
+        return _resolve_measurement_basis(basis, int(n), rng=rng)
+
+    def _sample_frame_terms(self, basis, order):
+        """Return ``C^dagger P_q C`` terms for each measured physical site."""
+        return {
+            int(q): self._frame_terms(
+                basis[int(q)], (int(q),), allow_identity=True
+            )
+            for q in order
+        }
+
+    def _sample_expectation(self, terms, sign):
+        """Evaluate one resolved frame Pauli on the coefficient tree."""
+        if not terms:
+            return float(sign)
+        support = tuple(sorted(terms))
+        axes = "".join(terms[q] for q in support)
+        return float(sign) * self._tree.expectation_pauli(axes, support)
+
+    @staticmethod
     def _prob_zero_from_expectation(expectation):
         return min(max(0.5 * (1.0 + float(expectation)), 0.0), 1.0)
 
@@ -3474,6 +4186,7 @@ class TreeStabOptimizer:
         other.operator_tol = self.operator_tol
         other.max_dense_sample_qubits = self.max_dense_sample_qubits
         other.max_dense_cap_qubits = self.max_dense_cap_qubits
+        other.track_infidelity = self.track_infidelity
         other.exact_cooling = self.exact_cooling
         other.to_backend = self.to_backend
         other._clifford_rotation_cache = self._clifford_rotation_cache
@@ -3504,27 +4217,100 @@ class TreeStabOptimizer:
         if probability <= 1e-12:
             return None
         if terms:
-            # Use the tree's Pauli-sum MPO rather than its legacy multi-site
-            # parity-projector branch tensor. The MPO keeps the ``+`` and ``-``
-            # branches distinct and remains efficient for long sparse supports.
-            if len(terms) == 1:
-                from ..stabilizer_tn.operators import pauli_matrix
-
-                q, axis = next(iter(terms.items()))
-                projector = 0.5 * (
-                    np.eye(2, dtype=complex)
-                    + outcome * float(sign) * pauli_matrix(axis)
-                )
-                self._tree.apply_1q(
-                    self._tree._as_state_backend(projector, warn=False), q
-                )
-            else:
-                self._tree.apply_pauli_sum([
+            # Every coefficient-frame projector, including a one-site one,
+            # uses the compact TreeMPO route. This keeps sampling and
+            # multi-site projection on the same Tree-native canonical/
+            # compression implementation.
+            self._apply_tree_pauli_sum(
+                [
                     (0.5, {}),
                     (0.5 * outcome * float(sign), dict(terms)),
-                ])
+                ],
+                track_norm=False,
+            )
             self._tree.normalize()
         return probability
+
+    def _sample_basis_arrays(
+        self,
+        shots,
+        *,
+        basis="Z",
+        seed=None,
+        order=None,
+        shuffle=True,
+        resolved_basis=None,
+    ):
+        """Sample product-Pauli outcomes with shared Tree prefix branches.
+
+        The readout basis is resolved in the physical frame, then each sampled
+        bit is conditioned through ``_condition_computational_bit``.  That
+        method is intentionally the only projection primitive used here: its
+        compact-support Pauli-sum route remains Tree-native.
+        """
+        shots = int(shots)
+        if shots < 0:
+            raise ValueError("shots must be nonnegative.")
+        rng = self._sample_rng(seed)
+        if resolved_basis is None:
+            resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
+        else:
+            resolved_basis = tuple(str(axis).upper() for axis in resolved_basis)
+            if len(resolved_basis) != self.n or any(
+                axis not in {"X", "Y", "Z"} for axis in resolved_basis
+            ):
+                raise ValueError(
+                    "resolved_basis must contain exactly one X/Y/Z axis per qubit."
+                )
+        order = self._bit_measurement_order(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
+        bits = np.empty((shots, self.n), dtype=np.int8)
+        probabilities = np.empty(shots, dtype=float)
+        if shots == 0:
+            return bits, probabilities, resolved_basis
+
+        # Rows sharing a measured prefix share the collapsed coefficient TTN.
+        # The prefix probability is retained so this internal helper has the
+        # same exact Born-probability contract as MpsStabOptimizer.
+        stack = [(self._sampling_copy(), 0, 0, shots, 1.0)]
+        while stack:
+            sim, position, lo, hi, prefix_probability = stack.pop()
+            q = order[position]
+            count = hi - lo
+            terms, sign = frame_terms[q]
+            expectation = sim._sample_expectation(terms, sign)
+            p0 = self._prob_zero_from_expectation(expectation)
+            n0 = (
+                0 if p0 <= 1e-12 else
+                count if p0 >= 1.0 - 1e-12 else
+                int(rng.binomial(count, p0))
+            )
+            mid = lo + n0
+            bits[lo:mid, q] = 0
+            bits[mid:hi, q] = 1
+            p_zero = prefix_probability * p0
+            p_one = prefix_probability * (1.0 - p0)
+            if position + 1 == self.n:
+                probabilities[lo:mid] = p_zero
+                probabilities[mid:hi] = p_one
+                continue
+            both = 0 < n0 < count
+            if n0:
+                child = sim._sampling_copy() if both else sim
+                child._condition_computational_bit(
+                    terms, sign, 0, probability=p0
+                )
+                stack.append((child, position + 1, lo, mid, p_zero))
+            if n0 < count:
+                sim._condition_computational_bit(
+                    terms, sign, 1, probability=1.0 - p0
+                )
+                stack.append((sim, position + 1, mid, hi, p_one))
+        if shuffle:
+            permutation = rng.permutation(shots)
+            bits = bits[permutation]
+            probabilities = probabilities[permutation]
+        return bits, probabilities, resolved_basis
 
     @staticmethod
     def _bits_matrix(bitstrings, *, expected_length):
@@ -3558,68 +4344,69 @@ class TreeStabOptimizer:
         return np.asarray(rows, dtype=np.int8)
 
     def sample_bits(
-        self, shots=1, *, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots=1,
+        *,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
-        """Sample computational-basis bitstrings using shared TTN branches."""
-        shots = int(shots)
-        if shots < 0:
-            raise ValueError("shots must be nonnegative.")
-        rng = self._sample_rng(seed)
-        order = self._bit_measurement_order(order)
-        if shots == 0:
-            bits = np.empty((0, self.n), dtype=np.int8)
-            return self.pack_bit_samples(bits) if packed else bits
-        frame_terms = self._computational_z_frame_terms(order)
-        bits = np.empty((shots, self.n), dtype=np.int8)
-        stack = [(self._sampling_copy(), 0, 0, shots)]
-        while stack:
-            sim, position, lo, hi = stack.pop()
-            q = order[position]
-            count = hi - lo
-            terms, sign = frame_terms[q]
-            p0 = self._prob_zero_from_expectation(sim.expectation("Z", q))
-            n0 = (
-                0 if p0 <= 1e-12 else
-                count if p0 >= 1.0 - 1e-12 else
-                int(rng.binomial(count, p0))
-            )
-            mid = lo + n0
-            bits[lo:mid, q] = 0
-            bits[mid:hi, q] = 1
-            if position + 1 == self.n:
-                continue
-            both = 0 < n0 < count
-            if n0:
-                child = sim._sampling_copy() if both else sim
-                child._condition_computational_bit(terms, sign, 0, probability=p0)
-                stack.append((child, position + 1, lo, mid))
-            if n0 < count:
-                sim._condition_computational_bit(
-                    terms, sign, 1, probability=1.0 - p0
-                )
-                stack.append((sim, position + 1, mid, hi))
-        if shuffle:
-            rng.shuffle(bits, axis=0)
-        return self.pack_bit_samples(bits) if packed else bits
+        """Sample product-Pauli basis bitstrings using shared TTN branches.
+
+        ``basis`` accepts one global ``X``, ``Y``, or ``Z`` axis, a per-qubit
+        pattern such as ``"XYZ"``, or ``"random"``.  Returned columns remain
+        indexed by physical qubit, independently of the conditional
+        measurement ``order``.
+        """
+        out, _probabilities, _resolved_basis = self._sample_basis_arrays(
+            shots,
+            basis=basis,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+        )
+        return self.pack_bit_samples(out) if packed else out
+
+    def sample_basis(self, shots=1, *, basis="Z", **kwargs):
+        """Explicit alias for :meth:`sample_bits` with a Pauli basis policy."""
+        return self.sample_bits(shots, basis=basis, **kwargs)
 
     def sample_bitstrings(
-        self, shots=1, *, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots=1,
+        *,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
         """Alias for :meth:`sample_bits`."""
         return self.sample_bits(
-            shots, seed=seed, order=order, shuffle=shuffle, packed=packed
+            shots,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+            packed=packed,
+            basis=basis,
         )
 
-    def probability_bits(self, bits, *, order=None):
-        """Return one computational-basis probability by conditional projection."""
+    def probability_bits(self, bits, *, order=None, basis="Z", seed=None):
+        """Return one product-Pauli outcome probability by conditional projection."""
         bits = _validate_bits(bits, expected_length=self.n)
+        rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
         tmp = self._sampling_copy()
         probability = 1.0
         for q in order:
             terms, sign = frame_terms[q]
-            p0 = self._prob_zero_from_expectation(tmp.expectation("Z", q))
+            p0 = self._prob_zero_from_expectation(
+                tmp._sample_expectation(terms, sign)
+            )
             bit = int(bits[q])
             branch = p0 if bit == 0 else 1.0 - p0
             if branch <= 1e-12:
@@ -3628,20 +4415,26 @@ class TreeStabOptimizer:
             tmp._condition_computational_bit(terms, sign, bit, probability=branch)
         return float(probability)
 
-    def probability_bits_many(self, bitstrings, *, order=None):
+    def probability_bits_many(
+        self, bitstrings, *, order=None, basis="Z", seed=None
+    ):
         """Return many computational-basis probabilities with shared prefixes."""
         bits = self._bits_matrix(bitstrings, expected_length=self.n)
-        probabilities = np.zeros(len(bits), dtype=float)
-        if not len(bits):
+        probabilities = np.zeros(bits.shape[0], dtype=float)
+        if bits.shape[0] == 0:
             return probabilities
+        rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
-        stack = [(self._sampling_copy(), 0, np.arange(len(bits)), 1.0)]
+        frame_terms = self._sample_frame_terms(resolved_basis, order)
+        stack = [(self._sampling_copy(), 0, np.arange(bits.shape[0]), 1.0)]
         while stack:
             sim, position, indices, prefix = stack.pop()
             q = order[position]
             terms, sign = frame_terms[q]
-            p0 = self._prob_zero_from_expectation(sim.expectation("Z", q))
+            p0 = self._prob_zero_from_expectation(
+                sim._sample_expectation(terms, sign)
+            )
             branches = (
                 (0, indices[bits[indices, q] == 0], p0),
                 (1, indices[bits[indices, q] == 1], 1.0 - p0),
@@ -3666,18 +4459,30 @@ class TreeStabOptimizer:
                 stack.append((child, position + 1, selected, value))
         return probabilities
 
-    def bitstring_probability(self, bits, *, order=None):
+    def bitstring_probability(self, bits, *, order=None, basis="Z", seed=None):
         """Alias for :meth:`probability_bits`."""
-        return self.probability_bits(bits, order=order)
+        return self.probability_bits(bits, order=order, basis=basis, seed=seed)
 
-    def bitstring_probabilities(self, bitstrings, *, order=None):
+    def bitstring_probabilities(
+        self, bitstrings, *, order=None, basis="Z", seed=None
+    ):
         """Alias for :meth:`probability_bits_many`."""
-        return self.probability_bits_many(bitstrings, order=order)
+        return self.probability_bits_many(
+            bitstrings, order=order, basis=basis, seed=seed
+        )
 
     def iter_sample_bits(
-        self, shots, *, chunk_size, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots,
+        *,
+        chunk_size,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
-        """Yield computational-basis samples in bounded-size chunks."""
+        """Yield product-Pauli basis samples in bounded-size chunks."""
         shots = int(shots)
         chunk_size = int(chunk_size)
         if shots < 0:
@@ -3685,21 +4490,35 @@ class TreeStabOptimizer:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive.")
         rng = self._sample_rng(seed)
+        resolved_basis = self._resolve_sample_basis(basis, self.n, rng)
         done = 0
         while done < shots:
             take = min(chunk_size, shots - done)
             yield self.sample_bits(
-                take, seed=rng, order=order, shuffle=shuffle, packed=packed
+                take,
+                seed=rng,
+                order=order,
+                shuffle=shuffle,
+                packed=packed,
+                basis=resolved_basis,
             )
             done += take
 
     def iter_sample_bitstrings(
-        self, shots, *, chunk_size, seed=None, order=None, shuffle=True, packed=False
+        self,
+        shots,
+        *,
+        chunk_size,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+        basis="Z",
     ):
         """Alias for :meth:`iter_sample_bits`."""
         yield from self.iter_sample_bits(
             shots, chunk_size=chunk_size, seed=seed, order=order,
-            shuffle=shuffle, packed=packed,
+            shuffle=shuffle, packed=packed, basis=basis,
         )
 
     # ------------------------------------------------------------------
@@ -3796,6 +4615,7 @@ class TreeStabOptimizer:
             cutoff=old_tree.cutoff,
             cutoff_mode=old_tree.cutoff_mode,
             mode=old_tree.mode,
+            compression_mode=old_tree.compression_mode,
             structure=old_tree.structure,
             max_arity=old_tree.max_arity,
             community_frac=old_tree.community_frac,
@@ -3821,11 +4641,24 @@ class TreeStabOptimizer:
         self.frame_layout_plan = None
         self.frame_layout_events = ()
         self.projection_diagnostics = self._tree.projection_diagnostics
-        self.norm_events = []
+        self.norm_events = self._tree.norm_events
         return self
 
     def norm(self):
         return self._tree.norm()
+
+    def shift_orthogonality_center(self, node=None):
+        """Move the coefficient-tree centre before a canonical norm readout.
+
+        ``TreeOptimizer`` already performs incremental centre movement along
+        the tree geodesic. Exposing the same operation on the stabilizer
+        wrapper keeps ordinary Tree and TreeStab diagnostics on one public
+        path without enabling expensive singular-spectrum tracking.
+        """
+        if node is None:
+            node = self._tree.plan.root
+        self._tree.shift_orthogonality_center(node)
+        return self
 
     def backend_info(self):
         """Return the coefficient TTN backend, dtype, and device."""
@@ -3836,6 +4669,10 @@ class TreeStabOptimizer:
         self.array_backend = info.get("array_backend", info["backend"])
         self.dtype = info["dtype"]
         return info
+
+    def _to_state_backend(self, array):
+        """Convert a generated array to the live coefficient TTN backend."""
+        return self._tree._as_state_backend(array, warn=False)
 
     def normalize(self):
         """Normalize the coefficient TTN and return ``self``.
@@ -3864,16 +4701,22 @@ class TreeStabOptimizer:
         """Return detailed tree truncation samples."""
         return self._tree.get_infidelity_samples()
 
-    def norm_diagnostics(self, *, include_current=True):
-        """Summarize TTN truncation and norm-survival diagnostics.
+    def get_norm_events(self):
+        """Return coefficient-tree path-level retained-norm events."""
+        return self._tree.get_norm_events()
 
-        Tree compression records are aggregated over the affected edges of
-        each update. They are deliberately reported as a truncation-survival
-        proxy, not as exact overlap fidelity and not as physical measurement
-        probability. Projective details remain available in
-        ``projection_diagnostics`` / ``truncation_report``.
+    def norm_diagnostics(self, *, include_current=True):
+        """Summarize coefficient-TTN norm and truncation diagnostics.
+
+        The canonical-centre norm ledger is available independently of
+        ``track_truncation``. ``track_truncation`` adds the separate,
+        spectrum-based per-edge report below. Neither quantity is a target
+        state overlap; the stabilizer tableau does not change that distinction.
+        ``state_norm`` and ``norm`` are the live represented Tree norm, while
+        ``cumulative_norm`` is the square-root retained-compression proxy.
         """
         _ = include_current  # tree updates have no open segment boundary
+        norm_report = self._tree.norm_diagnostics()
         tracking = bool(self._tree.track_truncation)
         samples = tuple(self._tree.get_infidelity_samples())
         losses = tuple(
@@ -3889,8 +4732,15 @@ class TreeStabOptimizer:
         )
         report = self._tree.truncation_report()
         return {
+            # ``tracking`` is retained as the historical truncation flag for
+            # callers that used it to detect get_infidelity_samples(). The
+            # explicit fields below remove that ambiguity.
             "tracking": tracking,
-            "current_valid": tracking,
+            "norm_tracking": norm_report["norm_tracking"],
+            "truncation_tracking": tracking,
+            "current_valid": norm_report["current_valid"],
+            "norm_events_count": norm_report["events"],
+            "norm_completed_events": norm_report["completed_events"],
             "completed_segments": len(losses),
             "segments_including_current": len(losses),
             "completed_segment_norms": [
@@ -3900,18 +4750,43 @@ class TreeStabOptimizer:
             "completed_projector_infidelities": [],
             "completed_nonunitary_infidelities": [],
             "completed_combined_infidelities": list(losses),
+            # ``current_segment_*`` below are optional spectrum/truncation
+            # diagnostics. The plain ``current_*`` and local/cumulative
+            # fidelity fields are the separate norm-derived ledger.
             "current_segment_norm": (
-                None if current_loss is None else float(max(0.0, 1.0 - current_loss) ** 0.5)
+                None
+                if current_loss is None
+                else float(max(0.0, 1.0 - current_loss) ** 0.5)
             ),
             "current_segment_infidelity": current_loss,
-            "norm_survival": survival,
-            "norm_infidelity": None if survival is None else float(1.0 - survival),
-            "fidelity": survival,
-            "infidelity": None if survival is None else float(1.0 - survival),
-            "norm": float(self.norm()),
-            "total_survival_proxy": survival,
-            "total_infidelity_proxy": None if survival is None else float(1.0 - survival),
-            "total_norm_proxy": None if survival is None else float(survival ** 0.5),
+            "current_fidelity": norm_report["current_fidelity"],
+            "current_infidelity": norm_report["current_infidelity"],
+            # Canonical-centre compression metrics shared with MPS and
+            # ordinary Tree. These are not the spectrum-based values above.
+            "local_fidelity": norm_report["local_fidelity"],
+            "local_infidelity": norm_report["local_infidelity"],
+            "local_norm": norm_report["local_norm"],
+            "cumulative_fidelity": norm_report["cumulative_fidelity"],
+            "cumulative_infidelity": norm_report["cumulative_infidelity"],
+            "cumulative_compression_fidelity": norm_report[
+                "cumulative_compression_fidelity"
+            ],
+            "cumulative_compression_infidelity": norm_report[
+                "cumulative_compression_infidelity"
+            ],
+            "norm_survival": norm_report["norm_survival"],
+            "fidelity": norm_report["cumulative_fidelity"],
+            "infidelity": norm_report["cumulative_infidelity"],
+            "state_norm": norm_report["state_norm"],
+            "norm": norm_report["norm"],
+            "total_survival_proxy": norm_report["norm_survival"],
+            "total_infidelity_proxy": norm_report["cumulative_infidelity"],
+            "total_norm_proxy": norm_report["cumulative_norm"],
+            "cumulative_norm": norm_report["cumulative_norm"],
+            "truncation_survival": survival,
+            "truncation_infidelity": (
+                None if survival is None else float(1.0 - survival)
+            ),
             "geometric_mean_survival": (
                 None if not losses else float(max(0.0, 1.0 - losses[-1]))
             ),
@@ -3929,6 +4804,7 @@ class TreeStabOptimizer:
             "mean_projector_infidelity": None,
             "max_projector_infidelity": None,
             "truncation_report": report,
+            "norm_events": norm_report["norm_events"],
             "projection_diagnostics": list(self._tree.get_projection_diagnostics()),
         }
 
@@ -3986,15 +4862,21 @@ class TreeStabOptimizer:
         other.operator_tol = self.operator_tol
         other.max_dense_sample_qubits = self.max_dense_sample_qubits
         other.max_dense_cap_qubits = self.max_dense_cap_qubits
+        other.track_infidelity = self.track_infidelity
         other.exact_cooling = self.exact_cooling
         other.to_backend = self.to_backend
         other.state = self.state.copy()
         other._queue = list(self._queue)
+        other._trajectory_plan = self._trajectory_plan
+        other._gate_stream = tuple(self._gate_stream)
+        other._has_trajectory_events = bool(self._has_trajectory_events)
         other._rng = np.random.default_rng()
+        other._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         other.measurements = list(self.measurements)
+        other.last_measurement_schedule = deepcopy(self.last_measurement_schedule)
         other.bond_history = list(self.bond_history)
         other.projection_diagnostics = other._tree.projection_diagnostics
-        other.norm_events = [dict(event) for event in self.norm_events]
+        other.norm_events = other._tree.norm_events
         other._clifford_rotation_cache = dict(self._clifford_rotation_cache)
         other.exact_cooling_events = list(self.exact_cooling_events)
         other.disentangle_events = [dict(event) for event in self.disentangle_events]
@@ -4015,6 +4897,8 @@ class TreeStabOptimizer:
     def __repr__(self):  # pragma: no cover - cosmetic
         return (
             f"TreeStabOptimizer(n={self.n}, chi={self._tree.chi}, "
+            f"mode={self.mode!r}, "
+            f"compression_mode={self._tree.compression_mode!r}, "
             f"max_bond={self.p.max_bond()}, "
             f"max_pauli_terms={self.max_pauli_terms}, "
             f"max_dense_cap_qubits={self.max_dense_cap_qubits})"
@@ -4058,13 +4942,6 @@ def _tree_runner_constructor_settings(advice, settings, *, seed):
         if not isinstance(settings, Mapping):
             raise TypeError("settings must be a mapping or None.")
         ctor.update(dict(settings))
-    if "track_infidelity" in ctor:
-        if "track_truncation" in ctor:
-            raise ValueError(
-                "pass only one of track_infidelity and track_truncation "
-                "to the TreeStab runner."
-            )
-        ctor["track_truncation"] = ctor.pop("track_infidelity")
     ctor.pop("layout_report", None)
     ctor.setdefault(
         "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS

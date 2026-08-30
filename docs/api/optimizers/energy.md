@@ -3,6 +3,28 @@
 
 > API details are maintained as handwritten Markdown in this page.
 
+## Torch SVD/QR policy
+
+`PepsEnergyOptimizer` and `MpsEnergyOptimizer` accept the same optional
+`torch_linalg_config` argument as `PepsOptimizer`:
+
+```python
+policy = pepsy.TorchLinalgConfig(
+    mode="complex",
+    stabilized=True,
+    svd_driver="gesvd",
+)
+optimizer = pepsy.PepsEnergyOptimizer(
+    state,
+    hamiltonian,
+    torch_linalg_config=policy,
+)
+```
+
+The supplied policy controls both SVD and QR registration. PEPS energy
+optimization automatically extends a policy to Quimb's raw Symmray split
+drivers when needed, while preserving the user's driver and rank settings.
+
 ## Symmray fermionic encodings
 
 For a native fermionic Symmray MPS, prefer native local Hamiltonian terms:

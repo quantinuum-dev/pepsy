@@ -1,11 +1,16 @@
-# Pepsy Library
+# PePsY Library
 
-<img src="assets/pepsy-icon.svg" alt="pepsy icon" width="220" />
+<img src="assets/pepsy-icon.svg" alt="PePsY icon" width="220" />
 
-`pepsy` is a tensor-network package for circuit simulation, contraction,
+**PePsY** is a tensor-network package for circuit simulation, contraction,
 optimization, sampling, and variational Monte Carlo workflows.
 
-Current package version: `0.4.0` (from `pyproject.toml` / `pepsy.__version__`).
+The name **PePsY** is a stylized shorthand for “PEPS in Python”: it points to
+projected entangled-pair states while leaving room for PePsY’s broader MPS,
+circuit, sampling, stabilizer, and VMC workflows. Use **PePsY** for the
+project name and `pepsy` for the Python package and import name.
+
+Current package version: `0.4.1` (from `pyproject.toml` / `pepsy.__version__`).
 See the [changelog](CHANGELOG.md) for release history and versioned changes.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test profiles.
 
@@ -67,12 +72,12 @@ print(pepsy.__version__, res.cost)
 
 ## Symmetric Fermionic States
 
-Pepsy includes optional Symmray-backed symmetric tensor-network wrappers. For
+PePsY includes optional Symmray-backed symmetric tensor-network wrappers. For
 spinful Fermi-Hubbard work, `model="fermi_hubbard"` uses total particle-number
 `U1`, while `model="fermi_hubbard_u1u1"` uses spin-resolved `U1U1` charges
 `(N_up, N_down)`.
 
-For direct fermionic Fermi-Hubbard work, the main Pepsy/Symmray methods
+For direct fermionic Fermi-Hubbard work, the main PePsY/Symmray methods
 reference is Gao et al., "Fermionic tensor network contraction for arbitrary
 geometries", Phys. Rev. Research 7, 023193 (2025),
 https://doi.org/10.1103/PhysRevResearch.7.023193. It motivates keeping
@@ -101,8 +106,20 @@ assert ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193
 ```
 
 ## Documentation
-Documentation is maintained as Markdown under `docs/`. No documentation
-builder or documentation-specific package extra is required.
+Documentation is maintained as Markdown under `docs/`, with an optional
+Sphinx build that adds searchable, generated API pages. Install the docs
+extra and build the site locally with:
+
+```bash
+source ~/envs/py312/bin/activate
+python -m pip install -e ".[docs]"
+python -m sphinx -b html docs docs/_build/html
+```
+
+The generated API pages include signatures, parameter descriptions, class
+members, cross-references, and links back to the corresponding GitHub source
+lines. The hand-written pages remain the place for tutorials, workflows, and
+Pepsy-specific guidance.
 
 See [the API stability policy](docs/stability.md) for the distinction between
 stable core modules and advanced domains.

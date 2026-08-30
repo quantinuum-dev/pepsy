@@ -888,7 +888,7 @@ def test_state_dependent_kraus_branches_are_sampled_from_the_current_state(kind)
             assert event["branch_probability"] == pytest.approx(0.5)
             assert event["physical_boundary"] is True
             assert event["renormalized"] is True
-            assert diagnostics["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+            assert diagnostics["infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_coalesced_ordinary_mps_kraus_norm_is_a_physical_boundary():
@@ -911,7 +911,7 @@ def test_coalesced_ordinary_mps_kraus_norm_is_a_physical_boundary():
         event = leaf.optimizer.get_norm_events()[0]
         assert event["kind"] == "trajectory_kraus"
         assert event["branch_probability"] == pytest.approx(0.5)
-        assert diagnostics["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+        assert diagnostics["infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state():
@@ -952,6 +952,69 @@ def test_tree_stab_state_dependent_kraus_branches_use_tree_normalization():
         expected = [1.0, 0.0] if records[0].label == "jump" else [0.0, 1.0]
         np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-8)
         assert optimizer.norm() == pytest.approx(1.0, abs=1e-8)
+
+
+def test_tree_stab_public_queue_compiles_trajectory_events_and_coalesces():
+    """TreeStab's public queue uses the shared local trajectory runner."""
+    channel = pepsy.TrajectoryChannel.amplitude_damping(0.5)
+    simulator = pepsy.TreeStabOptimizer(
+        1,
+        gates=[(_X, 0), pepsy.TrajectoryEvent(channel, 0)],
+    )
+
+    assert simulator.has_trajectory_events is True
+    assert isinstance(simulator.gate_stream()[1], pepsy.TrajectoryEvent)
+
+    result = simulator.run(
+        shots=32,
+        seed=6,
+        strategy="coalesced",
+        run_kwargs={"progbar": False},
+    )
+
+    assert result.coalesced is True
+    assert result.branches == 2
+    assert sum(result.counts) == 32
+    assert all(optimizer.norm() == pytest.approx(1.0, abs=1e-8)
+               for optimizer in result.optimizers)
+
+
+def test_tree_stab_public_error_model_can_coalesce_clean_stream():
+    """The Pauli error-model convenience path shares TreeStab prefixes."""
+    simulator = pepsy.TreeStabOptimizer(1, gates=[("h", 0)])
+    result = simulator.run(
+        shots=32,
+        error_model=pepsy.PauliErrorModel.bit_flip(0.01),
+        seed=3,
+        strategy="coalesced",
+    )
+
+    assert result.coalesced is True
+    assert sum(result.counts) == 32
+
+
+def test_tree_stab_norm_ledger_tracks_unitary_coeff_updates_without_spectra():
+    """TreeStab keeps norm tracking on when spectrum tracking is off."""
+    simulator = pepsy.TreeStabOptimizer(1, chi=1, track_truncation=False)
+    simulator.apply([("t", 0)])
+
+    diagnostics = simulator.norm_diagnostics()
+    assert diagnostics["norm_tracking"] is True
+    assert diagnostics["truncation_tracking"] is False
+    assert diagnostics["local_fidelity"] == pytest.approx(1.0)
+    assert len(simulator.get_norm_events()) == 1
+    assert len(simulator.norm_events) == 1
+    assert simulator.get_infidelity_samples() == []
+
+
+def test_tree_stab_known_nonunitary_matrix_does_not_create_norm_event():
+    """A physical filter's scale is not a retained-unitary norm event."""
+    filter_gate = np.diag([1.0, 0.25]).astype(complex)
+    simulator = pepsy.TreeStabOptimizer(1, chi=1, track_truncation=False)
+    simulator.apply([(filter_gate, (0,))])
+
+    assert simulator.get_norm_events() == []
+    assert simulator.norm_diagnostics()["cumulative_fidelity"] is None
 
 
 def test_tree_stab_random_unitary_depolarizing_channel_replays_branches():
@@ -1025,7 +1088,7 @@ def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
         ("rxx", 0.8, 0, 1),
     ]
     result = pepsy.run_trajectory_shots(
-        lambda: pepsy.MpsStabOptimizer(2, chi=1, track_infidelity=True),
+        lambda: pepsy.MpsStabOptimizer(2, chi=1),
         stream,
         shots=1,
         seed=7,

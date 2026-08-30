@@ -8,15 +8,40 @@ update only the tableau (free, `|nu>` unchanged); non-Clifford gates and
 measurements update `|nu>`.
 
 General physical matrices use the exact coefficient-frame Pauli mapping when
-their explicit budget is raised beyond the default two qubits. Set
-`max_pauli_decomposition_qubits=3` (or `max_operator_qubits=3` for TreeStab)
-and keep `max_pauli_terms` bounded; both guards are checked before the operator
-sum is applied. `chi=None` remains exact up to the configured cutoff, while a
-finite `chi` compresses the mapped operator with the normal diagnostics. The
-coefficient-MPS compression backend is selected with `mode="mpo"` (the
-default), `"dmrg"`/`"dmrg1"`/`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`,
-`"perm"`, or `"exact"`. `mode="exact"` forces `chi=None`; Clifford tableau
+their explicit budget is within the default three qubits. Set
+`max_pauli_decomposition_qubits=4` only when accepting the 256-term cost of a
+four-qubit dense gate; such gates emit a warning and are rejected by default.
+Set `max_pauli_terms` separately to bound the retained decomposition. `chi=None`
+remains exact up to the configured cutoff, while a finite `chi` compresses the
+mapped operator with the normal diagnostics. The coefficient-MPS compression
+backend uses the same bare method names as `MpsOptimizer`: `mode="direct"`
+(the default), `"dm"`, `"zipup"`, `"src"`, their `*-first` and
+`*-oversample` variants, and the `fit-*` variants. `"dmrg"`/`"dmrg1"`/
+`"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`, `"perm"`, and `"exact"` remain
+available. Historical `"quimb-*"` and `"mpo-*"` spellings are accepted only
+as deprecated aliases. `mode="exact"` forces `chi=None`; Clifford tableau
 updates remain free in every mode.
+
+For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
+native-compressed FIT guess before active bonds reach their `chi` ceilings;
+`"guess-src"` is the default SRC warm-up and continues into the fixed-rank
+one-site phase after expansion. `"auto"` resolves to `"guess-src"`.
+`"direct"`, `"random"`,
+`"random_expand"`, and `"svd_guess"` are also supported. The underscore
+spelling, for example `"guess_zipup"`, remains a compatibility alias. Set
+`compression_seed` separately from the STN measurement `seed` for randomized
+native methods. The STN DMRG wrapper grows with a two-site FIT target for
+`dmrg`, `dmrg1`, and `dmrg2`, and a three-site target for `dmrg3` when the
+active frame window spans at least three sites; `dmrg3` falls back to two-site
+FIT for the common two-qubit window. Each update finishes with a one-site
+refinement on multi-site windows, while the SRC guess is kept isolated from
+the exact target construction. On dense backends, the exact coefficient
+sub-MPO is retained as a tagged lazy FIT target layer: the active MPS window
+is canonicalized first, then FIT contracts the MPS and sub-MPO tensors without
+absorbing the operator into an intermediate target MPS. Symmray and fermionic
+routes retain the materialized backend-safe target fallback.
+`get_fit_diagnostics()` reports the selected block size, growth/refinement
+sweeps, SRC guess method, target representation, and the DMRG1 one-site latch.
 
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are
@@ -25,6 +50,11 @@ available at top level as `pepsy.StabilizerMpsSimulator` and
 prefer the descriptive class name and the explicit bitstring helpers
 (`sample_bitstrings`, `bitstring_probability`, and
 `bitstring_probabilities`); the shorter historical names remain supported.
+Internal measurement and projection paths keep the coefficient-MPS
+`state.info["cur_orthog"]` metadata synchronized. Ordinary diagnostic
+expectations and samples use non-collapsing paths; if lower-level code directly
+canonicalizes `sim.state.p`, call `sim.sync_canonicalization()` before
+continuing the simulation.
 Supported
 gate-stream entries include Clifford gates,
 non-Clifford Pauli rotations, `("t", q)` / `("tdg", q)`, explicit `(matrix,
@@ -48,7 +78,7 @@ rotations, other non-Clifford rotations, dense matrices, coefficient-frame
 sub-MPOs, measurements, resets, caps, touched qubits, and warnings. Then
 `MpsStabOptimizer.recommend_settings(gates, goal="run" | "validate" |
 "benchmark", ...)` returns a typed `StabilizerMpsSettingsAdvice` containing
-constructor settings (`chi`, `cutoff`, `track_infidelity`, `exact_cooling`),
+constructor settings (`chi`, `cutoff`, `exact_cooling`, `stabilize_unitary`),
 an explicit execution method (`apply`, `with_injection`, or
 `with_deferred_injection`), ancilla requirements, warnings, and a
 human-readable `message`.
@@ -100,8 +130,19 @@ print(sim.stim_sample.faults)
 
 With `progbar=True`, the STN progress bar reports the current stream
 `part` (`clifford`, `T`, `measurement`, `reset`, `nonclifford`, ...) and the
-MPS-compatible diagnostic field `infidelity`. The legacy
-`norm_infidelity` field is emitted with the same value.
+MPS-compatible `infidelity` field. It denotes the retained-norm compression
+proxy; it is not a target-state overlap.
+
+The STN norm diagnostics use the same naming contract as ordinary MPS
+compression: `current_fidelity` / `current_infidelity` describe the active
+normalized coefficient segment, while
+`cumulative_fidelity` / `cumulative_infidelity` are accumulated in log space.
+These are compression fidelities measured from retained norms for `|nu>`, not direct
+overlaps with the physical target state `C|nu>`. A direct target overlap is a
+separate diagnostic and is only available when an explicit reference state is
+contracted, such as the final FIT-target check in ordinary MPS DMRG.
+In `norm_diagnostics()`, `norm`/`state_norm` are the live coefficient-state
+norm, while `cumulative_norm` is the square-root retained-compression proxy.
 
 For physical readout, keep the two representations explicit:
 `sim.to_basis_statevector()` returns the dense coefficient vector `|nu>` in
@@ -112,10 +153,48 @@ constructs a dense `2**n`-by-`2**n` Clifford matrix. `to_physical_statevector()`
 remains a compatibility alias for `to_statevector()`. For a non-dense physical
 representation, use `sim.to_mps(mode="exact")`. This replays the tableau gate
 stream into a new ordinary MPS with unlimited bond and zero cutoff. For
-controlled approximation, use `mode="mpo"` or `mode="dmrg"` with `chi=...`
+controlled approximation, use a bare native mode such as `mode="src"` or
+`mode="dmrg"` with `chi=...`
 and `cutoff=...`; `logical_order=True` (the default) returns sites in logical
 qubit order, even when a static STN coefficient layout is installed.
 `to_physical_mps()` remains a compatibility alias for `to_mps()`.
+
+## Tableau inspection
+
+The STN basis Clifford is available as a read-only Stim tableau.  It is the
+`C` in `|psi> = C|nu>`; `x_output(i)` gives destabilizer `d_i` and
+`z_output(i)` gives stabilizer `s_i`:
+
+```python
+tableau = sim.tableau()
+print(tableau)
+```
+
+For a compact Pepsy-style summary, use `ascii_tableau()` to obtain text or
+`show()` to print it.  The default sparse generator format reports only the
+non-identity support, while `compact=False` uses Stim's full-width Pauli
+strings.  `max_generators=` is useful for large registers:
+
+```python
+sim.show(max_generators=12, color=True)
+text = sim.ascii_tableau(compact=False, color=False)
+```
+
+`draw()` returns a Stim circuit diagram of the current Clifford frame without
+materializing the dense Clifford matrix.  The default is a text timeline;
+the default text form is returned as a string.  Stim formats such as
+`timeline-svg` are forwarded as Stim diagram helper objects, and
+`format="circuit"` returns the underlying `stim.Circuit`:
+
+```python
+print(sim.draw())
+svg = str(sim.draw(format="timeline-svg"))
+circuit = sim.draw(format="circuit")
+```
+
+These views show the tableau/frame `C` only.  Non-Clifford evolution remains
+in the coefficient MPS `|nu>` and is summarized by the bond and norm fields in
+`show()`.
 
 Shot ensembles can use the same optimizer-level MPI API as ordinary MPS
 optimization:
@@ -167,6 +246,20 @@ injection runners also accept `layout="auto"`; they build a synthetic layout
 stream from the magic-ancilla gadgets and final projections, rather than using
 the original data-only stream.
 
+STN frame layout uses `weight_mode="operator_schmidt"` by default. Each
+multi-site frame event keeps a unit locality baseline and receives an
+operator-complexity premium: Pauli rotations use the exact two-branch
+operator-Schmidt tail for their angle, dense two-qubit matrices use their
+operator-Schmidt singular values, and explicit sub-MPOs use their maximum MPO
+bond as a conservative rank proxy. This covers the built-in `pepsy.rxx`,
+`pepsy.ryy`, `pepsy.rzz`, `pepsy.fsim`, `pepsy.fsimg`, and `pepsy.su4`
+constructors, as well as arbitrary user-supplied two-qubit matrices. It
+prioritizes long-range operators that would put more pressure on coefficient-
+MPS compression while retaining
+`weight_mode="count"` for the historical uniform score. `"angle"` and
+`"auto"` remain available for angle-based weighting. The weight is a static
+operator proxy, not a prediction of the evolving state's exact entanglement.
+
 For measurement/feed-forward circuits, use
 `("if", record, bit, action)`. `record=-1` means the latest measurement,
 negative records are Stim-style offsets, and `bit` is the computational
@@ -178,15 +271,31 @@ outside the quantum replay contract.
 
 ## Measurement, reset, and magic-state injection
 
-- `measure(pauli, where, *, outcome=None, absorb_basis=False)` — fixed-basis
-  projector `(I +- M)/2` by default; `absorb_basis=True` uses the basis-updating
+- `measure(pauli, where, *, outcome=None, disentangle=False)` — fixed-basis
+  projector `(I +- M)/2` by default; `disentangle=True` uses the basis-updating
   (canonical Lemma-3) form that disentangles the measured qubit from `|nu>`.
-- `reset(where)` — return qubit(s) to `|0>` (measure-`Z` absorb + conditional
-  `X`), disentangling them so ancillas can be recycled. Pass `basis="X"` or
-  `"Y"` to reset to the corresponding `+1` Pauli eigenstate.
-- `measure_reset(pauli, where, *, outcome=None, absorb_basis=True)` — record a
-  Pauli measurement, then reset the same qubit(s) to the `+1` eigenstate of
-  that basis. Stream aliases `mrx`, `mry`, and `mrz` are accepted.
+  The legacy `absorb_basis` keyword remains accepted as an alias.
+- `reset(where, basis="Z", *, order="min_span")` — return qubit(s) to `|0>`
+  (measure-`Z` absorb + conditional `X`), disentangling them so ancillas can
+  be recycled. Pass `basis="X"` or `"Y"` to reset to the corresponding `+1`
+  Pauli eigenstate. Separate targets use the metadata-only span scheduler by
+  default; pass `order="input"` to preserve the supplied order.
+- `measure_reset(pauli, where, *, outcome=None, disentangle=False,
+  order="min_span")` — record a Pauli measurement, then reset the same
+  qubit(s) to the `+1` eigenstate of that basis. Separate targets use the
+  metadata-only span scheduler by default. Pass `order="input"` to preserve
+  their supplied order and `disentangle=True` for the basis-updating path.
+  Returned outcomes remain aligned with the input target order. The legacy
+  `absorb_basis` keyword remains accepted as an alias. Stream aliases `mrx`,
+  `mry`, and `mrz` are accepted.
+- `measure_many(measurements, *, order="min_span", disentangle=False)` —
+  measure independent single-qubit entries such as
+  `[ ("Z", 1), ("X", 2) ]`. The span scheduler reads Tableau supports and
+  MPS layout metadata only; it never performs trial MPS contractions or
+  truncations. Outcomes are returned in input order and the selected schedule
+  is available as `last_measurement_schedule`.
+- `reset_many(where, basis="Z", *, order="min_span")` — batch alias for
+  `reset()` with the same span-ordering behavior.
 - `cap(where, vec, *, absorb="left")` — contract a physical qubit with `vec`
   and rebuild an `(n - 1)`-qubit identity-frame STN. This is a dense fallback
   guarded by `max_dense_cap_qubits`; for scalable DEM-style capping, use the
@@ -272,7 +381,8 @@ records such as `NormEventRecord`, `ImmediateProjectionRecord`,
   the MPS SVD `cutoff`. With `operator_tol=None`, the threshold is relative to
   the matrix scale and input dtype; an explicit value is an absolute tolerance.
 - Fallback Pauli decomposition is limited by
-  `max_pauli_decomposition_qubits=2` before its `4**k` enumeration begins.
+  `max_pauli_decomposition_qubits=3` before its `4**k` enumeration begins.
+  Four-qubit dense attempts warn and require an explicit limit of at least `4`.
   Set a larger integer, or `None`, only when accepting that cost explicitly.
   Clifford matrices and one-qubit unitaries use specialized paths and bypass
   this fallback limit. After decomposition and frame mapping, sparse Pauli sums
@@ -291,8 +401,9 @@ records such as `NormEventRecord`, `ImmediateProjectionRecord`,
 
 Tree sampling shares work for repeated prefixes, but high-entropy states can
 still generate a number of live branches proportional to the shot count.
-Fallback dense matrices use a `4**k` Pauli decomposition and are limited to two
-qubits by default. Sparse results such as `I + XX`, `I + YY`, `I + ZZ`, or
+Fallback dense matrices use a `4**k` Pauli decomposition and are limited to
+three qubits by default. Four-qubit attempts warn and are rejected unless the
+limit is raised explicitly. Sparse results such as `I + XX`, `I + YY`, `I + ZZ`, or
 small mixtures of those terms are applied as a single exact sub-MPO; dense
 results are combined with a balanced, streaming MPS sum. This improves
 reduction depth but does not remove the exponential number of candidate Paulis.
@@ -301,11 +412,16 @@ rotations. A `submpo` event is appropriate only when the MPO is already
 expressed in the coefficient frame. Clifford-angle Pauli rotations are
 synthesized directly as linear-size Stim basis-change and parity circuits, then
 cached; they do not form a `2**k x 2**k` dense matrix. Prefer structured
-coefficient-frame sub-MPOs where applicable. `track_infidelity=True` performs
-no reference-state copy or overlap contraction. For normalized unitary
+coefficient-frame sub-MPOs where applicable. Fidelity tracking is automatic and
+performs no reference-state copy or overlap contraction. For normalized unitary
 evolution it records the cumulative proxy `1 - ||nu||**2` after compressed
 coefficient-MPS updates, reading the norm from the tracked one-site canonical
-centre. Unitary updates are not renormalized, so lost norm remains visible.
+centre. `get_compression_norm_events()` exposes each update's local retained
+norm ratio, while `norm_diagnostics()["local_fidelity"]` is the latest such
+ratio and `cumulative_fidelity` is the stable cumulative proxy. By default
+unitary updates are not renormalized, so lost norm remains visible;
+`stabilize_unitary=True` restores the pre-compression working norm after recording
+the same local and cumulative ledger.
 For dense multi-qubit non-unitary matrices, the target norm is measured from
 the local physical `G†G` expectation and the retained norm ratio is reported as
 `infidelity`. Coefficient-frame sub-MPOs and arbitrary physical maps without a
@@ -316,16 +432,20 @@ historical, is not index-aligned with `bond_history`, and must not be summed.
 Projective measurement/reset boundaries do preserve the current segment before
 normalization in `norm_events`: the event records the pre-collapse norm,
 `1 - ||nu||**2` for that segment, the Born branch probability separately, and
-the actual post-projector norm before renormalization. Comparing the actual
-post-projector norm with `pre_norm**2 * branch_probability` gives a separate
-`projector_infidelity` proxy for compression done while applying the projector.
-The post-collapse state is then normalized. Use `norm_diagnostics()` to form
+the actual post-projector norm before renormalization. For fixed-basis projection,
+comparing the actual post-projector norm with
+`pre_norm**2 * branch_probability` gives a separate `projector_infidelity` proxy
+for compression done while applying the projector. Basis-updating projection
+computes the physical `branch_probability` before its localizer; if the localizer
+is compressed at finite `chi`, `projector_branch_probability` records the
+post-localizer conditional probability used to isolate the final one-site
+projector loss. The post-collapse state is then normalized. Use
+`norm_diagnostics()` to form
 product/geometric-mean survival summaries across completed segments plus the
 current open segment; these summaries multiply unitary- and projector-
 compression survival factors, but not measurement probabilities. The preferred
-summary keys are `infidelity`, `fidelity`, `norm_survival`, and `norm`;
-`norm_infidelity` and the older
-`total_*_proxy` keys remain compatibility aliases.
+summary keys are `infidelity`, `fidelity`, `norm_survival`, and `norm`; the
+older `total_*_proxy` keys remain compatibility aliases.
 The proxy is not exact overlap fidelity or a discarded-SVD-weight report;
 validate physical accuracy independently when that distinction matters.
 
@@ -340,8 +460,9 @@ to remove round-off-sized values and expose the lower bond dimension.
 
 Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,
 device="cuda")`, `pepsy.backend_cupy(...)`, `pepsy.backend_jax(...)`) to the
-constructor or `with_injection`.  The coefficient MPS `|nu>` and every gate/MPO
-applied to it are then placed on that backend, so the heavy MPS contractions
+constructor or `with_injection`. The coefficient MPS `|nu>` is placed on that
+backend, and user gates/MPOs must be prepared with the same converter before
+they are queued, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on that array backend.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
 cached per backend; expectation/fidelity scalars are converted back to Python
@@ -358,11 +479,14 @@ When an existing coefficient MPS is supplied, the stabilizer optimizer infers
 its common `backend`, `dtype`, and `device` automatically, even when
 `to_backend` is omitted. `backend_info()` returns the live mapping and refreshes
 the public `backend`, `backend_dtype`, and `backend_device` attributes. Explicit
-matrix gates and coefficient-frame sub-MPOs are checked against that signature;
-foreign payloads emit one warning per source/target combination. Sub-MPOs are
-copied to the live backend without mutating the caller's MPO; dense physical
-matrices use a temporary NumPy view for Stim/Pauli classification and their
-coefficient contractions remain on the inferred backend.
+matrix gates and every tensor in coefficient-frame sub-MPOs are checked against
+that backend and device at the stream boundary; non-NumPy payloads must also
+match dtype, while NumPy-to-NumPy dtype promotion is compatible. A foreign payload raises
+`TypeError`; prepare it explicitly with the same converter used for the
+coefficient state. Stim gate classification still uses a temporary NumPy view,
+while coefficient contractions remain on the inferred backend. Stim and
+trajectory-generated matrices are converted by the library before they enter
+this user-stream boundary.
 
 
 > API details are maintained as handwritten Markdown in this page.

@@ -33,15 +33,39 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
     paper/reference implementation's CNOT-cascade execution.
   - General few-qubit matrices are Pauli-decomposed, frame-mapped branch by branch, summed,
     and compressed with a balanced streaming reduction. The fallback defaults to at most
-    two qubits via `max_pauli_decomposition_qubits=2`; larger values explicitly opt into
-    the `4**k` cost. A `("submpo", mpo, where)` event instead acts directly in the
+    three qubits via `max_pauli_decomposition_qubits=3`; four-qubit dense gates warn and
+    require an explicit limit of at least `4` because of the `4**k` cost. A
+    `("submpo", mpo, where)` event instead acts directly in the
     coefficient frame.
 - **Exact vs approximate (bounded-$\chi$) mode** is selected on `MpsStabOptimizer`:
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
     numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
-  - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
-    unitary update can record cumulative norm loss `1 - ||p||^2`; bounded evolution does
-    not renormalize `p`, so compression loss remains visible.
+  - *Approximate*: `MpsStabOptimizer(..., chi=cap)`. Fidelity tracking is automatic:
+    each compressed unitary update records local and cumulative norm-survival loss.
+    By default bounded evolution keeps the raw coefficient-MPS norm so compression
+    loss remains visible; `stabilize_unitary=True` restores the pre-compression working
+    norm after recording the same diagnostic loss.
+- **Coefficient-MPS compression methods** use the same bare native method names
+  as `MpsOptimizer` (`direct`, `zipup`, `src`, `fit-*`, and variants).
+  Historical `quimb-*` and `mpo-*` spellings remain supported with deprecation
+  warnings. Every direct, density-matrix,
+  zip-up, SRC, SRCMPS, and `fit-*` method is forwarded to
+  `gate_with_submpo_`; randomized methods accept the separate
+  `compression_seed` control. DMRG modes use a disposable
+  `fit_init_strategy="guess-<method>"` (default `guess-src`) before active
+  bonds reach their cap and through the fixed-rank one-site phase, while the
+  exact coefficient sub-MPO target remains separate from the live coefficient
+  MPS as a tagged lazy FIT layer on dense backends. The active target window is
+  canonicalized before the layer is attached; FIT then contracts multiple
+  target tensors per site directly. `auto` resolves to `guess-src`. The
+  underscore `guess_<method>` spelling remains a compatibility alias. Native
+  Symmray and fermionic paths retain their sector-aware materialized target
+  and direct FIT initialization.
+- STN `dmrg1`, `dmrg2`, and `dmrg3` mirror the ordinary MPS local schedule:
+  isolated SRC warm-up, two-site or three-site growth, then one-site refinement
+  on longer windows. `dmrg3` falls back to two-site FIT on an adjacent two-site
+  window, and `dmrg1` latches one-site updates after full-chain rank ceilings
+  are reached. `get_fit_diagnostics()` exposes this schedule.
 - **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
   quimb operations. Canonicalize explicitly before local projection, evaluate local
   expectations and unitary norm loss at the tracked centre, and renormalize the centre
@@ -53,8 +77,9 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 
 ## Diagnostic contract
 
-- Treat `track_infidelity` as the canonical ``infidelity`` API. For unitary
-  updates it is the normalized norm-loss proxy; for compressed dense
+- Treat fidelity tracking as an unconditional part of the `MpsStabOptimizer` API;
+  there is no `track_infidelity` switch. For unitary updates the diagnostic is the
+  normalized norm-loss proxy; for compressed dense
   non-unitary matrices the retained norm ratio is measured against the local
   physical ``G^dagger G`` target. It is not a general ideal-circuit overlap
   calculation.
@@ -74,12 +99,17 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 - Projective measurement/reset boundaries are recorded separately in `.norm_events`.
   Each event snapshots the pre-collapse unitary segment norm, the physical Born branch
   probability, the actual projected norm before renormalization, and the post-normalized
-  norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
-  projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
-  product/geometric summaries that multiply unitary and projector compression-survival
-  factors, but never measurement probabilities. Prefer `infidelity`, `fidelity`,
-  `norm_survival`, and `norm`; `norm_infidelity` and
-  the older `total_*_proxy` keys are compatibility aliases. `geometric_mean_norm`
+  norm. For fixed-basis projection, compare `projected_norm_sq` to
+  `pre_norm_sq * branch_probability` to get the projector-compression proxy
+  `projector_infidelity`. For basis-updating projection, a finite-chi localizer can
+  change the conditional probability; `projector_branch_probability` is recorded for
+  the post-localizer projector check while `branch_probability` remains the physical
+  pre-localizer probability. Use `norm_diagnostics()` for product/geometric summaries
+  that multiply unitary and projector compression-survival factors, but never
+  measurement probabilities. Prefer `local_fidelity`,
+  `local_infidelity`, `cumulative_fidelity`, `cumulative_infidelity`,
+  `norm_survival`, and `norm`; the older `total_*_proxy` keys are compatibility
+  aliases. `geometric_mean_norm`
   is only the per-segment geometric mean, not the
   total norm summary.
 - A selected `TrajectoryEvent` Kraus outcome is a normalized trajectory
@@ -88,8 +118,9 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   canonical centre, reset the proxy, and commit a `"trajectory_kraus"` norm
   event. This lets later unitary steps track a fresh segment without treating
   the Born probability as compression loss. STN progress reports the shared
-  `infidelity` field plus a compact stream `part` label and retains
-  `norm_infidelity` as a compatibility alias.
+  `infidelity` field plus a compact stream `part` label. Fidelity and
+  infidelity names describe compression measured from norms; live `norm`
+  remains separate.
 - Treat stream-local stochastic entries as the primary Pepsy noise design.
   `("x_error", p, q)`, `("depolarize1", p, q)`,
   `("depolarize2", p, q0, q1)`, `("pauli_channel1", probs, q)`,
@@ -177,17 +208,23 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
   apply `(I + mM)/2`, reject zero-probability forced outcomes, and normalize at the tracked
   centre. The tableau is unchanged.
 - **Basis-updating measurement** → localize `M` to signed `Z_k` with a median-pivot
-  Clifford `V`, apply `V` to `p`, absorb `V^dagger` into `C`, project site `k`, and normalize
-  there. This is the reset/injection primitive.
+  Clifford `V`, apply `V` to `p` through the selected compression backend, absorb
+  `V^dagger` into `C`, project site `k`, and normalize there. The physical outcome
+  probability is computed before any finite-chi localizer compression. This is the
+  reset/injection primitive.
 - **Explicit matrix** → check true unitarity *before* asking stim whether it is Clifford;
   stim does not reject all non-unitary near-Clifford matrices. Non-Clifford 1q unitaries use
   ZYZ; remaining matrices within `max_pauli_decomposition_qubits` use a balanced
   Pauli-branch operator sum without normalization. Only a matrix verified unitary can emit
   a norm-loss sample. For larger physical-frame operators, prefer supported gate/rotation
   decompositions; `submpo` is coefficient-frame only and carries no unitarity declaration.
-- **Backend conversion** → stim/tableau classification remains NumPy/CPU; coefficient MPS,
-  local gates, and MPO arrays use `to_backend`. Convert user matrix entries to NumPy for
-  classification before converting coefficient-side operations back to the chosen backend.
+- **Backend conversion** → Stim/tableau classification remains NumPy/CPU, but every
+  user matrix and every tensor in a user coefficient-frame MPO must already match
+  the live coefficient state's backend and device when the stream is installed. Non-NumPy
+  payloads must also match its dtype; NumPy-to-NumPy dtype promotion is compatible. A
+  mismatch raises `TypeError`; callers explicitly prepare it with the same
+  `to_backend` converter used for the state. The shared trajectory runner converts
+  library-generated sampled matrices before they cross this boundary.
 
 ## Cooling and magic-injection policy
 

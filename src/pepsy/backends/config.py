@@ -51,10 +51,12 @@ class TorchLinalgConfig:
         rank-deficient tensor-network splits. The default keeps native Torch
         forward and backward behavior and is the recommended setting for
         ordinary non-differentiable simulation.
-    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="auto"
-        CUDA cuSOLVER driver. ``"auto"`` leaves the choice to Torch. The
-        approximate ``"gesvda"`` driver requires ``allow_approximate=True``.
-        This option has no effect on CPU tensors.
+    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="gesvd"
+        CUDA cuSOLVER driver. Pepsy defaults to the exact ``"gesvd"`` route;
+        ``"auto"`` leaves the choice to Torch and ``"gesvdj"`` remains an
+        explicit exact alternative. The approximate ``"gesvda"`` driver
+        requires ``allow_approximate=True``. This option has no effect on
+        CPU tensors.
     cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
         CPU forward SVD implementation. SciPy choices are useful for explicit
         LAPACK experimentation and forward-only MPS runs. With
@@ -65,9 +67,10 @@ class TorchLinalgConfig:
     allow_approximate : bool, default=False
         Safety acknowledgement required for CUDA's approximate ``gesvda``.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
-        Rank-deficiency response for the stabilized real QR VJP. ``"warn"``
-        reports a potentially ill-conditioned native fallback, ``"native"``
-        accepts it silently, and ``"error"`` stops the optimization.
+        Rank-deficiency response for stabilized QR VJPs. ``"warn"`` reports
+        the condition and uses the finite regularized rule, ``"native"``
+        accepts Torch's native fallback silently, and ``"error"`` stops the
+        optimization.
     qr_rank_tol_factor : float, default=1.0
         Scale-relative multiplier used by the stabilized real QR rule.
     quimb_split_drivers : bool, default=False
@@ -85,7 +88,7 @@ class TorchLinalgConfig:
 
     mode: str = "complex"
     stabilized: bool = False
-    svd_driver: str = "auto"
+    svd_driver: str = "gesvd"
     cpu_svd: str = "torch"
     svd_fallback: str = "auto"
     allow_approximate: bool = False
@@ -95,7 +98,7 @@ class TorchLinalgConfig:
 
     def __post_init__(self):
         mode = str(self.mode).strip().lower()
-        svd_driver = "auto" if self.svd_driver is None else str(self.svd_driver)
+        svd_driver = "gesvd" if self.svd_driver is None else str(self.svd_driver)
         cpu_svd = "torch" if self.cpu_svd is None else str(self.cpu_svd)
         svd_fallback = "auto" if self.svd_fallback is None else str(self.svd_fallback)
         qr_rank_policy = str(self.qr_rank_policy).strip().lower()
@@ -554,6 +557,13 @@ def _install_torch_linalg_config(config):
     # or tiny singular values. ``svd_driver`` and ``cpu_svd`` only select the
     # forward decomposition; they do not silently change the tensor dtype.
     fallback = config.resolved_svd_fallback
+    # Keep the ordinary and raw-block QR paths on the same rank policy. The
+    # native complex path does not need the policy itself, but its stabilized
+    # Quimb counterpart does.
+    lr._configure_qr_rank_policy(  # pylint: disable=protected-access
+        config.qr_rank_policy,
+        config.qr_rank_tol_factor,
+    )
     if config.stabilized:
         if config.mode == "complex":
             lr.reg_rel_svd_torch(
@@ -567,17 +577,20 @@ def _install_torch_linalg_config(config):
                 cpu_svd=config.cpu_svd,
                 svd_fallback=fallback,
             )
-        # QR registration: the real rule adds rank diagnostics and a finite
-        # VJP for singular pivots. Complex ordinary Autoray QR stays native
-        # for speed; its safe complex rule is used by the Quimb raw-block
-        # split path below when that path is enabled.
+        # QR registration: both real and complex stabilized rules use finite
+        # rank-deficient VJPs. Native Torch remains the fast default when
+        # stabilization is disabled.
         if config.mode == "real":
             lr.reg_real_qr_torch(
                 rank_policy=config.qr_rank_policy,
                 rank_tol_factor=config.qr_rank_tol_factor,
             )
         else:
-            lr.reg_complex_qr_torch()
+            lr.reg_complex_qr_torch(
+                stabilized=True,
+                rank_policy=config.qr_rank_policy,
+                rank_tol_factor=config.qr_rank_tol_factor,
+            )
     else:
         lr.reg_native_svd_torch(
             svd_driver=config.svd_driver,
@@ -596,6 +609,8 @@ def _install_torch_linalg_config(config):
             # Quimb's optional raw-block driver is the stabilized custom
             # split path even when the ordinary Autoray path is native.
             svd_fallback=fallback if config.stabilized else "scipy_gesvd",
+            qr_rank_policy=config.qr_rank_policy,
+            qr_rank_tol_factor=config.qr_rank_tol_factor,
         )
 
     global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
@@ -606,7 +621,7 @@ def register_torch_linalg(
     mode="complex",
     *,
     stabilized=False,
-    svd_driver="auto",
+    svd_driver="gesvd",
     cpu_svd="torch",
     svd_fallback="auto",
     allow_approximate=False,
@@ -627,8 +642,9 @@ def register_torch_linalg(
     stabilized : bool, default=False
         Keep native Torch SVD/QR by default. Set this to ``True`` to install
         Pepsy's relative-regularized SVD and validated real-QR rules.
-    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="auto"
-        CUDA cuSOLVER driver. ``"gesvda"`` is approximate and requires
+    svd_driver : {"auto", "gesvdj", "gesvda", "gesvd"}, default="gesvd"
+        CUDA cuSOLVER driver. Pepsy defaults to the exact ``"gesvd"`` route.
+        ``"gesvda"`` is approximate and requires
         ``allow_approximate=True``. CPU tensors ignore this option.
     cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
         CPU SVD implementation. SciPy choices are forward-only for native
@@ -639,7 +655,7 @@ def register_torch_linalg(
     allow_approximate : bool, default=False
         Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
-        Response to rank-deficient inputs when stabilized real QR is active.
+        Response to rank-deficient inputs when stabilized QR is active.
     qr_rank_tol_factor : float, default=1.0
         Multiplier for the scale-aware real-QR rank threshold.
     quimb_split_drivers : bool, default=False
@@ -741,7 +757,7 @@ def reg_native_svd_torch():
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
-    lr.reg_native_svd_torch()
+    lr.reg_native_svd_torch(svd_driver="gesvd")
     global _ACTIVE_TORCH_LINALG_CONFIG  # pylint: disable=global-statement
     _ACTIVE_TORCH_LINALG_CONFIG = TorchLinalgConfig()
 

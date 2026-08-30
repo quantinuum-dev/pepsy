@@ -42,3 +42,11 @@ change the symmetry sector; ordinary charge-preserving evolution should leave
 it disabled.
 
 > API details are maintained as handwritten Markdown in this page.
+
+## Gate transforms
+
+`pepsy.operators.gates.gate` and `gate_simple` accept `dagger=True` or
+`transpose=True`. The option is capability-checked against the installed
+Quimb gate API and applied to the requested user gate. If a non-local gate is
+routed through internal SWAPs, those SWAPs are always applied normally; only
+the final requested gate is transformed.

@@ -1,8 +1,9 @@
-# `pepsy.operators.build_itf_cluster_expansion_pepo`
+# PEPO cluster expansion and joint ordered products
 
 For the canonical MPO/PEPO entry-point map, step convention, and return-type
 summary, see the [unified exponential API](exponentials.md). This page gives
-the detailed cluster and fixed-channel PEPO reference.
+the detailed `pepsy.operators.pepo_cluster` cluster and fixed-channel PEPO
+reference. The higher-order MPO and MPO cluster families are separate APIs.
 
 `build_itf_cluster_expansion_pepo` constructs a dense square-lattice PEPO
 approximation to `exp(-beta * H)` for Pepsy's transverse-field Ising
@@ -111,8 +112,8 @@ Factories are provided for transverse-field Ising, spin-1/2 Heisenberg, and
 spin-1/2 XXZ models. Custom adapters can be made from dense `twosite_op` and
 `onesite_op` matrices, or recovered from a mapping/object exposing those
 terms. These adapters are finite and dense; fermionic parity, native
-Symmray charge blocks, and infinite/unit-cell evolution are intentionally
-outside this layer.
+Symmray charge blocks and graded fermionic histories are intentionally outside
+this layer.
 
 ## Generic cluster geometry
 
@@ -131,8 +132,83 @@ neighbour edges, diagonal-neighbour metadata, and its graph loop number. Use
 `quotient_rotations=True` for a C4 planning inventory. The dense P=5–9
 builders recursively subtract the actual lower-order PEPO on each support and
 then perform a spanning-tree SVD factorization. Set `max_tree_rank` to
-truncate those generic tree bonds. The fixed-channel Pauli builder remains
-limited to orders 1–4.
+truncate those generic tree bonds. The fixed-channel Pauli builder now uses
+the same connected-shape hierarchy through order 9 while keeping coefficient
+and step values backend-native. On a periodic square lattice, translated
+copies reuse one local residual and C4-related shapes reuse one
+factorization. A loop's full graph is used for its local residual, while the
+final PEPO channel uses an exact spanning-tree representation of that local
+tensor. This avoids a `bond_dim**4` dense allocation at PBC vertices, but
+p≥5 remains exponentially more expensive in local cluster size.
+For memory-controlled p≥5 runs, pass `max_tree_rank` to
+`PauliPEPOBasis.compile`; this is a fixed-rank differentiable truncation of
+generic tree channels, while `None` keeps the local factorization exact.
+
+## Arbitrary finite graph lattices
+
+The square `PEPO` builder keeps Quimb's four-leg `PEPO` contract. For a
+triangular, honeycomb, Kagome, or irregular finite graph, use
+`ClusterLattice` and the graph-native builder instead:
+
+```python
+from pepsy.operators import ClusterLattice, build_graph_cluster_expansion_pepo
+
+z = np.diag([1.0, -1.0])
+x = np.array([[0.0, 1.0], [1.0, 0.0]])
+y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+lattice = ClusterLattice.from_edges(
+    (0, 1, 2),
+    ((0, 1), (1, 2), (2, 0)),
+    name="triangle",
+)
+active = build_graph_cluster_expansion_pepo(
+    lattice,
+    0.03,
+    np.kron(z, z),
+    0.2 * x,
+    order=3,
+    materialize=False,
+)
+operator = active.to_tensor_network()
+```
+
+`GraphActivePEPOBlocks` has one virtual leg per graph edge and contracts to a
+generic Quimb `TensorNetwork`; `to_dense()` is intended for small validation
+graphs. The graph solver enumerates connected induced subgraphs, subtracts the
+complete lower-order graph operator, and factors every residual over a
+spanning tree. This is exact at the local residual level when the tree ranks
+are not capped, including for induced graph loops. It is deliberately a
+separate return type because Quimb's `PEPO` wrapper is square-lattice-only.
+
+## Internal symmetries
+
+Geometric `symmetry="C4"` and internal charge symmetry are separate options.
+`ClusterInternalSymmetry` currently validates neutral `U1`, `Z2`, `U1U1`, and
+`Z2Z2` Hamiltonian terms. Sector-ordered dense bases can use
+`physical_sectors`; arbitrary dense bases can use local `generators`:
+
+```python
+from pepsy.operators import ClusterInternalSymmetry
+
+u1 = ClusterInternalSymmetry("U1", physical_sectors={0: 1, 1: 1})
+active = build_graph_cluster_expansion_pepo(
+    lattice,
+    0.03,
+    np.kron(x, x) + np.kron(y, y),
+    z,
+    order=3,
+    internal_symmetry=u1,
+    materialize=False,
+)
+assert active.charge_symmetry == "U1"
+```
+
+The validator prevents charge-changing local terms and records the compatible
+physical-sector metadata on the active blocks. Dense SVD factors are not
+automatically relabeled as native block-sparse factors: Symmray conversion
+still requires explicit `virtual_charges` whenever endpoint factors carry
+nonzero charges. Fermionic graded factorization remains a separate native
+Symmray subsystem.
 
 ## Coefficient-dependent real-time exponentials
 
@@ -234,6 +310,43 @@ virtual-history sector rather than as dense tensor inflation.
 
 For a general dense local model, use
 `build_cluster_expansion_pepo(lx, ly, beta, twosite_op, onesite_op, ...)`.
+
+## Ordered PEPO products
+
+For a noncommuting product, compile one `PauliPEPOBasis` per factor and use
+`PEPOClusterProductExpansion`. Factors are listed in algebraic order, so the
+following constructs `exp(A) @ exp(B) @ exp(C)`:
+
+```python
+from pepsy.operators import PauliPEPOBasis, PEPOClusterProductExpansion
+
+A = PauliPEPOBasis.compile(4, 4, [("onsite", "X")], order=5)
+B = PauliPEPOBasis.compile(4, 4, [("edge", "ZZ")], order=5)
+C = PauliPEPOBasis.compile(4, 4, [("onsite", "Z")], order=5)
+
+product = PEPOClusterProductExpansion.from_bases(
+    (A, B, C),
+    coefficients=(0.2, -0.3, 0.4),
+)
+compiled = product.compile_exp()
+U = compiled.exp(0.01, compress=True, max_bond=64)
+```
+
+For every connected cluster `S`, the local target is formed jointly as
+`exp(A_S) @ exp(B_S) @ exp(C_S)`, lower connected partitions are subtracted,
+and the residual channels are assembled into one PEPO. No full-lattice PEPO is
+built for an individual factor. All bases must use the same cluster order;
+`order=2` is one joint two-site expansion, not `PEPO(order=2) @
+PEPO(order=3)`. Factor coefficients, term coefficients, and the step remain
+backend-native for Torch/JAX autodiff. This product path is intentionally
+separate from `exp(A + B + C)`, which is a different operator unless the
+factors commute. Contract the returned PEPO with the network contraction
+workflow appropriate for the observable you need.
+
+The order `p` controls local dimension: for physical dimension `d`, each
+`p`-site target is a `(d**p) x (d**p)` matrix, or `d**(2*p)` coefficients.
+The cost is exponential in `p` but not in the total lattice size `N` at fixed
+`p`; the number of translated/graph-embedded clusters scales with `N`.
 
 ## Fixed Pauli coefficient slots
 

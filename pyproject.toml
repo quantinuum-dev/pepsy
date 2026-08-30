@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepsy"
-version = "0.4.0"
+version = "0.4.1"
 description = "Tensor-network simulation, contraction, optimization, and VMC tools"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,12 @@ dev = [
   "ruff>=0.6",
   "build>=1.2",
   "twine>=5",
+]
+docs = [
+  "furo>=2024.8",
+  "myst-parser>=4",
+  "sphinx>=8.2",
+  "sphinx-autoapi>=3.8",
 ]
 test-extended = [
   "matplotlib>=3.7",

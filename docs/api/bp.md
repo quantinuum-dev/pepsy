@@ -43,6 +43,20 @@ gauges are used by `gate_simple`; D2BP recomputes its own norm messages. The
 `norm="1norm"` gauge route requires a closed scalar tensor network, so it is
 not the direct route for an open PEPO with ket/bra physical indices.
 
+For loop-cluster runs, `gloop_opts` forwards generalized-loop generation
+controls supported by the installed Quimb version. This is useful for
+selecting a maximum loop size or overlap policy while keeping the existing
+`gloops=None` and integer-cutoff defaults unchanged:
+
+```python
+correction = loop_cluster_expand(
+    scalar_tn,
+    gloops=None,
+    norm="1norm",
+    gloop_opts={"max_size": 6, "join_overlap": 1},
+)
+```
+
 ## Reduced loop-cluster compression
 
 For the first-pass local full-update style compression, use

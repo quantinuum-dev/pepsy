@@ -599,10 +599,10 @@ the optimizer's norm-survival ledger. The selected branch event retains its
 Born `branch_probability` and is marked as a `physical_boundary`; the expected
 norm includes that probability, so physical renormalization is not reported as
 compression infidelity. Inspect `optimizer.norm_diagnostics()` and
-`optimizer.get_norm_events()` after independent or coalesced replay. No
-`track_infidelity` flag is needed.
+`optimizer.get_norm_events()` after independent or coalesced replay. Fidelity
+tracking is automatic for `MpsStabOptimizer`; no tracking flag is needed.
 
-For `MpsStabOptimizer(track_infidelity=True)`, a selected Kraus outcome is a
+For `MpsStabOptimizer`, a selected Kraus outcome is a
 normalized trajectory boundary, just like a measurement/reset: its Born weight
 is retained in the trajectory record but is not treated as compression loss.
 `sim.norm_diagnostics()["norm"]` is the square root of the product of all

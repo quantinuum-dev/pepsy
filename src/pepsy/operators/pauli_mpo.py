@@ -25,7 +25,8 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
-from .mpo import FirstDegreeMPO, MPOProductTerm
+from .._internal.validation import is_strict_integer, normalize_integer_tuple
+from .mpo_semantic import FirstDegreeMPO, MPOProductTerm
 
 __all__ = [
     "PauliBondCompressionReport",
@@ -77,7 +78,8 @@ class PauliCompressionReport:
         return self.bond_reports
 
 
-_PAULIS = frozenset("IXYZ")
+_PAULI_LABELS = "IXYZ"
+_PAULIS = frozenset(_PAULI_LABELS)
 _PAULI_PRODUCT = {
     ("I", "I"): ("I", 1),
     ("I", "X"): ("X", 1),
@@ -102,6 +104,27 @@ _PAULI_MATRICES = {
     "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
     "Z": np.diag([1.0, -1.0]).astype(complex),
 }
+
+
+def _build_pauli_product_tensor():
+    """Build ``M[p, q, s]`` for ``P_p @ P_q = M[p, q, s] * P_s``."""
+
+    tensor = np.zeros((4, 4, 4), dtype=complex)
+    for (left, right), (out, phase) in _PAULI_PRODUCT.items():
+        tensor[
+            _PAULI_LABELS.index(left),
+            _PAULI_LABELS.index(right),
+            _PAULI_LABELS.index(out),
+        ] = phase
+    return tensor
+
+
+_PAULI_PRODUCT_TENSOR = _build_pauli_product_tensor()
+_PAULI_BASIS_TENSOR = np.stack(
+    tuple(_PAULI_MATRICES[label] for label in _PAULI_LABELS),
+)
+_PAULI_IDENTITY_SELECTOR = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+_PAULI_DELTA = np.eye(4, dtype=float)
 
 
 def _check_scalar(value, *, name="coefficient"):
@@ -159,6 +182,40 @@ def _zeros(shape, *, like):
 
 def _array_like(value, like):
     return ar.do("array", np.asarray(value), like=like)
+
+
+def _pauli_product_tensor(*, like=None):
+    """Return the backend-native Pauli multiplication tensor ``M[p, q, s]``."""
+
+    if like is None:
+        return _PAULI_PRODUCT_TENSOR
+    return _array_like(_PAULI_PRODUCT_TENSOR, like)
+
+
+def _pauli_basis_tensor(*, like=None):
+    """Return ``P[p, upper, lower]`` for the local ``I/X/Y/Z`` basis."""
+
+    if like is None:
+        return _PAULI_BASIS_TENSOR
+    return _array_like(_PAULI_BASIS_TENSOR, like)
+
+
+def _pauli_identity_selector(*, normalized, like=None):
+    """Return the trace map ``(1 or 2) * delta[p, I]``."""
+
+    selector = _PAULI_IDENTITY_SELECTOR * (1.0 if normalized else 2.0)
+    if like is None:
+        return selector
+    return _array_like(selector, like)
+
+
+def _pauli_overlap_tensor(*, normalized, like=None):
+    """Return the local Hilbert-Schmidt map ``(1 or 2) * delta[p, q]``."""
+
+    overlap = _PAULI_DELTA * (1.0 if normalized else 2.0)
+    if like is None:
+        return overlap
+    return _array_like(overlap, like)
 
 
 def _is_complex_array(value):
@@ -236,21 +293,15 @@ def _normalize_boundary(boundary):
     return boundary
 
 
-def _normalize_sites(sites, nsites):
-    if isinstance(sites, Integral):
-        sites = (int(sites),)
-    else:
-        try:
-            sites = tuple(int(site) for site in sites)
-        except TypeError as exc:
-            raise TypeError("sites must be an integer or an iterable of integers.") from exc
+def _normalize_sites(sites, nsites, *, sort=True, distinct=True):
+    sites = normalize_integer_tuple(sites, name="sites")
     if not sites:
         raise ValueError("sites must not be empty.")
-    if len(set(sites)) != len(sites):
+    if distinct and len(set(sites)) != len(sites):
         raise ValueError("sites must be distinct.")
     if any(site < 0 or site >= nsites for site in sites):
         raise ValueError(f"sites must lie in the range 0..{nsites - 1}.")
-    return tuple(sorted(sites))
+    return tuple(sorted(sites)) if sort else sites
 
 
 def _normalize_where(where, nsites):
@@ -662,31 +713,39 @@ def _native_direct_sum(left_cores, right_cores, sign=1):
 
 
 def _native_product(left_cores, right_cores):
-    """Multiply two Pauli core trains using the local IXYZ product tensor."""
+    """Multiply native cores through the local Pauli structure tensor.
+
+    If ``A[l, a, p]`` and ``B[b, r, q]`` are the local coefficient cores,
+    the result is
+
+    ``C[(l, b), (a, r), s] = A[l, a, p] * B[b, r, q] * M[p, q, s]``.
+
+    The Pauli label remains the physical index and the product only forms
+    the tensor-product virtual bonds.
+    """
 
     if len(left_cores) != len(right_cores):
         raise ValueError("Pauli core trains must have the same length.")
     left_cores, right_cores = _align_core_trains(left_cores, right_cores)
-    product_tensor = np.zeros((4, 4, 4), dtype=complex)
-    for (left, right), (out, phase) in _PAULI_PRODUCT.items():
-        product_tensor["IXYZ".index(left), "IXYZ".index(right), "IXYZ".index(out)] = phase
+    product_tensor = None
     result = []
     for left, right in zip(left_cores, right_cores):
         left = _complexify(left)
         right = _complexify(right)
+        if product_tensor is None:
+            product_tensor = _pauli_product_tensor(like=left)
         ll, lr, _ = _host_shape(left)
         rl, rr, _ = _host_shape(right)
-        tensor = _array_like(product_tensor, left)
-        product = _einsum("iap,jbq,pqr->ijabr", left, right, tensor)
+        product = _einsum("iap,jbq,pqr->ijabr", left, right, product_tensor)
         result.append(_reshape(product, (ll * rl, lr * rr, 4)))
     return tuple(result)
 
 
 def _native_trace(cores, *, normalized=False):
-    factor = 1.0 if normalized else 2.0
+    selector = _pauli_identity_selector(normalized=normalized, like=cores[0])
     state = None
     for core in cores:
-        local = _multiply(core[:, :, 0], factor)
+        local = _einsum("abp,p->ab", core, selector)
         if state is None:
             state = local[0, :]
         else:
@@ -704,26 +763,27 @@ def _native_inner(left_cores, right_cores, *, normalized=False):
     if use_complex:
         left_cores = tuple(_complexify(core) for core in left_cores)
         right_cores = tuple(_complexify(core) for core in right_cores)
+    overlap = _pauli_overlap_tensor(normalized=normalized, like=left_cores[0])
     state = _array_like([[1.0]], left_cores[0])
     for left, right in zip(left_cores, right_cores):
         state = _einsum(
-            "ij,iap,jbp->ab",
+            "ij,iap,jbq,pq->ab",
             state,
             _conjugate(left),
             right,
+            overlap,
         )
-    factor = 1.0 if normalized else float(2**len(left_cores))
-    return _multiply(state[0, 0], factor)
+    return state[0, 0]
 
 
 def _native_partial_trace(cores, traced, *, normalized=False):
     traced = set(traced)
-    factor = 1.0 if normalized else 2.0
+    selector = _pauli_identity_selector(normalized=normalized, like=cores[0])
     kept_cores = []
     pending = None
     for site, core in enumerate(cores):
         if site in traced:
-            transfer = _multiply(core[:, :, 0], factor)
+            transfer = _einsum("abp,p->ab", core, selector)
             if pending is None:
                 pending = transfer
             else:
@@ -1135,15 +1195,17 @@ def _parse_term(term):
 
 def _embed_word(word, sites, nsites):
     word = _normalize_word(word)
-    sites = _normalize_sites(sites, nsites)
+    sites = _normalize_sites(sites, nsites, sort=False, distinct=False)
     if len(word) != len(sites):
         raise ValueError(
             f"word length {len(word)} does not match sites length {len(sites)}."
         )
     result = ["I"] * nsites
+    phase = 1
     for site, label in zip(sites, word):
-        result[site] = label
-    return "".join(result)
+        result[site], local_phase = _PAULI_PRODUCT[(result[site], label)]
+        phase *= local_phase
+    return "".join(result), phase
 
 
 def _canonical_terms(terms, nsites):
@@ -1196,7 +1258,7 @@ class PauliMPO:
     """
 
     def __init__(self, nsites, terms=(), *, boundary="open"):
-        if not isinstance(nsites, Integral) or int(nsites) < 1:
+        if not is_strict_integer(nsites) or int(nsites) < 1:
             raise ValueError("nsites must be a positive integer.")
         self.nsites = int(nsites)
         self.boundary = _normalize_boundary(boundary)
@@ -1235,7 +1297,7 @@ class PauliMPO:
         ``coefficient``, ``sites``, and ``paulis``/``word``.
         """
 
-        if not isinstance(nsites, Integral) or int(nsites) < 1:
+        if not is_strict_integer(nsites) or int(nsites) < 1:
             raise ValueError("nsites must be a positive integer.")
         nsites = int(nsites)
         boundary = _normalize_boundary(boundary)
@@ -1248,7 +1310,8 @@ class PauliMPO:
             _check_scalar(coefficient)
             word = _normalize_word(raw_word)
             if sites is not None:
-                expanded.append((coefficient, _embed_word(word, sites, nsites)))
+                full_word, phase = _embed_word(word, sites, nsites)
+                expanded.append((_multiply(coefficient, phase), full_word))
                 continue
             if len(word) == nsites:
                 expanded.append((coefficient, word))
@@ -2115,14 +2178,15 @@ class PauliMPO:
 
     def _semantic_mpo(self):
         if self._cores is not None:
+            # Native cores have one Pauli-label leg.  This explicit basis map
+            # is the only step that turns it into Quimb's two physical legs.
+            reference = _complexify(self._cores[0])
+            basis = _pauli_basis_tensor(like=reference)
             arrays = tuple(
                 _einsum(
                     "abp,pij->abij",
                     _complexify(core),
-                    _array_like(
-                        np.stack(tuple(_PAULI_MATRICES[label] for label in "IXYZ")),
-                        _complexify(core),
-                    ),
+                    basis,
                 )
                 for core in self._cores
             )

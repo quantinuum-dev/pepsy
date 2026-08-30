@@ -7,19 +7,27 @@ from scipy.linalg import expm
 import pepsy
 from pepsy.operators import (
     ActivePEPOBlocks,
+    ClusterInternalSymmetry,
+    ClusterLattice,
     ConnectedClusterShape,
     ClusterExpansionReport,
     ClusterExpansionPlan,
     ClusterModelAdapter,
     CompiledPEPOExp,
+    GraphActivePEPOBlocks,
+    GraphClusterExpansionPlan,
+    GraphConnectedClusterShape,
     MPOParameter,
+    CompiledPEPOClusterProduct,
     PauliPEPOBasis,
     PauliPEPOTerm,
+    PEPOClusterProductExpansion,
     adapt_cluster_model,
     build_cluster_expansion_pepo,
     build_model_cluster_expansion_pepo,
     build_itf_cluster_expansion_pepo,
     build_real_time_cluster_expansion_pepo,
+    build_graph_cluster_expansion_pepo,
     compose_cluster_expansion_pepo,
     compose_pepo_layers,
     generate_connected_cluster_shapes,
@@ -151,6 +159,10 @@ def test_cluster_expansion_builder_is_public():
     assert ClusterExpansionPlan is pepsy.ClusterExpansionPlan
     assert ClusterExpansionReport is pepsy.ClusterExpansionReport
     assert ActivePEPOBlocks is pepsy.ActivePEPOBlocks
+    assert GraphActivePEPOBlocks is pepsy.GraphActivePEPOBlocks
+    assert GraphClusterExpansionPlan is pepsy.GraphClusterExpansionPlan
+    assert ClusterLattice is pepsy.ClusterLattice
+    assert ClusterInternalSymmetry is pepsy.ClusterInternalSymmetry
     assert PauliPEPOBasis is pepsy.PauliPEPOBasis
     assert PauliPEPOTerm is pepsy.PauliPEPOTerm
     assert CompiledPEPOExp is pepsy.CompiledPEPOExp
@@ -160,6 +172,7 @@ def test_cluster_expansion_builder_is_public():
     assert build_model_cluster_expansion_pepo is pepsy.build_model_cluster_expansion_pepo
     assert build_real_time_cluster_expansion_pepo is pepsy.build_real_time_cluster_expansion_pepo
     assert generate_connected_cluster_shapes is pepsy.generate_connected_cluster_shapes
+    assert build_graph_cluster_expansion_pepo is pepsy.build_graph_cluster_expansion_pepo
     assert "build_cluster_expansion_pepo" in pepsy.operators.__all__
 
 
@@ -227,6 +240,114 @@ def test_connected_cluster_geometry_can_quotient_c4_rotations():
     assert len(fixed) == 19
     assert len(rotated) == 7
     assert len({shape.sites for shape in rotated}) == 7
+
+
+def test_general_graph_geometry_keeps_loop_topology():
+    """Arbitrary graph clusters do not rely on square coordinates."""
+    lattice = ClusterLattice.from_edges(
+        ("a", "b", "c"),
+        (("a", "b"), ("b", "c"), ("c", "a")),
+        name="triangle",
+    )
+    shapes = lattice.connected_cluster_shapes(3)
+    triangles = [shape for shape in shapes if shape.nsites == 3]
+    assert len(triangles) == 1
+    assert isinstance(triangles[0], GraphConnectedClusterShape)
+    assert triangles[0].loops == 1
+    assert not triangles[0].is_tree
+
+
+def test_general_graph_cluster_builder_is_exact_on_a_triangle():
+    """The graph-native order-three residual closes an arbitrary loop."""
+    z = np.diag([1.0, -1.0])
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    twosite = np.kron(z, z)
+    onesite = 0.2 * x
+    lattice = ClusterLattice.from_edges(
+        (0, 1, 2),
+        ((0, 1), (1, 2), (2, 0)),
+    )
+    active, report = build_graph_cluster_expansion_pepo(
+        lattice,
+        0.03,
+        twosite,
+        onesite,
+        order=3,
+        materialize=False,
+        return_report=True,
+    )
+
+    identity = np.eye(2)
+    hamiltonian = np.zeros((8, 8))
+    for site in range(3):
+        factors = [identity] * 3
+        factors[site] = onesite
+        hamiltonian += _kron_all(factors)
+    for first, second in lattice.edges:
+        factors = [identity] * 3
+        factors[first] = factors[second] = z
+        hamiltonian += _kron_all(factors)
+
+    np.testing.assert_allclose(
+        active.to_dense(),
+        expm(-0.03 * hamiltonian),
+        atol=1e-12,
+    )
+    assert report.cluster_counts["order_3"] == 1
+    assert active.to_tensor_network().tensors
+
+
+def test_graph_materialization_accepts_nonstring_site_labels():
+    """Graph tensor tags remain safe for tuple-valued site labels."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    lattice = ClusterLattice.from_edges(
+        ((0, "a"), (1, "b")),
+        (((0, "a"), (1, "b")),),
+    )
+    active = build_graph_cluster_expansion_pepo(
+        lattice,
+        0.01,
+        np.zeros((4, 4)),
+        x,
+        order=1,
+        materialize=False,
+    )
+    assert active.to_tensor_network().tensors
+
+
+def test_cluster_internal_symmetry_validates_u1_and_generator_forms():
+    """Charge checks cover both sector-ordered and arbitrary dense bases."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+    z = np.diag([1.0, -1.0])
+    u1 = ClusterInternalSymmetry("U1", physical_sectors={0: 1, 1: 1})
+    u1.validate(np.kron(x, x) + np.kron(y, y), z)
+    with pytest.raises(ValueError, match="onesite_op changes"):
+        u1.validate(np.kron(x, x), x)
+
+    z2 = ClusterInternalSymmetry("Z2", generators=(x,))
+    z2.validate(np.kron(z, z), x)
+
+
+def test_internal_symmetry_metadata_reaches_square_active_blocks():
+    """The square builder records the validated native-conversion contract."""
+    twosite, onesite = _itf_terms()
+    symmetry = ClusterInternalSymmetry("Z2", generators=(
+        np.array([[0.0, 1.0], [1.0, 0.0]]),
+    ))
+    active = build_cluster_expansion_pepo(
+        1,
+        2,
+        0.01,
+        twosite,
+        onesite,
+        order=2,
+        internal_symmetry=symmetry,
+        materialize=False,
+    )
+    assert active.charge_symmetry == "Z2"
+    with pytest.raises(ValueError, match="dense basis without"):
+        active.to_symmray_pepo()
 
 
 def test_cluster_plan_exposes_geometry_through_order_six():
@@ -495,6 +616,28 @@ def test_order_seven_recurses_through_all_lower_generic_levels():
     assert report.cluster_counts["generic_tree_solved"] == 3
     for order in (5, 6, 7):
         assert report.residual_norms[f"generic_order_{order}"] < 1e-12
+
+
+@pytest.mark.parametrize("order, nsites", ((8, 8), (9, 9)))
+def test_upper_generic_orders_stay_finite_through_order_nine(order, nsites):
+    """The generic PEPO recursion remains valid through its order-nine cap."""
+    active, report = build_itf_cluster_expansion_pepo(
+        1,
+        nsites,
+        0.001,
+        order=order,
+        materialize=False,
+        return_report=True,
+    )
+
+    assert report.cluster_counts[f"generic_order_{order}"] == 1
+    assert report.residual_norms[f"generic_order_{order}"] < 1e-12
+    assert active.active_block_count > 0
+    assert all(
+        np.isfinite(block).all()
+        for site_blocks in active.blocks.values()
+        for block in site_blocks.values()
+    )
 
 
 def test_dense_model_adapter_builds_standard_spin_models():
@@ -768,6 +911,181 @@ def test_pauli_pepo_basis_matches_finite_chain_through_tree_order(order, nsites)
     pepo = basis.exp(step=-1j * 0.01, materialize=True)
     exact = expm(-1j * 0.01 * _pauli_chain_hamiltonian(nsites, 0.2, 1.0))
     np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
+
+
+def test_pauli_pepo_basis_order_five_is_exact_on_a_five_site_chain():
+    """The backend-native generic path closes the first five-site tree."""
+    basis = PauliPEPOBasis.compile(
+        1,
+        5,
+        [
+            PauliPEPOTerm("onsite", "X", coefficient=0.2),
+            PauliPEPOTerm("edge", "ZZ", coefficient=1.0),
+        ],
+        order=5,
+    )
+    pepo = basis.exp(step=-1j * 0.001, materialize=True)
+    exact = expm(-1j * 0.001 * _pauli_chain_hamiltonian(5, 0.2, 1.0))
+    np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
+    assert basis.cache_info["generic_cluster_levels"] == 1
+    assert basis.cache_info["generic_translated_clusters"] == 1
+
+
+def test_pauli_pepo_basis_batches_translated_pbc_shapes():
+    """PBC higher-order sources are reused across their torus translations."""
+    basis = PauliPEPOBasis.compile(
+        2,
+        3,
+        [("onsite", "X"), ("edge", "ZZ")],
+        order=5,
+        cyclic=True,
+        symmetry="C4",
+    )
+    active = basis.exp(
+        step=-1j * 1e-4,
+        coefficients=np.array([0.2, 1.0]),
+        materialize=False,
+    )
+    assert active.active_block_count > 0
+    assert basis.cache_info["generic_cluster_levels"] == 1
+    assert basis.cache_info["generic_translated_clusters"] > 1
+
+
+def test_pauli_pepo_basis_order_five_keeps_torch_autodiff():
+    """Generic tree SVD and sparse PBC-safe contraction keep Torch graphs."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        5,
+        [("onsite", "X"), ("edge", "ZZ")],
+        order=5,
+    )
+    coefficients = torch.tensor(
+        [0.2, 1.0], dtype=torch.float64, requires_grad=True
+    )
+    step = torch.tensor(0.001, dtype=torch.float64, requires_grad=True)
+    active = basis.exp(
+        step=-1j * step,
+        coefficients=coefficients,
+        materialize=False,
+    )
+    loss = sum(
+        block.real.sum()
+        for site_blocks in active.blocks.values()
+        for block in site_blocks.values()
+    )
+    coefficient_gradient, step_gradient = torch.autograd.grad(
+        loss,
+        (coefficients, step),
+    )
+    assert torch.isfinite(coefficient_gradient).all()
+    assert torch.isfinite(step_gradient)
+
+
+def test_ordered_pepo_cluster_product_order_five_is_joint_and_exact():
+    """exp(A) exp(B) exp(C) shares one p=5 cluster hierarchy."""
+    identity = np.eye(2)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+
+    def onsite_sum(operator):
+        result = np.zeros((32, 32))
+        for site in range(5):
+            factors = [identity] * 5
+            factors[site] = operator
+            local = factors[0]
+            for factor in factors[1:]:
+                local = np.kron(local, factor)
+            result += local
+        return result
+
+    # Construct the expected local factors explicitly so the ordered product
+    # is tested against three dense cluster Hamiltonians.
+    h_a = onsite_sum(x)
+    h_c = onsite_sum(z)
+    h_b = np.zeros((32, 32))
+    for site in range(4):
+        factors = [identity] * 5
+        factors[site] = z
+        factors[site + 1] = z
+        local = factors[0]
+        for factor in factors[1:]:
+            local = np.kron(local, factor)
+        h_b += local
+    bases = (
+        PauliPEPOBasis.compile(1, 5, [("onsite", "X")], order=5),
+        PauliPEPOBasis.compile(1, 5, [("edge", "ZZ")], order=5),
+        PauliPEPOBasis.compile(1, 5, [("onsite", "Z")], order=5),
+    )
+    result = PEPOClusterProductExpansion.from_bases(
+        bases,
+        coefficients=(0.2, -0.3, 0.4),
+    ).exp(0.001)
+    expected = expm(0.0002 * h_a) @ expm(-0.0003 * h_b) @ expm(0.0004 * h_c)
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1e-11)
+
+
+def test_ordered_pepo_cluster_product_preserves_factor_order():
+    """PEPO factors compose as exp(A) exp(B) exp(C) in one PEPO."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+    identity = np.eye(2)
+    bases = (
+        PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("edge", "ZZ")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("onsite", "Z")], order=2),
+    )
+    expansion = PEPOClusterProductExpansion.from_bases(
+        bases,
+        coefficients=(0.2, -0.3, 0.4),
+    )
+    compiled = expansion.compile_exp()
+    assert isinstance(compiled, CompiledPEPOClusterProduct)
+
+    result = compiled.exp(0.05)
+    h_a = np.kron(x, identity) + np.kron(identity, x)
+    h_b = np.kron(z, z)
+    h_c = np.kron(z, identity) + np.kron(identity, z)
+    expected = (
+        expm(0.01 * h_a)
+        @ expm(-0.015 * h_b)
+        @ expm(0.02 * h_c)
+    )
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1e-11)
+    assert compiled.cache_info["factor_count"] == 3
+    assert compiled.cache_info["compiled_exp"]
+
+
+def test_ordered_pepo_cluster_product_keeps_torch_autodiff_graph():
+    """Joint local products preserve factor, step, and PEPO autodiff paths."""
+    torch = pytest.importorskip("torch")
+    bases = (
+        PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("edge", "ZZ")], order=2),
+    )
+    coefficients = (
+        torch.tensor(0.2, dtype=torch.float64, requires_grad=True),
+        torch.tensor(-0.3, dtype=torch.float64, requires_grad=True),
+    )
+    step = torch.tensor(0.05, dtype=torch.float64, requires_grad=True)
+    compiled = PEPOClusterProductExpansion.from_bases(
+        bases,
+        coefficients=coefficients,
+    ).compile_exp()
+    result = compiled.exp(step)
+    loss = sum(tensor.data.real.sum() for tensor in result.tensors)
+    gradients = torch.autograd.grad(loss, (*coefficients, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+
+def test_ordered_pepo_cluster_product_requires_one_joint_cluster_order():
+    """Mixed p=2/p=3 factors are rejected instead of implying two PEPO layers."""
+    bases = (
+        PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2),
+        PauliPEPOBasis.compile(1, 2, [("edge", "ZZ")], order=3),
+    )
+    with pytest.raises(ValueError, match="same joint order"):
+        PEPOClusterProductExpansion.from_bases(bases)
 
 
 def test_pauli_pepo_basis_keeps_torch_coefficient_and_time_graph():

@@ -18,6 +18,7 @@ _SVD_EPS_REL = 1.0e-6
 _QR_EPS_REL = 1.0e-6
 _REGISTERED_FUNCTIONS = {}
 _SVD_WRAPPERS = {}
+_QR_WRAPPERS = {}
 _SVD_FORWARD_OPTIONS = contextvars.ContextVar(
     "pepsy_torch_svd_forward_options",
     default=None,
@@ -69,6 +70,20 @@ def _configure_qr_rank_policy(policy="warn", rank_tol_factor=1.0):
     global _QR_RANK_TOL_FACTOR  # pylint: disable=global-statement
     _QR_RANK_POLICY = policy
     _QR_RANK_TOL_FACTOR = rank_tol_factor
+
+
+def _handle_qr_rank_policy(rank_deficient):
+    """Apply the configured response to a detected QR rank deficiency."""
+    if not bool(rank_deficient.any().item()):
+        return
+    message = (
+        "Torch QR detected a rank-deficient input; the ordinary backward "
+        "derivative is not well-conditioned."
+    )
+    if _QR_RANK_POLICY == "error":
+        raise RuntimeError(message)
+    if _QR_RANK_POLICY == "warn":
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
 def safe_inverse(x, eps_abs=1.0e-12, *, eps_rel=0.0, eps_scale=None):
@@ -189,9 +204,9 @@ def _svd_forward(
     kwargs = {"full_matrices": False}
     if A.is_cuda:
         if driver == "auto":
-            # Preserve the historical stabilized path's robust CUDA choice,
-            # while native Torch keeps its own default (currently gesvdj with
-            # a gesvd fallback in supported CUDA builds).
+            # Preserve the historical stabilized path's robust CUDA choice;
+            # the public Pepsy default passes an explicit gesvd driver, while
+            # driver="auto" intentionally retains Torch's own selection.
             if stabilized:
                 kwargs["driver"] = "gesvd"
         else:
@@ -212,6 +227,84 @@ def _configured_svd_call(function, A, *, driver, cpu_svd, fallback):
         return function.apply(A)
     finally:
         _SVD_FORWARD_OPTIONS.reset(token)
+
+
+def _validate_stabilized_svd_call(args, kwargs):
+    """Validate the thin-SVD arguments accepted by the custom Torch VJP."""
+    kwargs = dict(kwargs)
+    if len(args) > 1:
+        raise TypeError(
+            "stabilized Torch SVD accepts at most one positional option: "
+            "full_matrices"
+        )
+    if args and "full_matrices" in kwargs:
+        raise TypeError("full_matrices was passed both positionally and by keyword")
+    full_matrices = args[0] if args else kwargs.pop("full_matrices", False)
+    if full_matrices:
+        raise NotImplementedError(
+            "Pepsy's stabilized Torch SVD only supports thin SVD "
+            "(full_matrices=False)."
+        )
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            f"stabilized Torch SVD got an unexpected keyword argument {unexpected!r}"
+        )
+
+
+def _validate_reduced_qr_call(args, kwargs):
+    """Validate the reduced-QR arguments accepted by the custom Torch VJP."""
+    kwargs = dict(kwargs)
+    if len(args) > 1:
+        raise TypeError(
+            "stabilized Torch QR accepts at most one positional option: mode"
+        )
+    if args and "mode" in kwargs:
+        raise TypeError("mode was passed both positionally and by keyword")
+    mode = args[0] if args else kwargs.pop("mode", "reduced")
+    if mode != "reduced":
+        raise NotImplementedError(
+            "Pepsy's stabilized Torch QR only supports mode='reduced'."
+        )
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            f"stabilized Torch QR got an unexpected keyword argument {unexpected!r}"
+        )
+
+
+def _get_stabilized_svd_call(function_class, *, driver, cpu_svd, fallback):
+    """Build a keyword-compatible thin-SVD dispatcher for Autoray."""
+    def function(A, *args, **kwargs):
+        _validate_stabilized_svd_call(args, kwargs)
+        return _configured_svd_call(
+            function_class,
+            A,
+            driver=driver,
+            cpu_svd=cpu_svd,
+            fallback=fallback,
+        )
+
+    function.__name__ = (
+        f"{function_class.__name__}_stabilized_svd_"
+        f"{driver}_{cpu_svd}_{fallback}"
+    )
+    return function
+
+
+def _get_stabilized_qr_call(function_class):
+    """Build a keyword-compatible reduced-QR dispatcher for Autoray."""
+    cached = _QR_WRAPPERS.get(function_class)
+    if cached is not None:
+        return cached
+
+    def function(A, *args, **kwargs):
+        _validate_reduced_qr_call(args, kwargs)
+        return function_class.apply(A)
+
+    function.__name__ = f"{function_class.__name__}_stabilized_qr"
+    _QR_WRAPPERS[function_class] = function
+    return function
 
 
 class SVD(torch.autograd.Function):
@@ -360,6 +453,8 @@ class SVD_real(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
+        if A.is_complex():
+            raise TypeError("SVD_real requires a real Torch tensor.")
         options = _SVD_FORWARD_OPTIONS.get()
         if options is None:
             options = ("auto", "torch", "scipy_gesvd")
@@ -466,24 +561,25 @@ class SVD_real(torch.autograd.Function):
 
 
 class QR_real(torch.autograd.Function):
-    """Real QR with a custom full-rank backward and native rank fallback."""
+    """Real QR with a custom full-rank and rank-aware backward."""
 
     @staticmethod
     def forward(self, A):
+        if A.is_complex():
+            raise TypeError("QR_real requires a real Torch tensor.")
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
         tolerance = (
             _QR_RANK_TOL_FACTOR
-            * torch.finfo(A.dtype).eps
-            * max(A.shape[-2:])
+            * _qr_regularization_relative_eps(A.dtype)
             * scale
         )
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
         if bool(rank_deficient.any().item()):
             message = (
-                "QR_real detected a rank-deficient input; native Torch QR "
-                "backward may be ill-conditioned."
+                "QR_real detected a rank-deficient input; using the "
+                "regularized QR backward rule."
             )
             if _QR_RANK_POLICY == "error":
                 raise RuntimeError(message)
@@ -496,7 +592,9 @@ class QR_real(torch.autograd.Function):
     def backward(self, dq, dr):
         A, q, r, rank_deficient = self.saved_tensors
         if bool(rank_deficient.any().item()):
-            return _native_qr_backward(A, dq, dr)
+            if _QR_RANK_POLICY == "native":
+                return _native_qr_backward(A, dq, dr)
+            return _regularized_qr_backward(A, q, r, dq, dr, rank_deficient)
         m, _n = r.shape[-2:]
         if m == _n:
             return _simple_qr_backward(q, r, dq, dr)
@@ -534,11 +632,14 @@ class QR_real_safe(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
+        if A.is_complex():
+            raise TypeError("QR_real_safe requires a real Torch tensor.")
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
-        tolerance = _qr_regularization_relative_eps(A.dtype) * scale
+        tolerance = _QR_RANK_TOL_FACTOR * _qr_regularization_relative_eps(A.dtype) * scale
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        _handle_qr_rank_policy(rank_deficient)
         ctx.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
 
@@ -546,6 +647,8 @@ class QR_real_safe(torch.autograd.Function):
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
         if bool(rank_deficient.any().item()):
+            if _QR_RANK_POLICY == "native":
+                return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if R.shape[-1] > R.shape[-2]:
             return _native_qr_backward(A, dQ, dR)
@@ -561,8 +664,9 @@ class QR_complex_safe(torch.autograd.Function):
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
         real_dtype = A.real.dtype if A.is_complex() else A.dtype
-        tolerance = _qr_regularization_relative_eps(real_dtype) * scale
+        tolerance = _QR_RANK_TOL_FACTOR * _qr_regularization_relative_eps(real_dtype) * scale
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        _handle_qr_rank_policy(rank_deficient)
         ctx.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
 
@@ -570,6 +674,8 @@ class QR_complex_safe(torch.autograd.Function):
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
         if bool(rank_deficient.any().item()):
+            if _QR_RANK_POLICY == "native":
+                return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         return _native_qr_backward(A, dQ, dR)
 
@@ -789,26 +895,14 @@ def _get_stabilized_svd_wrapper(
         fallback=fallback,
     )
     function_class = SVD_real if mode == "real" else SVD
-    if (
-        driver == "auto"
-        and cpu_svd == "torch"
-        and fallback == "scipy_gesvd"
-    ):
-        return function_class.apply
     key = ("stabilized", mode, driver, cpu_svd, fallback)
     function = _SVD_WRAPPERS.get(key)
     if function is None:
-        def function(A):
-            return _configured_svd_call(
-                function_class,
-                A,
-                driver=driver,
-                cpu_svd=cpu_svd,
-                fallback=fallback,
-            )
-
-        function.__name__ = (
-            f"{mode}_stabilized_svd_{driver}_{cpu_svd}_{fallback}"
+        function = _get_stabilized_svd_call(
+            function_class,
+            driver=driver,
+            cpu_svd=cpu_svd,
+            fallback=fallback,
         )
         _SVD_WRAPPERS[key] = function
     return _SVD_WRAPPERS[key]
@@ -831,7 +925,7 @@ def reset_torch_linalg_registrations():
     """Restore native Torch SVD/QR mappings and clear Pepsy's cache."""
     _REGISTERED_FUNCTIONS.clear()
     _configure_qr_rank_policy()
-    reg_native_svd_torch()
+    reg_native_svd_torch(svd_driver="gesvd")
     reg_complex_qr_torch()
 
 
@@ -883,17 +977,26 @@ def reg_real_svd_torch(
 def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
     """Register real QR with a configurable rank-deficiency policy."""
     _configure_qr_rank_policy(rank_policy, rank_tol_factor)
-    _register_once("linalg.qr", QR_real.apply)
+    _register_once("linalg.qr", _get_stabilized_qr_call(QR_real))
 
 
-def reg_complex_qr_torch():
-    """Register native Torch QR for complex inputs.
+def reg_complex_qr_torch(
+    *,
+    stabilized=False,
+    rank_policy="warn",
+    rank_tol_factor=1.0,
+):
+    """Register native or rank-safe Torch QR.
 
-    The explicit :class:`QR_complex` compatibility wrapper is safe but
-    recomputes native QR during its backward pass, so Autoray uses native QR
-    directly for the faster default path.
+    The native path is the fast default. The stabilized path uses the finite
+    rank-deficient VJP and accepts the same reduced-QR keyword arguments as
+    the native Torch operation.
     """
-    _register_once("linalg.qr", torch.linalg.qr)
+    if not stabilized:
+        _register_once("linalg.qr", torch.linalg.qr)
+        return
+    _configure_qr_rank_policy(rank_policy, rank_tol_factor)
+    _register_once("linalg.qr", _get_stabilized_qr_call(QR_complex_safe))
 
 
 def reg_quimb_torch_split_drivers(
@@ -902,6 +1005,8 @@ def reg_quimb_torch_split_drivers(
     svd_driver="auto",
     cpu_svd="torch",
     svd_fallback="scipy_gesvd",
+    qr_rank_policy=None,
+    qr_rank_tol_factor=None,
 ):
     """Advanced helper for Quimb raw-block split drivers.
 
@@ -916,6 +1021,11 @@ def reg_quimb_torch_split_drivers(
     """
     if mode not in {"real", "complex"}:
         raise ValueError("mode must be 'real' or 'complex'")
+    if qr_rank_policy is not None:
+        _configure_qr_rank_policy(
+            qr_rank_policy,
+            1.0 if qr_rank_tol_factor is None else qr_rank_tol_factor,
+        )
     try:
         import quimb.tensor.decomp as qd  # pylint: disable=import-outside-toplevel
     except ImportError:  # pragma: no cover - quimb is an optional integration

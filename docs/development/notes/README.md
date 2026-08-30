@@ -22,6 +22,16 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 ## Relationship to other docs
 
 - [`../plans/project.md`](../plans/project.md) — the project roadmap.
-- [`../modules/`](../modules/) — concise implementation maps.
+- [`../modules/`](../modules/README.md) — concise implementation maps.
 - `history/` — the journal (what happened each session).
 - `docs/` — the finished, published documentation.
+
+```{toctree}
+:hidden:
+
+belief_propagation
+quimb
+symmray
+fermionic_mpo
+higher_order_mpo_benchmarks
+```

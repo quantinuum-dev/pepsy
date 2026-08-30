@@ -4,6 +4,11 @@
 higher-order MPO construction used in SciPost Phys. 17, 135. It keeps virtual
 level histories separate from the compiled Quimb MPO tensors.
 
+The public family facade is `pepsy.operators.mpo_higher_order`. Spatial MPO
+clusters and ordered multi-factor products are documented separately in
+[`mpo_cluster.md`](mpo_cluster.md); they are not another meaning of this
+paper's history `order`.
+
 For the short decision guide and canonical MPO/PEPO examples, see the
 [unified exponential API](exponentials.md). This page documents the detailed
 history, mode, compression, and execution semantics.
@@ -29,16 +34,17 @@ The API is intentionally explicit about exact versus numerical work:
   step, while `extensive_exponential()` remains the paper-level construction;
 - `compress_fixed_rank()` provides a fixed-rank TT-SVD path for autodiff,
   while keeping the history-aware and cutoff-based paths separate;
-- native Symmray compilation remains separate without changing the ordinary
-  MPO contract.
+- optional Abelian symmetry metadata compiles the same semantic object to a
+  Quimb MPO backed by native Symmray blocks without changing the ordinary MPO
+  contract.
 
-This separation keeps the first implementation compatible with current Pepsy
-MPO/MPS workflows and makes the algebra testable against dense operators before
-adding backend-specific optimizations.
+This separation keeps the implementation compatible with current Pepsy
+MPO/MPS workflows and keeps the algebra testable against dense operators while
+the block-sparse execution path uses the same semantic histories.
 
 ```python
 import numpy as np
-from pepsy.operators import FirstDegreeMPO, MPOProductTerm
+from pepsy.operators import FirstDegreeMPO, MPOLocalOperatorTerm, MPOProductTerm
 
 x = np.array([[0.0, 1.0], [1.0, 0.0]])
 z = np.diag([1.0, -1.0])
@@ -56,6 +62,15 @@ H2_exact = H2.compress_exact()
 mpo = H2_exact.to_mpo()
 print(H2_exact.compression_report)
 ```
+
+`MPOLocalOperatorTerm` is the non-factorized counterpart to
+`MPOProductTerm`. A square `d**k` by `d**k` matrix on `k` distinct sites is
+decomposed into an exact local MPO segment by fixed-rank operator-Schmidt
+SVD. The scalar coefficient stays outside that decomposition, so parameter
+gradients are preserved. Product terms may repeat a bosonic site; factors at
+that site are multiplied in their supplied order before the stable site sort.
+Charged/string-decorated product terms reject reordering or repeated support,
+where those operations would make the virtual convention ambiguous.
 
 For optimization loops, use `MPOBasis` to compile the term topology once and
 bind fresh scalar coefficients on every evaluation. `MPOParameter` references
@@ -295,16 +310,83 @@ history bonds before exact compression; `on_exceed="raise"` stops safely, while
 `on_exceed="warn"` continues with a warning.
 
 History storage is controlled independently with
-`history_storage="auto"|"dense"|"sparse"|"streaming"`. The default uses the
-cached structural-sparse path for automaton-built MPOs, and automatically
-switches to the compatibility streaming path when `cache_history=False`.
-`"sparse"` avoids evaluating structurally impossible local transition
-products and batches the remaining physical block products. In all modes the
-final local MPO tensors are materialized as dense virtual arrays because
-Algorithms 1--4 rewrite them; this is not yet MPSKit.jl-style block-sparse
-tensor storage. Metadata reports the selected mode and
-`history_storage_blocks` gives the structurally stored versus considered local
-block counts.
+`history_storage="auto"|"dense"|"sparse"|"streaming"|"block_sparse"|"reduced"`. The
+default uses the cached structural-sparse path for ordinary automaton-built
+MPOs and switches to the compatibility streaming path when
+`cache_history=False`. `"sparse"` avoids evaluating structurally impossible
+local transition products but scatters the result into dense virtual tensors.
+`"block_sparse"` instead stores a dictionary of structurally present
+operator-valued `(left, right)` blocks and keeps that representation through
+Algorithms 1--4.
+When symmetry metadata is configured, `"auto"` selects this MPSKit-style
+operator-block path.
+
+`"reduced"` is the explicit direct-reduced executor. It symbolically compiles
+the raw-to-reduced maps and Algorithm 3 insertion plan, then streams reachable
+local products into the final sparse virtual tensors. It never allocates the
+raw order-`N` virtual tensors. The structural plan is cacheable, while all
+backend values and polynomial weights are rebuilt for each call. Metadata
+reports raw/reduced block counts and
+`materialized_raw_virtual_tensors=False`. It is explicit rather than the
+`"auto"` default while larger external timing studies establish crossover
+points.
+
+Metadata reports the selected mode. `history_storage_blocks` gives the stored
+versus dense virtual-block counts before and after the history rewrites, and
+`is_block_sparse` plus `sparse_block_counts` expose the final semantic storage
+without materializing it. Reading `arrays` is an explicit dense compatibility
+operation. `to_mpo()` either materializes an ordinary Quimb MPO or, when
+symmetry is configured, assembles native Symmray sectors directly.
+
+## Native Abelian symmetry
+
+`MPOPhysicalSpace` keeps local dimension, charge sectors, fermionic intent,
+and `MPOBraiding` together as intrinsic metadata carried by copies, bound
+bases, and finite windows. The higher-order path supports neutral bosonic
+`U1`, `Z2`, `U1U1`, and
+`Z2Z2` operators with NumPy local blocks. Supply one charge per local dense
+basis state, or use a charge-to-multiplicity mapping when the basis contains
+degenerate sectors. Mapping insertion order defines the dense basis sector
+order. Label each active virtual channel through
+`MPOProductTerm.charge`:
+
+```python
+raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+lowering = raising.T
+
+H = FirstDegreeMPO.from_local_terms(
+    4,
+    [
+        MPOProductTerm((0, 3), (raising, lowering), charge=-1),
+        MPOProductTerm((0, 3), (lowering, raising), charge=+1),
+    ],
+    symmetry="U1",
+    physical_charges={0: 1, 1: 1},
+)
+U = H.exp(-1j * 0.01, order=3, mode="approximate")
+mpo = U.to_mpo()  # Quimb MPO whose tensors contain Symmray U1Array data
+```
+
+The local convention is
+`-q_left + q_right + q_upper - q_lower = 0`. Consequently a first factor that
+raises U1 charge by one opens virtual channel `-1`; its lowering partner closes
+that channel. Symmetry names are case-insensitive and may use the compact
+hyphenated spelling, e.g. `"u1-u1"`. `Z2` charges are canonicalized modulo
+two, and product symmetries use charge pairs. Equal physical charges must be
+contiguous in the supplied dense basis, matching Symmray's sector-major index
+layout; degenerate sectors can be written as `{0: 1, 1: 2, 2: 1}` instead of
+`(0, 1, 1, 2)`. `MPOProductTerm.charge` labels every active channel along
+that term's path, which covers the common neutral onsite and charged-endpoint
+interactions. For a more general charge trajectory, construct an `MPOAutomaton`
+with charge metadata on each channel and call `FirstDegreeMPO.from_automaton`.
+
+The compiler validates every nonzero local sector and raises on inconsistent
+charge metadata instead of dropping a block. At term canonicalization time,
+`MPOBraiding("fermionic")` and explicit factor parities apply the odd-odd
+exchange phase without ad hoc Jordan--Wigner signs. Graded
+`fermionic=True` higher-order output is deliberately rejected: correct
+fermionic histories still require a native sign-preserving execution path,
+not a bosonic tensor relabeled after the fact.
 
 The numerical history pass gathers local products in backend batches. Its
 virtual-channel rewiring uses fused transfer contractions for moderate
@@ -342,6 +424,17 @@ numerical approximation. Use `share_channels=False` to retain one dedicated
 channel path per term when debugging the unshared representation. The
 ordinary `from_local_terms()` constructor accepts the same Pauli strings in
 `MPOProductTerm` or mapping inputs.
+
+For a one-call construction from operator/location/coefficient records, use
+`exp_mpo(terms, step, ...)`. It accepts singular keys such as
+`{"operator": "ZZ", "location": (0, 1), "coefficient": value}` (as well as
+the plural `operators`/`locations` aliases), infers 1D/2D/3D layouts, and
+returns a Quimb MPO by default. Pass `shape=` or a configured `OneDMap` with
+`mapper=` for lattice inputs, and use `return_semantic=True` when the
+history-aware `FirstDegreeMPO` is needed. Common supports and same-site terms
+are reduced by the shared automaton, while coefficient slots remain separate
+for autodiff. The compact Pauli-word mapping is also accepted, for example
+`{"XX": (2, 3)}` or `{"XX": ((2, 3), coefficient)}`.
 
 Coefficients may be scalar tensors from an Autoray-compatible autodiff
 backend. Static Pauli matrices are promoted to that backend, so the
@@ -405,7 +498,17 @@ chosen.
 
 The current implementation targets finite open-boundary NumPy, Torch, and JAX
 Autoray-compatible local blocks, including the optimal extension path under
-Torch/JAX autodiff. A small accuracy regression benchmark compares orders
-one--three with a first-order Trotter product and a finite two-site cluster
-expansion; see `tests/test_mpo_benchmarks.py`. Native fermionic/Symmray
-compilation and infinite/unit-cell MPOs remain separate future work.
+Torch/JAX autodiff. Native Symmray output currently requires NumPy local
+blocks. A small accuracy regression benchmark compares orders one--three with
+a first-order Trotter product and a finite two-site cluster expansion; see
+`tests/test_mpo_benchmarks.py`. Graded fermionic histories remain separate
+future work.
+
+## Spatial MPO clusters are a separate family
+
+For a spatial cluster cutoff, use the dedicated
+[`MPO cluster API`](mpo_cluster.md). Its `cluster_size` is not the Taylor or
+history `order` documented on this page. The cluster API also owns the joint
+ordered construction of `exp(A) @ exp(B) @ exp(C)`, formed locally before one
+MPO topology is assembled; it is not sequential multiplication of separately
+truncated full-lattice MPO layers.

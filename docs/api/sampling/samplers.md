@@ -71,6 +71,15 @@ configs = batch.configs
 probs = batch.probs
 ```
 
+For a stabilizer tensor-network state `|psi> = C|nu>`, use
+[`MpsStabSampler`](stabilizer.md). It keeps the same batch/result shape while
+using frame-mapped Pauli projectors, so X/Y/Z product-basis sampling remains
+scalable without forming the dense physical statevector. It is a separate
+sampler from `MpsStabOptimizer`: pass an existing optimizer, or pass `(C, nu)`
+with optimizer construction options such as `chi` and `mode`. Set
+`disentangle=True` to use branch-local basis-updating measurements. The legacy
+`absorb_basis=True` keyword remains accepted as an alias.
+
 With dense Torch or CuPy MPS tensors, `backend="native"` keeps `configs` and
 `probs` on the tensor device. Use `batch.to_numpy()` to copy to CPU NumPy, or
 `batch.to_sample_result()` when the legacy list/grid `MpsSampleResult` is

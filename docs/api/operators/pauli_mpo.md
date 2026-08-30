@@ -42,6 +42,46 @@ op.partial_trace((0, 1))
 op.norm()
 ```
 
+Native operator products stay in the Pauli coefficient tensor train.  To keep
+the whole product path native, first make the operands core-backed, then
+multiply and compress the virtual bonds:
+
+```python
+left = PauliMPO.from_terms(8, [(1.0, "XX"), (0.3, "Z")]).compress_pauli(
+    max_bond=32,
+)
+right = PauliMPO.from_terms(8, [(2.0, "ZZ"), (-0.2j, "YXY")]).compress_pauli(
+    max_bond=32,
+)
+
+product = left @ right
+product, report = product.compress(
+    max_bond=32,
+    cutoff=1.0e-10,
+    return_report=True,
+)
+```
+
+For native cores with shapes ``A[l, a, p]`` and ``B[b, r, q]``, the local
+product uses the explicit Pauli structure tensor ``M[p, q, s]``:
+
+```text
+C[(l, b), (a, r), s] = sum(p, q) A[l, a, p] B[b, r, q] M[p, q, s]
+```
+
+The physical index remains the four-label ``I/X/Y/Z`` basis.  The product
+temporarily multiplies the virtual bond dimensions, and native SVD
+compression reduces those bonds without converting to a qubit MPO or
+reindexing ket/bra legs.  ``to_mpo()`` is still the explicit conversion
+boundary: it applies the local map ``P[p, upper, lower]`` and produces a
+standard Quimb MPO with two dimension-two physical legs.
+
+For a 2D contraction example, see
+`examples/pauli_mpo_trace_flat_peps.py`. It builds a four-row, vertically
+periodic flat network for ``trace(A @ B @ C @ D)`` directly from native
+PauliMPO cores. The basis map is applied locally at each site; no dense global
+operator or intermediate Quimb MPO is formed.
+
 Canonicalization combines equal Pauli words, orders them deterministically,
 and can prune small coefficients without leaving the Pauli basis:
 

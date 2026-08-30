@@ -27,8 +27,17 @@
 - `target_cutoff=0.0`: target construction cutoff.
 - `fit_target_strategy={"auto", "layered", "mps"}`: lazy exact gate layers
   for ordinary arrays versus a materialized/native-routed target MPS.
+- `fit_init_strategy={"auto", "direct", "random", "random_expand", "guess_<method>"}`:
+  disposable FIT initial guess policy, defaulting to `guess_zipup`;
+  `fit_init_seed` makes random policies reproducible without a global backend
+  RNG.
+- `fit_init_rand_strength`: scale of deterministic random initialization.
 - `fit_single_pair_fast_path=True`: one update for an adjacent active pair.
 - `cutoff`, `cutoff_mode`, `chi`: output split/truncation controls.
+- Quimb guess methods follow the native 1D registry, including `direct`, `dm`,
+  `zipup`, SDC/SRC/SRCMPS and their oversampling variants, `fit`,
+  `fit-zipup`, `fit-projector`, and `fit-oversample`. Interior nested methods
+  preserve local sub-MPO tags by disabling the inner full-chain permutation.
 - `stabilize_unitary=True`: restore raw norm after recording compression loss
   for DMRG/FIT, mixed MPO compression, and standalone MPO/swap/perm/SVD modes,
   preventing deep complex64 underflow. Sampling and stabilization are
@@ -49,13 +58,14 @@
 For local circuit compression, `MpsOptimizer` builds an exact target,
 constructs `FIT(target, p=current, range_int=[xmin, xmax], inplace=True,
 copy_target=False)`, then calls `run_gate`. Ordinary dense targets default to
-small spatially split gate tensors layered over one owned MPS copy. If an
-active block is still below its attainable chi, the optimizer also constructs
-a separate exact MPS `target_support` source. FIT uses that source only for
-local two-/three-site subspace expansion; it never installs it as `fit.p` and
-never performs a global rank-chi target warm start. This avoids intermediate
-target-MPS rank growth in the normal objective path and repeated full-state
-copies. Symmray
+small spatially split gate tensors layered over one owned MPS copy. The
+optimizer selects a disposable FIT initial state: direct current MPS,
+fixed-rank deterministic random perturbation, active-bond random expansion,
+or isolated `guess_<method>` replay (default `guess_zipup`). In `auto`, only under-capacity dense active
+bonds receive random expansion; saturated bonds use the current MPS directly.
+FIT never installs the exact target as `fit.p` and never performs a global
+target warm start. This avoids intermediate target-MPS rank growth in the
+normal objective path. Symmray
 uses its native auto-swap MPS target until graded layered targets have an
 independently validated tag/phase contract. Left/right overlap environments
 project the target onto the fixed
@@ -64,13 +74,11 @@ environments, yielding the two physical groups and two outer virtual legs.
 `Tensor.split` truncates only the middle bond and absorbs singular values in
 the sweep direction.
 
-During local expansion, FIT first performs the ordinary variational effective
-tensor and SVD. When the active bond is below its target rank and `max_bond`,
-the separate target-support factors provide the missing local Schmidt sectors,
-with the bond capped at `max_bond`. The old current state remains the FIT
-initial state, and once the bond reaches its rank ceiling subsequent sweeps are
-ordinary fixed-rank rotations/refinements. Native Symmray inputs use their
-graded local sector rules instead of dense support factors.
+During local expansion, the optimizer first prepares the selected disposable
+FIT guess, while the exact target remains unchanged. FIT then performs the
+ordinary variational effective tensor and SVD from that guess. Native FIT uses
+its graded local sector rules and chi-capped auto-swap algebra for compatible
+sector growth; it never receives dense random padding.
 
 Fresh gate sweeps build fixed environments only beyond the first active
 block. Completed block sweeps retain the minimal cumulative boundaries needed

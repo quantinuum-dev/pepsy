@@ -3,6 +3,9 @@
 This page is the short usage guide for the two higher-order exponential
 builders. The rule is simple:
 
+For the longer-term ownership map, canonical vocabulary, and staged
+refactoring roadmap, see the [operator and exponential API plan](../../development/plans/operator_api.md).
+
 > Use `exp(step, ...)` for the operator exponential. Use `compile_exp(...)`
 > when the operator topology is reused. The `step` is the scalar in
 > `exp(step * H)`; it is not automatically a physical time.
@@ -11,14 +14,17 @@ builders. The rule is simple:
 
 | Goal | Canonical entry point | Result |
 | --- | --- | --- |
+| One-off term-centric MPO | `exp_mpo(terms, step, ...)` | Compiled Quimb `MatrixProductOperator` |
 | One parameterized 1D Hamiltonian | `MPOBasis.from_pauli_terms(...)` or `MPOBasis.from_local_terms(...)` | Reusable `MPOBasis` |
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
+| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
 | Quimb MPO interoperability | `semantic_mpo.to_mpo()` | Quimb `MatrixProductOperator` |
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |
 | One PEPO exponential | `basis.exp(step, ...)` | `ActivePEPOBlocks` by default |
 | Repeated PEPO exponentials | `basis.compile_exp().exp(step, ...)` | Cached `CompiledPEPOExp` call |
+| Ordered PEPO product | `PEPOClusterProductExpansion.from_bases(...)` | One composed PEPO |
 | Dense PEPO materialization | `active_blocks.to_pepo()` or `materialize=True` | Quimb `PEPO` |
 | Coefficient-dependent real-time PEPO | `build_real_time_cluster_expansion_pepo(...)` | Quimb `PEPO` or active blocks |
 | Fractional-step PEPO composition | `compose_cluster_expansion_pepo(...)` | Quimb `PEPO` |
@@ -26,6 +32,78 @@ builders. The rule is simple:
 The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
+
+There are three distinct construction axes: SciPost higher-order MPO history,
+connected MPO cluster size, and PEPO spatial cluster order. In both cluster
+families, `exp(A) @ exp(B) @ exp(C)` is a joint local-residual expansion: the
+ordered target is formed on each small connected support and inserted into one
+MPO or PEPO topology. It is not sequential multiplication of three separately
+truncated full-lattice layers. See the [MPO cluster guide](mpo_cluster.md)
+and [PEPO cluster guide](cluster_expansion.md).
+
+## Term-centric MPO construction
+
+For the common case, callers only need to provide an operator, its support,
+and a coefficient. `exp_mpo` infers a chain length or regular 2D/3D lattice,
+maps lattice coordinates through the default snake ordering, canonicalizes
+the support of commuting local factors, and shares common MPO channels:
+
+```python
+from pepsy.operators import exp_mpo
+
+terms = [
+    {"operator": "ZZ", "location": ((0, 0), (1, 0)), "coefficient": J},
+    {"operator": "X", "location": (0, 0), "coefficient": h},
+]
+
+# Returns a Quimb MatrixProductOperator by default.
+U = exp_mpo(terms, -1j * tau, shape=(4, 4), order=4, mode="optimal")
+```
+
+`location` can also be a 1D integer site or a sequence of chain sites. In a
+2D/3D term, one coordinate is used for a one-site operator and a sequence of
+coordinates is used for a product operator. Coefficients may be Python
+numbers, Torch/JAX scalars, `MPOParameter` references, or callables supported
+by `MPOBasis`; their slots remain independent even when their structural MPO
+path is shared. Pass a configured `OneDMap` with `mapper=` when a custom
+ordering is needed. Pass `symmetry=` and `physical_charges=` to enable the
+native bosonic block-sparse compilation. Set `return_semantic=True` to keep
+the history-aware `FirstDegreeMPO` instead of materializing the Quimb MPO.
+When `chi` is requested, use `compression="fixed_rank"` (or
+`differentiable=True`) with `return_semantic=True`; ordinary Quimb compression
+cannot preserve the higher-order history metadata.
+Terms carrying charge or string-operator metadata must list their support
+sites in increasing chain order so canonicalization cannot change their
+virtual path convention.
+
+An operator string or operator sequence describes a factorized product. To
+compile a genuinely entangled local operator, pass its full square matrix on
+two or more sites; Pepsy performs an exact operator-Schmidt decomposition and
+inserts the resulting local MPO segment without densifying the full chain:
+
+```python
+from pepsy.operators import MPOLocalOperatorTerm, MPOBasis
+
+basis = MPOBasis.from_local_terms(
+    6,
+    [MPOLocalOperatorTerm((1, 2, 4), local_eight_by_eight, coefficient=g)],
+)
+```
+
+Site labels are strict integers: Boolean and fractional values are rejected.
+For bosonic product terms, repeated sites are multiplied in the supplied local
+order before site sorting. Compact Pauli input keeps the corresponding phase,
+for example `X @ Y = 1j * Z`.
+
+The compact Pauli mapping used elsewhere in Pepsy is accepted directly:
+
+```python
+terms = {"XX": (2, 3)}                    # coefficient defaults to 1
+terms = {"XX": ((2, 3), J)}               # explicit coefficient
+terms = {"xyz": (((0, 0), (1, 0), (0, 1)), J)}
+```
+
+The number of Pauli labels must match the number of supplied sites.
 
 ## MPO: parameterized chain
 
@@ -70,6 +148,39 @@ U = basis.exp(-1j * tau, coefficients=theta, order=4, mode="optimal")
 is resolved through `MPOParameter("name")` references; a coefficient vector
 must have exactly `basis.num_terms` entries.
 
+For a square-lattice Hamiltonian that should be executed as an MPO, use the
+coordinate-aware compiler. It maps coordinates to a reusable 1D ordering with
+`OneDMap`, canonicalizes reversed location/Pauli descriptions, and retains
+the same autodiff coefficient path:
+
+```python
+basis = MPOBasis.from_square_lattice(
+    4,
+    4,
+    [
+        {
+            "locations": ((0, 0), (1, 0)),
+            "paulis": "ZZ",
+            "parameter": "J",
+        },
+        {
+            "locations": ((0, 0),),
+            "paulis": "X",
+            "parameter": "h",
+        },
+    ],
+)
+compiled = basis.compile_exp(order=4, mode="optimal")
+U = compiled.exp(-1j * tau, {"J": J, "h": h})
+```
+
+The default traversal is snake order; pass `map_mode=` or a configured
+`OneDMap` to choose another ordering. Similar and duplicate terms share the
+compiled MPO channel structure while retaining separate coefficient slots, so
+independent autodiff parameters are summed on the shared path at build time.
+If the desired output is a PEPO with local
+square-lattice virtual legs rather than an MPO, use `PauliPEPOBasis` instead.
+
 ### Repeated MPO evaluations
 
 Compile the order/mode policy once when only coefficients or `step` change:
@@ -110,6 +221,20 @@ custom operator: step = any backend scalar
 final numerical MPO compression cap. With `chi=None`, the result remains a
 semantic `FirstDegreeMPO`; with `chi` set, the default result is a Quimb MPO.
 Use `differentiable=True` with `chi` for fixed-rank autodiff compression.
+
+Set `history_storage="reduced"` to stream local products directly into the
+post-Algorithms-1/2 virtual space. This route supports all four modes,
+preserves Torch/JAX coefficient and step gradients, and reports
+`materialized_raw_virtual_tensors=False` in
+`result.metadata["history_storage_blocks"]`. The default `"auto"` policy
+remains unchanged so storage selection does not change silently.
+
+Use one `MPOPhysicalSpace` when dimension, Abelian charges, and braiding need
+to travel together. `MPOProductTerm(..., braiding="fermionic", parities=...)`
+applies one minus sign for each odd-odd crossing during canonical site order.
+This is construction-time graded ordering; native fermionic higher-order
+history execution remains intentionally unsupported until its sector-aware
+sign path is complete.
 
 ## PEPO: fixed Pauli channels on a square lattice
 
@@ -158,9 +283,12 @@ to calling `.to_pepo()` for a single evaluation.
 autodiff and memory-saving result; dense PEPO tensors should be materialized
 only when required by downstream code or a small-system validation.
 
-The fixed Pauli implementation currently supports tree orders 1–4. It does
-not perform PEPO × PEPS contractions, expectation values, loop-cluster
-corrections, or symmetry-native block-space calculations.
+The fixed Pauli implementation supports connected orders 1–9. Orders 1–4
+use compact fixed Pauli channels; orders 5–9 use cached translated-shape
+residuals and backend-native spanning-tree SVD channels. It does not perform
+PEPO × PEPS contractions, expectation values, or symmetry-native block-space
+calculations. For memory-controlled p≥5 runs, pass `max_tree_rank` to the
+`PauliPEPOBasis` constructor; `None` retains exact local tree ranks.
 
 ## Dense cluster-expansion convenience API
 
@@ -176,7 +304,7 @@ pepo = active.to_pepo()
 `ClusterExpansionReport` contains local residual and storage diagnostics. Its
 residual norms are local factorization diagnostics, not a global PEPO error
 bound. The dense implementation includes recursive generic order-five
-through order-nine tree paths; higher orders remain unsupported. Finite dense
+through order-nine tree paths; orders above nine remain unsupported. Finite dense
 model adapters are available through `ClusterModelAdapter` and
 `build_model_cluster_expansion_pepo`.
 
@@ -206,6 +334,12 @@ evolution workflows.
   compiled term topology intact.
 - `to_mpo()` and `to_pepo()` are explicit interoperability/materialization
   boundaries; neither is needed to construct the exponential itself.
+
+When an API returns a detailed construction or compression report, use
+`report.api_info` for cross-family logging. It provides the stable
+`family`/`algorithm`/`representation` vocabulary plus `order`,
+`factor_count`, `truncated`, and `differentiable`; the concrete report retains
+the algorithm-specific residual, rank, cutoff, and error fields.
 
 ## Compatibility names
 

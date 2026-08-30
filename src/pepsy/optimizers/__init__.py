@@ -50,8 +50,14 @@ _SYMBOL_MODULES = {
     "TreeOptimizer": ".tree",
     "TreePlan": ".tree",
     "build_tree_operator": ".tree",
-    "tree_mpo": ".tree",
     "square_lattice_zigzag": "._layout_orders",
+    "TreePeps": ".tree_peps",
+    "TreePepsPlan": ".tree_peps",
+    "TreePepsGeometry": ".tree_peps",
+    "TreePepsLayoutFinder": ".tree_peps",
+    "TreePepo": ".tree_peps",
+    "TreeSubPepo": ".tree_peps",
+    "TreePepsOptimizer": ".tree_peps",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",
     "CoalescedMeasurementRecord": ".noise",
@@ -133,6 +139,7 @@ _SUBMODULES = (
     "sym_dmrg",
     "sweep",
     "tree",
+    "tree_peps",
     "tree_stabilizer",
 )
 

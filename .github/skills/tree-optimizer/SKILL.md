@@ -63,12 +63,16 @@ to `TreeOptimizer`.
 - All live state tensors must use one backend, dtype, and device.
   `backend_info()` reports this. Reject a mixed state at construction or
   `set_tn`, rather than choosing an arbitrary execution backend.
-- Callers should convert every gate/operator/sub-MPO/observable/cap vector with
-  the same backend converter as the state. Explicit array mismatches are
-  coerced for compatibility with a one-time `UserWarning` per source/target
-  signature; untyped Python lists/scalars are convenience inputs and are
-  materialized silently. Internal Pauli, projector, reset, and tree-MPO helper
-  tensors must be built on the state backend without warning.
+- Callers must prepare every gate/operator/sub-MPO/TreeMPO payload with the
+  same backend and device as the state. Non-NumPy payloads must also use the
+  state dtype for direct contractions; dense NumPy-to-NumPy dtype promotion is
+  compatible. The complete user gate stream is checked
+  once at construction, `set_gates`, `add_gates`, or state replacement; every
+  gate and every operator tensor is checked, and a mismatch raises a
+  location-specific `TypeError` before replay. Replay does not rescan or cast
+  accepted payloads. Use `TreeOptimizer.to_backend(...)` for explicit
+  preparation. Internal Pauli, projector, reset, and generated TreeMPO helper
+  tensors may still convert explicitly without warning.
 - Backend-aware contractions must stay in Autoray/Quimb. Convert only scalar
   readouts intentionally (`to_float`); `to_dense()` intentionally returns a
   host NumPy vector for interoperability while the live TTN remains native.
@@ -404,8 +408,9 @@ oversubscription), ``profile=False``, and ``track_truncation=False`` (no
 diagnostic spectrum SVDs). The low-level
 ``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
 used by ``TreeOptimizer``. A ``track_truncation=True`` warning is intentional:
-it identifies the extra diagnostic work; backend conversion warnings and
-legacy-mode deprecations are the other actionable warning classes.
+it identifies the extra diagnostic work; explicit stream backend/device
+mismatches and incompatible non-NumPy dtypes are errors, and legacy mode
+selectors are the other actionable warning class.
 
 Dense and native trees share the direct one-edge contraction, immutable path
 cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the

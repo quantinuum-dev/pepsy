@@ -1,8 +1,17 @@
 # Higher-order MPO
 
-`pepsy.operators.mpo` contains the semantic MPO layer for the size-extensive
-higher-order construction in SciPost Phys. 17, 135. The implementation keeps
-the paper's virtual-level histories alongside ordinary local MPO tensors.
+`pepsy.operators.mpo_higher_order` is the public family facade for the
+size-extensive higher-order construction in SciPost Phys. 17, 135. The
+implementation keeps the paper's virtual-level histories alongside ordinary
+local MPO tensors. The semantic history implementation lives in
+`pepsy.operators.mpo_semantic`; parameterized bases and compiled evaluators
+are implemented in `pepsy.operators.mpo_basis`.
+
+This page covers only the paper-style higher-order MPO exponential. Connected
+spatial MPO clusters and ordered products of several exponentials belong to
+`pepsy.operators.mpo_product`, where `cluster_size` and `factor_count` have
+different meanings from history `order`. The historical
+`pepsy.operators.mpo_cluster` path is a compatibility facade.
 
 ## Public API contract
 
@@ -10,15 +19,18 @@ the paper's virtual-level histories alongside ordinary local MPO tensors.
 | --- | --- | --- |
 | `MPOBasis` / `MPOParameter` | Reuse a parameterized term topology | Structural cache only; each bind creates fresh backend-connected local blocks |
 | `MPOBasis.compile_exp` / `CompiledMPOExp` | Reuse coefficient-slot and higher-order execution plans | Value-only evaluator; static banks are cached, coefficient-dependent arrays and autodiff graphs are fresh |
-| `MPOProductTerm` | Describe a factorized local product term | Matrix operators or compact Pauli labels; `charge` is preserved but not interpreted |
+| `MPOProductTerm` | Describe a factorized local product term | Matrix operators or compact Pauli labels; `charge` labels active virtual sectors when symmetry is configured |
+| `MPOLocalOperatorTerm` | Describe an arbitrary multi-site local matrix | Exact fixed-rank operator-Schmidt decomposition; coefficient remains a separate differentiable slot |
+| `MPOPhysicalSpace` / `MPOBraiding` | Carry local sectors and exchange semantics | Backend-neutral immutable metadata; explicit odd-factor parities determine graded sorting signs |
 | `FirstDegreeMPO.from_local_terms` / `.from_pauli_terms` | Build a first-degree Hamiltonian-like MPO | Exact local automaton construction with optional channel sharing; no dense operator |
 | `FirstDegreeMPO.product`, `power`, `commutator` | Exact semantic algebra | Returns new objects and retains all virtual paths |
 | `FirstDegreeMPO.extensive_exponential` | Apply the paper's Algorithms 1--4 | Local tensor construction; direct Algorithm 3; named `mode` and temporary `max_bond` guard |
+| `MPOBasis.compile_cluster_expansion` / `compile_graph_cluster_expansion` | Compatibility adapters to the MPO cluster family | Delegate to `operators.mpo_product`; they do not turn a spatial cluster order into a history order |
 | `FirstDegreeMPO.exp` / `MPOBasis.exp` | Build `exp(step * H)` with an explicit scalar step | `chi` is a post-construction MPO cap; real-time uses `step=-1j * tau`; `differentiable=True` selects fixed-rank TT-SVD |
 | `FirstDegreeMPO.clear_history_cache` / `MPOBasis.clear_history_cache` | Release reusable higher-order plans | Keeps current tensors and compiled first-degree topology unchanged |
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
 | `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
-| `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator` |
+| `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator`, optionally backed by native Symmray blocks |
 | `FirstDegreeMPO.compress_numerical` | Apply explicit numerical policy | Delegates SVD/QR to Quimb and returns a separate truncation report |
 | `apply_to_mps`, `expectation` | Execute through tensor-network consumers | Delegates to Quimb/Pepsy contraction APIs and does not densify |
 
@@ -68,8 +80,8 @@ optimization steps. For ordinary static local operators it compiles each
 site into an affine bias/operator bank and evaluates that bank with one
 backend contraction per site. Backend-native operators and oversized banks
 retain the grouped scatter fallback. This avoids rebuilding the semantic
-automaton and first-degree wrapper per call; the remaining dense virtual
-history arrays are still materialized by Algorithms 1--4.
+automaton and first-degree wrapper per call. Algorithms 1--4 then use the
+selected dense, structural-sparse, or persistent block-sparse history policy.
 `compile_evolution()` and `CompiledMPOEvolution` remain compatibility names for
 older callers.
 
@@ -103,13 +115,29 @@ temporary edge states and leaves an ordinary open-boundary MPO.
 The reachable-history table can still grow exponentially with the Taylor order
 and local MPO bond dimension, although no global dense matrix is formed. The
 raw topology and local gather metadata are reusable across parameter bindings
-and time steps. History block products are gathered in backend batches rather than
-dispatched once per virtual pair. `history_storage="sparse"` additionally
-skips structurally invalid local transition products; automaton-built cached
-calls select that path automatically, while `cache_history=False` retains the
-compatibility streaming default. The current implementation still
-materializes dense virtual arrays for the in-place Algorithm 1--4 passes; a
-true block-sparse history tensor is a separate future optimization.
+and time steps. History block products are gathered in backend batches rather
+than dispatched once per virtual pair. `history_storage="sparse"` skips
+structurally invalid local transition products before scattering into dense
+virtual tensors. `history_storage="block_sparse"` stores structurally present
+operator-valued virtual entries and applies Algorithms 1--4 as sparse row and
+column transforms. Symmetry-configured calls select this path automatically;
+ordinary cached automaton calls retain the existing structural-sparse default,
+and ordinary `cache_history=False` calls retain the compatibility streaming
+default unless block-sparse storage is requested explicitly.
+
+The explicit `history_storage="reduced"` executor compiles Algorithms 1--2 as
+raw-axis maps, folds Algorithm 3 into those maps, and scatters numerical local
+products directly into final sparse virtual tensors. Its cached plan contains
+only integer indices and scalar combinatorics. It therefore avoids raw virtual
+tensor materialization without retaining backend values or autodiff graphs.
+
+The private `SparseVirtualTensor` representation is not a public tensor API.
+It is an execution detail behind `FirstDegreeMPO`: reading `arrays` materializes
+dense virtual tensors, while `to_mpo()` directly groups charge-compatible
+entries into Symmray sectors. Virtual history charges are recursively combined
+under MPO products, so Algorithms 1--4 may permute and merge histories without
+losing the total Abelian sector. Compilation validates
+`-q_left + q_right + q_upper - q_lower = 0` for every nonzero local block.
 
 The one-site path now evaluates an arbitrary-order local Taylor polynomial.
 With `extend=True` or `mode="optimal"`, it evaluates one additional local
@@ -140,24 +168,31 @@ semantic wrapper for autodiff but marks `history_valid=False`.
   finite reverse-mode derivatives; it intentionally clears semantic history
   validity after the numerical sweep.
 - Finite Torch and JAX paths use functional tensor updates, so Algorithm 3
-  remains compatible with reverse-mode autodiff and JIT tracing. Fermionic/
-  Symmray compilation is not enabled by this workstream; `charge` and
-  `string_operators` preserve construction metadata for a future native
-  backend without claiming that it is already supported.
+  remains compatible with reverse-mode autodiff and JIT tracing. Native
+  Symmray compilation supports neutral bosonic `U1`, `Z2`, `U1U1`, and
+  `Z2Z2` MPOs with NumPy local blocks. Symmetry names are normalized
+  case-insensitively, and `physical_charges` accepts either one charge per
+  basis state or an insertion-ordered charge-to-multiplicity mapping.
+  `MPOBraiding` already supplies explicit canonicalization signs for odd
+  factors; graded fermionic higher-order execution remains disabled until the
+  history engine itself carries that sign protocol natively.
 - Public algebraic operations are non-mutating. Mutation is available only
   through the named `inplace=True` compression option.
 
 ## Future implementation improvements
 
 The dense execution path now uses cached gather metadata, grouped coefficient
-contractions, fused virtual transfer maps, and raw tensor/batch interfaces for
-JAX/Torch compilation. The next larger optimization is a direct reduced
-Taylor automaton that avoids materializing the full order-N history tensor
-before Algorithms 1--4. Native fermionic/Symmray block-sparse compilation
-and larger external timing studies remain separate work. The maintained
+contractions, fused virtual transfer maps, raw tensor/batch interfaces for
+JAX/Torch compilation, and an explicit direct-reduced history executor.
+Native backend blocks for Torch/JAX Symmray, graded fermionic histories,
+sector-aware Schmidt decomposition for charged general local matrices,
+automatic inference of multi-stage term charges, and automatic storage-policy
+crossover selection remain separate work. The maintained
 small-system accuracy regression in `tests/test_mpo_benchmarks.py` compares
 the finite MPO orders with first-order Trotter and a p=2 two-site cluster
 baseline; it is deliberately not a timing harness.
+The external timing/memory harness is maintained at
+`../pepsy_examples/higher_order_mpo/benchmark.py`.
 
 These are implementation layers, not reasons to widen the current public API.
 The existing semantic and Quimb boundaries should remain stable while they are

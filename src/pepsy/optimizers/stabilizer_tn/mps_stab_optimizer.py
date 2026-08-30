@@ -61,12 +61,25 @@ import quimb.tensor as qtn
 
 from ...backends import (
     backend_infer,
+    backend_signatures_compatible,
     infer_backend_converter_from_sample,
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ..._internal.random import backend_random_array
+from .._fidelity import (
+    fidelity_from_log,
+    infidelity_from_log,
+    log_fidelity_from_norms,
+)
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
+    _MPO_COMPRESSION_METHODS,
+    _MPO_METHODS_IGNORE_CUTOFF,
+    _MPO_METHODS_NEED_INTERIOR_WORKAROUND,
+    _MPO_METHODS_USE_SEED,
+    _apply_submpo_with_interior_workaround,
+    _run_seeded_quimb,
     _resolve_conditional,
     conditional_event_parts,
     is_submpo_event,
@@ -80,7 +93,12 @@ from .operators import (
     single_qubit_combo_matrix,
     single_qubit_rotation_matrix,
 )
-from .paulis import hermitian_pauli_terms, pauli_string
+from .dense import _as_gate_matrix, _is_unitary, _tableau_from_exact_unitary
+from .paulis import (
+    _resolve_measurement_disentangle,
+    hermitian_pauli_terms,
+    pauli_string,
+)
 from .records import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -93,7 +111,9 @@ from .records import (
     StabilizerMpsRunResult,
     StreamAnalysisRecord,
 )
-from .settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
+from .settings import (
+    DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS,
+)
 from .stn_state import STNState, _tableau_gate_stream, _validate_bits
 
 __all__ = [
@@ -123,6 +143,39 @@ _RESET_AXIS_ALIASES = {"reset_x": "X", "reset_y": "Y", "reset_z": "Z"}
 _MR_ALIASES = {"measure_reset", "mr", "mreset", "measure_and_reset"}
 _MR_AXIS_ALIASES = {"mrx": "X", "mry": "Y", "mrz": "Z"}
 _MAX_PAULI_SUM_SUBMPO_TERMS = 4
+_FIT_INIT_STRATEGIES = frozenset(
+    {"auto", "direct", "random", "random_expand", "svd_guess"}
+    | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
+)
+
+_TABLEAU_ANSI = {
+    "header": "1;36",
+    "section": "1;35",
+    "destabilizer": "32",
+    "stabilizer": "33",
+    "muted": "2",
+}
+
+
+def _tableau_color(text, style, enabled):
+    """Apply one small ANSI style used by the compact tableau display."""
+    if not enabled:
+        return str(text)
+    return f"\033[{_TABLEAU_ANSI[style]}m{text}\033[0m"
+
+
+def _format_tableau_pauli(pauli, *, compact=True):
+    """Format a Stim Pauli string densely or by its non-identity support."""
+    text = str(pauli)
+    if not compact:
+        return text
+    sign, body = text[0], text[1:]
+    support = [
+        f"{axis}@{site}"
+        for site, axis in enumerate(body)
+        if axis != "_"
+    ]
+    return sign + ("I" if not support else " ".join(support))
 
 # Single-qubit Clifford matrices used to localize a signed Pauli string onto one
 # qubit for the basis-updating measurement (H, S-dagger, CNOT).
@@ -159,6 +212,40 @@ def _normalize_sites(where):
     return sites
 
 
+def _normalize_measurement_order(order, *, count, targets=None):
+    """Normalize a batch measurement order without touching the MPS."""
+    if isinstance(order, str) or order is None:
+        key = "min_span" if order is None else _normalize_event_name(order)
+        if key in {"auto", "span", "min_span", "shortest"}:
+            return "min_span"
+        if key in {"input", "given", "original"}:
+            return "input"
+        raise ValueError(
+            "measurement order must be 'min_span', 'input', or an explicit "
+            "permutation of the batch entries."
+        )
+    try:
+        requested = tuple(int(index) for index in order)
+    except TypeError as exc:
+        raise TypeError(
+            "measurement order must be a supported string or an entry permutation."
+        ) from exc
+    if len(requested) != int(count) or len(set(requested)) != int(count):
+        raise ValueError(
+            "an explicit measurement order must be a permutation of the batch."
+        )
+    if set(requested) == set(range(int(count))):
+        return requested
+    if targets is not None and len(set(targets)) == int(count):
+        target_to_index = {int(target): index for index, target in enumerate(targets)}
+        if set(requested) == set(target_to_index):
+            return tuple(target_to_index[target] for target in requested)
+    raise ValueError(
+        "an explicit measurement order must contain batch indices or each "
+        "target qubit exactly once."
+    )
+
+
 def _unique_ordered(items):
     """Return items with duplicates removed while preserving first occurrence."""
     seen = set()
@@ -178,6 +265,74 @@ def _layout_angle_weight(theta):
     except (TypeError, ValueError):
         return 1.0
     return min(1.0, max(0.0, angle)) if np.isfinite(angle) else 1.0
+
+
+def _operator_schmidt_tail_weight(theta):
+    """Return the non-leading Schmidt-weight fraction of a Pauli rotation.
+
+    A Pauli rotation has two operator-Schmidt branches, ``I`` and ``P``.
+    The returned value is zero for a product operator and reaches one half
+    for the maximally balanced two-branch case.  The layout event keeps a
+    unit baseline separately so weak rotations still contribute locality
+    pressure while strongly operator-entangling rotations receive priority.
+    """
+    try:
+        theta = float(theta)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(theta):
+        return 0.0
+    weights = np.asarray(
+        [np.cos(theta / 2.0) ** 2, np.sin(theta / 2.0) ** 2],
+        dtype=float,
+    )
+    total = float(weights.sum())
+    if total <= 0.0:
+        return 0.0
+    return float((total - weights.max()) / total)
+
+
+def _dense_operator_schmidt_layout_weight(gate, n_qubits):
+    """Return a baseline-plus-tail weight for a small dense operator.
+
+    The two-qubit case is evaluated exactly from the operator-Schmidt
+    singular values. Wider matrices retain the unit baseline and are handled
+    by their frame supports, avoiding a potentially large dense reshape in
+    the static layout pre-pass.
+    """
+    if int(n_qubits) != 2:
+        return 1.0
+    try:
+        array = np.asarray(ar.to_numpy(gate))
+        if array.shape != (4, 4):
+            return 1.0
+        reshaped = array.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3)
+        singular_values = np.linalg.svd(
+            reshaped.reshape(4, 4),
+            compute_uv=False,
+        )
+        weights = np.abs(singular_values) ** 2
+        total = float(weights.sum())
+        if total <= 0.0:
+            return 1.0
+        tail = (total - float(weights.max())) / total
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        return 1.0
+    return 1.0 + float(tail)
+
+
+def _submpo_operator_layout_weight(mpo):
+    """Return an MPO-bond-rank proxy for a coefficient-frame sub-MPO."""
+    try:
+        max_bond = int(mpo.max_bond())
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+    if max_bond < 1:
+        return 1.0
+    # A bond-two Pauli-rotation MPO has one unit of operator cut load. Wider
+    # MPOs receive proportionally more priority in the weighted interaction
+    # graph, while rank-one operators retain the locality baseline.
+    return max(1.0, float(np.log2(max_bond)))
 
 
 def _is_axis_string(value):
@@ -259,7 +414,7 @@ def _parse_measure_reset_args(params, *, default_axis=None):
         basis = params[0]
         where = _normalize_sites(params[1])
         outcome = params[2] if len(params) > 2 else None
-        absorb = bool(params[3]) if len(params) > 3 else True
+        absorb = bool(params[3]) if len(params) > 3 else False
         if len(params) > 4:
             raise ValueError('"measure_reset" accepts at most four arguments.')
     else:
@@ -452,18 +607,12 @@ class MpsStabOptimizer:
         ``cap`` contracts the dense physical state and rebuilds an identity-frame
         coefficient MPS, so this guard keeps the exponential fallback explicit.
         ``None`` opts out of the guard.
-    track_infidelity : bool
-        Legacy compatibility switch. Norm/infidelity diagnostics are enabled by
-        default and follow the same automatic ledger as ``MpsOptimizer``.
-        Passing ``False`` retains the old opt-out behavior for existing callers;
-        new code should omit this argument.
-        The normalized initial coefficient state is not renormalized during
-        unitary evolution, so this is a cheap cumulative norm-loss proxy read
-        from the canonical centre. Compressing a dense multi-qubit non-unitary
-        matrix also records its retained norm relative to the local
-        ``G^dagger G`` target norm. Projective measurement/reset boundaries
-        additionally snapshot the current segment norm in :attr:`norm_events`
-        before normalizing the selected branch.
+    stabilize_unitary : bool
+        If ``False`` (default), retain the raw norm loss after each unitary
+        compression so it remains visible in the live coefficient MPS. If
+        ``True``, restore the pre-compression working norm after recording the
+        same local and cumulative compression fidelities. Stabilization changes
+        only the live scale; it never erases the diagnostic ledger.
     exact_cooling : bool
         If ``True`` (default), recognize the constructive exact-cooling case
         before a multi-site Pauli rotation. A usable separable stabilizer site
@@ -494,14 +643,37 @@ class MpsStabOptimizer:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
-    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "exact"}
-        Compression backend for coefficient-MPS updates. ``"mpo"`` preserves
-        the native stabilizer-MPO path and is the default. The DMRG modes use
-        local FIT on the coefficient target, while ``"svd"``, ``"swap"``, and
-        ``"perm"`` use the native MPS compression path for the already
-        factorized coefficient-frame MPO. ``"exact"`` forces ``chi=None`` and
-        keeps the coefficient MPS lossless up to ``cutoff``. Clifford gates
-        remain tableau-only in every mode.
+    mode : {"direct", "dm", "zipup", "src", "fit-*", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "swap", "perm", "exact"}
+        Compression backend for coefficient-MPS updates. Native compression
+        names are used directly, for example ``"direct"``, ``"zipup"``, or
+        ``"src"``; the ``"*-first"`` and ``"*-oversample"`` variants are
+        available as well. The DMRG modes use local FIT on the coefficient
+        target; ``fit_init_strategy`` controls their disposable initial guess.
+        On dense backends, DMRG retains the exact coefficient sub-MPO as a
+        tagged lazy FIT target layer after canonicalizing the active MPS window;
+        Symmray and fermionic routes use the materialized backend-safe target.
+        Historical ``"quimb-*"`` and ``"mpo-*"`` spellings remain accepted as
+        deprecated aliases.
+        ``"svd"``, ``"swap"``, and ``"perm"`` remain compatibility aliases
+        for the historical direct coefficient-MPO path. ``"exact"`` forces
+        ``chi=None`` and keeps the coefficient MPS lossless up to ``cutoff``.
+        Clifford gates remain tableau-only in every mode.
+    fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}
+        Disposable FIT initialization for dense DMRG windows. The default
+        ``"guess-src"`` selects the SRC warm-up before active bonds reach their
+        attainable ``chi`` ceilings and continues to prepare the fixed-rank
+        one-site phase after expansion. ``"auto"`` resolves to the same
+        ``"guess-src"`` policy.
+        ``"guess_<method>"`` remains accepted as a compatibility spelling;
+        ``"svd_guess"`` is an alias for ``"guess-direct"``. Native Symmray
+        and fermionic paths retain their direct sector-aware initialization.
+    fit_init_rand_strength : float
+        Perturbation strength for ``"random"`` and ``"random_expand"``.
+    fit_init_seed : int
+        Deterministic seed for randomized FIT guesses.
+    compression_seed : int | None
+        Seed forwarded to randomized native compression methods. This is kept
+        separate from ``seed``, which controls STN measurement sampling.
 
     Attributes
     ----------
@@ -552,12 +724,12 @@ class MpsStabOptimizer:
         cutoff: float = 1e-12,
         operator_tol: Optional[float] = None,
         max_pauli_decomposition_qubits: Optional[int] = (
-            DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
+            DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS
         ),
         max_pauli_terms: Optional[int] = 256,
         max_dense_cap_qubits: Optional[int] = 10,
-        track_infidelity: bool = True,
         exact_cooling: bool = True,
+        stabilize_unitary: bool = False,
         seed: Optional[int] = None,
         dtype: str = "complex128",
         to_backend=None,
@@ -565,7 +737,11 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
-        mode: str = "mpo",
+        mode: str = "direct",
+        fit_init_strategy: str = "guess-src",
+        fit_init_rand_strength: float = 1.0e-1,
+        fit_init_seed: int = 0,
+        compression_seed: Optional[int] = None,
     ):
         if isinstance(state, STNState):
             self.state = state if inplace else state.copy()
@@ -588,6 +764,38 @@ class MpsStabOptimizer:
         self.chi = None if chi is None else int(chi)
         if self.mode == "exact":
             self.chi = None
+        self.fit_init_strategy = self._normalize_fit_init_strategy(
+            fit_init_strategy
+        )
+        try:
+            self.fit_init_rand_strength = float(fit_init_rand_strength)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            ) from exc
+        if (
+            not np.isfinite(self.fit_init_rand_strength)
+            or self.fit_init_rand_strength < 0.0
+        ):
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            )
+        if isinstance(fit_init_seed, bool) or not isinstance(fit_init_seed, Integral):
+            raise ValueError("fit_init_seed must be a non-negative integer.")
+        self.fit_init_seed = int(fit_init_seed)
+        if self.fit_init_seed < 0:
+            raise ValueError("fit_init_seed must be a non-negative integer.")
+        if compression_seed is not None:
+            if isinstance(compression_seed, bool) or not isinstance(
+                compression_seed, Integral
+            ):
+                raise ValueError("compression_seed must be a non-negative integer or None.")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError(
+                    "compression_seed must be a non-negative integer or None."
+                )
+        self.compression_seed = compression_seed
         self.cutoff = float(cutoff)
         if operator_tol is not None:
             operator_tol = float(operator_tol)
@@ -635,10 +843,11 @@ class MpsStabOptimizer:
                     f"got {max_dense_cap_qubits}."
                 )
         self.max_dense_cap_qubits = max_dense_cap_qubits
-        self.track_infidelity = bool(track_infidelity)
         self.exact_cooling = bool(exact_cooling)
-        self._norm_infidelity_valid = True
-        self._current_norm_infidelity = 0.0 if self.track_infidelity else None
+        self.stabilize_unitary = bool(stabilize_unitary)
+        self._infidelity_valid = True
+        self._current_infidelity = 0.0
+        self._compression_segment_log_survival = 0.0
         self._norm_segment_open = False
         self._norm_log_survival = 0.0
         self.dtype = self.state.dtype
@@ -647,6 +856,7 @@ class MpsStabOptimizer:
         self._logical_to_mps = {q: q for q in self.logical_order}
         self.layout_plan = None
         self.last_layout_plan = None
+        self.last_measurement_schedule = ()
 
         self.to_backend = to_backend
         self._explicit_backend_converter = to_backend
@@ -657,19 +867,28 @@ class MpsStabOptimizer:
         self._clifford_rot_cache: dict = {}
         self._localizer_cache: dict = {}
         if to_backend is not None:
-            # Place the coefficient MPS |nu> on the requested backend; gate/MPO
-            # arrays are converted on the fly by the _bk* helpers below.
+            # Place the coefficient MPS |nu> on the requested backend. User
+            # stream gates/MPOs must be prepared explicitly; _bk* conversion
+            # remains for internal generated operators and dtype alignment.
             self.state.p.apply_to_arrays(to_backend)
-        self.backend_info()
+        if self._backend_signature is None:
+            self.backend_info()
 
         self._queue: List[object] = []
         self._gate_stream = ()
         self._trajectory_plan = None
         self._has_trajectory_events = False
         self._last_run_timing = None
+        self._last_fit_diagnostics = None
+        self._dmrg1_one_site_locked = False
         self._quality_checks: list[dict] = []
         self.infidelities: List[float] = []
         self._nonunitary_infidelities: List[float] = []
+        # Per-update norm ratios are separate from projective boundary events.
+        # ``norm_events`` remains the historical boundary ledger; this list
+        # makes the ordinary-MPS local-vs-cumulative API available for every
+        # compressed unitary coefficient update as well.
+        self._compression_norm_events: List[dict] = []
         self.norm_events: List[NormEventRecord] = []
         self.bond_history: List[int] = [self.state.max_bond()]
         self.exact_cooling_events: List[dict] = []
@@ -701,8 +920,19 @@ class MpsStabOptimizer:
     # Initial-state constructors (product / GHZ / user tableau+MPS)
     # ------------------------------------------------------------------ #
     _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
+    _CANONICAL_MPO_MODES = frozenset(_MPO_COMPRESSION_METHODS)
+    _LEGACY_MODE_NAMES = frozenset({"quimb", "mpo"})
+    _LEGACY_MODE_PREFIXES = ("quimb-", "mpo-")
     _ALLOWED_MODES = frozenset(
-        _DMRG_MODES | {"mpo", "svd", "swap", "perm", "exact"}
+        _DMRG_MODES
+        | _CANONICAL_MPO_MODES
+        | {"svd", "swap", "perm", "exact"}
+        | _LEGACY_MODE_NAMES
+        | {
+            f"{prefix}{method}"
+            for prefix in _LEGACY_MODE_PREFIXES
+            for method in _MPO_COMPRESSION_METHODS
+        }
     )
 
     @classmethod
@@ -712,9 +942,76 @@ class MpsStabOptimizer:
         if mode == "fit":
             mode = "dmrg"
         if mode not in cls._ALLOWED_MODES:
-            allowed = ", ".join(sorted(cls._ALLOWED_MODES))
-            raise ValueError(f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}.")
+            allowed = (
+                "a native method such as direct, zipup, or src; "
+                "dmrg*, svd, swap, perm, or exact"
+            )
+            raise ValueError(
+                f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}."
+            )
+        if mode in cls._LEGACY_MODE_NAMES or mode.startswith(cls._LEGACY_MODE_PREFIXES):
+            warnings.warn(
+                f"mode={mode!r} is deprecated; use the bare native compression "
+                "method name (for example mode='src' or mode='direct').",
+                DeprecationWarning,
+                stacklevel=3,
+            )
         return mode
+
+    @classmethod
+    def _is_quimb_mode(cls, mode):
+        """Return whether ``mode`` selects native Quimb compression."""
+        mode = str(mode).strip().lower()
+        return (
+            mode in cls._CANONICAL_MPO_MODES
+            or mode in cls._LEGACY_MODE_NAMES
+            or mode.startswith(cls._LEGACY_MODE_PREFIXES)
+        )
+
+    @classmethod
+    def _mode_quimb_method(cls, mode):
+        """Return the Quimb compression method encoded by ``mode``."""
+        mode = str(mode).strip().lower()
+        if mode in cls._CANONICAL_MPO_MODES:
+            return mode
+        if mode in cls._LEGACY_MODE_NAMES:
+            return "direct"
+        for prefix in cls._LEGACY_MODE_PREFIXES:
+            if mode.startswith(prefix):
+                return cls._normalize_quimb_method(mode[len(prefix) :])
+        return "direct"
+
+    @classmethod
+    def _normalize_quimb_method(cls, method):
+        """Validate and normalize a native Quimb compression method."""
+        method = str(method).strip().lower()
+        if method not in _MPO_COMPRESSION_METHODS:
+            allowed = ", ".join(sorted(_MPO_COMPRESSION_METHODS))
+            raise ValueError(f"Unknown Quimb compression method {method!r}; choose one of {allowed}.")
+        return method
+
+    @classmethod
+    def _normalize_fit_init_strategy(cls, strategy):
+        """Validate and normalize the disposable DMRG FIT initialization."""
+        strategy = str(strategy).strip().lower()
+        if strategy.startswith("guess-"):
+            strategy = "guess_" + strategy[len("guess-") :]
+        if strategy not in _FIT_INIT_STRATEGIES:
+            allowed = "auto, direct, random, random_expand, guess-<method>"
+            raise ValueError(
+                "fit_init_strategy must be one of "
+                f"{allowed}; got {strategy!r}."
+            )
+        return strategy
+
+    @staticmethod
+    def _resolved_fit_init_strategy(strategy):
+        """Resolve strategy aliases to the canonical FIT warm-start policy."""
+        if strategy == "auto":
+            return "guess_src"
+        if strategy == "svd_guess":
+            return "guess_direct"
+        return strategy
 
     @classmethod
     def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
@@ -779,7 +1076,11 @@ class MpsStabOptimizer:
 
         # Local imports keep Stim optional and avoid coupling the STN core to
         # the generic trajectory module during ordinary construction.
-        from ..noise import compile_stim_circuit, sample_stim_circuit
+        from ..noise import (
+            _stream_on_optimizer_backend,
+            compile_stim_circuit,
+            sample_stim_circuit,
+        )
 
         plan = compile_stim_circuit(circuit)
         sample = sample_stim_circuit(plan, seed=seed)
@@ -788,7 +1089,10 @@ class MpsStabOptimizer:
             if stream_transform is None
             else stream_transform(sample.gate_stream)
         )
-        optimizer = cls(plan.num_qubits, gates=gates, seed=seed, **kwargs)
+        # Stim emits NumPy matrices. Convert this library-generated stream once
+        # before it crosses the strict user-stream boundary.
+        optimizer = cls(plan.num_qubits, seed=seed, **kwargs)
+        optimizer.set_gates(_stream_on_optimizer_backend(gates, optimizer))
         optimizer.stim_plan = plan
         optimizer.stim_sample = sample
         return optimizer
@@ -829,12 +1133,87 @@ class MpsStabOptimizer:
         )
 
         plan = compile_trajectory_stream(tuple(entries))
+        self._validate_gate_stream_backend(plan.entries)
         self._trajectory_plan = plan
         self._gate_stream = tuple(plan.entries)
         self._has_trajectory_events = bool(
             plan.has_trajectory_events or plan.has_leakage
         )
         self._queue = list(plan.entries)
+
+    def _validate_gate_stream_backend(self, entries, *, path_prefix="stream"):
+        """Require user matrix and MPO entries to match the live MPS backend.
+
+        The check runs once while a compiled stream is installed. Stateful
+        trajectory and leakage entries are intentionally skipped: the shared
+        runner selects their matrix outcomes and prepares those generated
+        payloads on the optimizer backend before installing the replay stream.
+        """
+        from ..noise import TrajectoryEvent, _leakage_event_parts
+
+        if self._backend_signature is None:
+            self.backend_info()
+        target_signature = self._backend_signature
+        mismatches = []
+
+        def check_entry(entry, path):
+            if isinstance(entry, TrajectoryEvent) or _leakage_event_parts(entry):
+                return
+
+            conditional = conditional_event_parts(entry)
+            if conditional is not None:
+                action = conditional[1]["action"]
+                check_entry(action, f"{path}.action")
+                return
+
+            submpo = submpo_event_parts(entry, normalize_where=True)
+            if submpo is not None:
+                mpo, _where = submpo
+                for tensor_index, tensor in enumerate(
+                    getattr(mpo, "tensors", ())
+                ):
+                    source_signature = infer_backend_signature(tensor.data)
+                    if not backend_signatures_compatible(
+                        source_signature, target_signature
+                    ):
+                        mismatches.append(
+                            (
+                                f"{path}.tensor[{tensor_index}]",
+                                "sub-MPO",
+                                source_signature,
+                            )
+                        )
+                return
+
+            if (
+                isinstance(entry, (tuple, list))
+                and len(entry) == 2
+                and not isinstance(entry[0], str)
+            ):
+                source_signature = infer_backend_signature(entry[0])
+                if not backend_signatures_compatible(
+                    source_signature, target_signature
+                ):
+                    mismatches.append((path, "gate", source_signature))
+
+        for index, entry in enumerate(entries):
+            check_entry(entry, f"{path_prefix}[{index}]")
+
+        if not mismatches:
+            return
+        details = "; ".join(
+            f"{path} ({kind}) has {source!r}"
+            for path, kind, source in mismatches[:8]
+        )
+        if len(mismatches) > 8:
+            details += f"; ... and {len(mismatches) - 8} more"
+        raise TypeError(
+            "MpsStabOptimizer requires every gate and sub-MPO payload to "
+            f"match the coefficient-MPS backend/device and required dtype "
+            f"{target_signature!r} "
+            f"before use; {details}. Prepare each payload explicitly with "
+            "the live backend converter before passing it to the gate stream."
+        )
 
     def gate_stream(self):
         """Return the immutable, compiled stream owned by this optimizer."""
@@ -861,9 +1240,17 @@ class MpsStabOptimizer:
         return is_submpo_event(entry)
 
     @staticmethod
-    def measure_event(pauli, where, outcome=None, absorb_basis=None):
+    def measure_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
         """Build a canonical Pauli-measurement event shared with MPS."""
         where = _normalize_sites(where)
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=False,
+            )
         entry = ("measure", str(pauli), where)
         if absorb_basis is None:
             if outcome is not None:
@@ -895,11 +1282,19 @@ class MpsStabOptimizer:
         return ("reset", where, "".join(axes))
 
     @staticmethod
-    def measure_reset_event(pauli, where, outcome=None, absorb_basis=None):
+    def measure_reset_event(
+        pauli, where, outcome=None, absorb_basis=None, *, disentangle=None
+    ):
         """Build a canonical measure-then-reset event."""
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis,
+                disentangle,
+                default=False,
+            )
         entry = ("measure_reset", "".join(axes), where)
         value = None if outcome is None else (
             outcomes[0] if len(outcomes) == 1 else outcomes
@@ -1102,24 +1497,23 @@ class MpsStabOptimizer:
         if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
             return "opaque"
         try:
-            gate = np.asarray(ar.to_numpy(entry[0]), dtype=complex)
-        except (TypeError, ValueError):
+            where = _normalize_sites(entry[1])
+            gate = _as_gate_matrix(entry[0], len(where))
+        except (TypeError, ValueError, IndexError):
             return "opaque"
         if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
             return "opaque"
         dim = gate.shape[0]
         nq = int(round(math.log2(dim))) if dim > 0 else -1
-        if nq < 0 or 2 ** nq != dim:
+        if nq < 0 or 2 ** nq != dim or len(where) != nq:
             return "opaque"
-        if not np.allclose(gate.conj().T @ gate, np.eye(dim), atol=1e-6):
+        if not _is_unitary(gate):
             return "nonunitary_matrix"
         try:
-            import stim
-
-            stim.Tableau.from_unitary_matrix(gate, endian="big")
-        except (ImportError, IndexError, TypeError, ValueError, RuntimeError):
+            is_clifford = _tableau_from_exact_unitary(gate) is not None
+        except ImportError:
             return "nonclifford_matrix"
-        return "clifford_matrix"
+        return "clifford_matrix" if is_clifford else "nonclifford_matrix"
 
     @classmethod
     def _analysis_entry_kind(cls, entry) -> str:
@@ -1409,25 +1803,32 @@ class MpsStabOptimizer:
             if len(entry) != 2:
                 return "opaque"
             try:
-                gate = np.asarray(ar.to_numpy(entry[0]), dtype=complex)
+                if cls._injectable_rz(entry) is not None:
+                    return "injectable"
+                where = _normalize_sites(entry[1])
+                gate = _as_gate_matrix(entry[0], len(where))
                 dim = gate.shape[0]
                 nq = int(round(math.log2(dim)))
                 if (
                     gate.ndim != 2
                     or gate.shape != (dim, dim)
+                    or len(where) != nq
                     or 2 ** nq != dim
                     or nq > 2
-                    or not np.allclose(
-                        gate.conj().T @ gate, np.eye(dim), atol=1e-6
-                    )
+                    or not _is_unitary(gate)
                 ):
                     return "opaque"
-                import stim
-
-                stim.Tableau.from_unitary_matrix(gate, endian="big")
             except (ImportError, IndexError, TypeError, ValueError, RuntimeError):
                 return "nonclifford"
-            return "clifford"
+            try:
+                is_clifford = _tableau_from_exact_unitary(gate) is not None
+            except ImportError:
+                return "nonclifford"
+            return (
+                "clifford"
+                if is_clifford
+                else "nonclifford"
+            )
 
         name = _normalize_event_name(entry[0])
         if name in _CLIFFORD_NAMES:
@@ -1636,12 +2037,11 @@ class MpsStabOptimizer:
         settings = {
             "chi": None,
             "cutoff": 1e-12,
-            "track_infidelity": False,
             "exact_cooling": True,
+            "stabilize_unitary": False,
         }
         if normalized_goal != "validate" and nonclifford_pressure:
             settings["chi"] = 64
-            settings["track_infidelity"] = True
         if (
             mode in {"direct", "immediate", "deferred"}
             and normalized_goal != "validate"
@@ -1819,15 +2219,23 @@ class MpsStabOptimizer:
         nevergrad_optimizer="OnePlusOne",
         kahypar_config_path=None,
         kahypar_seed=0,
-        weight_mode="count",
+        weight_mode="operator_schmidt",
     ):
         """Find a static MPS order from the queued STN frame supports.
 
         The pre-pass replays only tableau-changing events on a temporary copy.
         Each expensive coefficient-frame event contributes the support of its
-        current ``C^dagger O C`` image.  The returned plan is a Pepsy-style
-        layout plan whose ``site_order`` maps MPS positions to logical
-        coefficient qubits.  It does not mutate the simulator.
+        current ``C^dagger O C`` image.  By default, multi-site events are
+        weighted by a baseline locality cost plus an operator-Schmidt
+        entanglement proxy, so stronger two-branch rotations and wider
+        coefficient-frame operators receive more layout priority.  The
+        returned plan is a Pepsy-style layout plan whose ``site_order`` maps
+        MPS positions to logical coefficient qubits.  It does not mutate the
+        simulator.
+
+        ``weight_mode`` accepts ``"operator_schmidt"`` (the default),
+        ``"count"`` for the historical uniform weighting, and ``"angle"`` /
+        ``"auto"`` for angle-based weighting.
         """
         records = self._frame_layout_records(
             self._queue,
@@ -1867,14 +2275,15 @@ class MpsStabOptimizer:
 
     find_frame_layout = current_frame_layout
 
-    def _frame_layout_records(self, entries, *, weight_mode="count"):
+    def _frame_layout_records(self, entries, *, weight_mode="operator_schmidt"):
         """Return weighted logical frame-support records for a stream."""
         mode = str(weight_mode).replace("-", "_").strip().lower()
         if mode in ("unit", "uniform", "none"):
             mode = "count"
-        if mode not in ("count", "angle", "auto"):
+        if mode not in ("count", "angle", "auto", "operator_schmidt"):
             raise ValueError(
-                "STN frame layout weight_mode must be 'count', 'angle', or 'auto'."
+                "STN frame layout weight_mode must be 'operator_schmidt', "
+                "'count', 'angle', or 'auto'."
             )
         dry = self.copy()
         dry._queue = []
@@ -1883,8 +2292,37 @@ class MpsStabOptimizer:
             dry._frame_layout_trace_entry(entry, records, weight_mode=mode)
         return tuple(records)
 
-    def _frame_layout_weight(self, *, weight_mode, theta=None, coeff=None):
+    def _frame_layout_weight(
+        self,
+        *,
+        weight_mode,
+        theta=None,
+        coeff=None,
+        support_size=None,
+        operator_weight=None,
+    ):
         """Return the scalar weight used for one frame-layout record."""
+        if weight_mode == "operator_schmidt":
+            if operator_weight is not None:
+                amplitude = 1.0
+                if coeff is not None:
+                    try:
+                        amplitude = max(abs(complex(coeff)), 1.0e-12)
+                    except (TypeError, ValueError):
+                        amplitude = 1.0
+                return max(1.0e-12, float(operator_weight) * amplitude)
+            if theta is not None:
+                if support_size is not None and int(support_size) < 2:
+                    return 1.0
+                # Keep a unit locality baseline and add the non-leading
+                # operator-Schmidt weight of the I/P rotation branches.
+                return 1.0 + _operator_schmidt_tail_weight(theta)
+            if coeff is not None:
+                try:
+                    return max(abs(complex(coeff)), 1.0e-12)
+                except (TypeError, ValueError):
+                    return 1.0
+            return 1.0
         if coeff is not None:
             try:
                 return float(abs(complex(coeff)))
@@ -1916,12 +2354,14 @@ class MpsStabOptimizer:
                 weight = self._frame_layout_weight(
                     weight_mode=weight_mode,
                     theta=theta,
+                    support_size=len(support),
                 )
             records.append({
                 "kind": kind,
                 "entry": entry,
                 "support": support,
                 "weight": float(weight),
+                "operator_weight": float(weight),
                 "absorbs_basis": bool(absorb_basis),
             })
         if absorb_basis and support:
@@ -1943,20 +2383,24 @@ class MpsStabOptimizer:
         terms, _sign = hermitian_pauli_terms(m_pauli)
         support = tuple(sorted(terms))
         if support:
+            weight = self._frame_layout_weight(
+                weight_mode=weight_mode,
+                theta=theta,
+                support_size=len(support),
+            )
             records.append({
                 "kind": "rotation",
                 "entry": entry,
                 "support": support,
-                "weight": self._frame_layout_weight(
-                    weight_mode=weight_mode,
-                    theta=theta,
-                ),
+                "weight": float(weight),
+                "operator_weight": float(weight),
                 "absorbs_basis": False,
             })
 
     def _frame_layout_trace_matrix(self, gate, where, records, *, entry, weight_mode):
         """Trace an explicit physical matrix entry for layout."""
         where = _normalize_sites(where)
+        gate = _as_gate_matrix(gate, len(where))
         dim = gate.shape[0]
         nq = int(round(math.log2(dim)))
         if 2 ** nq != dim or gate.shape != (dim, dim):
@@ -1964,15 +2408,14 @@ class MpsStabOptimizer:
         if len(where) != nq:
             raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
 
-        import stim
+        dense_operator_weight = (
+            _dense_operator_schmidt_layout_weight(gate, nq)
+            if weight_mode == "operator_schmidt"
+            else None
+        )
 
-        tableau = None
+        tableau = _tableau_from_exact_unitary(gate)
         gate_is_unitary = _is_unitary(gate)
-        if gate_is_unitary:
-            try:
-                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-            except (ValueError, RuntimeError):
-                tableau = None
         if tableau is not None:
             self.state.do_tableau(tableau, where)
             return
@@ -2013,13 +2456,20 @@ class MpsStabOptimizer:
             frame_terms, _sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
             support = tuple(sorted(frame_terms))
             if support:
+                weight = self._frame_layout_weight(
+                    weight_mode=weight_mode,
+                    coeff=coeff,
+                    operator_weight=dense_operator_weight,
+                )
                 records.append({
                     "kind": "matrix_branch",
                     "entry": entry,
                     "support": support,
-                    "weight": self._frame_layout_weight(
-                        weight_mode=weight_mode,
-                        coeff=coeff,
+                    "weight": float(weight),
+                    "operator_weight": (
+                        float(dense_operator_weight)
+                        if dense_operator_weight is not None
+                        else float(weight)
                     ),
                     "absorbs_basis": False,
                 })
@@ -2035,14 +2485,20 @@ class MpsStabOptimizer:
             )
         parts = submpo_event_parts(entry, normalize_where=True)
         if parts is not None:
-            _mpo, where = parts
+            mpo, where = parts
             support = tuple(sorted(_unique_ordered(where)))
             if support:
+                weight = (
+                    _submpo_operator_layout_weight(mpo)
+                    if weight_mode == "operator_schmidt"
+                    else 1.0
+                )
                 records.append({
                     "kind": "submpo",
                     "entry": entry,
                     "support": support,
-                    "weight": 1.0,
+                    "weight": float(weight),
+                    "operator_weight": float(weight),
                     "absorbs_basis": False,
                 })
             return
@@ -2391,8 +2847,12 @@ class MpsStabOptimizer:
                 max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
                 max_pauli_terms=self.max_pauli_terms,
                 max_dense_cap_qubits=self.max_dense_cap_qubits,
-                track_infidelity=self.track_infidelity,
                 exact_cooling=self.exact_cooling,
+                stabilize_unitary=self.stabilize_unitary,
+                fit_init_strategy=self.fit_init_strategy,
+                fit_init_rand_strength=self.fit_init_rand_strength,
+                fit_init_seed=self.fit_init_seed,
+                compression_seed=self.compression_seed,
                 dtype=self.dtype,
                 to_backend=self.to_backend,
                 inplace=True,
@@ -2600,10 +3060,14 @@ class MpsStabOptimizer:
             "state": self.state.copy(),
             "infidelities": list(self.infidelities),
             "nonunitary_infidelities": list(self._nonunitary_infidelities),
+            "compression_norm_events": deepcopy(self._compression_norm_events),
             "norm_events": deepcopy(self.norm_events),
             "norm_log_survival": self._norm_log_survival,
-            "norm_infidelity_valid": self._norm_infidelity_valid,
-            "current_norm_infidelity": self._current_norm_infidelity,
+            "compression_segment_log_survival": (
+                self._compression_segment_log_survival
+            ),
+            "infidelity_valid": self._infidelity_valid,
+            "current_infidelity": self._current_infidelity,
             "norm_segment_open": self._norm_segment_open,
             "bond_history": list(self.bond_history),
             "exact_cooling_events": deepcopy(self.exact_cooling_events),
@@ -2620,6 +3084,8 @@ class MpsStabOptimizer:
             "layout_plan": deepcopy(self.layout_plan),
             "last_layout_plan": deepcopy(self.last_layout_plan),
             "rng_state": rng_state,
+            "last_fit_diagnostics": deepcopy(self._last_fit_diagnostics),
+            "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
         }
 
     def _restore_execution_snapshot(self, snapshot) -> None:
@@ -2627,10 +3093,16 @@ class MpsStabOptimizer:
         self.state = snapshot["state"]
         self.infidelities = list(snapshot["infidelities"])
         self._nonunitary_infidelities = list(snapshot["nonunitary_infidelities"])
+        self._compression_norm_events = deepcopy(
+            snapshot["compression_norm_events"]
+        )
         self.norm_events = deepcopy(snapshot["norm_events"])
         self._norm_log_survival = snapshot["norm_log_survival"]
-        self._norm_infidelity_valid = snapshot["norm_infidelity_valid"]
-        self._current_norm_infidelity = snapshot["current_norm_infidelity"]
+        self._compression_segment_log_survival = snapshot[
+            "compression_segment_log_survival"
+        ]
+        self._infidelity_valid = snapshot["infidelity_valid"]
+        self._current_infidelity = snapshot["current_infidelity"]
         self._norm_segment_open = snapshot["norm_segment_open"]
         self.bond_history = list(snapshot["bond_history"])
         self.exact_cooling_events = deepcopy(snapshot["exact_cooling_events"])
@@ -2651,6 +3123,8 @@ class MpsStabOptimizer:
         self._refresh_layout_map()
         self.layout_plan = deepcopy(snapshot["layout_plan"])
         self.last_layout_plan = deepcopy(snapshot["last_layout_plan"])
+        self._last_fit_diagnostics = deepcopy(snapshot["last_fit_diagnostics"])
+        self._dmrg1_one_site_locked = bool(snapshot["dmrg1_one_site_locked"])
         self._rng.bit_generator.state = deepcopy(snapshot["rng_state"])
         self.backend_info()
 
@@ -2695,8 +3169,7 @@ class MpsStabOptimizer:
         ----------
         progbar : bool
             Show a ``tqdm`` progress bar reporting the current stream part and
-            the MPS-compatible ``infidelity`` diagnostic. The legacy
-            ``norm_infidelity`` key is emitted alongside it.
+            the MPS-compatible ``infidelity`` diagnostic.
         shots, error_model, strategy, ...
             Shot/noise options matching :meth:`MpsOptimizer.run`. They use the
             shared trajectory runner and return :class:`pepsy.NoisyResult`.
@@ -2803,7 +3276,6 @@ class MpsStabOptimizer:
                     pbar.set_postfix(
                         part=part,
                         infidelity=formatted_infidelity,
-                        norm_infidelity=formatted_infidelity,
                     )
         except BaseException:
             if snapshot is not None:
@@ -2853,6 +3325,16 @@ class MpsStabOptimizer:
             for event in self.norm_events
         ]
 
+    def get_compression_norm_events(self):
+        """Return per-update retained-norm compression events.
+
+        These are intentionally separate from :meth:`get_norm_events`, whose
+        records mark projective/Kraus normalization boundaries. Each event
+        here contains both the local ratio for the update and the cumulative
+        ratio within the current boundary-aware ledger.
+        """
+        return deepcopy(self._compression_norm_events)
+
     def get_normalizations(self):
         """Return explicit normalization records.
 
@@ -2867,8 +3349,8 @@ class MpsStabOptimizer:
         return deepcopy(self._quality_checks)
 
     def get_fit_diagnostics(self):
-        """Return ``None`` because STN replay has no variational FIT stage."""
-        return None
+        """Return diagnostics for the most recent STN DMRG/FIT update."""
+        return deepcopy(self._last_fit_diagnostics)
 
     def get_run_timing(self):
         """Return the most recent replay timing record."""
@@ -2920,20 +3402,22 @@ class MpsStabOptimizer:
 
         Parameters
         ----------
-        mode : {"exact", "mpo", "dmrg"}, default="exact"
+        mode : {"exact", "direct", "zipup", "src", "fit-*", "dmrg"}, default="exact"
             ``"exact"`` applies the tableau circuit with unlimited bond and
-            zero cutoff. ``"mpo"`` applies it with ordinary MPS gate
-            compression, while ``"dmrg"`` uses the ordinary MPS variational
-            replay path. The latter two require ``chi``.
+            zero cutoff. Native MPS compression methods use their bare names,
+            matching the ordinary MPS optimizer; ``"dmrg"`` uses its
+            variational replay path. Approximate modes require ``chi``.
+            Historical ``"quimb-*"`` and ``"mpo-*"`` forms remain accepted as
+            deprecated aliases.
         chi : int or None
             Maximum bond dimension for the approximate modes.
         cutoff : float, default=0.0
-            Singular-value cutoff for ``"mpo"`` and ``"dmrg"``. It is
+            Singular-value cutoff for native compression modes and ``"dmrg"``. It is
             intentionally ignored by the lossless ``"exact"`` path.
         cutoff_mode : str, default="rsum2"
             Cutoff convention for the approximate modes.
         n_iter : int, default=5
-            DMRG replay sweeps. Ignored by ``"exact"`` and ``"mpo"``.
+            DMRG replay sweeps. Ignored by ``"exact"`` and native non-DMRG modes.
         logical_order : bool, default=True
             Return sites in logical qubit order. If false, preserve the
             coefficient MPS's current physical layout and map tableau gates
@@ -2942,7 +3426,7 @@ class MpsStabOptimizer:
             Show the ordinary MPS progress bar for approximate modes.
         **run_kwargs
             Additional keyword arguments forwarded to
-            :meth:`pepsy.MpsOptimizer.run` in ``"mpo"`` and ``"dmrg"`` mode.
+            :meth:`pepsy.MpsOptimizer.run` in native and ``"dmrg"`` modes.
 
         Returns
         -------
@@ -2950,8 +3434,13 @@ class MpsStabOptimizer:
             A new ordinary MPS. The STN optimizer is never mutated.
         """
         mode = str(mode).strip().lower()
-        if mode not in {"exact", "mpo", "dmrg"}:
-            raise ValueError("mode must be one of 'exact', 'mpo', or 'dmrg'.")
+        from ..mps.optimizer import MpsOptimizer  # pylint: disable=import-outside-toplevel
+
+        if mode != "exact" and mode not in MpsOptimizer._ALLOWED_MODES:
+            raise ValueError(
+                "mode must be 'exact', 'dmrg', or one of the ordinary MPS "
+                "compression modes."
+            )
         if not isinstance(logical_order, (bool, np.bool_)):
             raise TypeError("logical_order must be a boolean.")
         cutoff = float(cutoff)
@@ -3007,8 +3496,6 @@ class MpsStabOptimizer:
                     )
             return p
 
-        from ..mps.optimizer import MpsOptimizer  # pylint: disable=import-outside-toplevel
-
         options = dict(run_kwargs)
         options.setdefault("n_iter", n_iter)
         options.setdefault("progbar", progbar)
@@ -3029,6 +3516,145 @@ class MpsStabOptimizer:
     def to_physical_mps(self, *args, **kwargs):
         """Compatibility alias for :meth:`to_mps`."""
         return self.to_mps(*args, **kwargs)
+
+    def tableau(self):
+        """Return a read-only snapshot of the live basis Clifford tableau.
+
+        The returned :class:`stim.Tableau` represents ``C`` in the STN
+        factorization ``|psi> = C |nu>``.  Use ``x_output(i)`` and
+        ``z_output(i)`` to inspect destabilizer and stabilizer generators.
+        """
+        return self.state.tableau()
+
+    def ascii_tableau(
+        self,
+        *,
+        compact=True,
+        color=False,
+        generators=True,
+        max_generators=None,
+        diagnostics=True,
+    ):
+        """Return a compact, Pepsy-style text view of the STN tableau.
+
+        Parameters
+        ----------
+        compact : bool, default=True
+            Show Pauli generators by non-identity support, e.g. ``+X@0 Z@3``.
+            Set to ``False`` for Stim's full-width strings such as ``+X__Z``.
+        color : bool, default=False
+            Add ANSI colour styles to the returned text.
+        generators : bool, default=True
+            Include the destabilizer/stabilizer generator rows.
+        max_generators : int or None, default=None
+            Limit the number of generator rows shown.  The header and MPS
+            summary are still emitted when this is used for large systems.
+        diagnostics : bool, default=True
+            Include the coefficient-MPS bond, norm, mode, and queue summary.
+
+        Notes
+        -----
+        This method only reads the Stim tableau and MPS metadata.  It never
+        constructs the dense Clifford matrix and does not mutate the state.
+        """
+        if max_generators is not None:
+            if isinstance(max_generators, bool) or not isinstance(max_generators, Integral):
+                raise TypeError("max_generators must be a non-negative integer or None.")
+            max_generators = int(max_generators)
+            if max_generators < 0:
+                raise ValueError("max_generators must be non-negative or None.")
+
+        tableau = self.tableau()
+        frame = "I" if self.state.is_identity_frame() else "active"
+        chi = "inf" if self.chi is None else str(self.chi)
+        header = (
+            "STN  |psi> = C |nu>"
+            f"   n={self.n}   frame={frame}"
+            f"   max_bond={self.state.max_bond()}   chi={chi}"
+        )
+        lines = [_tableau_color(header, "header", color)]
+
+        if diagnostics:
+            norm = self.norm()
+            lines.append(
+                "  "
+                f"mode={self.mode}   norm={norm:.6g}"
+                f"   queued={len(self._queue)}"
+                f"   recorded_steps={max(0, len(self.bond_history) - 1)}"
+            )
+
+        if generators:
+            lines.append(_tableau_color("tableau generators:", "section", color))
+            count = self.n if max_generators is None else min(self.n, max_generators)
+            for q in range(count):
+                destabilizer = _format_tableau_pauli(
+                    tableau.x_output(q), compact=compact
+                )
+                stabilizer = _format_tableau_pauli(
+                    tableau.z_output(q), compact=compact
+                )
+                d_label = _tableau_color(f"d{q}", "destabilizer", color)
+                s_label = _tableau_color(f"s{q}", "stabilizer", color)
+                lines.append(
+                    f"  {d_label}: {destabilizer}   {s_label}: {stabilizer}"
+                )
+            if count < self.n:
+                omitted = self.n - count
+                lines.append(
+                    _tableau_color(
+                        f"  ... {omitted} generator row(s) omitted",
+                        "muted",
+                        color,
+                    )
+                )
+
+        return "\n".join(lines)
+
+    def show(
+        self,
+        *,
+        compact=True,
+        generators=True,
+        max_generators=None,
+        diagnostics=True,
+        color=True,
+    ):
+        """Print the compact STN tableau view.
+
+        This follows Pepsy's ``TreeTensorNetwork.show`` convention: the
+        corresponding ``ascii_tableau`` method returns the drawing as text,
+        while ``show`` prints it and returns ``None``.
+        """
+        print(
+            self.ascii_tableau(
+                compact=compact,
+                color=color,
+                generators=generators,
+                max_generators=max_generators,
+                diagnostics=diagnostics,
+            )
+        )
+
+    def draw(self, *, format="timeline-text"):
+        """Return a Stim circuit diagram for the current tableau.
+
+        ``format="timeline-text"`` is the dependency-free text diagram.
+        Stim's other diagram formats, including ``"timeline-svg"``, are
+        forwarded unchanged.  ``format="circuit"`` returns the underlying
+        :class:`stim.Circuit` instead of rendering it.
+
+        The circuit is a decomposition of the Clifford ``C`` only; it does
+        not include the coefficient-MPS state ``|nu>`` or non-Clifford events.
+        """
+        circuit = self.tableau().to_circuit()
+        normalized = str(format).strip().lower()
+        if normalized in {"circuit", "stim"}:
+            return circuit
+        diagram = circuit.diagram(normalized)
+        # Stim returns a display helper for every diagram format.  Make the
+        # dependency-free text form directly useful with string operations;
+        # keep richer formats (SVG, matching, ...) as their native helpers.
+        return str(diagram) if normalized == "timeline-text" else diagram
 
     def amplitude(self, bits) -> complex:
         """Amplitude ``<bits|psi>`` for a bitstring (str ``'010'`` or 0/1 seq).
@@ -3070,26 +3696,119 @@ class MpsStabOptimizer:
             return nrm * nrm * (10.0 ** (2.0 * exponent))
         return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
 
-    def _unitary_norm_infidelity(self) -> Optional[float]:
+    def _unitary_infidelity(self) -> Optional[float]:
         """Return cumulative unitary norm loss from the canonical centre."""
-        if not self.track_infidelity or not self._norm_infidelity_valid:
+        if not self._infidelity_valid:
             return None
 
         self._canonize_p_single()
         infidelity = min(1.0, max(0.0, 1.0 - self._norm_squared()))
-        self._current_norm_infidelity = infidelity
+        if not self._norm_segment_open:
+            self._current_infidelity = infidelity
         return infidelity
 
-    def _invalidate_norm_infidelity(self) -> None:
+    def _record_compression_norm_event(
+        self,
+        before_norm_sq: Optional[float],
+        after_infidelity: Optional[float],
+        *,
+        kind: str = "unitary_compression",
+    ) -> None:
+        """Record one local retained-norm ratio for a compressed update."""
+        if (
+            before_norm_sq is None
+            or after_infidelity is None
+            or not np.isfinite(before_norm_sq)
+            or before_norm_sq <= 0.0
+        ):
+            return
+        observed_norm_sq = min(1.0, max(0.0, 1.0 - float(after_infidelity)))
+        raw = float(np.divide(observed_norm_sq, float(before_norm_sq)))
+        local_log_fidelity = log_fidelity_from_norms(
+            observed_norm_sq ** 0.5,
+            float(before_norm_sq) ** 0.5,
+        )
+        local_fidelity = min(1.0, max(0.0, fidelity_from_log(local_log_fidelity)))
+        local_infidelity = float(1.0 - local_fidelity)
+        if local_fidelity == 0.0 or self._compression_segment_log_survival == -math.inf:
+            self._compression_segment_log_survival = -math.inf
+        else:
+            self._compression_segment_log_survival += math.log(local_fidelity)
+        segment_log_fidelity = self._compression_segment_log_survival
+        cumulative_log_fidelity = (
+            -math.inf
+            if segment_log_fidelity == -math.inf
+            else self._norm_log_survival + segment_log_fidelity
+        )
+        segment_fidelity = fidelity_from_log(segment_log_fidelity)
+        cumulative_fidelity = fidelity_from_log(cumulative_log_fidelity)
+        cumulative_infidelity = infidelity_from_log(cumulative_log_fidelity)
+        self._current_infidelity = infidelity_from_log(segment_log_fidelity)
+        self._norm_segment_open = True
+        self._compression_norm_events.append({
+            "step": len(self._compression_norm_events) + 1,
+            "kind": str(kind),
+            "valid": True,
+            "expected_norm": float(max(0.0, before_norm_sq) ** 0.5),
+            "observed_norm": float(observed_norm_sq ** 0.5),
+            "fidelity_raw": float(raw),
+            "local_fidelity": local_fidelity,
+            "local_infidelity": local_infidelity,
+            "segment_fidelity": float(segment_fidelity),
+            "segment_infidelity": infidelity_from_log(segment_log_fidelity),
+            "cumulative_fidelity": float(cumulative_fidelity),
+            "cumulative_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": float(cumulative_fidelity),
+            "cumulative_compression_infidelity": cumulative_infidelity,
+            "stabilized": bool(self.stabilize_unitary),
+        })
+
+    def _stabilize_unitary_norm(
+        self,
+        target_norm_sq: Optional[float],
+        observed_infidelity: Optional[float],
+    ) -> None:
+        """Restore the pre-compression working norm without changing fidelity data."""
+        if (
+            not self.stabilize_unitary
+            or target_norm_sq is None
+            or observed_infidelity is None
+            or not self._infidelity_valid
+        ):
+            return
+        target_norm = float(max(0.0, target_norm_sq) ** 0.5)
+        observed_norm = float(self._norm_squared() ** 0.5)
+        if (
+            target_norm <= 0.0
+            or observed_norm <= 0.0
+            or not np.isfinite(target_norm)
+            or not np.isfinite(observed_norm)
+        ):
+            raise FloatingPointError(
+                "Cannot stabilize a unitary compression with a zero or "
+                "non-finite retained norm."
+            )
+        if not np.isclose(target_norm, observed_norm, rtol=1e-14, atol=1e-15):
+            center_site = self._canonize_p_single()
+            center = self.state.p[self.state.p.site_tag(int(center_site))]
+            center.modify(data=center.data * (target_norm / observed_norm))
+        self.state.info["cur_orthog"] = (
+            int(self.state.info["cur_orthog"][0]),
+            int(self.state.info["cur_orthog"][1]),
+        )
+
+    def _invalidate_infidelity(self) -> None:
         """Stop unitary norm-loss reporting after an unnormalized update."""
-        self._norm_infidelity_valid = False
-        self._current_norm_infidelity = None
+        self._infidelity_valid = False
+        self._current_infidelity = None
+        self._compression_segment_log_survival = 0.0
         self._norm_segment_open = False
 
-    def _reset_norm_infidelity(self) -> None:
+    def _reset_infidelity(self) -> None:
         """Start a fresh normalized unitary segment after projection."""
-        self._norm_infidelity_valid = True
-        self._current_norm_infidelity = 0.0 if self.track_infidelity else None
+        self._infidelity_valid = True
+        self._current_infidelity = 0.0
+        self._compression_segment_log_survival = 0.0
         self._norm_segment_open = False
 
     def _make_norm_event(
@@ -3097,31 +3816,49 @@ class MpsStabOptimizer:
         kind: str,
         *,
         branch_probability: Optional[float] = None,
+        projector_branch_probability: Optional[float] = None,
     ) -> Optional[NormEventRecord]:
         """Snapshot the current unitary segment before projective normalization."""
-        if not self.track_infidelity:
-            return None
-
         if branch_probability is not None:
             branch_probability = min(1.0, max(0.0, float(branch_probability)))
+        if projector_branch_probability is None:
+            projector_branch_probability = branch_probability
+        elif projector_branch_probability is not None:
+            projector_branch_probability = min(
+                1.0, max(0.0, float(projector_branch_probability))
+            )
 
         event = NormEventRecord(
             kind=str(kind),
-            valid=bool(self._norm_infidelity_valid),
+            valid=bool(self._infidelity_valid),
             branch_probability=branch_probability,
+            projector_branch_probability=projector_branch_probability,
         )
-        if not self._norm_infidelity_valid:
+        if not self._infidelity_valid:
             return event
 
-        infidelity = self._unitary_norm_infidelity()
-        if infidelity is None:
-            event["valid"] = False
-            return event
-        norm_sq = min(1.0, max(0.0, 1.0 - float(infidelity)))
+        if self._norm_segment_open:
+            segment_infidelity = float(self._current_infidelity)
+        else:
+            infidelity = self._unitary_infidelity()
+            if infidelity is None:
+                event["valid"] = False
+                return event
+            segment_infidelity = float(infidelity)
+            segment_fidelity = max(0.0, 1.0 - segment_infidelity)
+            self._compression_segment_log_survival = (
+                -math.inf
+                if segment_fidelity == 0.0
+                else math.log(segment_fidelity)
+            )
+            self._norm_segment_open = True
+        segment_fidelity = max(0.0, min(1.0, 1.0 - segment_infidelity))
+        norm_sq = self._norm_squared()
         event.update(
             pre_norm=float(norm_sq ** 0.5),
             pre_norm_sq=float(norm_sq),
-            segment_infidelity=float(infidelity),
+            segment_infidelity=segment_infidelity,
+            segment_fidelity=segment_fidelity,
         )
         return event
 
@@ -3142,7 +3879,7 @@ class MpsStabOptimizer:
             event["projected_norm"] = projected_norm
             event["projected_norm_sq"] = projected_norm_sq
             pre_norm_sq = event.get("pre_norm_sq")
-            branch_probability = event.get("branch_probability")
+            branch_probability = event.get("projector_branch_probability")
             if (
                 event.get("valid")
                 and pre_norm_sq is not None
@@ -3176,6 +3913,16 @@ class MpsStabOptimizer:
             if projector_survival is not None:
                 survival *= max(0.0, min(1.0, float(projector_survival)))
             self._accumulate_norm_survival(survival)
+            event["cumulative_fidelity"] = (
+                0.0
+                if self._norm_log_survival == -math.inf
+                else float(math.exp(self._norm_log_survival))
+            )
+            event["cumulative_infidelity"] = (
+                1.0
+                if self._norm_log_survival == -math.inf
+                else float(-math.expm1(self._norm_log_survival))
+            )
 
     def _accumulate_norm_survival(self, survival: float) -> None:
         """Accumulate one validated norm-survival factor in log space."""
@@ -3194,8 +3941,12 @@ class MpsStabOptimizer:
         norm is also folded into the product/geometric summaries. The returned
         values are compression/norm-survival proxies only; measurement branch
         probabilities are kept in the individual events and are not multiplied
-        into the truncation total. Dense non-unitary matrix updates contribute
-        their ``G^dagger G``-normalized compression loss.
+        into the truncation total. Per-update local ratios are available from
+        :meth:`get_compression_norm_events`. Dense non-unitary matrix updates
+        contribute their ``G^dagger G``-normalized compression loss. These
+        values are not target-state overlaps. ``state_norm`` and ``norm`` are
+        the live coefficient-MPS norm; ``cumulative_norm`` is the square-root
+        retained-compression proxy.
         """
         completed = [
             event
@@ -3228,12 +3979,11 @@ class MpsStabOptimizer:
         current_loss = None
         if (
             include_current
-            and self.track_infidelity
-            and self._norm_infidelity_valid
+            and self._infidelity_valid
             and self._norm_segment_open
-            and self._current_norm_infidelity is not None
+            and self._current_infidelity is not None
         ):
-            current_loss = float(self._current_norm_infidelity)
+            current_loss = float(self._current_infidelity)
             survivals.append(min(1.0, max(0.0, 1.0 - current_loss)))
 
         if survivals:
@@ -3263,6 +4013,7 @@ class MpsStabOptimizer:
             mean_segment_infidelity = float(sum(event_losses) / len(event_losses))
             max_segment_infidelity = float(max(event_losses))
         else:
+            log_survival = None
             total_survival = None
             geometric_mean_survival = None
             mean_segment_infidelity = None
@@ -3272,14 +4023,33 @@ class MpsStabOptimizer:
             None if current_loss is None
             else float(max(0.0, 1.0 - current_loss) ** 0.5)
         )
-        norm_infidelity = (
-            None if total_survival is None else float(1.0 - total_survival)
+        cumulative_infidelity = (
+            None
+            if total_survival is None
+            else infidelity_from_log(log_survival)
         )
         norm_survival = total_survival
-        norm = None if total_survival is None else float(total_survival ** 0.5)
+        cumulative_norm = (
+            None if total_survival is None else float(total_survival ** 0.5)
+        )
+        state_norm = float(self.norm())
+        latest_compression = (
+            self._compression_norm_events[-1]
+            if self._compression_norm_events
+            else None
+        )
         return {
-            "tracking": self.track_infidelity,
-            "current_valid": bool(self._norm_infidelity_valid),
+            "tracking": True,
+            "norm_tracking": True,
+            # MPS-STN has no Tree-style per-edge spectrum tracker. Keep the
+            # explicit field present so cross-backend diagnostics can branch
+            # on one stable schema without mistaking ``None`` for disabled
+            # norm tracking.
+            "truncation_tracking": None,
+            "current_valid": bool(self._infidelity_valid),
+            "events": len(self.norm_events),
+            "norm_events_count": len(self.norm_events),
+            "completed_events": len(completed),
             "completed_segments": len(completed),
             "segments_including_current": len(survivals),
             "completed_segment_norms": [event["pre_norm"] for event in completed],
@@ -3293,19 +4063,52 @@ class MpsStabOptimizer:
             "completed_combined_infidelities": [
                 float(1.0 - survival) for survival in completed_survivals
             ],
+            "compression_events": len(self._compression_norm_events),
+            "compression_norm_events": self.get_compression_norm_events(),
             "current_segment_norm": current_norm,
             "current_segment_infidelity": current_loss,
+            "current_fidelity": (
+                None if current_loss is None else float(1.0 - current_loss)
+            ),
+            "current_infidelity": current_loss,
+            # Local means the most recent compressed update, matching the
+            # ordinary MPS and Tree ledgers. The current-segment fields above
+            # remain available for the boundary-aware STN history.
+            "local_fidelity": (
+                None
+                if latest_compression is None
+                else latest_compression["local_fidelity"]
+            ),
+            "local_infidelity": (
+                None
+                if latest_compression is None
+                else latest_compression["local_infidelity"]
+            ),
+            "local_norm": (
+                None
+                if latest_compression is None
+                else float(latest_compression["local_fidelity"] ** 0.5)
+            ),
+            # Provenance alias for the norm-derived cumulative fidelity; it is
+            # distinct from the live state norm returned below.
             "norm_survival": norm_survival,
-            "norm_infidelity": norm_infidelity,
+            "cumulative_fidelity": norm_survival,
+            "cumulative_infidelity": cumulative_infidelity,
+            "cumulative_compression_fidelity": norm_survival,
+            "cumulative_compression_infidelity": cumulative_infidelity,
             # MpsOptimizer-compatible public names. ``infidelity`` is the
             # cumulative multiplicative compression infidelity; it never
             # includes stochastic measurement branch probabilities.
             "fidelity": norm_survival,
-            "infidelity": norm_infidelity,
-            "norm": norm,
+            "infidelity": cumulative_infidelity,
+            # ``norm`` is the live coefficient-MPS norm. The retained
+            # compression proxy is separate as ``cumulative_norm``.
+            "norm": state_norm,
+            "state_norm": state_norm,
+            "cumulative_norm": cumulative_norm,
             "total_survival_proxy": norm_survival,
-            "total_infidelity_proxy": norm_infidelity,
-            "total_norm_proxy": norm,
+            "total_infidelity_proxy": cumulative_infidelity,
+            "total_norm_proxy": cumulative_norm,
             "geometric_mean_survival": geometric_mean_survival,
             "geometric_mean_norm": (
                 None if geometric_mean_survival is None
@@ -3371,7 +4174,11 @@ class MpsStabOptimizer:
         L = int(getattr(p, "L", 0))
         if L <= 0:
             return
-        p.canonize([0], cur_orthog=(0, max(0, L - 1)))
+        p.canonize(
+            [0],
+            cur_orthog=(0, max(0, L - 1)),
+            info=info,
+        )
         info["cur_orthog"] = (0, 0)
 
     def _canonize_p_single(self) -> int:
@@ -3467,17 +4274,25 @@ class MpsStabOptimizer:
             max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
             max_pauli_terms=self.max_pauli_terms,
             max_dense_cap_qubits=self.max_dense_cap_qubits,
-            track_infidelity=self.track_infidelity,
             exact_cooling=self.exact_cooling,
+            stabilize_unitary=self.stabilize_unitary,
+            fit_init_strategy=self.fit_init_strategy,
+            fit_init_rand_strength=self.fit_init_rand_strength,
+            fit_init_seed=self.fit_init_seed,
+            compression_seed=self.compression_seed,
             dtype=self.dtype,
             to_backend=self.to_backend,
         )
-        copied._norm_infidelity_valid = self._norm_infidelity_valid
-        copied._current_norm_infidelity = self._current_norm_infidelity
+        copied._infidelity_valid = self._infidelity_valid
+        copied._current_infidelity = self._current_infidelity
+        copied._compression_segment_log_survival = (
+            self._compression_segment_log_survival
+        )
         copied._norm_segment_open = self._norm_segment_open
         copied._norm_log_survival = self._norm_log_survival
         copied.infidelities = list(self.infidelities)
         copied._nonunitary_infidelities = list(self._nonunitary_infidelities)
+        copied._compression_norm_events = deepcopy(self._compression_norm_events)
         copied.norm_events = [
             NormEventRecord(**event.as_dict())
             if isinstance(event, NormEventRecord)
@@ -3489,6 +4304,9 @@ class MpsStabOptimizer:
         copied._refresh_layout_map()
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
+        copied.last_measurement_schedule = deepcopy(self.last_measurement_schedule)
+        copied._last_fit_diagnostics = deepcopy(self._last_fit_diagnostics)
+        copied._dmrg1_one_site_locked = bool(self._dmrg1_one_site_locked)
         copied._initial_state = copied.state.copy()
         copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         return copied
@@ -3788,15 +4606,6 @@ class MpsStabOptimizer:
             return converter(array)
         return ar.do("array", array, like=like)
 
-    def _diagnose_gate_backend(self, gate):
-        """Warn if an explicit stream matrix is foreign to the live MPS."""
-        self.backend_info()
-        source_signature = infer_backend_signature(gate)
-        if source_signature != self._backend_signature:
-            self._warn_backend_conversion(
-                source_signature, self._backend_signature, kind="gate"
-            )
-
     def _bk(self, mat):
         """Backend copy of an internally generated gate matrix."""
         arr = np.asarray(mat, dtype=self.dtype)
@@ -3821,10 +4630,19 @@ class MpsStabOptimizer:
         source_signatures = {
             infer_backend_signature(tensor.data) for tensor in tensors
         }
-        if source_signatures == {target_signature}:
-            return mpo
+        if source_signatures and all(
+            backend_signatures_compatible(source, target_signature)
+            for source in source_signatures
+        ):
+            if source_signatures == {target_signature}:
+                return mpo
+            # Backend/device already match; only normalize an execution copy's
+            # dtype when the operator implementation requires it.
         for source_signature in source_signatures:
-            if source_signature != target_signature and warn:
+            if (
+                not backend_signatures_compatible(source_signature, target_signature)
+                and warn
+            ):
                 self._warn_backend_conversion(
                     source_signature, target_signature, kind="sub-MPO"
                 )
@@ -3864,68 +4682,20 @@ class MpsStabOptimizer:
         return np.asarray(to_numpy(gate))
 
     # ------------------------------------------------------------------ #
-    # Scalable computational-basis sampling (no 2**n statevector)
+    # State primitives used by MpsStabSampler
     # ------------------------------------------------------------------ #
-    def _bit_measurement_order(self, order=None) -> tuple[int, ...]:
-        """Return a validated physical-qubit order for computational readout."""
-        if order is None:
-            order = "physical"
-        if isinstance(order, str):
-            key = order.strip().replace("-", "_").lower()
-            if key in ("physical", "index", "default"):
-                return tuple(range(self.n))
-            if key in ("mps", "layout"):
-                return tuple(int(q) for q in self.logical_order)
-            if key == "auto":
-                return (
-                    tuple(range(self.n))
-                    if self._layout_is_identity()
-                    else tuple(int(q) for q in self.logical_order)
-                )
-            raise ValueError(
-                "order must be 'physical', 'mps', 'auto', or a permutation "
-                f"of range({self.n}); got {order!r}."
-            )
-        try:
-            order = tuple(int(q) for q in order)
-        except TypeError as exc:
-            raise TypeError(
-                "order must be a string or a permutation of qubit indices."
-            ) from exc
-        if len(order) != self.n or sorted(order) != list(range(self.n)):
-            raise ValueError(
-                f"order must be a permutation of range({self.n}), got {order!r}."
-            )
-        return order
-
-    def _computational_z_frame_terms(self, order) -> dict[int, tuple[dict, int]]:
-        """Precompute ``C^dagger Z_q C`` frame images for a readout order.
-
-        Fixed-basis computational measurements leave the tableau unchanged, so a
-        whole readout tree can reuse these frame terms across every branch.
-        """
-        return {int(q): self._frame_terms("Z", int(q)) for q in order}
-
-    @staticmethod
-    def _prob_zero_from_expectation(exp: float) -> float:
-        """Return clipped ``P(bit=0)`` for a computational-basis Z readout."""
-        return min(max(0.5 * (1.0 + float(exp)), 0.0), 1.0)
-
     def _sample_rng(self, seed):
-        """Return the RNG used by shot-sampling helpers."""
+        """Return the RNG used by sampler branch operations.
+
+        The sampler owns shot generation and branch bookkeeping. The optimizer
+        only supplies this state-local RNG hook so seeded calls preserve the
+        historical behavior when sampling through either public API.
+        """
         if seed is None:
             return self._rng
         if isinstance(seed, np.random.Generator):
             return seed
         return np.random.default_rng(seed)
-
-    @staticmethod
-    def pack_bit_samples(samples) -> np.ndarray:
-        """Pack an ``(shots, n)`` 0/1 sample array along the qubit axis."""
-        arr = np.asarray(samples, dtype=np.uint8)
-        if arr.ndim != 2:
-            raise ValueError("samples must be a 2D array of 0/1 bit values.")
-        return np.packbits(arr, axis=1, bitorder="big")
 
     def _condition_computational_bit(
         self,
@@ -3935,55 +4705,79 @@ class MpsStabOptimizer:
         *,
         probability: Optional[float] = None,
     ) -> Optional[float]:
-        """Condition this simulator copy on one computational-basis bit.
+        """Condition this copied sampler branch on one fixed-frame bit.
 
-        Returns the branch probability, or ``None`` if the branch is numerically
-        impossible.  The tableau is intentionally unchanged: this is the fixed
-        basis projector path used by computational readout.
+        The sampler owns branch allocation and shot bookkeeping. This method
+        performs only the coefficient-MPS projector update, leaving the
+        tableau frame unchanged. A multi-site Pauli projector is routed
+        through ``_evolve_p`` and therefore honors this optimizer's ``chi``,
+        ``cutoff``, and DMRG/direct mode.
         """
         outcome = +1 if int(bit) == 0 else -1
         if probability is None:
             probability = self._outcome_probability(
-                self._pauli_expectation(terms, sign),
-                outcome,
+                self._pauli_expectation(terms, sign), outcome
             )
         probability = float(probability)
         if probability <= 1e-12:
             return None
-        self._apply_projector(terms, sign, outcome)
+        # Keep the branch probability (Born rule) separate from the
+        # projector's retained-norm diagnostic. ``_apply_projector`` passes
+        # this event through the direct or DMRG compression path and fills in
+        # ``projector_infidelity`` after the projected MPS is renormalized.
+        norm_event = self._make_norm_event(
+            "sample_measure_projector",
+            branch_probability=probability,
+            projector_branch_probability=probability,
+        )
+        self._apply_projector(terms, sign, outcome, norm_event=norm_event)
         return probability
 
+    def _condition_absorbed_bit(
+        self,
+        pauli,
+        where,
+        bit: int,
+        *,
+        probability: Optional[float] = None,
+    ) -> Optional[float]:
+        """Condition this copied sampler branch with basis absorption enabled.
+
+        This is deliberately a state-operation primitive rather than a public
+        sampling method. The sampler owns branching and shot bookkeeping;
+        this method owns the one-branch ``C^dagger O C`` localization, tableau
+        update, and coefficient-MPS projection. Unlike the fixed-frame path,
+        absorption changes ``C`` on this branch, so callers must recompute the
+        next frame image from the returned state.
+        """
+        outcome = +1 if int(bit) == 0 else -1
+        m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
+        terms, sign = hermitian_pauli_terms(m_pauli)
+        if probability is None:
+            probability = self._outcome_probability(
+                self._pauli_expectation(terms, sign), outcome
+            )
+        probability = float(probability)
+        if probability <= 1e-12:
+            return None
+        self._absorb_measure(
+            m_pauli,
+            outcome,
+            norm_event_kind="sample_measure_absorb",
+        )
+        return probability
+
+    # Sampling compatibility delegates
+    # ------------------------------------------------------------------ #
+    # Sampling is implemented by MpsStabSampler, next to MpsSampler. Keep
+    # these optimizer methods as thin compatibility shims for existing users
+    # and trajectory/noise result objects that expose optimizer sampling.
     @staticmethod
-    def _bits_matrix(bitstrings, *, expected_length: int) -> np.ndarray:
-        """Normalize one or more bitstrings to an ``(rows, n)`` int8 matrix."""
-        if isinstance(bitstrings, str):
-            rows = [_validate_bits(bitstrings, expected_length=expected_length)]
-        else:
-            arr = np.asarray(bitstrings)
-            if arr.ndim == 2:
-                rows = [
-                    _validate_bits(row.tolist(), expected_length=expected_length)
-                    for row in arr
-                ]
-            else:
-                try:
-                    values = list(bitstrings)
-                except TypeError as exc:
-                    raise TypeError(
-                        "bitstrings must be a bitstring, a sequence of bitstrings, "
-                        "or a 2D array-like of 0/1 values."
-                    ) from exc
-                if not values:
-                    return np.empty((0, expected_length), dtype=np.int8)
-                first = values[0]
-                if isinstance(first, str):
-                    rows = [
-                        _validate_bits(row, expected_length=expected_length)
-                        for row in values
-                    ]
-                else:
-                    rows = [_validate_bits(values, expected_length=expected_length)]
-        return np.asarray(rows, dtype=np.int8)
+    def pack_bit_samples(samples) -> np.ndarray:
+        """Compatibility delegate for packing raw sampler bit arrays."""
+        from ...sampling.stabilizer import MpsStabSampler
+
+        return MpsStabSampler.pack_bit_samples(samples)
 
     def sample_bits(
         self,
@@ -3993,64 +4787,29 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ) -> np.ndarray:
-        """Sample computational-basis bitstrings ``x ~ |<x|psi>|**2`` (scalable).
+        """Compatibility delegate to :class:`pepsy.MpsStabSampler`."""
+        from ...sampling.stabilizer import MpsStabSampler
 
-        Uses **perfect (tree) sampling**: shots that share a measured prefix
-        share the collapsed state, so the ``Z_0 ... Z_{n-1}`` collapse work is
-        done once per distinct prefix rather than once per shot — a large saving
-        for low-rank/structured ``|nu>`` (e.g. a state copy happens only at a
-        genuine branch point, not per shot).  ``order`` controls the commuting
-        ``Z``-measurement order: ``"physical"`` keeps the historical ``0..n-1``
-        order, ``"mps"`` follows the current coefficient-MPS layout, ``"auto"``
-        uses the layout order only when a nontrivial layout is installed, and an
-        explicit permutation is also accepted.  Returns an ``(shots, n)``
-        ``int8`` array of 0/1 with qubit ``q`` in column ``q``. The final uniform
-        row permutation converts prefix-grouped branch counts into an
-        exchangeable i.i.d. sample sequence; set ``shuffle=False`` to keep the
-        prefix grouping and avoid the final memory shuffle. Set ``packed=True``
-        to return ``np.packbits(..., axis=1, bitorder="big")`` output with dtype
-        ``uint8`` and ``ceil(n / 8)`` columns.
-        """
-        rng = self._sample_rng(seed)
-        shots = int(shots)
-        out = np.empty((shots, self.n), dtype=np.int8)
-        if shots == 0:
-            return self.pack_bit_samples(out) if packed else out
-        order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
-        # Stack of (collapsed_sim, order_position, lo, hi): rows [lo:hi) share
-        # this state and have measured the prefix order[:order_position].
-        stack = [(self.copy(), 0, 0, shots)]
-        while stack:
-            sim, pos, lo, hi = stack.pop()
-            q = order[pos]
-            count = hi - lo
-            terms, sign = frame_terms[q]
-            exp = sim._pauli_expectation(terms, sign)
-            p0 = self._prob_zero_from_expectation(exp)
-            if p0 <= 1e-12:
-                n0 = 0
-            elif p0 >= 1.0 - 1e-12:
-                n0 = count
-            else:
-                n0 = int(rng.binomial(count, p0))
-            mid = lo + n0
-            out[lo:mid, q] = 0
-            out[mid:hi, q] = 1
-            if pos + 1 == self.n:
-                continue  # last qubit: bits written, nothing left to collapse
-            both = 0 < n0 < count
-            if n0 > 0:
-                s0 = sim.copy() if both else sim
-                s0._condition_computational_bit(terms, sign, 0, probability=p0)
-                stack.append((s0, pos + 1, lo, mid))
-            if n0 < count:
-                sim._condition_computational_bit(terms, sign, 1, probability=1.0 - p0)
-                stack.append((sim, pos + 1, mid, hi))
-        if shuffle:
-            rng.shuffle(out, axis=0)
-        return self.pack_bit_samples(out) if packed else out
+        return MpsStabSampler(
+            self,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        ).sample_bits(
+            shots,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+            packed=packed,
+            basis=basis,
+        )
+
+    def sample_basis(self, shots: int = 1, *, basis="Z", **kwargs):
+        """Compatibility alias for :meth:`sample_bits`."""
+        return self.sample_bits(shots, basis=basis, **kwargs)
 
     def sample_bitstrings(
         self,
@@ -4060,102 +4819,109 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ) -> np.ndarray:
-        """Alias for :meth:`sample_bits` with a more explicit public name."""
+        """Compatibility alias for :meth:`sample_bits`."""
         return self.sample_bits(
             shots,
             seed=seed,
             order=order,
             shuffle=shuffle,
             packed=packed,
+            basis=basis,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
         )
 
-    def probability_bits(self, bits, *, order=None) -> float:
-        """Return ``|<bits|psi>|**2`` via chain-rule conditionals (scalable).
+    def probability_bits(
+        self,
+        bits,
+        *,
+        order=None,
+        basis="Z",
+        seed=None,
+        absorb_basis=None,
+        disentangle=None,
+    ) -> float:
+        """Compatibility delegate for one product-basis probability."""
+        from ...sampling.stabilizer import MpsStabSampler
 
-        Multiplies the per-qubit conditional Born probabilities along a forced
-        computational-basis measurement of a copy, so it costs ``O(n)`` MPS
-        measurements instead of an ``O(2**n)`` statevector.  ``bits`` is a string
-        like ``'010'`` or a 0/1 sequence with qubit ``q`` at position ``q``.
-        ``order`` accepts the same values as :meth:`sample_bits`.
-        """
-        bits = _validate_bits(bits, expected_length=self.n)
-        order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
-        tmp = self.copy()
-        prob = 1.0
-        for q in order:
-            b = int(bits[q])
-            terms, sign = frame_terms[q]
-            exp = tmp._pauli_expectation(terms, sign)
-            p0 = self._prob_zero_from_expectation(exp)
-            pq = p0 if b == 0 else 1.0 - p0
-            # ``measure(..., outcome=...)`` rejects post-selection below this
-            # tolerance. Treat the same numerically zero branch as a zero
-            # probability here instead of attempting an impossible collapse.
-            if pq <= 1e-12:
-                return 0.0
-            prob *= pq
-            tmp._condition_computational_bit(terms, sign, b, probability=pq)
-        return float(prob)
+        return MpsStabSampler(
+            self,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        ).probability_bits(
+            bits,
+            order=order,
+            basis=basis,
+            seed=seed,
+        )
 
-    def probability_bits_many(self, bitstrings, *, order=None) -> np.ndarray:
-        """Return probabilities for many computational-basis bitstrings.
+    def probability_bits_many(
+        self,
+        bitstrings,
+        *,
+        order=None,
+        basis="Z",
+        seed=None,
+        absorb_basis=None,
+        disentangle=None,
+    ) -> np.ndarray:
+        """Compatibility delegate for many product-basis probabilities."""
+        from ...sampling.stabilizer import MpsStabSampler
 
-        This is the batched counterpart to :meth:`probability_bits`.  Rows with
-        a shared measured prefix share one collapsed simulator copy, so repeated
-        or prefix-clustered bitstrings avoid replaying the full chain-rule
-        readout independently.
-        """
-        bits = self._bits_matrix(bitstrings, expected_length=self.n)
-        probs = np.zeros(bits.shape[0], dtype=float)
-        if bits.shape[0] == 0:
-            return probs
-        order = self._bit_measurement_order(order)
-        frame_terms = self._computational_z_frame_terms(order)
-        stack = [(self.copy(), 0, np.arange(bits.shape[0]), 1.0)]
-        while stack:
-            sim, pos, indices, prefix_prob = stack.pop()
-            if indices.size == 0:
-                continue
-            q = order[pos]
-            terms, sign = frame_terms[q]
-            exp = sim._pauli_expectation(terms, sign)
-            p0 = self._prob_zero_from_expectation(exp)
-            branch_specs = (
-                (0, indices[bits[indices, q] == 0], p0),
-                (1, indices[bits[indices, q] == 1], 1.0 - p0),
-            )
-            live = [
-                (bit, idx, float(p_branch))
-                for bit, idx, p_branch in branch_specs
-                if idx.size > 0 and p_branch > 1e-12
-            ]
-            for _bit, idx, p_branch in branch_specs:
-                if idx.size > 0 and p_branch <= 1e-12:
-                    probs[idx] = 0.0
-            for branch_index, (bit, idx, p_branch) in enumerate(live):
-                branch_prob = prefix_prob * p_branch
-                if pos + 1 == self.n:
-                    probs[idx] = branch_prob
-                    continue
-                child = sim.copy() if branch_index < len(live) - 1 else sim
-                child._condition_computational_bit(
-                    terms,
-                    sign,
-                    bit,
-                    probability=p_branch,
-                )
-                stack.append((child, pos + 1, idx, branch_prob))
-        return probs
+        return MpsStabSampler(
+            self,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        ).probability_bits_many(
+            bitstrings,
+            order=order,
+            basis=basis,
+            seed=seed,
+        )
 
-    def bitstring_probability(self, bits, *, order=None) -> float:
-        """Alias for :meth:`probability_bits`."""
-        return self.probability_bits(bits, order=order)
+    def bitstring_probability(
+        self,
+        bits,
+        *,
+        order=None,
+        basis="Z",
+        seed=None,
+        absorb_basis=None,
+        disentangle=None,
+    ) -> float:
+        """Compatibility alias for :meth:`probability_bits`."""
+        return self.probability_bits(
+            bits,
+            order=order,
+            basis=basis,
+            seed=seed,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        )
 
-    def bitstring_probabilities(self, bitstrings, *, order=None) -> np.ndarray:
-        """Alias for :meth:`probability_bits_many`."""
-        return self.probability_bits_many(bitstrings, order=order)
+    def bitstring_probabilities(
+        self,
+        bitstrings,
+        *,
+        order=None,
+        basis="Z",
+        seed=None,
+        absorb_basis=None,
+        disentangle=None,
+    ) -> np.ndarray:
+        """Compatibility alias for :meth:`probability_bits_many`."""
+        return self.probability_bits_many(
+            bitstrings,
+            order=order,
+            basis=basis,
+            seed=seed,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        )
 
     def iter_sample_bits(
         self,
@@ -4166,31 +4932,26 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ):
-        """Yield computational-basis samples in chunks.
+        """Compatibility delegate for chunked bit sampling."""
+        from ...sampling.stabilizer import MpsStabSampler
 
-        Each yielded array has at most ``chunk_size`` rows and the same column
-        convention as :meth:`sample_bits`.  A single RNG is shared across chunks,
-        so seeded chunked sampling does not repeat the first chunk.
-        """
-        shots = int(shots)
-        chunk_size = int(chunk_size)
-        if shots < 0:
-            raise ValueError("shots must be nonnegative.")
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive.")
-        rng = self._sample_rng(seed)
-        done = 0
-        while done < shots:
-            take = min(chunk_size, shots - done)
-            yield self.sample_bits(
-                take,
-                seed=rng,
-                order=order,
-                shuffle=shuffle,
-                packed=packed,
-            )
-            done += take
+        yield from MpsStabSampler(
+            self,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
+        ).iter_sample_bits(
+            shots,
+            chunk_size=chunk_size,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+            packed=packed,
+            basis=basis,
+        )
 
     def iter_sample_bitstrings(
         self,
@@ -4201,8 +4962,11 @@ class MpsStabOptimizer:
         order=None,
         shuffle: bool = True,
         packed: bool = False,
+        basis="Z",
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
     ):
-        """Alias for :meth:`iter_sample_bits` with an explicit bitstring name."""
+        """Compatibility alias for :meth:`iter_sample_bits`."""
         yield from self.iter_sample_bits(
             shots,
             chunk_size=chunk_size,
@@ -4210,6 +4974,9 @@ class MpsStabOptimizer:
             order=order,
             shuffle=shuffle,
             packed=packed,
+            basis=basis,
+            absorb_basis=absorb_basis,
+            disentangle=disentangle,
         )
 
     # ------------------------------------------------------------------ #
@@ -4233,7 +5000,9 @@ class MpsStabOptimizer:
         parts = submpo_event_parts(entry, normalize_where=True)
         if parts is not None:
             mpo, where = parts
-            self._apply_submpo(mpo, where)
+            # The complete stream was checked at installation. Do not scan or
+            # recast this user MPO again while replaying the accepted queue.
+            self._apply_submpo(mpo, where, _validate_backend=False)
             return
 
         if isinstance(entry, (list, tuple)) and len(entry) >= 1:
@@ -4292,8 +5061,8 @@ class MpsStabOptimizer:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             # matrix form: (gate_tensor, where)
             gate, where = entry
-            self._diagnose_gate_backend(gate)
-            self._apply_matrix(self._gate_to_numpy(gate), where)
+            where = _normalize_sites(where)
+            self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
             return
 
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
@@ -4506,6 +5275,73 @@ class MpsStabOptimizer:
             return True
         return False
 
+    def _quimb_compress_opts(self, method):
+        """Return the Quimb options shared by coefficient-MPO updates."""
+        opts = {
+            "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else self.cutoff,
+        }
+        if method == "fit-projector":
+            # Match the ordinary MPS path: projector fitting does not need the
+            # optional pre-gauge and is safer on exact product-state bonds.
+            opts["canonize"] = False
+        return opts
+
+    def _apply_quimb_submpo(self, p, mpo, where, *, method, max_bond, info):
+        """Apply one coefficient-frame sub-MPO with the selected Quimb method."""
+        method = self._normalize_quimb_method(method)
+        requires_chi = {
+            "src",
+            "src-first",
+            "src-oversample",
+            "srcmps",
+            "srcmps-first",
+            "srcmps-oversample",
+            "fit-oversample",
+        }
+        if max_bond is None and method in requires_chi:
+            raise ValueError(
+                f"MpsStabOptimizer mode {method!r} requires a finite chi."
+            )
+
+        opts = self._quimb_compress_opts(method)
+        is_interior = min(where) > 0 or max(where) < int(p.L) - 1
+        use_workaround = (
+            method in _MPO_METHODS_NEED_INTERIOR_WORKAROUND
+            and is_interior
+            and (max_bond is not None or method.startswith("fit-"))
+        )
+        if use_workaround:
+            return _apply_submpo_with_interior_workaround(
+                p,
+                mpo,
+                where,
+                chi=max_bond,
+                method=method,
+                cutoff=self.cutoff,
+                cutoff_mode=None,
+                info=info,
+                inplace_mpo=False,
+                seed=self.compression_seed,
+            )
+
+        seed = (
+            self.compression_seed
+            if method in _MPO_METHODS_USE_SEED
+            else None
+        )
+        _run_seeded_quimb(
+            seed,
+            p.gate_with_submpo_,
+            mpo,
+            where=where,
+            method=method,
+            max_bond=max_bond,
+            info=info,
+            inplace_mpo=False,
+            **opts,
+        )
+        return p
+
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
         # Validate the complete support before either the tableau or MPS changes.
@@ -4548,6 +5384,7 @@ class MpsStabOptimizer:
         unitary: bool = False,
         renormalize: bool = False,
         norm_event: Optional[NormEventRecord] = None,
+        norm_event_kind: str = "unitary_compression",
     ) -> Optional[float]:
         """Apply a windowed sub-MPO to the coefficient MPS ``p`` on ``where``.
 
@@ -4555,43 +5392,404 @@ class MpsStabOptimizer:
         compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
+        before_norm_sq = (
+            self._norm_squared()
+            if unitary and self._infidelity_valid
+            else None
+        )
         if self.mode in self._DMRG_MODES:
             self._evolve_p_dmrg(mpo, where)
         else:
             p = self.state.p
             self._ensure_p_center()
-            info = self.state.info
-            p.gate_with_submpo_(
-                mpo,
-                where=where,
-                max_bond=None if self.mode == "exact" else self.chi,
-                cutoff=self.cutoff,
-                info=info,
+            method = (
+                self._mode_quimb_method(self.mode)
+                if self._is_quimb_mode(self.mode)
+                else "direct"
             )
-        infidelity = self._unitary_norm_infidelity() if unitary else None
+            self._apply_quimb_submpo(
+                p,
+                mpo,
+                where,
+                method=method,
+                max_bond=None if self.mode == "exact" else self.chi,
+                info=self.state.info,
+            )
+        observed_infidelity = self._unitary_infidelity() if unitary else None
+        self._record_compression_norm_event(
+            before_norm_sq,
+            observed_infidelity,
+            kind=norm_event_kind,
+        )
+        infidelity = (
+            None
+            if not unitary
+            else self._current_infidelity
+        )
+        if unitary:
+            self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
         if renormalize:
             site = self._canonize_p_single()
             projected_norm = self._renorm_p_at(site)
-            self._reset_norm_infidelity()
+            self._reset_infidelity()
             self._commit_norm_event(norm_event, projected_norm=projected_norm)
         return infidelity
 
-    def _fit_coefficient_target(self, target, where):
+    @staticmethod
+    def _fit_random_data(data, shape, *, strength, rng):
+        """Generate backend-compatible random data for a disposable FIT guess."""
+        dtype_name = str(getattr(data, "dtype", "float64"))
+        if "complex64" in dtype_name:
+            random_dtype = np.complex64
+        elif "complex" in dtype_name:
+            random_dtype = np.complex128
+        elif "float32" in dtype_name:
+            random_dtype = np.float32
+        else:
+            random_dtype = np.float64
+        return backend_random_array(
+            shape,
+            like=data,
+            dtype=random_dtype,
+            scale=float(strength),
+            rng=rng,
+        )
+
+    def _fit_randomized_guess(self, p, where, *, block_size, expand):
+        """Build a deterministic dense random FIT guess when rank can grow."""
+        if (
+            block_size not in {2, 3}
+            or self.chi is None
+            or self.fit_init_rand_strength == 0.0
+            or self.backend == "symmray"
+            or p.isfermionic()
+        ):
+            return p
+
+        start, stop = min(where), max(where)
+        try:
+            active = FIT._active_bond_rank_targets(  # pylint: disable=protected-access
+                p,
+                start,
+                stop,
+                self.chi,
+            )
+        except (AttributeError, TypeError, ValueError):
+            active = None
+        if not active:
+            return p
+
+        guess = p.copy(deep=True)
+        rng = np.random.default_rng(self.fit_init_seed)
+        if expand:
+            bonds = []
+            for site, target_size in zip(range(start, stop), active):
+                current_size = int(p.bond_size(site, site + 1))
+                target_size = int(target_size)
+                if current_size < target_size:
+                    bonds.append((site, current_size, target_size))
+            if not bonds:
+                return p
+            for target_size in sorted({target for _, _, target in bonds}):
+                inds = [
+                    guess.bond(site, site + 1)
+                    for site, _, target in bonds
+                    if target == target_size
+                ]
+                qtn.TensorNetwork.expand_bond_dimension(
+                    guess,
+                    target_size,
+                    mode="zeros",
+                    inds_to_expand=inds,
+                    inplace=True,
+                )
+                for site, current_size, target in bonds:
+                    if target != target_size:
+                        continue
+                    bond = guess.bond(site, site + 1)
+                    for tensor in guess.tensors:
+                        if bond not in tensor.inds:
+                            continue
+                        axis = tensor.inds.index(bond)
+                        old_slices = [slice(None)] * tensor.ndim
+                        old_slices[axis] = slice(0, current_size)
+                        shape = list(tensor.shape)
+                        shape[axis] = target_size - current_size
+                        random_data = self._fit_random_data(
+                            tensor.data,
+                            shape,
+                            strength=self.fit_init_rand_strength,
+                            rng=rng,
+                        )
+                        tensor.modify(
+                            data=ar.do(
+                                "concatenate",
+                                (
+                                    tensor.data[tuple(old_slices)],
+                                    random_data,
+                                ),
+                                axis=axis,
+                            )
+                        )
+        else:
+            for site in range(start, stop + 1):
+                tensor = guess[site]
+                tensor.modify(
+                    data=ar.do(
+                        "add",
+                        tensor.data,
+                        self._fit_random_data(
+                            tensor.data,
+                            tensor.shape,
+                            strength=self.fit_init_rand_strength,
+                            rng=rng,
+                        ),
+                    )
+                )
+        guess_info = {}
+        guess.canonize([start, stop], info=guess_info)
+        return guess
+
+    def _fit_initial_guess(self, p, mpo, where, *, block_size):
+        """Select an isolated FIT guess without changing the live coefficient MPS."""
+        strategy = self._resolved_fit_init_strategy(self.fit_init_strategy)
+        if (
+            mpo is None
+            or block_size not in {1, 2, 3}
+            or self.chi is None
+            or self.backend == "symmray"
+            or p.isfermionic()
+        ):
+            return p
+
+        start, stop = min(where), max(where)
+        try:
+            at_target = FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+                p,
+                start,
+                stop,
+                self.chi,
+            )
+        except (AttributeError, TypeError, ValueError):
+            at_target = True
+        # The SRC warm-up is also intentional after rank expansion: ordinary
+        # MPS DMRG uses it to prepare the fixed-rank one-site phase. Keep
+        # direct/random policies as no-op warm starts once the active bonds
+        # are already at their attainable ceilings.
+        if at_target and not strategy.startswith("guess_"):
+            return p
+
+        if strategy.startswith("guess_"):
+            method = strategy[len("guess_") :]
+            guess = p.copy(deep=True)
+            self._apply_quimb_submpo(
+                guess,
+                mpo,
+                where,
+                method=method,
+                max_bond=self.chi,
+                info={},
+            )
+            return guess
+        if strategy in {"random", "random_expand"}:
+            return self._fit_randomized_guess(
+                p,
+                where,
+                block_size=block_size,
+                expand=strategy == "random_expand",
+            )
+        return p
+
+    def _fit_window_at_rank_targets(self, p, start, stop):
+        """Return whether all bonds in a DMRG window have reached their cap."""
+        if self.chi is None or stop <= start:
+            return False
+        try:
+            return bool(
+                FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
+                    p,
+                    int(start),
+                    int(stop),
+                    self.chi,
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            # A conservative answer keeps the variational growth phase when a
+            # backend cannot expose FIT's rank-ceiling helper.
+            return False
+
+    def _dmrg1_all_bonds_at_rank_targets(self, p):
+        """Return whether every full-chain coefficient bond is at its ceiling."""
+        if self.mode != "dmrg1" or self.chi is None or self.n < 2:
+            return False
+        return self._fit_window_at_rank_targets(p, 0, self.n - 1)
+
+    def _maybe_lock_dmrg1_one_site_phase(self, p=None):
+        """Latch DMRG1 into one-site refinement after full-chain growth."""
+        if self.mode != "dmrg1" or self._dmrg1_one_site_locked:
+            return
+        if p is None:
+            p = self.state.p
+        if self._dmrg1_all_bonds_at_rank_targets(p):
+            self._dmrg1_one_site_locked = True
+
+    @staticmethod
+    def _fit_target_is_layered(target):
+        """Return whether ``target`` still contains an operator layer."""
+        return len(getattr(target, "tensor_map", ())) > int(target.L)
+
+    @staticmethod
+    def _align_fit_submpo_tags(mpo, target, where):
+        """Copy and align sub-MPO site tags with the fitted MPS tags.
+
+        FIT accepts layered targets with several tensors per site, but every
+        target tensor must carry exactly one tag from the fitted MPS site-tag
+        family.  Native STN builders already use matching ``I{site}`` tags;
+        this small alignment step also keeps user/MPO site-tag formatters
+        compatible without mutating the operator retained for the warm start.
+        """
+        mpo = mpo.copy()
+        site_tag = getattr(mpo, "site_tag", None)
+        if not callable(site_tag):
+            raise TypeError("DMRG layered targets require a site-tagged sub-MPO.")
+
+        active_sites = tuple(sorted({int(site) for site in where}))
+        expected_tags = set()
+        for site in active_sites:
+            old_tag = site_tag(site)
+            new_tag = target.site_tag(site)
+            expected_tags.add(new_tag)
+            if old_tag != new_tag:
+                mpo.retag_({old_tag: new_tag})
+
+        for tensor in mpo.tensors:
+            tensor_site_tags = tuple(tag for tag in tensor.tags if tag in expected_tags)
+            if len(tensor_site_tags) != 1:
+                raise ValueError(
+                    "Each layered FIT sub-MPO tensor must carry exactly one "
+                    f"fitted-MPS site tag, got {tuple(tensor.tags)!r}."
+                )
+        return mpo
+
+    def _build_dmrg_fit_target(self, mpo, where):
+        """Build the DMRG target, retaining a lazy sub-MPO when supported.
+
+        Dense backends keep the coefficient sub-MPO as a separate operator
+        layer.  The live MPS is only canonicalized on the active window before
+        the layer is attached, so the target does not pay an intermediate
+        ``chi``-independent MPS materialization cost.  Symmray and fermionic
+        data retain the native materialized target path because their graded
+        operator metadata cannot safely use the generic lazy FIT layer.
+        """
+        start, stop = min(where), max(where)
+        target = self.state.p.copy()
+        target.canonicalize_((start, stop), info={})
+
+        self.backend_info()
+        layered_supported = (
+            self.backend != "symmray"
+            and not target.isfermionic()
+            and not mpo.isfermionic()
+        )
+        if layered_supported:
+            layered_mpo = self._align_fit_submpo_tags(mpo, target, where)
+            target.gate_with_op_lazy_(
+                layered_mpo,
+                inplace=True,
+                inplace_op=False,
+            )
+            return target, "layered"
+
+        # Native graded routes keep a one-tensor-per-site target and use the
+        # existing backend-aware sub-MPO contraction path.
+        target.gate_with_submpo_(
+            mpo,
+            where=where,
+            max_bond=None,
+            cutoff=0.0,
+            info={},
+            inplace_mpo=False,
+        )
+        return target, "mps"
+
+    def _fit_coefficient_target(
+        self,
+        target,
+        where,
+        *,
+        guess_mpo=None,
+        target_strategy=None,
+    ):
         """Fit a coefficient-MPS target with the selected DMRG schedule."""
         p = self.state.p
         start, stop = min(where), max(where)
-        block_size = 3 if self.mode == "dmrg3" else 2
+        span = stop - start + 1
+        if target_strategy is None:
+            target_strategy = (
+                "layered" if self._fit_target_is_layered(target) else "mps"
+            )
+        requested_block_size = 3 if self.mode == "dmrg3" else 2
+        block_size = min(requested_block_size, span)
+        self._maybe_lock_dmrg1_one_site_phase(p)
+        if (
+            self.mode == "dmrg1"
+            and block_size == 2
+            and span > 2
+            and self._dmrg1_one_site_locked
+        ):
+            block_size = 1
+        elif (
+            self.mode == "dmrg1"
+            and block_size == 2
+            and span > 2
+            and self._fit_window_at_rank_targets(p, start, stop)
+        ):
+            block_size = 1
+        # A three-site FIT update cannot be defined on a two-site active
+        # window.  Dense physical gates and mapped Pauli rotations commonly
+        # have exactly this support, so match the ordinary MPS DMRG behavior
+        # and fall back to a two-site update locally rather than rejecting a
+        # valid ``dmrg3`` run.
+        fit_guess = self._fit_initial_guess(
+            p,
+            guess_mpo,
+            where,
+            block_size=block_size,
+        )
         fit = FIT(
             target,
-            p=p,
+            p=fit_guess,
             cutoffs=self.cutoff,
             retag=False,
             range_int=[start, stop],
             inplace=True,
             copy_target=False,
         )
+        adjacent_two_site = span == 2 and block_size == 2
+        growth_sweeps = (
+            0 if block_size == 1 else (1 if adjacent_two_site else 2)
+        )
+        resolved_fit_init_strategy = self._resolved_fit_init_strategy(
+            self.fit_init_strategy
+        )
+        guess_method = (
+            resolved_fit_init_strategy[len("guess_") :]
+            if resolved_fit_init_strategy.startswith("guess_")
+            else None
+        )
+        guess_used = bool(
+            guess_method is not None
+            and guess_mpo is not None
+            and block_size in {1, 2, 3}
+            and self.chi is not None
+            and self.backend != "symmray"
+            and not p.isfermionic()
+        )
         fit.run_gate(
-            n_iter=3,
+            # A two-site gate is already the complete local problem. Match
+            # MpsOptimizer's structural fast path and spend one FIT update on
+            # it; longer windows use two growth sweeps and one-site handoff.
+            n_iter=1 if adjacent_two_site else 3,
             block_size=block_size,
             sweep_sequence="RL",
             max_bond=self.chi,
@@ -4599,30 +5797,49 @@ class MpsStabOptimizer:
             min_iter=1,
             rtol=None,
             patience=1,
-            adaptive_block_sweeps=2,
+            adaptive_block_sweeps=(
+                None if block_size == 1 else growth_sweeps
+            ),
             adaptive_until_rank=False,
-            final_one_site_sweeps=1,
+            # The remaining ``n_iter`` sweep after the two growth sweeps is
+            # FIT's one-site handoff. Do not add a second explicit refinement
+            # sweep on top of that canonical MpsOptimizer schedule.
+            final_one_site_sweeps=0,
             single_pair_fast_path=True,
             collect_split_diagnostics=False,
         )
         self.state.p = fit.p
+        self._maybe_lock_dmrg1_one_site_phase(self.state.p)
+        self._last_fit_diagnostics = {
+            "backend": "fit",
+            "mode": self.mode,
+            "block_size": int(block_size),
+            "growth_sweeps": int(getattr(fit, "adaptive_sweeps_run", growth_sweeps)),
+            "one_site_refinement_sweeps": int(
+                getattr(fit, "one_site_sweeps_run", 0)
+            ),
+            "iterations": int(getattr(fit, "iterations_run", 0)),
+            "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
+            "fit_init_strategy": resolved_fit_init_strategy,
+            "fit_init_strategy_requested": self.fit_init_strategy,
+            "guess_method": guess_method,
+            "guess_used": guess_used,
+            "target_strategy": target_strategy,
+        }
         center = fit.final_center_site
         if center is None:
             center = stop
         self.state.info["cur_orthog"] = (int(center), int(center))
 
     def _evolve_p_dmrg(self, mpo, where):
-        """Build a lossless MPO target and compress it with coefficient FIT."""
-        target = self.state.p.copy()
-        target.gate_with_submpo_(
-            mpo,
-            where=where,
-            max_bond=None,
-            cutoff=self.cutoff,
-            info={},
-            inplace_mpo=False,
+        """Build a layered target and compress it with coefficient FIT."""
+        target, target_strategy = self._build_dmrg_fit_target(mpo, where)
+        self._fit_coefficient_target(
+            target,
+            where,
+            guess_mpo=mpo,
+            target_strategy=target_strategy,
         )
-        self._fit_coefficient_target(target, where)
 
     # ------------------------------------------------------------------ #
     # Measurement (Lemma 3; non-unitary |nu> update)
@@ -4703,6 +5920,27 @@ class MpsStabOptimizer:
             total += complex(coeff) * self.expectation(pauli, where)
         return float(np.real(total))
 
+    def sync_canonicalization(self, site=None):
+        """Re-establish coefficient-MPS metadata after external state access.
+
+        Stabilizer measurement and projection paths pass ``state.info`` to
+        Quimb's canonical routines. If a caller instead uses a lower-level
+        method directly on ``state.p``, call this before resuming evolution.
+        Ordinary diagnostic expectations already operate on a private copy and
+        do not require synchronization.
+        """
+        p = self.state.p
+        current = tuple(int(x) for x in p.calc_current_orthog_center())
+        current = (min(current), max(current))
+        if site is None:
+            site = current[1]
+        site = int(site)
+        if not 0 <= site < int(p.L):
+            raise ValueError(f"site must lie in [0, {int(p.L)}), got {site}.")
+        p.canonize([site], cur_orthog=current, info=self.state.info)
+        self.state.info["cur_orthog"] = (site, site)
+        return self.state.info["cur_orthog"]
+
     def sample(self, pauli, where=None, *, shots: int = 1, seed=None):
         """Draw ``shots`` Born-rule outcomes (+/-1) of a Pauli observable.
 
@@ -4715,8 +5953,221 @@ class MpsStabOptimizer:
         rng = self._rng if seed is None else np.random.default_rng(seed)
         return np.where(rng.random(int(shots)) < p_plus, 1, -1)
 
-    def measure(self, pauli, where, *, outcome: Optional[int] = None,
-                absorb_basis: bool = False):
+    @staticmethod
+    def _normalize_measurement_batch(measurements):
+        """Normalize independent single-qubit measurements for scheduling."""
+        if isinstance(measurements, (str, bytes)):
+            raise TypeError(
+                "measure_many expects an iterable of (pauli, qubit[, outcome]) "
+                "entries."
+            )
+        try:
+            entries = tuple(measurements)
+        except TypeError as exc:
+            raise TypeError(
+                "measure_many expects an iterable of measurement entries."
+            ) from exc
+
+        operations = []
+        targets = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError(
+                    "measure_many entries must be (pauli, qubit) or "
+                    f"(pauli, qubit, outcome), got entry {index}: {entry!r}."
+                )
+            pauli, where = entry[:2]
+            sites = _normalize_sites(where)
+            if len(sites) != 1:
+                raise ValueError(
+                    "measure_many only schedules independent single-qubit "
+                    f"measurements, got where={where!r}."
+                )
+            (axis,) = _normalize_pauli_axes(
+                pauli,
+                sites,
+                event="measure_many",
+            )
+            outcome = entry[2] if len(entry) == 3 else None
+            outcome = MpsStabOptimizer._validate_outcome(outcome)
+            operations.append((axis, sites[0], outcome))
+            targets.append(sites[0])
+
+        if len(set(targets)) != len(targets):
+            raise ValueError(
+                "measure_many requires distinct target qubits so operations can "
+                "be safely reordered."
+            )
+        return tuple(operations)
+
+    def _measurement_span_info(self, axis, qubit, *, absorb_basis):
+        """Return cheap Tableau/MPS-layout costs for one measurement candidate."""
+        terms, _sign = self._frame_terms(axis, qubit)
+        frame_support = tuple(sorted(terms))
+        mps_support = tuple(sorted(self._mps_site(site) for site in frame_support))
+        if not mps_support:
+            return {
+                "frame_support": frame_support,
+                "mps_support": mps_support,
+                "span": 0,
+                "localizer_distance": 0,
+                "pivot": None,
+            }
+
+        span = int(max(mps_support) - min(mps_support))
+        ordered_support = sorted(
+            frame_support,
+            key=lambda site: (self._mps_site(site), int(site)),
+        )
+        pivot = ordered_support[len(ordered_support) // 2]
+        pivot_position = self._mps_site(pivot)
+        localizer_distance = int(
+            sum(
+                abs(self._mps_site(site) - pivot_position)
+                for site in frame_support
+            )
+        )
+        return {
+            "frame_support": frame_support,
+            "mps_support": mps_support,
+            "span": span,
+            "localizer_distance": (
+                localizer_distance if absorb_basis else 0
+            ),
+            "pivot": int(pivot),
+        }
+
+    def _run_measurement_batch(
+        self,
+        operations,
+        *,
+        order,
+        absorb_basis,
+        reset=False,
+        reset_after=False,
+    ):
+        """Run a batch using a metadata-only, adaptive span schedule."""
+        if reset and reset_after:
+            raise ValueError("reset and reset_after are mutually exclusive.")
+        operations = tuple(operations)
+        targets = tuple(operation[1] for operation in operations)
+        normalized_order = _normalize_measurement_order(
+            order,
+            count=len(operations),
+            targets=targets,
+        )
+        remaining = list(range(len(operations)))
+        result = [None] * len(operations)
+        schedule = []
+
+        for step in range(len(operations)):
+            if normalized_order == "input":
+                input_index = remaining.pop(0)
+            elif normalized_order == "min_span":
+                candidate_info = {
+                    index: self._measurement_span_info(
+                        operations[index][0],
+                        operations[index][1],
+                        absorb_basis=absorb_basis,
+                    )
+                    for index in remaining
+                }
+                input_index = min(
+                    remaining,
+                    key=lambda index: (
+                        candidate_info[index]["span"],
+                        candidate_info[index]["localizer_distance"],
+                        len(candidate_info[index]["frame_support"]),
+                        index,
+                    ),
+                )
+                remaining.remove(input_index)
+            else:
+                rank = {
+                    index: position
+                    for position, index in enumerate(normalized_order)
+                }
+                input_index = min(remaining, key=rank.__getitem__)
+                remaining.remove(input_index)
+
+            axis, qubit, forced = operations[input_index]
+            info = (
+                candidate_info[input_index]
+                if normalized_order == "min_span"
+                else self._measurement_span_info(
+                    axis,
+                    qubit,
+                    absorb_basis=absorb_basis,
+                )
+            )
+            if reset:
+                m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
+                outcome = self._absorb_measure(
+                    m_pauli,
+                    None,
+                    norm_event_kind="reset",
+                )
+            else:
+                outcome = self.measure(
+                    axis,
+                    qubit,
+                    outcome=forced,
+                    absorb_basis=absorb_basis,
+                )
+            if (reset or reset_after) and outcome < 0:
+                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+                self._record()
+            result[input_index] = int(outcome)
+            schedule.append({
+                "order": int(step),
+                "input_index": int(input_index),
+                "pauli": str(axis),
+                "qubit": int(qubit),
+                **info,
+            })
+
+        self.last_measurement_schedule = tuple(schedule)
+        return tuple(result)
+
+    def measure_many(
+        self,
+        measurements,
+        *,
+        order="min_span",
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
+    ):
+        """Measure independent single-qubit observables in a cheap span order.
+
+        ``order="min_span"`` is metadata-only: it reads current Tableau frame
+        supports and the logical-to-MPS layout, but never runs trial MPS
+        contractions or truncations.  Outcomes are returned in input order;
+        :attr:`last_measurement_schedule` records execution order and costs.
+        Use ``order="input"`` to preserve the supplied order, or pass an
+        explicit permutation of batch indices/target qubits.
+        """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
+        operations = self._normalize_measurement_batch(measurements)
+        result = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=absorb_basis,
+        )
+        return result[0] if len(result) == 1 else result
+
+    def measure(
+        self,
+        pauli,
+        where,
+        *,
+        outcome: Optional[int] = None,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
+    ):
         """Measure a Pauli observable, collapse ``|nu>``, and return ``+1``/``-1``.
 
         Parameters
@@ -4739,12 +6190,20 @@ class MpsStabOptimizer:
             the key primitive for magic-state injection (see :meth:`inject_t`).
             The default (``False``) keeps the cheaper fixed-basis projector
             ``(I +- M)/2`` applied directly to ``|nu>``.
+        disentangle : bool, optional
+            User-facing alias for ``absorb_basis``. If both names are supplied,
+            they must agree.
 
         Returns
         -------
         int
             The measured eigenvalue ``+1`` or ``-1``.
         """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         if absorb_basis:
             m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
             m = self._absorb_measure(
@@ -4781,7 +6240,7 @@ class MpsStabOptimizer:
         self.measurements.append(MeasurementRecord(pauli, where, int(m)))
         return m
 
-    def reset(self, where, basis="Z") -> "MpsStabOptimizer":
+    def reset(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
         """Reset qubit(s) to the ``+1`` eigenstate of ``basis``.
 
         Each target is measured with the basis-updating path (so it
@@ -4790,17 +6249,29 @@ class MpsStabOptimizer:
         ``basis="Z"`` form returns qubits to ``|0>``.  Available in a gate
         stream as ``("reset", where)`` or ``("reset", where, basis)``.  The
         internal measurements are *not* appended to :attr:`measurements` (a
-        reset is an operation, not a recorded readout).
+        reset is an operation, not a recorded readout).  By default, separate
+        targets are processed with the metadata-only ``min_span`` scheduler;
+        use ``order="input"`` to preserve their supplied order.
         """
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(basis, where, event="reset")
-        for axis, q in zip(axes, where):
-            m_pauli = self.state.frame_pauli(self._phys_pauli(axis, q))
-            m = self._absorb_measure(m_pauli, None, norm_event_kind="reset")
-            if m < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
-                self._record()
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "reset requires distinct target qubits so they can be safely "
+                "reordered."
+            )
+        operations = tuple((axis, q, None) for axis, q in zip(axes, where))
+        self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=True,
+            reset=True,
+        )
         return self
+
+    def reset_many(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
+        """Reset several independent qubits using the metadata-only span scheduler."""
+        return self.reset(where, basis=basis, order=order)
 
     def measure_reset(
         self,
@@ -4808,31 +6279,45 @@ class MpsStabOptimizer:
         where,
         *,
         outcome=None,
-        absorb_basis: bool = True,
+        absorb_basis: Optional[bool] = None,
+        disentangle: Optional[bool] = None,
+        order="min_span",
     ):
         """Measure target qubit(s), record outcomes, then reset to ``+pauli``.
 
         ``pauli`` is one X/Y/Z axis per target, or one axis broadcast across all
         targets.  Unlike :meth:`reset`, the measurement outcomes are appended to
-        :attr:`measurements`.  The default uses the basis-updating measurement
-        path so the reset target leaves the coefficient MPS compactly.
+        :attr:`measurements`.  The default uses the fixed-basis projector; pass
+        ``disentangle=True`` to use the basis-updating path so each reset target
+        leaves the coefficient MPS compactly.  Separate targets are processed
+        with the metadata-only ``min_span`` scheduler by default; use
+        ``order="input"`` to preserve their supplied order.  Returned outcomes
+        remain aligned with the input target order.
         """
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis,
+            disentangle,
+            default=False,
+        )
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
-        measured = []
-        for axis, q, forced in zip(axes, where, outcomes):
-            m = self.measure(
-                axis,
-                q,
-                outcome=forced,
-                absorb_basis=absorb_basis,
+        if len(set(where)) != len(where):
+            raise ValueError(
+                "measure_reset requires distinct target qubits so they can be "
+                "safely reordered."
             )
-            if m < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], q)
-                self._record()
-            measured.append(m)
-        return measured[0] if len(measured) == 1 else tuple(measured)
+        operations = tuple(
+            (axis, q, forced)
+            for axis, q, forced in zip(axes, where, outcomes)
+        )
+        measured = self._run_measurement_batch(
+            operations,
+            order=order,
+            absorb_basis=absorb_basis,
+            reset_after=True,
+        )
+        return measured[0] if len(measured) == 1 else measured
 
     def cap(self, where, vec, *, absorb="left") -> "MpsStabOptimizer":
         """Contract one physical qubit with ``vec`` and shorten the simulator.
@@ -4892,7 +6377,7 @@ class MpsStabOptimizer:
         self.state = STNState.from_tableau_and_state(tableau, p, dtype=self.dtype)
         self.backend_info()
         self._localizer_cache.clear()
-        self._invalidate_norm_infidelity()
+        self._invalidate_infidelity()
         self._record()
         return self
 
@@ -4928,19 +6413,33 @@ class MpsStabOptimizer:
         self._require_nonzero_state("measure")
         terms, sign = hermitian_pauli_terms(m_pauli)
         forced = self._validate_outcome(outcome)
+        support = sorted(terms)
+        if not support:  # M = +/- I: deterministic, state unchanged
+            if forced is not None and forced != sign:
+                raise ValueError(
+                    f"forced outcome {forced:+d} has zero probability for "
+                    f"the deterministic observable (expected {int(sign):+d})."
+                )
+            self._record()
+            return int(sign)
+        # Compute the Born probability before applying the localizing Clifford.
+        # The localizer is unitary in exact arithmetic, but its coefficient-MPS
+        # implementation can truncate at finite chi.  Sampling after that
+        # truncation would make the measurement distribution depend on the
+        # approximation used to localize the Pauli.
+        p_o_plus = self._outcome_probability(
+            self._pauli_expectation(terms, sign), +1
+        )
         if forced is not None:
-            probability = self._outcome_probability(
-                self._pauli_expectation(terms, sign), forced
-            )
+            probability = p_o_plus if forced > 0 else 1.0 - p_o_plus
             if probability <= 1e-12:
                 raise ValueError(
                     f"forced outcome {forced:+d} has ~0 probability "
                     f"({probability:.2e})."
                 )
-        support = sorted(terms)
-        if not support:  # M = +/- I: deterministic, state unchanged
-            self._record()
-            return int(sign)
+            m = forced
+        else:
+            m = 1 if self._rng.random() < p_o_plus else -1
         ops, v_tableau, k = self._localizing_clifford_cached(terms)
         conj_terms, s = hermitian_pauli_terms(v_tableau(m_pauli))  # V M V^dag
         if conj_terms != {k: "Z"}:  # pragma: no cover - localizer invariant
@@ -4952,24 +6451,26 @@ class MpsStabOptimizer:
         self._ensure_p_center()
         self._apply_localizer_to_p(ops)
         self.state.absorb_basis_clifford(v_tableau)
-        # Single-qubit ``Z_k`` expectation from the tracked canonical centre: this
-        # moves the centre to ``k`` and contracts only that site instead of the
-        # whole ``<p|Z_k|p>`` / ``<p|p>`` networks.
+        # The localizer should preserve the branch probability exactly, but a
+        # finite-chi approximation can change the localized state slightly.
+        # Keep the physical probability sampled above separate from the
+        # post-localizer probability used to isolate the final one-site
+        # projector's compression loss.
         zexp = float(np.real(self._to_scalar(
             self.state.p.local_expectation_canonical(
                 self._bk_const("PZ", pauli_matrix("Z")), self._mps_site(k),
                 normalized=True, info=self.state.info,
             )
         )))
-        p_o_plus = 0.5 * (1.0 + s * zexp)  # prob(outcome O = +1)
-        if forced is None:
-            m = 1 if self._rng.random() < p_o_plus else -1
-        else:
-            m = forced
+        projector_p_plus = self._outcome_probability(zexp, s)
         branch_probability = p_o_plus if m > 0 else 1.0 - p_o_plus
+        projector_branch_probability = (
+            projector_p_plus if m > 0 else 1.0 - projector_p_plus
+        )
         norm_event = self._make_norm_event(
             norm_event_kind,
             branch_probability=branch_probability,
+            projector_branch_probability=projector_branch_probability,
         )
         zval = m * s  # required Z_k eigenvalue (+1 -> |0>, -1 -> |1>)
         self._project_computational_site(
@@ -4980,28 +6481,43 @@ class MpsStabOptimizer:
         self._record()
         return m
 
+    def _cnot_submpo(self, control, target):
+        """Build a coefficient-frame sub-MPO for one localizer CNOT."""
+        control = int(control)
+        target = int(target)
+        branches = (
+            (0.5, {}),
+            (0.5, {control: "Z"}),
+            (0.5, {target: "X"}),
+            (-0.5, {control: "Z", target: "X"}),
+        )
+        return pauli_sum_submpo(branches, self.n, dtype=self.dtype)
+
     def _apply_localizer_to_p(self, ops) -> None:
-        """Apply the measurement's localizing Clifford to ``|nu>``."""
-        p = self.state.p
-        info = self.state.info
+        """Apply and track the measurement's localizing Clifford on ``|nu>``."""
         for name, targ in ops:
             mps_targ = self._mps_sites(targ)
             if name == "h":
                 # Unitary single-qubit Cliffords preserve the tracked centre.
-                p.gate_(self._bk_const("H", _H_MAT), mps_targ[0], contract=True)
-            elif name == "sdg":
-                p.gate_(self._bk_const("SDG", _SDG_MAT), mps_targ[0], contract=True)
-            elif name == "cnot":
-                cnot = self._bk_const("CNOT", _CNOT_MAT)
-                p.gate_(
-                    cnot,
-                    mps_targ,
-                    contract="swap+split",
-                    max_bond=self.chi,
-                    cutoff=self.cutoff,
-                    info=info,
-                    cur_orthog=info.get("cur_orthog"),
+                self.state.p.gate_(
+                    self._bk_const("H", _H_MAT), mps_targ[0], contract=True
                 )
+            elif name == "sdg":
+                self.state.p.gate_(
+                    self._bk_const("SDG", _SDG_MAT), mps_targ[0], contract=True
+                )
+            elif name == "cnot":
+                mpo, where = self._cnot_submpo(mps_targ[0], mps_targ[1])
+                infidelity = self._evolve_p(
+                    self._bk_mpo(mpo, warn=False),
+                    where,
+                    unitary=True,
+                    norm_event_kind="measurement_localizer",
+                )
+                # This is an internal localizer operation. Keep it in the
+                # compression ledger without adding an extra public-entry bond
+                # sample; the enclosing measurement records the final bond.
+                self._record(infidelity, record_bond=False)
 
     def _project_computational_site(
         self,
@@ -5020,7 +6536,7 @@ class MpsStabOptimizer:
         self.state.p.gate_(self._bk(proj), mps_k, contract=True, info=self.state.info)
         self.state.info["cur_orthog"] = (int(mps_k), int(mps_k))
         projected_norm = self._renorm_p_at(mps_k)
-        self._reset_norm_infidelity()
+        self._reset_infidelity()
         self._commit_norm_event(norm_event, projected_norm=projected_norm)
 
     def _apply_projector(
@@ -5045,7 +6561,7 @@ class MpsStabOptimizer:
             self.state.p.gate_(self._bk(proj), mps_q, contract=True, info=self.state.info)
             self.state.info["cur_orthog"] = (int(mps_q), int(mps_q))
             projected_norm = self._renorm_p_at(mps_q)
-            self._reset_norm_infidelity()
+            self._reset_infidelity()
             self._commit_norm_event(norm_event, projected_norm=projected_norm)
             self._record()
             return
@@ -5167,9 +6683,43 @@ class MpsStabOptimizer:
         *non-Clifford* and has ``phi`` a multiple of ``pi/4`` (so the injection
         correction is Clifford).  Clifford-angle ``Rz`` (multiple of ``pi/2``) is
         left for the free tableau path, and non-``pi/4`` angles for the normal
-        rotation path; both return ``None``.
+        rotation path; both return ``None``.  The matrix form also accepts
+        Pepsy's public gate constructors, e.g. ``(pepsy.t(), q)`` and
+        ``(pepsy.tdg(), q)``.  A global phase is ignored, as it is physically
+        irrelevant to the injection gadget.
         """
-        if not (isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], str)):
+        if not isinstance(entry, (list, tuple)) or not entry:
+            return None
+
+        # Pepsy's gate API represents T and T-dagger as explicit matrices, and
+        # ordinary MPS streams commonly use ``(gate, q)`` entries.  Classify a
+        # diagonal unitary by its relative phase rather than by object identity
+        # so qarrays, rank-4 gate tensors, and globally phased copies work too.
+        if not isinstance(entry[0], str):
+            if len(entry) != 2:
+                return None
+            try:
+                where = _normalize_sites(entry[1])
+                matrix = _as_gate_matrix(entry[0], 1)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if len(where) != 1 or matrix.shape != (2, 2) or not _is_unitary(matrix):
+                return None
+            scale = max(float(np.max(np.abs(matrix))), 1.0)
+            off_diagonal = matrix - np.diag(np.diag(matrix))
+            if not np.allclose(off_diagonal, 0.0, rtol=1e-8, atol=1e-9 * scale):
+                return None
+            diagonal = np.diag(matrix)
+            if min(abs(diagonal[0]), abs(diagonal[1])) <= 1e-12:
+                return None
+            relative_phase = diagonal[1] / diagonal[0]
+            k = np.angle(relative_phase) / (math.pi / 4)
+            nearest_k = int(round(k))
+            if abs(k - nearest_k) > 1e-8 or nearest_k % 2 == 0:
+                return None
+            return int(where[0]), nearest_k * (math.pi / 4)
+
+        if len(entry) < 2:
             return None
         name = entry[0].strip().lower()
         if name == "t":
@@ -5810,17 +7360,19 @@ class MpsStabOptimizer:
         approx_norm = float(self.norm())
         if target_norm <= 1.0e-15:
             fidelity = 1.0 if approx_norm <= 1.0e-15 else 0.0
+            infidelity = 1.0 - fidelity
         else:
-            fidelity = (approx_norm / target_norm) ** 2
-            fidelity = min(1.0, max(0.0, fidelity))
-        infidelity = float(1.0 - fidelity)
+            log_fidelity = log_fidelity_from_norms(approx_norm, target_norm)
+            fidelity = fidelity_from_log(log_fidelity)
+            infidelity = infidelity_from_log(log_fidelity)
         self._nonunitary_infidelities.append(infidelity)
         self._accumulate_norm_survival(fidelity)
-        self._invalidate_norm_infidelity()
+        self._invalidate_infidelity()
         return infidelity
 
     def _apply_matrix(self, gate: np.ndarray, where) -> None:
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
+        gate = _as_gate_matrix(gate, len(where))
         dim = gate.shape[0]
         nq = int(round(math.log2(dim)))
         if 2 ** nq != dim or gate.shape != (dim, dim):
@@ -5828,20 +7380,13 @@ class MpsStabOptimizer:
         if len(where) != nq:
             raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
 
-        import stim
-
         # NOTE: stim.Tableau.from_unitary_matrix does NOT verify unitarity, so a
         # non-unitary matrix that happens to be close to a Clifford (e.g. the
         # near-identity weighted "coin" (1-p)I + pX) would be silently accepted
         # as that Clifford and misapplied. Only attempt the tableau route when the
         # gate is actually unitary.
-        tableau = None
+        tableau = _tableau_from_exact_unitary(gate)
         gate_is_unitary = _is_unitary(gate)
-        if gate_is_unitary:
-            try:
-                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-            except (ValueError, RuntimeError):
-                tableau = None
 
         if tableau is not None:  # Clifford -> tableau update
             self.state.do_tableau(tableau, where)
@@ -5877,6 +7422,16 @@ class MpsStabOptimizer:
         k = len(where)
         # Validate support before either the complexity guard or decomposition.
         pauli_string(("I",) * k, where, self.n)
+        if k == 4:
+            warnings.warn(
+                "Applying a 4-qubit dense physical gate requires a 256-term "
+                "Pauli decomposition; this is deliberately expensive and is "
+                "preferably expressed as smaller supported gates. The default "
+                "max_pauli_decomposition_qubits=3 will reject it unless the "
+                "limit is raised explicitly.",
+                UserWarning,
+                stacklevel=3,
+            )
         limit = self.max_pauli_decomposition_qubits
         if limit is not None and k > limit:
             raise ValueError(
@@ -5954,7 +7509,7 @@ class MpsStabOptimizer:
             return self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True)
         self._evolve_p(self._bk_mpo(mpo, warn=False), where)
         if target_norm is None:
-            self._invalidate_norm_infidelity()
+            self._invalidate_infidelity()
             return None
         return self._nonunitary_compression_infidelity(target_norm)
 
@@ -5971,13 +7526,25 @@ class MpsStabOptimizer:
         """
         p = self.state.p
         branches = tuple(branches)
+        before_norm_sq = (
+            self._norm_squared()
+            if unitary and self._infidelity_valid
+            else None
+        )
         if not branches or self._norm_squared() <= 0.0:
             self._set_zero_coefficient_state()
             if unitary:
-                return self._unitary_norm_infidelity()
+                observed_infidelity = self._unitary_infidelity()
+                self._record_compression_norm_event(
+                    before_norm_sq,
+                    observed_infidelity,
+                )
+                infidelity = self._current_infidelity
+                self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
+                return infidelity
             if target_norm is not None:
                 return self._nonunitary_compression_infidelity(target_norm)
-            self._invalidate_norm_infidelity()
+            self._invalidate_infidelity()
             return None
 
         def combine(left, right, max_bond):
@@ -6029,10 +7596,17 @@ class MpsStabOptimizer:
             # compress() leaves the rebuilt MPS canonical with the centre at site 0.
             self.state.info["cur_orthog"] = (0, 0)
         if unitary:
-            return self._unitary_norm_infidelity()
+            observed_infidelity = self._unitary_infidelity()
+            self._record_compression_norm_event(
+                before_norm_sq,
+                observed_infidelity,
+            )
+            infidelity = self._current_infidelity
+            self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
+            return infidelity
         if target_norm is not None:
             return self._nonunitary_compression_infidelity(target_norm)
-        self._invalidate_norm_infidelity()
+        self._invalidate_infidelity()
         return None
 
     def _set_zero_coefficient_state(self) -> None:
@@ -6093,7 +7667,7 @@ class MpsStabOptimizer:
             mpo.retag_(retag_to_final)
         return mpo
 
-    def _apply_submpo(self, mpo, where) -> None:
+    def _apply_submpo(self, mpo, where, *, _validate_backend=True) -> None:
         """Apply a user MPO to the coefficient MPS ``p`` (coefficient frame).
 
         The MPO acts directly on ``p`` (any MPO, unitary or not); it is *not*
@@ -6103,22 +7677,32 @@ class MpsStabOptimizer:
         logical_where = _normalize_sites(where)
         mps_where = self._mps_sites(logical_where)
         mapped_mpo = self._copy_submpo_for_layout(mpo, logical_where)
-        self._evolve_p(self._bk_mpo(mapped_mpo), mps_where)
-        self._invalidate_norm_infidelity()
+        if _validate_backend:
+            mapped_mpo = self._bk_mpo(mapped_mpo)
+        self._evolve_p(mapped_mpo, mps_where)
+        self._invalidate_infidelity()
         self._record()
 
     # ------------------------------------------------------------------ #
     # Bookkeeping
     # ------------------------------------------------------------------ #
-    def _record(self, infidelity: Optional[float] = None) -> None:
+    def _record(
+        self,
+        infidelity: Optional[float] = None,
+        *,
+        record_bond: bool = True,
+    ) -> None:
+        """Record a public update and optionally its bond-history sample."""
         if infidelity is not None:
             self._norm_segment_open = True
             self.infidelities.append(float(infidelity))
-        self.bond_history.append(self.state.max_bond())
+        if record_bond:
+            self.bond_history.append(self.state.max_bond())
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
             f"MpsStabOptimizer(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
+            f"fit_init_strategy={self.fit_init_strategy!r}, "
             f"operator_tol={self.operator_tol}, "
             f"max_pauli_decomposition_qubits="
             f"{self.max_pauli_decomposition_qubits}, "
@@ -6385,12 +7969,6 @@ def _looks_like_stream(gates) -> bool:
         return False
     # First element is a str/number -> ``gates`` is a single named entry.
     return False
-
-
-def _is_unitary(gate: np.ndarray, tol: float = 1e-9) -> bool:
-    """Return whether ``gate`` is unitary within ``tol``."""
-    g = np.asarray(ar.to_numpy(gate), dtype=complex)
-    return np.allclose(g.conj().T @ g, np.eye(g.shape[0]), atol=tol)
 
 
 def _zyz_angles(gate: np.ndarray):

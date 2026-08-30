@@ -1,10 +1,26 @@
 # PEPO cluster expansion
 
-`pepsy.operators.cluster` is the dense square-lattice implementation of the
-connected-cluster PEPO construction. `ClusterExpansionPlan` caches lattice
-directions and cluster-orbit bookkeeping so different beta values do not
-rebuild geometry. `ActivePEPOBlocks` stores only nonzero virtual-sector
-blocks; `to_pepo()` is the explicit dense materialization boundary.
+`pepsy.operators.pepo_cluster` contains two construction layers. The legacy
+`ClusterExpansionPlan` is the dense square-lattice implementation of the
+connected-cluster PEPO construction. `GraphClusterExpansionPlan` handles an
+arbitrary finite `ClusterLattice` with one virtual bond per graph edge and
+returns `GraphActivePEPOBlocks`, which materialize as a generic Quimb tensor
+network because Quimb's `PEPO` wrapper is square-lattice-only.
+
+The dense/geometry implementation is in `pepsy.operators.pepo_dense`; the
+legacy `pepsy.operators.cluster` module is only a compatibility facade.
+Shared planner lookup is exposed through `pepsy.operators.pepo_geometry`.
+Active blocks are implemented in `pepsy.operators.pepo_active`, the
+fixed-channel basis in `pepsy.operators.pepo_basis`, and ordered products in
+`pepsy.operators.pepo_product`.
+The PEPO family is separate from both the paper-style higher-order MPO facade
+and the MPO product implementation in `pepsy.operators.mpo_product`.
+
+`ClusterExpansionPlan` caches lattice directions and cluster-orbit bookkeeping
+so different beta values do not rebuild geometry. Both active-block types
+store only nonzero virtual-sector blocks; `to_pepo()` is the explicit dense
+materialization boundary for square tensors, while graph blocks use
+`to_tensor_network()`.
 
 `generate_connected_cluster_shapes()` is the value-independent geometry
 inventory for the next implementation stage. It recursively enumerates
@@ -101,6 +117,30 @@ small-system boundary. Use `basis.exp(step, ...)` for one-off calls or
 plaquette-loop orders 1–4; PEPO–PEPS contractions remain outside this
 operator-construction API.
 
+`PEPOClusterProductExpansion` is the joint ordered-residual path. It retains
+the supplied `A`, `B`, `C`, ... objects as local Hamiltonian sources, and for
+each connected spatial cluster `S` forms
+`W_S = exp(A_S) @ exp(B_S) @ exp(C_S) @ ...` before subtracting products of
+lower connected residuals. The resulting channels are assembled once into one
+PEPO. It never constructs an independent full-lattice PEPO for each factor.
+This is the same local-residual definition used by the MPO cluster engine;
+only the final tensor topology differs. All factors must share the lattice,
+symmetry policy, and cluster order. `cache_info["joint_cluster_residual"]`
+records this construction invariant.
+
+## Cluster order and dimension accounting
+
+The cluster order `p` is a joint spatial cutoff, not a factor index. For
+local physical dimension `d`, a `p`-site dense cluster target has matrix shape
+`(d**p, d**p)` and `d**(2*p)` operator coefficients. Thus the local work is
+exponential in `p`, while for fixed `p` the number of cluster embeddings grows
+with the lattice size rather than with the full Hilbert-space dimension
+`d**N`. The PEPO bond dimension is the accumulated rank of the connected
+residual channels and their graph-history sectors; it does not multiply three
+full factor-PEPO bond dimensions. Use the smallest `p` that resolves the
+desired spatial correlations, and use optional compression only as a further
+bond-rank approximation.
+
 The dense path supports orders five through nine through a separate recursive
 generic stage. For each level it contracts the already-built lower-order
 active PEPO on each candidate support with zero boundary sectors, subtracts
@@ -111,8 +151,8 @@ This keeps the residual definition aligned with the actual Quimb PEPO rather
 than an idealized inclusion-exclusion formula. `ClusterModelAdapter` and
 `build_model_cluster_expansion_pepo` provide finite dense Ising, Heisenberg,
 XXZ, and custom local-term entry points. The fixed-channel Pauli path still
-covers tree and plaquette-loop orders 1–4; native Symmray solving and
-infinite/unit-cell evolution remain separate future subsystems.
+covers tree and plaquette-loop orders 1–4; native Symmray solving and graded
+fermionic MPO histories remain separate future subsystems.
 
 `build_real_time_cluster_expansion_pepo()` is the coefficient-dependent dense
 entry point. It assembles weighted local terms before forming the complex
@@ -129,6 +169,13 @@ it does not choose projectors from the environment of the full PEPO. The
 report separates these attempts as `generic_loop_solved` and
 `generic_loop_rank`; `loop_rank` remains the overall report, including the
 explicit four-site plaquette history rank.
+
+`ClusterInternalSymmetry` is an explicit validation/metadata boundary for
+neutral `U1`, `Z2`, `U1U1`, and `Z2Z2` terms. It is intentionally separate from
+geometric C4 orbit reduction. Dense SVDs are not treated as native graded
+factorizations; explicit virtual charges are still required for Symmray
+conversion, and fermionic graded solving remains in the native fermion
+subsystem.
 
 The BP loop-cluster API is intentionally not part of this operator builder.
 `pepsy.bp.loop_cluster_expand()` expands a tensor-network contraction around

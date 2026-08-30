@@ -17,17 +17,20 @@ The public simulator types are exported at top level (`import pepsy`); see
 
 - **Create a simulator**: `sim = pepsy.StabilizerMpsSimulator(n, gates=None, chi=None,
   cutoff=1e-12, operator_tol=None, max_pauli_decomposition_qubits=2,
-  track_infidelity=False, exact_cooling=True, seed=None, to_backend=None)`. It owns an
+  exact_cooling=True, stabilize_unitary=False, seed=None, to_backend=None)`. It owns an
   `STNState`; `sim.p` / `sim.state.p` is the coefficient MPS and `sim.nu` is an alias.
   `MpsStabOptimizer` is the compatibility alias for the same class. `STNState`
   constructs the initial product MPS with `pepsy.ps_to_mps(n)`.
 - **Exact/approximate control**:
   - `chi=None` is exact evolution; keep a small `cutoff` to remove numerically redundant
     Schmidt values introduced by bond-dimension-2 operators.
-  - `chi=cap` bounds the coefficient bond. Add `track_infidelity=True` to record cumulative
-    `1 - ||p||^2` after compressed unitary updates. The norm comes from the tracked
-    canonical centre, with no uncapped target or overlap contraction. Non-unitary updates
-    emit no sample. Read `.infidelities` and `.bond_history`, but do not align or zip them:
+  - `chi=cap` bounds the coefficient bond. Fidelity tracking is automatic and records
+    local and cumulative compression survival after compressed unitary updates. The norm
+    comes from the tracked canonical centre, with no uncapped target or overlap
+    contraction. `stabilize_unitary=True` restores the pre-compression working norm after
+    recording the same ledger; it does not make the fidelity loss disappear. Non-unitary
+    updates emit no unitary sample. Read `.infidelities` and `.bond_history`, but do not
+    align or zip them:
     the former is sparse while the latter records ordinary simulator bookkeeping.
 - **Named physical stream entries**:
   - Clifford: `("h"|"s"|"sdg"|"x"|"y"|"z", q)`,
@@ -148,8 +151,9 @@ The public simulator types are exported at top level (`import pepsy`); see
   reset, and normalized Kraus-trajectory boundaries, including the Born
   `branch_probability` and the actual `projected_norm_sq` before normalization; compare it
   to `pre_norm_sq * branch_probability` for the separate compression-survival proxy.
-  Prefer `norm_diagnostics()["norm_infidelity"]`, `["norm_survival"]`, and `["norm"]`;
-  the older `total_*_proxy` keys remain compatibility aliases. `geometric_mean_norm`
+  Prefer `norm_diagnostics()["cumulative_infidelity"]`, `["norm_survival"]`, and
+  `["norm"]`; the older `total_*_proxy` keys remain compatibility aliases.
+  `geometric_mean_norm`
   is only a per-segment average.
   Never sum `.infidelities`: each sample is already cumulative for its segment.
   `.measurements` stores tuple-compatible `MeasurementRecord` objects; `.norm_events`,
@@ -235,9 +239,9 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   compression is reported separately in `.norm_events` as `projector_infidelity`, while
   physical measurement probabilities remain separate. A normalized selected Kraus branch
   likewise closes the current segment and starts a fresh one; it must not leave the proxy
-  invalid. STN progress reports a compact stream `part` label and `norm_infidelity`;
-  use `norm = sqrt(norm_survival)` from `norm_diagnostics()` when the norm-survival
-  summary is needed programmatically.
+  invalid. STN progress reports a compact stream `part` label and `infidelity`.
+  Use `norm = sqrt(cumulative_fidelity)` only for the retained-compression proxy;
+  the live represented norm is reported separately by `norm_diagnostics()`.
   Validate physical accuracy independently against dense evolution on small systems.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 

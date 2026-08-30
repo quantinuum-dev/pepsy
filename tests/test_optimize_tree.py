@@ -11,6 +11,7 @@ import pepsy
 
 from pepsy.optimizers.tree import (
     TreeLayoutFinder,
+    TreeMPO,
     TreeOptimizer,
     TreePlan,
     TreeTensorNetwork,
@@ -19,6 +20,70 @@ from pepsy.optimizers.tree.optimizer import _contract_two_tensors
 from pepsy.optimizers.tree.ttn import _native_qr_block_scaled
 
 
+def test_tree_mpo_higher_order_term_routes_and_replays_natively():
+    """A dense higher-order TreeMPO applies without chain-MPO lowering."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    rng = np.random.default_rng(42)
+    term = rng.normal(size=(2,) * 8) + 1j * rng.normal(size=(2,) * 8)
+    operator = TreeMPO.from_terms(
+        plan,
+        {(3, 0, 2, 1): term},
+        compress=True,
+        cutoff=0.0,
+    )
+
+    assert operator.max_bond() > 1
+    assert operator.tree_network.pepsy_tree_operator_is_ttno is True
+    support = (3, 0, 2, 1)
+    order = tuple(sorted(range(4), key=support.__getitem__))
+    reference = term.transpose(order + tuple(axis + 4 for axis in order))
+    np.testing.assert_allclose(operator.to_dense(), reference.reshape(16, 16))
+    operator.canonicalize(center=plan.root)
+    assert operator.is_canonical_form()
+    assert operator.validate(check_canonical=True) is operator
+    operator.compress(
+        max_bond=None,
+        cutoff=0.0,
+    )
+    assert operator.validate() is operator
+    np.testing.assert_allclose(operator.to_dense(), reference.reshape(16, 16))
+
+    initial = np.zeros(16, dtype=complex)
+    initial[0] = 1.0
+    optimizer = TreeOptimizer(
+        None,
+        n=4,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        run=False,
+    )
+    optimizer.apply_subtreempo(operator, track_norm=False)
+
+    np.testing.assert_allclose(
+        optimizer.to_dense(),
+        operator.to_dense() @ initial,
+        rtol=1e-11,
+        atol=1e-11,
+    )
+    assert optimizer.tn.is_canonical_form()
+    assert optimizer.tn.validate_isometry_metadata() is optimizer.tn
+
+    streamed = TreeOptimizer(
+        [TreeOptimizer.subtreempo_event(operator)],
+        n=4,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        run=False,
+    )
+    streamed.run()
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        optimizer.to_dense(),
+        rtol=1e-11,
+        atol=1e-11,
+    )
 # -- exact statevector reference ----------------------------------------------
 
 
@@ -187,14 +252,178 @@ def test_tree_cutoff_mode_controls_edge_truncation_and_copy():
     assert relative_sum2.copy().cutoff_mode == "rsum2"
 
 
-def test_tree_cutoff_defaults_match_quimb_open_mps_submpo_path():
-    """TreeOptimizer defaults match Quimb's open-chain MPO compression."""
+def test_tree_cutoff_defaults_are_dtype_aware():
+    """TreeOptimizer defaults resolve from the default complex128 state."""
     opt = TreeOptimizer(None, n=2, run=False)
 
-    assert opt.cutoff == pytest.approx(1e-10)
+    assert opt.cutoff == pytest.approx(1e-12)
     assert opt.cutoff_mode == "rsum2"
-    assert opt.copy().cutoff == pytest.approx(1e-10)
+    assert opt.copy().cutoff == pytest.approx(1e-12)
     assert opt.copy().cutoff_mode == "rsum2"
+
+
+def test_tree_dm_compression_uses_the_fused_operator_state_network():
+    """DM mode changes the local truncating decomposition, not routing."""
+    plan = TreePlan.from_order(range(2), structure="balanced", top_arity=2)
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    stream = [(hadamard, 0), (cnot, (0, 1))]
+
+    direct = TreeOptimizer(
+        stream,
+        n=2,
+        tree=plan,
+        chi=1,
+        cutoff=0.0,
+        compression_mode="direct",
+    )
+    dm = TreeOptimizer(
+        stream,
+        n=2,
+        tree=plan,
+        chi=1,
+        cutoff=0.0,
+        compression_mode="dm",
+    )
+
+    np.testing.assert_allclose(direct.to_dense(), dm.to_dense(), atol=1e-10)
+    assert dm.compression_mode == "dm"
+    assert dm.copy().compression_mode == "dm"
+    assert dm.tn.validate(check_canonical=True) is dm.tn
+
+
+def test_tree_dm_mode_is_a_shorthand_for_direct_routing():
+    opt = TreeOptimizer(None, n=2, mode="dm", run=False)
+
+    assert opt.mode == "auto"
+    assert opt.compression_mode == "dm"
+
+
+@pytest.mark.parametrize(
+    ("mode", "normalized", "compression"),
+    [
+        ("tree_mpo_direct", "tree_mpo_direct", "direct"),
+        ("tree-mpo-dm", "tree_mpo_dm", "dm"),
+        ("tree_mpo_dem", "tree_mpo_dm", "dm"),
+        ("tree_mpo", "tree_mpo_direct", "direct"),
+    ],
+)
+def test_tree_mpo_modes_normalize_to_explicit_tree_routes(
+    mode, normalized, compression,
+):
+    """TreeMPO mode names retain both their route and compression contract."""
+    opt = TreeOptimizer(None, n=2, mode=mode, run=False)
+
+    assert opt.mode == normalized
+    assert opt.compression_mode == compression
+
+
+def test_tree_mpo_gate_modes_use_tree_mpo_not_chain_submpo(monkeypatch):
+    """Named TreeMPO modes use the active TreePlan span, never a chain MPO."""
+    rng = np.random.default_rng(921)
+    support = (0, 3, 7)
+    gate = _rand_unitary(len(support), rng)
+    opt = TreeOptimizer(
+        None,
+        n=8,
+        chi=64,
+        cutoff=0.0,
+        mode="tree_mpo_direct",
+        profile=True,
+        run=False,
+    )
+    routed = []
+    apply_subtreempo = opt.apply_subtreempo
+
+    def traced_apply_subtreempo(tree_mpo, *args, **kwargs):
+        routed.append(tree_mpo)
+        return apply_subtreempo(tree_mpo, *args, **kwargs)
+
+    def no_chain_mpo(*args, **kwargs):
+        raise AssertionError("TreeMPO gate route used a chain sub-MPO")
+
+    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    monkeypatch.setattr(qtn.MatrixProductOperator, "from_dense", no_chain_mpo)
+    opt.apply_gate(gate, support)
+
+    assert routed
+    assert isinstance(routed[0], TreeMPO)
+    path_events = [
+        event.get("kind") == "gate_factorization"
+        and event.get("route") == "treempo"
+        for event in opt.profile_events
+    ]
+    assert any(path_events)
+    metadata = [
+        event for event in opt.profile_events
+        if event.get("kind") == "metadata_path"
+        and event.get("route") == "subtreempo"
+    ]
+    assert metadata
+    assert metadata[-1]["support"] == support
+    assert metadata[-1]["subtree_nodes"] == len(
+        opt._steiner_nodes([opt.plan.node_of_qubit[q] for q in support])
+    )
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_direct_gate_mode_stays_dense_for_four_qubits(monkeypatch):
+    """The bounded direct route does not promote a four-qubit gate to TreeMPO."""
+    rng = np.random.default_rng(922)
+    opt = TreeOptimizer(None, n=6, chi=64, cutoff=0.0, mode="direct", run=False)
+
+    def unexpected_tree_mpo(*args, **kwargs):
+        raise AssertionError("direct gate route unexpectedly built a TreeMPO")
+
+    monkeypatch.setattr(opt, "_apply_gate_tree_mpo_impl", unexpected_tree_mpo)
+    opt.apply_gate(_rand_unitary(4, rng), (0, 2, 4, 5))
+
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_direct_gate_mode_rejects_wider_dense_gate():
+    """Wide dense gates provide an actionable TreeMPO route recommendation."""
+    opt = TreeOptimizer(None, n=5, mode="direct", run=False)
+
+    with pytest.raises(ValueError, match="tree_mpo_direct"):
+        opt.apply_gate(np.eye(32, dtype=complex), tuple(range(5)))
+
+
+def test_tree_mpo_run_mode_updates_route_and_compression():
+    """run(mode=...) persists the combined TreeMPO mode contract."""
+    opt = TreeOptimizer(None, n=3, mode="direct", run=False)
+
+    opt.run(mode="tree-mpo-dm")
+    assert opt.mode == "tree_mpo_dm"
+    assert opt.compression_mode == "dm"
+
+    opt.run(mode="tree_mpo_direct")
+    assert opt.mode == "tree_mpo_direct"
+    assert opt.compression_mode == "direct"
+
+
+def test_tree_mpo_dm_uses_density_matrix_compression_after_tree_routing():
+    """The TreeMPO density-matrix mode reaches the tree compression core."""
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        [(hadamard, 0), (cnot, (0, 1))],
+        n=2,
+        chi=1,
+        cutoff=0.0,
+        mode="tree_mpo_dm",
+        track_truncation=True,
+    )
+
+    assert opt.compression_mode == "dm"
+    assert any(event["kind"] == "compress" for event in opt.truncation_history)
+    assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
 def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
@@ -218,6 +447,29 @@ def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
 
     assert checked
     assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_dense_thread_hops_use_explicitly_lossless_qr(monkeypatch):
+    """Geodesic threading never inherits Quimb's truncating cutoff default."""
+    import quimb.tensor.tensor_core as qtc
+
+    rng = np.random.default_rng(9191)
+    calls = []
+    tensor_split = qtc.tensor_split
+
+    def traced_tensor_split(*args, **kwargs):
+        if kwargs.get("method") == "qr":
+            calls.append(dict(kwargs))
+        return tensor_split(*args, **kwargs)
+
+    monkeypatch.setattr(qtc, "tensor_split", traced_tensor_split)
+    opt = TreeOptimizer(
+        None, n=8, chi=64, cutoff=1e-10, mode="direct", run=False,
+    )
+    opt.apply_2q(_rand_unitary(2, rng), 0, 7)
+
+    assert calls
+    assert all(call["cutoff"] == 0.0 for call in calls)
 
 
 @pytest.mark.parametrize("mode", ("direct", "mpo", "submpo"))
@@ -676,6 +928,55 @@ def test_tree_truncation_infidelity_compatibility_trace():
     assert opt.get_normalizations() == []
 
 
+def test_tree_norm_ledger_is_independent_of_spectrum_tracking():
+    """Tree norm fidelity remains available without per-edge SVD probes."""
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        [(h, 0), (cnot, (0, 3))],
+        n=4,
+        chi=1,
+        track_truncation=False,
+    )
+
+    diagnostics = opt.norm_diagnostics()
+    assert diagnostics["norm_tracking"] is True
+    assert diagnostics["truncation_tracking"] is False
+    removed_metric_names = {
+        "norm_fidelity_raw",
+        "norm_fidelity",
+        "norm_infidelity",
+        "local_norm_fidelity",
+        "local_norm_infidelity",
+        "cumulative_norm_fidelity",
+        "cumulative_norm_infidelity",
+    }
+    assert removed_metric_names.isdisjoint(diagnostics)
+    assert removed_metric_names.isdisjoint(opt.get_norm_events()[0])
+    assert diagnostics["cumulative_fidelity"] == pytest.approx(0.5)
+    assert diagnostics["cumulative_infidelity"] == pytest.approx(0.5)
+    assert len(opt.get_norm_events()) == 2
+    assert opt.get_infidelity_samples() == []
+
+
+def test_tree_norm_ledger_can_exclude_known_nonunitary_updates():
+    """Physical filter scale must not be labeled retained compression loss."""
+    filter_gate = np.diag([1.0, 0.25]).astype(complex)
+    opt = TreeOptimizer(None, n=2, chi=1, track_truncation=False, run=False)
+
+    opt.apply_subtree_operator(filter_gate, (0,), track_norm=False)
+
+    assert opt.get_norm_events() == []
+    assert opt.norm_diagnostics()["cumulative_fidelity"] is None
+
+    opt.apply_1q(np.eye(2, dtype=complex), 0)
+    assert len(opt.get_norm_events()) == 1
+    assert opt.get_norm_events()[0]["local_fidelity"] == pytest.approx(1.0)
+
+
 def test_tree_truncation_survival_accumulates_in_log_space():
     """Many local survival factors remain stable in the cumulative trace."""
     opt = TreeOptimizer(None, n=2, chi=2, track_truncation=True, run=False)
@@ -994,6 +1295,350 @@ def test_tree_layout_accepts_explicit_fixed_site_order():
     assert tuple(plan.qubit_of_leaf.values()) == order
     assert plan.top_arity == 3
     assert plan.is_binary()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "row-major",
+        "col-major",
+        "snake",
+        "snake-row-major",
+        "folded-snake",
+        "folded-snake-row-major",
+        "hilbert",
+        "hilbert-row-major",
+    ],
+)
+def test_tree_layout_finder_supports_onedmap_lattice_presets(mode):
+    """Named Tree presets preserve the corresponding OneDMap leaf traversal."""
+    Lx = Ly = 4
+    finder = TreeLayoutFinder(
+        [],
+        n=Lx * Ly,
+        structure="quality",
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(Lx, Ly),
+    )
+    one_d_to_lattice, _ = pepsy.OneDMap.build(Lx, Ly, mode=mode)
+    expected = tuple(x * Ly + y for x, y in one_d_to_lattice.values())
+
+    plan = finder.run(order=mode)
+
+    assert plan.mpo_order() == expected
+
+
+def test_tree_layout_aliases_match_onedmap_hilbert_orientation():
+    """Tree aliases preserve both rectangular generalized-Hilbert orientations."""
+    finder = TreeLayoutFinder(
+        [],
+        n=15,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(3, 5),
+    )
+    expected = {
+        mode: tuple(x * 5 + y for x, y in pepsy.OneDMap.build(
+            3, 5, mode="hilbert-row-major" if "row" in mode else "hilbert",
+        )[0].values())
+        for mode in ("hilbert-row", "hilbert-row-major", "hilbert")
+    }
+
+    assert finder.run(order="hilbert-row").mpo_order() == expected["hilbert-row"]
+    assert finder.run(order="hilbert-row-major").mpo_order() == expected[
+        "hilbert-row-major"
+    ]
+    assert finder.run(order="hilbert").mpo_order() == expected["hilbert"]
+    assert expected["hilbert-row"] != expected["hilbert"]
+
+
+@pytest.mark.parametrize("mode", [
+    "row-major",
+    "col-major",
+    "snake",
+    "snake-row-major",
+    "folded-snake",
+    "folded-snake-row-major",
+    "hilbert",
+    "hilbert-row-major",
+])
+@pytest.mark.parametrize("shape", [(3, 5), (5, 3), (1, 7), (2, 5)])
+def test_tree_geometric_order_is_preserved_at_every_hierarchy_layer(
+    mode, shape,
+):
+    """Geometric trees coarsen adjacent OneDMap intervals at every level."""
+    Lx, Ly = shape
+    n = Lx * Ly
+    finder = TreeLayoutFinder(
+        [],
+        n=n,
+        max_arity=2,
+        top_arity=3,
+        lattice_shape=shape,
+    )
+    expected = tuple(
+        x * Ly + y
+        for x, y in pepsy.OneDMap.build(Lx, Ly, mode=mode)[0].values()
+    )
+    plan = finder.run(order=mode)
+
+    assert plan.mpo_order() == expected
+    masks = plan.subtree_qubit_masks()
+    positions = {qubit: i for i, qubit in enumerate(expected)}
+
+    # Every internal node must partition one contiguous path interval into
+    # consecutive child intervals. This includes the top layer, rather than
+    # checking only the leaf MPO order.
+    for node, children in plan.children.items():
+        if len(children) < 2:
+            continue
+        intervals = []
+        for child in children:
+            child_positions = sorted(
+                positions[q]
+                for q in range(n)
+                if masks[child] & (1 << q)
+            )
+            intervals.append((child_positions[0], child_positions[-1]))
+            assert child_positions == list(
+                range(child_positions[0], child_positions[-1] + 1)
+            )
+        assert intervals[0][0] == min(interval[0] for interval in intervals)
+        for previous, current in zip(intervals, intervals[1:]):
+            assert previous[1] + 1 == current[0]
+
+    # These cases are large enough to exercise the root plus multiple middle
+    # layers; the top children must themselves be non-leaf subtrees.
+    assert len(plan.children[plan.root]) == 3
+    assert all(plan.children[child] for child in plan.children[plan.root])
+
+
+def test_tree_lattice_order_helper_and_missing_shape_error():
+    """Tree geometric orders are reusable and require an explicit shape."""
+    expected = (0, 2, 4, 1, 3, 5)
+    assert TreeLayoutFinder.lattice_order(
+        2, 3, "row-major", site=lambda x, y: y * 2 + x,
+    ) == expected
+
+    finder = TreeLayoutFinder([], n=4)
+    with pytest.raises(ValueError, match="lattice_shape"):
+        finder.run(order="hilbert")
+
+
+def test_tree_alternating_lattice_orders_and_coarse_blocks():
+    """Coarse presets traverse complete blocks before moving to the next."""
+    shape = (4, 3)
+    row_alternate = TreeLayoutFinder.lattice_order(
+        *shape, "alternate-x"
+    )
+    col_alternate = TreeLayoutFinder.lattice_order(
+        *shape, "alternate-y"
+    )
+    assert row_alternate == (0, 3, 6, 9, 10, 7, 4, 1, 2, 5, 8, 11)
+    assert col_alternate == (0, 1, 2, 5, 4, 3, 6, 7, 8, 11, 10, 9)
+
+    coarse_row = TreeLayoutFinder.lattice_order(
+        *shape, "coarse-row-major", grain=(2, 1)
+    )
+    assert coarse_row == (0, 3, 1, 4, 2, 5, 6, 9, 7, 10, 8, 11)
+
+    coarse_y = TreeLayoutFinder.lattice_order(
+        *shape, "coarse-alternate-y", grain=(1, 2)
+    )
+    assert coarse_y == col_alternate
+
+    for mode in (
+        "coarse-row-major",
+        "coarse-col-major",
+        "coarse-snake",
+        "coarse-snake-row-major",
+        "coarse-folded-snake",
+        "coarse-folded-snake-row-major",
+        "coarse-hilbert",
+        "coarse-hilbert-row-major",
+    ):
+        order = TreeLayoutFinder.lattice_order(
+            5, 4, mode, grain=(2, 2)
+        )
+        assert len(order) == 20
+        assert set(order) == set(range(20))
+
+        coords = [(q // 4, q % 4) for q in order]
+        blocks = [(x // 2, y // 2) for x, y in coords]
+        block_runs = []
+        start = 0
+        while start < len(blocks):
+            block = blocks[start]
+            end = start + 1
+            while end < len(blocks) and blocks[end] == block:
+                end += 1
+            block_runs.append(block)
+            assert all(current == block for current in blocks[start:end])
+            start = end
+        assert len(block_runs) == 6
+        assert len(set(block_runs)) == 6
+
+
+def test_tree_coarse_order_handoff_and_validation():
+    """TreeOptimizer and finder diagnostics retain coarse-layout settings."""
+    finder = TreeLayoutFinder(
+        [],
+        n=12,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(4, 3),
+        order="coarse-alternate-x",
+        coarse_grain=(2, 1),
+    )
+    plan = finder.run()
+    assert plan.mpo_order() == (0, 3, 6, 9, 10, 7, 4, 1, 2, 5, 8, 11)
+    assert finder.report(plan)["coarse_grain"] == (2, 1)
+
+    forwarded = TreeOptimizer.find_tree_layout(
+        [],
+        n=12,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=(4, 3),
+        order="coarse-row-major",
+        coarse_grain=2,
+    )
+    assert forwarded.mpo_order() == (0, 3, 1, 4, 2, 5, 6, 9, 7, 10, 8, 11)
+
+    with pytest.raises(ValueError, match="coarse_grain"):
+        TreeLayoutFinder.lattice_order(
+            4, 3, "coarse-snake", grain=(0, 1)
+        )
+
+
+def test_tree_3d_lattice_orders_support_axis_alternation():
+    """Tree presets preserve the shared 3D OneDMap traversal vocabulary."""
+    shape = (3, 2, 2)
+    size = np.prod(shape)
+    coords = {
+        q: (q // (shape[1] * shape[2]),
+            (q // shape[2]) % shape[1],
+            q % shape[2])
+        for q in range(size)
+    }
+    for mode in (
+        "row-major",
+        "col-major",
+        "snake",
+        "snake-row-major",
+        "alternate-x",
+        "alternate-y",
+        "alternate-z",
+    ):
+        expected = tuple(
+            x * shape[1] * shape[2] + y * shape[2] + z
+            for x, y, z in pepsy.OneDMap.build(
+                *shape[:2], Lz=shape[2], mode=mode,
+            )[0].values()
+        )
+        order = TreeLayoutFinder.lattice_order(*shape, mode=mode)
+        assert order == expected
+        assert set(order) == set(range(size))
+
+    # Each non-coarse alternating path is a nearest-neighbor 3D traversal.
+    for mode in ("alternate-x", "alternate-y", "alternate-z"):
+        order = TreeLayoutFinder.lattice_order(*shape, mode=mode)
+        assert all(
+            sum(abs(coords[left][axis] - coords[right][axis]) for axis in range(3))
+            == 1
+            for left, right in zip(order[:-1], order[1:])
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "grain"),
+    [
+        ("coarse-alternate-x", (2, 1, 1)),
+        ("coarse-alternate-y", (1, 2, 1)),
+        ("coarse-alternate-z", (1, 1, 2)),
+    ],
+)
+def test_tree_3d_coarse_alternating_axes_keep_blocks_and_paths(mode, grain):
+    """3D coarse alternation keeps each block contiguous and path-connected."""
+    shape = (4, 3, 3)
+    size = int(np.prod(shape))
+    order = TreeLayoutFinder.lattice_order(*shape, mode=mode, grain=grain)
+    assert len(order) == size
+    assert set(order) == set(range(size))
+
+    coords = {
+        q: (q // (shape[1] * shape[2]),
+            (q // shape[2]) % shape[1],
+            q % shape[2])
+        for q in range(size)
+    }
+    block_ids = [
+        tuple(coords[q][axis] // grain[axis] for axis in range(3))
+        for q in order
+    ]
+    runs = []
+    start = 0
+    while start < len(block_ids):
+        block = block_ids[start]
+        end = start + 1
+        while end < len(block_ids) and block_ids[end] == block:
+            end += 1
+        assert all(block_id == block for block_id in block_ids[start:end])
+        runs.append(block)
+        start = end
+    expected_blocks = int(np.prod([
+        (length + block - 1) // block
+        for length, block in zip(shape, grain)
+    ]))
+    assert len(runs) == len(set(runs)) == expected_blocks
+    assert all(
+        sum(abs(coords[left][axis] - coords[right][axis]) for axis in range(3))
+        == 1
+        for left, right in zip(order[:-1], order[1:])
+    )
+
+
+def test_tree_3d_coarse_order_handoff_and_site_mapper():
+    """Finder and TreeOptimizer retain 3D coarse-layout metadata."""
+    shape = (3, 2, 2)
+    finder = TreeLayoutFinder(
+        [],
+        n=int(np.prod(shape)),
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=shape,
+        order="coarse-alternate-z",
+        coarse_grain=(1, 1, 2),
+    )
+    plan = finder.run()
+    expected = tuple(
+        x * shape[1] * shape[2] + y * shape[2] + z
+        for x, y, z in pepsy.OneDMap.build(
+            *shape[:2], Lz=shape[2], mode="alternate-z",
+        )[0].values()
+    )
+    assert plan.mpo_order() == expected
+    report = finder.report(plan)
+    assert report["lattice_shape"] == shape
+    assert report["coarse_grain"] == (1, 1, 2)
+
+    custom = TreeLayoutFinder.lattice_order(
+        3, 2, 2, "alternate-z",
+        site=lambda x, y, z: z * 6 + y * 3 + x,
+    )
+    assert set(custom) == set(range(12))
+
+    forwarded = TreeOptimizer.find_tree_layout(
+        [],
+        n=12,
+        max_arity=2,
+        top_arity=2,
+        lattice_shape=shape,
+        order="coarse-alternate-x",
+        coarse_grain=2,
+    )
+    assert set(forwarded.mpo_order()) == set(range(12))
 
 
 def test_quality_layout_not_worse_than_balanced():
@@ -1495,8 +2140,27 @@ def test_optimizer_defaults_to_congestion_layout_for_replay_performance():
     assert opt.subtree_workers == 1
     assert opt.track_truncation is False
     assert opt.track_infidelity is True
+    assert inspect.signature(TreeOptimizer).parameters["cutoff"].default == "auto"
+    assert inspect.signature(TreeOptimizer).parameters["cutoff_mode"].default == "auto"
+    assert opt.cutoff == pytest.approx(1e-12)
     assert opt.cutoff_mode == "rsum2"
     assert opt.profile is False
+
+
+def test_tree_optimizer_auto_cutoff_tracks_state_dtype():
+    """Automatic tree cutoffs use the live TTN precision."""
+    opt = TreeOptimizer(
+        None,
+        n=3,
+        dtype="complex64",
+        cutoff="auto",
+        cutoff_mode="auto",
+        run=False,
+    )
+
+    assert opt.backend_info()["dtype"] == "complex64"
+    assert opt.cutoff == pytest.approx(1e-6)
+    assert opt.cutoff_mode == "rsum2"
 
 
 def test_tree_state_compression_default_matches_optimizer():
@@ -2142,6 +2806,36 @@ def test_tree_layout_tent_edges_match_order_colors_by_default():
     plt.close(fig)
 
 
+def test_tree_layout_tent_can_highlight_leaf_edges():
+    """The physical-to-first-parent layer can use a contrasting color."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))],
+        n=4,
+        max_arity=2,
+        top_arity=2,
+    )
+    plan = finder.run()
+    fig, ax = finder.plot_tent(
+        plan,
+        lattice=False,
+        show_gate_connectivity=False,
+        leaf_edge_color="#2563eb",
+    )
+
+    line_index = 0
+    for parent, children in plan.children.items():
+        for child in children:
+            if plan.is_leaf(child):
+                assert ax.lines[line_index].get_color() == "#2563eb"
+            line_index += 1
+    assert line_index == len(plan.nodes()) - 1
+    plt.close(fig)
+
+
 def test_tree_layout_tent_colored_edges_match_child_nodes():
     """Colored incoming edges use the same scale color as their child node."""
     matplotlib = pytest.importorskip("matplotlib")
@@ -2702,6 +3396,36 @@ def test_fresh_state_is_canonical_at_root():
     assert abs(opt.norm() - 1.0) < 1e-12
 
 
+def test_tree_tensor_network_has_native_whole_tree_compress():
+    """Direct TTN compression leaves one validated tree canonical centre."""
+    plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=2, seed=31, canonicalize=False)
+
+    assert state.compress(
+        max_bond=None,
+        cutoff=0.0,
+        center=plan.root,
+    ) is state
+    assert state.orthogonality_center == plan.root
+    assert state.is_canonical_form()
+    assert state.validate(check_canonical=True) is state
+
+
+def test_tree_mpo_rank_aware_compression_records_edge_order():
+    """TreeMPO compression uses and reports the native rank-aware order."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    rng = np.random.default_rng(32)
+    dense = rng.normal(size=(2**4, 2**4))
+    operator = TreeMPO.from_dense(plan, dense)
+
+    operator.compress(max_bond=4, cutoff=1e-12)
+    report = operator.pepsy_compression_report
+    assert report["order"] == "rank"
+    assert len(report["edge_order"]) == len(plan.nodes()) - 1
+    assert operator.validate() is operator
+    assert operator.max_bond() <= 4
+
+
 def test_two_qubit_gate_rejects_repeated_qubit():
     """A two-qubit gate on a single qubit is rejected loudly."""
     rng = np.random.default_rng(15)
@@ -2921,7 +3645,7 @@ def test_thread_index_clears_after_failed_two_qubit_update(monkeypatch):
     assert opt._thread_ind is None
 
 
-def test_tree_run_progbar_reports_norm_infidelity(monkeypatch):
+def test_tree_run_progbar_reports_infidelity(monkeypatch):
     """Tree replay exposes MPS-style progress fields without SVD probes."""
     progress_instances = []
 
@@ -3217,6 +3941,33 @@ def test_tree_public_submpo_and_pauli_backend_operations():
     )
 
 
+def test_tree_pauli_sum_routes_only_active_support_over_steiner_subtree():
+    """Sparse Pauli TreeMPOs must not turn support into a chain window."""
+    plan = TreePlan.from_order(range(8), structure="balanced")
+    active = (0, 2, 7)
+    opt = TreeOptimizer(
+        None, n=8, tree=plan, chi=8, cutoff=0.0, profile=True, run=False
+    )
+
+    opt.apply_pauli_sum([
+        (0.7, {0: "X", 2: "Y", 7: "Z"}),
+        (0.2, {0: "Z", 7: "X"}),
+    ])
+
+    assert opt.update_history[-1]["support"] == active
+    routes = [
+        event for event in opt.profile_events
+        if event.get("route") == "subtreempo"
+        and event.get("kind") == "metadata_path"
+    ]
+    assert routes
+    assert routes[-1]["support"] == active
+    assert routes[-1]["subtree_nodes"] == len(
+        opt._steiner_nodes([opt.plan.node_of_qubit[q] for q in active])
+    )
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_tree_two_site_numpy_mpo_is_coerced_to_cupy_state_backend():
     """Two-site MPO factors follow a CuPy TTN without mutating the MPO."""
     cupy = pytest.importorskip("cupy")
@@ -3255,6 +4006,40 @@ def test_tree_two_site_numpy_mpo_is_coerced_to_cupy_state_backend():
     assert opt.tn.validate() is opt.tn
     for tensor, original in zip(mpo.tensors, before):
         np.testing.assert_array_equal(tensor.data, original)
+
+
+def test_tree_two_site_cupy_gate_does_not_unwrap_memory_pointer():
+    """A CuPy dense gate reaches TreeMPO factorization as an array."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    n = 4
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    state.apply_to_arrays(
+        lambda array: cupy.asarray(array, dtype=cupy.complex128)
+    )
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    gate = cupy.asarray(np.kron(x, x), dtype=cupy.complex128)
+    opt = TreeOptimizer(
+        [(gate, (0, 1))],
+        n=n,
+        tree=plan,
+        state=state,
+        chi=8,
+        cutoff=0.0,
+        run=False,
+    )
+
+    opt.run(progbar=False)
+
+    expected = np.zeros(2**n, dtype=np.complex128)
+    expected[12] = 1.0
+    np.testing.assert_allclose(opt.to_dense(), expected, atol=1e-12)
 
 
 def test_tree_expectation_mpo_is_batched_and_non_mutating():
@@ -3480,6 +4265,18 @@ def test_tree_pauli_expectation_and_projection_are_public():
     assert opt.expectation_pauli("XX", (0, 1)) == pytest.approx(1.0)
     opt.project_pauli("ZZ", (0, 1), +1)
     assert opt.expectation_pauli("ZZ", (0, 1)) == pytest.approx(1.0)
+
+
+def test_tree_sync_canonicalization_rebuilds_state_owned_center():
+    """Tree recovery clears stale lower-level canonical-region metadata."""
+    opt = TreeOptimizer([], n=4, chi=8, run=False)
+    opt.tn.canonize_around_qubits_((0, 3))
+
+    center = opt.sync_canonicalization()
+
+    assert center == opt.plan.root
+    assert opt.center == opt.tn.orthogonality_center == center
+    assert opt.is_canonical_form(center)
 
 
 def test_tree_public_pauli_measurement_returns_probability_and_diagnostics():
@@ -3999,8 +4796,8 @@ def test_tree_warns_once_when_a_gate_does_not_match_the_state_backend():
     assert opt.backend_info()["backend"] == "torch"
 
 
-def test_tree_gate_stream_backend_preparation_is_stream_level():
-    """One representative gate decides conversion for the whole stream."""
+def test_tree_gate_stream_backend_requires_explicit_preparation():
+    """Every stream gate must already match the live TTN backend."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
@@ -4012,19 +4809,15 @@ def test_tree_gate_stream_backend_preparation_is_stream_level():
     ]
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend(gates, ["gate", "gate"])
-
-    assert all(torch.is_tensor(gate) for gate in prepared)
     assert all(isinstance(gate, np.ndarray) for gate in gates)
 
     matching = [to_backend(gate) for gate in gates]
-    untouched = opt._prepare_gate_stream_backend(matching, ["gate", "gate"])
-    assert untouched[0] is matching[0]
-    assert untouched[1] is matching[1]
+    opt.set_gates([(matching[0], 0), (matching[1], 1)])
+    with pytest.raises(TypeError, match=r"stream\[1\].*gate"):
+        opt.set_gates([(matching[0], 0), (gates[1], 1)])
 
 
-def test_tree_gate_stream_backend_preparation_checks_late_payloads():
+def test_tree_gate_stream_backend_checks_late_payloads():
     """A matching first gate cannot hide a later backend mismatch."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
@@ -4035,12 +4828,10 @@ def test_tree_gate_stream_backend_preparation_checks_late_payloads():
     foreign = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend(
+    with pytest.raises(TypeError, match=r"stream\[1\].*gate"):
+        opt._validate_gate_stream_backend(
             [matching, foreign], ["gate", "gate"]
         )
-    assert prepared[0] is matching
-    assert isinstance(prepared[1], torch.Tensor)
 
 
 def test_tree_optimizer_reports_symmray_block_backend():
@@ -4074,8 +4865,8 @@ def test_tree_optimizer_reports_symmray_block_backend():
     }
 
 
-def test_tree_submpo_stream_backend_preparation_preserves_input():
-    """A mismatched stream sub-MPO is copied and converted by its arrays."""
+def test_tree_submpo_stream_backend_requires_explicit_preparation():
+    """Every stream sub-MPO tensor must match the live TTN backend."""
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
@@ -4084,12 +4875,47 @@ def test_tree_submpo_stream_backend_preparation_preserves_input():
     submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
-    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
-        prepared = opt._prepare_gate_stream_backend([submpo], ["submpo"])[0]
-
-    assert prepared is not submpo
-    assert all(torch.is_tensor(tensor.data) for tensor in prepared.tensors)
+    with pytest.raises(TypeError, match=r"stream\[0\].*sub-MPO"):
+        opt.set_gates([opt.submpo_event(submpo, (0, 1))])
     assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
+
+    prepared = opt.to_backend(submpo)
+    opt.set_gates([opt.submpo_event(prepared, (0, 1))])
+
+
+def test_tree_treemppo_stream_backend_requires_explicit_preparation():
+    """Every TreeMPO tensor must match the live TTN backend."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    plan = TreePlan.from_order(range(2), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    state.apply_to_arrays(to_backend)
+    identity = np.eye(4, dtype=complex).reshape(2, 2, 2, 2)
+    tree_mpo = TreeMPO.from_terms(
+        plan,
+        {(0, 1): identity},
+        compress=False,
+    )
+    opt = TreeOptimizer(None, state=state, tree=plan, run=False)
+
+    with pytest.raises(TypeError, match=r"stream\[0\].*TreeMPO"):
+        opt.set_gates([opt.subtreempo_event(tree_mpo, (0, 1))])
+
+    prepared = opt.to_backend(tree_mpo)
+    assert all(
+        torch.is_tensor(tensor.data)
+        for network in prepared.tree_networks
+        for tensor in network
+    )
+    assert all(
+        isinstance(tensor.data, np.ndarray)
+        for network in tree_mpo.tree_networks
+        for tensor in network
+    )
+    opt.set_gates([opt.subtreempo_event(prepared, (0, 1))])
+    opt.run()
+    np.testing.assert_allclose(opt.to_dense(), [1.0, 0.0, 0.0, 0.0])
+    assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
 def test_tree_rejects_a_mixed_backend_initial_state():

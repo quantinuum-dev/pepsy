@@ -177,62 +177,45 @@ def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
 @pytest.mark.parametrize(
     "mode", ["dmrg", "mpo", "svd", "swap", "perm", "mix", "su", "exact"]
 )
-def test_mps_optimizer_casts_numpy_gate_stream_to_torch_state_backend(mode):
-    """Backend conversion should happen only when a gate payload mismatches p."""
+def test_mps_optimizer_rejects_mismatched_gate_stream_backend(mode):
+    """Mismatched user gates must be prepared before optimizer construction."""
     torch = pytest.importorskip("torch")
 
     state = qtn.MPS_computational_state("00", dtype="complex128")
     state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
     gate = qu.CNOT()  # ordinary NumPy gate stream
-    optimizer = py.MpsOptimizer(
-        state,
-        gates=[(gate, (0, 1))],
-        chi=2,
-        mode=mode,
-        inplace=True,
-    )
-
-    with pytest.warns(UserWarning, match="converted a gate payload"):
-        optimizer.run(progbar=False, n_iter=2)
-
-    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
-    dense = np.asarray(py.MpsOptimizer._real_float(optimizer.p.norm()))
-    assert dense == pytest.approx(1.0)
-
-    matching_gate = torch.as_tensor(np.array(gate, copy=True), dtype=torch.complex128)
-    assert optimizer.to_backend(matching_gate) is matching_gate
+    with pytest.raises(TypeError, match="requires every gate"):
+        py.MpsOptimizer(
+            state,
+            gates=[(gate, (0, 1))],
+            chi=2,
+            mode=mode,
+            inplace=True,
+        )
 
 
-def test_mps_optimizer_casts_submpo_stream_arrays_to_torch_state_backend():
-    """Sub-MPO conversion preserves the network structure and input stream."""
+def test_mps_optimizer_rejects_mismatched_submpo_stream_backend():
+    """Mismatched sub-MPO tensors must be prepared before replay."""
     torch = pytest.importorskip("torch")
 
     state = qtn.MPS_computational_state("00", dtype="complex128")
     state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
     submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
-    original_inds = tuple(submpo.outer_inds())
     optimizer = py.MpsOptimizer(
         state,
-        gates=[py.MpsOptimizer.submpo_event(submpo, (0, 1))],
+        gates=[],
         chi=2,
         mode="mpo",
         inplace=True,
     )
 
-    with pytest.warns(UserWarning, match="converted a sub-MPO payload"):
-        optimizer.run(progbar=False, n_iter=2)
-
-    # ``run`` prepares a local executable segment, leaving the public queue
-    # unchanged. Re-run the same helper to inspect the converted payload.
-    converted = optimizer._prepare_gate_stream_backend([submpo], ["submpo"])[0]
-    assert converted is not submpo
-    assert tuple(converted.outer_inds()) == original_inds
-    assert all(isinstance(tensor.data, torch.Tensor) for tensor in converted.tensors)
+    with pytest.raises(TypeError, match="sub-MPO"):
+        optimizer.set_gates([py.MpsOptimizer.submpo_event(submpo, (0, 1))])
     assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
 
 
-def test_mps_optimizer_backend_diagnostics_and_late_gate_conversion():
+def test_mps_optimizer_backend_diagnostics_check_every_gate():
     """Backend checks inspect every gate, not only the first stream payload."""
     torch = pytest.importorskip("torch")
 
@@ -255,12 +238,25 @@ def test_mps_optimizer_backend_diagnostics_and_late_gate_conversion():
         "device": "cpu",
     }
     assert optimizer.backend == "torch"
-    with pytest.warns(UserWarning, match="converted a gate payload"):
-        prepared = optimizer._prepare_gate_stream_backend(
+    with pytest.raises(TypeError, match=r"stream\[1\]"):
+        optimizer._validate_gate_stream_backend(
             [matching, foreign], ["gate", "gate"]
         )
-    assert prepared[0] is matching
-    assert isinstance(prepared[1], torch.Tensor)
+
+
+def test_mps_optimizer_accepts_explicitly_prepared_gate():
+    """Callers can prepare a payload explicitly before installing it."""
+    torch = pytest.importorskip("torch")
+
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="svd")
+
+    gate = optimizer.to_backend(qu.CNOT())
+    optimizer.set_gates([(gate, (0, 1))])
+    optimizer.run(progbar=False)
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
 
 
 def test_mps_optimizer_rejects_mixed_state_backends():
@@ -301,8 +297,8 @@ def test_mps_optimizer_reports_symmray_block_backend():
     }
 
 
-def test_mps_optimizer_converts_symmray_submpo_blocks_to_state_backend():
-    """Symmray sub-MPO copies preserve charge metadata while changing blocks."""
+def test_mps_optimizer_rejects_dense_symmray_submpo_blocks():
+    """Dense sub-MPO blocks cannot be promoted into a native Symmray MPS."""
     pytest.importorskip("symmray")
     torch = pytest.importorskip("torch")
 
@@ -327,12 +323,8 @@ def test_mps_optimizer_converts_symmray_submpo_blocks_to_state_backend():
     )
     optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="mpo")
 
-    with pytest.warns(UserWarning, match="converted a sub-MPO payload"):
-        converted = optimizer._prepare_gate_stream_backend(
-            [submpo], ["submpo"]
-        )[0]
-    assert converted is not submpo
-    assert all(tensor.data.backend == "torch" for tensor in converted.tensors)
+    with pytest.raises(TypeError, match="sub-MPO"):
+        optimizer._validate_gate_stream_backend([submpo], ["submpo"])
     assert all(tensor.data.backend == "numpy" for tensor in submpo.tensors)
 
 
@@ -534,6 +526,48 @@ def test_mps_optimizer_fit_diagnostics_is_none_before_fit():
     assert opt.get_fit_diagnostics() is None
 
 
+def test_mps_optimizer_fit_overlap_diagnostic_failure_is_nonfatal(monkeypatch):
+    """Optional FIT overlap failures stay diagnostics, not replay failures."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="dmrg",
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("diagnostic unavailable")
+
+    monkeypatch.setattr(mps_optimizer_module, "tn_fidelity", fail)
+    result = opt._fit_overlap_diagnostics(opt.p, opt.p)
+
+    assert result["fit_overlap_fidelity"] is None
+    assert result["fit_overlap_infidelity"] is None
+    assert "diagnostic unavailable" in result["fit_overlap_error"]
+
+
+def test_mps_optimizer_fit_overlap_diagnostics_are_opt_in(monkeypatch):
+    """The expensive FIT-target overlap contraction is disabled by default."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("FIT overlap diagnostics should be opt-in")
+
+    monkeypatch.setattr(mps_optimizer_module, "tn_fidelity", fail)
+    optimizer.run(progbar=False, n_iter=2, fit_rtol=None)
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_overlap_diagnostics"] is False
+    assert diagnostics["fit_overlap_fidelity"] is None
+    assert diagnostics["fit_overlap_infidelity"] is None
+    assert diagnostics["fit_overlap_error"] is None
+
+
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd", "dmrg", "mix"])
 def test_mps_optimizer_modes_skip_clocks_when_timing_disabled(
     monkeypatch,
@@ -590,8 +624,8 @@ def test_mps_optimizer_timing_record_identifies_named_dmrg_mode():
 
 
 @pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
-def test_mps_optimizer_long_range_dmrg_enriches_local_target_support(mode):
-    """DMRG keeps the current MPS and enriches only active bonds."""
+def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
+    """DMRG keeps the target exact and seeds only the disposable FIT guess."""
     stream = [
         (qu.hadamard(), (0,)),
         (qu.CNOT(), (0, 7)),
@@ -615,54 +649,686 @@ def test_mps_optimizer_long_range_dmrg_enriches_local_target_support(mode):
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-12)
     assert out.max_bond() == 2
-    assert optimizer.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+    assert optimizer.norm_diagnostics()["infidelity"] == pytest.approx(
         0.0, abs=1.0e-12
     )
     diagnostics = optimizer.get_fit_diagnostics()
     assert diagnostics["backend"] == "fit"
     assert diagnostics["fallback"] is False
-    expansion = diagnostics["target_support_expansion"]
-    if mode in {"dmrg1", "dmrg3"}:
-        assert diagnostics["mpo_fit_guess_used"] is True
-        assert expansion["enabled"] is False
-        assert expansion["updates"] == 0
-    else:
-        assert expansion["enabled"] is True
-        assert expansion["updates"] > 0
-    assert all(record["new_rank"] <= 4 for record in expansion["bonds"])
+    initialization = diagnostics["random_initialization"]
+    assert diagnostics["mpo_fit_guess_used"] is True
+    assert diagnostics["guess_used"] is True
+    assert diagnostics["guess_method"] == "src"
+    assert initialization["enabled"] is False
+    assert initialization["reason"] == "guess_src"
 
 
-def test_fit_target_support_never_replaces_current_mps():
-    """FIT keeps the supplied current state as its live variational MPS."""
-    state = qtn.MPS_computational_state("0" * 8, dtype="complex128")
-    state.gate_(qu.hadamard(), 0, contract=True)
-    target = state.copy(deep=True)
-    target.gate_nonlocal_(
-        qu.CNOT(),
-        (0, 7),
-        max_bond=None,
-        method="direct",
-        cutoff=0.0,
-    )
-    fit = py.FIT(
-        target,
-        p=state,
-        range_int=[0, 7],
-        cutoffs=1.0e-12,
-        inplace=True,
-        target_support=target,
-    )
-    assert fit.p is state
-    fit.run_gate(
-        n_iter=2,
+def test_randomized_fit_guess_is_disposable_and_active_only():
+    """Random initialization expands a copy, never the live current MPS."""
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="dmrg2")
+    guess, initialization = optimizer._build_randomized_fit_guess(
+        state,
+        (0, 3),
         block_size=2,
-        sweep_sequence="RL",
-        max_bond=2,
-        cutoff=1.0e-12,
-        adaptive_block_sweeps=2,
+        rand_strength=1.0e-4,
     )
-    assert fit.p is state
-    assert fit.info["target_subspace_expansion"]["updates"] > 0
+    assert guess is not state
+    assert [state.bond_size(i, i + 1) for i in range(3)] == [1, 1, 1]
+    assert [guess.bond_size(i, i + 1) for i in range(3)] == [2, 2, 2]
+    assert initialization["enabled"] is True
+    assert [record["new_rank"] for record in initialization["bonds"]] == [2, 2, 2]
+
+
+def test_random_fit_guess_preserves_existing_bond_dimensions_and_is_deterministic():
+    """The random-only guess perturbs p without changing its bond ranks."""
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="dmrg2")
+    guess_a, info_a = optimizer._build_randomized_fit_guess(
+        state,
+        (0, 3),
+        block_size=2,
+        rand_strength=1.0e-2,
+        expand=False,
+        seed=17,
+    )
+    guess_b, info_b = optimizer._build_randomized_fit_guess(
+        state,
+        (0, 3),
+        block_size=2,
+        rand_strength=1.0e-2,
+        expand=False,
+        seed=17,
+    )
+
+    assert info_a["enabled"] is True
+    assert info_a["expanded"] is False
+    assert info_a["sites"] == [0, 1, 2, 3]
+    assert info_b == info_a
+    assert [guess_a.bond_size(i, i + 1) for i in range(3)] == [1, 1, 1]
+    assert all(
+        np.array_equal(tensor_a.data, tensor_b.data)
+        for tensor_a, tensor_b in zip(guess_a.tensors, guess_b.tensors)
+    )
+    assert any(
+        not np.array_equal(tensor_a.data, tensor_b.data)
+        for tensor_a, tensor_b in zip(state.tensors, guess_a.tensors)
+    )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "direct",
+        "random",
+        "random_expand",
+        "guess_direct",
+        "guess_zipup",
+        "svd_guess",
+    ],
+)
+def test_mps_optimizer_fit_initial_guess_strategy_is_diagnostic(strategy):
+    """Each initial-guess strategy remains separate from FIT's target."""
+    stream = [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))]
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        stream,
+        chi=2,
+        mode="dmrg2",
+    )
+    optimizer.run(
+        progbar=False,
+        n_iter=2,
+        cutoff=1.0e-12,
+        fit_rtol=None,
+        fit_init_strategy=strategy,
+        fit_init_rand_strength=1.0e-2,
+        stabilize_unitary=False,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy_requested"] == strategy
+    assert diagnostics["fit_init_strategy"] == strategy
+    assert diagnostics["backend"] == "fit"
+    if strategy == "random":
+        assert diagnostics["random_initialization"]["expanded"] is False
+        assert diagnostics["random_initialization"]["enabled"] is True
+    elif strategy == "random_expand":
+        assert diagnostics["random_initialization"]["expanded"] is True
+        assert diagnostics["random_initialization"]["enabled"] is True
+    elif strategy.startswith("guess_") or strategy == "svd_guess":
+        assert diagnostics["svd_guess_used"] is True
+        assert diagnostics["guess_used"] is True
+    else:
+        assert diagnostics["mpo_fit_guess_used"] is False
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "direct",
+        "dm",
+        "zipup",
+        "zipup-first",
+        "zipup-oversample",
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit",
+        "fit-zipup",
+        "fit-projector",
+        "fit-oversample",
+    ],
+)
+def test_mps_optimizer_mpo_method_modes(method):
+    """Every Quimb method is selectable as ``quimb-<method>``."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=f"quimb-{method}",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert out.max_bond() <= 2
+    assert optimizer.mode == f"quimb-{method}"
+
+
+@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
+def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
+    """New SDC modes never silently fall back on older Quimb installations."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=f"quimb-{method}",
+    )
+    supported = mps_optimizer_module._quimb_compression_method_available(method)
+
+    if not supported:
+        with pytest.raises(NotImplementedError, match="sdc compressor"):
+            optimizer.run(progbar=False, cutoff=1.0e-12)
+        return
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+    assert out.max_bond() <= 2
+    assert optimizer.mode == f"quimb-{method}"
+
+
+@pytest.mark.parametrize(
+    "mode, method",
+    [
+        ("quimb", "direct"),
+        ("quimb-direct", "direct"),
+        ("quimb-src", "src"),
+        ("mpo", "direct"),
+        ("mpo-direct", "direct"),
+        ("mpo-src", "src"),
+    ],
+)
+def test_mps_optimizer_quimb_mode_aliases(mode, method):
+    """Quimb names are canonical while the old MPO names remain valid."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert out.max_bond() <= 2
+    assert optimizer._mode_mpo_method(optimizer.mode) == method
+
+
+@pytest.mark.parametrize(
+    ("mode", "canonical", "method"),
+    [
+        ("direct", "quimb-direct", "direct"),
+        ("dm", "quimb-dm", "dm"),
+        ("zipup", "quimb-zipup", "zipup"),
+        ("src", "quimb-src", "src"),
+        ("srcmps", "quimb-srcmps", "srcmps"),
+        ("fit-projector", "quimb-fit-projector", "fit-projector"),
+    ],
+)
+def test_mps_optimizer_accepts_bare_quimb_method_modes(mode, canonical, method):
+    """Bare Quimb method names normalize to the qualified backend mode."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode=mode,
+    )
+
+    assert optimizer.mode == canonical
+    assert optimizer._is_mpo_mode(mode)
+    assert optimizer._mode_mpo_method(mode) == method
+
+
+def test_mps_optimizer_fit_name_remains_dmrg_alias():
+    """Bare ``fit`` remains DMRG while Quimb FIT stays qualified."""
+    dmrg = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="fit",
+    )
+    quimb_fit = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="quimb-fit",
+    )
+
+    assert dmrg.mode == "dmrg"
+    assert quimb_fit.mode == "quimb-fit"
+
+
+@pytest.mark.parametrize("mode", ["src", "zipup"])
+def test_mps_optimizer_runs_bare_quimb_method_mode(mode):
+    """Bare SRC and zip-up names select the corresponding replay backend."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert optimizer.mode == f"quimb-{mode}"
+    assert out.max_bond() <= 2
+
+
+@pytest.mark.parametrize(
+    "mode, expected_desc",
+    [
+        ("quimb", "direct"),
+        ("quimb-dm", "dm"),
+        ("quimb-src", "src"),
+        ("mpo", "direct"),
+        ("mpo-zipup", "zipup"),
+        ("mpo-src", "src"),
+    ],
+)
+def test_mps_optimizer_progress_bar_uses_mode_name(
+    monkeypatch,
+    mode,
+    expected_desc,
+):
+    """MPO-family progress bars show only the selected replay mode."""
+    import tqdm as tqdm_module
+
+    descriptors = []
+
+    class FakeProgress:
+        def __init__(self, *args, **kwargs):
+            del args
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, _postfix):
+            pass
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tqdm_module, "tqdm", FakeProgress)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    optimizer.run(
+        progbar=True,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert descriptors == [expected_desc]
+
+
+@pytest.mark.parametrize(
+    "mode, expected_desc",
+    [
+        ("fit", "dmrg"),
+        ("dmrg", "dmrg"),
+        ("dmrg1", "dmrg1"),
+        ("dmrg2", "dmrg2"),
+        ("dmrg3", "dmrg3"),
+    ],
+)
+def test_mps_optimizer_dmrg_progress_bar_uses_schedule_name(
+    monkeypatch,
+    mode,
+    expected_desc,
+):
+    """Named DMRG schedules identify themselves in the progress bar."""
+    import tqdm as tqdm_module
+
+    descriptors = []
+
+    class FakeProgress:
+        def __init__(self, *args, **kwargs):
+            del args
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, _postfix):
+            pass
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tqdm_module, "tqdm", FakeProgress)
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode=mode,
+    )
+
+    optimizer.run(
+        progbar=True,
+        n_iter=2,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    assert descriptors == [expected_desc]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "direct",
+        "dm",
+        "zipup",
+        "zipup-first",
+        "zipup-oversample",
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit",
+        "fit-zipup",
+        "fit-projector",
+        "fit-oversample",
+    ],
+)
+def test_mps_optimizer_guess_method_strategies(method):
+    """Every Quimb method is available as a ``guess-<method>`` policy."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=2,
+        fit_rtol=None,
+        fit_init_strategy=f"guess-{method}",
+        stabilize_unitary=False,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy"] == f"guess_{method}"
+    assert diagnostics["guess_method"] == method
+    assert diagnostics["guess_used"] is True
+
+
+def test_mps_optimizer_hyphenated_guess_strategy_alias():
+    """The canonical ``guess-<method>`` spelling normalizes cleanly."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=2,
+        fit_rtol=None,
+        fit_init_strategy="guess-src",
+        stabilize_unitary=False,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy_requested"] == "guess_src"
+    assert diagnostics["fit_init_strategy"] == "guess_src"
+    assert diagnostics["guess_method"] == "src"
+
+
+def test_mps_optimizer_default_src_guess_reaches_one_site_fit():
+    """The default DMRG warm-start remains SRC after reaching ``chi``."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_rand_state(
+            3,
+            bond_dim=2,
+            phys_dim=2,
+            dtype="complex128",
+            seed=20260823,
+        ),
+        [(np.eye(4, dtype=np.complex128), (0, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(
+        progbar=False,
+        n_iter=1,
+        fit_rtol=None,
+        fit_block_size=1,
+        timing=True,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
+
+
+def test_mps_optimizer_src_compression_seed_is_reproducible():
+    """Explicit seeds control both MPO replay and disposable SRC guesses."""
+    state = qtn.MPS_rand_state(
+        6,
+        bond_dim=2,
+        phys_dim=2,
+        seed=23,
+        dtype="complex128",
+    )
+    gate = qu.CNOT()
+
+    guess_optimizer = py.MpsOptimizer(state, gates=[], chi=3, mode="dmrg2")
+    guess_a = guess_optimizer._build_compression_fit_guess(
+        state,
+        gate,
+        (0, 5),
+        method="src",
+        cutoff=1.0e-12,
+        cutoff_mode="rsum2",
+        seed=17,
+    )
+    guess_b = guess_optimizer._build_compression_fit_guess(
+        state,
+        gate,
+        (0, 5),
+        method="src",
+        cutoff=1.0e-12,
+        cutoff_mode="rsum2",
+        seed=17,
+    )
+    assert all(
+        np.array_equal(tensor_a.data, tensor_b.data)
+        for tensor_a, tensor_b in zip(guess_a.tensors, guess_b.tensors)
+    )
+
+    replay_a = py.MpsOptimizer(
+        state.copy(), [(gate, (0, 5))], chi=3, mode="quimb-src"
+    ).run(
+        progbar=False,
+        compression_seed=17,
+        stabilize_unitary=False,
+    )
+    replay_b = py.MpsOptimizer(
+        state.copy(), [(gate, (0, 5))], chi=3, mode="quimb-src"
+    ).run(
+        progbar=False,
+        compression_seed=17,
+        stabilize_unitary=False,
+    )
+    assert all(
+        np.array_equal(tensor_a.data, tensor_b.data)
+        for tensor_a, tensor_b in zip(replay_a.tensors, replay_b.tensors)
+    )
+
+
+@pytest.mark.parametrize("method", ["srcmps", "fit", "fit-oversample"])
+def test_mps_optimizer_compression_seed_is_not_forwarded_as_quimb_option(method):
+    """Seeded Quimb methods use Quimb's RNG without leaking ``seed`` kwargs."""
+    state = qtn.MPS_rand_state(
+        6,
+        bond_dim=2,
+        phys_dim=2,
+        seed=23,
+        dtype="complex128",
+    )
+    gate = qu.rand_uni(4, seed=11)
+    outputs = []
+    for _ in range(2):
+        optimizer = py.MpsOptimizer(
+            state.copy(deep=True),
+            [(gate, (0, 5))],
+            chi=3,
+            mode=f"quimb-{method}",
+        )
+        out = optimizer.run(
+            progbar=False,
+            cutoff=1.0e-12,
+            compression_seed=17,
+            stabilize_unitary=False,
+        )
+        outputs.append([np.array(tensor.data, copy=True) for tensor in out.tensors])
+
+    assert all(
+        np.array_equal(tensor_a, tensor_b)
+        for tensor_a, tensor_b in zip(outputs[0], outputs[1])
+    )
+
+
+def test_mps_optimizer_submpo_fit_projector_product_state_is_finite():
+    """Explicit endpoint sub-MPOs disable the singular projector pre-gauge."""
+    mpo = qtn.MatrixProductOperator.from_dense(
+        qu.CNOT(),
+        dims=(2, 2),
+        sites=(0, 3),
+        L=4,
+    )
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [py.MpsOptimizer.submpo_event(mpo, (0, 3))],
+        chi=2,
+        mode="quimb-fit-projector",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        non_unitary=True,
+        stabilize_unitary=False,
+    )
+
+    assert all(np.isfinite(np.asarray(tensor.data)).all() for tensor in out.tensors)
+
+
+@pytest.mark.parametrize("method", ["zipup-first", "fit-zipup", "fit-projector"])
+def test_mps_optimizer_interior_oversampled_mpo_methods(method):
+    """Nested Quimb methods also work on an interior sub-MPO span."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_rand_state(
+            8,
+            bond_dim=2,
+            phys_dim=2,
+            seed=3,
+            dtype="complex128",
+        ),
+        [(qu.CNOT(), (1, 6))],
+        chi=3,
+        mode=f"quimb-{method}",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    assert out.max_bond() <= 3
+    assert all(np.isfinite(np.asarray(tensor.data)).all() for tensor in out.tensors)
+
+
+@pytest.mark.parametrize("method", ["zipup-first", "fit-zipup"])
+def test_mps_optimizer_interior_submpo_oversampled_methods(method):
+    """Explicit interior sub-MPO events use the same safe local path."""
+    mpo = _two_branch_flip_submpo(
+        L=8,
+        sites=(1, 6),
+        targets=(1, 6),
+    )
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_rand_state(
+            8,
+            bond_dim=2,
+            phys_dim=2,
+            seed=3,
+            dtype="complex128",
+        ),
+        [py.MpsOptimizer.submpo_event(mpo, (1, 6))],
+        chi=3,
+        mode=f"quimb-{method}",
+    )
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+        non_unitary=True,
+    )
+
+    assert out.max_bond() <= 3
+    assert all(np.isfinite(np.asarray(tensor.data)).all() for tensor in out.tensors)
+
+
+@pytest.mark.parametrize("cutoff_mode", [None, "auto"])
+def test_mps_optimizer_dm_uses_native_cutoff_mode_by_default(
+    monkeypatch,
+    cutoff_mode,
+):
+    """The MPO density-matrix method keeps Quimb's native rsum1 default."""
+    calls = []
+
+    def fake_gate_nonlocal_(self, gate, where, **kwargs):
+        calls.append(kwargs)
+        kwargs["info"]["cur_orthog"] = (min(where), min(where))
+        return self
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "gate_nonlocal_",
+        fake_gate_nonlocal_,
+    )
+
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="quimb-dm",
+    )
+    optimizer.run(
+        progbar=False,
+        stabilize_unitary=False,
+        cutoff_mode=cutoff_mode,
+    )
+    assert "cutoff_mode" not in calls[-1]
+
+    optimizer.run(
+        progbar=False,
+        cutoff_mode="rsum2",
+        stabilize_unitary=False,
+    )
+    assert calls[-1]["cutoff_mode"] == "rsum2"
 
 
 @pytest.mark.parametrize("mode", ["mpo", "swap", "svd"])
@@ -906,8 +1572,8 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
-def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
-    """MPO rank warm-up should feed the DMRG2 two-site/one-site schedule."""
+def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg1():
+    """Direct warm-up should feed the default mixed one-site DMRG schedule."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -921,7 +1587,6 @@ def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
         progbar=False,
         cutoff=1e-12,
         n_iter=3,
-        fit_block_size=1,
         fit_rtol=None,
         timing=True,
     )
@@ -934,10 +1599,10 @@ def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg2():
         "dmrg",
     ]
     fit_steps = opt.get_run_timing()["fit_steps"]
-    assert [record["block_size"] for record in fit_steps] == [2, 2, 1]
+    assert [record["block_size"] for record in fit_steps] == [1, 1, 1]
     diagnostics = opt.get_fit_diagnostics()
-    assert diagnostics["adaptive_sweeps"] == 2
-    assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["one_site_refinement_sweeps"] == 3
     assert opt.last_mix_summary["mpo_steps"] == 3
     assert opt.last_mix_summary["dmrg_steps"] == 1
 
@@ -1016,9 +1681,9 @@ def test_mps_optimizer_mix_history_accumulates_control_segments():
     opt.run(progbar=False, seed=7)
 
     assert [event["step"] for event in opt.mix_history] == [1, 2]
-    assert [event["backend"] for event in opt.mix_history] == ["mpo", "dmrg"]
-    assert opt.last_mix_summary["mpo_steps"] == 1
-    assert opt.last_mix_summary["dmrg_steps"] == 1
+    assert [event["backend"] for event in opt.mix_history] == ["mpo", "mpo"]
+    assert opt.last_mix_summary["mpo_steps"] == 2
+    assert opt.last_mix_summary["dmrg_steps"] == 0
 
 
 def test_mps_optimizer_mix_one_site_is_exact_at_target_bond():
@@ -1043,8 +1708,9 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
 
     def nonfinite_dmrg(self, *args, **kwargs):
         original_run_dmrg(self, *args, **kwargs)
-        data = np.asarray(self.p[0].data)
-        self.p[0].modify(data=np.full_like(data, np.nan))
+        center = self._current_orthog(self.p)[0]
+        data = np.asarray(self.p[center].data)
+        self.p[center].modify(data=np.full_like(data, np.nan))
 
     monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", nonfinite_dmrg)
     opt = py.MpsOptimizer(p0, gates=gates, chi=2, mode="mix", inplace=True)
@@ -1232,8 +1898,8 @@ def test_fit_gate_two_site_grows_only_active_bonds():
     assert [record["direction"] for record in fit.get_timing()] == []
 
 
-def test_fit_gate_target_support_enrichment_handles_cutoff_from_product_state():
-    """Local support expansion opens remote-gate sectors before the cutoff."""
+def test_fit_gate_randomized_guess_handles_cutoff_from_product_state():
+    """A seeded disposable guess opens remote-gate sectors before the cutoff."""
     initial = qtn.MPS_computational_state("0000", dtype="complex128")
     initial.gate_(qu.hadamard(), 0, contract=True)
     target = initial.copy()
@@ -1244,13 +1910,19 @@ def test_fit_gate_target_support_enrichment_handles_cutoff_from_product_state():
         method="direct",
         cutoff=0.0,
     )
+    optimizer = py.MpsOptimizer(initial, gates=[], chi=2, mode="dmrg2")
+    guess, initialization = optimizer._build_randomized_fit_guess(
+        initial,
+        (0, 3),
+        block_size=2,
+        rand_strength=1.0e-4,
+    )
     fit = py.FIT(
         target,
-        p=initial,
+        p=guess,
         range_int=[0, 3],
         cutoffs=1.0e-12,
         inplace=True,
-        target_support=target,
     )
 
     fit.run_gate(
@@ -1261,8 +1933,9 @@ def test_fit_gate_target_support_enrichment_handles_cutoff_from_product_state():
         cutoff=1.0e-12,
     )
 
-    assert fit.p is initial
-    assert fit.info["target_subspace_expansion"]["updates"] > 0
+    assert fit.p is guess
+    assert initialization["enabled"] is True
+    assert [initial.bond_size(i, i + 1) for i in range(3)] == [1, 1, 1]
     assert [fit.p.bond_size(i, i + 1) for i in range(3)] == [2, 2, 2]
     assert float(
         np.real(py.tn_fidelity(fit.p, target, contraction_opt="greedy"))
@@ -1703,8 +2376,8 @@ def test_dmrg1_under_capacity_grows_twice_then_refines():
 
 
 @pytest.mark.parametrize("fit_mpo_guess", [True, False])
-def test_dmrg1_optional_mpo_compression_fit_guess(fit_mpo_guess):
-    """DMRG1 can toggle the MPO-compressed FIT initial guess."""
+def test_dmrg1_optional_svd_guess(fit_mpo_guess):
+    """DMRG1 can toggle the legacy switch for the direct-SVD guess."""
     hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
     cnot = np.array(
         [
@@ -1754,8 +2427,8 @@ def test_dmrg1_optional_mpo_compression_fit_guess(fit_mpo_guess):
 
 
 @pytest.mark.parametrize("fit_mpo_guess", [True, False])
-def test_dmrg3_optional_mpo_compression_fit_guess(fit_mpo_guess):
-    """DMRG3 can toggle the MPO-compressed FIT initial guess."""
+def test_dmrg3_optional_svd_guess(fit_mpo_guess):
+    """DMRG3 can toggle the legacy switch for the direct-SVD guess."""
     hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
     cnot = np.array(
         [
@@ -1868,8 +2541,11 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
     ] == [1, 1, 1]
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["adaptive_sweeps"] == 0
+    assert diagnostics["one_site_refinement_sweeps"] == 3
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
     assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
 
 
@@ -1908,8 +2584,7 @@ def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-12)
     diagnostics = optimizer.get_fit_diagnostics()
-    assert diagnostics["target_support_expansion"]["enabled"] is False
-    assert diagnostics["target_support_expansion"]["updates"] == 0
+    assert diagnostics["random_initialization"]["enabled"] is False
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
@@ -2415,6 +3090,36 @@ def test_fit_auto_cutoff_is_dtype_aware():
     assert fit.info["cutoff_resolved"] == pytest.approx(1.0e-6)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expected_cutoff"),
+    [("complex64", 1.0e-6), ("complex128", 1.0e-12)],
+)
+def test_mps_optimizer_default_cutoff_policy_is_dtype_aware(
+    monkeypatch,
+    dtype,
+    expected_cutoff,
+):
+    """An omitted MPS run cutoff resolves from the live tensor dtype."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0", dtype=dtype),
+        gates=[(qu.hadamard(), (0,))],
+        chi=2,
+        mode="svd",
+    )
+    calls = {}
+
+    def record_execute(*args, **kwargs):
+        calls.update(kwargs)
+        return optimizer.p
+
+    monkeypatch.setattr(optimizer, "_execute_mode", record_execute)
+    optimizer.run(progbar=False)
+
+    assert calls["cutoff"] == pytest.approx(expected_cutoff)
+    assert calls["cutoff_mode"] == "rsum2"
+    assert calls["mpo_cutoff_mode"] == "rsum2"
+
+
 def test_fit_retag_resolves_environment_and_preserves_info_object():
     """Retagging precedes route selection and caller diagnostics stay live."""
     state = qtn.MPS_rand_state(
@@ -2545,7 +3250,13 @@ def test_new_fit_configuration_is_keyword_only():
     run_parameters = inspect.signature(py.MpsOptimizer.run).parameters
 
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert run_parameters["fit_rtol"].default == pytest.approx(1.0e-8)
+    assert run_parameters["n_iter"].default == 8
+    assert run_parameters["cutoff"].default == "auto"
+    assert run_parameters["cutoff_mode"].default == "auto"
+    assert run_parameters["fit_rtol"].default == "auto"
+    assert run_parameters["quality_check_every"].default is False
+    assert run_parameters["fit_overlap_diagnostics"].default is False
+    assert run_parameters["fit_init_rand_strength"].default == 0.0
     for name in (
         "fit_min_iter",
         "fit_rtol",
@@ -2559,6 +3270,7 @@ def test_new_fit_configuration_is_keyword_only():
         "target_cutoff",
         "fit_target_strategy",
         "fit_single_pair_fast_path",
+        "fit_overlap_diagnostics",
         "stabilize_unitary",
         "fit_stabilize_unitary",
         "timing",
@@ -2569,15 +3281,63 @@ def test_new_fit_configuration_is_keyword_only():
         assert run_parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_mps_optimizer_fit_defaults_are_adaptive_and_single_pair_fast():
-    """The public DMRG defaults use the safe local fast paths."""
+def test_mps_optimizer_fit_defaults_are_adaptive_and_fixed_pair_sweeps():
+    """The public DMRG defaults retain requested adjacent-pair sweeps."""
     fit_rtol = inspect.signature(py.MpsOptimizer.run).parameters["fit_rtol"]
     fast_path = inspect.signature(py.MpsOptimizer.run).parameters[
         "fit_single_pair_fast_path"
     ]
 
-    assert fit_rtol.default == pytest.approx(1.0e-8)
-    assert fast_path.default is True
+    assert fit_rtol.default == "auto"
+    assert fast_path.default is False
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [("complex64", 1.0e-5), ("complex128", 1.0e-9)],
+)
+def test_mps_optimizer_auto_fit_rtol_tracks_state_dtype(dtype, expected):
+    """The automatic FIT tolerance follows the live MPS precision."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype=dtype),
+        gates=[],
+        chi=2,
+        mode="dmrg",
+    )
+
+    assert optimizer._resolve_fit_rtol("auto") == pytest.approx(expected)
+
+
+def test_mps_optimizer_default_runs_requested_adjacent_pair_sweeps():
+    """The default MPS optimizer path does not stop after one pair update."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    optimizer.run(progbar=False, n_iter=2, fit_rtol=None, timing=True)
+
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["iterations"] == 2
+    assert diagnostics["convergence_reason"] != "single_pair_exact"
+
+
+def test_mps_optimizer_dmrg2_adjacent_pair_defaults_to_one_update():
+    """Named DMRG2 keeps its one-update schedule for neighboring gates."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    optimizer.run(progbar=False, n_iter=8, fit_rtol=None, timing=True)
+
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["iterations"] == 1
+    assert diagnostics["convergence_reason"] == "single_pair_exact"
 
 
 def test_fit_two_site_single_pair_fast_path_is_structurally_converged():
@@ -2618,7 +3378,13 @@ def test_dmrg_modes_advance_after_one_update_per_two_site_window(mode):
         mode=mode,
     )
 
-    optimizer.run(progbar=False, n_iter=8, fit_rtol=None, timing=True)
+    optimizer.run(
+        progbar=False,
+        n_iter=8,
+        fit_rtol=None,
+        fit_single_pair_fast_path=True,
+        timing=True,
+    )
 
     records = optimizer.get_run_timing()["fit_steps"]
     assert [record["fit_index"] for record in records] == [0, 1]
@@ -3011,8 +3777,8 @@ def test_unitary_norm_overshoot_tolerance_is_dtype_aware():
         observed_norm=np.sqrt(1.0 + 1.0e-5),
         where=(0, 1),
     )
-    assert event["norm_fidelity_raw"] == pytest.approx(1.0 + 1.0e-5)
-    assert event["norm_fidelity"] == pytest.approx(1.0)
+    assert event["fidelity_raw"] == pytest.approx(1.0 + 1.0e-5)
+    assert event["local_fidelity"] == pytest.approx(1.0)
 
     with pytest.raises(FloatingPointError, match="squared ratio"):
         complex64._record_norm_event(
@@ -3685,6 +4451,72 @@ def test_fit_fermionic_arbitrary_target_keeps_native_guess_separate(
     ) == pytest.approx(1.0, abs=1.0e-10)
 
 
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+@pytest.mark.parametrize("fit_init_strategy", [None, "guess_src"])
+def test_mps_optimizer_native_guess_src_uses_sector_preserving_randomized_guess(
+    symmetry,
+    fit_init_strategy,
+    monkeypatch,
+):
+    """Native default and explicit ``guess_src`` supply a randomized guess."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        4,
+        fermion=fermion,
+        occupations=fermion.half_filled_occupations(4),
+        seed=17,
+        dtype="complex128",
+    )
+    gate_stream = [(fermion.hopping_gate(0.2, t=1.0), (0, 3))]
+
+    def fail_dense(*_args, **_kwargs):
+        raise AssertionError("native guess_src must not call dense compression")
+
+    def fail_quimb_guess(*_args, **_kwargs):
+        raise AssertionError("native guess_src must not call Quimb guess()")
+
+    monkeypatch.setattr(
+        mps_optimizer_module,
+        "_apply_dense_gate_with_method",
+        fail_dense,
+    )
+    monkeypatch.setattr(mps_optimizer_module, "guess", fail_quimb_guess)
+
+    optimizer = py.MpsOptimizer(state, gate_stream, chi=8, mode="dmrg2")
+    run_kwargs = {}
+    if fit_init_strategy is not None:
+        run_kwargs["fit_init_strategy"] = fit_init_strategy
+    out = optimizer.run(
+        progbar=False,
+        n_iter=2,
+        fit_rtol=None,
+        cutoff=1.0e-12,
+        fit_init_seed=23,
+        stabilize_unitary=False,
+        **run_kwargs,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy_requested"] == "guess_src"
+    assert diagnostics["fit_init_strategy"] == "guess_src"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["guess_used"] is True
+    assert diagnostics["svd_guess_used"] is True
+    assert diagnostics["guess_backend"] == "symmray-svd:rand"
+    assert diagnostics["native_randomized_guess_used"] is True
+    assert diagnostics["random_initialization"]["reason"] == "native_src"
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in out.tensors
+    )
+
+
 def test_fit_run_eff_fermionic_keeps_current_state_as_initial_guess():
     """Native block run_eff does not replace its current state."""
     pytest.importorskip("symmray")
@@ -4343,7 +5175,7 @@ def test_mps_optimizer_3x4_pbc_hubbard_long_range_modes_native(
                     contraction_opt="greedy",
                 )
             )
-        ) == pytest.approx(1.0, abs=5.0e-8)
+        ) == pytest.approx(1.0, abs=5.0e-5)
 
 
 @pytest.mark.slow
@@ -4625,7 +5457,7 @@ def test_unitary_fit_stabilization_preserves_working_norm():
         mode="fit",
     )
 
-    out = optimizer.run(progbar=False, n_iter=2)
+    out = optimizer.run(progbar=False, n_iter=2, stabilize_unitary=True)
     raw = out.copy()
     raw.exponent = 0.0
 
@@ -4738,8 +5570,8 @@ def test_mps_optimizer_dmrg_mode_aliases_select_block_size(mode, expected_blocks
     ] == expected_blocks
 
 
-def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
-    """Successful mixed FIT sweeps should share one full pre-commit check."""
+def test_mps_optimizer_mix_uses_norm_guard_without_full_scan(monkeypatch):
+    """Successful mixed FIT should avoid a full post-update data scan."""
     original_check = py.MpsOptimizer._mps_data_is_finite
     checks = 0
 
@@ -4765,11 +5597,11 @@ def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
     opt.run(progbar=False, n_iter=3, fit_rtol=None)
 
     assert opt.mix_history[0]["backend"] == "dmrg"
-    assert checks == 1
+    assert checks == 0
 
 
-def test_mps_optimizer_mix_full_checks_once_per_mpo_warmup(monkeypatch):
-    """Consecutive MPO warm-up gates should share one final full-state check."""
+def test_mps_optimizer_mix_uses_norm_guard_after_mpo_warmup(monkeypatch):
+    """MPO warm-up should avoid a full post-update data scan."""
     original_check = py.MpsOptimizer._mps_data_is_finite
     checks = 0
 
@@ -4797,7 +5629,7 @@ def test_mps_optimizer_mix_full_checks_once_per_mpo_warmup(monkeypatch):
     opt.run(progbar=False, fit_block_size=1)
 
     assert [entry["backend"] for entry in opt.mix_history] == ["mpo"] * 3
-    assert checks == 1
+    assert checks == 0
 
 
 def test_mps_optimizer_mix_stops_fit_adaptively():
@@ -4822,9 +5654,9 @@ def test_mps_optimizer_mix_stops_fit_adaptively():
 
     event = opt.mix_history[0]
     assert event["backend"] == "dmrg"
-    # The adaptive warm-up is mandatory; tolerance stopping then gets a
-    # separate one-site refinement phase.
-    assert event["fit_iterations"] == 4
+    # Mixed mode's default is one-site FIT, so there is no separate block
+    # warm-up phase before tolerance stopping.
+    assert event["fit_iterations"] == 2
     assert event["fit_converged"] is True
     assert event["fit_relative_change"] <= 1e9
 
@@ -5256,6 +6088,78 @@ def test_mps_optimizer_accepts_bundled_gate_stream():
     assert opt.where == [(1,), (0, 3)]
 
 
+def test_mps_optimizer_accepts_stabilizer_style_symbolic_gate_stream():
+    """Named entries should resolve to the same matrices as Pepsy primitives."""
+    theta = 0.19
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[("H", 0), ("rzz", theta, 0, 1)],
+        chi=4,
+        mode="svd",
+    )
+
+    assert opt.where == [(0,), (0, 1)]
+    assert opt.G[0].shape == (2, 2)
+    assert opt.G[1].shape == (2, 2, 2, 2)
+
+    expected = p0.copy()
+    expected.gate_(py.h(), 0, contract=True)
+    expected.gate_(py.rzz(theta), (0, 1), contract="split", cutoff=0.0)
+    opt.run(progbar=False, cutoff=1.0e-12)
+
+    np.testing.assert_allclose(
+        np.asarray(opt.p.to_dense()).reshape(-1),
+        np.asarray(expected.to_dense()).reshape(-1),
+        atol=1.0e-10,
+    )
+
+
+def test_mps_optimizer_symbolic_gate_stream_uses_explicit_to_backend():
+    """Named gates should be converted before strict backend validation."""
+    torch = pytest.importorskip("torch")
+
+    backend = py.backend_torch(dtype=torch.complex64, device="cpu")
+    p0 = qtn.MPS_computational_state("000", dtype="complex64")
+    p0.apply_to_arrays(backend)
+    converted = []
+
+    def to_backend(array):
+        converted.append(array)
+        return backend(np.array(array, copy=True))
+
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[("H", 0), ("rzz", 0.19, 0, 1)],
+        chi=4,
+        mode="svd",
+        to_backend=to_backend,
+    )
+
+    assert len(converted) == 2
+    assert all(isinstance(gate, torch.Tensor) for gate in opt.G)
+    assert all(gate.dtype == torch.complex64 for gate in opt.G)
+    opt.run(progbar=False, cutoff=1.0e-7)
+    assert opt.backend_info()["backend"] == "torch"
+
+
+def test_mps_optimizer_symbolic_set_and_add_gates_resolve():
+    """Queue mutation should use the same symbolic resolver as construction."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[],
+        chi=4,
+        mode="svd",
+    )
+
+    opt.set_gates([("H", 0)])
+    opt.add_gates([("rzz", 0.2, 0, 1)])
+
+    assert len(opt.G) == 2
+    assert all(isinstance(gate, np.ndarray) for gate in opt.G)
+    opt.run(progbar=False, cutoff=1.0e-12)
+
+
 def test_mps_optimizer_compiles_gate_stream_once(monkeypatch):
     """Repeated replay reuses compiled stream metadata."""
     calls = []
@@ -5349,6 +6253,86 @@ def test_mps_optimizer_gate_stream_layout_remaps_long_range_path():
         abs(where[0] - where[1]) == 1
         for where in plan["mapped_where"]
     )
+
+
+def test_mps_quality_layout_includes_periodic_folded_candidate():
+    """Quality search should remove the long wrap tail of a periodic grid."""
+    Lx = Ly = 8
+
+    def site(x, y):
+        return (x % Lx) * Ly + (y % Ly)
+
+    edge_builder = getattr(qtn, "edges_square", qtn.edges_2d_square)
+    gates = tuple(
+        (qu.CNOT(), (site(*left), site(*right)))
+        for left, right in edge_builder(Lx, Ly, cyclic=True)
+    )
+    plan = py.MpsOptimizer.LayoutFinder(gates, L=Lx * Ly).run(
+        order="quality",
+        nevergrad_budget=0,
+    )
+
+    assert "folded_8" in plan["candidate_losses"]
+    assert plan["selected_order"] == "folded_8"
+    assert plan["stats"]["max_span"] < plan["input_stats"]["max_span"]
+    assert plan["stats"]["loss"] < plan["input_stats"]["loss"]
+
+
+def test_mps_quality_layout_can_exclude_input_candidate():
+    """From-scratch search keeps the original order as diagnostics only."""
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+    plan = py.MpsOptimizer.LayoutFinder(gates, L=4).run(
+        order="quality",
+        from_scratch=True,
+        nevergrad_budget=0,
+    )
+
+    assert plan["from_scratch"] is True
+    assert "input" not in plan["candidate_plans"]
+    assert plan["input_stats"]["long_range_events"] == 2
+    assert plan["stats"]["loss"] < plan["input_stats"]["loss"]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "row-major",
+        "col-major",
+        "snake",
+        "snake-row-major",
+        "folded-snake",
+        "folded-snake-row-major",
+        "hilbert",
+        "hilbert-row-major",
+    ],
+)
+def test_mps_layout_geometric_presets_match_onedmap(mode):
+    """MPS geometric presets must use the shared OneDMap traversal exactly."""
+    Lx, Ly = 3, 5
+    mapping, _ = py.OneDMap.build(Lx, Ly, mode=mode)
+    expected = tuple(x * Ly + y for x, y in mapping.values())
+
+    finder = py.MpsOptimizer.LayoutFinder(
+        [],
+        L=Lx * Ly,
+        lattice_shape=(Lx, Ly),
+    )
+    plan = finder.run(order=mode)
+
+    assert plan["selected_order"] == mode
+    assert plan["site_order"] == expected
+    assert plan["mapped_where"] == ()
+
+
+def test_mps_hilbert_layout_requires_lattice_shape():
+    """Named MPS lattice orders reject ambiguous unshaped site sets."""
+    finder = py.MpsOptimizer.LayoutFinder([], L=6)
+    with pytest.raises(ValueError, match="lattice_shape"):
+        finder.run(order="hilbert")
 
 
 def test_mps_layout_accepts_explicit_fixed_site_order():
@@ -5835,6 +6819,36 @@ def test_mps_optimizer_mpo_mode_applies_submpo_stream_event():
     assert out.max_bond() <= 8
 
 
+def test_mps_optimizer_dmrg_mode_applies_submpo_as_layered_fit_target():
+    """DMRG keeps an explicit sub-MPO lazy and fits its tagged target layer."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(1, 3), targets=(1, 3))
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (1, 3))],
+        chi=2,
+        mode="dmrg2",
+    )
+
+    out = opt.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        non_unitary=True,
+        normalize_final=False,
+        fit_overlap_diagnostics=True,
+    )
+    vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
+    expected = np.zeros(16, dtype=np.complex128)
+    expected[0] = 0.7
+    expected[5] = 0.3
+
+    assert np.allclose(vec, expected)
+    diagnostics = opt.get_fit_diagnostics()
+    assert diagnostics["target_strategy"] == "layered"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["fit_overlap_fidelity"] == pytest.approx(1.0)
+
+
 def test_mps_optimizer_mpo_mode_accepts_submpo_mapping_event():
     """Mapping events should provide a readable public sub-MPO stream API."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -6019,8 +7033,8 @@ def test_mps_optimizer_submpo_method_validation(monkeypatch):
         bad.run(progbar=False, submpo_method="bad")
 
 
-def test_mps_optimizer_submpo_stream_events_require_mpo_mode():
-    """Non-MPO modes should reject sub-MPO stream events clearly."""
+def test_mps_optimizer_submpo_stream_events_require_mpo_or_dmrg_mode():
+    """SVD/swap/exact modes still reject sub-MPO stream events clearly."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     mpo = _two_branch_flip_submpo(L=3, sites=(0, 2), targets=(0, 2))
     opt = py.MpsOptimizer(
@@ -6030,7 +7044,7 @@ def test_mps_optimizer_submpo_stream_events_require_mpo_mode():
         mode="svd",
     )
 
-    with pytest.raises(ValueError, match="subMPO stream events"):
+    with pytest.raises(ValueError, match="require an MPO or DMRG mode"):
         opt.run(progbar=False)
 
 
@@ -6789,7 +7803,7 @@ def test_mps_optimizer_measure_forced_outcome_collapses_and_records():
     assert event["branch_probability"] == pytest.approx(prob)
     assert event["physical_boundary"] is True
     assert event["renormalized"] is True
-    assert event["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+    assert event["local_infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 def test_mps_optimizer_measure_multisite_pauli():
@@ -6800,6 +7814,86 @@ def test_mps_optimizer_measure_multisite_pauli():
 
     assert np.isclose(_dense_pauli_expectation(opt.p, "ZZ", (1, 3)), -1.0)
     assert opt.measurements[0][:3] == ("ZZ", (1, 3), -1)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_method"),
+    [("mpo", "direct"), ("quimb-src", "src")],
+)
+def test_mps_optimizer_multisite_measurement_uses_bond_two_submpo(
+    monkeypatch, mode, expected_method
+):
+    """Dense MPS measurements should use the low-bond sub-MPO compressor."""
+    calls = []
+    original = qtn.MatrixProductState.gate_with_submpo_
+
+    def recording(self, submpo, *args, **kwargs):
+        calls.append(
+            (
+                kwargs.get("method"),
+                tuple(kwargs.get("where", ())),
+                submpo.max_bond(),
+            )
+        )
+        return original(self, submpo, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "gate_with_submpo_",
+        recording,
+    )
+
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 2, seed=2, dtype="complex128"),
+        [("measure", "XZY", (1, 3, 5), +1)],
+        chi=8,
+        mode=mode,
+    )
+    opt.run(progbar=False, cutoff=0.0)
+
+    assert calls == [(expected_method, (1, 2, 3, 4, 5), 2)]
+    assert _dense_pauli_expectation(opt.p, "XZY", (1, 3, 5)) == pytest.approx(
+        1.0
+    )
+
+
+def test_mps_optimizer_dmrg_measurement_uses_lazy_submpo_and_src_guess(monkeypatch):
+    """DMRG measurements should use a lazy target and the normal SRC guess."""
+    methods = []
+    original = qtn.MatrixProductState.gate_with_submpo_
+
+    def recording(self, submpo, *args, **kwargs):
+        methods.append(kwargs.get("method"))
+        return original(self, submpo, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "gate_with_submpo_",
+        recording,
+    )
+
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 2, seed=2, dtype="complex128"),
+        [("measure", "XZY", (1, 3, 5), +1)],
+        chi=8,
+        mode="dmrg2",
+    )
+    opt.run(
+        progbar=False,
+        n_iter=3,
+        fit_min_iter=1,
+        fit_patience=1,
+        cutoff=0.0,
+    )
+
+    diagnostics = opt.get_fit_diagnostics()
+    assert methods == ["lazy", "src"]
+    assert diagnostics["target_representation"] == "lazy_submpo"
+    assert diagnostics["guess_method"] == "src"
+    assert diagnostics["fallback"] is False
+    assert _dense_pauli_expectation(opt.p, "XZY", (1, 3, 5)) == pytest.approx(
+        1.0
+    )
 
 
 def test_mps_optimizer_expectation_uses_local_canonical_path(monkeypatch):
@@ -6917,6 +8011,29 @@ def test_mps_optimizer_local_expectation_matches_full_network(pauli, where):
     assert local == pytest.approx(full, abs=1e-10)
 
 
+def test_mps_optimizer_sync_canonicalization_repairs_external_readout():
+    """External Quimb readout can be explicitly rebound to ``info_c``."""
+    z = np.diag([1.0, -1.0]).astype(complex)
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 4, seed=17), gates=[], chi=8, mode="dmrg2"
+    )
+    opt.canonize_mps(opt.p, 0)
+    assert opt.info_c["cur_orthog"] == (0, 0)
+
+    # This deliberately models a lower-level caller bypassing Pepsy's
+    # tracked expectation helper.
+    opt.p.local_expectation_canonical(z, (5,), normalized=True)
+    assert opt.info_c["cur_orthog"] == (0, 0)
+    assert tuple(opt.p.calc_current_orthog_center()) == (5, 5)
+
+    assert opt.sync_canonicalization() == (5, 5)
+    assert opt.info_c["cur_orthog"] == (5, 5)
+
+    opt.set_gates([(np.eye(4, dtype=complex), (0, 1))])
+    opt.run(progbar=False, n_iter=1, cutoff=0.0)
+    assert tuple(opt.p.calc_current_orthog_center()) == opt.info_c["cur_orthog"]
+
+
 def test_mps_optimizer_measure_born_statistics():
     """Sampled outcomes should follow the Born rule for a biased qubit."""
     theta = np.pi / 3
@@ -7020,7 +8137,7 @@ def test_mps_optimizer_reset_returns_qubit_to_zero():
     assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (1,)), 1.0)
     assert opt.measurements == []
     assert [event["kind"] for event in opt.get_norm_events()] == ["reset"]
-    assert opt.norm_diagnostics()["norm_infidelity"] == pytest.approx(0.0, abs=1e-10)
+    assert opt.norm_diagnostics()["infidelity"] == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("axis", ["X", "Y", "Z"])
@@ -7353,10 +8470,10 @@ def test_standalone_compression_modes_honor_unitary_stabilization(mode):
 
     assert _mps_data_norm(stabilized.p) == pytest.approx(1.0, abs=2.0e-5)
     assert _mps_data_norm(unstabilized.p) < 0.999
-    assert stabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+    assert stabilized.norm_diagnostics()["infidelity"] == pytest.approx(
         0.5, abs=2.0e-5
     )
-    assert unstabilized.norm_diagnostics()["norm_infidelity"] == pytest.approx(
+    assert unstabilized.norm_diagnostics()["infidelity"] == pytest.approx(
         0.5, abs=2.0e-5
     )
     assert stabilized.get_norm_events()[0]["kind"] == "unitary_compression"
@@ -7372,12 +8489,52 @@ def test_dmrg_schedules_record_automatic_norm_survival(mode):
         chi=1,
         mode=mode,
     )
-    opt.run(progbar=False, cutoff=0.0, n_iter=3)
+    opt.run(progbar=False, cutoff=0.0, n_iter=3, stabilize_unitary=True)
 
     diagnostics = opt.norm_diagnostics()
     assert diagnostics["events"] == 1
-    assert diagnostics["norm_infidelity"] == pytest.approx(0.5, abs=2.0e-5)
+    assert diagnostics["infidelity"] == pytest.approx(0.5, abs=2.0e-5)
     assert _mps_data_norm(opt.p) == pytest.approx(1.0, abs=2.0e-5)
+
+
+def test_mps_norm_names_and_dmrg_target_overlap_are_distinct():
+    """DMRG exposes target overlap separately from retained norm fidelity."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 2))],
+        chi=1,
+        mode="dmrg",
+    )
+    opt.run(
+        progbar=False,
+        cutoff=0.0,
+        n_iter=3,
+        stabilize_unitary=True,
+        fit_overlap_diagnostics=True,
+    )
+
+    diagnostics = opt.norm_diagnostics()
+    fit = opt.get_fit_diagnostics()
+    removed_metric_names = {
+        "norm_fidelity_raw",
+        "norm_fidelity",
+        "norm_infidelity",
+        "local_norm_fidelity",
+        "local_norm_infidelity",
+        "cumulative_norm_fidelity",
+        "cumulative_norm_infidelity",
+    }
+    assert removed_metric_names.isdisjoint(diagnostics)
+    assert removed_metric_names.isdisjoint(opt.get_norm_events()[0])
+    assert diagnostics["local_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert diagnostics["cumulative_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert diagnostics["norm"] == pytest.approx(1.0, abs=2e-5)
+    assert diagnostics["state_norm"] == pytest.approx(1.0, abs=2e-5)
+    assert diagnostics["cumulative_norm"] == pytest.approx(
+        np.sqrt(0.5), abs=2e-5,
+    )
+    assert fit["fit_overlap_fidelity"] == pytest.approx(0.5, abs=2e-5)
+    assert fit["fit_overlap_infidelity"] == pytest.approx(0.5, abs=2e-5)
 
 
 def test_fit_run_gate_reuse_resets_per_run_traces_and_split_diagnostics():

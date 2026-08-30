@@ -1,5 +1,7 @@
 # One symbol per line: frozen top-level compatibility aliases.
 ActivePEPOBlocks
+ClusterInternalSymmetry
+ClusterLattice
 BdyMPS
 BoundaryContractResult
 BoundaryFitDiagnostic
@@ -7,6 +9,9 @@ ClusterExpansionPlan
 ClusterExpansionReport
 ClusterModelAdapter
 ConnectedClusterShape
+GraphActivePEPOBlocks
+GraphClusterExpansionPlan
+GraphConnectedClusterShape
 CoalescedMeasurementRecord
 CoalescedSampleResult
 CoalescedTrajectoryLeaf
@@ -14,6 +19,7 @@ CoalescedTrajectoryResult
 CoherentCrosstalkModel
 CompBdy
 CompiledPEPOExp
+CompiledPEPOClusterProduct
 DeferredInjectionRecord
 DeferredInjectionReport
 DeferredProjectionRecord
@@ -41,6 +47,7 @@ MpsEnergyOptimizer
 MpsOptimizer
 MpsSampleResult
 MpsSampler
+MpsStabSampler
 MpsStabOptimizer
 MPIRankDiagnostics
 MPIShotError
@@ -54,6 +61,8 @@ OneDMap
 PEPSSampleResult
 PauliPEPOTerm
 PauliPEPOBasis
+PEPOClusterFactor
+PEPOClusterProductExpansion
 PauliErrorModel
 PauliFault
 PepsBpSampler
@@ -71,6 +80,7 @@ SpinfulFermionHubbard
 StabilizerMpsRunResult
 StabilizerMpsSettingsAdvice
 StabilizerMpsSimulator
+StabilizerMpsSampler
 StabilizerTreeRunResult
 StimCircuitPlan
 StimDetector
@@ -105,6 +115,13 @@ TreeMPO
 TreeNoisy
 TreeOptimizer
 TreePlan
+TreePeps
+TreePepsGeometry
+TreePepsLayoutFinder
+TreePepsPlan
+TreePepsOptimizer
+TreePepo
+TreeSubPepo
 TreeSampleResult
 TreeSampler
 TreeStabOptimizer
@@ -121,6 +138,7 @@ boundary_norm
 build_backend
 build_bra_ket
 build_cluster_expansion_pepo
+build_graph_cluster_expansion_pepo
 build_model_cluster_expansion_pepo
 build_compressed_optimizer
 compose_cluster_expansion_pepo
@@ -170,6 +188,7 @@ fermion_interaction_param_gen
 fsim
 fsimg
 gate
+gate_mpo_auto_swap
 gate_simple
 gauge_all
 gauge_all_simple
@@ -272,7 +291,6 @@ tn_fidelity
 tn_norm
 tns_align
 to_float
-tree_mpo
 u1
 u2
 u3

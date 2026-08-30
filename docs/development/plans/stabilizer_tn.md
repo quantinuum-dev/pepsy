@@ -54,10 +54,11 @@ evolution or a finite `chi` for controlled compression.
 
 There are two measurement forms:
 
-- **Fixed basis (default):** leave `C` unchanged, evaluate the Born rule from
+- **Fixed basis (default for `measure` and `measure_reset`):** leave `C` unchanged, evaluate the Born rule from
   `<p|M|p> / <p|p>`, then apply `(I + m M) / 2` to `p` and normalize. Repeating
   the same measurement is deterministic.
-- **Basis updating (`absorb_basis=True`):** construct a Clifford `V` that maps
+- **Basis updating (`disentangle=True`, legacy `absorb_basis=True`):**
+  construct a Clifford `V` that maps
   `M` to signed `Z_k`; apply `V` to `p`, absorb `V^dagger` into `C` so the
   physical state is preserved, then project coefficient site `k` to `|0>` or
   `|1>`. This disentangles that coefficient degree of freedom and is the
@@ -173,7 +174,8 @@ new simulator features.
 - **Measurement (Lemma 3)** — `expectation` = `<nu|M|nu>`; `measure` collapses
   with the fixed-basis projector `(I +- M)/2` + renormalize; Born sampling +
   forced outcomes; `("measure", ...)` stream entry.
-- **Basis-updating (canonical) measurement** — `measure(..., absorb_basis=True)`:
+- **Basis-updating (canonical) measurement** — `measure(..., disentangle=True)`
+  (`absorb_basis=True` remains a compatibility alias):
   a Clifford `V` localises the frame image `M = C^dagger O C` to a single
   coefficient qubit (`V M V^dagger = +-Z_k`, built via `_localizing_clifford`),
   `V` is applied to `|nu>` and `V^dagger` absorbed into the basis
@@ -192,13 +194,13 @@ new simulator features.
   frame; any MPO, unitary or not), matching the `MpsOptimizer` contract. A
   *physical*-frame few-qubit operator goes through a dense `(matrix, where)`
   entry instead (frame-mapped automatically).
-- Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, `track_infidelity`,
-  `infidelities`, `bond_history`, `set_gates`/`add_gates`/`run`/`apply`).
+- Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, automatic fidelity
+  tracking, `stabilize_unitary`, `infidelities`, `bond_history`,
+  `set_gates`/`add_gates`/`run`/`apply`).
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
   matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current
-  stream part and MPS-compatible `infidelity`, with `norm_infidelity` retained as
-  an alias); `norm_diagnostics()` reports the same multiplicative `infidelity`
+  stream part and MPS-compatible `infidelity`); `norm_diagnostics()` reports the same multiplicative `infidelity`
   and `fidelity` names, and `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
@@ -348,15 +350,22 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
 ### R3. Basis-updating (canonical Lemma-3) measurement
 - Reference `meas_tableau` + `P_k` projection: absorb the measured observable into
   the stabilizer group and project qubit `k` to `|0>`, keeping `|nu>` support
-  compact. Add as `measure(..., absorb_basis=True)` (keep fixed-basis default).
+  compact. Add as `measure(..., disentangle=True)` (keep fixed-basis default).
 - Impact: smaller `|nu>` after measurement-heavy circuits. Low/medium effort.
-- **STATUS: DONE** — `measure(..., absorb_basis=True)` localises `M` with a
+- **STATUS: DONE** — `measure(..., disentangle=True)` localises `M` with a
   Clifford `V` (`_localizing_clifford`), applies `V` to `|nu>`, absorbs
   `V^dagger` into the basis (`STNState.absorb_basis_clifford`), and single-site
-  projects/disentangles the pivot qubit. Fixed-basis remains the default.
+  projects/disentangles the pivot qubit. Fixed-basis remains the default;
+  `absorb_basis=True` remains a compatibility alias.
   Follow-ups: choose the pivot / CNOT-ladder to minimise the transient bond
   (currently the support median with nearest-first merging); reuse the R2
   disentangler to pre-localise `M`.
+- **Metadata-only measurement/reset scheduling — STATUS: DONE** — independent
+  single-qubit batches use `order="min_span"` by default. The scheduler reads
+  only current Tableau frame supports and the logical-to-MPS layout, executes
+  the selected operation once, then recomputes after any frame update. It does
+  not trial-run MPS contractions or truncations; `order="input"` preserves the
+  caller's sequence.
 
 ### R4. Sampling & observables
 - Computational-basis shot sampling via `pepsy.MpsSampler` on `|nu>` mapped
@@ -404,9 +413,11 @@ Options, in order of value:
 - **Static frame auto-layout: DONE (first cut)** — `apply_layout("auto")` /
   `current_frame_layout(...)` dry-run the queued Clifford/basis-update skeleton,
   collect weighted coefficient-frame supports `C^dag O C`, and install an MPS
-  order that shortens those dynamic supports. The installer is exact only while
-  `|nu>` is product (`state.max_bond() == 1`); physical qubit/tableau labels
-  stay stable while coefficient-frame operations are mapped through the layout.
+  order that shortens those dynamic supports. The default weight is now an
+  operator-Schmidt complexity proxy with explicit count/angle fallbacks. The
+  installer is exact only while `|nu>` is product (`state.max_bond() == 1`);
+  physical qubit/tableau labels stay stable while coefficient-frame operations
+  are mapped through the layout.
 - Center the multi-qubit rotation on the innermost affected `|nu>` site (paper Fig. 4)
   and/or adapt the TN geometry to connectivity to hit the `4·chi` (not `16·chi`) bound.
 - A dynamic per-step layout: permute `|nu>` sites (= relabel destabilizer generators,

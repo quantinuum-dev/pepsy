@@ -12,12 +12,16 @@ from pepsy.operators import (
     FirstDegreeMPO,
     MPOCompressionReport,
     MPOBasis,
+    MPOBraiding,
     MPOLevel,
     MPOLevelToken,
+    MPOLocalOperatorTerm,
     MPOParameter,
+    MPOPhysicalSpace,
     MPODifferentiableCompressionReport,
     MPONumericalCompressionReport,
     MPOProductTerm,
+    exp_mpo,
 )
 
 
@@ -39,16 +43,32 @@ def _two_term_mpo():
     )
 
 
+def _symmray_mpo_to_dense(mpo):
+    """Unfuse Symmray sectors before comparing in physical basis order."""
+    value = mpo.to_dense()
+    if hasattr(value, "unfuse_all"):
+        value = value.unfuse_all()
+    if hasattr(value, "to_dense"):
+        value = value.to_dense()
+    value = np.asarray(value)
+    dimension = int(round(np.sqrt(value.size)))
+    return value.reshape(dimension, dimension)
+
+
 def test_first_degree_mpo_public_exports_resolve():
     """The new semantic MPO layer belongs to ``pepsy.operators``."""
     assert FirstDegreeMPO is pepsy.operators.FirstDegreeMPO
     assert CompiledMPOEvolution is pepsy.operators.CompiledMPOEvolution
     assert CompiledMPOExp is pepsy.operators.CompiledMPOExp
     assert MPOBasis is pepsy.operators.MPOBasis
+    assert exp_mpo is pepsy.operators.exp_mpo
     assert MPOParameter is pepsy.operators.MPOParameter
     assert MPOLevel is pepsy.operators.MPOLevel
     assert MPOLevelToken is pepsy.operators.MPOLevelToken
     assert MPOProductTerm is pepsy.operators.MPOProductTerm
+    assert MPOLocalOperatorTerm is pepsy.operators.MPOLocalOperatorTerm
+    assert MPOBraiding is pepsy.operators.MPOBraiding
+    assert MPOPhysicalSpace is pepsy.operators.MPOPhysicalSpace
     assert MPOCompressionReport is pepsy.operators.MPOCompressionReport
     assert (
         MPODifferentiableCompressionReport
@@ -61,6 +81,144 @@ def test_first_degree_mpo_public_exports_resolve():
     assert "FirstDegreeMPO" in pepsy.operators.__all__
     assert "CompiledMPOEvolution" in pepsy.operators.__all__
     assert "CompiledMPOExp" in pepsy.operators.__all__
+    assert "exp_mpo" in pepsy.operators.__all__
+
+
+def test_general_local_operator_term_exactly_decomposes_entangled_support():
+    """A dense multi-site term is inserted as an exact local MPO segment."""
+    rng = np.random.default_rng(711)
+    raw = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
+    operator = raw + raw.conj().T
+    term = MPOLocalOperatorTerm((0, 1, 2), operator)
+
+    hamiltonian = FirstDegreeMPO.from_local_terms(3, [term])
+    np.testing.assert_allclose(
+        hamiltonian.to_mpo().to_dense(),
+        operator,
+        atol=2.0e-12,
+    )
+
+
+def test_term_centric_general_operator_handles_noncontiguous_and_reordered_sites():
+    """General operators preserve their supplied tensor-leg/site association."""
+    x, _, z = _paulis()
+    operator = np.kron(x, z) + 0.3 * np.kron(z, x)
+    swap = np.array(
+        [[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
+        dtype=float,
+    )
+    basis = MPOBasis.from_terms(
+        [{"operator": operator, "location": (2, 0)}],
+        shape=3,
+    )
+
+    assert isinstance(basis.terms[0], MPOLocalOperatorTerm)
+    assert basis.terms[0].sites == (0, 2)
+    expected_support = swap @ operator @ swap
+    expected = np.zeros((8, 8), dtype=complex)
+    for row in range(8):
+        for column in range(8):
+            row_bits = ((row >> 2) & 1, (row >> 1) & 1, row & 1)
+            col_bits = ((column >> 2) & 1, (column >> 1) & 1, column & 1)
+            if row_bits[1] != col_bits[1]:
+                continue
+            support_row = 2 * row_bits[0] + row_bits[2]
+            support_col = 2 * col_bits[0] + col_bits[2]
+            expected[row, column] = expected_support[support_row, support_col]
+    np.testing.assert_allclose(basis.build().to_mpo().to_dense(), expected, atol=1e-12)
+
+
+def test_general_local_operator_keeps_parameter_coefficient_differentiable():
+    """The coefficient slot remains outside the fixed operator decomposition."""
+    torch = pytest.importorskip("torch")
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    operator = np.diag([0.0, 1.0, 2.0, 3.0])
+    basis = MPOBasis.from_terms(
+        [{"operator": operator, "location": (0, 1), "coefficient": coefficient}],
+        shape=2,
+    )
+    dense = basis.build().to_mpo().to_dense()
+    loss = dense.real.sum()
+    (gradient,) = torch.autograd.grad(loss, coefficient)
+    assert torch.allclose(gradient, torch.tensor(6.0, dtype=torch.float64))
+
+
+def test_general_local_operator_validates_tensor_product_dimension():
+    """The matrix dimension must resolve to one integer local dimension."""
+    with pytest.raises(ValueError, match=r"not d\*\*2"):
+        MPOLocalOperatorTerm((0, 1), np.eye(6))
+
+
+def test_mpo_braiding_canonicalizes_odd_factors_with_exchange_phase():
+    """Graded ordering attaches exactly one sign per crossing of odd factors."""
+    x, y, z = _paulis()
+    graded = MPOProductTerm(
+        (2, 0, 1),
+        (x, y, z),
+        coefficient=2.0,
+        parities=(1, 1, 0),
+        braiding="fermionic",
+    )
+    assert graded.sites == (0, 1, 2)
+    assert graded.parities == (1, 0, 1)
+    assert graded.coefficient == -2.0
+    np.testing.assert_allclose(graded.operators[0], y)
+    np.testing.assert_allclose(graded.operators[1], z)
+    np.testing.assert_allclose(graded.operators[2], x)
+
+    with pytest.raises(ValueError, match="explicit parities"):
+        MPOProductTerm((1, 0), (x, y), braiding="fermionic")
+
+
+def test_graded_parameter_phase_remains_in_autodiff_graph():
+    """Canonical exchange phases wrap symbolic coefficients without resolving them."""
+    torch = pytest.importorskip("torch")
+    x, y, _ = _paulis()
+    basis = MPOBasis.from_local_terms(
+        2,
+        [
+            MPOProductTerm(
+                (1, 0),
+                (x, y),
+                coefficient=MPOParameter("g"),
+                parities=(1, 1),
+                braiding="fermionic",
+            )
+        ],
+    )
+    value = torch.tensor(0.4, dtype=torch.float64, requires_grad=True)
+    dense = basis.build({"g": value}).to_mpo().to_dense()
+    loss = dense[0, 3].imag
+    (gradient,) = torch.autograd.grad(loss, value)
+    expected = torch.as_tensor(-np.kron(y, x)[0, 3].imag, dtype=torch.float64)
+    assert torch.allclose(gradient, expected)
+
+
+def test_mpo_physical_space_is_intrinsic_and_preserved_by_copies():
+    """Sector and braiding metadata travel as one immutable physical-space object."""
+    _, _, z = _paulis()
+    space = MPOPhysicalSpace(
+        2,
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    operator = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (z,))],
+        physical_space=space,
+    )
+    assert operator.physical_space == space
+    assert operator.copy().physical_space == space
+    assert operator.physical_space.braiding == MPOBraiding("bosonic")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        FirstDegreeMPO.from_local_terms(
+            1,
+            [MPOProductTerm((0,), (z,))],
+            physical_space=space,
+            symmetry="U1",
+            physical_charges=(0, 1),
+        )
 
 
 def test_mpo_basis_reuses_compiled_automaton_for_rebinding():
@@ -278,6 +436,266 @@ def test_mpo_basis_shares_suffixes_and_assembles_terminal_coefficient_groups():
     np.testing.assert_allclose(bound.to_mpo().to_dense(), expected)
     assert bound.bond_dimensions == basis.bond_dimensions
     assert basis.bond_dimensions[-1] < 4
+
+
+def test_mpo_basis_square_lattice_aligns_paulis_and_preserves_autodiff():
+    """Coordinate terms canonicalize into shared MPO paths with live gradients."""
+    torch = pytest.importorskip("torch")
+    basis = MPOBasis.from_square_lattice(
+        2,
+        2,
+        [
+            ("XY", ((1, 0), (0, 0)), MPOParameter("a")),
+            {
+                "locations": ((0, 0), (1, 0)),
+                "paulis": "YX",
+                "parameter": "b",
+            },
+            {
+                "locations": ((0, 0),),
+                "paulis": "Z",
+                "parameter": "h",
+            },
+        ],
+    )
+
+    assert basis.lattice_shape == (2, 2)
+    assert basis.cache_info["lattice_mode"] == "snake"
+    assert basis.lattice_to_chain[(0, 0)] == 0
+    assert basis.terms[0].sites == basis.terms[1].sites
+    np.testing.assert_allclose(basis.terms[0].operators[0], basis.terms[1].operators[0])
+    np.testing.assert_allclose(basis.terms[0].operators[1], basis.terms[1].operators[1])
+    # The two equivalent coordinate descriptions share one structural channel.
+    assert max(basis.bond_dimensions) == 3
+
+    a = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    b = torch.tensor(-0.2, dtype=torch.float64, requires_grad=True)
+    h = torch.tensor(0.1, dtype=torch.float64, requires_grad=True)
+    time = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    bound = basis.build({"a": a, "b": b, "h": h})
+    reference = FirstDegreeMPO.from_pauli_terms(
+        4,
+        [
+            (basis.terms[0].sites, "YX", a + b),
+            (basis.terms[2].sites, "Z", h),
+        ],
+    )
+    torch.testing.assert_close(
+        bound.to_mpo().to_dense(),
+        reference.to_mpo().to_dense(),
+    )
+    compiled = basis.compile_exp(order=2, mode="base")
+    exponential = compiled.exp(
+        -1j * time,
+        {"a": a, "b": b, "h": h},
+    )
+    loss = sum(array.real.sum() for array in exponential.arrays)
+    gradients = torch.autograd.grad(loss, (a, b, h, time))
+
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+    mapping = basis.lattice_to_chain
+    mapping[(0, 0)] = 99
+    assert basis.lattice_to_chain[(0, 0)] == 0
+    assert basis.chain_to_lattice[basis.lattice_to_chain[(1, 1)]] == (1, 1)
+
+
+def test_term_centric_mpo_api_infers_lattices_and_accepts_custom_map():
+    """The compact operator/location form handles 1D, 2D, and 3D inputs."""
+    from pepsy.tensors import OneDMap
+
+    one_dimensional = MPOBasis.from_terms(
+        [
+            {"operator": "Z", "location": 0, "coefficient": 1.0},
+            {"operator": "XX", "location": (0, 1), "coefficient": 0.25},
+        ]
+    )
+    assert one_dimensional.L == 2
+    assert one_dimensional.lattice_shape is None
+
+    mapper = OneDMap(2, 2, mode="row-major")
+    two_dimensional = MPOBasis.from_terms(
+        [
+            ("Z", (1, 0), 0.5),
+            {
+                "operator": "XX",
+                "location": ((0, 0), (1, 0)),
+                "coefficient": 0.25,
+            },
+        ],
+        mapper=mapper,
+    )
+    assert two_dimensional.lattice_shape == (2, 2)
+    assert two_dimensional.lattice_to_chain == mapper.build()[1]
+    assert two_dimensional.terms[0].sites == (two_dimensional.lattice_to_chain[(1, 0)],)
+
+    three_dimensional = MPOBasis.from_terms(
+        [{"operator": "Z", "location": (1, 0, 0), "coefficient": 0.5}],
+        shape=(2, 1, 1),
+    )
+    assert three_dimensional.L == 2
+    assert three_dimensional.lattice_shape == (2, 1, 1)
+    assert three_dimensional.lattice_to_chain[(1, 0, 0)] == 1
+
+
+def test_term_centric_api_accepts_pepsy_pauli_keyed_mappings():
+    """Pauli-word keys can use the same compact mapping style as PauliMPO."""
+    torch = pytest.importorskip("torch")
+    coefficient = torch.tensor(0.4, dtype=torch.float64, requires_grad=True)
+
+    basis = MPOBasis.from_terms(
+        {"xyz": (((0, 0), (1, 0), (0, 1)), coefficient)},
+        shape=(2, 2),
+    )
+    expected_sites = tuple(
+        sorted(basis.lattice_to_chain[where] for where in ((0, 0), (1, 0), (0, 1)))
+    )
+    assert basis.terms[0].sites == expected_sites
+    assert basis.terms[0].coefficient is coefficient
+
+    chain_basis = MPOBasis.from_terms({"XX": (2, 3)}, shape=4)
+    assert chain_basis.terms[0].sites == (2, 3)
+
+    compiled = exp_mpo({"XX": ((2, 3), coefficient)}, 0.01, shape=4)
+    assert hasattr(compiled, "to_dense")
+
+
+def test_term_centric_compact_mapping_accepts_integer_coefficients():
+    """Integer weights are coefficients, not ambiguous lattice sites."""
+    basis = MPOBasis.from_terms({"XX": ((2, 3), 2)}, shape=4)
+    assert basis.terms[0].sites == (2, 3)
+    assert basis.terms[0].coefficient == 2
+
+    compiled = exp_mpo({"XX": ((2, 3), 2)}, 0.01, shape=4)
+    assert hasattr(compiled, "to_dense")
+
+
+@pytest.mark.parametrize("site", [0.9, True, np.float64(1.0)])
+def test_product_terms_reject_lossy_site_coercions(site):
+    """Product-term sites must never be silently truncated or accept booleans."""
+    x, _, _ = _paulis()
+    with pytest.raises(TypeError, match="sites.*integers"):
+        MPOProductTerm((site,), (x,))
+
+
+def test_product_terms_pair_sort_and_multiply_repeated_sites_in_order():
+    """Bosonic term canonicalization keeps factors paired and ordered locally."""
+    x, y, z = _paulis()
+    term = MPOProductTerm((1, 0, 1), (x, z, y))
+
+    assert term.sites == (0, 1)
+    np.testing.assert_allclose(term.operators[0], z)
+    np.testing.assert_allclose(term.operators[1], x @ y)
+    dense = FirstDegreeMPO.from_local_terms(2, [term]).to_mpo().to_dense()
+    np.testing.assert_allclose(dense, np.kron(z, x @ y))
+
+    with pytest.raises(ValueError, match="charge.*repeat"):
+        MPOProductTerm((0, 0), (x, y), charge=1)
+
+
+def test_term_centric_inputs_reject_nonintegral_shapes_and_coordinates():
+    """Coordinate and shape validation must not silently truncate values."""
+    with pytest.raises(TypeError, match="integer dimensions"):
+        MPOBasis.from_terms(
+            [{"operator": "Z", "location": (0, 0)}],
+            shape=(2.5, 2),
+        )
+    with pytest.raises(TypeError, match="integer coordinates"):
+        MPOBasis.from_terms(
+            [{"operator": "Z", "location": ((0.5, 0),)}],
+        )
+    with pytest.raises(ValueError, match="one-dimensional, 2D, or 3D"):
+        MPOBasis.from_terms(
+            [{"operator": "Z", "location": ((0, 0, 0, 0),)}],
+        )
+    with pytest.raises(TypeError, match="integer coordinates"):
+        MPOBasis.from_square_lattice(
+            2,
+            2,
+            [{"locations": ((0.5, 0),), "paulis": "Z"}],
+        )
+
+
+def test_term_centric_accepts_array_like_local_matrix_inputs():
+    """Nested Python lists can represent one local matrix."""
+    matrix = [[0.0, 1.0], [1.0, 0.0]]
+    expected = np.array(matrix)
+    for terms in (
+        [{"operator": matrix, "location": 0}],
+        [(matrix, 0)],
+    ):
+        basis = MPOBasis.from_terms(terms, shape=1)
+        np.testing.assert_allclose(basis.build().to_mpo().to_dense(), expected)
+
+
+def test_exp_mpo_semantic_return_rejects_quimb_compression():
+    """A semantic result cannot be retained after ordinary Quimb compression."""
+    with pytest.raises(ValueError, match="return_semantic=True"):
+        exp_mpo(
+            [{"operator": "Z", "location": 0}],
+            0.01,
+            shape=1,
+            chi=1,
+            return_semantic=True,
+        )
+
+    semantic = exp_mpo(
+        [{"operator": "Z", "location": 0}],
+        0.01,
+        shape=1,
+        chi=1,
+        differentiable=True,
+        return_semantic=True,
+    )
+    assert isinstance(semantic, FirstDegreeMPO)
+
+
+def test_term_centric_charge_metadata_requires_canonical_support_order():
+    """Reordering a charged term must not silently change its virtual path."""
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    with pytest.raises(ValueError, match="charge.*locations"):
+        MPOBasis.from_terms(
+            [
+                {
+                    "operator": (lowering, raising),
+                    "location": ((1, 0), (0, 0)),
+                    "charge": 1,
+                },
+            ],
+            shape=(2, 1),
+            symmetry="U1",
+            physical_charges=(0, 1),
+        )
+
+
+def test_exp_mpo_term_api_combines_common_terms_and_keeps_autodiff():
+    """One high-level call returns an MPO while preserving coefficient graphs."""
+    torch = pytest.importorskip("torch")
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    onsite = torch.tensor(-0.2, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    terms = [
+        {"operator": "XX", "location": (0, 1), "coefficient": coefficient},
+        {"operator": "Z", "location": 0, "coefficient": onsite},
+        {"operator": "Z", "location": 0, "coefficient": 0.3},
+    ]
+    basis = MPOBasis.from_terms(terms, shape=2)
+    assert max(basis.bond_dimensions) <= 3
+
+    semantic = exp_mpo(
+        terms,
+        step,
+        shape=2,
+        order=2,
+        return_semantic=True,
+    )
+    assert isinstance(semantic, FirstDegreeMPO)
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, onsite, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+    compiled = exp_mpo(terms, 0.01, shape=2)
+    assert hasattr(compiled, "to_dense")
 
 
 def test_mpo_basis_batches_coefficients_and_reuses_history_topology():
@@ -965,17 +1383,428 @@ def test_extensive_exponential_streaming_and_sparse_storage_match_dense():
         cache_history=False,
         history_storage="sparse",
     )
+    block_sparse = H.extensive_exponential(
+        0.01,
+        order=3,
+        mode="optimal",
+        cache_history=False,
+        history_storage="block_sparse",
+    )
+    reduced = H.extensive_exponential(
+        0.01,
+        order=3,
+        mode="optimal",
+        history_storage="reduced",
+    )
 
     expected = dense.to_mpo().to_dense()
     np.testing.assert_allclose(streaming.to_mpo().to_dense(), expected)
     np.testing.assert_allclose(sparse.to_mpo().to_dense(), expected)
+    np.testing.assert_allclose(block_sparse.to_mpo().to_dense(), expected)
+    np.testing.assert_allclose(reduced.to_mpo().to_dense(), expected)
     assert streaming.metadata["history_storage"] == "streaming"
     assert sparse.metadata["history_storage"] == "sparse"
+    assert block_sparse.metadata["history_storage"] == "block_sparse"
+    assert reduced.metadata["history_storage"] == "reduced"
+    assert block_sparse.is_block_sparse
+    assert all(count > 0 for count in block_sparse.sparse_block_counts)
     assert sparse.metadata["history_storage_blocks"]["stored_blocks"] < (
         sparse.metadata["history_storage_blocks"]["total_blocks"]
     )
+    block_info = block_sparse.metadata["history_storage_blocks"]
+    assert block_info["stored_blocks"] < block_info["total_blocks"]
+    assert block_info["materialized_dense_virtual_tensors"] is False
+    reduced_info = reduced.metadata["history_storage_blocks"]
+    assert reduced_info["materialized_raw_virtual_tensors"] is False
+    assert reduced_info["total_blocks"] < reduced_info["raw_total_blocks"]
     assert streaming.history_cache_info["orders"] == ()
     assert sparse.history_cache_info["orders"] == ()
+    assert block_sparse.history_cache_info["orders"] == ()
+
+
+@pytest.mark.parametrize("mode", ["base", "algorithm4", "optimal", "approximate"])
+def test_direct_reduced_history_matches_raw_execution_for_every_policy(mode):
+    """The streamed Algorithms-1/2 quotient is exactly the raw policy result."""
+    hamiltonian = _two_term_mpo()
+    raw = hamiltonian.extensive_exponential(
+        -0.013j,
+        order=3,
+        mode=mode,
+        history_storage="dense",
+    )
+    reduced = hamiltonian.extensive_exponential(
+        -0.013j,
+        order=3,
+        mode=mode,
+        history_storage="reduced",
+    )
+    np.testing.assert_allclose(
+        reduced.to_mpo().to_dense(),
+        raw.to_mpo().to_dense(),
+        atol=2.0e-12,
+    )
+    assert reduced.bond_dimensions == raw.bond_dimensions
+
+
+def test_direct_reduced_history_plan_caches_and_preserves_torch_gradients():
+    """Reduced plans contain structure only and reconnect fresh backend values."""
+    torch = pytest.importorskip("torch")
+    x, _, z = _paulis()
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        3,
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=coefficient),
+            MPOProductTerm((1, 2), (z, z)),
+        ],
+    )
+    first = hamiltonian.extensive_exponential(
+        step,
+        order=3,
+        mode="approximate",
+        history_storage="reduced",
+    )
+    second = hamiltonian.extensive_exponential(
+        2 * step,
+        order=3,
+        mode="approximate",
+        history_storage="reduced",
+    )
+    loss = sum(array.real.sum() for array in second.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+    assert first.metadata["history_cache_hit"] is False
+    assert second.metadata["history_cache_hit"] is True
+    assert hamiltonian.history_cache_info["reduced_plan_orders"] == (3,)
+
+
+def test_block_sparse_history_preserves_torch_autograd():
+    """Sparse virtual transforms keep backend blocks in the autodiff graph."""
+    torch = pytest.importorskip("torch")
+    x, _, z = _paulis()
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        3,
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=coefficient),
+            MPOProductTerm((1, 2), (z, z)),
+        ],
+    )
+
+    exponential = hamiltonian.extensive_exponential(
+        step,
+        order=2,
+        mode="approximate",
+        history_storage="block_sparse",
+    )
+    loss = sum(array.real.sum() for array in exponential.arrays)
+    coefficient_gradient, step_gradient = torch.autograd.grad(
+        loss,
+        (coefficient, step),
+    )
+
+    assert exponential.is_block_sparse
+    assert torch.isfinite(coefficient_gradient)
+    assert torch.isfinite(step_gradient)
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "physical_charges", "forward_charge", "backward_charge"),
+    [
+        ("U1", (0, 1), -1, 1),
+        ("Z2", (0, 1), 1, 1),
+        ("U1U1", ((0, 0), (1, 0)), (-1, 0), (1, 0)),
+        ("Z2Z2", ((0, 0), (1, 0)), (1, 0), (1, 0)),
+    ],
+)
+def test_higher_order_block_sparse_symmetry_matches_dense_mpo(
+    symmetry,
+    physical_charges,
+    forward_charge,
+    backward_charge,
+):
+    """Algorithms 1--4 compile directly to native Abelian charge blocks."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    diagonal = np.diag([-0.2, 0.2])
+    terms = []
+    for left_site in (0, 1):
+        terms.extend([
+            MPOProductTerm(
+                (left_site, left_site + 1),
+                (raising, lowering),
+                charge=forward_charge,
+            ),
+            MPOProductTerm(
+                (left_site, left_site + 1),
+                (lowering, raising),
+                charge=backward_charge,
+            ),
+        ])
+    terms.extend(
+        MPOProductTerm((site,), (diagonal,))
+        for site in range(3)
+    )
+    symmetric_h = FirstDegreeMPO.from_local_terms(
+        3,
+        terms,
+        symmetry=symmetry,
+        physical_charges=physical_charges,
+    )
+    dense_h = FirstDegreeMPO.from_local_terms(3, terms)
+
+    symmetric_u = symmetric_h.extensive_exponential(
+        -0.01j,
+        order=2,
+        mode="approximate",
+    )
+    dense_u = dense_h.extensive_exponential(
+        -0.01j,
+        order=2,
+        mode="approximate",
+        history_storage="dense",
+    )
+    compiled = symmetric_u.to_mpo()
+
+    assert symmetric_u.is_block_sparse
+    assert symmetric_u.metadata["history_storage"] == "block_sparse"
+    assert all(
+        type(tensor.data).__name__ == f"{symmetry}Array"
+        for tensor in compiled.tensors
+    )
+    storage = symmetric_u.metadata["history_storage_blocks"]
+    assert storage["stored_blocks"] < storage["total_blocks"]
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(compiled),
+        dense_u.to_mpo().to_dense(),
+    )
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(symmetric_h.to_mpo()),
+        dense_h.to_mpo().to_dense(),
+    )
+
+
+def test_higher_order_symmetry_rejects_incorrect_virtual_charge():
+    """A nonzero block cannot be silently placed in the wrong charge sector."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        2,
+        [MPOProductTerm((0, 1), (raising, lowering), charge=1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    with pytest.raises(ValueError, match="violates the configured U1 charge flow"):
+        hamiltonian.to_mpo()
+
+
+def test_u1_symmetry_supports_degenerate_physical_sectors():
+    """Sector blocks retain every local basis state inside a charge degeneracy."""
+    pytest.importorskip("symmray")
+    raising = np.zeros((4, 4))
+    raising[1, 0] = 1.0
+    raising[2, 0] = -0.5
+    raising[3, 1] = 0.75
+    raising[3, 2] = 0.25
+    lowering = raising.T
+    terms = [
+        MPOProductTerm((0, 1), (raising, lowering), charge=-1),
+        MPOProductTerm((0, 1), (lowering, raising), charge=1),
+    ]
+    symmetric_h = FirstDegreeMPO.from_local_terms(
+        2,
+        terms,
+        symmetry="U1",
+        physical_charges={0: 1, 1: 2, 2: 1},
+    )
+    dense_h = FirstDegreeMPO.from_local_terms(2, terms)
+    symmetric_u = symmetric_h.exp(-0.01j, order=2, mode="base")
+    dense_u = dense_h.exp(
+        -0.01j,
+        order=2,
+        mode="base",
+        history_storage="dense",
+    )
+
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(symmetric_u.to_mpo()),
+        dense_u.to_mpo().to_dense(),
+    )
+
+
+def test_mpo_symmetry_metadata_accepts_normalized_names_and_sector_mappings():
+    """The symmetry API accepts the same compact sector form as Pepsy tensors."""
+    identity = FirstDegreeMPO.identity(
+        1,
+        4,
+        symmetry="u1-u1",
+        physical_charges={
+            (0, 0): 1,
+            (0, 1): 1,
+            (1, 0): 1,
+            (1, 1): 1,
+        },
+    )
+
+    assert identity.symmetry == "U1U1"
+    assert identity.physical_charges == (
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    )
+
+
+def test_exp_mpo_forwards_symmetry_to_native_compiler():
+    """The term-centric boundary keeps the optional block-sparse fast path."""
+    pytest.importorskip("symmray")
+    compiled = exp_mpo(
+        [{"operator": np.diag([-0.3, 0.7]), "location": 0}],
+        -0.02j,
+        shape=1,
+        symmetry="u1",
+        physical_charges={0: 1, 1: 1},
+    )
+    assert type(compiled.tensors[0].data).__name__ == "U1Array"
+
+
+@pytest.mark.parametrize(
+    "physical_charges, match",
+    [
+        ({0: 1, 1: 0}, "positive integers"),
+        ({0: 1, 1: 1}, "summing to 3"),
+    ],
+)
+def test_mpo_symmetry_sector_mapping_validates_multiplicities(physical_charges, match):
+    """Invalid sector maps fail before optional Symmray compilation."""
+    with pytest.raises(ValueError, match=match):
+        FirstDegreeMPO.identity(
+            1,
+            3,
+            symmetry="U1",
+            physical_charges=physical_charges,
+        )
+
+
+def test_symmetry_requires_contiguous_physical_charge_sectors():
+    """Reject a dense basis order that Symmray cannot represent unchanged."""
+    with pytest.raises(ValueError, match="group equal charge sectors contiguously"):
+        FirstDegreeMPO.from_local_terms(
+            1,
+            [MPOProductTerm((0,), (np.eye(3),))],
+            symmetry="U1",
+            physical_charges=(0, 1, 0),
+        )
+
+
+def test_one_site_u1_exponential_compiles_native_rank_two_array():
+    """The local Taylor path uses the same symmetric compilation boundary."""
+    pytest.importorskip("symmray")
+    diagonal = np.diag([-0.3, 0.7])
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (diagonal,))],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    exponential = hamiltonian.exp(-0.02j, order=4, mode="optimal")
+    compiled = exponential.to_mpo()
+
+    assert type(compiled.tensors[0].data).__name__ == "U1Array"
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(compiled),
+        exponential.arrays[0][0, 0],
+    )
+
+
+def test_one_site_u1_zero_operator_retains_native_complex_dtype():
+    """Symmray receives a valid zero sector even when every entry vanishes."""
+    pytest.importorskip("symmray")
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (np.zeros((2, 2), dtype=complex),))],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    compiled = hamiltonian.to_mpo()
+
+    assert type(compiled.tensors[0].data).__name__ == "U1Array"
+    assert np.issubdtype(compiled.tensors[0].data.dtype, np.complexfloating)
+    np.testing.assert_array_equal(
+        _symmray_mpo_to_dense(compiled),
+        np.zeros((2, 2)),
+    )
+
+
+def test_mpo_basis_preserves_symmetry_for_parameterized_exponential():
+    """Reusable coefficient binding keeps charge metadata and sparse history."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    basis = MPOBasis.from_local_terms(
+        2,
+        [
+            MPOProductTerm(
+                (0, 1),
+                (raising, lowering),
+                coefficient=MPOParameter("J"),
+                charge=-1,
+            ),
+            MPOProductTerm(
+                (0, 1),
+                (lowering, raising),
+                coefficient=MPOParameter("J"),
+                charge=1,
+            ),
+        ],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    exponential = basis.exp(
+        -0.01j,
+        {"J": 0.7},
+        order=2,
+        mode="base",
+    )
+
+    assert exponential.symmetry == "U1"
+    assert exponential.physical_charges == (0, 1)
+    assert exponential.is_block_sparse
+    assert all(
+        type(tensor.data).__name__ == "U1Array"
+        for tensor in exponential.to_mpo().tensors
+    )
+
+    compiled = basis.compile_exp(order=2, mode="base")
+    compiled_exponential = compiled.exp(-0.01j, {"J": 0.7})
+    assert compiled_exponential.symmetry == "U1"
+    assert compiled_exponential.is_block_sparse
+    np.testing.assert_allclose(
+        _symmray_mpo_to_dense(compiled_exponential.to_mpo()),
+        _symmray_mpo_to_dense(exponential.to_mpo()),
+    )
+
+
+def test_higher_order_symmetry_rejects_graded_fermionic_compilation():
+    """Bosonic history tensors must not claim sign-correct fermionic output."""
+    pytest.importorskip("symmray")
+    diagonal = np.diag([0.0, 1.0])
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        1,
+        [MPOProductTerm((0,), (diagonal,))],
+        symmetry="U1",
+        physical_charges=(0, 1),
+        fermionic=True,
+    )
+
+    with pytest.raises(NotImplementedError, match="sign-preserving"):
+        hamiltonian.to_mpo()
 
 
 def test_extensive_exponential_supports_generic_order_three_histories():

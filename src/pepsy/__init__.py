@@ -82,8 +82,13 @@ if TYPE_CHECKING:
     from .fitting import FIT  # noqa: F401
     from .operators import (  # noqa: F401
         ActivePEPOBlocks,
+        GraphActivePEPOBlocks,
+        GraphClusterExpansionPlan,
+        ClusterInternalSymmetry,
+        ClusterLattice,
         ClusterModelAdapter,
         ConnectedClusterShape,
+        GraphConnectedClusterShape,
         ClusterExpansionReport,
         build_cluster_expansion_pepo,
         build_model_cluster_expansion_pepo,
@@ -92,11 +97,15 @@ if TYPE_CHECKING:
         compose_pepo_layers,
         compose_cluster_expansion_pepo,
         generate_connected_cluster_shapes,
+        build_graph_cluster_expansion_pepo,
         adapt_cluster_model,
         ClusterExpansionPlan,
         PauliPEPOTerm,
         PauliPEPOBasis,
         CompiledPEPOExp,
+        PEPOClusterFactor,
+        PEPOClusterProductExpansion,
+        CompiledPEPOClusterProduct,
         build_mpo_from_gates,
         build_pepo_from_gates,
         cnot,
@@ -140,8 +149,8 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoChannelEvent, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, MPIRankDiagnostics, MPIShotError, MPIShotResult, MPIShotRunner, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan, TreeStabOptimizer, build_tree_operator, run_mpi_shots, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
-    from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsSampler, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler  # noqa: F401
+    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoChannelEvent, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, MPIRankDiagnostics, MPIShotError, MPIShotResult, MPIShotRunner, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan, TreePeps, TreePepsGeometry, TreePepsOptimizer, TreePepsPlan, TreePepo, TreeSubPepo, TreeStabOptimizer, build_tree_operator, run_mpi_shots, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
+    from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, MpsStabSampler, PEPSSampleResult, PepsSampler, PepsBpSampler, StabilizerMpsSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler  # noqa: F401
     from .solvers import FDSolver  # noqa: F401
     from .tensors import (  # noqa: F401
         OneDMap,

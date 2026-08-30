@@ -2562,7 +2562,11 @@ def run_noisy_shots(
                 proposal_model=importance_sampling,
                 return_weight=True,
             )
-            optimizer.set_gates(stream)
+            # Sampled/library-generated matrices must cross the optimizer
+            # backend boundary before strict stream validation, regardless of
+            # whether the coefficient state is an MPS or a TTN/STN wrapper.
+            replay_stream = _stream_on_optimizer_backend(stream, optimizer)
+            optimizer.set_gates(replay_stream)
             optimizer.run(**dict(run_kwargs))
         if retain != "none":
             optimizers.append(optimizer)
@@ -2984,7 +2988,7 @@ def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
     """Recognize the chain STN optimizer without importing it at setup time."""
-    return all(
+    required = all(
         callable(getattr(optimizer, attr, None))
         for attr in (
             "copy",
@@ -2992,10 +2996,10 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
             "_canonize_p",
             "_renorm_p_at",
             "_make_norm_event",
-            "_reset_norm_infidelity",
             "_commit_norm_event",
         )
     )
+    return required and callable(getattr(optimizer, "_reset_infidelity", None))
 
 
 def _trajectory_norm_squared(optimizer) -> float:
@@ -3290,10 +3294,7 @@ def _run_trajectory_entries(
     # explicit for branch steps containing exactly one selected outcome.
     shared_cache = bool(getattr(optimizer, "_shared_backend_cache", False))
     shared_plan = getattr(optimizer, "_backend_cache_plan", None)
-    if isinstance(optimizer, MpsOptimizer):
-        replay_entries = list(entries)
-    else:
-        replay_entries = list(_stream_on_optimizer_backend(entries, optimizer))
+    replay_entries = list(_stream_on_optimizer_backend(entries, optimizer))
     optimizer.set_gates(replay_entries)
     # ``set_gates`` normally starts a new user-owned stream plan. Shot-created
     # MPS optimizers instead share the constructor plan's backend payload cache
@@ -3399,7 +3400,7 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         # A selected Kraus outcome is a normalized quantum-trajectory branch:
         # close the preceding unitary segment without counting its Born weight
         # as compression loss, then establish the new unit-norm baseline.
-        optimizer._reset_norm_infidelity()
+        optimizer._reset_infidelity()
         optimizer._commit_norm_event(norm_event, projected_norm=projected_norm)
         return
     normalize = getattr(optimizer, "normalize", None)

@@ -64,6 +64,20 @@ def test_pauli_mpo_supports_periodic_translation_and_explicit_sites():
     assert explicit.terms == ((2.0, "YIIX"),)
 
 
+def test_pauli_mpo_explicit_support_preserves_site_label_pairs_and_products():
+    """Explicit supports are canonicalized as paired ordered products."""
+    reordered = PauliMPO.from_terms(2, [(1.0, (1, 0), "XY")])
+    assert reordered.terms == ((1.0, "YX"),)
+
+    repeated = PauliMPO.from_terms(2, [(2.0, (0, 0), "XY")])
+    assert repeated.terms == ((2.0j, "ZI"),)
+
+    with pytest.raises(TypeError, match="sites.*integers"):
+        PauliMPO.from_terms(2, [(1.0, (0.9,), "X")])
+    with pytest.raises(TypeError, match="sites.*integers"):
+        PauliMPO.from_terms(2, [(1.0, (True,), "X")])
+
+
 def test_pauli_mpo_algebra_uses_ixyz_phase_rules():
     x = PauliMPO.from_terms(1, [(1.0, "X")])
     y = PauliMPO.from_terms(1, [(1.0, "Y")])
@@ -241,6 +255,43 @@ def test_pauli_mpo_native_cores_canonicalize_and_compress_without_leaving_basis(
     default_compressed = operator.compress(max_bond=8)
     assert isinstance(default_compressed, PauliMPO)
     assert max(default_compressed.pauli_bond_dimensions) <= 8
+
+
+def test_pauli_mpo_native_product_grows_then_compresses_pauli_bonds():
+    left = PauliMPO.from_terms(
+        4,
+        [(1.0, "XX"), (0.5, "Z"), (0.25j, "YXY")],
+    ).compress_pauli(max_bond=3)
+    right = PauliMPO.from_terms(
+        4,
+        [(2.0, "ZZ"), (-0.75, "X"), (0.5j, "YZY")],
+    ).compress_pauli(max_bond=2)
+
+    product = left @ right
+    expected_bonds = tuple(
+        left_bond * right_bond
+        for left_bond, right_bond in zip(
+            left.pauli_bond_dimensions,
+            right.pauli_bond_dimensions,
+        )
+    )
+    assert product.pauli_bond_dimensions == expected_bonds
+    assert all(core.shape[2] == 4 for core in product.to_pauli_cores())
+    np.testing.assert_allclose(
+        product.to_dense(),
+        left.to_dense() @ right.to_dense(),
+        atol=1.0e-11,
+    )
+
+    compressed, report = product.compress(
+        max_bond=3,
+        cutoff=1.0e-12,
+        return_report=True,
+    )
+    assert isinstance(compressed, PauliMPO)
+    assert max(compressed.pauli_bond_dimensions) <= 3
+    assert compressed.compression_report is report
+    assert not report.exact
 
 
 def test_pauli_mpo_native_core_constructor_round_trips_small_expansion():
