@@ -78,7 +78,7 @@ import pepsy
 torch_linalg = pepsy.TorchLinalgConfig(
     mode="complex",          # selects complex-safe SVD/QR rules
     stabilized=True,          # finite SVD/QR VJPs for autodiff
-    svd_driver="auto",       # CUDA: native Torch's driver selection
+    svd_driver="gesvd",      # CUDA: Pepsy's exact fast default
     cpu_svd="torch",         # CPU: native Torch LAPACK
     qr_rank_policy="warn",   # warn if a real QR block is rank deficient
     quimb_split_drivers=True, # required for raw Symmray blocks
@@ -97,8 +97,9 @@ optimizer = pepsy.PepsOptimizer(
 factorization: it regularizes singular-gap and QR-pivot terms only where the
 ordinary derivative is undefined or ill-conditioned. Use `stabilized=False`
 for the fastest native forward/backward path when those gradients are not
-needed. For non-approximate speed experiments, use CUDA `svd_driver="gesvdj"`
-or CPU `cpu_svd="scipy_gesdd"`; `gesvda` is approximate and requires an
+needed. Pepsy defaults to the exact CUDA `svd_driver="gesvd"` route.
+Benchmark `svd_driver="gesvdj"` on your hardware if desired, or use CPU
+`cpu_svd="scipy_gesdd"` for an explicit LAPACK experiment; `gesvda` is approximate and requires an
 explicit `allow_approximate=True` acknowledgement.
 
 For dense states, `quimb_split_drivers` can remain `False`. For Symmray PEPS,

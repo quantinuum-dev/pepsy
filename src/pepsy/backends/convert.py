@@ -186,6 +186,24 @@ def infer_backend_signature(sample_data):
     return "symmray", str(dtype), device, str(block_backend)
 
 
+def backend_signatures_compatible(source_signature, target_signature):
+    """Return whether payloads can replay without implicit conversion.
+
+    NumPy can safely promote mixed dtypes during its contractions, so dtype is
+    ignored only for dense NumPy-to-NumPy payloads. Other array backends, and
+    Symmray charge blocks, require matching dtypes for direct replay.
+    """
+    return (
+        source_signature[0] == target_signature[0]
+        and (
+            source_signature[0] == "numpy"
+            or source_signature[1] == target_signature[1]
+        )
+        and source_signature[2] == target_signature[2]
+        and source_signature[3:] == target_signature[3:]
+    )
+
+
 def _backend_data_values(value):
     """Return array payloads from an array, tensor, or tensor network."""
     tensor_map = getattr(value, "tensor_map", None)

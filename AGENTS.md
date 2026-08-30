@@ -127,6 +127,45 @@ The tree-native operator API lives in `pepsy.optimizers.tree.operators`:
   invariants. Emit explicit warnings for intentional compatibility coercions.
 - Do not vendor upstream internals.
 
+## Upstream compatibility audit
+
+Pepsy is tightly coupled to the Quimb tensor-network stack. Before changing
+any contraction, compression, canonicalization, gating, layout, backend, or
+Symmray path, check all of the following upstream sources, even when the
+reported issue initially appears to involve only one dependency:
+
+- [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html)
+- [Autoray repository](https://github.com/jcmgray/autoray)
+- [Cotengra documentation](https://cotengra.readthedocs.io/en/latest/#) and
+  its [changelog](https://cotengra.readthedocs.io/en/latest/changelog.html)
+- [Symmray Abelian-array documentation](https://symmray.readthedocs.io/en/latest/abelian_arrays.html)
+  and the [Symmray repository](https://github.com/jcmgray/symmray)
+
+Perform this audit at the start of each relevant maintenance task, whenever a
+dependency or development checkout changes, and again when a failing test may
+be caused by an upstream API or numerical behavior change. In the same active
+Pepsy environment, record the installed versions and inspect the actual
+callable signatures and dispatch tables for every upstream API being used;
+documentation and release headlines alone are not sufficient, especially for
+development versions.
+
+For each upstream change, classify the result as **adopt**, **compatibility
+shim**, **prototype**, or **defer**. Preserve Pepsy's existing defaults,
+ordering, backend and metadata invariants unless the user explicitly requests
+a breaking change. New upstream algorithms must be opt-in and capability
+gated rather than selected solely by a version string. Compatibility shims
+must be narrow, in-memory, covered by a regression test, and must not edit
+installed packages or vendor upstream implementation. If an upstream change
+affects more than one layer, validate dense, native Symmray, and relevant
+Autoray backend paths separately, and run the closest Quimb/Cotengra
+contraction regression before broadening the change.
+
+Keep the audit result and any deferred opportunities in the relevant
+`docs/development/notes/` file, including the audit date, installed versions,
+API probes, affected Pepsy paths, and focused tests. Update the handwritten
+API documentation and `CHANGELOG.md` whenever an upstream-facing behavior or
+new opt-in compatibility path becomes part of Pepsy.
+
 ## Torch SVD/QR policy
 
 Keep Torch linear-algebra registration behind the single public

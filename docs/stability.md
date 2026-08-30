@@ -1,6 +1,6 @@
 # API stability policy
 
-Pepsy is organized into two user-facing layers.
+PePsY is organized into two user-facing layers.
 
 ## Stable core
 

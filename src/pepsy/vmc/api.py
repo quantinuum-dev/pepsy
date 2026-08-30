@@ -154,13 +154,11 @@ def _resolve_contraction_config(contraction, chi=None, cutoff=None, options=None
 class SamplingConfig:
     """Shared chain-preserving sampling settings.
 
-    The canonical constructor follows NetKet::
-
-    ``n_samples`` is the total requested across chains,
-    ``n_discard_per_chain`` is the discarded prefix of every chain, and
-    ``sweep_size`` is the number of Metropolis sweeps between retained
-    configurations. The total must be divisible by ``n_chains`` so both
-    backends can return a fixed chain-shaped batch.
+    The canonical constructor follows NetKet. ``n_samples`` is the total
+    requested across chains, ``n_discard_per_chain`` is the discarded prefix
+    of every chain, and ``sweep_size`` is the number of Metropolis sweeps
+    between retained configurations. The total must be divisible by
+    ``n_chains`` so both backends can return a fixed chain-shaped batch.
 
     The former ``n_samples_per_chain``, ``burn_in``, and ``thin`` keywords are
     retained as compatibility aliases. They are also exposed as properties

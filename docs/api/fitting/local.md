@@ -37,8 +37,6 @@ fit = pepsy.FIT(
     # Keep the safe default for caller-owned targets. MpsOptimizer transfers
     # its fresh disposable target with copy_target=False.
     copy_target=True,
-    # Optional separate support MPS; it is never installed as fit.p.
-    target_support=target_support,
 )
 fit.run_gate(
     n_iter=4,
@@ -175,13 +173,14 @@ the effective tensor and its SVD solve the entire active problem, so another
 sweep only rebuilds the same environments. That terminal update constructs no
 active-window environments; native fermionic outside-window environments stay
 intact. The default is `False` on direct
-`FIT.run_gate` calls to preserve fixed-sweep compatibility; MpsOptimizer opts
-in by default. Consequently, named `dmrg1`, `dmrg2`, and `dmrg3` windows of
-two sites perform one two-site update and advance to the next gate without
-one-site refinement; `n_iter` and tolerance controls cannot add a second sweep
-while the fast path is enabled. `collect_split_diagnostics=False` omits per-SVD
-truncation dictionaries when only the fitted state and retained norm are
-needed.
+`FIT.run_gate` calls and in `MpsOptimizer`, preserving fixed-sweep
+compatibility. Set it to `True` to make named `dmrg1`, `dmrg2`, and `dmrg3`
+windows of two sites perform one two-site update and advance to the next gate
+without one-site refinement; `n_iter` and tolerance controls cannot add a
+second sweep while the fast path is enabled. `collect_split_diagnostics=False`
+omits per-SVD truncation dictionaries when only the fitted state and retained
+norm are needed. `MpsOptimizer` additionally keeps the named `dmrg2`
+nearest-neighbor schedule at one update by default.
 
 `sweep_sequence` uses Quimb direction names: `"R"` is left-to-right, `"L"` is
 right-to-left, and `"RL"` alternates. Native fermionic `run_gate` executes the
@@ -194,15 +193,13 @@ phases afterward. The physical ket is restored on both success and failure.
 The same convention supports one-, two-, and three-site native `run_eff`
 sweeps.
 
-FIT never replaces its live `p` with a target copy. Dense MPS gate replay can
-pass an optional separate `target_support` MPS. During a two- or three-site
-block update, if an active bond is below `max_bond`, FIT uses only local target
-Schmidt factors to open that bond, capped at `max_bond`; once the bond has
-reached its target rank or cap, ordinary fixed-rank FIT continues. The
-support template is not the variational objective and is never used for a
-global rank-`chi` warm start. Native Symmray fits retain their graded local
-SVD/auto-swap sector rules and raise an explicit disconnected-sector error if
-the supplied current sectors cannot reach the target locally.
+FIT never replaces its live `p` with a target copy. If dense MPS gate replay
+needs rank growth, the caller can prepare a disposable copy of the current MPS
+with small random entries on the active bonds below their attainable rank and
+pass that copy as `p`. FIT then uses that state as its ordinary variational
+initialization while the target remains the exact variational objective.
+Native Symmray fits retain their graded local SVD/auto-swap sector rules and
+should use native sector growth rather than dense random padding.
 
 `environment_strategy="auto"` selects
 `"mps-direct"` for an ordinary dense one-tensor-per-site target,

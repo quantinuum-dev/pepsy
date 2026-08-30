@@ -37,8 +37,12 @@ class OneDMap:
         "folded-snake-row-major",
         "row-major",
         "col-major",
+        "alternate-x",
+        "alternate-y",
+        "alternate-z",
         "hilbert",
         "hilbert-row-major",
+        "inside-out",
         "diag",
         "finder",
     )
@@ -66,6 +70,12 @@ class OneDMap:
         "torus-snake-row-major": "folded-snake-row-major",
         "row-major": "row-major",
         "col-major": "col-major",
+        "alternate-x": "alternate-x",
+        "alternate-y": "alternate-y",
+        "alternate-z": "alternate-z",
+        "alt-x": "alternate-x",
+        "alt-y": "alternate-y",
+        "alt-z": "alternate-z",
         "hilbert": "hilbert",
         "hilbert-curve": "hilbert",
         "hilbert-col": "hilbert",
@@ -74,6 +84,12 @@ class OneDMap:
         "hilbert-column-major": "hilbert",
         "hilbert-row": "hilbert-row-major",
         "hilbert-row-major": "hilbert-row-major",
+        "inside-out": "inside-out",
+        "insideout": "inside-out",
+        "center-out": "inside-out",
+        "centerout": "inside-out",
+        "center": "inside-out",
+        "outward": "inside-out",
         "diag": "diag",
         "diagonal": "diag",
         "diag-snake": "diag",
@@ -263,6 +279,52 @@ class OneDMap:
         return [(x, y, z) for z in range(L_z) for y in range(L_y) for x in range(L_x)]
 
     @staticmethod
+    def _coords_inside_out_2d(L_x, L_y):
+        """Return a deterministic center-to-boundary site ordering.
+
+        This is a *growth ordering*, rather than a Hamiltonian path. Sites
+        are grouped by Manhattan shells around the geometric center and use
+        row-major order to break shell ties. The ordering therefore remains
+        useful for rectangular lattices and for tree builders that attach
+        each new site through an available nearest-neighbor edge.
+        """
+        center_x = L_x - 1
+        center_y = L_y - 1
+        coords = [(x, y) for x in range(L_x) for y in range(L_y)]
+        return sorted(
+            coords,
+            key=lambda coord: (
+                abs(2 * coord[0] - center_x) + abs(2 * coord[1] - center_y),
+                coord[0],
+                coord[1],
+            ),
+        )
+
+    @staticmethod
+    def _coords_inside_out_3d(L_x, L_y, L_z):
+        """Return a deterministic center-to-boundary ordering in 3D."""
+        center_x = L_x - 1
+        center_y = L_y - 1
+        center_z = L_z - 1
+        coords = [
+            (x, y, z)
+            for x in range(L_x)
+            for y in range(L_y)
+            for z in range(L_z)
+        ]
+        return sorted(
+            coords,
+            key=lambda coord: (
+                abs(2 * coord[0] - center_x)
+                + abs(2 * coord[1] - center_y)
+                + abs(2 * coord[2] - center_z),
+                coord[0],
+                coord[1],
+                coord[2],
+            ),
+        )
+
+    @staticmethod
     def _coords_snake_2d(L_x, L_y, *, major="col"):
         coords = []
         if major == "col":
@@ -311,48 +373,111 @@ class OneDMap:
         raise ValueError(f"Unknown folded snake major axis: {major!r}.")
 
     @staticmethod
-    def _is_power_of_two(value):
-        return value > 0 and (value & (value - 1)) == 0
+    def _hilbert_sign(value):
+        """Return the sign of an integer Hilbert basis component."""
+        return -1 if value < 0 else (1 if value > 0 else 0)
 
-    @staticmethod
-    def _next_power_of_two(value):
-        value = int(value)
-        if value < 1:
-            raise ValueError("value must be >= 1.")
-        return 1 << (value - 1).bit_length()
+    @classmethod
+    def _generate_hilbert_2d(cls, x, y, ax, ay, bx, by):
+        """Recursively generate one oriented rectangular Hilbert region.
 
-    @staticmethod
-    def _hilbert_rot(n, x, y, rx, ry):
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            x, y = y, x
-        return x, y
+        This is the generalized rectangular Hilbert (often called Gilbert)
+        construction. Unlike cropping a power-of-two Hilbert square, each
+        recursive region is part of the requested rectangle, so arbitrary
+        rectangular sizes remain complete and deterministic. The classical
+        Hilbert traversal is recovered when both dimensions are powers of two.
+
+        The construction is adapted from Jakub Cerveny's BSD-2-Clause
+        reference implementation (copyright 2018) at
+        https://github.com/jakubcerveny/gilbert.
+        """
+        width = abs(ax + ay)
+        height = abs(bx + by)
+        dax, day = cls._hilbert_sign(ax), cls._hilbert_sign(ay)
+        dbx, dby = cls._hilbert_sign(bx), cls._hilbert_sign(by)
+
+        if height == 1:
+            for _ in range(width):
+                yield x, y
+                x += dax
+                y += day
+            return
+        if width == 1:
+            for _ in range(height):
+                yield x, y
+                x += dbx
+                y += dby
+            return
+
+        ax2, ay2 = ax // 2, ay // 2
+        bx2, by2 = bx // 2, by // 2
+        width2 = abs(ax2 + ay2)
+        height2 = abs(bx2 + by2)
+
+        if 2 * width > 3 * height:
+            if width2 % 2 and width > 2:
+                ax2 += dax
+                ay2 += day
+            yield from cls._generate_hilbert_2d(
+                x, y, ax2, ay2, bx, by,
+            )
+            yield from cls._generate_hilbert_2d(
+                x + ax2,
+                y + ay2,
+                ax - ax2,
+                ay - ay2,
+                bx,
+                by,
+            )
+            return
+
+        if height2 % 2 and height > 2:
+            bx2 += dbx
+            by2 += dby
+        yield from cls._generate_hilbert_2d(
+            x, y, bx2, by2, ax2, ay2,
+        )
+        yield from cls._generate_hilbert_2d(
+            x + bx2,
+            y + by2,
+            ax,
+            ay,
+            bx - bx2,
+            by - by2,
+        )
+        yield from cls._generate_hilbert_2d(
+            x + (ax - dax) + (bx2 - dbx),
+            y + (ay - day) + (by2 - dby),
+            -bx2,
+            -by2,
+            -(ax - ax2),
+            -(ay - ay2),
+        )
 
     @classmethod
     def _coords_hilbert_2d_base(cls, L_x, L_y):
-        # For rectangles, traverse the smallest enclosing power-of-two square
-        # in Hilbert order and keep only points inside the requested bounds.
-        side = cls._next_power_of_two(max(L_x, L_y))
-        coords = []
-        for distance in range(side * side):
-            x = 0
-            y = 0
-            t = distance
-            scale = 1
-            while scale < side:
-                rx = 1 & (t // 2)
-                ry = 1 & (t ^ rx)
-                x, y = cls._hilbert_rot(scale, x, y, rx, ry)
-                x += scale * rx
-                y += scale * ry
-                t //= 4
-                scale *= 2
-            if x < L_x and y < L_y:
-                coords.append((x, y))
-                if len(coords) == L_x * L_y:
-                    break
+        """Return a complete x-oriented Hilbert traversal of a rectangle."""
+        # Keep the basis orientation explicit instead of rotating based on
+        # aspect ratio.  ``hilbert-row-major`` is the transposed orientation,
+        # and both remain useful distinct baselines on rectangular lattices.
+        coords = list(
+            cls._generate_hilbert_2d(0, 0, L_x, 0, 0, L_y)
+        )
+
+        expected = L_x * L_y
+        if len(coords) != expected or len(set(coords)) != expected:
+            raise RuntimeError(
+                "generalized Hilbert traversal did not cover the requested "
+                f"rectangle {L_x}x{L_y} exactly."
+            )
+        if any(
+            x < 0 or x >= L_x or y < 0 or y >= L_y
+            for x, y in coords
+        ):
+            raise RuntimeError(
+                "generalized Hilbert traversal escaped the requested "
+                f"rectangle {L_x}x{L_y}."
+            )
         return coords
 
     @classmethod
@@ -372,6 +497,43 @@ class OneDMap:
                 layer.reverse()
             for x, y in layer:
                 coords.append((x, y, z))
+        return coords
+
+    @classmethod
+    def _coords_alternate_x_3d(cls, L_x, L_y, L_z):
+        """Return a 3D path that alternates the x direction.
+
+        Each ``y`` row snakes in x, and successive z layers are traversed
+        in the opposite direction so the path remains nearest-neighbour
+        across all three axes.
+        """
+        return cls._coords_snake_3d(L_x, L_y, L_z, major="row")
+
+    @classmethod
+    def _coords_alternate_y_3d(cls, L_x, L_y, L_z):
+        """Return a 3D path that alternates the y direction."""
+        return cls._coords_snake_3d(L_x, L_y, L_z, major="col")
+
+    @staticmethod
+    def _coords_alternate_z_3d(L_x, L_y, L_z):
+        """Return a 3D path with z as the alternating inner direction.
+
+        The x-y lines use row-major snake order. The z direction flips for
+        each successive line, including when a row changes, so every step
+        stays on a nearest-neighbour edge of the 3D lattice.
+        """
+        coords = []
+        line = 0
+        for y in range(L_y):
+            x_iter = range(L_x) if y % 2 == 0 else range(L_x - 1, -1, -1)
+            for x in x_iter:
+                z_iter = (
+                    range(L_z)
+                    if line % 2 == 0
+                    else range(L_z - 1, -1, -1)
+                )
+                coords.extend((x, y, z) for z in z_iter)
+                line += 1
         return coords
 
     @staticmethod
@@ -559,6 +721,24 @@ class OneDMap:
                 if Lz is None
                 else cls._coords_col_major_3d(Lx, Ly, Lz)
             )
+        elif mode_norm == "alternate-x":
+            coords = (
+                cls._coords_snake_2d(Lx, Ly, major="row")
+                if Lz is None
+                else cls._coords_alternate_x_3d(Lx, Ly, Lz)
+            )
+        elif mode_norm == "alternate-y":
+            coords = (
+                cls._coords_snake_2d(Lx, Ly, major="col")
+                if Lz is None
+                else cls._coords_alternate_y_3d(Lx, Ly, Lz)
+            )
+        elif mode_norm == "alternate-z":
+            if Lz is None:
+                raise ValueError(
+                    "alternate-z mode requires a 3D lattice with Lz provided."
+                )
+            coords = cls._coords_alternate_z_3d(Lx, Ly, Lz)
         elif mode_norm == "hilbert":
             if Lz is not None:
                 raise NotImplementedError("hilbert mode is currently implemented only for 2D lattices.")
@@ -567,6 +747,12 @@ class OneDMap:
             if Lz is not None:
                 raise NotImplementedError("hilbert mode is currently implemented only for 2D lattices.")
             coords = cls._coords_hilbert_2d(Lx, Ly, major="row")
+        elif mode_norm == "inside-out":
+            coords = (
+                cls._coords_inside_out_2d(Lx, Ly)
+                if Lz is None
+                else cls._coords_inside_out_3d(Lx, Ly, Lz)
+            )
         elif mode_norm == "diag":
             if Lz is not None:
                 raise NotImplementedError("diag mode is currently implemented only for 2D lattices.")
@@ -712,6 +898,10 @@ class OneDMap:
                 center=0.56,
                 width=0.052,
                 length=0.105,
+                # Keep arrowheads fixed-size. Quimb's default relative
+                # scaling makes non-local periodic jumps produce enormous
+                # arrowheads that obscure the lattice schematic.
+                relative=False,
             )
 
         for coord, idx in lattice_to_one_d.items():

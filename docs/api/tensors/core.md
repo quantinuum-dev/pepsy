@@ -20,7 +20,11 @@ The Quimb split-driver registration is process-global. Passing
 Autoray's native Torch rules.
 
 `stabilized=True` selects Pepsy's relative-regularized SVD and validated
-real-QR rules. The lower-level `reg_*_torch()` helpers remain for advanced
+real/complex QR rules. Stabilized Autoray calls accept the normal thin-SVD
+`full_matrices=False` and reduced-QR `mode="reduced"` keywords; full SVD and
+complete QR are intentionally rejected because their custom VJPs are thin and
+reduced only. A real policy rejects complex input rather than silently using a
+real-only VJP. The lower-level `reg_*_torch()` helpers remain for advanced
 compatibility use; ordinary applications should not combine them. The
 stabilized SVD CPU forward path falls back to SciPy `gesvd` if
 `torch.linalg.svd` fails.
@@ -42,10 +46,9 @@ same Autoray implementation, while switching Torch between native/stabilized
 or real/complex modes, and JAX between native/stabilized modes, intentionally
 updates the active implementation. Stabilized real
 QR supports square, tall, wide, and batched reduced QR. Its rank policy can be
-`warn`, `native`, or `error`, and the tolerance is configurable. Complex mode
-keeps native `torch.linalg.qr`; the explicit complex QR compatibility wrapper
-uses the same conjugate-aware native VJP but is not registered because it
-recomputes QR during backward.
+`warn`, `native`, or `error`, and the tolerance is configurable. Stabilized
+real and complex modes use the finite rank-aware QR VJPs; native mode keeps
+Torch's direct QR implementation.
 Calling `reset_linalg_registrations()` restores native Torch/JAX mappings and
 clears Pepsy's registration caches.
 

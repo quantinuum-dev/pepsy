@@ -154,12 +154,75 @@ def test_unified_fermion_helper_supports_spinless_native_workflow(symmetry):
     assert stream.order == 2
     assert all(len(where) == 2 for _, where in stream if isinstance(where, tuple))
 
+    fourth = fermions.gate_stream(
+        [(0, 1), (1, 2)],
+        0.01,
+        sites=range(3),
+        order=4,
+        t=1.0,
+        V=2.0,
+        mu=0.3,
+    )
+    assert fourth.order == 4
+    assert len(fourth) == 3 * len(stream)
+
     ham = fermions.hamiltonian(((0, 1), (1, 2)), t=1.0, V=2.0, mu=0.3)
     assert ham.model == "fermi_hubbard_spinless"
     assert ham.symmetry == symmetry
     assert set(fermions.local_terms(
         ((0, 1), (1, 2)), t=1.0, V=2.0, mu=0.3
     )) == {(0, 1), (1, 2)}
+
+
+@pytest.mark.parametrize(
+    ("spinful", "symmetry"),
+    [
+        (False, "U1"),
+        (False, "Z2"),
+        (True, "U1"),
+        (True, "U1U1"),
+        (True, "Z2"),
+    ],
+)
+def test_unified_fermion_complex64_gates_preserve_native_dtype(
+    spinful, symmetry
+):
+    """Native complex64 gate streams must not rely on optimizer downcasts."""
+    fermion = Fermion(spinful=spinful, symmetry=symmetry, dtype="complex64")
+    params = {"t": 0.7, "mu": 0.13, "V": 0.2}
+    if spinful:
+        params["U"] = 1.2
+    stream = list(
+        fermion.gate_stream(
+            ((0, 1), (1, 2)),
+            0.01,
+            sites=range(3),
+            order=2,
+            **params,
+        )
+    )
+    direct = (
+        fermion.onsite_gate(
+            0.01,
+            U=1.2 if spinful else None,
+            mu=0.13,
+        ),
+        fermion.hopping_gate(0.01, t=0.7),
+        fermion.density_gate(0.01, V=0.2),
+    )
+
+    for stream_gate, _where in stream:
+        assert {
+            np.dtype(block.dtype) for block in stream_gate.blocks.values()
+        } == {
+            np.dtype("complex64")
+        }
+    for direct_gate in direct:
+        assert {
+            np.dtype(block.dtype) for block in direct_gate.blocks.values()
+        } == {
+            np.dtype("complex64")
+        }
 
 
 def test_spinless_fermion_rejects_ignored_hubbard_couplings():
@@ -1672,6 +1735,10 @@ def test_fermion_hopping_gate_matches_native_hamiltonian_exponential():
     ham = fermion.hamiltonian({(0, 1): -fermion.hopping_operator()})
     named = fermion.hopping_gate(0.01, t=1.0, imaginary=True)
     reference = ham.trotter_gates(0.01, imaginary=True)[0][0]
+
+    fourth = ham.trotter_gates(0.01, imaginary=True, order=4)
+    assert fourth.order == 4
+    assert len(fourth) == 3 * len(ham.trotter_gates(0.01, imaginary=True, order=2))
 
     np.testing.assert_allclose(named.to_dense(), reference.to_dense())
 

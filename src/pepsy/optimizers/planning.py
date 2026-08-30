@@ -459,7 +459,9 @@ class SimulatorPlanner:
         )
         settings = {"chi": self.chi, "layout": layout}
         if stabilizer_frame:
-            settings.update({"exact_cooling": True, "track_infidelity": True})
+            settings.update(
+                {"exact_cooling": True, "stabilize_unitary": False}
+            )
         return SimulatorCandidate(
             optimizer=optimizer,
             geometry=geometry_name,

@@ -12,6 +12,7 @@ __pycache__/
 cache/
 .numba_cache/
 docs/_build/
+docs/api/reference/
 cash/
 ctg_cache/
 cotengra_cache/

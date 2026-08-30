@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 from typing import Any
 import warnings
@@ -89,10 +89,19 @@ class PepsEnergyOptimizer:
         contraction_opt: Any = "auto-hq",
         compute_kwargs: Mapping[str, Any] | None = None,
         loss_kwargs: Mapping[str, Any] | None = None,
+        torch_linalg_config: TorchLinalgConfig | None = None,
     ):
+        if torch_linalg_config is not None and not isinstance(
+            torch_linalg_config,
+            TorchLinalgConfig,
+        ):
+            raise TypeError(
+                "torch_linalg_config must be a TorchLinalgConfig instance or None."
+            )
         self.state = self._as_peps_state(state)
         self.hamiltonian = hamiltonian
         self.terms = self._terms_from_hamiltonian(hamiltonian)
+        self.torch_linalg_config = torch_linalg_config
         self.losses: list[float] = []
         self.loss_kwargs = {
             "chi": chi,
@@ -286,7 +295,14 @@ class PepsEnergyOptimizer:
             return
 
     @classmethod
-    def _configure_torch_linalg(cls, state, terms, *, quimb_split_drivers):
+    def _configure_torch_linalg(
+        cls,
+        state,
+        terms,
+        *,
+        quimb_split_drivers,
+        torch_linalg_config=None,
+    ):
         """Configure one consistent Torch linalg stack for an optimizer run."""
         dtype_name = cls._autodiff_dtype_name(state, terms)
         mode = "complex" if "complex" in str(dtype_name).lower() else "real"
@@ -295,11 +311,19 @@ class PepsEnergyOptimizer:
             # Keep those registrations together in the public policy class so
             # the optimizer cannot accidentally regularize one decomposition
             # while leaving the other on an incompatible backend.
-            TorchLinalgConfig(
-                mode=mode,
-                stabilized=True,
-                quimb_split_drivers=quimb_split_drivers,
-            ).register()
+            config = torch_linalg_config
+            if config is None:
+                config = TorchLinalgConfig(
+                    mode=mode,
+                    stabilized=True,
+                    quimb_split_drivers=quimb_split_drivers,
+                )
+            elif quimb_split_drivers and not config.quimb_split_drivers:
+                # Raw Symmray blocks bypass Autoray, so PEPS energy cleanup
+                # must extend the user's policy to Quimb without changing any
+                # of its SVD, QR, or fallback choices.
+                config = replace(config, quimb_split_drivers=True)
+            config.register()
         except ImportError:
             # TNOptimizer will report a missing requested backend if it is
             # actually needed; preserve the optional-dependency behavior.
@@ -1022,6 +1046,7 @@ class PepsEnergyOptimizer:
                 self.state,
                 terms,
                 quimb_split_drivers=True,
+                torch_linalg_config=self.torch_linalg_config,
             )
         constants = {
             "terms": self._terms_for_autodiff_backend(
@@ -1261,6 +1286,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         loss_kwargs: Mapping[str, Any] | None = None,
         allow_encoding_conversion: bool = False,
         native_mpo_compression: Mapping[str, Any] | None = None,
+        torch_linalg_config: TorchLinalgConfig | None = None,
     ):
         if hamiltonian is not None and terms is not None:
             raise TypeError("pass either hamiltonian or terms, not both")
@@ -1268,6 +1294,14 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         self.state = self._as_mps_state(state)
         self.hamiltonian = hamiltonian
         self.terms = self._terms_from_hamiltonian(hamiltonian)
+        if torch_linalg_config is not None and not isinstance(
+            torch_linalg_config,
+            TorchLinalgConfig,
+        ):
+            raise TypeError(
+                "torch_linalg_config must be a TorchLinalgConfig instance or None."
+            )
+        self.torch_linalg_config = torch_linalg_config
         self.losses: list[float] = []
         self.loss_kwargs = {
             "normalized": normalized,
@@ -2038,6 +2072,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 self.state,
                 {},
                 quimb_split_drivers=False,
+                torch_linalg_config=self.torch_linalg_config,
             )
         if self._is_fermionic_sym_hamiltonian(terms):
             if self._can_use_native_local_terms(terms, self.state):

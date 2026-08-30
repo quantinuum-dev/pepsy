@@ -20,6 +20,11 @@ gate construction explicit internally.
   `SymHamiltonian` model dispatch.
 - `src/pepsy/tensors/symm_fermions.py` and `src/pepsy/tensors/__init__.py` for
   the model-facing namespace and aliases.
+- `references/symmray-native.md` for the compact sign, dummy-mode, MPS/PEPS,
+  and SymDMRG2 implementation map, including the relevant commit trail and
+  the upstream docs/changelog watch protocol.
+- `docs/development/notes/symmray.md` for the human-readable upstream audit,
+  adoption status, and design/implementation guidance.
 - `tests/test_symmetric_tensors.py`, `tests/test_public_api.py`, and
   `docs/api/tensors/symmetric.md` before changing public behavior.
 - The concrete workflows under

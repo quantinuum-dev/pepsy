@@ -34,6 +34,9 @@ from pepsy.bp import (  # noqa: E402
     two_norm_bp,
     weight_pass,
 )
+from pepsy.bp._symmray import (  # noqa: E402
+    install_quimb_symmray_compat,
+)
 from pepsy.operators.gates import gate_loop_cluster, gate_simple  # noqa: E402
 from pepsy.tensors import (  # noqa: E402
     Fermion,
@@ -43,6 +46,22 @@ from pepsy.tensors import (  # noqa: E402
     site_charge_alternating,
     site_charge_from_map,
 )
+
+
+def test_quimb_safe_inverse_compat_handles_symmray_block_vector():
+    """The old Quimb axis reduction must not break projector compression."""
+    install_quimb_symmray_compat()
+    from quimb.tensor.decomp import safe_inverse
+
+    values = sr.BlockVector(
+        {
+            0: np.asarray([1.0, 2.0]),
+            1: np.asarray([3.0]),
+        }
+    )
+    result = safe_inverse(values, power=0.5).to_dense()
+
+    np.testing.assert_allclose(result, 1.0 / np.sqrt([1.0, 2.0, 3.0]))
 
 
 def _long_range_density_term(where, *, symmetry="U1"):

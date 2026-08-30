@@ -102,7 +102,7 @@ param_opt = builder.parametric_optimizer(
 result = param_opt.run(solver="torch-adam", n_steps=10, compiled=True)
 ```
 
-### qMERA schematics
+## qMERA schematics
 
 `QMeraSchedule.draw_schematic()` uses Quimb's manual `schematic.Drawing`
 primitives. The default `style="clean"` view separates the input sites,
@@ -128,7 +128,7 @@ later step; use `rg_step=None` to draw all steps. The older `layer=` selector
 remains an alias. `schedule.schematic_blocks()` remains the machine-readable
 placement audit.
 
-### qMERA layout search and prototype comparison
+## qMERA layout search and prototype comparison
 
 `QMeraLayoutFinder` searches valid immutable RG scale plans and ranks them by
 gate count, executable depth, reverse-lightcone width, and Hamiltonian-support

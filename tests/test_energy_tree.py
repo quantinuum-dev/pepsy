@@ -13,6 +13,39 @@ def _tree_state():
     return pepsy.TreeTensorNetwork.from_plan(plan, dtype=complex)
 
 
+def test_energy_optimizers_preserve_supplied_torch_linalg_policy(monkeypatch):
+    """Energy optimizers pass one user policy through their Torch setup."""
+    policy = pepsy.TorchLinalgConfig(
+        mode="real",
+        stabilized=False,
+        svd_driver="gesvdj",
+    )
+    registered = []
+
+    def record_register(config):
+        registered.append(config)
+        return config
+
+    monkeypatch.setattr(pepsy.TorchLinalgConfig, "register", record_register)
+    pepsy.PepsEnergyOptimizer._configure_torch_linalg(
+        None,
+        {},
+        quimb_split_drivers=True,
+        torch_linalg_config=policy,
+    )
+    pepsy.MpsEnergyOptimizer._configure_torch_linalg(
+        None,
+        {},
+        quimb_split_drivers=False,
+        torch_linalg_config=policy,
+    )
+
+    assert registered[0] is not policy
+    assert registered[0].quimb_split_drivers is True
+    assert registered[0].svd_driver == "gesvdj"
+    assert registered[1] is policy
+
+
 def test_tree_energy_optimizer_reports_energy():
     state = _tree_state()
     z = np.diag([1.0, -1.0]).astype(complex)

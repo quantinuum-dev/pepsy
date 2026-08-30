@@ -201,6 +201,13 @@ pairing = py.Fermion(spinful=False, symmetry="Z2")
 pairing.strang_gate_stream(edges, dt=0.01, t=1.0, pairing=0.2)
 ```
 
+The gate-stream helpers accept `order=1`, `2`, or `4`. Order four is an
+opt-in Suzuki-Yoshida composition of three symmetric second-order steps and
+includes a negative middle substep; the existing order-one and order-two
+streams are unchanged. For example, use
+`spinless.gate_stream(edges, dt=0.01, order=4, t=1.0, V=0.5)` when the
+additional gate applications are worthwhile.
+
 The bare ``*_operator`` methods return explicit native fermionic operators,
 not exponentiated gates or model coefficients. For example,
 ``spinful.hopping_operator(spin="up")`` returns
@@ -817,6 +824,10 @@ jw_step = py.fermi_hubbard_u1u1_jw_gate_stream(
 )
 ```
 
+The Jordan-Wigner stream also accepts `order=4`. It keeps the same
+nearest-neighbour restriction and composes the validated order-two
+Jordan-Wigner gates, so no new parity-string convention is introduced.
+
 For a **single, controlled Jordan-Wigner conversion**, build the gates and the
 MPO from the *same* ``SymHamiltonian`` and ordering. ``jw_trotter_gates`` reads
 the same terms, site ordering (``mapper``), local operators, and parity-string
@@ -832,6 +843,7 @@ ham = py.SymHamiltonian.from_edges(
 )
 mpo = ham.to_mpo(L=8)                 # energy / SymDMRG2
 gates = ham.jw_trotter_gates(0.05, order=2)   # consistent time-evolution gates
+# gates4 = ham.jw_trotter_gates(0.05, order=4)  # optional higher order
 ```
 
 ``ham.jw_energy(state)`` reads the energy of a bosonic (``fermionic=False``)

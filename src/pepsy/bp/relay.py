@@ -47,6 +47,12 @@ from ._symmray import (
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
+from .._internal.quimb import (
+    quimb_bp_class as _quimb_bp_class,
+    quimb_bp_constructor_option_supported as _quimb_bp_constructor_option_supported,
+    quimb_bp_constructor_options as _quimb_bp_constructor_options,
+    quimb_bp_run_options as _quimb_bp_run_options,
+)
 
 __all__ = [
     "BPState",
@@ -74,9 +80,7 @@ def _method_key(method: str, classes: Mapping[str, str]) -> str:
 
 def _bp_class(method_key: str):
     """Return the quimb BP class for a validated method key."""
-    from quimb.tensor import belief_propagation as _bp
-
-    return getattr(_bp, _RELAY_CLASSES[method_key])
+    return _quimb_bp_class(method_key)
 
 
 def _message_data(message):
@@ -215,14 +219,30 @@ def _set_messages(bp, messages) -> None:
 
 def _bp_constructor_kwargs(method_key: str, damping, update, bp_opts):
     """Adapt Pepsy's common API to the differing public quimb constructors."""
+    bp_opts = dict(bp_opts)
     if method_key == "hv1bp":
         if update not in (None, "parallel"):
             raise ValueError("HV1BP only supports update='parallel'")
-        return {"damping": damping, **bp_opts}
+        options = {"damping": damping, **bp_opts}
+    else:
+        if update is None:
+            update = "sequential"
+        options = {"damping": damping, "update": update, **bp_opts}
+    return _quimb_bp_constructor_options(method_key, options)
 
-    if update is None:
-        update = "sequential"
-    return {"damping": damping, "update": update, **bp_opts}
+
+def _bp_constructor_kwargs_with_diis(
+    method_key: str,
+    damping,
+    update,
+    bp_opts,
+    diis,
+):
+    """Add constructor-level DIIS only on Quimb versions that support it."""
+    opts = dict(bp_opts)
+    if _quimb_bp_constructor_option_supported(method_key, "diis"):
+        opts["diis"] = diis
+    return _bp_constructor_kwargs(method_key, damping, update, opts)
 
 
 def _run_options(tol_abs, tol_rolling_diff) -> dict[str, Any]:
@@ -579,19 +599,22 @@ def one_norm_bp(
     bp_class = _bp_class(method_key)
     bp = bp_class(
         tn,
-        **_bp_constructor_kwargs(method_key, damping, update, bp_opts),
+        **_bp_constructor_kwargs_with_diis(
+            method_key, damping, update, bp_opts, diis
+        ),
     )
     if init_messages is not None:
         _set_messages(bp, init_messages)
     info: dict = {}
-    bp.run(
-        max_iterations=max_iterations,
-        tol=tol,
-        diis=diis,
-        progbar=progbar,
-        info=info,
+    run_opts = {
+        "max_iterations": max_iterations,
+        "tol": tol,
+        "diis": diis,
+        "progbar": progbar,
+        "info": info,
         **_run_options(tol_abs, tol_rolling_diff),
-    )
+    }
+    bp.run(**_quimb_bp_run_options(bp, run_opts))
     max_mdiff = float(info.get("max_mdiff", float("nan")))
     return RelayBPResult(
         bp=bp,
@@ -638,19 +661,22 @@ def two_norm_bp(
             diis = False
     bp = _bp_class("d2bp")(
         tn,
-        **_bp_constructor_kwargs("d2bp", damping, update, bp_opts),
+        **_bp_constructor_kwargs_with_diis(
+            "d2bp", damping, update, bp_opts, diis
+        ),
     )
     if init_messages is not None:
         _set_messages(bp, init_messages)
     info: dict = {}
-    bp.run(
-        max_iterations=max_iterations,
-        tol=tol,
-        diis=diis,
-        progbar=progbar,
-        info=info,
+    run_opts = {
+        "max_iterations": max_iterations,
+        "tol": tol,
+        "diis": diis,
+        "progbar": progbar,
+        "info": info,
         **_run_options(tol_abs, tol_rolling_diff),
-    )
+    }
+    bp.run(**_quimb_bp_run_options(bp, run_opts))
     max_mdiff = float(info.get("max_mdiff", float("nan")))
     return RelayBPResult(
         bp=bp,
@@ -770,7 +796,9 @@ def relay_bp(
     rng = np.random.default_rng(seed)
     bp = bp_class(
         tn,
-        **_bp_constructor_kwargs(method_key, damping, update, bp_opts),
+        **_bp_constructor_kwargs_with_diis(
+            method_key, damping, update, bp_opts, diis
+        ),
     )
 
     if init_messages is not None:
@@ -785,13 +813,14 @@ def relay_bp(
         if not use_memory:
             # Plain leg: use quimb's DIIS-accelerated run.
             info: dict = {}
-            bp.run(
-                max_iterations=max_iterations,
-                tol=tol,
-                diis=diis,
-                info=info,
+            run_opts = {
+                "max_iterations": max_iterations,
+                "tol": tol,
+                "diis": diis,
+                "info": info,
                 **_run_options(tol_abs, tol_rolling_diff),
-            )
+            }
+            bp.run(**_quimb_bp_run_options(bp, run_opts))
             iteration = int(info.get("iterations", 0))
             max_mdiff = float(info.get("max_mdiff", float("nan")))
             converged = _strict_converged(max_mdiff, tol, tol_abs)

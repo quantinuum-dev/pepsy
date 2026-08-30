@@ -9,6 +9,7 @@ from importlib import import_module
 
 _SYMBOL_MODULES = {
     "backend_infer": ".convert",
+    "backend_signatures_compatible": ".convert",
     "dispatch_backend_converter": ".convert",
     "infer_backend_and_dtype": ".convert",
     "infer_backend_signature": ".convert",

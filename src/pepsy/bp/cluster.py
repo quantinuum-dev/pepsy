@@ -65,6 +65,7 @@ D1BP fixed point for their formal cancellations.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import chain, combinations
 from math import factorial
@@ -80,6 +81,12 @@ from ._symmray import (
     dense_message_tree as _dense_message_tree,
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
+)
+from .._internal.quimb import (
+    quimb_bp_class as _quimb_bp_class,
+    quimb_bp_constructor_option_supported as _quimb_bp_constructor_option_supported,
+    quimb_bp_constructor_options as _quimb_bp_constructor_options,
+    quimb_bp_run_options as _quimb_bp_run_options,
 )
 
 __all__ = [
@@ -112,9 +119,9 @@ def _cluster_bp_class(norm: str):
         raise ValueError(
             f"norm must be one of {sorted(_CLUSTER_BP_CLASSES)}; got {norm!r}"
         )
-    from quimb.tensor import belief_propagation as _bp
-
-    return key, getattr(_bp, _CLUSTER_BP_CLASSES[key])
+    return key, _quimb_bp_class(
+        "d2bp" if key == "2norm" else "d1bp"
+    )
 
 
 _GAUGE_INIT_ONLY_BP_OPTS = {
@@ -153,15 +160,16 @@ def _run_plain_bp(
         # Symmray messages cannot be packed by Quimb's dense DIIS
         # vectorizer; sequential D2BP remains native and convergent.
         diis = False
-    bp.run(
-        max_iterations=max_iterations,
-        tol=tol,
-        tol_abs=tol_abs,
-        tol_rolling_diff=tol_rolling_diff,
-        diis=diis,
-        info=info,
-        progbar=progbar,
-    )
+    run_opts = {
+        "max_iterations": max_iterations,
+        "tol": tol,
+        "tol_abs": tol_abs,
+        "tol_rolling_diff": tol_rolling_diff,
+        "diis": diis,
+        "info": info,
+        "progbar": progbar,
+    }
+    bp.run(**_quimb_bp_run_options(bp, run_opts))
     info["quimb_converged"] = bool(info.get("converged", False))
     info["converged"] = _strict_converged(info, tol, tol_abs)
     return info
@@ -221,24 +229,44 @@ class ScalarClusterCache:
         gloops,
         *,
         autocomplete: bool = True,
+        gloop_opts: Mapping[str, Any] | None = None,
     ) -> tuple[tuple[frozenset, int], ...]:
         """Return singleton-baseline regions plus loop intersections."""
         from quimb.tensor.belief_propagation.regions import gen_region_counts
 
         self._check_topology(tn)
+        gloop_opts = {} if gloop_opts is None else dict(gloop_opts)
 
         if gloops is None:
-            loops = tuple(frozenset(region) for region in tn.gen_gloops())
+            loops = tuple(
+                frozenset(region) for region in tn.gen_gloops(**gloop_opts)
+            )
         elif isinstance(gloops, int):
-            try:
-                loops = self.loops_by_max_size[gloops]
-            except KeyError:
+            if "max_size" in gloop_opts:
+                raise ValueError(
+                    "gloop_opts['max_size'] cannot be combined with integer "
+                    "gloops; pass the limit in one place only."
+                )
+            if gloop_opts:
                 loops = tuple(
                     frozenset(region)
-                    for region in tn.gen_gloops(max_size=gloops)
+                    for region in tn.gen_gloops(max_size=gloops, **gloop_opts)
                 )
-                self.loops_by_max_size[gloops] = loops
+            else:
+                try:
+                    loops = self.loops_by_max_size[gloops]
+                except KeyError:
+                    loops = tuple(
+                        frozenset(region)
+                        for region in tn.gen_gloops(max_size=gloops)
+                    )
+                    self.loops_by_max_size[gloops] = loops
         else:
+            if gloop_opts:
+                raise ValueError(
+                    "gloop_opts can only be used when gloops is None or an "
+                    "integer maximum loop size."
+                )
             loops = tuple(frozenset(region) for region in gloops)
 
         loop_key = (frozenset(loops), bool(autocomplete))
@@ -601,6 +629,7 @@ def _expand_scalar_bp(
     autocomplete: bool = True,
     autoreduce: bool = False,
     progbar: bool = False,
+    gloop_opts: Mapping[str, Any] | None = None,
     **contract_opts,
 ):
     """Evaluate a scalar BP loop-cluster expansion with a Bethe baseline."""
@@ -619,6 +648,7 @@ def _expand_scalar_bp(
         bp.tn,
         gloops,
         autocomplete=autocomplete,
+        gloop_opts=gloop_opts,
     )
     if progbar:
         from quimb.utils import progbar as Progbar
@@ -722,6 +752,7 @@ class LoopClusterResult:
         combine: str | None = None,
         autocomplete: bool = True,
         autoreduce: bool = False,
+        gloop_opts: Mapping[str, Any] | None = None,
         optimize: str = "auto-hq",
         strip_exponent: bool = False,
         progbar: bool = False,
@@ -750,6 +781,7 @@ class LoopClusterResult:
                 autocomplete=autocomplete,
                 autoreduce=autoreduce,
                 progbar=progbar,
+                gloop_opts=gloop_opts,
                 **contract_opts,
             )
         return _expand(
@@ -889,7 +921,12 @@ def linked_cluster_expand(
 
         from .relay import _set_messages
 
-        bp = D1BP(tn, damping=damping, update=update, **bp_opts)
+        bp = D1BP(
+            tn,
+            **_quimb_bp_constructor_options(
+                "d1bp", {"damping": damping, "update": update, **bp_opts}
+            ),
+        )
         if messages is not None:
             _set_messages(bp, messages)
         bp_converged = None
@@ -1097,6 +1134,7 @@ def loop_cluster_expand(
     cache: ScalarClusterCache | None = None,
     autocomplete: bool = True,
     autoreduce: bool = False,
+    gloop_opts: Mapping[str, Any] | None = None,
     optimize: str = "auto-hq",
     strip_exponent: bool = False,
     progbar: bool = False,
@@ -1126,6 +1164,11 @@ def loop_cluster_expand(
         The cluster specification. An ``int`` uses all generalized loops up to
         that many tensor sites; an iterable specifies the generalized loops
         explicitly. ``None`` uses all generalized loops supported by Quimb.
+    gloop_opts : mapping, optional
+        Keyword options forwarded to Quimb's generalized-loop generator when
+        ``gloops`` is ``None`` or an integer. This exposes newer controls such
+        as ``max_size``/``join_overlap`` without changing the default loop
+        set. Do not combine ``max_size`` with integer ``gloops``.
     norm : {"2norm", "1norm"}, optional
         Which BP family to use: ``D2BP`` (2-norm, default) or ``D1BP`` (1-norm).
     combine : {"prod", "sum"}, optional
@@ -1198,6 +1241,7 @@ def loop_cluster_expand(
         messages = _dense_message_tree(messages)
         gauges = _dense_message_tree(gauges)
     contract_opts = {} if contract_opts is None else dict(contract_opts)
+    gloop_opts = {} if gloop_opts is None else dict(gloop_opts)
     if run_bp and (
         not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1
     ):
@@ -1304,8 +1348,10 @@ def loop_cluster_expand(
         if key == "2norm":
             # only D2BP takes an optimize kwarg at construction time.
             ctor["optimize"] = optimize
+        if _quimb_bp_constructor_option_supported(key, "diis"):
+            ctor["diis"] = diis
         ctor.update(bp_opts)
-        bp = bp_cls(tn, **ctor)
+        bp = bp_cls(tn, **_quimb_bp_constructor_options(key, ctor))
 
         if run_bp:
             info = _run_plain_bp(
@@ -1320,6 +1366,22 @@ def loop_cluster_expand(
 
     region_counts = None
     scalar_cache = None
+    if key == "2norm" and gloop_opts:
+        if gloops is not None and not isinstance(gloops, int):
+            raise ValueError(
+                "gloop_opts can only be combined with None or integer gloops."
+            )
+        if gloops is not None and "max_size" in gloop_opts:
+            raise ValueError(
+                "gloop_opts['max_size'] cannot be combined with integer "
+                "gloops; pass the limit in one place only."
+            )
+        generated_opts = dict(gloop_opts)
+        if gloops is not None:
+            generated_opts["max_size"] = gloops
+        gloops = tuple(
+            frozenset(region) for region in bp.tn.gen_gloops(**generated_opts)
+        )
     if key == "1norm":
         if require_fixed_point and run_bp and not info.get("converged", False):
             raise RuntimeError(
@@ -1339,12 +1401,14 @@ def loop_cluster_expand(
             autocomplete=autocomplete,
             autoreduce=autoreduce,
             progbar=progbar,
+            gloop_opts=gloop_opts,
             **contract_opts,
         )
         region_counts = scalar_cache.regions_for(
             bp.tn,
             gloops,
             autocomplete=autocomplete,
+            gloop_opts=gloop_opts,
         )
     else:
         _align_symmray_d2bp_messages(bp)
@@ -1386,6 +1450,7 @@ def norm1_gloop_expand(
     require_fixed_point: bool | None = None,
     combine: str = "prod",
     cache: ScalarClusterCache | None = None,
+    gloop_opts: Mapping[str, Any] | None = None,
     optimize: str = "auto",
     strip_exponent: bool = False,
     progbar: bool = False,
@@ -1428,6 +1493,7 @@ def norm1_gloop_expand(
         update=update,
         require_fixed_point=require_fixed_point,
         cache=cache,
+        gloop_opts=gloop_opts,
         autocomplete=autocomplete,
         autoreduce=autoreduce,
         optimize=optimize,

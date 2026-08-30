@@ -9,12 +9,14 @@ _SYMBOL_MODULES = {
     "MpsBatchSampleResult": ".samplers",
     "MpsSampleResult": ".samplers",
     "MpsSampler": ".samplers",
+    "MpsStabSampler": ".stabilizer",
     "PEPSSampleResult": ".samplers",
     "PepsSampler": ".samplers",
     "PepsBpSampler": ".samplers",
     "TreeBatchSampleResult": ".tree",
     "TreeSampleResult": ".tree",
     "TreeSampler": ".tree",
+    "StabilizerMpsSampler": ".stabilizer",
     "VecSampler": ".samplers",
 }
 

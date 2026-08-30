@@ -16,6 +16,11 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from .._internal.quimb import (
+    quimb_mpo_auto_swap_function,
+    require_quimb_gate_option,
+)
+
 
 # Symmray's cutoff-based block-SVD keeps every singular value tied with the
 # global threshold. This is symmetry-respecting, but means ``max_bond`` is a
@@ -168,6 +173,7 @@ from ..tensors.core import OneDMap, add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
+    "gate_mpo_auto_swap",
     "gate_loop_cluster",
     "gate_simple",
     "renorm_gauge",
@@ -210,6 +216,44 @@ __all__ = [
     "fsim",
     "fsimg",
 ]
+
+
+def gate_mpo_auto_swap(
+    mpo,
+    G,
+    where,
+    *,
+    dagger=False,
+    swap_back=True,
+    strip_exponent=False,
+    contract="split",
+    inplace=False,
+    **compress_opts,
+):
+    """Prototype wrapper for Quimb's MPO auto-swap gate sandwich.
+
+    This is deliberately separate from :func:`gate` and the MPS optimizer:
+    Quimb applies the operator sandwich to an MPO, tracks its canonical form,
+    and optionally swaps a long-range pair back. The wrapper performs no
+    fallback or dense conversion, so unsupported Quimb versions fail at the
+    explicit opt-in call rather than changing existing gate behavior.
+    """
+    function = quimb_mpo_auto_swap_function(mpo)
+    if function is None:
+        raise NotImplementedError(
+            "The installed Quimb build does not provide "
+            "MatrixProductOperator.gate_sandwich_with_auto_swap()."
+        )
+    return function(
+        G,
+        where,
+        dagger=bool(dagger),
+        swap_back=bool(swap_back),
+        strip_exponent=bool(strip_exponent),
+        contract=contract,
+        inplace=bool(inplace),
+        **compress_opts,
+    )
 
 
 def _stop_gradient(x):
@@ -1683,7 +1727,7 @@ def _normalize_gate_entries(
     )
 
 
-def gate(tn, gates, where=None, which=None, **kwargs):
+def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwargs):
     """Apply one or many gates with automatic 1D/2D/3D dispatch.
 
     Parameters
@@ -1757,7 +1801,15 @@ def gate(tn, gates, where=None, which=None, **kwargs):
     entries = _normalize_gate_entries(
         gates, where=where, allow_empty=True, allow_which=True
     )
+    if dagger:
+        require_quimb_gate_option("dagger")
+    if transpose:
+        require_quimb_gate_option("transpose")
     opts = dict(kwargs)
+    if dagger:
+        opts["dagger"] = True
+    if transpose:
+        opts["transpose"] = True
     opts.setdefault("cutoff_mode", "rsum2")
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
@@ -1890,6 +1942,8 @@ def gate_simple(
     cutoff=1e-12,
     cutoff_mode="rsum2",
     strict_max_bond: bool = False,
+    dagger=False,
+    transpose=False,
     contract=None,
     sequence="auto",
     path_canonize=False,
@@ -1962,6 +2016,10 @@ def gate_simple(
         when a nonzero cutoff has degenerate singular values at its boundary.
         This is disabled by default to preserve Symmray's standard
         degeneracy-preserving truncation policy.
+    dagger, transpose : bool, optional
+        Apply the conjugate-transpose or transpose of each user gate. These
+        options are forwarded to Quimb's simple-update gate and are not
+        applied to internal routing SWAPs.
     contract : {None, "auto", "split", "reduce-split"}, optional
         Two-site split strategy passed to Quimb. The default ``None``/``"auto"``
         selects ``"split"`` as a conservative fallback for block-sparse
@@ -1989,6 +2047,10 @@ def gate_simple(
         where = None
     if gauges is None:
         raise TypeError("gate_simple() requires a gauges dictionary.")
+    if dagger:
+        require_quimb_gate_option("dagger", simple=True)
+    if transpose:
+        require_quimb_gate_option("transpose", simple=True)
 
     tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
     entries = _normalize_gate_entries(
@@ -2092,6 +2154,8 @@ def gate_simple(
                     path_compress_cutoff=path_compress_cutoff,
                     path_compress_canonize_distance=path_compress_canonize_distance,
                     path_compress_opts=path_compress_opts,
+                    dagger=dagger,
+                    transpose=transpose,
                 )
 
     return tn_work
@@ -2366,6 +2430,8 @@ def _gate_simple_one(
     path_compress_cutoff=None,
     path_compress_canonize_distance=0,
     path_compress_opts=None,
+    dagger=False,
+    transpose=False,
 ):
     """Apply a single normalized gate through quimb simple update."""
     if not hasattr(tn_work, "gate_simple_"):
@@ -2407,6 +2473,8 @@ def _gate_simple_one(
             path_compress_cutoff=path_compress_cutoff,
             path_compress_canonize_distance=path_compress_canonize_distance,
             path_compress_opts=path_compress_opts,
+            dagger=dagger,
+            transpose=transpose,
         )
     finally:
         if ind_id is not None and has_site_ind_id:
@@ -2431,8 +2499,16 @@ def _gate_simple_one_with_current_site_ind_id(
     path_compress_cutoff=None,
     path_compress_canonize_distance=0,
     path_compress_opts=None,
+    dagger=False,
+    transpose=False,
 ):
     """Apply a single gate after selecting its site-index family or side."""
+    transform_opts = {}
+    if dagger:
+        transform_opts["dagger"] = True
+    if transpose:
+        transform_opts["transpose"] = True
+
     # One-site gate — no gauge update needed.
     if len(where) == 1:
         operator_which = gate_opts.get("which")
@@ -2440,6 +2516,7 @@ def _gate_simple_one_with_current_site_ind_id(
             tn_work.gate_simple_(
                 G, where=where, gauges=gauges,
                 renorm=False, smudge=smudge, inplace=True,
+                **transform_opts,
             )
         else:
             # Quimb's one-tensor gate_simple shortcut does not forward
@@ -2451,6 +2528,7 @@ def _gate_simple_one_with_current_site_ind_id(
                 which=operator_which,
                 contract=True,
                 inplace=True,
+                **transform_opts,
             )
         return tn_work
 
@@ -2475,6 +2553,7 @@ def _gate_simple_one_with_current_site_ind_id(
         tn_work.gate_simple_(
             G, where=where, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
+            **transform_opts,
             **gate_opts,
         )
         _maybe_compress_path(
@@ -2560,6 +2639,7 @@ def _gate_simple_one_with_current_site_ind_id(
     tn_work.gate_simple_(
         G, where=final, gauges=gauges,
         renorm=renorm, smudge=smudge, inplace=True,
+        **transform_opts,
         **gate_opts,
     )
 
@@ -2660,6 +2740,8 @@ def _apply_gate_2d(
     path_compress_cutoff=None,
     path_compress_canonize_distance=0,
     path_compress_opts=None,
+    dagger=False,
+    transpose=False,
 ):
     """Apply a single normalized 2D gate, routing long-range pairs with SWAPs."""
 
@@ -2676,6 +2758,11 @@ def _apply_gate_2d(
     G_apply = gate
     split_max_bond = max_bond if max_bond is not None else bond_dim
     split_opts = _local_split_opts(split_max_bond)
+    transform_opts = {}
+    if dagger:
+        transform_opts["dagger"] = True
+    if transpose:
+        transform_opts["transpose"] = True
 
     if len(where) == 1:
         ((i, j),) = where
@@ -2689,6 +2776,7 @@ def _apply_gate_2d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **transform_opts,
         )
         return peps
 
@@ -2723,6 +2811,7 @@ def _apply_gate_2d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **transform_opts,
             **split_opts,
         )
         _maybe_compress_path(
@@ -2803,6 +2892,7 @@ def _apply_gate_2d(
         inplace=True,
         cutoff=cutoff,
         cutoff_mode=cutoff_mode,
+        **transform_opts,
         **split_opts,
     )
 
@@ -2936,6 +3026,8 @@ def _apply_gate_3d(
     path_compress_cutoff=None,
     path_compress_canonize_distance=0,
     path_compress_opts=None,
+    dagger=False,
+    transpose=False,
 ):
     """Apply a single normalized 3D gate, routing long-range pairs with SWAPs."""
 
@@ -2952,6 +3044,11 @@ def _apply_gate_3d(
     G_apply = gate
     split_max_bond = max_bond if max_bond is not None else bond_dim
     split_opts = _local_split_opts(split_max_bond)
+    transform_opts = {}
+    if dagger:
+        transform_opts["dagger"] = True
+    if transpose:
+        transform_opts["transpose"] = True
 
     if len(where) == 1:
         ((i, j, k),) = where
@@ -2965,6 +3062,7 @@ def _apply_gate_3d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **transform_opts,
         )
         return tn
 
@@ -2996,6 +3094,7 @@ def _apply_gate_3d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **transform_opts,
             **split_opts,
         )
         _maybe_compress_path(
@@ -3079,6 +3178,7 @@ def _apply_gate_3d(
         inplace=True,
         cutoff=cutoff,
         cutoff_mode=cutoff_mode,
+        **transform_opts,
         **split_opts,
     )
 
@@ -3635,11 +3735,18 @@ def _apply_gate_1d(
     path_compress_cutoff=None,
     path_compress_canonize_distance=0,
     path_compress_opts=None,
+    dagger=False,
+    transpose=False,
 ):
     """Apply a single normalized 1D gate on one or two sites."""
 
     G_apply = gate
     split_opts = _local_split_opts(max_bond)
+    transform_opts = {}
+    if dagger:
+        transform_opts["dagger"] = True
+    if transpose:
+        transform_opts["transpose"] = True
 
     if len(where) == 2:
         x, y = where
@@ -3696,6 +3803,7 @@ def _apply_gate_1d(
                 inplace=inplace,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                **transform_opts,
                 **split_opts,
             )
 
@@ -3744,6 +3852,7 @@ def _apply_gate_1d(
                 inplace=inplace,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                **transform_opts,
                 **split_opts,
             )
             _maybe_compress_path(
@@ -3770,6 +3879,7 @@ def _apply_gate_1d(
             [_format_ind_id(ind_id, x)],
             contract=contract,
             inplace=inplace,
+            **transform_opts,
             **split_opts,
         )
 

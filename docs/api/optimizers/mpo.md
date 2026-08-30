@@ -136,11 +136,21 @@ print(diagnostics["fidelity"])
 print(diagnostics["infidelity"])
 ```
 
-`diagnostics["fidelity"]` is the stable cumulative product of the per-event
-`norm_fidelity` values, evaluated in log space. `infidelity` is
-`1 - fidelity`, evaluated with `expm1` for small losses. The progress bar's
-`~F` field uses this same cumulative value. `get_fidelities()` remains the
-legacy normalized-MPO-norm history and is not the compression ledger.
+`diagnostics["cumulative_fidelity"]` is the stable cumulative product of the
+per-event `local_fidelity` values, evaluated in log space. The matching
+`cumulative_infidelity` uses `expm1` for small losses. These are compression
+fidelities measured from retained norms, not target-state overlaps. The live
+represented MPO norm is reported separately as `norm`/`state_norm`, while
+`cumulative_norm` is only the square-root retained-compression proxy. The
+progress bar's `~F` field uses the cumulative compression fidelity.
+`get_fidelities()` remains the legacy normalized-MPO-norm history and is not
+the compression ledger.
+
+If lower-level code accesses `opt.p` and moves its canonical centre directly,
+call `opt.sync_canonicalization()` before resuming replay so `opt.info_c` is
+rebased to the live MPO. With no compression events yet, the cumulative
+fidelity fields are `None`; they are not a claim that a compression has been
+measured.
 
 DMRG FIT controls are exposed directly through `run`: `fit_min_iter`,
 `fit_rtol`, `fit_patience`, `fit_finite_check`, `timing`,
@@ -261,7 +271,7 @@ basis = MPOBasis.from_pauli_terms(
     [((i, i + 1), "ZZ", MPOParameter("J")) for i in range(L - 1)]
     + [((i,), "X", MPOParameter("hx")) for i in range(L)],
 )
-U = basis.extensive_exponential(
+U = basis.exp(
     -1j * dt,
     {"J": J, "hx": hx},
     order=2,
@@ -282,8 +292,9 @@ Algorithms 1--3, where Algorithm 3 adds selected order-`N + 1` terms without
 increasing the analytical history bond dimension. `mode="approximate"`
 additionally enables Algorithm 4 after that extension. These modes, together
 with `order`, `max_bond`, `on_exceed`, `cache_history`, and `history_storage`,
-are shared by `basis.exp()`, `basis.time_evolution()`, and the compatibility
-alias `basis.evolution_mpo()`. `MPOProductTerm` also accepts arbitrary
+are shared by `basis.exp()` and `basis.compile_exp()`. The names
+`basis.time_evolution()` and `basis.evolution_mpo()` remain compatibility
+aliases. `MPOProductTerm` also accepts arbitrary
 one-dimensional supports, for example `(0, 1, 3)` with operators `"XYZ"`.
 
 The first build compiles the first-degree MPO topology and symbolic history

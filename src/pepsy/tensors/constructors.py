@@ -14,6 +14,7 @@ import quimb.tensor as qtn
 from .contractions import build_optimizer, tn_norm
 from .bonds import new_native_bond
 from .validation import validate_tensor_network_tags
+from .._internal.quimb import quimb_lattice_bond_map
 
 __all__ = [
     "add_cycle", "id_to_pepo", "id_to_mpo", "tns_align", "expec_mpo",
@@ -44,18 +45,44 @@ def add_cycle(peps, bond_dim, cylinder=False):
     """Add periodic bonds to a PEPS network in x (and optional y) directions."""
     Ly = peps.Ly
     Lx = peps.Lx
+    bond_map = quimb_lattice_bond_map(Lx, Ly)
+
+    def bond_name(left, right):
+        return None if bond_map is None else bond_map(left, right)
+
+    def has_bond(T1, T2, name):
+        if name is not None:
+            return name in T1.inds and name in T2.inds
+        return bool(qtn.bonds(T1, T2))
+
     for j in range(Ly):
         T1 = peps[f"I{Lx-1},{j}"]
         T2 = peps[f"I{0},{j}"]
-        if not qtn.bonds(T1, T2):
-            new_native_bond(T1, T2, size=bond_dim, axis1=0, axis2=0)
+        name = bond_name((Lx - 1, j), (Lx, j))
+        if not has_bond(T1, T2, name):
+            new_native_bond(
+                T1,
+                T2,
+                size=bond_dim,
+                name=name,
+                axis1=0,
+                axis2=0,
+            )
 
     if not cylinder:
         for i in range(Lx):
             T1 = peps[f"I{i},{Ly-1}"]
             T2 = peps[f"I{i},{0}"]
-            if not qtn.bonds(T1, T2):
-                new_native_bond(T1, T2, size=bond_dim, axis1=0, axis2=0)
+            name = bond_name((i, Ly - 1), (i, Ly))
+            if not has_bond(T1, T2, name):
+                new_native_bond(
+                    T1,
+                    T2,
+                    size=bond_dim,
+                    name=name,
+                    axis1=0,
+                    axis2=0,
+                )
     return peps
 
 

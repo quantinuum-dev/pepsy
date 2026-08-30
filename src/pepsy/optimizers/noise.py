@@ -201,11 +201,45 @@ class _TrajectorySeedPair:
     optimizer: Any
 
 
-def _trajectory_seed_pairs(seed, shots):
+def _trajectory_seed_pairs(seed, shots, *, shot_ids=None):
     if isinstance(seed, _TrajectorySeedPair):
         if int(shots) != 1:
             raise ValueError("a pre-split trajectory seed can only run one shot.")
         return (seed,)
+    if shot_ids is not None:
+        if isinstance(shot_ids, range):
+            if shot_ids.step <= 0 or shot_ids.start < 0:
+                raise ValueError("shot_ids must be a nonnegative increasing range.")
+            if len(shot_ids) != int(shots):
+                raise ValueError("shot_ids must contain one entry per shot.")
+
+            def iter_range_seed_pairs():
+                for shot_id in shot_ids:
+                    if shot_id >= 2**64:
+                        raise ValueError("shot_ids must be smaller than 2**64.")
+                    spawn_key = (shot_id & 0xFFFFFFFF, shot_id >> 32)
+                    child_seed = np.random.SeedSequence(seed, spawn_key=spawn_key)
+                    yield _TrajectorySeedPair(*child_seed.spawn(2))
+
+            return iter_range_seed_pairs()
+        shot_ids = tuple(int(shot_id) for shot_id in shot_ids)
+        if len(shot_ids) != int(shots):
+            raise ValueError("shot_ids must contain one entry per shot.")
+        if any(shot_id < 0 for shot_id in shot_ids):
+            raise ValueError("shot_ids must be nonnegative.")
+        if len(set(shot_ids)) != len(shot_ids):
+            raise ValueError("shot_ids must be unique.")
+        pairs = []
+        for shot_id in shot_ids:
+            # A shot-specific spawn key makes the trajectory independent of
+            # the number of MPI ranks that happen to execute it. Splitting the
+            # integer keeps the key within SeedSequence's uint32 contract.
+            if shot_id >= 2**64:
+                raise ValueError("shot_ids must be smaller than 2**64.")
+            spawn_key = (shot_id & 0xFFFFFFFF, shot_id >> 32)
+            child_seed = np.random.SeedSequence(seed, spawn_key=spawn_key)
+            pairs.append(_TrajectorySeedPair(*child_seed.spawn(2)))
+        return tuple(pairs)
     return tuple(
         _TrajectorySeedPair(*child_seed.spawn(2))
         for child_seed in np.random.SeedSequence(seed).spawn(int(shots))
@@ -1418,6 +1452,8 @@ def _as_entries(gates) -> list[object]:
     """Normalize a single bundled event or iterable gate stream."""
     if gates is None:
         return []
+    if isinstance(gates, TrajectoryStreamPlan):
+        return list(gates.entries)
     if isinstance(gates, Mapping):
         return [gates]
     if isinstance(gates, (tuple, list)):
@@ -2002,7 +2038,13 @@ def _validate_parallel_backend(parallel_backend):
     return backend
 
 
-def _parallel_map_ordered(function, values, parallel_workers, parallel_backend):
+def _parallel_map_ordered(
+    function,
+    values,
+    parallel_workers,
+    parallel_backend,
+    progress=None,
+):
     """Apply independent optimizer work in deterministic input order.
 
     GPU execution deliberately uses threads rather than processes: optimizer
@@ -2011,9 +2053,19 @@ def _parallel_map_ordered(function, values, parallel_workers, parallel_backend):
     """
     values = tuple(values)
     if parallel_workers <= 1 or parallel_backend == "serial":
-        return [function(value) for value in values]
+        results = []
+        for value in values:
+            results.append(function(value))
+            if progress is not None:
+                progress(1)
+        return results
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-        return list(executor.map(function, values))
+        results = []
+        for result in executor.map(function, values):
+            results.append(result)
+            if progress is not None:
+                progress(1)
+        return results
 
 
 def _importance_distribution(policy, event_index, outcomes, target, optimizer=None):
@@ -2085,6 +2137,44 @@ def _auto_prefers_coalescing(entries, error_model, max_expected_faults):
     if _has_unforced_branching_control(entries):
         return False
     return _expected_pauli_faults(entries, error_model) <= max_expected_faults
+
+
+def _resolve_auto_parallel_strategy(
+    gates,
+    shots,
+    *,
+    error_model=None,
+    max_branches=None,
+    max_branch_factor=None,
+    auto_max_expected_faults=0.1,
+):
+    """Resolve ``auto`` before dispatching work to local workers.
+
+    The decision mirrors the serial runners' representation choice. Keeping
+    it here lets optimizer-level worker selection preserve branch shape while
+    still using the parallel independent/coalesced implementations.
+    """
+    max_branches = _validate_max_branches(max_branches)
+    max_branch_factor = _validate_max_branch_factor(max_branch_factor)
+    if error_model is not None:
+        if not isinstance(error_model, PauliErrorModel):
+            raise TypeError("error_model must be a PauliErrorModel.")
+        threshold = float(auto_max_expected_faults)
+        if not np.isfinite(threshold) or threshold < 0.0:
+            raise ValueError("auto_max_expected_faults must be finite and nonnegative.")
+        return (
+            "coalesced"
+            if _auto_prefers_coalescing(_as_entries(gates), error_model, threshold)
+            else "independent"
+        )
+    plan = compile_trajectory_stream(gates)
+    return (
+        "coalesced"
+        if _trajectory_coalescing_fits_cap(
+            plan, shots, max_branches, max_branch_factor
+        )
+        else "independent"
+    )
 
 
 def _trajectory_coalescing_fits_cap(plan, shots, max_branches, max_branch_factor):
@@ -2293,6 +2383,8 @@ def run_noisy_shots(
     parallel_workers: int = 1,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _shot_ids=None,
+    _progress=None,
 ) -> NoisyShotResult | CoalescedTrajectoryResult:
     """Build and replay independent noisy trajectories with either MPS optimizer.
 
@@ -2333,14 +2425,47 @@ def run_noisy_shots(
     max_branch_factor = _validate_max_branch_factor(max_branch_factor)
     parallel_workers = _validate_parallel_workers(parallel_workers)
     parallel_backend = _validate_parallel_backend(parallel_backend)
+    if _shot_ids is not None and strategy != "independent":
+        raise ValueError("shot_ids are supported only for independent replay.")
     entries = _as_entries(gates)
     plan = compile_trajectory_stream(entries)
+    auto_max_expected_faults = float(auto_max_expected_faults)
+    if (
+        not np.isfinite(auto_max_expected_faults)
+        or auto_max_expected_faults < 0.0
+    ):
+        raise ValueError("auto_max_expected_faults must be finite and nonnegative.")
     if parallel_workers > 1:
         if strategy == "auto":
-            raise ValueError(
-                "parallel trajectory execution needs an explicit strategy: "
-                "'independent' or 'coalesced'."
+            strategy = _resolve_auto_parallel_strategy(
+                entries,
+                shots,
+                error_model=error_model,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                auto_max_expected_faults=auto_max_expected_faults,
             )
+            if strategy == "coalesced":
+                try:
+                    return run_parallel_noisy_shots(
+                        optimizer_factory,
+                        entries,
+                        error_model,
+                        shots,
+                        seed=seed,
+                        run_kwargs=run_kwargs,
+                        strategy=strategy,
+                        max_branches=max_branches,
+                        importance_sampling=importance_sampling,
+                        max_branch_factor=max_branch_factor,
+                        parallel_workers=parallel_workers,
+                        parallel_backend=parallel_backend,
+                        retain=retain,
+                        _shot_ids=_shot_ids,
+                        _progress=_progress,
+                    )
+                except _CoalescedBranchCapExceeded:
+                    strategy = "independent"
         return run_parallel_noisy_shots(
             optimizer_factory,
             entries,
@@ -2355,13 +2480,9 @@ def run_noisy_shots(
             parallel_workers=parallel_workers,
             parallel_backend=parallel_backend,
             retain=retain,
+            _shot_ids=_shot_ids,
+            _progress=_progress,
         )
-    auto_max_expected_faults = float(auto_max_expected_faults)
-    if (
-        not np.isfinite(auto_max_expected_faults)
-        or auto_max_expected_faults < 0.0
-    ):
-        raise ValueError("auto_max_expected_faults must be finite and nonnegative.")
     if _contains_stochastic_entries(entries):
         raise ValueError(
             "Stream-local stochastic entries require run_trajectory_shots(...) "
@@ -2411,7 +2532,7 @@ def run_noisy_shots(
             # distribution nor its independent-trajectory semantics.
             pass
 
-    child_seeds = _trajectory_seed_pairs(seed, shots)
+    child_seeds = _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids)
     optimizers = []
     streams = []
     faults = []
@@ -2441,7 +2562,11 @@ def run_noisy_shots(
                 proposal_model=importance_sampling,
                 return_weight=True,
             )
-            optimizer.set_gates(stream)
+            # Sampled/library-generated matrices must cross the optimizer
+            # backend boundary before strict stream validation, regardless of
+            # whether the coefficient state is an MPS or a TTN/STN wrapper.
+            replay_stream = _stream_on_optimizer_backend(stream, optimizer)
+            optimizer.set_gates(replay_stream)
             optimizer.run(**dict(run_kwargs))
         if retain != "none":
             optimizers.append(optimizer)
@@ -2480,6 +2605,8 @@ def run_parallel_noisy_shots(
     parallel_workers: int = 2,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _shot_ids=None,
+    _progress=None,
 ) -> NoisyShotResult | CoalescedTrajectoryResult:
     """Run noisy shots in deterministic parallel batches.
 
@@ -2498,6 +2625,8 @@ def run_parallel_noisy_shots(
         raise ValueError(
             "parallel noisy execution needs strategy='independent' or 'coalesced'."
         )
+    if _shot_ids is not None and strategy != "independent":
+        raise ValueError("shot_ids are supported only for independent replay.")
     if strategy == "coalesced":
         return run_coalesced_noisy_shots(
             optimizer_factory,
@@ -2518,10 +2647,14 @@ def run_parallel_noisy_shots(
         raise ValueError("shots must be a nonnegative integer.")
     entries = _as_entries(gates)
     plan = compile_trajectory_stream(entries)
-    child_seeds = np.random.SeedSequence(seed).spawn(int(shots))
+    child_seeds = _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids)
 
     def run_one(child_seed):
-        child = _TrajectorySeedPair(*child_seed.spawn(2))
+        child = (
+            child_seed
+            if isinstance(child_seed, _TrajectorySeedPair)
+            else _TrajectorySeedPair(*child_seed.spawn(2))
+        )
         return run_noisy_shots(
             optimizer_factory,
             entries,
@@ -2534,7 +2667,13 @@ def run_parallel_noisy_shots(
             retain=retain,
         )
 
-    results = _parallel_map_ordered(run_one, child_seeds, workers, backend)
+    results = _parallel_map_ordered(
+        run_one,
+        child_seeds,
+        workers,
+        backend,
+        progress=_progress,
+    )
     if retain == "none":
         return NoisyShotResult(
             (),
@@ -2849,7 +2988,7 @@ def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
     """Recognize the chain STN optimizer without importing it at setup time."""
-    return all(
+    required = all(
         callable(getattr(optimizer, attr, None))
         for attr in (
             "copy",
@@ -2857,10 +2996,10 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
             "_canonize_p",
             "_renorm_p_at",
             "_make_norm_event",
-            "_reset_norm_infidelity",
             "_commit_norm_event",
         )
     )
+    return required and callable(getattr(optimizer, "_reset_infidelity", None))
 
 
 def _trajectory_norm_squared(optimizer) -> float:
@@ -3155,10 +3294,7 @@ def _run_trajectory_entries(
     # explicit for branch steps containing exactly one selected outcome.
     shared_cache = bool(getattr(optimizer, "_shared_backend_cache", False))
     shared_plan = getattr(optimizer, "_backend_cache_plan", None)
-    if isinstance(optimizer, MpsOptimizer):
-        replay_entries = list(entries)
-    else:
-        replay_entries = list(_stream_on_optimizer_backend(entries, optimizer))
+    replay_entries = list(_stream_on_optimizer_backend(entries, optimizer))
     optimizer.set_gates(replay_entries)
     # ``set_gates`` normally starts a new user-owned stream plan. Shot-created
     # MPS optimizers instead share the constructor plan's backend payload cache
@@ -3264,7 +3400,7 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         # A selected Kraus outcome is a normalized quantum-trajectory branch:
         # close the preceding unitary segment without counting its Born weight
         # as compression loss, then establish the new unit-norm baseline.
-        optimizer._reset_norm_infidelity()
+        optimizer._reset_infidelity()
         optimizer._commit_norm_event(norm_event, projected_norm=projected_norm)
         return
     normalize = getattr(optimizer, "normalize", None)
@@ -4595,6 +4731,8 @@ def run_trajectory_shots(
     parallel_workers: int = 1,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _shot_ids=None,
+    _progress=None,
 ) -> TrajectoryShotResult | CoalescedTrajectoryResult:
     """Replay user-defined noisy gate-stream trajectories on MPS or tree optimizers.
 
@@ -4638,15 +4776,46 @@ def run_trajectory_shots(
     max_branch_factor = _validate_max_branch_factor(max_branch_factor)
     parallel_workers = _validate_parallel_workers(parallel_workers)
     parallel_backend = _validate_parallel_backend(parallel_backend)
+    if _shot_ids is not None and strategy != "independent":
+        raise ValueError("shot_ids are supported only for independent replay.")
     policy = _coerce_importance_policy(importance_sampling)
     plan = compile_trajectory_stream(gates)
     entries = plan.entries
     if parallel_workers > 1:
         if strategy == "auto":
-            raise ValueError(
-                "parallel trajectory execution needs an explicit strategy: "
-                "'independent' or 'coalesced'."
+            strategy = _resolve_auto_parallel_strategy(
+                plan,
+                shots,
+                max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
             )
+            if str(magic_strategy).strip().lower().replace("-", "_") != "direct":
+                strategy = "independent"
+            if strategy == "coalesced":
+                try:
+                    return run_parallel_trajectory_shots(
+                        optimizer_factory,
+                        plan.entries,
+                        shots,
+                        seed=seed,
+                        run_kwargs=run_kwargs,
+                        strategy=strategy,
+                        max_branches=max_branches,
+                        magic_strategy=magic_strategy,
+                        magic_ancillas=magic_ancillas,
+                        magic_recycle=magic_recycle,
+                        magic_reset_ancillas=magic_reset_ancillas,
+                        magic_projection_order=magic_projection_order,
+                        importance_sampling=policy,
+                        max_branch_factor=max_branch_factor,
+                        parallel_workers=parallel_workers,
+                        parallel_backend=parallel_backend,
+                        retain=retain,
+                        _shot_ids=_shot_ids,
+                        _progress=_progress,
+                    )
+                except _CoalescedBranchCapExceeded:
+                    strategy = "independent"
         return run_parallel_trajectory_shots(
             optimizer_factory,
             gates,
@@ -4665,6 +4834,8 @@ def run_trajectory_shots(
             parallel_workers=parallel_workers,
             parallel_backend=parallel_backend,
             retain=retain,
+            _shot_ids=_shot_ids,
+            _progress=_progress,
         )
     magic_strategy = str(magic_strategy).strip().lower().replace("-", "_")
     if magic_strategy not in {"direct", "immediate", "deferred"}:
@@ -4697,7 +4868,7 @@ def run_trajectory_shots(
         measurement_records = []
         weights = []
         diagnostic_infos = []
-        for child_seed in _trajectory_seed_pairs(seed, shots):
+        for child_seed in _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids):
             noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
             sample = sample_trajectory_stream(
                 entries,
@@ -4784,7 +4955,7 @@ def run_trajectory_shots(
     measurement_records = []
     weights = []
     diagnostic_infos = []
-    for child_seed in _trajectory_seed_pairs(seed, shots):
+    for child_seed in _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids):
         channel_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
         optimizer = optimizer_factory()
         _check_trajectory_optimizer(optimizer)
@@ -4953,6 +5124,8 @@ def run_parallel_trajectory_shots(
     parallel_workers: int = 2,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _shot_ids=None,
+    _progress=None,
 ) -> TrajectoryShotResult | CoalescedTrajectoryResult:
     """Run trajectory shots or coalesced leaves in deterministic parallel batches.
 
@@ -4972,6 +5145,8 @@ def run_parallel_trajectory_shots(
             "parallel trajectory execution needs strategy='independent' or "
             "'coalesced'."
         )
+    if _shot_ids is not None and strategy != "independent":
+        raise ValueError("shot_ids are supported only for independent replay.")
     if (
         strategy == "coalesced"
         and str(magic_strategy).strip().lower().replace("-", "_") != "direct"
@@ -4999,10 +5174,14 @@ def run_parallel_trajectory_shots(
         raise ValueError("shots must be a nonnegative integer.")
     entries = _as_entries(gates)
     plan = compile_trajectory_stream(entries)
-    child_seeds = np.random.SeedSequence(seed).spawn(int(shots))
+    child_seeds = _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids)
 
     def run_one(child_seed):
-        child = _TrajectorySeedPair(*child_seed.spawn(2))
+        child = (
+            child_seed
+            if isinstance(child_seed, _TrajectorySeedPair)
+            else _TrajectorySeedPair(*child_seed.spawn(2))
+        )
         return run_trajectory_shots(
             optimizer_factory,
             entries,
@@ -5019,7 +5198,13 @@ def run_parallel_trajectory_shots(
             retain=retain,
         )
 
-    results = _parallel_map_ordered(run_one, child_seeds, workers, backend)
+    results = _parallel_map_ordered(
+        run_one,
+        child_seeds,
+        workers,
+        backend,
+        progress=_progress,
+    )
     if any(not isinstance(result, TrajectoryShotResult) for result in results):
         raise TypeError("parallel independent trajectory workers returned an invalid result.")
     diagnostic_infos = tuple(

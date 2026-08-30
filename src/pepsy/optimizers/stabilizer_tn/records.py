@@ -62,14 +62,25 @@ class MeasurementRecord(NamedTuple):
 
 @dataclass
 class NormEventRecord(_TypedRecord):
-    """Projective normalization boundary for STN norm-loss diagnostics."""
+    """Projective boundary plus norm-derived compression diagnostics.
+
+    ``segment_fidelity`` and ``cumulative_fidelity`` are fidelities measured
+    from coefficient-state norms. They are not overlaps with a physical
+    target state; ``projector_survival`` remains a separate projector check.
+    ``branch_probability`` is the physical pre-localizer Born probability.
+    When a basis-updating localizer is itself compressed, the
+    ``projector_branch_probability`` field records the probability in the
+    approximate localized state used to isolate the final projector loss.
+    """
 
     kind: str
     valid: bool
     pre_norm: Optional[float] = None
     pre_norm_sq: Optional[float] = None
     segment_infidelity: Optional[float] = None
+    segment_fidelity: Optional[float] = None
     branch_probability: Optional[float] = None
+    projector_branch_probability: Optional[float] = None
     expected_projected_norm: Optional[float] = None
     expected_projected_norm_sq: Optional[float] = None
     projected_norm: Optional[float] = None
@@ -77,6 +88,8 @@ class NormEventRecord(_TypedRecord):
     projector_survival: Optional[float] = None
     projector_survival_raw: Optional[float] = None
     projector_infidelity: Optional[float] = None
+    cumulative_fidelity: Optional[float] = None
+    cumulative_infidelity: Optional[float] = None
     post_norm: Optional[float] = None
     post_norm_sq: Optional[float] = None
 

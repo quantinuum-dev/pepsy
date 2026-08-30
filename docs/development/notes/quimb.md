@@ -19,19 +19,25 @@ and contraction from scratch.
 - **Backends** — `autoray` dispatch lets the same code run on numpy / torch /
   jax / cupy, and is exactly how `symmray` arrays plug in (see `symmray.md`).
 
-## "pepsy concept → quimb API" map (to fill in during M1)
+## Verified integration map
 
 | pepsy need | quimb surface | notes |
 | --- | --- | --- |
 | Build double-layer network | `build_bra_ket` → `qtn.TensorNetwork` | already done |
-| BP fixed point | `quimb.tensor` BP message-passing classes | audit exact names/signatures in M1 |
+| BP fixed point | `quimb.tensor.belief_propagation.{L1BP,HV1BP,D1BP,D2BP}` | pepsy filters constructor and `run` options against the installed signatures |
 | BP gauge | quimb BP gauging helpers (`gauge_all`-family) | doubles as simple-update gauge / initializer |
 | BP environments / RDMs | quimb message → local env contraction | may need a thin pepsy adapter |
 | Sub-network contraction | `cotengra` via pepsy `build_optimizer` | do **not** add seed kwargs (tests assert absence) |
+| Generalized loops | `TensorNetwork.gen_gloops(**gloop_opts)` | forwarded by scalar and 2-norm loop-cluster APIs |
+| Periodic lattice bonds | `qtn.LatticeBondMap` | keeps length-two periodic directions' wrap bonds distinct |
+| Long-range MPO gate | `MatrixProductOperator.gate_sandwich_with_auto_swap` | explicit opt-in `pepsy.gate_mpo_auto_swap`; no dense fallback |
+| Backend-native random data | `autoray.random.array` | used for FIT warm starts with a NumPy fallback for older Autoray |
 
-> The exact class/function names are intentionally left to the M1 audit so this
-> doc records *verified* API, not guesses. Update the table with the concrete
-> symbols and the pinned minimum quimb version once confirmed.
+The optional surfaces above are detected at execution time. Missing newer
+Quimb or Autoray capabilities either keep the existing path or raise a focused
+error at the explicit opt-in call; existing defaults are not changed. The
+regular `gate` and `gate_simple` paths forward `dagger` and `transpose` only
+to the user gate, never to internal routing SWAPs.
 
 ## Integration guidelines
 

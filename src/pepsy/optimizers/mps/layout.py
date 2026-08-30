@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from itertools import combinations
+import math
 from numbers import Integral
 import os
 
@@ -20,6 +21,7 @@ from .._layout_visualization import (
     matplotlib_modules,
     resolve_site_coords,
 )
+from ...tensors.maps import OneDMap
 
 __all__ = ["MpsGateStreamLayoutFinder"]
 
@@ -197,6 +199,46 @@ def _normalize_layout_sites(supports, *, sites=None, L=None):
             f"{unknown!r}."
         )
     return site_list
+
+
+def _normalize_lattice_shape(shape):
+    """Return a validated two-dimensional ``(Lx, Ly)`` lattice shape."""
+    if shape is None:
+        return None
+    if isinstance(shape, (str, bytes)):
+        raise TypeError("lattice_shape must be a two-item (Lx, Ly) sequence.")
+    try:
+        shape = tuple(shape)
+    except TypeError as exc:
+        raise TypeError(
+            "lattice_shape must be a two-item (Lx, Ly) sequence."
+        ) from exc
+    if len(shape) != 2:
+        raise ValueError("lattice_shape must contain exactly (Lx, Ly).")
+    if any(isinstance(value, bool) for value in shape):
+        raise ValueError("lattice_shape dimensions must be positive integers.")
+    try:
+        shape = tuple(int(value) for value in shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "lattice_shape dimensions must be positive integers."
+        ) from exc
+    if any(value < 1 for value in shape):
+        raise ValueError("lattice_shape dimensions must be positive integers.")
+    return shape
+
+
+def _lattice_site_order(sites, lattice_shape, mode, *, site=None):
+    """Build and validate a logical-site order from a 2D ``OneDMap`` mode."""
+    Lx, Ly = lattice_shape
+    one_d_to_lattice, _ = OneDMap.build(Lx, Ly, mode=mode)
+    if site is None:
+        # Match OneDMap's logical 2D convention: (x, y) -> x * Ly + y.
+        site = lambda x, y: x * Ly + y
+    if not callable(site):
+        raise TypeError("lattice_site must be callable or None.")
+    order = tuple(site(*one_d_to_lattice[index]) for index in range(len(sites)))
+    return normalize_fixed_order(order, sites, name="lattice order")
 
 
 def _payload_angle(payload):
@@ -1159,6 +1201,55 @@ def _gate_stream_recursive_order(
     return ordered
 
 
+def _gate_stream_folded_block_orders(sites):
+    """Return folded block orders useful for periodic grid-like streams.
+
+    A periodic row-major grid has a particularly bad final block: the
+    periodic edge from the first block to the last spans almost the whole
+    MPS. Folding the block order as ``0, last, 1, last - 1, ...`` keeps that
+    edge local while preserving the short within-block path. The heuristic
+    is deliberately based only on the current site order, so it remains a
+    safe generic candidate for opaque or non-integer site labels. Both sides
+    of every factor pair are tried, covering the two grid orientations.
+    """
+    sites = list(sites)
+    n = len(sites)
+    if n < 4:
+        return {}
+
+    block_sizes = set()
+    for divisor in range(2, math.isqrt(n) + 1):
+        if n % divisor:
+            continue
+        block_sizes.add(divisor)
+        block_sizes.add(n // divisor)
+
+    candidates = {}
+    for block_size in sorted(block_sizes):
+        block_count = n // block_size
+        if block_count < 2:
+            continue
+        block_order = []
+        left, right = 0, block_count - 1
+        while left <= right:
+            block_order.append(left)
+            if left != right:
+                block_order.append(right)
+            left += 1
+            right -= 1
+
+        order = []
+        for step, block_index in enumerate(block_order):
+            block = sites[
+                block_index * block_size : (block_index + 1) * block_size
+            ]
+            if step % 2:
+                block.reverse()
+            order.extend(block)
+        candidates[f"folded_{block_size}"] = order
+    return candidates
+
+
 def _kahypar_config_from_user(config_path):
     """Resolve user/environment KaHyPar config path, if any."""
     if config_path in (None, False):
@@ -1428,6 +1519,28 @@ def _normalize_gate_stream_layout_order(order):
         "bfs_refined": "bfs_refined",
         "degree_refined": "degree_refined",
         "input_refined": "input_refined",
+        "row": "row_major",
+        "row_major": "row_major",
+        "column": "col_major",
+        "column_major": "col_major",
+        "col": "col_major",
+        "col_major": "col_major",
+        "snake_col": "snake",
+        "snake_column": "snake",
+        "snake_col_major": "snake",
+        "snake_row": "snake_row_major",
+        "snake_row_major": "snake_row_major",
+        "folded_snake_col": "folded_snake",
+        "folded_snake_column": "folded_snake",
+        "folded_snake_col_major": "folded_snake",
+        "folded_snake_row": "folded_snake_row_major",
+        "folded_snake_row_major": "folded_snake_row_major",
+        "hilbert_curve": "hilbert",
+        "hilbert_col": "hilbert",
+        "hilbert_column": "hilbert",
+        "hilbert_col_major": "hilbert",
+        "hilbert_row": "hilbert_row_major",
+        "hilbert_row_major": "hilbert_row_major",
     }
     name = aliases.get(name, name)
     allowed = {
@@ -1446,6 +1559,14 @@ def _normalize_gate_stream_layout_order(order):
         "kahypar_refined",
         "nevergrad",
         "nevergrad_refined",
+        "row_major",
+        "col_major",
+        "snake",
+        "snake_row_major",
+        "folded_snake",
+        "folded_snake_row_major",
+        "hilbert",
+        "hilbert_row_major",
     }
     if name not in allowed:
         allowed_text = ", ".join(repr(item) for item in sorted(allowed))
@@ -1453,13 +1574,34 @@ def _normalize_gate_stream_layout_order(order):
             f"Unknown gate-stream layout order {order!r}. Expected one of: "
             f"{allowed_text}."
         )
-    return name
+    return _GEOMETRIC_LAYOUT_CANONICAL.get(name, name)
+
+
+_GEOMETRIC_LAYOUT_ORDERS = frozenset({
+    "row-major",
+    "col-major",
+    "snake",
+    "snake-row-major",
+    "folded-snake",
+    "folded-snake-row-major",
+    "hilbert",
+    "hilbert-row-major",
+})
+_GEOMETRIC_LAYOUT_CANONICAL = {
+    "row_major": "row-major",
+    "col_major": "col-major",
+    "snake_row_major": "snake-row-major",
+    "folded_snake": "folded-snake",
+    "folded_snake_row_major": "folded-snake-row-major",
+    "hilbert_row_major": "hilbert-row-major",
+}
 
 
 def _gate_stream_layout_candidates(
     sites,
     pair_weights,
     *,
+    include_input=True,
     refine_passes=8,
     spectral_dense_max=512,
     recursive_dense_max=1024,
@@ -1473,8 +1615,12 @@ def _gate_stream_layout_candidates(
     kahypar_seed=0,
 ):
     """Return deterministic candidate orders for gate-stream layout search."""
-    candidates = {"input": list(sites)}
+    candidates = {}
+    if include_input:
+        candidates["input"] = list(sites)
     if not pair_weights:
+        if not candidates:
+            candidates["unweighted"] = list(sites)
         return candidates
 
     candidates["degree"] = _gate_stream_degree_order(sites, pair_weights)
@@ -1491,6 +1637,7 @@ def _gate_stream_layout_candidates(
         pair_weights,
         dense_max=recursive_dense_max,
     )
+    candidates.update(_gate_stream_folded_block_orders(sites))
     if include_kahypar:
         kahypar = _gate_stream_kahypar_order(
             sites,
@@ -1504,7 +1651,7 @@ def _gate_stream_layout_candidates(
         nevergrad = _gate_stream_nevergrad_order(
             sites,
             pair_weights,
-            start_orders=tuple(candidates.values()),
+            start_orders=(tuple(candidates.values()) if include_input else ()),
             budget=nevergrad_budget,
             seed=nevergrad_seed,
             optimizer_name=nevergrad_optimizer,
@@ -1530,7 +1677,28 @@ class MpsGateStreamLayoutFinder:
     mapped locations, but never mutate or replace the original gate stream.
     """
 
-    def __init__(self, gate_stream, *, sites=None, L=None):
+    def __init__(
+        self,
+        gate_stream,
+        *,
+        sites=None,
+        L=None,
+        lattice_shape=None,
+        lattice_site=None,
+    ):
+        self.lattice_shape = _normalize_lattice_shape(lattice_shape)
+        if self.lattice_shape is not None:
+            lattice_size = self.lattice_shape[0] * self.lattice_shape[1]
+            if sites is None and L is None:
+                L = lattice_size
+            elif L is not None and int(L) != lattice_size:
+                raise ValueError(
+                    "lattice_shape product must equal L; got "
+                    f"{lattice_size} != {L}."
+                )
+        if lattice_site is not None and not callable(lattice_site):
+            raise TypeError("lattice_site must be callable or None.")
+        self.lattice_site = lattice_site
         payloads, wheres, event_types = _normalize_layout_gate_queue(gate_stream)
         self.payloads = tuple(payloads)
         self.where = tuple(wheres)
@@ -1539,6 +1707,14 @@ class MpsGateStreamLayoutFinder:
             _normalize_layout_support(where) for where in self.where
         )
         self.sites = tuple(_normalize_layout_sites(self.supports, sites=sites, L=L))
+        if self.lattice_shape is not None and (
+            self.lattice_shape[0] * self.lattice_shape[1] != len(self.sites)
+        ):
+            raise ValueError(
+                "lattice_shape product must equal the number of layout sites; "
+                f"got {self.lattice_shape[0]} * {self.lattice_shape[1]} "
+                f"!= {len(self.sites)}."
+            )
         self.event_weights = tuple(1.0 for _support in self.supports)
         self.pair_weights = _gate_stream_pair_weights(
             self.supports,
@@ -1547,7 +1723,15 @@ class MpsGateStreamLayoutFinder:
         )
 
     @classmethod
-    def from_optimizer(cls, optimizer, *, sites=None, L=None):
+    def from_optimizer(
+        cls,
+        optimizer,
+        *,
+        sites=None,
+        L=None,
+        lattice_shape=None,
+        lattice_site=None,
+    ):
         """Construct from an optimizer's queued stream without mutating it.
 
         Control events (measure/cap/reset) do not constrain gate locality, so
@@ -1568,7 +1752,44 @@ class MpsGateStreamLayoutFinder:
                 stream.append((payload, where))
             # measure/cap/reset control events are skipped: they do not change
             # the optimal gate layout.
-        return cls(stream, sites=sites, L=L)
+        return cls(
+            stream,
+            sites=sites,
+            L=L,
+            lattice_shape=lattice_shape,
+            lattice_site=lattice_site,
+        )
+
+    @classmethod
+    def lattice_order(cls, Lx, Ly, mode="row-major", *, site=None):
+        """Return a logical-site order from a two-dimensional ``OneDMap``."""
+        lattice_shape = _normalize_lattice_shape((Lx, Ly))
+        normalized = _normalize_gate_stream_layout_order(mode)
+        if normalized not in _GEOMETRIC_LAYOUT_ORDERS:
+            raise ValueError(
+                "lattice_order mode must be a geometric OneDMap preset."
+            )
+        sites = tuple(range(lattice_shape[0] * lattice_shape[1]))
+        return _lattice_site_order(
+            sites,
+            lattice_shape,
+            normalized,
+            site=site,
+        )
+
+    def _preset_order(self, mode):
+        """Resolve a named geometric preset against this finder."""
+        if self.lattice_shape is None:
+            raise ValueError(
+                f"order={mode!r} requires lattice_shape=(Lx, Ly) "
+                "when constructing MpsGateStreamLayoutFinder."
+            )
+        return _lattice_site_order(
+            self.sites,
+            self.lattice_shape,
+            mode,
+            site=self.lattice_site,
+        )
 
     def run(
         self,
@@ -1584,6 +1805,7 @@ class MpsGateStreamLayoutFinder:
         nevergrad_optimizer="OnePlusOne",
         kahypar_config_path=None,
         kahypar_seed=0,
+        from_scratch=False,
         weight_fn=None,
         weight_mode="auto",
         schmidt_max_dim=4,
@@ -1594,6 +1816,12 @@ class MpsGateStreamLayoutFinder:
         ``order`` can also be an explicit permutation of the layout sites.
         In that case the permutation is returned as a fixed comparison plan
         and no layout search or refinement is performed.
+
+        ``from_scratch=True`` omits the original site order from the searched
+        candidates and does not use those sites as a Nevergrad inoculation.
+        Graph-derived candidates are still allowed: the gate supports are the
+        data being optimized, while the original order is only a diagnostic
+        baseline.
         """
         fixed_order = None
         if isinstance(order, (str, type(None))):
@@ -1641,7 +1869,10 @@ class MpsGateStreamLayoutFinder:
                 event_weights,
             )
             score_event_weights = event_weights
-        if fixed_order is None:
+        geometric_order = order_name in _GEOMETRIC_LAYOUT_ORDERS
+        if fixed_order is None and geometric_order:
+            candidates = {order_name: list(self._preset_order(order_name))}
+        elif fixed_order is None:
             include_nevergrad = (
                 order_name == "auto" or order_name.startswith("nevergrad")
             )
@@ -1651,6 +1882,7 @@ class MpsGateStreamLayoutFinder:
             candidates = _gate_stream_layout_candidates(
                 self.sites,
                 pair_weights,
+                include_input=not from_scratch,
                 refine_passes=refine_passes,
                 refine_numba=refine_numba,
                 spectral_dense_max=spectral_dense_max,
@@ -1671,8 +1903,7 @@ class MpsGateStreamLayoutFinder:
                 "fixed": list(fixed_order),
             }
 
-        candidate_stats = {}
-        for name, candidate in candidates.items():
+        def score_candidate(candidate):
             locality_stats = _gate_stream_layout_stats(
                 candidate,
                 pair_weights,
@@ -1694,7 +1925,13 @@ class MpsGateStreamLayoutFinder:
                 ))
                 stats["loss"] = stats["compression_loss"]
                 stats["score"] = stats["compression_score"]
-            candidate_stats[name] = stats
+            return stats
+
+        input_stats = score_candidate(self.sites)
+        candidate_stats = {
+            name: score_candidate(candidate)
+            for name, candidate in candidates.items()
+        }
 
         if order_name == "auto":
             selected_order = min(
@@ -1758,8 +1995,9 @@ class MpsGateStreamLayoutFinder:
                 "weight_mode": _normalize_weight_mode(weight_mode),
                 "objective": objective,
                 "max_operator_qubits": max_operator_qubits,
+                "from_scratch": bool(from_scratch),
                 "stats": stats,
-                "input_stats": candidate_stats["input"],
+                "input_stats": input_stats,
                 "score": stats["score"],
             }
 

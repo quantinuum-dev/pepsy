@@ -56,7 +56,12 @@ conjugated through `C`.
 - Build a `TreePlan` from the circuit before replay. Never implicitly relayout
   an entangled coefficient TTN; product TTNs may be remounted exactly.
 - Keep backend, dtype, device, logical qubit labels, and tree geometry stable
-  during replay. Internal Pauli/projector tensors follow the live backend.
+  during replay. Every user gate, sub-MPO tensor, and native TreeMPO tensor must
+  match the coefficient TTN backend and device at stream installation. Non-NumPy
+  payloads must also match its dtype; NumPy-to-NumPy dtype promotion is compatible. Reject a
+  mismatch with `TypeError` and require explicit preparation. Internal
+  Pauli/projector tensors and sampled trajectory matrices follow the live
+  backend through explicit internal conversion.
 - Treat `chi=None` as uncapped but still honor the configured SVD cutoff.
 - Bound dense operator and Pauli decomposition work with
   `max_operator_qubits` / `max_pauli_decomposition_qubits`; use native Pauli,

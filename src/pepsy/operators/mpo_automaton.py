@@ -19,6 +19,8 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
+from .._internal.validation import normalize_integer_tuple
+
 __all__ = ["MPOChannel", "MPOTransition", "MPOAutomaton"]
 
 
@@ -440,9 +442,11 @@ class MPOAutomaton:
                 raise ValueError(
                     "product-term sites and operators must be non-empty and aligned."
                 )
-            if not all(isinstance(site, Integral) for site in sites):
-                raise TypeError("product-term sites must contain integers.")
-            sites = tuple(map(int, sites))
+            sites = normalize_integer_tuple(
+                sites,
+                name="product-term sites",
+                allow_scalar=False,
+            )
             if any(site < 0 or site >= L for site in sites):
                 raise ValueError(
                     f"product-term sites must lie in [0, {L - 1}], got {sites!r}."
@@ -869,9 +873,7 @@ class MPOAutomaton:
         operators = tuple(operators)
         if not sites or len(sites) != len(operators):
             raise ValueError("sites and operators must be non-empty and equally sized.")
-        if not all(isinstance(site, Integral) for site in sites):
-            raise TypeError("sites must contain integer chain positions.")
-        sites = tuple(map(int, sites))
+        sites = normalize_integer_tuple(sites, name="sites", allow_scalar=False)
         if any(site < 0 or site >= self.L for site in sites):
             raise ValueError(
                 f"product-term sites must lie in [0, {self.L - 1}], got {sites!r}."
@@ -997,6 +999,102 @@ class MPOAutomaton:
             channel_id=channel_id,
             charge=charge,
         )
+
+    def add_local_mpo_term(
+        self,
+        sites,
+        cores,
+        *,
+        coefficient=1.0,
+        channel_id=None,
+        charge=None,
+        return_slots=False,
+    ):
+        """Add an already factorized multi-site operator as one MPO segment.
+
+        ``cores`` are ordered ``(left, right, upper, lower)`` and correspond
+        one-to-one with the strictly increasing ``sites``. Identity
+        transitions carry every internal Schmidt channel across gaps. The
+        scalar coefficient is attached to all first-core transitions, which
+        keeps a parameterized coefficient independent of the decomposition.
+        """
+
+        sites = normalize_integer_tuple(sites, name="sites", allow_scalar=False)
+        cores = tuple(cores)
+        if not sites or len(sites) != len(cores):
+            raise ValueError("sites and MPO cores must be non-empty and aligned.")
+        if any(site < 0 or site >= self.L for site in sites):
+            raise ValueError(
+                f"local-MPO sites must lie in [0, {self.L - 1}], got {sites!r}."
+            )
+        if any(left >= right for left, right in zip(sites, sites[1:])):
+            raise ValueError("local-MPO sites must be strictly increasing.")
+        _check_scalar(coefficient, name="coefficient")
+
+        shapes = tuple(_operator_shape(core) for core in cores)
+        if any(len(shape) != 4 for shape in shapes):
+            raise ValueError("local-MPO cores must have shape (left, right, d, d).")
+        if shapes[0][0] != 1 or shapes[-1][1] != 1:
+            raise ValueError("local-MPO boundary core dimensions must be one.")
+        if any(shape[2] != shape[3] for shape in shapes):
+            raise ValueError("local-MPO physical dimensions must be square.")
+        if any(shape[2:] != shapes[0][2:] for shape in shapes[1:]):
+            raise ValueError("all local-MPO cores must use one physical dimension.")
+        if any(left[1] != right[0] for left, right in zip(shapes, shapes[1:])):
+            raise ValueError("neighboring local-MPO core bonds do not match.")
+        phys_dim = int(shapes[0][2])
+        if self.phys_dim is not None and phys_dim != self.phys_dim:
+            raise ValueError(
+                f"local-MPO cores use physical dimension {phys_dim}, expected "
+                f"{self.phys_dim}."
+            )
+        if self.phys_dim is None:
+            self.phys_dim = phys_dim
+
+        if channel_id is None:
+            channel_id = ("local-mpo", self._term_counter)
+            self._term_counter += 1
+        _check_state(channel_id, name="channel_id")
+
+        slots = []
+        left_states = (self.start_state,)
+        for position, (site, core, shape) in enumerate(zip(sites, cores, shapes)):
+            final = position == len(cores) - 1
+            if final:
+                right_states = (self.done_state,)
+            else:
+                right_states = tuple(
+                    (channel_id, position, right_index)
+                    for right_index in range(shape[1])
+                )
+                next_site = sites[position + 1]
+                for cut in range(site, next_site):
+                    for state in right_states:
+                        self.add_channel(cut, state, charge=charge)
+
+            for left_index, left_state in enumerate(left_states):
+                for right_index, right_state in enumerate(right_states):
+                    operator = core[left_index, right_index]
+                    transition_index = len(self._transitions[site])
+                    self.add_transition(
+                        site,
+                        left_state,
+                        right_state,
+                        _multiply_scalar(coefficient, operator)
+                        if position == 0
+                        else operator,
+                    )
+                    if position == 0:
+                        slots.append((site, transition_index, operator))
+
+            if not final:
+                identity = ar.do("eye", phys_dim, like=core)
+                for gap_site in range(site + 1, sites[position + 1]):
+                    for state in right_states:
+                        self.add_transition(gap_site, state, state, identity)
+            left_states = right_states
+
+        return tuple(slots) if return_slots else channel_id
 
     def _materialized_transitions(self, site):
         """Return explicit and built-in identity transitions for one site."""

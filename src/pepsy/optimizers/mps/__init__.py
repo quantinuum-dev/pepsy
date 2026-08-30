@@ -5,17 +5,21 @@ from importlib import import_module
 from .layout import MpsGateStreamLayoutFinder
 from .optimizer import (
     MpsOptimizer,
+    guess,
     is_submpo_event,
     normalize_submpo_where,
     submpo_event_parts,
+    svd_guess,
 )
 
 __all__ = [
     "MpsOptimizer",
+    "guess",
     "MpsGateStreamLayoutFinder",
     "is_submpo_event",
     "normalize_submpo_where",
     "submpo_event_parts",
+    "svd_guess",
     "compression",
     "diagnostics",
     "layout",

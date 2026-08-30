@@ -10,6 +10,43 @@ Use this skill for `pepsy.MpsOptimizer` and its implementation in
 [`docs/api/optimizers/mps.md`](../../../docs/api/optimizers/mps.md) and the closest
 tests before editing.
 
+## Decision guide
+
+Make decisions in this order; each choice owns a different invariant:
+
+1. **State contract.** Use `exact` for a dense reference or cyclic input,
+   `su` for gate-only simple-update evolution, and a canonical open-boundary
+   MPS mode for local norms, controls, and DMRG. Do not make a cyclic MPS look
+   canonical by scanning it—the missing loop environment makes a one-center
+   norm invalid.
+2. **Compression route.** Use `dmrg2` for the normal variational production
+   path, `dmrg1` when the fixed two-site-growth/one-site-refinement schedule is
+   required, and `dmrg3` when a three-site warm-up is useful. Use
+   `quimb-<method>` (or its bare method alias) when benchmarking a specific
+   Quimb compressor, `svd` for a transparent local split reference, and
+   `swap`/`perm` when endpoint movement is the intended representation.
+3. **Target versus guess.** `fit_target_strategy` decides how the exact
+   operator-applied target is represented (`layered` dense factors versus
+   materialized/native MPS). `fit_init_strategy` decides only the disposable
+   starting point for FIT (`direct`, random expansion, or `guess-*`). Never
+   replace the exact target with the guess, and do not disable an explicit
+   `guess-*` merely because the active bonds already reached `chi`.
+4. **Cutoff and seed.** `target_cutoff` controls optional target
+   materialization, while `cutoff` controls output compression. SRC/SRCMPS
+   choose rank through `max_bond` and ignore singular-value cutoff. Forward an
+   explicit `compression_seed`/`fit_init_seed` only to the randomized policy;
+   never leak it into a contraction-option dictionary.
+5. **Control boundaries.** Flush the preceding gate segment before
+   `measure`, `reset`, `measure_reset`, `cap`, or feed-forward dispatch. A
+   measurement probability belongs to the pre-collapse physical state; a
+   post-collapse norm is a separate compression/branch diagnostic. Preserve
+   logical site labels in records even when a persistent layout executes on
+   physical positions.
+
+When reviewing a change, ask which decision above it changes. If it changes
+more than one, keep the conversion or bookkeeping boundary explicit rather
+than hiding policy in a mode-specific helper.
+
 ## Execution modes
 
 - `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
@@ -29,11 +66,17 @@ tests before editing.
   remaining `n_iter` budget. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
-- `mpo`: direct non-local gate/MPO replay with bond truncation.
+- `quimb-<method>`: native Quimb non-local gate/MPO replay with the selected
+  compression method; `quimb-direct` is explicit and `quimb` is its direct
+  alias. The legacy `mpo-<method>` and `mpo` spellings remain supported.
+  Supported methods include `direct`, `dm`, `zipup`, the zipup/SDC/SRC/SRCMPS
+  oversampling variants, `fit`, `fit-zipup`, `fit-projector`, and
+  `fit-oversample`.
 - `svd`: local SVD compression; `swap`: swap-and-split with swap-back.
 - `perm`: swap-and-split with lazy logical-to-physical tracking.
-- `mix`: transactional FIT with per-step MPO fallback. Two-site FIT grows
-  active bonds directly; fixed-rank one-site FIT retains MPO rank warm-up.
+- `mix`: transactional direct/MPO warm-up followed by one-site FIT by default,
+  with per-step MPO fallback. Explicit `fit_block_size=2` or `3` opts into
+  mixed block-FIT transactions.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
 
 Keep `exact` separate from MPS code. When switching from exact to an MPS mode,
@@ -130,6 +173,26 @@ gates through backend-compatible split/auto-swap paths; never force a dense
 NumPy identity into a Symmray contraction. Keep optional Symmray coverage
 guarded with `pytest.importorskip("symmray")`.
 
+The MPS gate-stream backend boundary is explicit and single-pass:
+
+- `MpsOptimizer` requires user-supplied gates and sub-MPO tensor data to use
+  the same array backend and device as the state. Non-NumPy payloads must also
+  match the state dtype because their contractions reject mixed dtypes;
+  dense NumPy-to-NumPy dtype promotion remains compatible. Backend/device
+  mismatches, and incompatible dtypes, raise a location-specific `TypeError`.
+- Constructor, `set_gates`, and `add_gates` normalize a stream once, validate
+  that normalized queue once, and install that same queue. `set_p()` validates
+  the existing normalized queue against the replacement state before mutation.
+  Do not normalize or validate the whole stream again for each replay segment.
+- `_execute_mode` receives the already validated payloads and must dispatch
+  directly. Do not add a per-segment conversion or `gate_stream.prepare` stage.
+  Internal control operators remain the optimizer's responsibility, while
+  library-generated trajectory outcomes are converted by the shot runner before
+  calling `set_gates`.
+- `MpsOptimizer.to_backend(...)` is an explicit caller helper for preparing a
+  payload before installing it. Native Symmray gates must retain their charge
+  and fermionic metadata; a dense gate cannot be generically promoted.
+
 Native fermionic FIT environments must use graph-planned contraction directly
 on the Symmray arrays so dummy-mode conjugate pairs and graded phases determine
 the contraction order; do not replace this with an arbitrary pairwise loop or
@@ -147,9 +210,17 @@ Native FIT never replaces the current MPS with a target copy. Its graded local
 SVD and chi-capped auto-swap algebra are responsible for opening compatible
 charge sectors; if the current sectors and target are disconnected, raise a
 clear disconnected-sector error rather than hiding the failure behind a dense
-conversion or global warm start. Dense FIT may receive a separate
-`target_support` MPS, consumed only by local two-/three-site subspace
-expansion; this support source is never installed as `fit.p`.
+conversion or global warm start. Dense two-/three-site growth windows select
+their disposable FIT `p` with `fit_init_strategy`: direct current MPS,
+fixed-rank deterministic random perturbation, active-bond random expansion,
+or isolated `guess-<method>` replay (default `guess-zipup`). The underscore
+spelling remains accepted for compatibility. In `auto`, only active bonds below their attainable
+physical/`chi` rank are expanded, and the exact gate target remains separate as
+`p_g`. Native Symmray/fermionic paths keep their graded sector-growth route and
+do not use dense random padding. If `run()` omits `cutoff_mode`, ordinary paths
+use `rsum2` while MPO `dm` preserves Quimb's native `rsum1` default; an
+explicit mode overrides it. Interior oversampled zipup and `fit-*` replay keep
+the local sub-MPO partition and disable nested full-chain array permutation.
 
 ## Profiling contract
 
@@ -168,6 +239,28 @@ retained one-center norm read, and scalar log-fidelity bookkeeping in timing
 records. In SVD mode measure the non-unitary target before the routed gate
 split so both that cutoff and the final chi compression contribute to reported
 loss.
+
+## Implementation review checklist
+
+Before changing `optimizer.py`, verify the following ownership boundaries:
+
+- `_normalize_mode` may canonicalize public aliases, but the DMRG alias must
+  remain available to select its schedule.
+- `_execute_mode` receives backend-prepared payloads and dispatches only gate
+  or sub-MPO events. `_run_segmented` owns control-event boundaries.
+- DMRG builds an isolated exact target, an isolated initial guess, and a
+  transactional snapshot before FIT. A fallback must restore both tensor data
+  and `info_c` before direct MPO replay.
+- `_apply_measure_event` computes the Born probability before any frame
+  localizer and records compression survival separately. A dense multi-site
+  projector should remain a bond-two sub-MPO; native graded states retain
+  their metadata-safe route.
+- `info_c["cur_orthog"]`, `p.exponent`, and raw unitary norm baselines are
+  updated together after every replacement, normalization, layout reorder, or
+  control event.
+- `where` has one meaning per layer: logical stream locations at the public
+  API, mapped physical locations during execution, and logical locations again
+  in user-facing measurement/feed-forward records.
 
 ## Validation
 

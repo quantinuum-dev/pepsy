@@ -86,6 +86,127 @@ def _validate_qubit_mps(p):
     return n
 
 
+def _apply_dense_local_gate(state, gate, where, n):
+    """Apply a one- or two-qubit gate to a big-endian dense statevector."""
+    where = tuple(int(site) for site in where)
+    tensor = np.asarray(state).reshape((2,) * int(n))
+    if len(where) == 1:
+        axis = where[0]
+        tensor = np.moveaxis(tensor, axis, 0)
+        tensor = np.tensordot(gate, tensor, axes=([1], [0]))
+        return np.moveaxis(tensor, 0, axis).reshape(-1)
+    if len(where) != 2:
+        raise ValueError(
+            "Clifford reconstruction only supports 1- or 2-qubit gates, "
+            f"got {where!r}."
+        )
+
+    left, right = where
+    gate = np.asarray(gate).reshape(2, 2, 2, 2)
+    tensor = np.tensordot(gate, tensor, axes=([2, 3], [left, right]))
+    remaining = [site for site in range(int(n)) if site not in where]
+    axes = []
+    for site in range(int(n)):
+        if site == left:
+            axes.append(0)
+        elif site == right:
+            axes.append(1)
+        else:
+            axes.append(2 + remaining.index(site))
+    return tensor.transpose(axes).reshape(-1)
+
+
+def _tableau_gate_stream(circuit):
+    """Return the local gate stream for a Stim tableau circuit.
+
+    ``Tableau.to_circuit()`` may group repeated targets in one instruction,
+    especially for one-qubit gates and CNOTs.  Expand those groups here so the
+    same decomposition can be replayed by dense readout and by an ordinary
+    physical MPS without constructing the exponentially large tableau matrix.
+    """
+    one_qubit_gates = {
+        "H": np.asarray([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0),
+        "S": np.asarray([[1.0, 0.0], [0.0, 1.0j]], dtype=complex),
+        "S_DAG": np.asarray([[1.0, 0.0], [0.0, -1.0j]], dtype=complex),
+        "X": np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
+        "Y": np.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex),
+        "Z": np.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
+    }
+    cnot = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=complex,
+    )
+    two_qubit_gates = {"CX": cnot, "CNOT": cnot}
+    gates = []
+    for instruction in circuit:
+        name = str(instruction.name).upper()
+        targets = tuple(int(target.value) for target in instruction.targets_copy())
+        if name in one_qubit_gates:
+            arity = 1
+            gate = one_qubit_gates[name]
+        elif name in two_qubit_gates:
+            arity = 2
+            gate = two_qubit_gates[name]
+        else:
+            raise ValueError(
+                "Stim produced an unsupported gate while decomposing the "
+                f"tableau: {name!r}."
+            )
+        if len(targets) % arity:
+            raise ValueError(
+                f"Stim returned an invalid target group for {name!r}: {targets!r}."
+            )
+        for start in range(0, len(targets), arity):
+            gates.append((gate, targets[start : start + arity]))
+    return tuple(gates)
+
+
+def _apply_tableau_circuit_to_statevector(state, circuit, n, *, site_order=None):
+    """Apply a Stim tableau circuit without materializing its unitary matrix."""
+    dtype = np.asarray(state).dtype
+    out = np.asarray(state, dtype=dtype).reshape(-1)
+    logical_to_position = None
+    if site_order is not None:
+        site_order = tuple(int(site) for site in site_order)
+        if set(site_order) != set(range(int(n))) or len(site_order) != int(n):
+            raise ValueError("site_order must be a permutation of the logical sites.")
+        logical_to_position = {
+            logical: position for position, logical in enumerate(site_order)
+        }
+    for gate, where in _tableau_gate_stream(circuit):
+        if logical_to_position is not None:
+            where = tuple(logical_to_position[site] for site in where)
+        out = _apply_dense_local_gate(out, np.asarray(gate, dtype=dtype), where, n)
+    return out
+
+
+def _clean_statevector_roundoff(state, *, operation_count):
+    """Remove only floating-point cancellation noise from dense Clifford readout."""
+    state = np.asarray(state)
+    if not np.all(np.isfinite(state)):
+        return state
+    scale = float(np.max(np.abs(state), initial=0.0))
+    if scale == 0.0:
+        return state
+    real_dtype = np.empty((), dtype=state.dtype).real.dtype
+    eps = np.finfo(real_dtype).eps
+    # Tableau replay uses exact Clifford identities such as H @ H = I. A
+    # bounded multiple of machine epsilon removes their cancellation residue
+    # without acting as a physical amplitude cutoff.
+    tolerance = 32.0 * max(1, int(operation_count)) * eps * scale
+    small = np.abs(state) <= tolerance
+    if not np.any(small):
+        return state
+    cleaned = state.copy()
+    cleaned[small] = 0
+    return cleaned
+
+
 class STNState:
     """A stabilizer tensor-network state.
 
@@ -274,6 +395,18 @@ class STNState:
     # Backward-compatible alias.
     nu_frame_pauli = frame_pauli
 
+    def tableau(self):
+        """Return a fresh :class:`stim.Tableau` for the live basis Clifford.
+
+        The STN representation is ``|psi> = C |p>``.  Stim exposes the
+        simulator's inverse tableau, so this method returns its inverse: the
+        tableau for ``C`` itself, with ``x_output(i)`` giving destabilizer
+        ``d_i`` and ``z_output(i)`` giving stabilizer ``s_i``.  A fresh tableau
+        is returned so display or circuit-conversion code cannot mutate the
+        live simulator through this readout helper.
+        """
+        return self._sim.current_inverse_tableau().inverse()
+
     # ------------------------------------------------------------------ #
     # Clifford update (basis only; |nu> unchanged)
     # ------------------------------------------------------------------ #
@@ -388,17 +521,44 @@ class STNState:
     # Backward-compatible alias.
     nu_dense = p_dense
 
-    def to_statevector(self) -> np.ndarray:
-        """Reconstruct the full statevector ``|psi> = C p`` (small ``n``).
+    def to_basis_statevector(self) -> np.ndarray:
+        """Return the dense coefficient vector ``|nu>`` in tableau order."""
+        return self.p_dense()
 
-        Uses the identity ``d_hat_i |psi_S> = C|i>`` so that
-        ``|psi> = sum_i p_i C|i> = C p``.  The result is defined up to a
-        global phase (tableaus do not track global phase).
-        """
-        p_dense = self.p_dense()
+    def _statevector_from_basis(self, p_dense, *, site_order=None) -> np.ndarray:
+        """Apply the tableau Clifford to a dense coefficient vector."""
+        p_dense = np.asarray(p_dense, dtype=self.dtype).reshape(-1)
+        expected_size = 2**self.n
+        if p_dense.size != expected_size:
+            raise ValueError(
+                f"basis statevector must have length {expected_size}, "
+                f"got {p_dense.size}."
+            )
         if self.is_identity_frame():
             return p_dense
-        return self.clifford_unitary() @ p_dense
+        tableau = self._sim.current_inverse_tableau().inverse()
+        circuit = tableau.to_circuit()
+        state = _apply_tableau_circuit_to_statevector(
+            p_dense, circuit, self.n, site_order=site_order
+        )
+        return _clean_statevector_roundoff(
+            state,
+            operation_count=len(circuit),
+        )
+
+    def to_statevector(self) -> np.ndarray:
+        """Return the physical statevector ``|psi> = C|nu>``.
+
+        This materializes only the final length-``2**n`` vector. It applies a
+        circuit decomposition of the tableau instead of constructing the
+        ``2**n`` by ``2**n`` dense Clifford unitary. The result is defined up
+        to a global phase because tableaus do not track global phase.
+        """
+        return self._statevector_from_basis(self.to_basis_statevector())
+
+    def to_physical_statevector(self) -> np.ndarray:
+        """Compatibility alias for :meth:`to_statevector`."""
+        return self.to_statevector()
 
     def _bits_to_index(self, bits) -> int:
         """Map a bitstring (str ``'010'`` or 0/1 sequence) to a big-endian index."""

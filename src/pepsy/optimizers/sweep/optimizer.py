@@ -2246,13 +2246,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 track_boundary_fidelity=track_boundary_fidelity,
             )
         overlap_fidelity = None
-        norm_fidelity = None
+        norm_layer_fidelity = None
         if track_boundary_fidelity:
             if comp_overlap.fidel:
                 overlap_fidelity = float(complex(comp_overlap.fidel[-1]).real)
             if comp_norm.fidel:
-                norm_fidelity = float(complex(comp_norm.fidel[-1]).real)
-        return {"norm": norm_fidelity, "overlap": overlap_fidelity}
+                norm_layer_fidelity = float(complex(comp_norm.fidel[-1]).real)
+        return {"norm": norm_layer_fidelity, "overlap": overlap_fidelity}
 
     def _run_axis_half_sweep(  # pylint: disable=too-many-arguments,too-many-locals
         self,

@@ -17,6 +17,7 @@ references:
   - README.md
   - pyproject.toml
   - docs/development/package_layout.md
+  - docs/development/notes/symmray.md
   - .github/skills/SKILL_POLICY.md
   - .github/skills/README.md
 

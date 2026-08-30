@@ -1,6 +1,6 @@
 # Package API map
 
-Pepsy has two layers:
+PePsY has two layers:
 
 - **Core namespaces** are the normal application API.
 - **Advanced namespaces** contain optional backends, research workflows, and

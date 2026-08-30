@@ -1,4 +1,4 @@
-"""Stabilizer Tensor Network (STN) simulator.
+r"""Stabilizer Tensor Network (STN) simulator.
 
 Implementation of Masot-Llima & Garcia-Saez, *Stabilizer Tensor Networks:
 universal quantum simulator on a basis of stabilizer states*, PRL 133, 230601
@@ -6,7 +6,9 @@ universal quantum simulator on a basis of stabilizer states*, PRL 133, 230601
 
 A state is stored as
 
-    |psi> = sum_i nu_i  d_hat_i |psi_S>
+.. math::
+
+   |\psi\rangle = \sum_i \nu_i \hat d_i |\psi_S\rangle
 
 i.e. a **stabilizer basis** ``B(S, D)`` (a tableau of ``n`` stabilizer + ``n``
 destabilizer generators, tracked with :mod:`stim`) times a **coefficient state**
