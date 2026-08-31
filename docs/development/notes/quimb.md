@@ -28,7 +28,7 @@ and contraction from scratch.
 | BP gauge | quimb BP gauging helpers (`gauge_all`-family) | doubles as simple-update gauge / initializer |
 | BP environments / RDMs | quimb message → local env contraction | may need a thin pepsy adapter |
 | Sub-network contraction | `cotengra` via pepsy `build_optimizer` | do **not** add seed kwargs (tests assert absence) |
-| Generalized loops | `TensorNetwork.gen_gloops(**gloop_opts)` | forwarded by scalar and 2-norm loop-cluster APIs |
+| Generalized loops | `TensorNetwork.gen_gloops(**gloop_opts)` | capability-checked and forwarded by scalar and 2-norm loop-cluster APIs |
 | Periodic lattice bonds | `qtn.LatticeBondMap` | keeps length-two periodic directions' wrap bonds distinct |
 | Long-range MPO gate | `MatrixProductOperator.gate_sandwich_with_auto_swap` | explicit opt-in `pepsy.gate_mpo_auto_swap`; no dense fallback |
 | Backend-native random data | `autoray.random.array` | used for FIT warm starts with a NumPy fallback for older Autoray |
@@ -68,3 +68,31 @@ to the user gate, never to internal routing SWAPs.
 - quimb docs: https://quimb.readthedocs.io/ (tensor + belief propagation).
 - cotengra: https://cotengra.readthedocs.io/.
 - autoray: https://github.com/jcmgray/autoray.
+
+## 2026-08-31 compatibility audit
+
+- Installed development stack: Quimb `1.15.1.dev37+gdf03dbe79`
+  (`df03dbe7989fe19eeb78ca78ea19a87b44da631a`), Autoray
+  `0.11.1.dev1+gc56f64427` (`c56f644279f560e93d884ddfb2d7b0b60032382f`),
+  Cotengra `0.8.3.dev6+g08fe1a3a1` (`08fe1a3a1398feb4ef667cf7009dc7a47bcdbb81`),
+  and Symmray `0.3.1` (`1eaa48c9bdc2d128abed936dbe06a131105ab2e0`).
+- Probes confirmed the current Quimb surfaces for SDC compression, seeded
+  SRC/FIT, gate transforms, BP constructor/run options, generalized-loop
+  options, `LatticeBondMap`, and MPO auto-swap. The upstream `safe_inverse`
+  now handles a one-dimensional Symmray `BlockVector` directly.
+- The `SimpleUpdateGen` regression now accepts Quimb's fixed long-range gate
+  behavior while retaining an exact compatibility assertion for older Quimb
+  releases. The safe-inverse workaround is installed only when a behavior
+  probe shows that the installed Quimb build needs it.
+- Loop-series resummation now forwards Quimb's newer required `num_tensors`
+  argument while ignoring it on older Quimb builds. Cluster BP option probes
+  use the concrete `d1bp`/`d2bp` method names rather than Pepsy's `1norm`/
+  `2norm` labels.
+- Tree energy optimizers now initialize their Torch linalg policy, and native
+  CPU complex64 QR bypasses unrelated process-global Autoray registrations
+  when an earlier autodiff run installed a stabilized rule.
+- Focused validation: the pre-fix compatibility run was 141 passed, 1 skipped,
+  and 1 stale expectation; after the fixes, the focused compatibility set was
+  164 passed and 1 skipped, with Ruff clean. Generalized-loop options are now
+  capability-checked with a focused error on older Quimb signatures. The full
+  headless suite passed with 3100 passed and 39 skipped.

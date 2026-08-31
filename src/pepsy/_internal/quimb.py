@@ -100,6 +100,43 @@ def quimb_bp_run_options(bp, options):
     return quimb_filter_options(getattr(bp, "run", None), options)
 
 
+def quimb_gloop_options(options):
+    """Validate explicit generalized-loop options against Quimb's API."""
+    function = getattr(qtn.TensorNetwork, "gen_gloops", None)
+    parameters, accepts_kwargs = _signature_parameters(function)
+    if function is None:
+        raise NotImplementedError(
+            "The installed Quimb build does not provide "
+            "TensorNetwork.gen_gloops()."
+        )
+
+    if not accepts_kwargs:
+        unsupported = sorted(set(options) - set(parameters))
+        if unsupported:
+            names = ", ".join(repr(name) for name in unsupported)
+            raise NotImplementedError(
+                "The installed Quimb build does not support generalized-loop "
+                f"option(s): {names}. Upgrade Quimb to use these options."
+            )
+    return dict(options)
+
+
+def quimb_process_loop_series_expansion_weights(
+    weights, *, num_tensors, **options
+):
+    """Call Quimb's loop-series weight processor across API revisions."""
+    from quimb.tensor.belief_propagation.bp_common import (
+        process_loop_series_expansion_weights,
+    )
+
+    parameters, accepts_kwargs = _signature_parameters(
+        process_loop_series_expansion_weights
+    )
+    if accepts_kwargs or "num_tensors" in parameters:
+        options = {"num_tensors": num_tensors, **options}
+    return process_loop_series_expansion_weights(weights, **options)
+
+
 def quimb_lattice_bond_map(*shape):
     """Return Quimb's lattice bond map when the installed build provides it."""
     lattice_bond_map = getattr(qtn, "LatticeBondMap", None)

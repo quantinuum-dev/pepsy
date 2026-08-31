@@ -86,6 +86,7 @@ from .._internal.quimb import (
     quimb_bp_class as _quimb_bp_class,
     quimb_bp_constructor_option_supported as _quimb_bp_constructor_option_supported,
     quimb_bp_constructor_options as _quimb_bp_constructor_options,
+    quimb_gloop_options as _quimb_gloop_options,
     quimb_bp_run_options as _quimb_bp_run_options,
 )
 
@@ -235,7 +236,7 @@ class ScalarClusterCache:
         from quimb.tensor.belief_propagation.regions import gen_region_counts
 
         self._check_topology(tn)
-        gloop_opts = {} if gloop_opts is None else dict(gloop_opts)
+        gloop_opts = _quimb_gloop_options(gloop_opts or {})
 
         if gloops is None:
             loops = tuple(
@@ -1234,6 +1235,7 @@ def loop_cluster_expand(
     LoopClusterResult
     """
     key, bp_cls = _cluster_bp_class(norm)
+    bp_method = "d2bp" if key == "2norm" else "d1bp"
     if key == "2norm" and _uses_symmray(tn):
         tn = _restore_fermionic_dummy_modes(tn)
     if key == "1norm" and _uses_symmray(tn):
@@ -1241,7 +1243,7 @@ def loop_cluster_expand(
         messages = _dense_message_tree(messages)
         gauges = _dense_message_tree(gauges)
     contract_opts = {} if contract_opts is None else dict(contract_opts)
-    gloop_opts = {} if gloop_opts is None else dict(gloop_opts)
+    gloop_opts = _quimb_gloop_options(gloop_opts or {})
     if run_bp and (
         not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1
     ):
@@ -1348,10 +1350,10 @@ def loop_cluster_expand(
         if key == "2norm":
             # only D2BP takes an optimize kwarg at construction time.
             ctor["optimize"] = optimize
-        if _quimb_bp_constructor_option_supported(key, "diis"):
+        if _quimb_bp_constructor_option_supported(bp_method, "diis"):
             ctor["diis"] = diis
         ctor.update(bp_opts)
-        bp = bp_cls(tn, **_quimb_bp_constructor_options(key, ctor))
+        bp = bp_cls(tn, **_quimb_bp_constructor_options(bp_method, ctor))
 
         if run_bp:
             info = _run_plain_bp(

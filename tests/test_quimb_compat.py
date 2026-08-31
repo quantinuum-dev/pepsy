@@ -1,12 +1,21 @@
 """Focused compatibility tests for optional Quimb capabilities."""
 
+import inspect
+
 import numpy as np
+import pytest
 import quimb.tensor as qtn
 
 import pepsy
+from pepsy.bp._symmray import (
+    _quimb_safe_inverse_supports_symmray,
+    install_quimb_symmray_compat,
+)
 from pepsy._internal.quimb import (
     quimb_bp_constructor_option_supported,
     quimb_bp_constructor_options,
+    quimb_gloop_options,
+    quimb_process_loop_series_expansion_weights,
     quimb_mpo_auto_swap_function,
 )
 from pepsy._internal.random import backend_random_array
@@ -39,6 +48,58 @@ def test_backend_random_array_is_seeded_and_native_for_numpy():
 
     assert first.dtype == np.complex64
     np.testing.assert_array_equal(first, second)
+
+
+def test_gloop_options_are_capability_checked():
+    """Explicit generalized-loop controls fail clearly when unavailable."""
+    options = {"join_overlap": 2}
+    if "join_overlap" in inspect.signature(
+        qtn.TensorNetwork.gen_gloops
+    ).parameters:
+        assert quimb_gloop_options(options) == options
+    else:
+        with pytest.raises(NotImplementedError, match="generalized-loop"):
+            quimb_gloop_options(options)
+
+
+def test_loop_series_weight_adapter_handles_num_tensors_change():
+    """Loop-series resummation adapts to Quimb's new tensor-count argument."""
+    from quimb.tensor.belief_propagation.bp_common import (
+        process_loop_series_expansion_weights,
+    )
+
+    weights = {frozenset((0, 1)): 0.1}
+    suppression = quimb_process_loop_series_expansion_weights(
+        weights,
+        num_tensors=2,
+        multi_excitation_correct=True,
+        tol_correction=1e-14,
+        maxiter_correction=100,
+        return_all=True,
+    )
+
+    assert np.isfinite(suppression[frozenset((0, 1))])
+    if "num_tensors" in inspect.signature(
+        process_loop_series_expansion_weights
+    ).parameters:
+        assert suppression[frozenset((0, 1))] == pytest.approx(
+            0.9127652716086229
+        )
+
+
+def test_safe_inverse_compat_defers_to_fixed_quimb():
+    """Do not replace Quimb's implementation after its upstream fix."""
+    qd = pytest.importorskip("quimb.tensor.decomp")
+    pytest.importorskip("symmray")
+    if getattr(qd, "_pepsy_symmray_safe_inverse", False):
+        pytest.skip("the compatibility wrapper was already installed")
+    if not _quimb_safe_inverse_supports_symmray(qd):
+        pytest.skip("the installed Quimb build needs the compatibility wrapper")
+
+    original = qd.safe_inverse
+    install_quimb_symmray_compat()
+
+    assert qd.safe_inverse is original
 
 
 def test_mpo_auto_swap_is_explicit_and_preserves_long_range_identity():

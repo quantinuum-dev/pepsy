@@ -2968,7 +2968,7 @@ def test_fermi_hubbard_u1u1_streams_run_mps_optimizer_and_direct_gate():
 
     assert len(interaction) == 3
     assert len(hopping) == 2
-    assert len(stream) == 3 + 2 + 3
+    assert len(stream) == 2 * len(interaction) + 2 * len(hopping)
     assert direct.tn.L == 3
     assert out.L == 3
     assert out.max_bond() <= 4

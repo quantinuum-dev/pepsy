@@ -14,6 +14,14 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Updated Quimb compatibility handling to defer the Symmray `safe_inverse`
+  shim to older builds, accept Quimb's native long-range simple-update path,
+  capability-check generalized-loop options, and adapt loop-series resummation
+  to Quimb's newer `num_tensors` argument.
+
+- Fixed tree-energy Torch policy initialization and protected native complex64
+  QR from stale process-global Autoray registrations.
+
 - Added opt-in Quimb `sdc` and `sdc-oversample` MPS compression mode names
   with execution-time capability checks; existing compression defaults and
   modes are unchanged.

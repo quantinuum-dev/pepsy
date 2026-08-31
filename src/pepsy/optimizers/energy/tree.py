@@ -21,7 +21,7 @@ import warnings
 
 import autoray as ar
 
-from ...backends import infer_backend_converter_from_sample
+from ...backends import TorchLinalgConfig, infer_backend_converter_from_sample
 from ...tensors import build_optimizer
 from .peps import EnergyEstimate, PepsEnergyOptimizer
 
@@ -76,13 +76,22 @@ class TreeEnergyOptimizer(PepsEnergyOptimizer):
         real: bool = True,
         contraction_opt: Any = "auto-hq",
         loss_kwargs: Mapping[str, Any] | None = None,
+        torch_linalg_config: TorchLinalgConfig | None = None,
     ):
         if hamiltonian is not None and terms is not None:
             raise TypeError("pass either hamiltonian or terms, not both")
+        if torch_linalg_config is not None and not isinstance(
+            torch_linalg_config,
+            TorchLinalgConfig,
+        ):
+            raise TypeError(
+                "torch_linalg_config must be a TorchLinalgConfig instance or None."
+            )
         source = terms if terms is not None else hamiltonian
         self.state = self._as_tree_state(state)
         self.hamiltonian = source
         self.terms = self._terms_from_hamiltonian(source)
+        self.torch_linalg_config = torch_linalg_config
         self.loss_kwargs = {
             "normalized": bool(normalized),
             "energy_per_site": bool(energy_per_site),

@@ -6369,26 +6369,24 @@ def test_native_complex64_qr_scales_low_norm_rank_deficient_block():
 def test_native_complex64_qr_leaves_healthy_block_on_native_path(monkeypatch):
     """Healthy complex64 blocks use one unmodified native Torch QR call."""
     torch = pytest.importorskip("torch")
-    import pepsy.optimizers.tree.ttn as ttn_module
 
     generator = torch.Generator().manual_seed(4108)
     block = torch.randn((6, 4), generator=generator).to(torch.complex64)
     qr_calls = []
-    original_do = ttn_module.ar.do
+    original_qr = torch.linalg.qr
 
-    def record_qr_call(fn, x, *args, **kwargs):
-        if fn == "linalg.qr":
-            qr_calls.append(x.detach().clone())
-        return original_do(fn, x, *args, **kwargs)
+    def record_qr_call(x, *args, **kwargs):
+        qr_calls.append(x.detach().clone())
+        return original_qr(x, *args, **kwargs)
 
-    monkeypatch.setattr(ttn_module.ar, "do", record_qr_call)
+    monkeypatch.setattr(torch.linalg, "qr", record_qr_call)
     q, _, r = _native_qr_block_scaled(
         block,
         method="qr",
         absorb="right",
         stabilized=False,
     )
-    expected_q, expected_r = torch.linalg.qr(block)
+    expected_q, expected_r = original_qr(block)
 
     assert len(qr_calls) == 1
     torch.testing.assert_close(qr_calls[0], block)
@@ -6399,21 +6397,19 @@ def test_native_complex64_qr_leaves_healthy_block_on_native_path(monkeypatch):
 def test_native_complex64_qr_scales_dynamic_range_block(monkeypatch):
     """Native QR scales moderate-norm blocks with tiny charge entries."""
     torch = pytest.importorskip("torch")
-    import pepsy.optimizers.tree.ttn as ttn_module
 
     block = torch.zeros((4, 10), dtype=torch.complex64)
     for index, magnitude in enumerate((8.9e-3, 8.9e-11, 8.9e-25, 8.9e-41)):
         block[index, index] = complex(magnitude, magnitude)
 
     qr_input_maxes = []
-    original_do = ttn_module.ar.do
+    original_qr = torch.linalg.qr
 
-    def record_qr_input(fn, x, *args, **kwargs):
-        if fn == "linalg.qr":
-            qr_input_maxes.append(float(x.abs().amax().item()))
-        return original_do(fn, x, *args, **kwargs)
+    def record_qr_input(x, *args, **kwargs):
+        qr_input_maxes.append(float(x.abs().amax().item()))
+        return original_qr(x, *args, **kwargs)
 
-    monkeypatch.setattr(ttn_module.ar, "do", record_qr_input)
+    monkeypatch.setattr(torch.linalg, "qr", record_qr_input)
     q, _, r = _native_qr_block_scaled(
         block,
         method="qr",

@@ -248,7 +248,23 @@ def _native_qr_block_scaled(array, **kwargs):
         if left_like:
             x = ar.do("transpose", x, (1, 0))
         try:
-            q, r = ar.do("linalg.qr", x, **qr_kwargs)
+            if (
+                backend == "torch"
+                and getattr(getattr(x, "device", None), "type", "cpu") == "cpu"
+            ):
+                # A previous autodiff run can leave a stabilized real/complex
+                # QR rule in Autoray's process-global Torch namespace. This
+                # helper explicitly requests the native complex64 path, so do
+                # not let an unrelated registration change its forward rule.
+                import torch  # pylint: disable=import-outside-toplevel
+
+                registered_qr = ar.get_lib_fn("torch", "linalg.qr")
+                if registered_qr is not torch.linalg.qr:
+                    q, r = torch.linalg.qr(x, **qr_kwargs)
+                else:
+                    q, r = ar.do("linalg.qr", x, **qr_kwargs)
+            else:
+                q, r = ar.do("linalg.qr", x, **qr_kwargs)
         except Exception:
             if not allow_failure:
                 raise

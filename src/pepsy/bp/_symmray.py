@@ -43,6 +43,52 @@ def is_symmray_array(value) -> bool:
     )
 
 
+_SAFE_INVERSE_PROBE = None
+
+
+def _quimb_safe_inverse_supports_symmray(qd) -> bool:
+    """Check whether Quimb's installed ``safe_inverse`` handles vectors."""
+    global _SAFE_INVERSE_PROBE
+
+    safe_inverse = getattr(qd, "safe_inverse", None)
+    if not callable(safe_inverse):
+        return False
+
+    if (
+        _SAFE_INVERSE_PROBE is not None
+        and _SAFE_INVERSE_PROBE[0] is safe_inverse
+    ):
+        return _SAFE_INVERSE_PROBE[1]
+
+    try:
+        import symmray as sr
+
+        block_vector_cls = getattr(sr, "BlockVector", None)
+        if block_vector_cls is None:
+            supported = True
+        else:
+            values = block_vector_cls(
+                {
+                    0: np.asarray([1.0, 2.0]),
+                    1: np.asarray([3.0]),
+                }
+            )
+            result = safe_inverse(values, power=0.5)
+            if hasattr(result, "to_dense"):
+                result = result.to_dense()
+            supported = np.allclose(
+                np.asarray(result),
+                np.asarray([1.0, 1.0 / np.sqrt(2.0), 1.0 / np.sqrt(3.0)]),
+            )
+    except Exception:  # pragma: no cover - depends on installed backends
+        # A failed probe means the narrow compatibility path is safer. The
+        # wrapper is only installed when a Symmray network is actually used.
+        supported = False
+
+    _SAFE_INVERSE_PROBE = (safe_inverse, supported)
+    return supported
+
+
 def install_quimb_symmray_compat() -> None:
     """Patch only Quimb's old scalar-vector inverse path for Symmray.
 
@@ -62,7 +108,11 @@ def install_quimb_symmray_compat() -> None:
     if getattr(qd, "_pepsy_symmray_safe_inverse", False):
         return
 
-    original = qd.safe_inverse
+    original = getattr(qd, "safe_inverse", None)
+    if not callable(original):
+        return
+    if _quimb_safe_inverse_supports_symmray(qd):
+        return
 
     def safe_inverse(x, cutoff=None, power=1.0):
         if not (is_symmray_array(x) and getattr(x, "ndim", None) == 1):

@@ -49,7 +49,7 @@ from pepsy.tensors import (  # noqa: E402
 
 
 def test_quimb_safe_inverse_compat_handles_symmray_block_vector():
-    """The old Quimb axis reduction must not break projector compression."""
+    """Symmray vector inversion works on old and fixed Quimb builds."""
     install_quimb_symmray_compat()
     from quimb.tensor.decomp import safe_inverse
 
