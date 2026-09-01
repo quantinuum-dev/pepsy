@@ -408,6 +408,11 @@ currently supports only `contraction="exact"`; approximate CTMRG/HOTRG
 contractions retain their existing eager/vmap behavior. Boundary-MPS models
 have a separate compiled reuse path described below.
 
+For the diagnostic `backend="eager"`, Pepsy uses the exported/vmapped graph
+directly rather than wrapping it in TorchDynamo's eager backend. This avoids a
+PyTorch 2.6 FakeTensor issue in the stable-log path while retaining the same
+fixed-batch behavior. Other backends continue through `torch.compile`.
+
 The compiled path follows the fixed-shape strategy of the paper and the
 reference [`vmc_torch` implementation](https://github.com/sjdu10/vmc_torch).
 

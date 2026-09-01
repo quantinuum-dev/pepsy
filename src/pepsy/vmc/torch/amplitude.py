@@ -550,7 +550,10 @@ class TorchPEPSAmplitude:
         example_configs : array-like
             Shape ``(n_sites,)`` or ``(batch, n_sites)``.
         mode, backend, dynamic
-            Forwarded to ``torch.compile``.
+            Forwarded to ``torch.compile``.  The diagnostic backend
+            ``"eager"`` uses the exported/vmapped graph directly because
+            PyTorch's eager Dynamo backend can return FakeTensors for this
+            nested export/vmap path.
         strict : bool
             Forwarded to ``torch.export.export``.
         compile_log : bool
@@ -576,10 +579,12 @@ class TorchPEPSAmplitude:
 
         exporter = getattr(getattr(torch, "export", None), "export", None)
         compiler = getattr(torch, "compile", None)
-        if not callable(exporter) or not callable(compiler):
+        if not callable(exporter) or (
+            backend != "eager" and not callable(compiler)
+        ):
             raise RuntimeError(
-                "export_and_compile requires a PyTorch build exposing both "
-                "torch.export.export and torch.compile."
+                "export_and_compile requires torch.export.export; optimized "
+                "backends additionally require torch.compile."
             )
 
         example_configs = _as_long_matrix(example_configs)
@@ -597,24 +602,31 @@ class TorchPEPSAmplitude:
         model = self
 
         class _SingleAmplitudeModule(torch.nn.Module):
-            def __init__(self, *, log=False):
-                super().__init__()
-                self.log = bool(log)
-
             def forward(self, config, *params):
-                if self.log:
-                    phase, log_abs = model.forward_log(
-                        config.reshape(1, -1),
-                        params=params,
-                    )
-                    return phase[0], log_abs[0]
                 return model.amplitude(config, params=params)
+
+        # Keep the amplitude and log-amplitude wrappers separate. The log
+        # wrapper calls the scalar contraction directly instead of entering
+        # the batched ``forward_log`` method, which would introduce a nested
+        # vmap while export is tracing the single-sample graph.
+        class _SingleLogAmplitudeModule(torch.nn.Module):
+            def forward(self, config, *params):
+                tn = model._unpack_tn(params)
+                reference = model._reference_tensor(params)
+                return model._contract_log_parts(
+                    model._select_config(tn, config),
+                    reference,
+                )
 
         params = list(self.params)
         in_dims = (0,) + (None,) * len(params)
 
         def build(log=False):
-            wrapper = _SingleAmplitudeModule(log=log)
+            wrapper = (
+                _SingleLogAmplitudeModule()
+                if log
+                else _SingleAmplitudeModule()
+            )
             try:
                 # PyTorch 2.6 emits harmless FX warnings while un lifting
                 # static quimb/Symmray metadata. Keep this opt-in API quiet.
@@ -644,13 +656,23 @@ class TorchPEPSAmplitude:
                         exported.module(),
                         in_dims=in_dims,
                     )
-                    compile_kwargs = {
-                        "backend": backend,
-                        "dynamic": dynamic,
-                    }
-                    if mode is not None:
-                        compile_kwargs["mode"] = mode
-                    compiled = compiler(vmapped, **compile_kwargs)
+                    if backend == "eager":
+                        # ``torch.compile(..., backend="eager")`` is a
+                        # Dynamo tracing diagnostic rather than an optimized
+                        # backend.  On PyTorch 2.6 it can leak FakeTensors
+                        # from an exported graph after a sibling compiled
+                        # graph has run.  The exported/vmapped graph already
+                        # has the fixed batch contract needed here, and is
+                        # the stable eager diagnostic implementation.
+                        compiled = vmapped
+                    else:
+                        compile_kwargs = {
+                            "backend": backend,
+                            "dynamic": dynamic,
+                        }
+                        if mode is not None:
+                            compile_kwargs["mode"] = mode
+                        compiled = compiler(vmapped, **compile_kwargs)
             except Exception as error:
                 name = "log-amplitude" if log else "amplitude"
                 raise RuntimeError(

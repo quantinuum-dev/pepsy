@@ -106,6 +106,11 @@ Changes for the next release should be added here before the version is bumped.
   compression controls of `exp_mpo_cluster` while making the factor list
   explicit.
 
+- Fixed exact Torch export/compile log-amplitude evaluation by tracing the
+  scalar contraction directly and making `backend="eager"` use the stable
+  exported/vmapped graph. This prevents PyTorch 2.6 FakeTensor leakage into
+  Metropolis acceptance while preserving real compiler backends.
+
 - Added an opt-in Torch PEPS export pipeline matching the GPU VMC
   `torch.export -> torch.vmap -> torch.compile` flow. Exact PEPS models can
   compile a fixed walker batch, including stable log amplitudes; Metropolis
