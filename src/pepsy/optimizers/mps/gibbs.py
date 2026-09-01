@@ -206,6 +206,13 @@ class GibbsMps:
         self._identity_mps = None
         self.optimizer = None
         self.gates = ()
+        self.trotter_gates = ()
+        self.trotter_layers = ()
+        self._trotter_ham = None
+        self.trotter_order = None
+        self.trotter_ordering = None
+        self.trotter_fuse_adjacent = None
+        self.trotter_alternate = None
         self.beta = None
         self.trotter_step = None
         self.n_steps = 0
@@ -243,6 +250,14 @@ class GibbsMps:
             return term.operators[0]
         return ar.do("kron", term.operators[0], term.operators[1])
 
+    def _scaled_term_operator(self, term, coefficient):
+        """Return one term's local Hamiltonian contribution."""
+        return ar.do(
+            "multiply",
+            self._term_operator(term),
+            coefficient,
+        )
+
     def _build_identity_mps(self, coefficients=(), beta=None):
         """Build the interleaved Bell-pair MPS on the active backend."""
         values = [
@@ -268,14 +283,6 @@ class GibbsMps:
             site_tag_id="I{}",
         )
 
-    def _gate_for_term(self, term, coefficient, step):
-        """Build ``exp(-step * coefficient * term / 2)`` for one term."""
-        operator = self._term_operator(term)
-        scale = ar.do("multiply", coefficient, -0.5 * step)
-        generator = ar.do("multiply", operator, scale)
-        return ar.do("reshape", ar.do("linalg.expm", generator),
-                     (self.phys_dim,) * (2 * len(term.sites)))
-
     def _convert_gate_stream(self, gates):
         """Place generated gates on the same backend as the purification."""
         if self.to_backend is None:
@@ -290,17 +297,191 @@ class GibbsMps:
             for gate, where in gates
         )
 
-    def _build_trotter_stream(self, coefficients, step, n_steps):
-        """Build a symmetric second-order gate stream."""
-        term_gates = tuple(
-            (
-                self._gate_for_term(term, coefficient, step),
-                tuple(2 * int(site) for site in term.sites),
+    def _build_local_ham(self, coefficients):
+        """Compile normalized terms into Quimb's graph Hamiltonian form.
+
+        ``LocalHamGen`` stores pair interactions and can absorb one-site terms
+        into incident pairs. Doing that lifting here, rather than passing
+        ``H1`` directly, keeps the identity Kronecker products on the selected
+        Autoray backend. This preserves differentiable Torch/JAX coefficient
+        graphs while retaining Quimb's local-Hamiltonian representation.
+
+        Sites carrying only one-site terms are returned separately. They are
+        disconnected from every pair interaction and can therefore be applied
+        as exact one-site exponentials without changing the product formula.
+        """
+        pair_terms = {}
+        site_terms = {}
+
+        for term, coefficient in zip(self.basis.terms, coefficients):
+            operator = self._scaled_term_operator(term, coefficient)
+            sites = tuple(int(site) for site in term.sites)
+            if len(sites) == 2:
+                where = tuple(sorted(sites))
+                if where in pair_terms:
+                    pair_terms[where] = ar.do(
+                        "add",
+                        pair_terms[where],
+                        operator,
+                    )
+                else:
+                    pair_terms[where] = operator
+            else:
+                site = sites[0]
+                if site in site_terms:
+                    site_terms[site] = ar.do(
+                        "add",
+                        site_terms[site],
+                        operator,
+                    )
+                else:
+                    site_terms[site] = operator
+
+        if not pair_terms:
+            return None, site_terms
+
+        covering = {}
+        for where in pair_terms:
+            for site in where:
+                covering.setdefault(site, []).append(where)
+
+        isolated = {}
+        for site, operator in site_terms.items():
+            pairs = covering.get(site, ())
+            if not pairs:
+                isolated[site] = operator
+                continue
+
+            identity = ar.do("eye", self.phys_dim, like=operator)
+            for where in pairs:
+                if where[0] == site:
+                    lifted = ar.do("kron", operator, identity)
+                else:
+                    lifted = ar.do("kron", identity, operator)
+                lifted = ar.do("divide", lifted, len(pairs))
+                pair_terms[where] = ar.do(
+                    "add",
+                    pair_terms[where],
+                    lifted,
+                )
+
+        ham = qtn.LocalHamGen(pair_terms)
+        if self.to_backend is not None:
+            def convert(array):
+                if _backend_name(array) in {"builtins", "numpy"}:
+                    return self.to_backend(array)
+                return array
+
+            # Keep the explicit backend boundary visible on the native
+            # Quimb Hamiltonian as well as on the final gate stream.
+            ham.apply_to_arrays(convert)
+        return ham, isolated
+
+    def _build_isolated_gates(self, isolated, total_exponent):
+        """Build exact one-site gates for sites with no pair interactions."""
+        gates = []
+        for site in sorted(isolated):
+            generator = ar.do(
+                "multiply",
+                isolated[site],
+                total_exponent,
             )
-            for term, coefficient in zip(self.basis.terms, coefficients)
+            gate = ar.do("linalg.expm", generator)
+            gate = ar.do("reshape", gate, (self.phys_dim, self.phys_dim))
+            gates.append((gate, (2 * int(site),)))
+        return tuple(gates)
+
+    def _build_trotter_stream(
+        self,
+        coefficients,
+        step,
+        n_steps,
+        *,
+        order,
+        ordering,
+        fuse_adjacent,
+        alternate,
+    ):
+        """Build a Quimb Trotter stream and map it to purification sites."""
+        if n_steps == 0:
+            return (), (), None, ()
+
+        ham, isolated = self._build_local_ham(coefficients)
+        if ham is None:
+            total_exponent = ar.do("multiply", step, -int(n_steps))
+            return (
+                self._build_isolated_gates(isolated, total_exponent),
+                (),
+                None,
+                (),
+            )
+
+        get_trotter_gates = getattr(ham, "get_trotter_gates", None)
+        if get_trotter_gates is None:
+            raise RuntimeError(
+                "GibbsMps requires a Quimb LocalHamGen with "
+                "get_trotter_gates; upgrade Quimb to use the native "
+                "TrotterGate scheduler."
+            )
+
+        if isinstance(ordering, str) or ordering is None:
+            layers = tuple(ham.get_auto_ordering(ordering, group=True))
+            native_ordering = ordering
+        else:
+            native_ordering = tuple(tuple(layer) for layer in ordering)
+            layers = native_ordering
+
+        exponent = ar.do("multiply", step, -1.0)
+        schedule_kwargs = {
+            "order": order,
+            "steps": int(n_steps),
+            "ordering": native_ordering,
+            "fuse_adjacent": bool(fuse_adjacent),
+            "alternate": bool(alternate),
+        }
+        try:
+            hash(exponent)
+        except TypeError:
+            # JAX arrays are intentionally unhashable, while the installed
+            # Quimb cache uses ``(id(term), x)`` as its key. Ask Quimb for the
+            # exact schedule with a neutral scalar, then regenerate only the
+            # payloads through Autoray so the real exponent stays in the JAX
+            # graph. The TrotterGate metadata remains Quimb-native.
+            scheduled_gates = tuple(get_trotter_gates(0.0, **schedule_kwargs))
+            native_gates = tuple(
+                type(scheduled_gate)(
+                    ar.do(
+                        "linalg.expm",
+                        ar.do(
+                            "multiply",
+                            ham.get_gate(scheduled_gate.where),
+                            ar.do("multiply", exponent, scheduled_gate.frac),
+                        ),
+                    ),
+                    scheduled_gate.where,
+                    scheduled_gate.frac,
+                    scheduled_gate.layer,
+                    scheduled_gate.step,
+                )
+                for scheduled_gate in scheduled_gates
+            )
+        else:
+            native_gates = tuple(get_trotter_gates(exponent, **schedule_kwargs))
+        gates = tuple(
+            (
+                ar.do(
+                    "reshape",
+                    trotter_gate.U,
+                    (self.phys_dim,) * (2 * len(trotter_gate.where)),
+                ),
+                tuple(2 * int(site) for site in trotter_gate.where),
+            )
+            for trotter_gate in native_gates
         )
-        one_step = term_gates + tuple(reversed(term_gates))
-        return one_step * int(n_steps)
+
+        total_exponent = ar.do("multiply", step, -int(n_steps))
+        isolated_gates = self._build_isolated_gates(isolated, total_exponent)
+        return gates + isolated_gates, native_gates, ham, layers
 
     def prepare(
         self,
@@ -318,16 +499,25 @@ class GibbsMps:
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
+        trotter_order=2,
+        trotter_ordering="sort",
+        trotter_fuse_adjacent=True,
+        trotter_alternate=True,
         parameters=None,
         optimizer_kwargs=None,
         run_kwargs=None,
     ):
         r"""Prepare ``(exp(-beta * H / 2) \otimes I) |I>``.
 
-        ``n_steps`` selects the number of second-order Trotter steps.  If it
-        is omitted, ``dt`` is interpreted as a requested maximum imaginary
-        time step and the number of steps is chosen by ceiling.  With neither
-        argument supplied, one Trotter step is used.
+        ``n_steps`` selects the number of Trotter steps. By default these are
+        symmetric second-order steps, generated by Quimb's
+        :meth:`quimb.tensor.tnag.tebd.LocalHamGen.get_trotter_gates`. If
+        ``dt`` is supplied, it is interpreted as a requested maximum imaginary
+        time step and the number of steps is chosen by ceiling. With neither
+        argument supplied, one Trotter step is used. ``trotter_order`` may be
+        ``1``, ``2``, or ``4``; ``trotter_ordering`` controls graph edge
+        ordering, while ``trotter_fuse_adjacent`` and ``trotter_alternate``
+        are passed to Quimb's scheduler.
 
         The returned object is ``self``.  Inspect the purification through
         :attr:`mps`, or call :meth:`to_mpo` to trace out the ancillas.
@@ -341,6 +531,26 @@ class GibbsMps:
         beta_float = _scalar_float(beta, name="beta")
         if beta_float < 0.0:
             raise ValueError("beta must be non-negative.")
+        if (
+            not isinstance(trotter_order, Integral)
+            or isinstance(trotter_order, bool)
+            or int(trotter_order) not in (1, 2, 4)
+        ):
+            raise ValueError("trotter_order must be one of 1, 2, or 4.")
+        trotter_order = int(trotter_order)
+        if (
+            trotter_ordering is not None
+            and not isinstance(trotter_ordering, str)
+        ):
+            try:
+                trotter_ordering = tuple(
+                    tuple(layer) for layer in trotter_ordering
+                )
+            except TypeError as exc:
+                raise TypeError(
+                    "trotter_ordering must be a string, None, or a sequence "
+                    "of commuting edge layers."
+                ) from exc
         if n_steps is not None:
             if not isinstance(n_steps, Integral) or isinstance(n_steps, bool):
                 raise TypeError("n_steps must be a positive integer or None.")
@@ -424,9 +634,26 @@ class GibbsMps:
         coefficient_batch = self.basis.coefficients(parameters)
         coefficients = tuple(coefficient_batch[index] for index in range(self.basis.num_terms))
         step = 0.0 if n_steps == 0 else ar.do("divide", beta, 2 * n_steps)
-        gates = self._convert_gate_stream(
-            self._build_trotter_stream(coefficients, step, n_steps)
+        if self.to_backend is not None and _backend_name(step) in {
+            "builtins",
+            "numpy",
+        }:
+            step = self.to_backend(step)
+        (
+            gates,
+            trotter_gates,
+            trotter_ham,
+            trotter_layers,
+        ) = self._build_trotter_stream(
+            coefficients,
+            step,
+            n_steps,
+            order=trotter_order,
+            ordering=trotter_ordering,
+            fuse_adjacent=trotter_fuse_adjacent,
+            alternate=trotter_alternate,
         )
+        gates = self._convert_gate_stream(gates)
         identity = self._build_identity_mps(coefficients, beta=beta)
         identity_snapshot = identity.copy()
 
@@ -458,6 +685,13 @@ class GibbsMps:
         self.optimizer.run(**options)
         self._identity_mps = identity_snapshot
         self.gates = gates
+        self.trotter_gates = trotter_gates
+        self.trotter_layers = trotter_layers
+        self._trotter_ham = trotter_ham
+        self.trotter_order = trotter_order
+        self.trotter_ordering = trotter_ordering
+        self.trotter_fuse_adjacent = bool(trotter_fuse_adjacent)
+        self.trotter_alternate = bool(trotter_alternate)
         self.beta = beta
         self.trotter_step = step
         self.n_steps = int(n_steps)

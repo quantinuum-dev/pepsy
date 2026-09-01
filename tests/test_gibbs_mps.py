@@ -84,6 +84,72 @@ def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
     assert state.optimizer._unitary_previous_norm is None
 
 
+def test_gibbs_mps_uses_quimb_trotter_schedule_and_physical_mapping():
+    """Quimb's schedule metadata survives the purification site mapping."""
+    state = GibbsMps(
+        [
+            (("ZZ", 0.7), (0, 1)),
+            (("XX", 0.2), (1, 2)),
+        ],
+        shape=3,
+    )
+    state.prepare(
+        0.2,
+        n_steps=2,
+        trotter_order=2,
+        trotter_fuse_adjacent=False,
+        cutoff=0.0,
+    )
+
+    assert state.trotter_layers == (((0, 1),), ((1, 2),))
+    assert len(state.trotter_gates) == 6
+    assert all(
+        hasattr(gate, attribute)
+        for gate in state.trotter_gates
+        for attribute in ("frac", "layer", "step")
+    )
+    assert [gate.step for gate in state.trotter_gates] == [0] * 3 + [1] * 3
+    assert all(
+        where == tuple(2 * site for site in logical_where)
+        for (gate, where), logical_where in zip(
+            state.gates,
+            (trotter_gate.where for trotter_gate in state.trotter_gates),
+        )
+    )
+
+
+@pytest.mark.parametrize("order", (1, 4))
+def test_gibbs_mps_accepts_quimb_first_and_fourth_order_schedules(order):
+    """The public order control follows Quimb's supported product formulas."""
+    state = GibbsMps([(("ZZ", 0.2), (0, 1))], shape=2)
+    state.prepare(0.1, n_steps=1, trotter_order=order, cutoff=0.0)
+
+    assert state.trotter_order == order
+    assert state.trotter_gates
+    assert all(gate.where == (0, 1) for gate in state.trotter_gates)
+
+
+def test_gibbs_mps_applies_disconnected_onsite_terms_exactly():
+    """One-site terms outside the interaction graph avoid fake edges."""
+    state = GibbsMps(
+        [
+            (("ZZ", 0.7), (0, 1)),
+            (("X", -0.2), 3),
+        ],
+        shape=4,
+    )
+    state.prepare(0.4, n_steps=2, cutoff=0.0)
+
+    assert len(state.trotter_gates) == 1
+    assert state.gates[-1][1] == (6,)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    np.testing.assert_allclose(
+        np.asarray(state.gates[-1][0]),
+        expm(0.2 * 0.2 * x),
+        atol=1.0e-12,
+    )
+
+
 def test_gibbs_mps_forwards_direct_mps_controls_and_normalization():
     """Common MpsOptimizer controls are available without nested kwargs."""
     state = GibbsMps([(("ZZ", 0.7), (0, 1))], shape=2)
@@ -221,3 +287,24 @@ def test_gibbs_mps_preserves_autograd_gate_payloads():
 
     assert torch.isfinite(grad_beta)
     assert torch.isfinite(grad_coefficient)
+
+
+def test_gibbs_mps_jax_gate_schedule_preserves_backend_arrays():
+    """Unhashable JAX exponents use the native schedule plus Autoray gates."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    import pepsy
+
+    backend = pepsy.backend_jax(dtype=jnp.complex64)
+    state = GibbsMps(
+        [
+            (("ZZ", jnp.asarray(0.4)), (0, 1)),
+            (("X", jnp.asarray(-0.1)), 0),
+        ],
+        shape=2,
+        to_backend=backend,
+    )
+    state.prepare(jnp.asarray(0.2), n_steps=2, cutoff=0.0)
+
+    assert isinstance(state.trotter_gates[0].U, jax.Array)
+    assert isinstance(state.gates[0][0], jax.Array)

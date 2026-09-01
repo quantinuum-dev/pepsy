@@ -74,10 +74,38 @@ API.
 
 ## Imaginary-time stepping and compression
 
-`prepare(beta, n_steps=N)` applies `N` symmetric second-order Trotter steps to
-imaginary time `beta / 2`. If `dt` is supplied instead, `N` is chosen by
-ceiling so the actual step does not exceed the requested value. With neither
-argument, one Trotter step is used.
+`prepare(beta, n_steps=N)` applies `N` Trotter steps to imaginary time
+`beta / 2`. The default `trotter_order=2` uses Quimb's
+`LocalHamGen.get_trotter_gates`, which automatically groups non-overlapping
+Hamiltonian edges into commuting layers and emits the symmetric palindromic
+schedule. `trotter_order=1` and `trotter_order=4` are also available. If `dt`
+is supplied instead, `N` is chosen by ceiling so the actual step does not
+exceed the requested value. With neither argument, one Trotter step is used.
+
+For example, the graph ordering and fusion controls can be made explicit:
+
+```python
+gibbs.prepare(
+    beta=0.4,
+    n_steps=8,
+    trotter_order=2,
+    trotter_ordering="sort",       # or None, "random", or edge layers
+    trotter_fuse_adjacent=True,
+    trotter_alternate=True,
+)
+```
+
+The Hamiltonian terms are first combined by logical edge. One-site terms on
+connected sites are lifted into the incident edges with an equal partition, so
+the represented Hamiltonian is unchanged. A one-site term on a site with no
+incident edge is kept as an exact one-site exponential; no artificial graph
+edge is introduced. The generated Quimb metadata is available as
+`gibbs.trotter_gates` (`frac`, `layer`, `step`, and logical `where`) and
+`gibbs.trotter_layers`. The executable `gibbs.gates` stream contains the same
+gates with logical sites mapped to the even physical positions of the
+purification. For Hamiltonians with disconnected one-site terms, the
+executable stream additionally contains those exact one-site gates, which do
+not have a Quimb edge-layer record.
 
 The default replay mode is `mode="mpo"`, which is appropriate for the
 non-unitary gates and the interleaved physical/ancilla layout. Other ordinary

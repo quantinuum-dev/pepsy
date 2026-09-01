@@ -18,6 +18,12 @@ Changes for the next release should be added here before the version is bumped.
   configurable tag-wise trace contraction options, while preserving the
   backend and autodiff paths.
 
+- Updated `GibbsMps` to use Quimb's graph-aware `LocalHamGen` Trotter scheduler
+  for first-, second-, and fourth-order product formulas. Connected one-site
+  terms are combined into incident edges without leaving the selected backend;
+  isolated one-site terms use exact one-site gates. Trotter layer metadata and
+  ordering/fusion controls are now exposed on the Gibbs-MPS object.
+
 - Added `GibbsMps`, a first finite-temperature purification API. It builds an
   interleaved physical/ancilla MPS from Bell pairs, applies backend-aware
   second-order imaginary-time Trotter gates through `MpsOptimizer`, supports
