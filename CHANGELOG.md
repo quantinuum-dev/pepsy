@@ -14,6 +14,10 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Extended `GibbsMps` with the reusable `bell_to_mps` Quimb constructor and
+  configurable tag-wise trace contraction options, while preserving the
+  backend and autodiff paths.
+
 - Added `GibbsMps`, a first finite-temperature purification API. It builds an
   interleaved physical/ancilla MPS from Bell pairs, applies backend-aware
   second-order imaginary-time Trotter gates through `MpsOptimizer`, supports

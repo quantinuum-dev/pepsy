@@ -17,6 +17,13 @@ surfaces:
   class because an interleaved ordinary MPS needs a charge-aware Bell-pair
   constructor and symmetry-preserving imaginary-time gates.
 
+The installed Quimb `partial_trace_to_mpo` signature is
+`(keep, upper_ind_id='b{}', rescale_sites=True)` and does not expose a
+`contract_tags` keyword. Its implementation nevertheless performs the
+reduction through local tag contractions. `GibbsMps.to_mpo(contract_opts=...)`
+now exposes safe options for those internal `contract_tags` and
+`contract_cumulative` calls while keeping the native method as the default.
+
 The compatibility decision is **adopt** for the ordinary dense/Autoray path:
 `bell_to_mps` uses Quimb's `MatrixProductState` constructor and
 `apply_to_arrays`; term operators, exponential gates, MPS replay, and the

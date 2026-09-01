@@ -18,6 +18,7 @@ from numbers import Integral
 
 import autoray as ar
 import numpy as np
+import quimb.tensor as qtn
 
 from ...backends.convert import (
     infer_backend_converter_from_sample,
@@ -484,15 +485,85 @@ class GibbsMps:
     @property
     def raw_mpo(self):
         """Return the ancilla-traced, unnormalized thermal operator."""
-        return self.mps.partial_trace_to_mpo(
-            keep=self.physical_sites,
-            upper_ind_id="b{}",
-            rescale_sites=True,
-        )
+        return self._partial_trace_to_mpo()
 
-    def to_mpo(self, *, normalized=True):
-        """Trace out ancillas and return the thermal operator as an MPO."""
-        rho = self.raw_mpo
+    def _partial_trace_to_mpo(self, contract_opts=None):
+        """Trace ancillas with Quimb's native tag-wise MPO construction."""
+        if contract_opts is None:
+            return self.mps.partial_trace_to_mpo(
+                keep=self.physical_sites,
+                upper_ind_id="b{}",
+                rescale_sites=True,
+            )
+        if not isinstance(contract_opts, Mapping):
+            raise TypeError("contract_opts must be a mapping or None.")
+        contract_opts = dict(contract_opts)
+        forbidden = {
+            "tags",
+            "which",
+            "output_inds",
+            "get",
+            "backend",
+            "strip_exponent",
+            "equalize_norms",
+            "preserve_tensor",
+            "inplace",
+        }
+        overlap = forbidden.intersection(contract_opts)
+        if overlap:
+            raise TypeError(
+                "contract_opts cannot override the internal tag-trace contract: "
+                + ", ".join(sorted(overlap))
+            )
+
+        mps = self.mps
+        keep = tuple(sorted(self.physical_sites))
+        p_bra = mps.copy()
+        p_bra.reindex_sites_("b{}", where=keep)
+        rho = mps.H & p_bra
+
+        for site in mps.gen_sites_present():
+            tag = mps.site_tag(site)
+            if site in keep:
+                rho.contract_tags(tag, inplace=True, **contract_opts)
+            else:
+                next_site = site + 1 if site < mps.L - 1 else max(keep)
+                rho.contract_cumulative(
+                    (tag, mps.site_tag(next_site)),
+                    inplace=True,
+                    **contract_opts,
+                )
+                rho.drop_tags(tag)
+
+        retag = {}
+        reind = {}
+        for new, old in enumerate(keep):
+            retag[mps.site_tag(old)] = mps.site_tag(new)
+            reind[mps.site_ind(old)] = mps.site_ind(new)
+            reind[f"b{old}"] = f"b{new}"
+        rho.retag_(retag)
+        rho.reindex_(reind)
+        rho.view_as_(
+            qtn.MatrixProductOperator,
+            cyclic=mps.cyclic,
+            L=len(keep),
+            site_tag_id=mps.site_tag_id,
+            lower_ind_id="b{}",
+            upper_ind_id=mps.site_ind_id,
+        )
+        rho.fuse_multibonds_()
+        return rho
+
+    def to_mpo(self, *, normalized=True, contract_opts=None):
+        """Trace out ancillas and return the thermal operator as an MPO.
+
+        By default this calls Quimb's native ``partial_trace_to_mpo``. If
+        ``contract_opts`` is supplied, the same tag-wise reduction is used
+        with those options forwarded to Quimb's ``contract_tags`` and
+        ``contract_cumulative`` calls. This allows an explicit contraction
+        optimizer without ever densifying the full purification.
+        """
+        rho = self._partial_trace_to_mpo(contract_opts)
         if not normalized:
             return rho
         trace = rho.trace()
@@ -504,17 +575,24 @@ class GibbsMps:
 
     density_mpo = to_mpo
 
-    def to_dense(self, *, normalized=True, **contract_opts):
-        """Return the ancilla-traced thermal operator as a dense matrix."""
-        return self.to_mpo(normalized=normalized).to_dense(**contract_opts)
+    def to_dense(self, *, normalized=True, trace_contract_opts=None, **contract_opts):
+        """Return the ancilla-traced thermal operator as a dense matrix.
 
-    def trace(self):
+        ``trace_contract_opts`` controls the preceding MPO trace; the other
+        keyword arguments are passed to the final MPO-to-dense contraction.
+        """
+        return self.to_mpo(
+            normalized=normalized,
+            contract_opts=trace_contract_opts,
+        ).to_dense(**contract_opts)
+
+    def trace(self, *, contract_opts=None):
         """Return the trace of the raw ancilla-traced operator."""
-        return self.raw_mpo.trace()
+        return self._partial_trace_to_mpo(contract_opts).trace()
 
-    def partition_function(self):
+    def partition_function(self, *, contract_opts=None):
         """Return ``Z = Tr(exp(-beta H))`` represented by the purification."""
-        trace = self.trace()
+        trace = self.trace(contract_opts=contract_opts)
         if self.normalized:
             return ar.do("multiply", trace, self.phys_dim ** self.length)
         return trace

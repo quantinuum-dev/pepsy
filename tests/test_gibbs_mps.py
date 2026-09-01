@@ -40,6 +40,24 @@ def test_gibbs_mps_uses_interleaved_bell_pairs_and_traces_ancillas():
     assert state.partition_function() == pytest.approx(4.0)
 
 
+def test_gibbs_mps_trace_options_keep_the_quimb_mpo_path():
+    """Explicit Quimb contraction options do not densify the purification."""
+    state = GibbsMps([(("ZZ", 0.3), (0, 1))], shape=2)
+    state.prepare(0.2, n_steps=2, cutoff=0.0)
+
+    native = state.raw_mpo
+    configured = state.to_mpo(
+        normalized=False,
+        contract_opts={"optimize": "greedy"},
+    )
+    np.testing.assert_allclose(
+        np.asarray(configured.to_dense()),
+        np.asarray(native.to_dense()),
+        atol=1.0e-12,
+    )
+    assert configured.L == state.length
+
+
 def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
     """Second-order imaginary-time replay converges to the exact Gibbs state."""
     terms = [
