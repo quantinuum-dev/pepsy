@@ -6,6 +6,41 @@ family. It is separate from the SciPost higher-order/history construction in
 connected support, while higher-order `order` controls virtual history/Taylor
 construction.
 
+## Term-centric facade
+
+`exp_mpo_cluster(...)` is the one-shot facade for the cluster family. It uses
+the same term spellings, `shape`/`mapper` handling, coefficient parameters,
+`dt` compatibility keyword, backend conversion, semantic return, reports, and
+final `chi` compression controls as `exp_mpo`, while adding explicit
+`cluster_size` and `graph` arguments:
+
+```python
+from pepsy.operators import ClusterLattice, exp_mpo_cluster
+
+graph = ClusterLattice.square(4, 4)
+
+U = exp_mpo_cluster(
+    [{"operator": "ZZ", "location": ((0, 0), (1, 0)), "coefficient": 0.7}],
+    -1j * 0.01,
+    shape=(4, 4),
+    cluster_size=3,
+    graph=graph,
+)
+```
+
+Without `graph`, the facade selects connected chain intervals. With `graph`,
+the supplied graph is mapped through the lattice-to-chain ordering and
+`cluster_size` counts graph sites. `return_semantic=True` returns the
+cluster-produced `FirstDegreeMPO`; the default returns a Quimb MPO. `max_bond`
+caps each analytical residual factorization, while `chi` is an optional final
+numerical MPO compression. `to_backend` is applied to local operators, the
+step, resolved coefficients, intermediate tensor contractions, and the final
+Quimb tensor boundary.
+
+The history-only keywords `order`, `mode`, `history_storage`, and
+`extension_budget` are deliberately not accepted here. They have no safe
+translation to spatial cluster size and remain part of `exp_mpo` only.
+
 ## Single-factor cluster expansion
 
 ```python

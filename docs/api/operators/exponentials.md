@@ -54,6 +54,7 @@ The semantic result records `requested_mode`, `mode`,
 | One parameterized 1D Hamiltonian | `MPOBasis.from_pauli_terms(...)` or `MPOBasis.from_local_terms(...)` | Reusable `MPOBasis` |
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
+| One-shot connected-cluster MPO | `exp_mpo_cluster(terms, step, ...)` | Quimb MPO or semantic cluster MPO |
 | Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
 | Product of two existing MPOs | `compress_mpo_product(A, B, ...)` | Lazy `A @ B`, then one ordinary compressed MPO |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |

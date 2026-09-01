@@ -120,6 +120,7 @@ _MPO_CLUSTER_EXPORTS = [
     "MPOGraphClusterProductExpansion",
     "CompiledMPOClusterProduct",
     "compress_mpo_product",
+    "exp_mpo_cluster",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_product" for name in _MPO_CLUSTER_EXPORTS})
 _MPO_CLUSTER_COMPATIBILITY_EXPORTS = [

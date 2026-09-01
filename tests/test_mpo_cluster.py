@@ -13,6 +13,7 @@ from pepsy.operators import (
     MPOGraphClusterBasisExpansion,
     MPOParameter,
     MPOProductTerm,
+    exp_mpo_cluster,
 )
 
 
@@ -345,3 +346,134 @@ def test_three_ordered_factors_keep_jax_autodiff_graph_finite():
 
     gradients = jax.grad(loss)(jnp.array([0.2, -0.3, 0.4, 0.01]))
     assert np.all(np.isfinite(np.asarray(gradients)))
+
+
+def test_exp_mpo_cluster_matches_term_centric_exp_mpo_surface():
+    """The cluster facade parses compact terms and returns a Quimb MPO."""
+    x, z = _paulis()
+    result, report = exp_mpo_cluster(
+        [((0, 1), "XX", 1.0), ((1, 2), "ZZ", -0.2)],
+        0.03,
+        shape=3,
+        cluster_size=3,
+        cutoff=0.0,
+        return_report=True,
+    )
+    hamiltonian = _kron_all((x, x, np.eye(2))) - 0.2 * _kron_all(
+        (np.eye(2), z, z)
+    )
+    np.testing.assert_allclose(
+        result.to_dense(),
+        scipy_linalg.expm(0.03 * hamiltonian),
+        atol=1.0e-12,
+    )
+    assert report.cluster_size == 3
+    assert result.pepsy_cluster_report is report
+    assert result.pepsy_cluster_metadata["cluster_mode"] == "interval"
+
+
+def test_exp_mpo_cluster_preserves_requested_backend_and_coefficients():
+    """The term facade applies ``to_backend`` before local cluster work."""
+    torch = pytest.importorskip("torch")
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    converted = []
+
+    def to_backend(value):
+        converted.append(value)
+        return torch.as_tensor(value, dtype=torch.float64)
+
+    semantic = exp_mpo_cluster(
+        [((0, 1), (x, x), coefficient)],
+        step,
+        shape=3,
+        cluster_size=2,
+        cutoff=0.0,
+        to_backend=to_backend,
+        return_semantic=True,
+    )
+    assert all(isinstance(array, torch.Tensor) for array in semantic.arrays)
+    assert all(
+        isinstance(tensor.data, torch.Tensor)
+        for tensor in semantic.to_mpo().tensors
+    )
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+    exp_mpo_cluster(
+        [((0, 1), (x, x), 0.7)],
+        0.01,
+        shape=3,
+        cluster_size=2,
+        cutoff=0.0,
+        to_backend=to_backend,
+        return_semantic=True,
+    )
+    assert any(np.ndim(value) == 0 for value in converted)
+
+
+def test_exp_mpo_cluster_maps_coordinate_graphs_and_supports_ordered_factors():
+    """The high-level facade maps graph coordinates before MPO assembly."""
+    x, z = _paulis()
+    graph = ClusterLattice.from_edges(
+        ((0, 0), (0, 1), (1, 0), (1, 1)),
+        [
+            ((0, 0), (0, 1)),
+            ((0, 0), (1, 0)),
+            ((0, 1), (1, 1)),
+            ((1, 0), (1, 1)),
+            ((0, 0), (1, 1)),
+        ],
+    )
+    result = exp_mpo_cluster(
+        step=0.05,
+        shape=(2, 2),
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        factors=[
+            [
+                {
+                    "operator": "XX",
+                    "location": ((0, 0), (1, 1)),
+                    "coefficient": 0.2,
+                }
+            ],
+            [
+                {
+                    "operator": "ZZ",
+                    "location": ((0, 0), (1, 1)),
+                    "coefficient": -0.3,
+                }
+            ],
+        ],
+    )
+    mapping = MPOBasis.from_square_lattice(
+        2,
+        2,
+        [{"locations": ((0, 0), (1, 1)), "paulis": "XX"}],
+    ).lattice_to_chain
+    xx = _kron_all((x, np.eye(2), x, np.eye(2)))
+    zz = _kron_all((z, np.eye(2), z, np.eye(2)))
+    expected = scipy_linalg.expm(0.01 * xx) @ scipy_linalg.expm(-0.015 * zz)
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-11)
+    assert result.pepsy_cluster_metadata["cluster_mode"] == "graph"
+    assert result.pepsy_cluster_metadata["factor_count"] == 2
+    assert mapping[(1, 1)] == 2
+
+
+def test_interval_cluster_expansion_keeps_explicit_string_operators():
+    """Term-centric cluster construction retains fermionic gap operators."""
+    x, z = _paulis()
+    term = MPOProductTerm((0, 2), (x, x), string_operators=(z,))
+    result = exp_mpo_cluster(
+        [term],
+        0.1,
+        shape=3,
+        cluster_size=3,
+        cutoff=0.0,
+    )
+    expected = scipy_linalg.expm(0.1 * _kron_all((x, z, x)))
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)

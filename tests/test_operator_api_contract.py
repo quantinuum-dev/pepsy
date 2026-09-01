@@ -21,6 +21,7 @@ _CANONICAL_OWNERS = {
     "MPOClusterProductExpansion": ".mpo_product",
     "MPOGraphClusterProductExpansion": ".mpo_product",
     "CompiledMPOClusterProduct": ".mpo_product",
+    "exp_mpo_cluster": ".mpo_product",
     "ActivePEPOBlocks": ".pepo_cluster",
     "GraphActivePEPOBlocks": ".pepo_cluster",
     "PauliPEPOBasis": ".pepo_cluster",

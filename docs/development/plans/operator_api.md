@@ -18,7 +18,7 @@ different abstraction levels:
 | Family | Current implementation | What it means |
 | --- | --- | --- |
 | Higher-order MPO exponential | `MPOBasis`, `FirstDegreeMPO`, `CompiledMPOExp` in `operators.mpo_higher_order` | Approximate `exp(step * H)` using virtual history and Taylor/order controls |
-| MPO local cluster expansion | `MPOClusterProductExpansion` and `MPOGraphClusterProductExpansion` in `operators.mpo_product` | Build connected spatial/graph residuals and assemble them as an MPO |
+| MPO local cluster expansion | `exp_mpo_cluster`, `MPOClusterProductExpansion`, and `MPOGraphClusterProductExpansion` in `operators.mpo_product` | Build connected spatial/graph residuals and assemble them as an MPO |
 | Fixed-channel PEPO exponential | `PauliPEPOBasis`, `CompiledPEPOExp` in `operators.pepo_cluster` | Differentiable square-lattice PEPO with value-independent Pauli channels |
 | Dense PEPO cluster expansion | `ClusterExpansionPlan` and graph plans in `operators.pepo_cluster` | Factor local connected residuals for a finite model or graph |
 | Ordered PEPO products | `PEPOClusterProductExpansion` in `operators.pepo_cluster` | Jointly construct `exp(A) @ exp(B) @ exp(C) @ ...` |

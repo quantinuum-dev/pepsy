@@ -20,7 +20,7 @@ Hilbert space dimension.  The result is an ordinary finite open
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 import autoray as ar
@@ -38,6 +38,8 @@ from .mpo_semantic import (
     _multiply_scalar,
     _resolve_compression_cutoff,
     _resolve_compression_cutoff_mode,
+    _resolve_exp_step,
+    _normalize_exp_compress_opts,
     _ensure_pepsy_mpo_boundary,
     _native_sector_summary,
     _normalize_sector_aware_request,
@@ -61,6 +63,7 @@ __all__ = [
     "ClusterExpBasis",
     "MPOClusterExpansion",
     "compress_mpo_product",
+    "exp_mpo_cluster",
 ]
 
 
@@ -598,16 +601,32 @@ def _matrix_exponential(matrix):
     return expm(np.asarray(matrix))
 
 
-def _resolve(value, parameters):
+def _resolve(value, parameters, to_backend=None):
     if isinstance(value, MPOParameter):
         if parameters is None:
             raise ValueError(
                 "parameters are required to resolve an MPOParameter in a "
                 "cluster expansion."
             )
-        return value.resolve(parameters)
+        value = value.resolve(parameters)
     if callable(value):
-        return value(parameters)
+        value = value(parameters)
+    if (
+        to_backend is not None
+        and _backend_name(value) in {"builtins", "numpy"}
+    ):
+        value = to_backend(value)
+    return value
+
+
+def _cluster_to_backend(value, to_backend):
+    """Convert a host scalar at the cluster backend boundary."""
+
+    if (
+        to_backend is not None
+        and _backend_name(value) in {"builtins", "numpy"}
+    ):
+        return to_backend(value)
     return value
 
 
@@ -801,6 +820,37 @@ def _operator_schmidt(operator, nsites, phys_dim, cutoff, max_bond=None):
             carry,
             (left_rank * phys_dim * phys_dim, remaining),
         )
+        if (
+            _backend_name(operator) == "jax"
+            and max_bond is None
+            and cutoff in (None, 0.0)
+        ):
+            # A no-truncation JAX path does not need singular vectors. Use an
+            # exact identity factorization on the smaller side of the split;
+            # unlike the stabilized SVD this introduces no perturbation into
+            # the represented operator while preserving autodiff.
+            rows, columns = int(matrix.shape[0]), int(matrix.shape[1])
+            if rows <= columns:
+                rank = rows
+                u = _identity(rank, like=matrix)
+                carry = matrix
+            else:
+                rank = columns
+                u = matrix
+                carry = _identity(rank, like=matrix)
+            core = ar.do(
+                "reshape",
+                u,
+                (left_rank, phys_dim, phys_dim, rank),
+            )
+            cores.append(ar.do("transpose", core, (0, 3, 1, 2)))
+            carry = ar.do(
+                "reshape",
+                carry,
+                (rank, *([local_size] * (nsites - site - 1))),
+            )
+            left_rank = rank
+            continue
         if _backend_name(operator) == "jax":
             u, vh = _jax_stable_factorization(matrix)
             rank = int(u.shape[1])
@@ -945,9 +995,12 @@ class MPOClusterProductExpansion:
         cutoff=1.0e-12,
         max_bond=None,
         graph=None,
+        to_backend=None,
     ):
         if not isinstance(L, Integral) or isinstance(L, bool) or int(L) < 1:
             raise ValueError("L must be a positive integer.")
+        if to_backend is not None and not callable(to_backend):
+            raise TypeError("to_backend must be callable or None.")
         self.L = int(L)
         if not isinstance(cluster_size, Integral) or isinstance(cluster_size, bool):
             raise TypeError("cluster_size must be a positive integer.")
@@ -966,6 +1019,7 @@ class MPOClusterProductExpansion:
                 raise ValueError("max_bond must be a positive integer or None.")
             max_bond = int(max_bond)
         self.max_bond = max_bond
+        self.to_backend = to_backend
         self.graph = None if graph is None else _graph_lattice_from_input(graph, self.L)
         self.cluster_mode = "graph" if self.graph is not None else "interval"
         self.factors = tuple(self._normalize_factor(factor) for factor in factors)
@@ -987,6 +1041,20 @@ class MPOClusterProductExpansion:
             for term in factor.terms:
                 if any(site < 0 or site >= self.L for site in term.sites):
                     raise ValueError("a cluster term site is outside the chain.")
+                if (
+                    isinstance(term, MPOProductTerm)
+                    and term.string_operators is not None
+                ):
+                    gap_count = sum(
+                        right - left - 1
+                        for left, right in zip(term.sites, term.sites[1:])
+                    )
+                    if len(term.string_operators) != gap_count:
+                        raise ValueError(
+                            "string_operators must have one operator for each "
+                            f"gap, got {len(term.string_operators)} for "
+                            f"{gap_count} gaps."
+                        )
                 term_dim = (
                     term.phys_dim
                     if isinstance(term, MPOLocalOperatorTerm)
@@ -1246,10 +1314,21 @@ class MPOClusterProductExpansion:
         reference = None
         if isinstance(term, MPOProductTerm):
             factors = {site: operator for site, operator in zip(term.sites, term.operators)}
-            reference = term.operators[0]
+            string_factors = {}
+            if term.string_operators is not None:
+                string_index = 0
+                for left, right in zip(term.sites, term.sites[1:]):
+                    for gap_site in range(left + 1, right):
+                        string_factors[gap_site] = term.string_operators[string_index]
+                        string_index += 1
+            reference = _backend_reference(
+                (*term.operators, *(term.string_operators or ()))
+            )
             matrices = []
             for site in sites:
                 operator = factors.get(site)
+                if operator is None:
+                    operator = string_factors.get(site)
                 if operator is None:
                     operator = np.eye(self.phys_dim)
                 matrices.append(operator)
@@ -1373,9 +1452,12 @@ class MPOClusterProductExpansion:
         for index in active:
             factor = self.factors[index]
             terms = interval_factors[index]
-            references.append(_resolve(factor.coefficient, parameters))
+            references.append(
+                _resolve(factor.coefficient, parameters, self.to_backend)
+            )
             references.extend(
-                _resolve(term.coefficient, parameters) for term in terms
+                _resolve(term.coefficient, parameters, self.to_backend)
+                for term in terms
             )
             references.extend(
                 term.operator if isinstance(term, MPOLocalOperatorTerm)
@@ -1395,10 +1477,13 @@ class MPOClusterProductExpansion:
                 generator = ar.do(
                     "add",
                     generator,
-                    _multiply_scalar(_resolve(term.coefficient, parameters), local),
+                    _multiply_scalar(
+                        _resolve(term.coefficient, parameters, self.to_backend),
+                        local,
+                    ),
                 )
             exponent = _multiply_scalar(
-                _resolve(factor.coefficient, parameters),
+                _resolve(factor.coefficient, parameters, self.to_backend),
                 _multiply_scalar(step, generator),
             )
             local_exponentials.append(_matrix_exponential(exponent))
@@ -1421,8 +1506,13 @@ class MPOClusterProductExpansion:
         for index in active:
             factor = self.factors[index]
             terms = factor_terms[index]
-            references.append(_resolve(factor.coefficient, parameters))
-            references.extend(_resolve(term.coefficient, parameters) for term in terms)
+            references.append(
+                _resolve(factor.coefficient, parameters, self.to_backend)
+            )
+            references.extend(
+                _resolve(term.coefficient, parameters, self.to_backend)
+                for term in terms
+            )
             references.extend(
                 term.operator if isinstance(term, MPOLocalOperatorTerm)
                 else term.operators[0]
@@ -1441,10 +1531,13 @@ class MPOClusterProductExpansion:
                 generator = ar.do(
                     "add",
                     generator,
-                    _multiply_scalar(_resolve(term.coefficient, parameters), local),
+                    _multiply_scalar(
+                        _resolve(term.coefficient, parameters, self.to_backend),
+                        local,
+                    ),
                 )
             exponent = _multiply_scalar(
-                _resolve(factor.coefficient, parameters),
+                _resolve(factor.coefficient, parameters, self.to_backend),
                 _multiply_scalar(step, generator),
             )
             local_exponentials.append(_matrix_exponential(exponent))
@@ -1901,6 +1994,7 @@ class MPOClusterProductExpansion:
         """Build the cluster expansion for the supplied exponential step."""
 
         self._build_count += 1
+        step = _cluster_to_backend(step, self.to_backend)
         residuals = self._residuals(step, parameters)
         if self.graph is None:
             arrays, state_lists, cores = self._assemble(residuals)
@@ -1969,3 +2063,452 @@ ClusterBasisExpansion = MPOClusterProductExpansion
 ClusterExpansionBasis = MPOClusterProductExpansion
 ClusterExpBasis = MPOClusterProductExpansion
 MPOClusterExpansion = MPOClusterProductExpansion
+
+
+def _cluster_factor_from_source(
+    source,
+    *,
+    shape,
+    mapper,
+    map_mode,
+    phys_dim,
+    to_backend,
+):
+    """Normalize one term-centric ordered-product factor."""
+
+    from .mpo_basis import (  # pylint: disable=import-outside-toplevel
+        MPOBasis,
+        _convert_term_to_backend,
+    )
+
+    if isinstance(source, MPOClusterFactor):
+        if to_backend is None:
+            return source, None
+        return (
+            MPOClusterFactor(
+                tuple(
+                    _convert_term_to_backend(term, to_backend)
+                    for term in source.terms
+                ),
+                coefficient=source.coefficient,
+            ),
+            None,
+        )
+
+    if isinstance(source, MPOBasis):
+        if to_backend is not None:
+            return (
+                MPOClusterFactor(
+                    tuple(
+                        _convert_term_to_backend(term, to_backend)
+                        for term in source.terms
+                    )
+                ),
+                source,
+            )
+        return MPOClusterFactor.from_mpo_basis(source), source
+
+    factor_coefficient = 1.0
+    if isinstance(source, Mapping):
+        terms = source.get("terms")
+        if terms is None:
+            raise ValueError(
+                "cluster factor mappings require a 'terms' entry."
+            )
+        factor_coefficient = source.get("coefficient", 1.0)
+    else:
+        terms = source
+
+    basis = MPOBasis.from_terms(
+        terms,
+        shape=shape,
+        mapper=mapper,
+        map_mode=map_mode,
+        phys_dim=phys_dim,
+        to_backend=to_backend,
+    )
+    return (
+        MPOClusterFactor.from_mpo_basis(
+            basis,
+            coefficient=factor_coefficient,
+        ),
+        basis,
+    )
+
+
+def _cluster_factor_reference(factors):
+    """Return one local operator for dtype-aware cutoff resolution."""
+
+    for factor in factors:
+        for term in factor.terms:
+            if isinstance(term, MPOLocalOperatorTerm):
+                return term.operator
+            return term.operators[0]
+    return None
+
+
+def exp_mpo_cluster(
+    terms=None,
+    step=None,
+    *,
+    shape=None,
+    mapper=None,
+    map_mode="snake",
+    parameters=None,
+    coefficients=None,
+    dt=None,
+    phys_dim=None,
+    cluster_size=2,
+    graph=None,
+    factors=None,
+    max_bond=None,
+    cutoff=1.0e-12,
+    chi=None,
+    cutoff_mode="rel",
+    compression=None,
+    differentiable=False,
+    sector_aware="auto",
+    symmetry=None,
+    physical_charges=None,
+    fermionic=False,
+    physical_space=None,
+    to_backend=None,
+    return_semantic=False,
+    return_report=False,
+    form=None,
+    create_bond=False,
+    compress_opts=None,
+    progress=False,
+):
+    """Build a term-centric connected-cluster MPO.
+
+    This is the cluster-family counterpart to :func:`exp_mpo`. The shared
+    term parser handles chain and regular-lattice locations, coefficient
+    parameters, custom one-dimensional maps, and backend conversion. The
+    cluster-specific ``cluster_size`` counts connected spatial sites; when
+    ``graph`` is supplied it is a graph-site cutoff rather than a chain-span
+    cutoff.
+
+    Parameters
+    ----------
+    terms : iterable or mapping, optional
+        One local Hamiltonian factor in the same forms accepted by
+        :func:`exp_mpo`. Required unless ``factors`` is supplied.
+    step, dt : scalar, optional
+        The scalar in ``exp(step * H)``. ``dt`` is the compatibility spelling
+        used by the rest of the MPO API; pass only one of them.
+    shape, mapper, map_mode, parameters, coefficients, phys_dim : optional
+        Shared term-centric parsing and coefficient controls. ``coefficients``
+        is mutually exclusive with ``parameters`` and overrides the parsed
+        term coefficient slots, matching :func:`exp_mpo`.
+    cluster_size : int, default=2
+        Largest connected interval or graph cluster retained.
+    graph : optional
+        A :class:`ClusterLattice`, ``(sites, edges)`` pair, or mapping. For
+        coordinate-labelled graphs, supply ``shape`` or a lattice-aware
+        basis through the term parser so coordinates can be mapped to the MPO
+        chain. Omitting ``graph`` selects the ordinary chain-interval path.
+    factors : iterable, optional
+        Ordered factors for ``exp(A) @ exp(B) @ ...``. Each factor may be an
+        ``MPOClusterFactor``, an ``MPOBasis``, a term iterable, or a mapping
+        with ``terms`` and optional factor ``coefficient``. When supplied,
+        ``terms`` and ``coefficients`` must be omitted.
+    max_bond, cutoff : optional
+        Analytical local operator-Schmidt controls. ``max_bond`` caps each
+        residual factorization; it is not the final MPO bond cap. ``cutoff``
+        is a relative local singular-value cutoff. ``"auto"`` is resolved
+        from the local operator dtype.
+    chi, cutoff_mode, compression, differentiable, sector_aware, form,
+    create_bond, compress_opts : optional
+        Optional final numerical MPO compression, using the same semantic
+        boundary as :func:`exp_mpo`. ``chi`` is separate from ``max_bond``.
+        With ``return_semantic=True``, use ``compression="fixed_rank"`` or
+        ``differentiable=True`` to retain a semantic result.
+    symmetry, physical_charges, fermionic, physical_space : optional
+        Native Symmray and graded history metadata are intentionally rejected
+        here. The analytical cluster assembler currently produces ordinary
+        dense-backend MPO blocks; use the higher-order ``exp_mpo`` path for
+        native block-sparse history construction.
+    to_backend : callable, optional
+        Converter applied to parsed local operators, the exponential step,
+        and resolved scalar coefficients before local exponentials, residual
+        SVDs, MPO assembly, and the final Quimb boundary. Torch/JAX autodiff
+        values therefore remain on the requested backend.
+    return_semantic : bool, default=False
+        Return the semantic :class:`FirstDegreeMPO`; otherwise return a
+        Quimb MPO, matching :func:`exp_mpo`.
+    return_report : bool, default=False
+        Return ``(result, cluster_report)``. If final ``chi`` compression is
+        requested, its numerical report is attached to the result while the
+        returned report remains the analytical cluster report.
+    progress : bool, default=False
+        Show one construction stage and, when requested, one compression
+        stage.
+
+    Notes
+    -----
+    ``order``, ``mode``, ``history_storage``, and ``extension_budget`` are not
+    accepted because they belong to the separate higher-order MPO history
+    family. Here ``cluster_size`` is the spatial expansion control.
+    """
+
+    if not isinstance(progress, bool):
+        raise TypeError("progress must be a boolean.")
+    if symmetry is not None or physical_charges is not None or fermionic:
+        raise NotImplementedError(
+            "native symmetry and graded MPO metadata are not currently "
+            "supported by exp_mpo_cluster; use exp_mpo for that path."
+        )
+    if physical_space is not None:
+        raise NotImplementedError(
+            "physical_space is not currently supported by exp_mpo_cluster."
+        )
+    if not isinstance(differentiable, bool):
+        raise TypeError("differentiable must be a boolean.")
+    sector_aware = _normalize_sector_aware_request(sector_aware)
+    step = _resolve_exp_step(step, dt)
+    step = _cluster_to_backend(step, to_backend)
+
+    from .mpo_basis import (  # pylint: disable=import-outside-toplevel
+        MPOBasis,
+        _apply_to_backend,
+    )
+
+    if factors is not None and terms is not None:
+        raise ValueError("pass either terms or factors, not both.")
+    if factors is not None and coefficients is not None:
+        raise ValueError(
+            "coefficients are only supported for the single-factor terms "
+            "interface; put coefficients in each factor's terms instead."
+        )
+
+    reference_basis = None
+    if factors is None:
+        if terms is None:
+            raise TypeError("exp_mpo_cluster requires terms or factors.")
+        basis = MPOBasis.from_terms(
+            terms,
+            shape=shape,
+            mapper=mapper,
+            map_mode=map_mode,
+            phys_dim=phys_dim,
+            to_backend=to_backend,
+        )
+        reference_basis = basis
+        if coefficients is None:
+            cluster_factors = (
+                MPOClusterFactor.from_mpo_basis(basis),
+            )
+        else:
+            values = basis._coefficient_values(  # pylint: disable=protected-access
+                parameters,
+                coefficients,
+            )
+            cluster_factors = (
+                MPOClusterFactor(
+                    tuple(
+                        replace(term, coefficient=value)
+                        for term, value in zip(basis.terms, values)
+                    )
+                ),
+            )
+            parameters = None
+    else:
+        if isinstance(factors, (MPOClusterFactor, MPOBasis, Mapping)):
+            factor_sources = (factors,)
+        else:
+            factor_sources = tuple(factors)
+        if not factor_sources:
+            raise ValueError("factors must contain at least one factor.")
+        cluster_factors = []
+        for source in factor_sources:
+            factor, basis = _cluster_factor_from_source(
+                source,
+                shape=shape,
+                mapper=mapper,
+                map_mode=map_mode,
+                phys_dim=phys_dim,
+                to_backend=to_backend,
+            )
+            cluster_factors.append(factor)
+            if reference_basis is None and basis is not None:
+                reference_basis = basis
+        cluster_factors = tuple(cluster_factors)
+
+    reference = _cluster_factor_reference(cluster_factors)
+    if isinstance(cutoff, str):
+        local_cutoff = _resolve_compression_cutoff(cutoff, reference)
+    else:
+        local_cutoff = cutoff
+
+    if reference_basis is not None:
+        length = reference_basis.L
+        if shape is not None and isinstance(shape, Integral) and int(shape) != length:
+            raise ValueError(
+                f"shape={shape} does not match the parsed MPO length {length}."
+            )
+    else:
+        if shape is not None:
+            if not isinstance(shape, Integral) or isinstance(shape, bool):
+                raise ValueError(
+                    "shape must be an integer chain length when factors do not "
+                    "contain a term-centric MPOBasis."
+                )
+            length = int(shape)
+        else:
+            length = max(
+                site
+                for factor in cluster_factors
+                for term in factor.terms
+                for site in term.sites
+            ) + 1
+
+    if graph is None:
+        expansion = MPOClusterProductExpansion.from_factors(
+            length,
+            cluster_factors,
+            phys_dim=phys_dim,
+            cluster_size=cluster_size,
+            cutoff=local_cutoff,
+            max_bond=max_bond,
+            to_backend=to_backend,
+        )
+    else:
+        if reference_basis is None:
+            normalized_graph = _graph_lattice_from_input(graph, length)
+        else:
+            normalized_graph = _graph_lattice_for_basis(graph, reference_basis)
+        expansion = MPOGraphClusterProductExpansion.from_factors(
+            length,
+            cluster_factors,
+            graph=normalized_graph,
+            phys_dim=phys_dim,
+            cluster_size=cluster_size,
+            cutoff=local_cutoff,
+            max_bond=max_bond,
+            to_backend=to_backend,
+        )
+
+    if chi is not None:
+        if not isinstance(chi, Integral) or isinstance(chi, bool) or int(chi) < 1:
+            raise ValueError("chi must be a positive integer or None.")
+        chi = int(chi)
+    compression_options = _normalize_exp_compress_opts(
+        compress_opts,
+        form=form,
+        create_bond=create_bond,
+    )
+    if chi is None and (
+        compression is not None
+        or differentiable
+        or compression_options
+        or sector_aware is True
+    ):
+        raise ValueError(
+            "compression options require chi; omit them for an uncompressed MPO."
+        )
+    if return_semantic and chi is not None and not differentiable and compression != "fixed_rank":
+        raise ValueError(
+            "return_semantic=True with chi requires compression='fixed_rank' "
+            "or differentiable=True; numerical Quimb compression returns an "
+            "ordinary MPO."
+        )
+
+    progress_bar = None
+    timings = {}
+    import time  # pylint: disable=import-outside-toplevel
+
+    construction_start = time.perf_counter()
+    if progress:
+        from tqdm.auto import tqdm  # pylint: disable=import-outside-toplevel
+
+        progress_bar = tqdm(
+            total=2 if chi is not None else 1,
+            desc="exp_mpo_cluster",
+            unit="stage",
+            leave=True,
+            dynamic_ncols=True,
+        )
+    try:
+        stage_start = time.perf_counter()
+        semantic = expansion.exp(step, parameters=parameters)
+        timings["cluster"] = time.perf_counter() - stage_start
+        cluster_report = expansion.last_report
+        if progress_bar is not None:
+            progress_bar.set_description("exp_mpo_cluster | cluster")
+            progress_bar.update(1)
+
+        numerical_report = None
+        if chi is not None:
+            stage_start = time.perf_counter()
+            numerical_cutoff = 0.0 if cutoff is None else cutoff
+            compressed = semantic.compress_to_bond(
+                chi,
+                cutoff=numerical_cutoff,
+                cutoff_mode=cutoff_mode,
+                compression=compression,
+                differentiable=differentiable,
+                return_report=True,
+                sector_aware=sector_aware,
+                **compression_options,
+            )
+            result, numerical_report = compressed
+            timings["chi_compression"] = time.perf_counter() - stage_start
+            if progress_bar is not None:
+                progress_bar.set_description(
+                    f"exp_mpo_cluster | chi-compress (chi={chi})"
+                )
+                progress_bar.update(1)
+        else:
+            result = semantic
+
+        result_metadata = getattr(result, "metadata", None)
+        if isinstance(result_metadata, dict):
+            result_metadata["exp_mpo_cluster"] = True
+            result_metadata["cluster_report"] = cluster_report
+            result_metadata["cluster_mode"] = expansion.cluster_mode
+            result_metadata["graph_requested"] = graph is not None
+            if numerical_report is not None:
+                result_metadata["numerical_compression_report"] = numerical_report
+            if progress:
+                result_metadata["progress"] = True
+                result_metadata["timings"] = dict(timings)
+                result_metadata["order_seconds"] = (
+                    time.perf_counter() - construction_start
+                )
+
+        if return_semantic:
+            output = result
+        elif hasattr(result, "to_mpo"):
+            output = result.to_mpo()
+        else:
+            output = result
+        _apply_to_backend(output, to_backend)
+        output.pepsy_cluster_report = cluster_report
+        cluster_metadata = {
+            "cluster_mode": expansion.cluster_mode,
+            "graph_requested": graph is not None,
+            "cluster_size": expansion.cluster_size,
+            "factor_count": len(expansion.factors),
+            "cutoff": expansion.cutoff,
+            "max_bond": expansion.max_bond,
+            "chi": chi,
+            "compression": (
+                None
+                if chi is None
+                else compression or ("fixed_rank" if differentiable else "quimb")
+            ),
+            "differentiable": bool(differentiable),
+            "numerical_compression_report": numerical_report,
+        }
+        if progress:
+            cluster_metadata["progress"] = True
+            cluster_metadata["timings"] = dict(timings)
+            cluster_metadata["order_seconds"] = (
+                time.perf_counter() - construction_start
+            )
+        output.pepsy_cluster_metadata = cluster_metadata
+        return (output, cluster_report) if return_report else output
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
