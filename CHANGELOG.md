@@ -139,6 +139,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Fixed backend preservation through higher-order sparse history materialization.
+  Empty sparse virtual tensors now retain a backend reference, backend-native
+  zero/equality operations no longer silently fall back to NumPy, and the
+  `to_backend=` contract is covered through Torch/JAX semantic and final MPO
+  boundaries for all canonical history modes.
+
 - Fixed the native Symmray MPO dense-conversion boundary. Pepsy now supplies
   the original physical basis-to-charge maps when Quimb contracts fused native
   sectors, so `to_mpo().to_dense()` and the result of native sector-aware

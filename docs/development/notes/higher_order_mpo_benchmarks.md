@@ -118,3 +118,31 @@ Focused validation includes interior one-/two-site native terms, higher-order
 native histories, and the post-compression native output. The direct dense
 and native outputs now agree in computational-basis order, while the MPO
 tensors remain native Symmray arrays before explicit dense conversion.
+
+## 2026-09-01 backend execution audit
+
+The active environment reports Quimb `1.15.1.dev39+g369d09b9d`, Autoray
+`0.11.1.dev1+gc56f64427`, Cotengra `0.8.3.dev6+g08fe1a3a1`, and Symmray
+`0.3.2.dev6+ga17699db6`. Autoray's `ar.do(..., like=...)`, `ar.to(...)`,
+`ar.infer_backend(...)`, and registered `array`/`zeros`/`stack`/`tensordot`/
+`linalg` dispatches were inspected in the installed environment and against
+the upstream documentation.
+
+The adopted boundary is: structural channel/history plans keep NumPy integer
+indices and masks, while all numerical local blocks, generated identity and
+zero blocks, sparse virtual transforms, Algorithms 1--4, and final ordinary
+Quimb MPO arrays follow the requested `to_backend=` converter. Quimb's
+`apply_to_arrays` remains the final compatibility check after materialization
+and optional numerical compression. Empty private sparse tensors now retain a
+backend reference so they cannot silently materialize as NumPy.
+
+Native Symmray `symmetry=` compilation remains a separate NumPy block-sparse
+path and is still rejected together with `to_backend=`; extending that route
+would require a native Symmray backend conversion design rather than treating
+Symmray blocks as ordinary dense Torch/JAX arrays.
+
+Focused validation covers Torch for every canonical history mode and the
+`sparse`/`block_sparse`/`reduced` storage policies, plus JAX block-sparse
+execution and final `chi` compression. This is classified as an **adopted
+Autoray dispatch contract with a narrow empty-sparse compatibility fix**; no
+installed dependency was modified.

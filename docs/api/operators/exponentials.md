@@ -220,9 +220,16 @@ native bosonic block-sparse compilation. Set `return_semantic=True` to keep
 the history-aware `FirstDegreeMPO` instead of materializing the Quimb MPO.
 Pass `to_backend=pepsy.backend_torch(...)` or another array converter to move
 the compiled operator blocks and coefficient assembly onto a backend before
-higher-order contractions; the final ordinary Quimb MPO is checked with
-`apply_to_arrays` as well. `to_backend` is currently for dense MPO execution
-and cannot be combined with native `symmetry=` compilation.
+higher-order contractions. Autoray-dispatched numerical operations, generated
+identity rails, Algorithms 1--4, and the private `sparse`, `block_sparse`, and
+`reduced` history executors retain that backend. The final ordinary Quimb MPO
+is checked with `apply_to_arrays` after materialization and optional `chi`
+compression, so its tensor data remains on the requested backend too. The
+structural history plans may still contain NumPy integer indices and masks;
+those are topology metadata, not numerical operator arrays. The converter
+should therefore be compatible with Autoray's `like=` dispatch model. Native
+Symmray `symmetry=` compilation is a separate NumPy block-sparse path and
+cannot currently be combined with `to_backend=`.
 When `chi` is requested, use `compression="fixed_rank"` (or
 `differentiable=True`) with `return_semantic=True`; ordinary Quimb compression
 cannot preserve the higher-order history metadata.

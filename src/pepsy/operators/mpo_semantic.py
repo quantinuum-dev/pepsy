@@ -950,7 +950,13 @@ def _as_4d(data, *, site, length):
 def _sparse_virtual_to_dense(tensor):
     """Materialize one sparse virtual tensor on its local block backend."""
     if not tensor.blocks:
-        return np.zeros(tensor.shape)
+        reference = getattr(tensor, "_like", None)
+        if reference is None:
+            raise ValueError(
+                "cannot materialize an empty sparse MPO tensor without a "
+                "backend reference."
+            )
+        return _zeros(tensor.shape, like=reference)
     rows = np.fromiter((key[0] for key in tensor.blocks), dtype=int)
     columns = np.fromiter((key[1] for key in tensor.blocks), dtype=int)
     values = _stack(tuple(tensor.blocks.values()), axis=0)
@@ -1245,10 +1251,17 @@ def _local_operator_mpo_cores(term):
 
 
 def _zeros(shape, *, like):
+    if like is None:
+        raise ValueError("backend-native zeros require a reference array.")
     try:
         return ar.do("zeros", tuple(shape), like=like)
-    except Exception:  # pragma: no cover - backend compatibility fallback
-        return np.zeros(tuple(shape), dtype=np.asarray(like).dtype)
+    except Exception as exc:  # pragma: no cover - backend compatibility guard
+        backend = _backend_name(like)
+        raise TypeError(
+            f"cannot construct zeros for backend {backend!r}; register the "
+            "backend with Autoray or provide a compatible to_backend "
+            "converter."
+        ) from exc
 
 
 def _stack(blocks, *, axis):
@@ -1471,10 +1484,19 @@ def _align_tensordot_dtypes(left, right):
 
 def _array_equal(left, right):
     """Check exact equality without introducing a numerical cutoff."""
-    # NumPy is the cheap path for ordinary arrays.  The Autoray fallback keeps
-    # backend tensors supported, but may still transfer a small local block to
-    # the host through ``np.asarray``.  Future native backends should register
-    # a structural equality/fingerprint here to avoid that synchronization.
+    # Prefer backend dispatch for non-host arrays.  In particular, attempting
+    # ``np.asarray`` first can synchronize or fail for CUDA arrays and can
+    # sever the intended backend boundary for JAX/Torch values.
+    if _backend_name(left) not in {"builtins", "numpy"} or _backend_name(right) not in {
+        "builtins",
+        "numpy",
+    }:
+        try:
+            equal = ar.do("equal", left, right)
+            result = ar.do("all", equal)
+            return bool(result.item() if hasattr(result, "item") else result)
+        except Exception:  # pragma: no cover - defensive backend guard
+            return False
     try:
         return bool(np.array_equal(np.asarray(left), np.asarray(right)))
     except Exception:
@@ -4536,12 +4558,18 @@ class FirstDegreeMPO:
                 right_indices = site_plan["right_indices"]
                 positions = site_plan["positions"]
 
+            source = self._arrays[site]
+            reference = (
+                source._like
+                if isinstance(source, SparseVirtualTensor)
+                else source[0, 0]
+            )
             tensor = SparseVirtualTensor((
                 len(left_states),
                 len(right_states),
                 self.phys_dim,
                 self.phys_dim,
-            ))
+            ), like=reference)
             for start in range(0, len(left_indices), chunk_size):
                 stop = start + chunk_size
                 values = self._history_local_product_batch_values(
@@ -5604,12 +5632,18 @@ class FirstDegreeMPO:
         raw_stored_blocks = 0
         for site_plan in plan["sites"]:
             site = site_plan["site"]
+            source = self._arrays[site]
+            reference = (
+                source._like
+                if isinstance(source, SparseVirtualTensor)
+                else source[0, 0]
+            )
             tensor = SparseVirtualTensor((
                 len(plan["levels"][site]),
                 len(plan["levels"][site + 1]),
                 self.phys_dim,
                 self.phys_dim,
-            ))
+            ), like=reference)
             left_indices = site_plan["left_indices"]
             right_indices = site_plan["right_indices"]
             raw_stored_blocks += len(left_indices)

@@ -789,6 +789,89 @@ def test_exp_mpo_uses_to_backend_before_contraction_and_compression():
     assert compiled.bond_sizes() == [1, 1]
 
 
+@pytest.mark.parametrize("mode", ["base", "exact", "folded", "hybrid"])
+@pytest.mark.parametrize("history_storage", ["sparse", "block_sparse", "reduced"])
+def test_exp_mpo_history_storage_preserves_requested_torch_backend(
+    mode,
+    history_storage,
+):
+    """Every higher-order history path keeps local tensors on Torch."""
+    torch = pytest.importorskip("torch")
+    x, _, z = _paulis()
+    to_backend = pepsy.backend_torch(dtype=torch.complex128)
+    semantic = exp_mpo(
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=0.4),
+            MPOProductTerm((1, 2), (z, z), coefficient=-0.7),
+        ],
+        0.01,
+        shape=3,
+        order=2,
+        mode=mode,
+        history_storage=history_storage,
+        to_backend=to_backend,
+        return_semantic=True,
+    )
+
+    assert all(isinstance(array, torch.Tensor) for array in semantic.arrays)
+    compiled = semantic.to_mpo()
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in compiled)
+
+
+def test_exp_mpo_block_sparse_compression_preserves_requested_jax_backend():
+    """The sparse-history and final Quimb boundaries also preserve JAX."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    import autoray as ar
+
+    x, _, z = _paulis()
+    to_backend = pepsy.backend_jax(dtype=jnp.complex128)
+    semantic = exp_mpo(
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=0.4),
+            MPOProductTerm((1, 2), (z, z), coefficient=-0.7),
+        ],
+        0.01,
+        shape=3,
+        order=2,
+        mode="hybrid",
+        history_storage="block_sparse",
+        to_backend=to_backend,
+        return_semantic=True,
+    )
+
+    assert all(ar.infer_backend(array) == "jax" for array in semantic.arrays)
+    compiled = exp_mpo(
+        [
+            MPOProductTerm((0, 1), (x, x), coefficient=0.4),
+            MPOProductTerm((1, 2), (z, z), coefficient=-0.7),
+        ],
+        0.01,
+        shape=3,
+        order=2,
+        mode="hybrid",
+        history_storage="block_sparse",
+        chi=1,
+        cutoff=0.0,
+        to_backend=to_backend,
+    )
+    assert all(ar.infer_backend(tensor.data) == "jax" for tensor in compiled)
+
+
+def test_empty_sparse_virtual_tensor_materializes_on_its_reference_backend():
+    """An empty sparse map must not silently create a NumPy tensor."""
+    torch = pytest.importorskip("torch")
+    from pepsy.operators._mpo_sparse import SparseVirtualTensor
+    from pepsy.operators.mpo_semantic import _sparse_virtual_to_dense
+
+    reference = torch.zeros((2, 2), dtype=torch.complex128)
+    sparse = SparseVirtualTensor((1, 1, 2, 2), like=reference)
+    dense = _sparse_virtual_to_dense(sparse)
+
+    assert isinstance(dense, torch.Tensor)
+    assert dense.dtype is torch.complex128
+
+
 @pytest.mark.parametrize("site", [0.9, True, np.float64(1.0)])
 def test_product_terms_reject_lossy_site_coercions(site):
     """Product-term sites must never be silently truncated or accept booleans."""
