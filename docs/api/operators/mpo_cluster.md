@@ -15,27 +15,31 @@ final `chi` compression controls as `exp_mpo`, while adding explicit
 `cluster_size` and `graph` arguments:
 
 ```python
-from pepsy.operators import ClusterLattice, exp_mpo_cluster
-
-graph = ClusterLattice.square(4, 4)
+from pepsy.operators import exp_mpo_cluster
 
 U = exp_mpo_cluster(
     [{"operator": "ZZ", "location": ((0, 0), (1, 0)), "coefficient": 0.7}],
     -1j * 0.01,
     shape=(4, 4),
     cluster_size=3,
-    graph=graph,
+    graph="square",
+    cyclic=True,
 )
 ```
 
-Without `graph`, the facade selects connected chain intervals. With `graph`,
-the supplied graph is mapped through the lattice-to-chain ordering and
-`cluster_size` counts graph sites. `return_semantic=True` returns the
-cluster-produced `FirstDegreeMPO`; the default returns a Quimb MPO. `max_bond`
-caps each analytical residual factorization, while `chi` is an optional final
-numerical MPO compression. `to_backend` is applied to local operators, the
-step, resolved coefficients, intermediate tensor contractions, and the final
-Quimb tensor boundary.
+Without `graph`, the facade selects connected chain intervals. Use
+`graph="chain"` for an explicit chain graph, or `graph="square"` with a
+two-dimensional `shape` for the common square geometry. `cyclic=True` makes a
+chain a ring or a square periodic in both directions; for a square,
+`cyclic=(True, False)` selects only the first direction. Explicit
+`ClusterLattice` objects remain available for arbitrary graphs and already
+encode their own periodic edges. In all graph cases, the graph is mapped
+through the lattice-to-chain ordering and `cluster_size` counts graph sites.
+`return_semantic=True` returns the cluster-produced `FirstDegreeMPO`; the
+default returns a Quimb MPO. `max_bond` caps each analytical residual
+factorization, while `chi` is an optional final numerical MPO compression.
+`to_backend` is applied to local operators, the step, resolved coefficients,
+intermediate tensor contractions, and the final Quimb tensor boundary.
 
 The history-only keywords `order`, `mode`, `history_storage`, and
 `extension_budget` are deliberately not accepted here. They have no safe

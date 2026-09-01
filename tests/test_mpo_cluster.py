@@ -464,6 +464,35 @@ def test_exp_mpo_cluster_maps_coordinate_graphs_and_supports_ordered_factors():
     assert mapping[(1, 1)] == 2
 
 
+def test_exp_mpo_cluster_accepts_square_graph_shorthand_and_cyclic_edges():
+    """Shape plus a compact graph name is enough for periodic square graphs."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    term = {
+        "operator": "XX",
+        "location": ((0, 1), (2, 1)),
+        "coefficient": 0.3,
+    }
+    result = exp_mpo_cluster(
+        [term],
+        0.05,
+        shape=(3, 2),
+        graph="square",
+        cyclic=True,
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    mapping = MPOBasis.from_terms([term], shape=(3, 2)).lattice_to_chain
+    sites = sorted((mapping[(0, 1)], mapping[(2, 1)]))
+    factors = [np.eye(2) for _ in range(6)]
+    factors[sites[0]] = x
+    factors[sites[1]] = x
+    hamiltonian = factors[0]
+    for factor in factors[1:]:
+        hamiltonian = np.kron(hamiltonian, factor)
+    expected = scipy_linalg.expm(0.015 * hamiltonian)
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
+
+
 def test_interval_cluster_expansion_keeps_explicit_string_operators():
     """Term-centric cluster construction retains fermionic gap operators."""
     x, z = _paulis()

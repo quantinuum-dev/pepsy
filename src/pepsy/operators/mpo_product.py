@@ -795,6 +795,75 @@ def _graph_lattice_for_basis(graph, basis):
     )
 
 
+def _graph_lattice_from_spec(graph, *, shape, length, basis, cyclic=False):
+    """Resolve the compact graph/shape/cyclic facade arguments."""
+
+    from .pepo_dense import ClusterLattice  # pylint: disable=import-outside-toplevel
+
+    if not isinstance(graph, str):
+        if isinstance(cyclic, (bool, np.bool_)):
+            cyclic_requested = bool(cyclic)
+        else:
+            cyclic_requested = True
+        if cyclic_requested:
+            raise ValueError(
+                "cyclic is only a shorthand for graph='chain' or "
+                "graph='square'; an explicit graph already defines its "
+                "periodic edges."
+            )
+        if basis is None:
+            return _graph_lattice_from_input(graph, length)
+        return _graph_lattice_for_basis(graph, basis)
+
+    graph_name = graph.strip().lower().replace("-", "_").replace(" ", "_")
+    if graph_name == "square":
+        lattice_shape = shape
+        if lattice_shape is None and basis is not None:
+            lattice_shape = basis.lattice_shape
+        if isinstance(lattice_shape, Integral) or lattice_shape is None:
+            raise ValueError(
+                "graph='square' requires a two-dimensional shape=(lx, ly)."
+            )
+        try:
+            lattice_shape = tuple(lattice_shape)
+        except TypeError as exc:
+            raise TypeError(
+                "graph='square' requires a two-dimensional shape=(lx, ly)."
+            ) from exc
+        if len(lattice_shape) != 2:
+            raise ValueError(
+                "graph='square' requires a two-dimensional shape=(lx, ly)."
+            )
+        lattice = ClusterLattice.square(
+            lattice_shape[0],
+            lattice_shape[1],
+            cyclic=cyclic,
+        )
+    elif graph_name in {"chain", "line"}:
+        if not isinstance(cyclic, (bool, np.bool_)):
+            raise TypeError(
+                "cyclic must be a boolean when graph='chain'."
+            )
+        chain_length = length if basis is None else basis.L
+        edges = [(site, site + 1) for site in range(chain_length - 1)]
+        if bool(cyclic) and chain_length > 1:
+            edges.append((chain_length - 1, 0))
+        lattice = ClusterLattice.from_edges(
+            range(chain_length),
+            edges,
+            name="ring" if cyclic else "chain",
+        )
+    else:
+        raise ValueError(
+            "graph must be 'chain', 'square', an explicit ClusterLattice, "
+            "a (sites, edges) pair, or a graph mapping."
+        )
+
+    if basis is None:
+        return _graph_lattice_from_input(lattice, length)
+    return _graph_lattice_for_basis(lattice, basis)
+
+
 def _operator_schmidt(operator, nsites, phys_dim, cutoff, max_bond=None):
     """Return an exact-or-cutoff operator TT decomposition."""
 
@@ -2160,6 +2229,7 @@ def exp_mpo_cluster(
     phys_dim=None,
     cluster_size=2,
     graph=None,
+    cyclic=False,
     factors=None,
     max_bond=None,
     cutoff=1.0e-12,
@@ -2204,10 +2274,18 @@ def exp_mpo_cluster(
     cluster_size : int, default=2
         Largest connected interval or graph cluster retained.
     graph : optional
-        A :class:`ClusterLattice`, ``(sites, edges)`` pair, or mapping. For
+        ``"chain"`` or ``"square"`` for the common geometries, or a
+        :class:`ClusterLattice`, ``(sites, edges)`` pair, or mapping. For
         coordinate-labelled graphs, supply ``shape`` or a lattice-aware
         basis through the term parser so coordinates can be mapped to the MPO
-        chain. Omitting ``graph`` selects the ordinary chain-interval path.
+        chain. Omitting ``graph`` selects the ordinary open-chain interval
+        path.
+    cyclic : bool or tuple of bool, default=False
+        Periodic-edge shorthand for ``graph="chain"`` or ``graph="square"``.
+        A boolean makes a square lattice periodic in both directions; a
+        ``(cyclic_x, cyclic_y)`` tuple selects square directions separately.
+        Explicit graph objects already define their edges and cannot be
+        combined with a non-default ``cyclic`` value.
     factors : iterable, optional
         Ordered factors for ``exp(A) @ exp(B) @ ...``. Each factor may be an
         ``MPOClusterFactor``, an ``MPOBasis``, a term iterable, or a mapping
@@ -2364,6 +2442,15 @@ def exp_mpo_cluster(
             ) + 1
 
     if graph is None:
+        if isinstance(cyclic, (bool, np.bool_)):
+            cyclic_requested = bool(cyclic)
+        else:
+            cyclic_requested = True
+        if cyclic_requested:
+            raise ValueError(
+                "cyclic requires graph='chain', graph='square', or an "
+                "explicit graph with its periodic edges."
+            )
         expansion = MPOClusterProductExpansion.from_factors(
             length,
             cluster_factors,
@@ -2374,10 +2461,13 @@ def exp_mpo_cluster(
             to_backend=to_backend,
         )
     else:
-        if reference_basis is None:
-            normalized_graph = _graph_lattice_from_input(graph, length)
-        else:
-            normalized_graph = _graph_lattice_for_basis(graph, reference_basis)
+        normalized_graph = _graph_lattice_from_spec(
+            graph,
+            shape=shape,
+            length=length,
+            basis=reference_basis,
+            cyclic=cyclic,
+        )
         expansion = MPOGraphClusterProductExpansion.from_factors(
             length,
             cluster_factors,
