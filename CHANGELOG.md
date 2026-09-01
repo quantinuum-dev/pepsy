@@ -106,6 +106,18 @@ Changes for the next release should be added here before the version is bumped.
   compression controls of `exp_mpo_cluster` while making the factor list
   explicit.
 
+- Added an opt-in Torch PEPS export pipeline matching the GPU VMC
+  `torch.export -> torch.vmap -> torch.compile` flow. Exact PEPS models can
+  compile a fixed walker batch, including stable log amplitudes; Metropolis
+ proposal evaluations pad changing subsets to that batch and discard the
+ auxiliary rows, while existing eager/vmap/serial paths remain unchanged.
+
+- Added opt-in compiled boundary-MPS reuse for finite rectangular Torch PEPS.
+  Boundary environments and fixed one-/two-row or one-/two-column geometry
+ classes can be exported, vmapped, and compiled; connected local-energy
+ targets are grouped across parent walkers and retain the eager fallback for
+ unsupported Quimb or Symmray contraction paths.
+
 - Added the backend-neutral `MPOBlock` / `MPOBlockPlan` structural inspection
   layer. First-degree automata and persistent higher-order block-sparse MPOs
   now expose virtual-state transitions, stored block counts, recipes, and

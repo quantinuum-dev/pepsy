@@ -386,6 +386,53 @@ never used for gradient-enabled or custom-parameter calls.
 
 ### Native Torch throughput probes and rank-sharded sampling
 
+For exact dense or flat-Z2 PEPS on a stable GPU workload, the Torch amplitude
+model also has an explicit compiled path matching the
+`torch.export -> torch.vmap -> torch.compile` pipeline:
+
+```python
+# Compile once using the same fixed number of walkers used by the sampler.
+model.export_and_compile(configs, compile_log=True)
+amplitudes = model.compiled_forward(configs)
+phase, log_abs = model.compiled_forward_log(configs)
+```
+
+`forward` and `forward_log` automatically use the compiled graph when their
+batch has the compiled size. During Metropolis sweeps, proposal rows are
+temporarily padded to that fixed size and the auxiliary results are discarded;
+this avoids recompiling for every changing subset of walkers. Parameter values
+remain explicit graph inputs, so optimizer updates do not require rebuilding
+the graph. Moving or casting the model invalidates it; call
+`export_and_compile` again afterward. This opt-in path for ordinary amplitudes
+currently supports only `contraction="exact"`; approximate CTMRG/HOTRG
+contractions retain their existing eager/vmap behavior. Boundary-MPS models
+have a separate compiled reuse path described below.
+
+The compiled path follows the fixed-shape strategy of the paper and the
+reference [`vmc_torch` implementation](https://github.com/sjdu10/vmc_torch).
+
+For a finite rectangular boundary-MPS PEPS, compile the paper's geometry
+classes as well as their environment builders:
+
+```python
+model.export_and_compile_boundary_reuse(
+    configs,
+    directions=("x", "y"),
+    widths=(1, 2),
+    compile_log=True,
+)
+```
+
+Each row/column window receives a fixed-shape `torch.export -> torch.vmap ->
+torch.compile` graph. Connected local-energy targets are grouped by window
+across parent walkers, while the two endpoint environments are batched as
+graph inputs. The default `environment_mode="full-bond"` is selected because
+Quimb's MPS compression path currently contains data-dependent SVD shape
+guards that PyTorch export cannot represent reliably. The static reuse path
+uses `reuse_mode="direct"`, matching the reference implementation's direct
+assembly of cached boundary MPSs and the selected strip. Unsupported windows
+fall back to the existing eager boundary cache.
+
 Use `benchmark_torch_amplitudes` (or
 `TorchVMCDriver.benchmark_amplitudes`) with an existing configuration batch to
 compare the supported amplitude batching and chunk sizes without drawing more
@@ -504,13 +551,17 @@ contraction="boundary")` now constructs `TorchPEPSBoundaryAmplitude`. It
 reuses bounded row or column environment caches for local Hamiltonian
 connections and for local Metropolis proposals, rather than rebuilding a full
 boundary contraction for every proposal. During a local-energy measurement,
-connected configurations are grouped by parent and preferred boundary strip.
-A cached parent-selected strip is copied and only its changed physical
+connected configurations are grouped by preferred boundary strip. In the
+eager path they are further grouped by parent; after
+`export_and_compile_boundary_reuse(...)`, compatible windows are batched
+across parent walkers and use the compiled geometry-class graphs. A cached
+parent-selected strip is copied and only its changed physical
 projectors are replaced, so all terms in that strip share two-sided boundary
 environments and unchanged tensor data. The cache is keyed by the parent and
 target configurations and automatically invalidated when torch PEPS leaves
 change. The optional VMC profile exposes `num_groups`,
-`num_strip_cache_hits`, and `num_strip_builds` alongside reuse/fallback counts:
+`num_compiled_groups`, `num_compiled_connections`, `num_strip_cache_hits`, and
+`num_strip_builds` alongside reuse/fallback counts:
 
 ```python
 model = pvmc.TorchPEPSBoundaryAmplitude(

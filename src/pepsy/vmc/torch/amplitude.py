@@ -8,6 +8,7 @@ local estimators and samplers.
 from __future__ import annotations
 
 import warnings
+from contextlib import contextmanager
 
 from ..torch_types import _check_positive_int, _require_torch
 from ..api import ContractionFallbackWarning
@@ -446,6 +447,16 @@ class TorchPEPSAmplitude:
         # Connected estimators and proposal batches are independent fast
         # paths. A failed ordinary amplitude trace must not poison either one.
         self._connection_vmap_enabled = has_vmap
+        # Populated only by the explicit export/compile opt-in. Keeping these
+        # separate from the ordinary vmap flags preserves the established
+        # eager fallback for unsupported contraction paths.
+        self._exported_amplitude_program = None
+        self._compiled_amplitude_forward = None
+        self._exported_log_amplitude_program = None
+        self._compiled_log_amplitude_forward = None
+        self._compiled_batch_size = None
+        self._compiled_mode = None
+        self._compiled_backend = None
 
     @property
     def is_symmray(self):
@@ -480,8 +491,243 @@ class TorchPEPSAmplitude:
 
     def to(self, *args, **kwargs):
         """Move/cast PEPS tensor parameters, mirroring ``torch.nn.Module.to``."""
+        self.clear_compiled()
         self.params.to(*args, **kwargs)
         return self
+
+    def clear_compiled(self):
+        """Drop exported and compiled amplitude graphs.
+
+        Exported graphs contain device- and shape-specific constants. Parameter
+        value updates do not require clearing because packed PEPS leaves are
+        explicit graph inputs, but moving or casting the model does.
+        """
+        self._exported_amplitude_program = None
+        self._compiled_amplitude_forward = None
+        self._exported_log_amplitude_program = None
+        self._compiled_log_amplitude_forward = None
+        self._compiled_batch_size = None
+        self._compiled_mode = None
+        self._compiled_backend = None
+        return self
+
+    def export_and_compile(
+        self,
+        example_configs,
+        *,
+        mode="default",
+        backend="inductor",
+        dynamic=False,
+        strict=False,
+        compile_log=True,
+    ):
+        """Export, batch, and compile the exact PEPS amplitude closure.
+
+        This follows the GPU VMC pipeline used by the reference
+        ``vmc_torch`` implementation: export one configuration with
+        ``torch.export``, add the walker axis with ``torch.vmap``, and compile
+        the fixed-shape batch with ``torch.compile``. The feature is opt-in
+        because export support depends on the tensor-network backend.
+
+        ``example_configs`` may be one configuration or a batch. Its batch
+        size becomes the compiled size. Calls through :meth:`forward` use the
+        compiled route when they provide that size; :meth:`compiled_forward`
+        makes the fixed-size requirement explicit. ``dynamic`` is forwarded to
+        ``torch.compile``, but the default is static to match compiled GPU
+        sampling.
+
+        Only ``contraction="exact"`` is supported. Approximate boundary,
+        CTMRG, and HOTRG paths retain their existing eager/vmap policies. The
+        native ``graded_torch`` projector likewise keeps its own fixed-shape
+        route.
+
+        ``strict=False`` is the default because quimb's packed pytree contains
+        static Symmray metadata tensors that PyTorch 2.x can lift in non-strict
+        export, while strict export rejects them on some releases.
+
+        Parameters
+        ----------
+        example_configs : array-like
+            Shape ``(n_sites,)`` or ``(batch, n_sites)``.
+        mode, backend, dynamic
+            Forwarded to ``torch.compile``.
+        strict : bool
+            Forwarded to ``torch.export.export``.
+        compile_log : bool
+            Also compile the stable ``(phase, log_abs)`` closure used by
+            Metropolis acceptance.
+
+        Returns
+        -------
+        TorchPEPSAmplitude
+            This model, for setup chaining.
+        """
+        torch = _require_torch()
+        if self.contraction != "exact":
+            raise ValueError(
+                "export_and_compile currently supports contraction='exact' "
+                "only; keep approximate PEPS paths on eager/vmap evaluation."
+            )
+        if self.graded_torch:
+            raise ValueError(
+                "export_and_compile is for dense or flat PEPS; "
+                "graded_torch already provides its own fixed-shape projector."
+            )
+
+        exporter = getattr(getattr(torch, "export", None), "export", None)
+        compiler = getattr(torch, "compile", None)
+        if not callable(exporter) or not callable(compiler):
+            raise RuntimeError(
+                "export_and_compile requires a PyTorch build exposing both "
+                "torch.export.export and torch.compile."
+            )
+
+        example_configs = _as_long_matrix(example_configs)
+        if example_configs.shape[0] == 0:
+            raise ValueError("example_configs must contain at least one row.")
+        if example_configs.shape[1] != self.n_sites:
+            raise ValueError(
+                "example_configs must have one physical index per site; "
+                f"expected {self.n_sites}, got {example_configs.shape[1]}."
+            )
+
+        # The public model intentionally remains outside nn.Module. Passing
+        # each packed leaf explicitly keeps the existing optimizer interface
+        # while making graph parameters visible to torch.export.
+        model = self
+
+        class _SingleAmplitudeModule(torch.nn.Module):
+            def __init__(self, *, log=False):
+                super().__init__()
+                self.log = bool(log)
+
+            def forward(self, config, *params):
+                if self.log:
+                    phase, log_abs = model.forward_log(
+                        config.reshape(1, -1),
+                        params=params,
+                    )
+                    return phase[0], log_abs[0]
+                return model.amplitude(config, params=params)
+
+        params = list(self.params)
+        in_dims = (0,) + (None,) * len(params)
+
+        def build(log=False):
+            wrapper = _SingleAmplitudeModule(log=log)
+            try:
+                # PyTorch 2.6 emits harmless FX warnings while un lifting
+                # static quimb/Symmray metadata. Keep this opt-in API quiet.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Attempted to insert a get_attr Node.*",
+                        category=UserWarning,
+                    )
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Node lifted_tensor_.*",
+                        category=UserWarning,
+                    )
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Additional .* warnings suppressed about "
+                        "get_attr references",
+                        category=UserWarning,
+                    )
+                    exported = exporter(
+                        wrapper,
+                        (example_configs[0], *params),
+                        strict=strict,
+                    )
+                    vmapped = torch.vmap(
+                        exported.module(),
+                        in_dims=in_dims,
+                    )
+                    compile_kwargs = {
+                        "backend": backend,
+                        "dynamic": dynamic,
+                    }
+                    if mode is not None:
+                        compile_kwargs["mode"] = mode
+                    compiled = compiler(vmapped, **compile_kwargs)
+            except Exception as error:
+                name = "log-amplitude" if log else "amplitude"
+                raise RuntimeError(
+                    f"Could not export and compile the exact PEPS {name} "
+                    "closure. Try strict=False, backend='eager' for a "
+                    "diagnostic, or retain the ordinary vmap/serial path."
+                ) from error
+            return exported, compiled
+
+        # Rebuilding is atomic: an unsuccessful rebuild cannot leave a graph
+        # tied to the previous device or batch shape.
+        self.clear_compiled()
+        exported_amplitude, compiled_amplitude = build(log=False)
+        exported_log = compiled_log_fn = None
+        if compile_log:
+            try:
+                exported_log, compiled_log_fn = build(log=True)
+            except RuntimeError:
+                self.clear_compiled()
+                raise
+
+        self._exported_amplitude_program = exported_amplitude
+        self._compiled_amplitude_forward = compiled_amplitude
+        self._exported_log_amplitude_program = exported_log
+        self._compiled_log_amplitude_forward = compiled_log_fn
+        self._compiled_batch_size = int(example_configs.shape[0])
+        self._compiled_mode = mode
+        self._compiled_backend = backend
+        return self
+
+    def compiled_forward(self, configs):
+        """Evaluate a fixed-size batch through the compiled graph."""
+        if self._compiled_amplitude_forward is None:
+            raise RuntimeError(
+                "No compiled amplitude graph is available; call "
+                "export_and_compile(...) first."
+            )
+        configs = _as_long_matrix(configs)
+        if configs.shape[0] != self._compiled_batch_size:
+            raise ValueError(
+                "compiled_forward requires exactly "
+                f"{self._compiled_batch_size} configurations, got "
+                f"{configs.shape[0]}."
+            )
+        if configs.shape[1] != self.n_sites:
+            raise ValueError(
+                f"configs must have {self.n_sites} sites per row."
+            )
+        self.last_amplitude_batching = "export-vmap-compile"
+        return self._compiled_amplitude_forward(
+            configs,
+            *list(self.params),
+        )
+
+    def compiled_forward_log(self, configs):
+        """Evaluate stable ``(phase, log_abs)`` through the compiled graph."""
+        if self._compiled_log_amplitude_forward is None:
+            raise RuntimeError(
+                "No compiled log-amplitude graph is available; call "
+                "export_and_compile(..., compile_log=True) first."
+            )
+        configs = _as_long_matrix(configs)
+        if configs.shape[0] != self._compiled_batch_size:
+            raise ValueError(
+                "compiled_forward_log requires exactly "
+                f"{self._compiled_batch_size} configurations, got "
+                f"{configs.shape[0]}."
+            )
+        if configs.shape[1] != self.n_sites:
+            raise ValueError(
+                f"configs must have {self.n_sites} sites per row."
+            )
+        self.last_amplitude_batching = "export-vmap-compile-log"
+        return self._compiled_log_amplitude_forward(
+            configs,
+            *list(self.params),
+        )
 
     def _params_pytree(self, params=None):
         import quimb as qu
@@ -878,6 +1124,14 @@ class TorchPEPSAmplitude:
                 for start in range(0, configs.shape[0], chunk_size)
             ])
 
+        if (
+            params is None
+            and chunk_size is None
+            and self._compiled_amplitude_forward is not None
+            and configs.shape[0] == self._compiled_batch_size
+        ):
+            return self.compiled_forward(configs)
+
         if self.graded_torch:
             self.last_amplitude_batching = (
                 "graded-vmap"
@@ -902,6 +1156,12 @@ class TorchPEPSAmplitude:
     def forward_log(self, configs, params=None):
         """Return ``(phase, log_abs)`` for a batch of configurations."""
         configs = _as_long_matrix(configs)
+        if (
+            params is None
+            and self._compiled_log_amplitude_forward is not None
+            and configs.shape[0] == self._compiled_batch_size
+        ):
+            return self.compiled_forward_log(configs)
         if self.graded_torch:
             torch = _require_torch()
             amp = self.forward(configs, params=params)
@@ -931,6 +1191,87 @@ class TorchPEPSAmplitude:
             log_abs.append(log_scale)
         torch = _require_torch()
         return torch.stack(phases), torch.stack(log_abs)
+
+    def proposal_amplitudes(
+        self,
+        parent_configs,
+        target_configs,
+        current_amplitudes,
+        *,
+        chunk_size=None,
+    ):
+        """Evaluate proposals, padding to the compiled batch when available.
+
+        The compiled GPU graph has one fixed walker dimension. For a sweep
+        where only ``n`` walkers changed, repeat the first target row to fill
+        the remaining slots and discard those auxiliary outputs. This mirrors
+        the upstream compiled sampler while preserving the exact result for
+        the requested proposals. The path is used only when no explicit
+        ``chunk_size`` is active; otherwise the ordinary proposal batching
+        policy remains authoritative.
+        """
+        del parent_configs, current_amplitudes
+        torch = _require_torch()
+        target_configs = _as_long_matrix(target_configs)
+        n_targets = int(target_configs.shape[0])
+        batch_size = self._compiled_batch_size
+        if (
+            self._compiled_amplitude_forward is not None
+            and chunk_size is None
+            and n_targets > 0
+            and batch_size is not None
+            and n_targets <= batch_size
+        ):
+            if n_targets < batch_size:
+                padding = target_configs[:1].expand(
+                    batch_size - n_targets,
+                    -1,
+                )
+                evaluation_configs = torch.cat((target_configs, padding), dim=0)
+            else:
+                evaluation_configs = target_configs
+            return self.compiled_forward(evaluation_configs)[:n_targets]
+        return _call_amplitude_fn(
+            self,
+            target_configs,
+            chunk_size=chunk_size,
+        )
+
+    def proposal_log_amplitudes(
+        self,
+        parent_configs,
+        target_configs,
+        *,
+        chunk_size=None,
+    ):
+        """Evaluate proposal log amplitudes with the fixed compiled batch."""
+        del parent_configs
+        target_configs = _as_long_matrix(target_configs)
+        n_targets = int(target_configs.shape[0])
+        batch_size = self._compiled_batch_size
+        if (
+            self._compiled_log_amplitude_forward is not None
+            and chunk_size is None
+            and n_targets > 0
+            and batch_size is not None
+            and n_targets <= batch_size
+        ):
+            torch = _require_torch()
+            if n_targets < batch_size:
+                padding = target_configs[:1].expand(
+                    batch_size - n_targets,
+                    -1,
+                )
+                evaluation_configs = torch.cat((target_configs, padding), dim=0)
+            else:
+                evaluation_configs = target_configs
+            phase, log_abs = self.compiled_forward_log(evaluation_configs)
+            return phase[:n_targets], log_abs[:n_targets]
+        return _call_log_amplitude_fn(
+            self.forward_log,
+            target_configs,
+            chunk_size=chunk_size,
+        )
 
     def connected_amplitudes(
         self,
@@ -1046,6 +1387,18 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         # contraction and let connected local estimators replace only their
         # changed physical projectors.
         self._boundary_strip_cache = {}
+        # Compiled boundary reuse is keyed by a static geometry class, for
+        # example ``('x', (1, 2))``.  The boundary environments are inputs to
+        # these graphs rather than captured constants, so parameter updates
+        # only require rebuilding the environments, not re-exporting the
+        # contraction graph.
+        self._compiled_boundary_reuse = {}
+        self._compiled_boundary_environments = {}
+        self._compiled_boundary_batch_size = None
+        self._compiled_boundary_mode = None
+        self._compiled_boundary_backend = None
+        self._compiled_boundary_environment_mode = None
+        self.last_boundary_compile_report = None
 
     def _parameter_cache_token(self):
         """Return a cheap token that changes when torch leaves are updated."""
@@ -1068,6 +1421,18 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         self.clear_boundary_cache()
         return self
 
+    def clear_compiled(self):
+        """Clear full-amplitude and boundary-reuse compiled graphs."""
+        super().clear_compiled()
+        self._compiled_boundary_reuse = {}
+        self._compiled_boundary_environments = {}
+        self._compiled_boundary_batch_size = None
+        self._compiled_boundary_mode = None
+        self._compiled_boundary_backend = None
+        self._compiled_boundary_environment_mode = None
+        self.last_boundary_compile_report = None
+        return self
+
     def _ensure_boundary_cache_current(self):
         token = self._parameter_cache_token()
         if token != self._boundary_cache_token:
@@ -1076,6 +1441,787 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             self._boundary_strip_cache.clear()
             self._boundary_amplitude_cache.clear()
             self._boundary_cache_token = token
+
+    def _boundary_reuse_patterns(self, directions=("x", "y"), widths=(1, 2)):
+        """Return static row/column geometry classes for boundary reuse."""
+        if self._boundary_geometry is None:
+            return ()
+        patterns = []
+        for direction in directions:
+            direction = str(direction).lower()
+            if direction not in {"x", "y"}:
+                raise ValueError("directions must contain only 'x' and 'y'.")
+            length = self._boundary_geometry[
+                "Lx" if direction == "x" else "Ly"
+            ]
+            for width in widths:
+                width = _check_positive_int("width", width)
+                for start in range(length - width + 1):
+                    patterns.append(
+                        (direction, tuple(range(start, start + width)))
+                    )
+        return tuple(patterns)
+
+    @staticmethod
+    def _pack_boundary_network(boundary_tn):
+        """Pack one cached boundary network for graph inputs."""
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        params, skeleton = qtn.pack(boundary_tn)
+        flat, pytree = qu.utils.tree_flatten(params, get_ref=True)
+        return tuple(flat), pytree, skeleton
+
+    @staticmethod
+    @contextmanager
+    def _boundary_export_warnings():
+        """Return the harmless export warnings emitted by packed Quimb data."""
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Attempted to insert a get_attr Node.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Node lifted_tensor_.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Additional .* warnings suppressed about get_attr references",
+                category=UserWarning,
+            )
+            yield
+
+    def _boundary_environment_manifest(self, envs):
+        """Describe packed environments with stable reconstruction metadata."""
+        manifest = []
+        for key in sorted(envs):
+            flat, pytree, skeleton = self._pack_boundary_network(envs[key])
+            manifest.append({
+                "key": key,
+                "n_leaves": len(flat),
+                "pytree": pytree,
+                "skeleton": skeleton,
+                "shapes": tuple(tuple(leaf.shape) for leaf in flat),
+            })
+        return tuple(manifest)
+
+    def _boundary_environment_options_for_mode(self, mode):
+        options = self._boundary_environment_options()
+        options["mode"] = mode
+        return options
+
+    def _build_boundary_environment_compiler(
+        self,
+        axis,
+        example_config,
+        *,
+        environment_mode,
+        mode,
+        backend,
+        strict,
+    ):
+        """Export one batched boundary-environment builder."""
+        torch = _require_torch()
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        params = list(self.params)
+        manifest_options = self._boundary_environment_options_for_mode(
+            environment_mode
+        )
+        with torch.no_grad():
+            tn = self._unpack_tn()
+            selected = self._select_config(tn, example_config)
+            if axis == "x":
+                example_envs = selected.compute_x_environments(
+                    max_bond=self.chi,
+                    cutoff=self.cutoff,
+                    **manifest_options,
+                )
+            else:
+                example_envs = selected.compute_y_environments(
+                    max_bond=self.chi,
+                    cutoff=self.cutoff,
+                    **manifest_options,
+                )
+        manifest = self._boundary_environment_manifest(example_envs)
+        params_pytree = self.params_pytree
+        skeleton = self.skeleton
+        site_inds = self.site_inds
+        chi = self.chi
+        cutoff = self.cutoff
+
+        def wrapper(config, *flat_params):
+            tn_params = qu.utils.tree_unflatten(list(flat_params), params_pytree)
+            tns = qtn.unpack(tn_params, skeleton)
+            selected = tns.isel({
+                ind: config[index]
+                for index, ind in enumerate(site_inds)
+            })
+            if axis == "x":
+                envs = selected.compute_x_environments(
+                    max_bond=chi,
+                    cutoff=cutoff,
+                    **manifest_options,
+                )
+            else:
+                envs = selected.compute_y_environments(
+                    max_bond=chi,
+                    cutoff=cutoff,
+                    **manifest_options,
+                )
+            outputs = []
+            for item in manifest:
+                env_params, _ = qtn.pack(envs[item["key"]])
+                flat, _ = qu.utils.tree_flatten(env_params, get_ref=True)
+                outputs.extend(flat)
+            return tuple(outputs)
+
+        class _EnvironmentModule(torch.nn.Module):
+            def forward(self, config, *flat_params):
+                return wrapper(config, *flat_params)
+
+        with self._boundary_export_warnings():
+            exported = torch.export.export(
+                _EnvironmentModule(),
+                (example_config, *params),
+                strict=strict,
+            )
+        exported_module = exported.module()
+        vmapped = torch.vmap(
+            exported_module,
+            in_dims=(0,) + (None,) * len(params),
+        )
+        compile_kwargs = {
+            "backend": backend,
+            "dynamic": False,
+        }
+        if mode is not None:
+            compile_kwargs["mode"] = mode
+        compiled = torch.compile(vmapped, **compile_kwargs)
+        return {
+            "fn": compiled,
+            "exported": exported,
+            "manifest": manifest,
+            "axis": axis,
+            "environment_mode": environment_mode,
+        }
+
+    def _boundary_environment_batch(self, configs, axis):
+        """Evaluate a fixed-size compiled environment batch, if available."""
+        torch = _require_torch()
+        entry = self._compiled_boundary_environments.get(axis)
+        if entry is None:
+            return None
+        configs = _as_long_matrix(configs)
+        n_configs = int(configs.shape[0])
+        batch_size = int(self._compiled_boundary_batch_size)
+        if n_configs == 0 or n_configs > batch_size:
+            return None
+        if n_configs < batch_size:
+            configs = torch.cat((
+                configs,
+                configs[:1].expand(batch_size - n_configs, -1),
+            ), dim=0)
+        outputs = tuple(entry["fn"](configs, *list(self.params)))
+        grouped = {}
+        offset = 0
+        for item in entry["manifest"]:
+            n_leaves = item["n_leaves"]
+            grouped[item["key"]] = tuple(
+                output[:n_configs]
+                for output in outputs[offset:offset + n_leaves]
+            )
+            offset += n_leaves
+        return grouped
+
+    def _materialize_boundary_environment_batch(
+        self,
+        axis,
+        grouped,
+        *,
+        n_configs=None,
+    ):
+        """Turn batched packed environment leaves back into Quimb networks."""
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        entry = self._compiled_boundary_environments[axis]
+        result = []
+        if n_configs is None:
+            n_configs = next(
+                (
+                    int(leaf.shape[0])
+                    for leaves in grouped.values()
+                    for leaf in leaves
+                ),
+                0,
+            )
+        for index in range(n_configs):
+            envs = {}
+            for item in entry["manifest"]:
+                leaves = [leaf[index] for leaf in grouped[item["key"]]]
+                params = qu.utils.tree_unflatten(leaves, item["pytree"])
+                envs[item["key"]] = qtn.unpack(params, item["skeleton"])
+            result.append(envs)
+        return result
+
+    def _populate_compiled_boundary_environments(self, configs, axis):
+        """Populate the ordinary environment cache from compiled batches."""
+        torch = _require_torch()
+        if axis not in self._compiled_boundary_environments:
+            return 0
+        configs = _as_long_matrix(configs)
+        batch_size = int(self._compiled_boundary_batch_size)
+        built = 0
+        missing = []
+        seen = set()
+        for config in configs:
+            key = (axis, self._configuration_key(config))
+            if key not in self._boundary_environment_cache and key not in seen:
+                missing.append(config)
+                seen.add(key)
+        for start in range(0, len(missing), batch_size):
+            batch = torch.stack(missing[start:start + batch_size], dim=0)
+            grouped = self._boundary_environment_batch(batch, axis)
+            if grouped is None:
+                continue
+            # ``_materialize_boundary_environment_batch`` returns the padded
+            # graph size. Only retain rows belonging to this request.
+            materialized = self._materialize_boundary_environment_batch(
+                axis,
+                {
+                    key: tuple(leaf[:batch.shape[0]] for leaf in leaves)
+                    for key, leaves in grouped.items()
+                },
+                n_configs=int(batch.shape[0]),
+            )
+            for index, config in enumerate(batch):
+                self._cache_put(
+                    self._boundary_environment_cache,
+                    (axis, self._configuration_key(config)),
+                    materialized[index],
+                )
+                built += 1
+        return built
+
+    def _compiled_boundary_environment_inputs(
+        self,
+        parent_configs,
+        axis,
+        indices,
+    ):
+        """Pack cached endpoint environments for one compiled geometry class."""
+        torch = _require_torch()
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        entry = self._compiled_boundary_reuse.get((axis, tuple(indices)))
+        if entry is None:
+            return None
+        tn = self._unpack_tn()
+        endpoint_keys = entry["endpoint_keys"]
+        packed = []
+        for endpoint in endpoint_keys:
+            rows = []
+            for parent_config in parent_configs:
+                cache_key = (axis, self._configuration_key(parent_config))
+                envs = self._boundary_environment_cache.get(cache_key)
+                if envs is None:
+                    if axis in self._compiled_boundary_environments:
+                        return None
+                    envs, _ = self._cached_boundary_environments(
+                        tn,
+                        parent_config,
+                        axis,
+                    )
+                params, _ = qtn.pack(envs[endpoint])
+                flat, _ = qu.utils.tree_flatten(params, get_ref=True)
+                expected = entry["environment_manifests"][endpoint]
+                if len(flat) != expected["n_leaves"]:
+                    return None
+                if any(
+                    tuple(leaf.shape) != shape
+                    for leaf, shape in zip(flat, expected["shapes"])
+                ):
+                    return None
+                rows.append(tuple(flat))
+            if rows:
+                n_leaves = len(rows[0])
+                packed.append(tuple(
+                    torch.stack([
+                        row[leaf_index].to(device=parent_configs.device)
+                        for row in rows
+                    ], dim=0)
+                    for leaf_index in range(n_leaves)
+                ))
+            else:
+                packed.append(())
+        return tuple(packed)
+
+    def _compiled_boundary_reuse_batch(
+        self,
+        parent_configs,
+        target_configs,
+        axis,
+        indices,
+        *,
+        log=False,
+    ):
+        """Evaluate one fixed-shape compiled boundary-reuse group."""
+        torch = _require_torch()
+        key = (axis, tuple(indices))
+        entry = self._compiled_boundary_reuse.get(key)
+        if entry is None or torch.is_grad_enabled():
+            return None
+        parent_configs = _as_long_matrix(parent_configs)
+        target_configs = _as_long_matrix(target_configs)
+        if parent_configs.shape != target_configs.shape:
+            raise ValueError("Boundary reuse parent and target shapes differ.")
+        n_configs = int(target_configs.shape[0])
+        batch_size = int(self._compiled_boundary_batch_size)
+        if n_configs == 0 or n_configs > batch_size:
+            return None
+        env_inputs = self._compiled_boundary_environment_inputs(
+            parent_configs,
+            axis,
+            indices,
+        )
+        if env_inputs is None:
+            return None
+        if n_configs < batch_size:
+            target_configs = torch.cat((
+                target_configs,
+                target_configs[:1].expand(batch_size - n_configs, -1),
+            ), dim=0)
+
+        padded_env_inputs = []
+        for endpoint_inputs in env_inputs:
+            for leaf in endpoint_inputs:
+                if n_configs < batch_size:
+                    leaf = torch.cat((
+                        leaf,
+                        leaf[:1].expand(
+                            (batch_size - n_configs,) + tuple(leaf.shape[1:])
+                        ),
+                    ), dim=0)
+                padded_env_inputs.append(leaf)
+        outputs = entry["log_fn" if log else "fn"](
+            target_configs,
+            *list(self.params),
+            *padded_env_inputs,
+        )
+        if log:
+            return outputs[0][:n_configs], outputs[1][:n_configs]
+        return outputs[:n_configs]
+
+    def _compiled_boundary_proposals(
+        self,
+        parent_configs,
+        target_configs,
+        *,
+        log=False,
+    ):
+        """Evaluate proposal rows through compiled geometry classes."""
+        torch = _require_torch()
+        compiled_reuse = getattr(self, "_compiled_boundary_reuse", {})
+        if torch.is_grad_enabled() or not compiled_reuse:
+            return None
+        parent_configs = _as_long_matrix(parent_configs)
+        target_configs = _as_long_matrix(target_configs)
+        if parent_configs.shape != target_configs.shape:
+            raise ValueError("Boundary proposal parent and target shapes differ.")
+
+        candidates = {}
+        for index in range(int(parent_configs.shape[0])):
+            windows = self._changed_axis_windows(
+                parent_configs[index],
+                target_configs[index],
+            )
+            if not windows:
+                continue
+            axis, indices = windows[0]
+            key = (axis, indices)
+            entry = compiled_reuse.get(key)
+            if entry is None or (log and entry.get("log_fn") is None):
+                continue
+            candidates.setdefault(key, []).append(index)
+        if not candidates:
+            return None
+
+        stats = {
+            "num_compiled_groups": 0,
+            "num_compiled_connections": 0,
+            "num_environment_compiled": 0,
+        }
+        for axis, _indices in candidates:
+            stats["num_environment_compiled"] += (
+                self._populate_compiled_boundary_environments(
+                    parent_configs,
+                    axis,
+                )
+            )
+
+        n_configs = int(target_configs.shape[0])
+        handled = torch.zeros(
+            n_configs,
+            dtype=torch.bool,
+            device=target_configs.device,
+        )
+        values = [None] * n_configs
+        batch_size = int(self._compiled_boundary_batch_size)
+        for (axis, indices), indices_for_group in candidates.items():
+            for start in range(0, len(indices_for_group), batch_size):
+                group_indices = indices_for_group[start:start + batch_size]
+                index_tensor = torch.as_tensor(
+                    group_indices,
+                    dtype=torch.long,
+                    device=target_configs.device,
+                )
+                try:
+                    result = self._compiled_boundary_reuse_batch(
+                        parent_configs[index_tensor],
+                        target_configs[index_tensor],
+                        axis,
+                        indices,
+                        log=log,
+                    )
+                except Exception:  # pragma: no cover - backend-specific fallback
+                    result = None
+                if result is None:
+                    continue
+                if log:
+                    result = (
+                        result[0].to(device=target_configs.device),
+                        result[1].to(device=target_configs.device),
+                    )
+                    for offset, index in enumerate(group_indices):
+                        values[index] = (result[0][offset], result[1][offset])
+                else:
+                    result = result.to(device=target_configs.device)
+                    for offset, index in enumerate(group_indices):
+                        values[index] = result[offset]
+                handled[index_tensor] = True
+                stats["num_compiled_groups"] += 1
+                stats["num_compiled_connections"] += len(group_indices)
+
+        if not bool(torch.any(handled)):
+            return None
+        if log:
+            phases = torch.stack([
+                value[0] for value in values if value is not None
+            ])
+            log_abs = torch.stack([
+                value[1] for value in values if value is not None
+            ])
+            # The compact arrays above are only used for handled rows; the
+            # caller scatters them with the same boolean mask.
+            result = (phases, log_abs)
+        else:
+            result = torch.stack([
+                value for value in values if value is not None
+            ])
+        return result, handled, stats
+
+    def export_and_compile_boundary_reuse(
+        self,
+        example_configs,
+        *,
+        mode="default",
+        backend="inductor",
+        strict=False,
+        directions=("x", "y"),
+        widths=(1, 2),
+        compile_log=True,
+        compile_environments=True,
+        environment_mode="full-bond",
+        reuse_mode="direct",
+    ):
+        """Compile static row/column boundary-environment reuse patterns.
+
+        This is the boundary analogue of :meth:`export_and_compile`. One
+        graph is exported for each fixed row/column window, with the PEPS
+        parameters and the two endpoint boundary environments as explicit
+        inputs. ``torch.vmap`` adds the walker dimension and ``torch.compile``
+        fuses the resulting fixed-shape batch. Connected local-energy calls
+        dispatch compatible targets to these geometry-class graphs.
+
+        ``compile_environments=True`` also compiles the environment builder.
+        The default ``environment_mode='full-bond'`` is intentional: Quimb's
+        MPS compression path contains data-dependent SVD shape guards that
+        PyTorch export cannot represent in current releases. The resulting
+        static path is opt-in and retains the ordinary eager fallback when a
+        PEPS or Symmray backend is not exportable. ``reuse_mode='direct'``
+        contracts the assembled boundary environments and selected strip
+        directly, matching the static reuse strategy in the reference
+        implementation. ``reuse_mode='boundary'`` requests an additional
+        compression sweep and may not be exportable for all Quimb versions.
+        """
+        torch = _require_torch()
+        if self.contraction != "boundary":
+            raise ValueError(
+                "export_and_compile_boundary_reuse requires "
+                "contraction='boundary'."
+            )
+        if self._boundary_geometry is None:
+            raise ValueError("The PEPS geometry is not a finite rectangular grid.")
+        reuse_mode = str(reuse_mode).lower().replace("_", "-")
+        if reuse_mode not in {"direct", "boundary", "auto"}:
+            raise ValueError("reuse_mode must be 'direct', 'boundary', or 'auto'.")
+        environment_mode = str(environment_mode).lower().replace("_", "-")
+        directions = tuple(str(direction).lower() for direction in directions)
+        widths = tuple(widths)
+        self._boundary_reuse_patterns(directions=directions, widths=widths)
+        example_configs = _as_long_matrix(example_configs)
+        if example_configs.shape[0] == 0:
+            raise ValueError("example_configs must contain at least one row.")
+        if example_configs.shape[1] != self.n_sites:
+            raise ValueError(
+                "example_configs must have one physical index per site; "
+                f"expected {self.n_sites}, got {example_configs.shape[1]}."
+            )
+        if environment_mode not in {"mps", "full-bond"}:
+            raise ValueError("environment_mode must be 'mps' or 'full-bond'.")
+
+        self.clear_compiled()
+        self._compiled_boundary_batch_size = int(example_configs.shape[0])
+        self._compiled_boundary_mode = mode
+        self._compiled_boundary_backend = backend
+        self._compiled_boundary_environment_mode = environment_mode
+        report = {
+            "batch_size": self._compiled_boundary_batch_size,
+            "environment_mode": environment_mode,
+            "reuse_mode": reuse_mode,
+            "environment_compiled": {},
+            "reuse_compiled": [],
+            "reuse_failures": {},
+        }
+
+        first_config = example_configs[0]
+        if compile_environments:
+            for axis in directions:
+                try:
+                    self._compiled_boundary_environments[axis] = (
+                        self._build_boundary_environment_compiler(
+                            axis,
+                            first_config,
+                            environment_mode=environment_mode,
+                            mode=mode,
+                            backend=backend,
+                            strict=strict,
+                        )
+                    )
+                except Exception as error:  # pragma: no cover - backend-specific
+                    report["environment_compiled"][axis] = False
+                    report["reuse_failures"][f"environment:{axis}"] = (
+                        f"{type(error).__name__}: {error}"
+                    )[:1000]
+                else:
+                    report["environment_compiled"][axis] = True
+
+        # Materialize one environment set per direction to establish the
+        # fixed packed skeletons used by every reuse graph in that direction.
+        with torch.no_grad():
+            for axis in directions:
+                if axis in self._compiled_boundary_environments:
+                    grouped = self._boundary_environment_batch(
+                        first_config.reshape(1, -1),
+                        axis,
+                    )
+                    if grouped is not None:
+                        envs = self._materialize_boundary_environment_batch(
+                            axis,
+                            {
+                                key: tuple(leaf[:1] for leaf in leaves)
+                                for key, leaves in grouped.items()
+                            },
+                            n_configs=1,
+                        )[0]
+                        self._cache_put(
+                            self._boundary_environment_cache,
+                            (axis, self._configuration_key(first_config)),
+                            envs,
+                        )
+                else:
+                    envs, _ = self._cached_boundary_environments(
+                        self._unpack_tn(),
+                        first_config,
+                        axis,
+                    )
+
+                for direction, indices in self._boundary_reuse_patterns(
+                    directions=(axis,), widths=widths
+                ):
+                    endpoint_keys = (
+                        ("xmin", indices[0]), ("xmax", indices[-1])
+                    ) if direction == "x" else (
+                        ("ymin", indices[0]), ("ymax", indices[-1])
+                    )
+                    environment_manifests = {}
+                    environment_flats = []
+                    for endpoint in endpoint_keys:
+                        flat, pytree, skeleton = self._pack_boundary_network(
+                            envs[endpoint]
+                        )
+                        environment_manifests[endpoint] = {
+                            "n_leaves": len(flat),
+                            "pytree": pytree,
+                            "skeleton": skeleton,
+                            "shapes": tuple(tuple(leaf.shape) for leaf in flat),
+                        }
+                        environment_flats.append(flat)
+
+                    def build_reuse(log, selected_direction=direction,
+                                    selected_indices=indices,
+                                    selected_endpoints=endpoint_keys,
+                                    selected_manifests=environment_manifests,
+                                    selected_flats=tuple(environment_flats),
+                                    selected_mode=None):
+                        import quimb as qu
+                        import quimb.tensor as qtn
+
+                        if selected_mode is None:
+                            selected_mode = reuse_mode
+
+                        tn_params_pytree = self.params_pytree
+                        tn_skeleton = self.skeleton
+                        site_inds = self.site_inds
+                        view_kwargs = self._boundary_geometry["view_kwargs"]
+                        chi = self.chi
+                        cutoff = self.cutoff
+                        boundary_options = self._boundary_environment_options()
+                        final_options = self._final_contraction_options()
+                        log_options = dict(final_options)
+                        log_options["strip_exponent"] = True
+                        n_tn = len(self.params)
+                        n_min = selected_manifests[selected_endpoints[0]]["n_leaves"]
+
+                        def wrapper(config, *flat_args):
+                            tn_params = qu.utils.tree_unflatten(
+                                list(flat_args[:n_tn]), tn_params_pytree
+                            )
+                            min_params = qu.utils.tree_unflatten(
+                                list(flat_args[n_tn:n_tn + n_min]),
+                                selected_manifests[selected_endpoints[0]]["pytree"],
+                            )
+                            max_params = qu.utils.tree_unflatten(
+                                list(flat_args[n_tn + n_min:]),
+                                selected_manifests[selected_endpoints[1]]["pytree"],
+                            )
+                            tns = qtn.unpack(tn_params, tn_skeleton)
+                            boundary_min = qtn.unpack(
+                                min_params,
+                                selected_manifests[selected_endpoints[0]]["skeleton"],
+                            )
+                            boundary_max = qtn.unpack(
+                                max_params,
+                                selected_manifests[selected_endpoints[1]]["skeleton"],
+                            )
+                            amp = tns.isel({
+                                ind: config[index]
+                                for index, ind in enumerate(site_inds)
+                            })
+                            tags = [
+                                tns.x_tag(index) if selected_direction == "x"
+                                else tns.y_tag(index)
+                                for index in selected_indices
+                            ]
+                            reuse_tn = boundary_min | amp.select(tags, which="any") | boundary_max
+                            reuse_tn.view_as_(qtn.PEPS, **view_kwargs)
+                            if selected_mode in {"boundary", "auto"}:
+                                if selected_direction == "x":
+                                    reuse_tn.contract_boundary_from_xmin_(
+                                        xrange=[selected_indices[0], selected_indices[-1] + 1],
+                                        max_bond=chi,
+                                        cutoff=cutoff,
+                                        **boundary_options,
+                                    )
+                                else:
+                                    reuse_tn.contract_boundary_from_ymin_(
+                                        yrange=[selected_indices[0], selected_indices[-1] + 1],
+                                        max_bond=chi,
+                                        cutoff=cutoff,
+                                        **boundary_options,
+                                    )
+                            if log:
+                                return reuse_tn.contract(all, **log_options)
+                            return reuse_tn.contract(all, **final_options)
+
+                        class _ReuseModule(torch.nn.Module):
+                            def forward(self, config, *flat_args):
+                                return wrapper(config, *flat_args)
+
+                        args = (
+                            first_config,
+                            *list(self.params),
+                            *selected_flats[0],
+                            *selected_flats[1],
+                        )
+                        with self._boundary_export_warnings():
+                            exported = torch.export.export(
+                                _ReuseModule(),
+                                args,
+                                strict=strict,
+                            )
+                        exported_module = exported.module()
+                        in_dims = (
+                            (0,)
+                            + (None,) * n_tn
+                            + (0,) * len(selected_flats[0])
+                            + (0,) * len(selected_flats[1])
+                        )
+                        vmapped = torch.vmap(exported_module, in_dims=in_dims)
+                        compile_kwargs = {"backend": backend, "dynamic": False}
+                        if mode is not None:
+                            compile_kwargs["mode"] = mode
+                        return exported, torch.compile(vmapped, **compile_kwargs)
+
+                    try:
+                        exported, compiled = build_reuse(False)
+                        log_export = log_compiled = None
+                        if compile_log:
+                            log_export, log_compiled = build_reuse(True)
+                    except Exception as error:  # pragma: no cover - backend-specific
+                        if reuse_mode == "auto":
+                            try:
+                                reuse_mode = "direct"
+                                exported, compiled = build_reuse(False)
+                                log_export = log_compiled = None
+                                if compile_log:
+                                    log_export, log_compiled = build_reuse(True)
+                            except Exception as retry_error:
+                                report["reuse_failures"][str((direction, indices))] = (
+                                    f"{type(retry_error).__name__}: {retry_error}"
+                                )[:1000]
+                                continue
+                        else:
+                            report["reuse_failures"][str((direction, indices))] = (
+                                f"{type(error).__name__}: {error}"
+                            )[:1000]
+                            continue
+
+                    self._compiled_boundary_reuse[(direction, indices)] = {
+                        "fn": compiled,
+                        "log_fn": log_compiled,
+                        "exported": exported,
+                        "log_exported": log_export,
+                        "endpoint_keys": endpoint_keys,
+                        "environment_manifests": environment_manifests,
+                    }
+                    report["reuse_compiled"].append((direction, indices))
+
+        report["reuse_mode"] = reuse_mode
+        self.last_boundary_compile_report = report
+        if not report["reuse_compiled"]:
+            raise RuntimeError(
+                "Could not export any boundary-reuse geometry class. "
+                "Try environment_mode='full-bond', reuse_mode='direct', "
+                "backend='eager', or retain the eager boundary path."
+            )
+        return self
 
     @staticmethod
     def _configuration_key(config):
@@ -1338,6 +2484,9 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             "num_requests": int(parent_configs.shape[0]),
             "num_vmapped": 0,
             "num_vmap_fallback": 0,
+            "num_compiled_groups": 0,
+            "num_compiled_connections": 0,
+            "num_environment_compiled": 0,
             "num_transition_cache_hits": 0,
             "num_environment_cache_hits": 0,
             "num_environment_builds": 0,
@@ -1345,13 +2494,30 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             "num_fallback": 0,
         }
         changed = torch.any(parent_configs != target_configs, dim=1)
-        n_changed = int(changed.sum().item())
-        if n_changed and self._should_vmap_proposals(
-            n_changed=n_changed,
+        unresolved = changed.clone()
+        compiled_result = self._compiled_boundary_proposals(
+            parent_configs[changed],
+            target_configs[changed],
+        )
+        if compiled_result is not None:
+            compiled_values, compiled_handled, compiled_stats = compiled_result
+            changed_indices = changed.nonzero(as_tuple=True)[0]
+            handled_indices = changed_indices[compiled_handled]
+            out[handled_indices] = compiled_values.to(
+                dtype=out.dtype,
+                device=out.device,
+            )
+            unresolved[handled_indices] = False
+            for name in compiled_stats:
+                stats[name] += compiled_stats[name]
+
+        n_unresolved = int(unresolved.sum().item())
+        if n_unresolved and self._should_vmap_proposals(
+            n_changed=n_unresolved,
             device=parent_configs.device,
         ):
             vmapped = self._try_vmapped_forward(
-                target_configs[changed],
+                target_configs[unresolved],
                 force=True,
             )
             if vmapped is None and self.proposal_batching == "vmap":
@@ -1361,13 +2527,13 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 # entry point rather than rebuilding one boundary per move.
                 vmapped = _call_amplitude_fn(
                     self,
-                    target_configs[changed],
+                    target_configs[unresolved],
                     chunk_size=chunk_size,
                 )
-                stats["num_vmap_fallback"] = n_changed
+                stats["num_vmap_fallback"] = n_unresolved
             if vmapped is not None:
-                out[changed] = vmapped.to(dtype=out.dtype, device=out.device)
-                stats["num_vmapped"] = n_changed
+                out[unresolved] = vmapped.to(dtype=out.dtype, device=out.device)
+                stats["num_vmapped"] = n_unresolved
                 stats["num_fallback"] = int(
                     (~torch.isfinite(vmapped)).sum().item()
                 )
@@ -1376,7 +2542,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
 
         tn = self._unpack_tn()
         reference = self._reference_tensor()
-        for index in range(parent_configs.shape[0]):
+        for index_tensor in unresolved.nonzero(as_tuple=True)[0]:
+            index = int(index_tensor)
             parent_config = parent_configs[index]
             target_config = target_configs[index]
             if torch.equal(parent_config, target_config):
@@ -1409,6 +2576,53 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             out[index] = value
         self.last_proposal_cache_stats = stats
         return out
+
+    def proposal_log_amplitudes(
+        self,
+        parent_configs,
+        target_configs,
+        *,
+        chunk_size=None,
+    ):
+        """Evaluate proposal log amplitudes through compiled reuse classes."""
+        torch = _require_torch()
+        parent_configs = _as_long_matrix(parent_configs)
+        target_configs = _as_long_matrix(target_configs)
+        compiled_result = self._compiled_boundary_proposals(
+            parent_configs,
+            target_configs,
+            log=True,
+        )
+        if compiled_result is None:
+            return super().proposal_log_amplitudes(
+                parent_configs,
+                target_configs,
+                chunk_size=chunk_size,
+            )
+
+        (compiled_phase, compiled_log_abs), handled, _stats = compiled_result
+        phases = torch.empty(
+            target_configs.shape[0],
+            dtype=compiled_phase.dtype,
+            device=target_configs.device,
+        )
+        log_abs = torch.empty(
+            target_configs.shape[0],
+            dtype=compiled_log_abs.dtype,
+            device=target_configs.device,
+        )
+        phases[handled] = compiled_phase
+        log_abs[handled] = compiled_log_abs
+        unresolved = ~handled
+        if bool(torch.any(unresolved)):
+            fallback_phase, fallback_log_abs = _call_log_amplitude_fn(
+                self.forward_log,
+                target_configs[unresolved],
+                chunk_size=chunk_size,
+            )
+            phases[unresolved] = fallback_phase
+            log_abs[unresolved] = fallback_log_abs
+        return phases, log_abs
 
     def _infer_boundary_geometry(self, tn):
         try:
@@ -1654,6 +2868,9 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 "num_parallel": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
+                "num_compiled_groups": 0,
+                "num_compiled_connections": 0,
+                "num_environment_compiled": 0,
                 "num_strip_cache_hits": 0,
                 "num_strip_builds": 0,
                 "num_alternative_axis_reused": 0,
@@ -1682,6 +2899,9 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 "num_parallel": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
+                "num_compiled_groups": 0,
+                "num_compiled_connections": 0,
+                "num_environment_compiled": 0,
                 "num_strip_cache_hits": 0,
                 "num_strip_builds": 0,
                 "num_alternative_axis_reused": 0,
@@ -1750,6 +2970,9 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             "num_parallel": 0,
             "num_groups": 0,
             "num_grouped_connections": 0,
+            "num_compiled_groups": 0,
+            "num_compiled_connections": 0,
+            "num_environment_compiled": 0,
             "num_environment_cache_hits": 0,
             "num_environment_builds": 0,
             "num_strip_cache_hits": 0,
@@ -1758,11 +2981,13 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             "num_fallback": 0,
         }
 
-        # Group by the first/cheapest boundary strip. Local Hamiltonian terms
-        # often share a parent and a single transverse plane, especially for
-        # PBC edges. They can then reuse one environment pair and one selected
-        # parent-strip template while only their changed projectors differ.
+        # Group by the first/cheapest boundary strip. Compiled geometry
+        # classes are shared across parent walkers, matching the paper's
+        # batched reuse path. Unsupported or over-sized groups retain the
+        # parent-local eager reuse implementation below.
+        compiled_reuse = getattr(self, "_compiled_boundary_reuse", {})
         groups = {}
+        compiled_groups = {}
         fallback_indices = []
         for conn_idx_tensor in offdiag:
             conn_idx = int(conn_idx_tensor)
@@ -1775,9 +3000,72 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 stats["num_fallback"] += 1
                 continue
             axis, indices = windows[0]
-            groups.setdefault((parent_idx, axis, indices), []).append(
-                (conn_idx, windows)
-            )
+            reuse_key = (axis, indices)
+            if (
+                not torch.is_grad_enabled()
+                and reuse_key in compiled_reuse
+            ):
+                compiled_groups.setdefault(reuse_key, []).append(
+                    (conn_idx, parent_idx, windows)
+                )
+            else:
+                groups.setdefault((parent_idx, axis, indices), []).append(
+                    (conn_idx, windows)
+                )
+
+        # A compiled environment builder is also fixed-shape. Populate the
+        # ordinary cache first so both compiled reuse and eager fallback see
+        # one consistent environment snapshot for this local-energy batch.
+        for axis, _indices in compiled_groups:
+            try:
+                stats["num_environment_compiled"] += (
+                    self._populate_compiled_boundary_environments(configs, axis)
+                )
+            except Exception:  # pragma: no cover - backend-specific fallback
+                continue
+
+        # Dispatch each geometry class as one full-batch compiled call. A
+        # local Hamiltonian normally has one or two changed sites, so the
+        # groups below correspond to the paper's one-row/two-row or
+        # one-column/two-column reuse kernels.
+        for (axis, indices), entries in compiled_groups.items():
+            batch_size = int(self._compiled_boundary_batch_size)
+            for start in range(0, len(entries), batch_size):
+                entries_chunk = entries[start:start + batch_size]
+                conn_indices = [entry[0] for entry in entries_chunk]
+                parent_indices = torch.as_tensor(
+                    [entry[1] for entry in entries_chunk],
+                    dtype=torch.long,
+                    device=configs.device,
+                )
+                conn_index_tensor = torch.as_tensor(
+                    conn_indices,
+                    dtype=torch.long,
+                    device=configs.device,
+                )
+                try:
+                    compiled_values = self._compiled_boundary_reuse_batch(
+                        configs[parent_indices],
+                        connections.configs[conn_index_tensor],
+                        axis,
+                        indices,
+                    )
+                except Exception:  # pragma: no cover - backend-specific fallback
+                    compiled_values = None
+                if compiled_values is None:
+                    for conn_idx, parent_idx, windows in entries_chunk:
+                        groups.setdefault(
+                            (parent_idx, axis, indices), []
+                        ).append((conn_idx, windows))
+                    continue
+                out[conn_index_tensor] = compiled_values.to(
+                    dtype=out.dtype,
+                    device=out.device,
+                )
+                stats["num_compiled_groups"] += 1
+                stats["num_compiled_connections"] += len(entries_chunk)
+                stats["num_batched"] += len(entries_chunk)
+                stats["num_reused"] += len(entries_chunk)
 
         stats["num_groups"] = len(groups)
         stats["num_grouped_connections"] = sum(
