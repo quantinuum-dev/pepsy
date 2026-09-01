@@ -1365,6 +1365,43 @@ def test_auto_exponential_mode_uses_symbolic_extension_budget_metadata():
     assert folded_hamiltonian.history_cache_info["extension_plan_orders"] == ()
 
 
+def test_mpo_basis_forwards_auto_budget_and_canonicalizes_storage_aliases():
+    """Convenience wrappers expose one consistent compiled policy surface."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+    canonical = basis.compile_exp(
+        order=2,
+        mode="folded",
+        history_storage="block_sparse",
+    )
+    compatibility = basis.compile_exp(
+        order=2,
+        mode="folded",
+        history_storage="blocks",
+    )
+
+    assert compatibility is canonical
+    batch = basis.exp_batch(
+        0.01,
+        np.array([[0.7, -0.2], [0.2, 0.3]]),
+        order=2,
+        mode="auto",
+        extension_budget=1,
+    )
+    assert batch[0].shape[0] == 2
+    output = basis.evolution_mpo(
+        dt=0.01,
+        coefficients=np.array([0.7, -0.2]),
+        order=2,
+        mode="auto",
+        extension_budget=1,
+    )
+    assert output.metadata["extension_budget"] == 1
+    assert output.metadata["mode"] == "folded"
+
+
 def test_compress_mpo_product_materializes_exact_and_compresses_lazily():
     """MPO products use a lazy target and return an ordinary Quimb MPO."""
     qtn = pytest.importorskip("quimb.tensor")

@@ -89,6 +89,13 @@ def _apply_to_backend(tn, to_backend):
     return tn
 
 
+def _canonical_history_storage(history_storage):
+    """Normalize the compatibility spelling for persistent block storage."""
+    if history_storage == "blocks":
+        return "block_sparse"
+    return history_storage
+
+
 class CompiledMPOExp:
     """Value-only higher-order exponential evaluator for an :class:`MPOBasis`.
 
@@ -174,10 +181,12 @@ class CompiledMPOExp:
                 else "base"
             )
 
+        history_storage = _canonical_history_storage(history_storage)
         if history_storage == "streaming":
             raise ValueError(
                 "compiled evolution requires cached history; use "
-                "history_storage='auto', 'sparse', or 'dense'."
+                "history_storage='auto', 'sparse', 'block_sparse', or "
+                "'reduced'."
             )
 
         self.basis = basis
@@ -530,7 +539,6 @@ class CompiledMPOExp:
         create_bond=False,
         compress_opts=None,
         progress=False,
-        extension_budget=None,
     ):
         """Evaluate ``exp(step * H)`` with optional final compression.
 
@@ -1175,6 +1183,7 @@ class MPOBasis:
         available for existing programs and returns the same cached
         :class:`CompiledMPOExp` object.
         """
+        history_storage = _canonical_history_storage(history_storage)
         key = (
             order,
             mode,
@@ -1687,6 +1696,7 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        extension_budget=None,
     ):
         """Evaluate ``exp(step * H)`` for a batch of coefficient vectors.
 
@@ -1717,6 +1727,7 @@ class MPOBasis:
             "on_exceed": on_exceed,
             "cache_history": cache_history,
             "history_storage": history_storage,
+            "extension_budget": extension_budget,
         }
         if cache_history:
             compiled = self.compile_exp(
@@ -1727,6 +1738,7 @@ class MPOBasis:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 history_storage=history_storage,
+                extension_budget=extension_budget,
             )
             if _backend_name(coefficients) == "jax":
                 import jax  # pylint: disable=import-outside-toplevel
@@ -1825,6 +1837,7 @@ class MPOBasis:
         cache_history=True,
         history_storage="auto",
         progress=False,
+        extension_budget=None,
         chi=None,
         cutoff=1.0e-10,
         cutoff_mode="rel",
@@ -1858,6 +1871,7 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
             progress=progress,
             chi=chi,
             cutoff=cutoff,

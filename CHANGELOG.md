@@ -158,6 +158,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Fixed the higher-order MPO convenience API so `extension_budget` is
+  available consistently on batched and compatibility evolution entry points,
+  while compiled evaluator policy remains fixed at compile time. The
+  compatibility `history_storage="blocks"` alias now shares its compiled cache
+  with the canonical `"block_sparse"` spelling.
+
 - Extended `compress_mpo_product` with `guess_method` and `guess_seed` for
   DMRG/FIT warm starts. The default deterministic SDC guess is retained;
   dense-only `src` and `src-oversample` guesses can now initialize the exact

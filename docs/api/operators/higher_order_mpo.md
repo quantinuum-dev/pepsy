@@ -291,7 +291,9 @@ U_arrays = basis.exp_arrays(
 `basis.exp_batch(step, coefficient_batch, ...)` accepts an array with shape
 `(batch, number_of_terms)` and returns tensors with a leading batch axis. JAX
 and current Torch releases use their native `vmap` implementation when
-available; the fallback loop remains autodiff-safe.
+available; the fallback loop remains autodiff-safe. It accepts the same
+analytical controls as `basis.exp_arrays()`, including `extension_budget` for
+`mode="auto"`.
 
 For repeated calls with the same higher-order policy, compile the value-only
 evaluator explicitly:
