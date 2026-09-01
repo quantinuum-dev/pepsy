@@ -5682,8 +5682,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self._is_mpo_mode(self.mode):
+            # Report the selected compression method rather than the internal
+            # implementation family. For example, ``mode="mpo"`` and
+            # ``mode="direct"`` both report ``direct.replay``.
+            replay_name = self._mode_mpo_method(self.mode)
             self._timed_call(
-                "mpo.replay",
+                f"{replay_name}.replay",
                 self._run_mpo,
                 G_seq,
                 where_seq,
@@ -10486,6 +10490,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         mpo_method = self._normalize_submpo_method(submpo_method)
+        # ``mpo`` is the internal backend name; expose the selected Quimb
+        # compressor in timing records instead (``direct``, ``src``, etc.).
+        timing_name = mpo_method
         gate_cutoff_mode = (
             _DEFAULT_CUTOFF_MODE
             if cutoff_mode is None
@@ -10585,7 +10592,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         p, (xmin, xmax)
                     )
                     self._timed_call(
-                        "mpo.stabilize",
+                        f"{timing_name}.stabilize",
                         self._stabilize_unitary_compression_state,
                         p,
                         (xmin, xmax),
@@ -10648,7 +10655,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         p, (xmin, xmax)
                     )
                     self._timed_call(
-                        "mpo.stabilize",
+                        f"{timing_name}.stabilize",
                         self._stabilize_unitary_compression_state,
                         p,
                         (xmin, xmax),

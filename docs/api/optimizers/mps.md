@@ -606,10 +606,13 @@ timing is disabled, so the normal mixed path performs no profiling clock
 reads. The measured replay interval begins after argument validation and any
 temporary layout setup; it ends before temporary layout restoration and
 before `get_run_timing()` makes its defensive result copy.
-It also contains inclusive `stages` totals for the active mode replay,
+It also contains inclusive `stages` totals for the active compression-method
+replay, such as `direct.replay` or `src.replay`, together with
 `canonicalize`, `gate.apply`, `dmrg.target`, `dmrg.fit`,
 `normalization`, `control.<event>`, and (when enabled)
-`<mode>.stabilize`. Stage totals can overlap with the mode replay total; use
+`<method>.stabilize`. The internal MPO implementation is therefore not
+exposed as the timing label. Stage totals can overlap with the method replay
+total; use
 them to identify the dominant work, not to add into a second total. DMRG and
 mixed-mode timing also
 expose

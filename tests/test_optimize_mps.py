@@ -470,7 +470,7 @@ def test_mps_optimizer_opt_in_run_timing_reports_replay_metrics():
     assert timing["event_count"] == 1
     assert timing["elapsed_seconds"] >= 0.0
     assert timing["final_bond"] <= 2
-    assert timing["stages"]["mpo.replay"]["calls"] == 1
+    assert timing["stages"]["direct.replay"]["calls"] == 1
     assert timing["stages"]["canonicalize"]["calls"] >= 1
     assert not any(name.startswith("infidelity.") for name in timing["stages"])
     timing["mode"] = "changed"
@@ -978,6 +978,31 @@ def test_mps_optimizer_runs_bare_quimb_method_mode(mode):
 
     assert optimizer.mode == f"quimb-{mode}"
     assert out.max_bond() <= 2
+
+
+@pytest.mark.parametrize(
+    "mode, timing_name",
+    [("mpo", "direct"), ("quimb-src", "src")],
+)
+def test_mps_optimizer_timing_names_follow_quimb_method(mode, timing_name):
+    """MPO-family timing stages expose the selected compressor name."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode=mode,
+    )
+
+    optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+        timing=True,
+    )
+
+    stages = optimizer.get_run_timing()["stages"]
+    assert stages[f"{timing_name}.replay"]["calls"] == 1
+    assert stages[f"{timing_name}.stabilize"]["calls"] == 1
 
 
 @pytest.mark.parametrize(
@@ -8536,7 +8561,8 @@ def test_standalone_compression_modes_honor_unitary_stabilization(mode):
         0.5, abs=2.0e-5
     )
     assert stabilized.get_norm_events()[0]["kind"] == "unitary_compression"
-    assert stabilized.get_run_timing()["stages"][f"{mode}.stabilize"]["calls"] == 1
+    timing_name = "direct" if mode == "mpo" else mode
+    assert stabilized.get_run_timing()["stages"][f"{timing_name}.stabilize"]["calls"] == 1
 
 
 @pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
