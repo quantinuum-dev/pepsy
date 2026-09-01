@@ -611,12 +611,7 @@ def _resolve(value, parameters, to_backend=None):
         value = value.resolve(parameters)
     if callable(value):
         value = value(parameters)
-    if (
-        to_backend is not None
-        and _backend_name(value) in {"builtins", "numpy"}
-    ):
-        value = to_backend(value)
-    return value
+    return _cluster_to_backend(value, to_backend)
 
 
 def _cluster_to_backend(value, to_backend):
@@ -626,7 +621,17 @@ def _cluster_to_backend(value, to_backend):
         to_backend is not None
         and _backend_name(value) in {"builtins", "numpy"}
     ):
-        return to_backend(value)
+        try:
+            return to_backend(value)
+        except (TypeError, ValueError):
+            # A real-valued backend converter may intentionally reject a
+            # complex scalar such as ``-1j * dt``. Let backend arithmetic
+            # promote the scalar alongside the converted tensor blocks; do
+            # not turn this common real-operator/complex-step case into an
+            # avoidable API failure.
+            if np.iscomplexobj(value):
+                return value
+            raise
     return value
 
 
@@ -1643,6 +1648,67 @@ class MPOClusterProductExpansion:
             residuals[cluster] = residual
         return residuals
 
+    def _graph_span_cores(
+        self,
+        cluster,
+        residual,
+        *,
+        residuals=None,
+        include_background=False,
+    ):
+        """Embed a graph residual without densifying its MPO chain span."""
+
+        cluster = tuple(cluster)
+        cluster_cores = _operator_schmidt(
+            residual,
+            len(cluster),
+            self.phys_dim,
+            self.cutoff,
+            self.max_bond,
+        )
+
+        def gap_core(left_rank, right_rank, operator):
+            if left_rank != right_rank:
+                raise ValueError(
+                    "graph residual factorization has incompatible virtual "
+                    "ranks across a chain gap."
+                )
+            rank = int(left_rank)
+            array = ar.do(
+                "zeros",
+                (rank, rank, self.phys_dim, self.phys_dim),
+                like=residual,
+            )
+            values = ar.do("stack", (operator,) * rank, axis=0)
+            return _scatter_add_2d(
+                array,
+                np.arange(rank, dtype=int),
+                np.arange(rank, dtype=int),
+                values,
+            )
+
+        span_cores = []
+        for index, site in enumerate(cluster):
+            if index:
+                left_rank = int(cluster_cores[index - 1].shape[1])
+                right_rank = int(cluster_cores[index].shape[0])
+                for gap_site in range(cluster[index - 1] + 1, site):
+                    if include_background:
+                        if residuals is None:
+                            raise ValueError(
+                                "residuals are required when graph-span "
+                                "background cores are requested."
+                            )
+                        operator = _as_backend(
+                            residuals[(gap_site,)],
+                            like=residual,
+                        )
+                    else:
+                        operator = _identity(self.phys_dim, like=residual)
+                    span_cores.append(gap_core(left_rank, right_rank, operator))
+            span_cores.append(cluster_cores[index])
+        return tuple(span_cores)
+
     def _residuals(self, step, parameters):
         if self.graph is not None:
             return self._graph_residuals(step, parameters)
@@ -1668,40 +1734,11 @@ class MPOClusterProductExpansion:
         for cluster, residual in residuals.items():
             if len(cluster) == 1:
                 continue
-            start, end = min(cluster), max(cluster)
-            span_sites = tuple(range(start, end + 1))
-            positions = tuple(span_sites.index(site) for site in cluster)
-            embedded = _embed_matrix_on_positions(
+            cores[cluster] = self._graph_span_cores(
+                cluster,
                 residual,
-                positions,
-                len(span_sites),
-                self.phys_dim,
-            )
-            # A graph cluster can skip sites in the MPO chain.  The skipped
-            # sites still carry the singleton background in the corresponding
-            # partition contribution.  Embedding an identity there is only
-            # correct when the singleton factor itself is identity; omitting
-            # it otherwise drops terms such as K_(0,2) U_1.  Include the
-            # background before the local Schmidt factorization so a cluster
-            # path represents the same partition contribution as the graph
-            # residual recursion.
-            for site in span_sites:
-                if site in cluster:
-                    continue
-                background = _embed_matrix_on_positions(
-                    residuals[(site,)],
-                    (span_sites.index(site),),
-                    len(span_sites),
-                    self.phys_dim,
-                )
-                background = _as_backend(background, like=embedded)
-                embedded = ar.do("matmul", embedded, background)
-            cores[cluster] = _operator_schmidt(
-                embedded,
-                len(span_sites),
-                self.phys_dim,
-                self.cutoff,
-                self.max_bond,
+                residuals=residuals,
+                include_background=True,
             )
 
         state_lists = [[("rail",)]]
@@ -1836,21 +1873,9 @@ class MPOClusterProductExpansion:
         for cluster, residual in residuals.items():
             if len(cluster) == 1:
                 continue
-            start, end = min(cluster), max(cluster)
-            span_sites = tuple(range(start, end + 1))
-            positions = tuple(span_sites.index(site) for site in cluster)
-            embedded = _embed_matrix_on_positions(
+            pure_cores[cluster] = self._graph_span_cores(
+                cluster,
                 residual,
-                positions,
-                len(span_sites),
-                self.phys_dim,
-            )
-            pure_cores[cluster] = _operator_schmidt(
-                embedded,
-                len(span_sites),
-                self.phys_dim,
-                self.cutoff,
-                self.max_bond,
             )
 
         collection_cores = []
