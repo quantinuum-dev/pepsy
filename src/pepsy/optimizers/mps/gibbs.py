@@ -28,7 +28,7 @@ from ...operators.mpo_higher_order import (
     MPOBasis,
     MPOProductTerm,
 )
-from ...tensors.constructors import bell_ro_mps
+from ...tensors.constructors import bell_to_mps
 from .optimizer import MpsOptimizer
 
 __all__ = ["GibbsMps"]
@@ -257,7 +257,7 @@ class GibbsMps:
         if beta is not None:
             values.append(beta)
         dtype = _host_dtype(values)
-        return bell_ro_mps(
+        return bell_to_mps(
             self.length,
             phys_dim=self.phys_dim,
             dtype=dtype,

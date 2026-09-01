@@ -18,7 +18,7 @@ from .._internal.quimb import quimb_lattice_bond_map
 
 __all__ = [
     "add_cycle", "id_to_pepo", "id_to_mpo", "tns_align", "expec_mpo",
-    "ps_to_peps", "ps_to_3dpeps", "bell_ro_mps", "ps_to_mps", "ps_to_ttn",
+    "ps_to_peps", "ps_to_3dpeps", "bell_to_mps", "ps_to_mps", "ps_to_ttn",
     "hrs_to_ttn",
     "ps_to_pepo", "ps_to_mpo", "random_haar_qubit", "haar_random_state",
     "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn",
@@ -663,7 +663,7 @@ def _set_fermionic_product_site(tensor, physical_index, *, charge, basis_index):
     tensor.modify(data=data)
 
 
-def bell_ro_mps(
+def bell_to_mps(
     L: int,
     phys_dim: int = 2,
     dtype: str = "complex128",

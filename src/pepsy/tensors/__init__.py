@@ -64,7 +64,7 @@ _register(
 _register(
     ".constructors",
     "add_cycle",
-    "bell_ro_mps",
+    "bell_to_mps",
     "expec_mpo",
     "haar_random_state",
     "hrs_to_mps",

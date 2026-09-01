@@ -18,7 +18,7 @@ surfaces:
   constructor and symmetry-preserving imaginary-time gates.
 
 The compatibility decision is **adopt** for the ordinary dense/Autoray path:
-`bell_ro_mps` uses Quimb's `MatrixProductState` constructor and
+`bell_to_mps` uses Quimb's `MatrixProductState` constructor and
 `apply_to_arrays`; term operators, exponential gates, MPS replay, and the
 traced MPO all stay on the selected backend. Generated gate streams are passed
 through the same converter before installation. The class uses `MpsOptimizer`'s

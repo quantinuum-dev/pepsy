@@ -4,7 +4,7 @@
 ordinary MPS gate replay:
 
 ```python
-from pepsy import bell_ro_mps
+from pepsy import bell_to_mps
 from pepsy.optimizers import GibbsMps
 
 terms = [
@@ -22,7 +22,7 @@ Z = gibbs.partition_function()
 ```
 
 The reusable identity purification is also available directly as
-`pepsy.bell_ro_mps(L, phys_dim=2, normalized=True, to_backend=...)`. It is a
+`pepsy.bell_to_mps(L, phys_dim=2, normalized=True, to_backend=...)`. It is a
 Quimb `MatrixProductState`, so it can be inspected, converted with
 `apply_to_arrays`, or passed to other MPS workflows before any thermal gates
 are applied.

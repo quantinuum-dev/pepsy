@@ -4,13 +4,13 @@ import numpy as np
 import pytest
 from scipy.linalg import expm
 
-from pepsy import GibbsMps, bell_ro_mps
+from pepsy import GibbsMps, bell_to_mps
 from pepsy.operators import MPOBasis
 
 
-def test_bell_ro_mps_is_a_quimb_interleaved_identity_purification():
+def test_bell_to_mps_is_a_quimb_interleaved_identity_purification():
     """The reusable Bell constructor has the same layout as GibbsMps."""
-    state = bell_ro_mps(2)
+    state = bell_to_mps(2)
 
     assert state.L == 4
     assert state.cyclic is False
@@ -20,7 +20,7 @@ def test_bell_ro_mps_is_a_quimb_interleaved_identity_purification():
         atol=1.0e-12,
     )
 
-    cyclic = bell_ro_mps(2, cyclic=True)
+    cyclic = bell_to_mps(2, cyclic=True)
     assert cyclic.cyclic is True
 
 
