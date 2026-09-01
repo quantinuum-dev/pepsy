@@ -1,0 +1,145 @@
+"""Tests for purified finite-temperature MPS preparation."""
+
+import numpy as np
+import pytest
+from scipy.linalg import expm
+
+from pepsy import GibbsMps
+from pepsy.operators import MPOBasis
+
+
+def test_gibbs_mps_uses_interleaved_bell_pairs_and_traces_ancillas():
+    """The beta-zero purification reduces to the normalized identity."""
+    state = GibbsMps([(("Z", 0.3), 0)], shape=2)
+
+    assert state.mps.L == 4
+    assert state.physical_sites == (0, 2)
+    assert state.ancilla_sites == (1, 3)
+    assert state.mps.cyclic is False
+    assert state.mps.norm() == pytest.approx(1.0)
+
+    dense = np.asarray(state.to_dense())
+    np.testing.assert_allclose(dense, np.eye(4) / 4.0, atol=1.0e-12)
+    assert state.trace() == pytest.approx(1.0)
+    assert state.partition_function() == pytest.approx(4.0)
+
+
+def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
+    """Second-order imaginary-time replay converges to the exact Gibbs state."""
+    terms = [
+        (("ZZ", 0.7), (0, 1)),
+        (("X", -0.2), 0),
+    ]
+    state = GibbsMps(terms, shape=2)
+    state.prepare(0.4, n_steps=40, chi=32, mode="mpo", cutoff=0.0)
+
+    z = np.diag([1.0, -1.0])
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    hamiltonian = 0.7 * np.kron(z, z) - 0.2 * np.kron(x, np.eye(2))
+    exact = expm(-0.4 * hamiltonian)
+    exact /= np.trace(exact)
+
+    np.testing.assert_allclose(
+        np.asarray(state.to_dense()),
+        exact,
+        atol=1.0e-7,
+        rtol=1.0e-7,
+    )
+    assert state.optimizer is not None
+    assert state.optimizer.norm_diagnostics()["tracking"] is True
+    assert state.optimizer._unitary_previous_norm is None
+
+
+def test_gibbs_mps_accepts_lattice_terms_through_one_d_map():
+    """Regular-lattice terms use the same OneDMap traversal as MPOBasis."""
+    terms = [
+        {"operator": "Z", "location": (0, 0), "coefficient": 0.2},
+        {"operator": "ZZ", "location": ((0, 0), (1, 0)), "coefficient": 0.4},
+    ]
+    state = GibbsMps(terms, shape=(2, 2), map_mode="row-major")
+
+    expected_basis = MPOBasis.from_terms(terms, shape=(2, 2), map_mode="row-major")
+    assert state.length == 4
+    assert state.mapper.mode == "row-major"
+    assert state.basis.lattice_to_chain == expected_basis.lattice_to_chain
+    assert state.basis.terms[1].sites == (
+        expected_basis.lattice_to_chain[(0, 0)],
+        expected_basis.lattice_to_chain[(1, 0)],
+    )
+
+
+def test_gibbs_mps_materializes_term_generators_once():
+    """Generator-based term input remains available for backend inference."""
+    terms = ((("Z", 0.2), site) for site in range(2))
+    state = GibbsMps(terms, shape=2)
+
+    assert state.basis.num_terms == 2
+    assert state.mps.L == 4
+
+
+def test_gibbs_mps_rejects_unsupported_multisite_and_string_gap_terms():
+    """The first step reports unsupported gate arities explicitly."""
+    with pytest.raises(NotImplementedError, match="only one- and two-site"):
+        GibbsMps([(("XXX", 0.1), (0, 1, 2))], shape=3)
+
+    with pytest.raises(NotImplementedError, match="string operators across"):
+        GibbsMps(
+            [
+                {
+                    "operator": "XX",
+                    "location": (0, 2),
+                    "coefficient": 0.1,
+                    "string_operators": ("Z",),
+                }
+            ],
+            shape=3,
+        )
+
+
+def test_gibbs_mps_rejects_layout_override_during_replay():
+    """Ancilla positions remain meaningful only without MPS reordering."""
+    state = GibbsMps([(("ZZ", 0.1), (0, 1))], shape=2)
+
+    with pytest.raises(TypeError, match="layout"):
+        state.prepare(0.1, n_steps=1, run_kwargs={"layout": "quality"})
+
+
+def test_gibbs_mps_keeps_identity_snapshot_with_inplace_optimizer():
+    """The identity accessor remains un evolved even for in-place replay."""
+    state = GibbsMps([(("Z", 0.1), 0)], shape=1)
+    state.prepare(
+        0.2,
+        n_steps=1,
+        optimizer_kwargs={"inplace": True},
+        cutoff=0.0,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(
+            state.identity_mps.partial_trace_to_mpo(
+                keep=state.physical_sites,
+                upper_ind_id="b{}",
+            ).to_dense()
+        ),
+        np.eye(2) / 2.0,
+        atol=1.0e-12,
+    )
+
+
+def test_gibbs_mps_keeps_explicit_backend_for_state_and_gates():
+    """Explicit ``to_backend`` reaches Bell tensors, gates, and the MPO."""
+    torch = pytest.importorskip("torch")
+    import pepsy
+
+    backend = pepsy.backend_torch(dtype=torch.complex128, device="cpu")
+    state = GibbsMps(
+        [(("ZZ", 0.4), (0, 1)), (("X", -0.1), 0)],
+        shape=2,
+        to_backend=backend,
+    )
+    state.prepare(0.2, n_steps=2, chi=16, cutoff=0.0)
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in state.mps)
+    assert all(isinstance(gate, torch.Tensor) for gate, _where in state.gates)
+    rho = state.to_mpo(normalized=False)
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in rho)

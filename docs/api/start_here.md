@@ -14,6 +14,7 @@ signatures, members, and source links.
 | Prepare and contract a PEPS norm | `pepsy.boundary` | [Boundary metrics](boundary/metrics.md), [boundary states](boundary/states.md) |
 | Apply gates and build operators | `pepsy.operators` | [Gates](operators/gates.md), [Hamiltonians](operators/hamiltonians.md) |
 | Evolve an MPS circuit | `pepsy.optimizers.mps` | [MPS optimization](optimizers/mps.md) |
+| Prepare a Gibbs state with MPS purification | `pepsy.optimizers.mps` | [GibbsMps](optimizers/gibbs_mps.md) |
 | Evolve or clean up a PEPS | `pepsy.optimizers.peps` | [PEPS optimization](optimizers/peps.md) |
 | Run boundary sweeps | `pepsy.optimizers.sweep` | [Sweep optimization](optimizers/sweep.md) |
 | Replay a circuit on a tree | `pepsy.optimizers.tree` | [Tree optimization](optimizers/tree.md) |
@@ -42,6 +43,9 @@ signatures, members, and source links.
 - {py:class}`MpsOptimizer <pepsy.optimizers.mps.optimizer.MpsOptimizer>` replays
   one-dimensional gate streams with exact, MPO, FIT,
   DMRG, and mixed modes. See [MPS optimization](optimizers/mps.md).
+- {py:class}`GibbsMps <pepsy.optimizers.mps.gibbs.GibbsMps>` prepares a
+  finite-temperature purification from Hamiltonian terms and traces ancillas
+  to an MPO. See [GibbsMps](optimizers/gibbs_mps.md).
 - {py:class}`PepsOptimizer <pepsy.optimizers.peps.optimizer.PepsOptimizer>`
   applies gates to PEPS and optionally performs boundary or
   global cleanup. See [PEPS optimization](optimizers/peps.md).

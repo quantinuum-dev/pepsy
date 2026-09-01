@@ -41,6 +41,7 @@ LeakageRecord
 MeasurementRecord
 MpoChannelEvent
 MpoOptimizer
+GibbsMps
 MpsBatchSampleResult
 MpsDiagonalEstimate
 MpsEnergyOptimizer

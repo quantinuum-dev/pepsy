@@ -117,6 +117,7 @@ _SYMBOL_MODULES = {
     "GlobalOptimizer": ".optimizers",
     "MpoOptimizer": ".optimizers",
     "MpoChannelEvent": ".optimizers",
+    "GibbsMps": ".optimizers",
     "MpsEnergyOptimizer": ".optimizers",
     "MpsOptimizer": ".optimizers",
     "MpsStabOptimizer": ".optimizers",

@@ -1,5 +1,9 @@
 # `pepsy.optimizers.mps.optimizer`
 
+For finite-temperature preparation from Hamiltonian terms, see the dedicated
+[`GibbsMps` guide](gibbs_mps.md). It uses an interleaved physical/ancilla MPS
+and delegates non-unitary gate replay to this optimizer.
+
 ## Torch SVD policy
 
 Torch/Autoray SVD dispatch is process-global, so configure it once at

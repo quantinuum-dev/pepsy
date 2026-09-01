@@ -31,6 +31,7 @@ _SYMBOL_MODULES = {
     "load_qmera_prototype_layout": ".qmera",
     "MpoOptimizer": ".mpo",
     "MpoChannelEvent": ".mpo",
+    "GibbsMps": ".mps",
     "MpsOptimizer": ".mps",
     "MPIRankDiagnostics": ".mpi",
     "MPIShotError": ".mpi",

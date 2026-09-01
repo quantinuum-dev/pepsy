@@ -14,6 +14,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added `GibbsMps`, a first finite-temperature purification API. It builds an
+  interleaved physical/ancilla MPS from Bell pairs, applies backend-aware
+  second-order imaginary-time Trotter gates through `MpsOptimizer`, supports
+  `MPOBasis` one-dimensional and `OneDMap` lattice terms, and traces ancillas
+  back to a thermal MPO.
+
 - Added bounded graph-cluster assembly controls to `exp_mpo_cluster` and
   `MPOBasis.compile_graph_cluster_expansion`. The default
   `graph_assembly="auto"` protects wide MPO orderings with a finite

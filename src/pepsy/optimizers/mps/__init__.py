@@ -3,6 +3,7 @@
 from importlib import import_module
 
 from .layout import MpsGateStreamLayoutFinder
+from .gibbs import GibbsMps
 from .optimizer import (
     MpsOptimizer,
     guess,
@@ -13,6 +14,7 @@ from .optimizer import (
 )
 
 __all__ = [
+    "GibbsMps",
     "MpsOptimizer",
     "guess",
     "MpsGateStreamLayoutFinder",
