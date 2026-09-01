@@ -18,7 +18,8 @@ from .._internal.quimb import quimb_lattice_bond_map
 
 __all__ = [
     "add_cycle", "id_to_pepo", "id_to_mpo", "tns_align", "expec_mpo",
-    "ps_to_peps", "ps_to_3dpeps", "ps_to_mps", "ps_to_ttn", "hrs_to_ttn",
+    "ps_to_peps", "ps_to_3dpeps", "bell_ro_mps", "ps_to_mps", "ps_to_ttn",
+    "hrs_to_ttn",
     "ps_to_pepo", "ps_to_mpo", "random_haar_qubit", "haar_random_state",
     "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn",
 ]
@@ -660,6 +661,100 @@ def _set_fermionic_product_site(tensor, physical_index, *, charge, basis_index):
             f"no compatible Symmray block exists for physical charge {charge!r}."
         )
     tensor.modify(data=data)
+
+
+def bell_ro_mps(
+    L: int,
+    phys_dim: int = 2,
+    dtype: str = "complex128",
+    normalized: bool = True,
+    cyclic: bool = False,
+    *,
+    to_backend=None,
+    site_ind_id: str = "k{}",
+    site_tag_id: str = "I{}",
+):
+    r"""Create an interleaved Bell-pair purification MPS.
+
+    The returned MPS has ``2 * L`` sites in the order
+    ``(physical_0, ancilla_0, physical_1, ancilla_1, ...)``.  Its physical
+    and ancilla sites are maximally entangled pairwise, so tracing the odd
+    sites gives ``I / phys_dim**L`` when ``normalized=True``.  This is the
+    identity purification used by :class:`pepsy.optimizers.GibbsMps`.
+
+    Parameters
+    ----------
+    L : int
+        Number of physical sites, and therefore number of Bell pairs.
+    phys_dim : int, default=2
+        Local dimension of each physical and ancilla site.
+    dtype : str or numpy.dtype, default="complex128"
+        Host dtype used to construct the MPS before optional conversion.
+    normalized : bool, default=True
+        If true, each Bell pair has amplitude ``1 / sqrt(phys_dim)``.
+    cyclic : bool, default=False
+        Whether to close the virtual MPS boundary. The Bell-pair layout is
+        compatible with cyclic Quimb MPS construction, although canonical
+        open-chain optimizers such as :class:`MpsOptimizer` still require
+        ``cyclic=False``.
+    to_backend : callable, optional
+        Converter applied once through Quimb's ``apply_to_arrays`` traversal.
+    site_ind_id, site_tag_id : str, optional
+        Quimb format strings for physical index and site tag names.
+
+    Returns
+    -------
+    quimb.tensor.MatrixProductState
+        The Bell-pair purification MPS.
+    """
+    if isinstance(L, bool) or not isinstance(L, Integral):
+        raise TypeError("L must be a positive integer.")
+    if int(L) < 1:
+        raise ValueError("L must be a positive integer.")
+    if isinstance(phys_dim, bool) or not isinstance(phys_dim, Integral):
+        raise TypeError("phys_dim must be a positive integer.")
+    if int(phys_dim) < 1:
+        raise ValueError("phys_dim must be a positive integer.")
+    if to_backend is not None and not callable(to_backend):
+        raise TypeError("to_backend must be callable or None.")
+
+    L = int(L)
+    phys_dim = int(phys_dim)
+    try:
+        dtype = np.dtype(dtype)
+    except TypeError as exc:
+        raise TypeError(f"invalid dtype {dtype!r}.") from exc
+
+    bell_scale = 1.0 / np.sqrt(phys_dim) if normalized else 1.0
+    arrays = []
+    for site in range(L):
+        if cyclic or site != 0:
+            first = np.zeros((1, phys_dim, phys_dim), dtype=dtype)
+            for basis_index in range(phys_dim):
+                first[0, basis_index, basis_index] = bell_scale
+        else:
+            first = np.zeros((phys_dim, phys_dim), dtype=dtype)
+            np.fill_diagonal(first, bell_scale)
+        arrays.append(first)
+
+        if cyclic or site != L - 1:
+            second = np.zeros((phys_dim, 1, phys_dim), dtype=dtype)
+            for basis_index in range(phys_dim):
+                second[basis_index, 0, basis_index] = 1.0
+        else:
+            second = np.zeros((phys_dim, phys_dim), dtype=dtype)
+            np.fill_diagonal(second, 1.0)
+        arrays.append(second)
+
+    mps = qtn.MatrixProductState(
+        arrays,
+        shape="lrp",
+        site_ind_id=site_ind_id,
+        site_tag_id=site_tag_id,
+    )
+    if to_backend is not None:
+        mps.apply_to_arrays(to_backend)
+    return mps
 
 
 def ps_to_mps(

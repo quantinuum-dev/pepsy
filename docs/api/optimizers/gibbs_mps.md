@@ -4,6 +4,7 @@
 ordinary MPS gate replay:
 
 ```python
+from pepsy import bell_ro_mps
 from pepsy.optimizers import GibbsMps
 
 terms = [
@@ -19,6 +20,12 @@ rho = gibbs.to_mpo()                    # normalized, Tr(rho) = 1
 rho_raw = gibbs.to_mpo(normalized=False)
 Z = gibbs.partition_function()
 ```
+
+The reusable identity purification is also available directly as
+`pepsy.bell_ro_mps(L, phys_dim=2, normalized=True, to_backend=...)`. It is a
+Quimb `MatrixProductState`, so it can be inspected, converted with
+`apply_to_arrays`, or passed to other MPS workflows before any thermal gates
+are applied.
 
 The internal MPS has `2 * L` sites in the order
 `(physical_0, ancilla_0, physical_1, ancilla_1, ...)`. Physical site `i` is
@@ -79,6 +86,26 @@ always sets `non_unitary=True`; unitary stabilization and unitary overlap
 diagnostics are not used. `to_backend` is forwarded through term compilation,
 Bell-pair construction, generated exponentials, MPS replay, and ancilla
 tracing.
+
+Common compression controls can be passed directly:
+
+```python
+gibbs.prepare(
+    beta=0.4,
+    n_steps=8,
+    mode="dmrg",             # "direct", "mpo", "dmrg1", "dmrg2", ...
+    chi=128,
+    contraction_opt="auto",
+    n_iter=4,
+    normalize_every=True,
+    normalize_final=True,
+)
+```
+
+The remaining `MpsOptimizer` constructor options and run options are available
+through `optimizer_kwargs={...}` and `run_kwargs={...}`. Normalization is
+non-unitary scale bookkeeping: the optimizer stores removed scale in its
+exponent, so `to_mpo(normalized=False)` still represents the same raw operator.
 
 The returned `GibbsMps` object stores the live optimizer in `gibbs.optimizer`,
 the prepared gate stream in `gibbs.gates`, and the requested temperature in

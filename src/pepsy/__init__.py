@@ -180,6 +180,7 @@ if TYPE_CHECKING:
         fermion_density_param_gen,
         fermion_hopping_param_gen,
         fermion_interaction_param_gen,
+        bell_ro_mps,
         expec_mpo,
         haar_random_state,
         hrs_to_mps,

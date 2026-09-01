@@ -263,6 +263,7 @@ _SYMBOL_MODULES = {
     "fermion_hopping_param_gen": ".tensors",
     "fermion_interaction_param_gen": ".tensors",
     "expec_mpo": ".tensors",
+    "bell_ro_mps": ".tensors",
     "haar_random_state": ".tensors",
     "hrs_to_mps": ".tensors",
     "hrs_to_peps": ".tensors",

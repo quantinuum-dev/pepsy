@@ -25,6 +25,7 @@ DeferredInjectionReport
 DeferredProjectionRecord
 FDSolver
 FIT
+bell_ro_mps
 Fermion
 FermionConfigurationEncoding
 FermionLatticeSetup

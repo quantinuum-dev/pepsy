@@ -4,8 +4,24 @@ import numpy as np
 import pytest
 from scipy.linalg import expm
 
-from pepsy import GibbsMps
+from pepsy import GibbsMps, bell_ro_mps
 from pepsy.operators import MPOBasis
+
+
+def test_bell_ro_mps_is_a_quimb_interleaved_identity_purification():
+    """The reusable Bell constructor has the same layout as GibbsMps."""
+    state = bell_ro_mps(2)
+
+    assert state.L == 4
+    assert state.cyclic is False
+    np.testing.assert_allclose(
+        np.asarray(state.partial_trace_to_mpo(keep=(0, 2)).to_dense()),
+        np.eye(4) / 4.0,
+        atol=1.0e-12,
+    )
+
+    cyclic = bell_ro_mps(2, cyclic=True)
+    assert cyclic.cyclic is True
 
 
 def test_gibbs_mps_uses_interleaved_bell_pairs_and_traces_ancillas():
@@ -48,6 +64,26 @@ def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
     assert state.optimizer is not None
     assert state.optimizer.norm_diagnostics()["tracking"] is True
     assert state.optimizer._unitary_previous_norm is None
+
+
+def test_gibbs_mps_forwards_direct_mps_controls_and_normalization():
+    """Common MpsOptimizer controls are available without nested kwargs."""
+    state = GibbsMps([(("ZZ", 0.7), (0, 1))], shape=2)
+    state.prepare(
+        0.2,
+        n_steps=2,
+        chi=8,
+        mode="direct",
+        contraction_opt="auto",
+        n_iter=1,
+        normalize_every=True,
+        normalize_final=True,
+        cutoff=0.0,
+    )
+
+    assert state.optimizer.mode == "quimb-direct"
+    assert state.optimizer.get_normalizations()
+    assert np.isfinite(float(np.real(state.trace())))
 
 
 def test_gibbs_mps_accepts_lattice_terms_through_one_d_map():
@@ -143,3 +179,27 @@ def test_gibbs_mps_keeps_explicit_backend_for_state_and_gates():
     assert all(isinstance(gate, torch.Tensor) for gate, _where in state.gates)
     rho = state.to_mpo(normalized=False)
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in rho)
+
+
+def test_gibbs_mps_preserves_autograd_gate_payloads():
+    """Backend placement must not detach differentiable generated gates."""
+    torch = pytest.importorskip("torch")
+    import pepsy
+
+    beta = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+    coefficient = torch.tensor(0.4, dtype=torch.float64, requires_grad=True)
+    backend = pepsy.backend_torch(dtype=torch.complex128, device="cpu")
+    state = GibbsMps(
+        [(("Z", coefficient), 0)],
+        shape=1,
+        to_backend=backend,
+    )
+    state.prepare(beta, n_steps=2, chi=8, cutoff=0.0)
+    loss = torch.real(state.to_mpo(normalized=False).to_dense()[0, 0])
+    grad_beta, grad_coefficient = torch.autograd.grad(
+        loss,
+        (beta, coefficient),
+    )
+
+    assert torch.isfinite(grad_beta)
+    assert torch.isfinite(grad_coefficient)

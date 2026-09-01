@@ -18,7 +18,6 @@ from numbers import Integral
 
 import autoray as ar
 import numpy as np
-import quimb.tensor as qtn
 
 from ...backends.convert import (
     infer_backend_converter_from_sample,
@@ -29,6 +28,7 @@ from ...operators.mpo_higher_order import (
     MPOBasis,
     MPOProductTerm,
 )
+from ...tensors.constructors import bell_ro_mps
 from .optimizer import MpsOptimizer
 
 __all__ = ["GibbsMps"]
@@ -106,11 +106,6 @@ def _host_dtype(values):
     if dtype.kind in "biu":
         return np.dtype("float64")
     return dtype
-
-
-def _as_backend(value, to_backend):
-    """Convert a freshly-created host array through the selected backend."""
-    return value if to_backend is None else to_backend(value)
 
 
 class GibbsMps:
@@ -262,26 +257,12 @@ class GibbsMps:
         if beta is not None:
             values.append(beta)
         dtype = _host_dtype(values)
-        bell_scale = 1.0 / np.sqrt(self.phys_dim) if self.normalized else 1.0
-        arrays = []
-        for site in range(self.length):
-            first = np.zeros((self.phys_dim, self.phys_dim), dtype=dtype)
-            np.fill_diagonal(first, bell_scale)
-            if site == 0:
-                arrays.append(_as_backend(first, self.to_backend))
-            else:
-                arrays.append(_as_backend(first[None, ...], self.to_backend))
-
-            second = np.zeros((self.phys_dim, self.phys_dim), dtype=dtype)
-            np.fill_diagonal(second, 1.0)
-            if site == self.length - 1:
-                arrays.append(_as_backend(second, self.to_backend))
-            else:
-                arrays.append(_as_backend(second[:, None, :], self.to_backend))
-
-        return qtn.MatrixProductState(
-            arrays,
-            shape="lrp",
+        return bell_ro_mps(
+            self.length,
+            phys_dim=self.phys_dim,
+            dtype=dtype,
+            normalized=self.normalized,
+            to_backend=self.to_backend,
             site_ind_id="k{}",
             site_tag_id="I{}",
         )
@@ -293,6 +274,20 @@ class GibbsMps:
         generator = ar.do("multiply", operator, scale)
         return ar.do("reshape", ar.do("linalg.expm", generator),
                      (self.phys_dim,) * (2 * len(term.sites)))
+
+    def _convert_gate_stream(self, gates):
+        """Place generated gates on the same backend as the purification."""
+        if self.to_backend is None:
+            return gates
+        return tuple(
+            (
+                self.to_backend(gate)
+                if _backend_name(gate) in {"builtins", "numpy"}
+                else gate,
+                where,
+            )
+            for gate, where in gates
+        )
 
     def _build_trotter_stream(self, coefficients, step, n_steps):
         """Build a symmetric second-order gate stream."""
@@ -314,9 +309,14 @@ class GibbsMps:
         n_steps=None,
         chi=64,
         mode="mpo",
+        contraction_opt="auto-hq",
         cutoff="auto",
         cutoff_mode="auto",
         progress=False,
+        n_iter=8,
+        normalize_every=False,
+        normalize_final=False,
+        normalize_eps=1e-15,
         parameters=None,
         optimizer_kwargs=None,
         run_kwargs=None,
@@ -331,7 +331,11 @@ class GibbsMps:
         The returned object is ``self``.  Inspect the purification through
         :attr:`mps`, or call :meth:`to_mpo` to trace out the ancillas.
         ``MpsOptimizer`` is always run with ``non_unitary=True`` and without
-        unitary stabilization or overlap-fidelity diagnostics.
+        unitary stabilization or overlap-fidelity diagnostics. ``n_iter``,
+        ``contraction_opt``, and the normalization options are the common
+        direct ``MpsOptimizer`` controls; all other constructor and run
+        options can be forwarded through ``optimizer_kwargs`` and
+        ``run_kwargs``.
         """
         beta_float = _scalar_float(beta, name="beta")
         if beta_float < 0.0:
@@ -377,7 +381,14 @@ class GibbsMps:
             raise ValueError(
                 "GibbsMps uses non-unitary evolution; stabilize_unitary is not applicable."
             )
-        reserved_constructor = {"p", "gates", "chi", "mode", "to_backend"}
+        reserved_constructor = {
+            "p",
+            "gates",
+            "chi",
+            "mode",
+            "to_backend",
+            "contraction_opt",
+        }
         overlap = reserved_constructor.intersection(optimizer_kwargs)
         if overlap:
             raise TypeError(
@@ -389,6 +400,10 @@ class GibbsMps:
             "cutoff",
             "cutoff_mode",
             "non_unitary",
+            "n_iter",
+            "normalize_every",
+            "normalize_final",
+            "normalize_eps",
             "use_layout_finder",
             "layout_order",
             "layout_kwargs",
@@ -408,12 +423,15 @@ class GibbsMps:
         coefficient_batch = self.basis.coefficients(parameters)
         coefficients = tuple(coefficient_batch[index] for index in range(self.basis.num_terms))
         step = 0.0 if n_steps == 0 else ar.do("divide", beta, 2 * n_steps)
-        gates = self._build_trotter_stream(coefficients, step, n_steps)
+        gates = self._convert_gate_stream(
+            self._build_trotter_stream(coefficients, step, n_steps)
+        )
         identity = self._build_identity_mps(coefficients, beta=beta)
         identity_snapshot = identity.copy()
 
         constructor_options = dict(optimizer_kwargs)
         constructor_options.setdefault("ind_id", "k{}")
+        constructor_options.setdefault("contraction_opt", contraction_opt)
         self.optimizer = MpsOptimizer(
             identity,
             gates=gates,
@@ -426,9 +444,13 @@ class GibbsMps:
         options.update(
             {
                 "progbar": bool(progress),
+                "n_iter": n_iter,
                 "cutoff": cutoff,
                 "cutoff_mode": cutoff_mode,
                 "non_unitary": True,
+                "normalize_every": normalize_every,
+                "normalize_final": normalize_final,
+                "normalize_eps": normalize_eps,
                 "stabilize_unitary": False,
             }
         )

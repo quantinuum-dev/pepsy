@@ -51,7 +51,9 @@ with `finder=plan` instead of `gate_stream=`.
 
 Constructors create common tensor-network states and operators:
 
-- `ps_to_mps` (bond-one product states), `ps_to_ttn`, `ps_to_peps`, `ps_to_3dpeps`
+- `bell_ro_mps` (interleaved physical/ancilla Bell-pair purifications),
+  `ps_to_mps` (bond-one product states), `ps_to_ttn`, `ps_to_peps`,
+  `ps_to_3dpeps`
 - `ps_to_mpo`, `ps_to_pepo`
 - `id_to_mpo`, `id_to_pepo`
 - `haar_random_state`, `random_haar_qubit`
