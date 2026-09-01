@@ -108,6 +108,7 @@ if TYPE_CHECKING:
         CompiledPEPOClusterProduct,
         build_mpo_from_gates,
         build_pepo_from_gates,
+        compress_mpo_product,
         cnot,
         cphase,
         crx,

@@ -37,10 +37,35 @@ The API is intentionally explicit about exact versus numerical work:
 - optional Abelian symmetry metadata compiles the same semantic object to a
   Quimb MPO backed by native Symmray blocks without changing the ordinary MPO
   contract.
+- `block_plan.validate_charges()` checks virtual charge labels structurally,
+  while `validate_charge_flow()` adds the native local physical-index check.
+- final `chi` compression uses Quimb's native Symmray sector-wise SVD when
+  `sector_aware="auto"` (the default), and reports sector dimensions and
+  stored block counts before and after compression.
 
 This separation keeps the implementation compatible with current Pepsy
 MPO/MPS workflows and keeps the algebra testable against dense operators while
 the block-sparse execution path uses the same semantic histories.
+
+### Inspect the structural block plan
+
+Every semantic MPO exposes a backend-neutral `MPOBlockPlan` through
+`semantic_mpo.block_plan`. The plan contains virtual-state labels, local block
+recipes, optional charge metadata, and block counts, but never owns numerical
+backend arrays:
+
+```python
+from pepsy.operators import MPOBlockPlan
+
+plan = H.block_plan
+assert isinstance(plan, MPOBlockPlan)
+print(plan.summary())
+```
+
+Automaton-built first-degree MPOs expose exact transition blocks. Persistent
+`history_storage="block_sparse"` higher-order results expose the blocks that
+survive the analytical history passes. Dense MPOs without source transition
+metadata use a conservative all-pairs upper bound.
 
 ```python
 import numpy as np
@@ -62,6 +87,28 @@ H2_exact = H2.compress_exact()
 mpo = H2_exact.to_mpo()
 print(H2_exact.compression_report)
 ```
+
+For a symmetry-aware MPO, validation is deliberately split at the numerical
+boundary:
+
+```python
+report = H.validate_charge_flow()
+print(report.as_dict())
+
+compressed, compression_report = H.exp(
+    -0.01j,
+    order=2,
+    chi=4,
+    sector_aware="auto",
+    return_report=True,
+)
+print(compression_report.initial_sector_dimensions)
+print(compression_report.final_sector_dimensions)
+```
+
+The structural report never reads backend tensor values. The native stage
+checks nonzero local blocks against the configured physical charges, and the
+compression report records native sector changes without densifying the MPO.
 
 `MPOLocalOperatorTerm` is the non-factorized counterpart to
 `MPOProductTerm`. A square `d**k` by `d**k` matrix on `k` distinct sites is
@@ -94,7 +141,7 @@ U = basis.exp(
     -1j * 0.01,
     {"J": J, "V": V},
     order=2,
-    mode="algorithm4",
+    mode="folded",
 )
 ```
 
@@ -108,10 +155,16 @@ The exponential entry points share the same analytical controls: `order`, `mode`
 `max_bond`, `on_exceed`, `cache_history`, and `history_storage`. Use the named
 `mode` policies for new code; `extend=True` and `approximate=True` remain
 backward-compatible flags on the lower-level construction API. `mode="base"`
-is the conservative Algorithms 1--2 path, `mode="algorithm4"` is the fast
-Algorithms 1, 2, and 4 path, `mode="optimal"` adds the exact Algorithm-3
-extension, and `mode="approximate"` adds Algorithm 4 after that extension.
-Legacy flag calls are normalized to these canonical mode names in metadata.
+is the conservative Algorithms 1--2 path, `mode="exact"` adds the exact
+Algorithm-3 extension, `mode="folded"` selects the fast Algorithms 1, 2, and 4
+path, and `mode="hybrid"` adds Algorithm 4 after the exact extension.
+`mode="auto"` uses a cheap symbolic Algorithm-3 estimate before building
+the numerical pair plan. It selects `exact` when the estimate is within
+`extension_budget` (default 1,024 selected terms), and `folded` otherwise.
+The result metadata records `requested_mode`, `mode`,
+`estimated_extension_terms`, `extension_budget`, and `mode_reason`.
+Historical spellings `algorithm4`, `optimal`, and `approximate` remain accepted
+as aliases and are normalized to these canonical mode names in metadata.
 
 The final numerical bond cap is a separate stage from the temporary history
 construction. Pass `chi` to `exp` when the returned MPO should be compressed
@@ -122,7 +175,7 @@ U_chi, compression_report = basis.exp(
     -1j * 0.01,
     {"J": J, "V": V},
     order=3,
-    mode="approximate",
+    mode="hybrid",
     chi=64,
     cutoff=1.0e-10,
     return_report=True,
@@ -133,7 +186,58 @@ Here `chi` is the final MPO bond cap; it is different from the existing
 `max_bond` argument, which only guards the temporary raw-history bonds before
 analytical compression. The default `chi` path delegates the numerical sweep
 to Quimb and therefore returns an ordinary Quimb `MatrixProductOperator`.
-Numerical compression cannot retain the original paper-history metadata.
+Numerical compression cannot retain the original paper-history metadata. Use
+`cutoff="auto"` and `cutoff_mode="auto"` for dtype-aware/default cutoff
+selection, and pass `form`, `create_bond`, or additional Quimb compression
+keywords through `compress_opts`:
+
+```python
+U_chi = basis.exp(
+    -1j * 0.01,
+    {"J": J, "V": V},
+    order=3,
+    chi=64,
+    cutoff="auto",
+    cutoff_mode="auto",
+    form="left",
+    compress_opts={"renorm": False},
+)
+```
+
+Set `progress=True` on `basis.exp`, `FirstDegreeMPO.exp`, or `exp_mpo` to see
+`exp(order=N)` with color-coded history, analytical algorithm, boundary, and
+final numerical compression stages. In particular,
+`A4 analytical-compress` is Algorithm 4's order-controlled history reduction,
+whereas `chi-compress (chi=...)` is the separate final numerical compression.
+The backend and method remain in `numerical_compression`. Completed results
+retain stage timings in `metadata["timings"]` or
+`pepsy_exp_metadata["timings"]`, with `timing_history` keyed by order and
+`order_seconds` storing total elapsed time.
+
+For Torch/JAX or another Autoray backend, pass `to_backend` to
+`MPOBasis.from_terms` or `exp_mpo`. The converter is applied to the compiled
+automaton blocks and coefficient values before the higher-order contractions,
+so the final `chi` compression runs on that backend too:
+
+```python
+import pepsy
+import torch
+from pepsy.operators import exp_mpo
+
+U = exp_mpo(
+    terms,
+    -1j * 0.01,
+    shape=20,
+    order=4,
+    mode="exact",
+    chi=64,
+    to_backend=pepsy.backend_torch(dtype=torch.complex128),
+)
+```
+
+The same term tuple spellings as `ham_tn.build_mpo` are accepted by
+`MPOBasis.from_terms` and `exp_mpo`, including `(location, paulis,
+coefficient)` and `((paulis, coefficient), location)`.
 
 For parameter optimization, use a fixed-rank differentiable compression:
 
@@ -142,7 +246,7 @@ U_chi, compression_report = basis.exp(
     -1j * 0.01,
     {"J": J, "V": V},
     order=3,
-    mode="optimal",
+    mode="exact",
     chi=64,
     differentiable=True,
     return_report=True,
@@ -180,7 +284,7 @@ U_arrays = basis.exp_arrays(
     -1j * time,
     {"J": J, "V": V},
     order=2,
-    mode="algorithm4",
+    mode="folded",
 )
 ```
 
@@ -193,7 +297,7 @@ For repeated calls with the same higher-order policy, compile the value-only
 evaluator explicitly:
 
 ```python
-compiled = basis.compile_exp(order=3, mode="optimal")
+compiled = basis.compile_exp(order=3, mode="exact")
 U_arrays = compiled.exp_arrays(
     -1j * time,
     {"J": J, "V": V},
@@ -215,7 +319,7 @@ U = basis.exp(
     -1j * 0.01,
     {"J": 0.7, "V": 0.2},
     order=4,
-    mode="optimal",
+    mode="exact",
     cache_history=False,
 )
 ```
@@ -250,7 +354,7 @@ exponential is formed. The reachable history space can still grow
 exponentially with `N`, but it avoids allocating disconnected boundary and
 edge channels that cannot contribute to the finite-chain operator.
 The one-site path evaluates the direct local Taylor polynomial at arbitrary
-positive order. In `mode="optimal"` or with `extend=True`, it includes one
+positive order. In `mode="exact"` or with `extend=True`, it includes one
 additional local Taylor term; a one-site chain has no non-trivial virtual
 history for Algorithm 3 or 4 to rewire.
 
@@ -267,16 +371,16 @@ U5 = single_site.extensive_exponential(dt=0.01, order=5)
 
 # Optional paper extensions, kept explicit in the API.
 U2_extended = H.extensive_exponential(dt=0.01, order=2, extend=True)
-U2_approx = H.extensive_exponential(dt=0.01, order=2, approximate=True)
-U2_algorithm4 = H.extensive_exponential(
+U2_hybrid = H.extensive_exponential(dt=0.01, order=2, mode="hybrid")
+U2_folded = H.extensive_exponential(
     dt=0.01,
     order=2,
-    mode="algorithm4",
+    mode="folded",
 )
-U2_optimal = H.extensive_exponential(
+U2_exact = H.extensive_exponential(
     dt=0.01,
     order=2,
-    mode="optimal",
+    mode="exact",
     max_bond=128,
 )
 
@@ -299,13 +403,16 @@ analytical approximation, not a numerical SVD cutoff, and is therefore exposed
 as a separate opt-in flag. Numerical Quimb compression remains a separate
 post-processing step.
 
-The named `mode` policies are `"base"` (Algorithms 1--2), `"algorithm4"`
-(Algorithms 1, 2, and 4), `"optimal"` (Algorithms 1--3), and
-`"approximate"` (Algorithms 1--4). The word `optimal` refers to the paper's
-exact extension/compression construction, not to a globally minimum-bond MPO.
-`mode="algorithm4"` is the fast explicit Algorithm-4 policy; it omits the
-selected next-order replay from Algorithm 3. `mode="approximate"` retains the
-full extended approximate construction. `max_bond` limits the temporary
+The named `mode` policies are `"base"` (Algorithms 1--2), `"exact"`
+(Algorithms 1--3), `"folded"` (Algorithms 1, 2, and 4), and `"hybrid"`
+(Algorithms 1--4). `mode="auto"` estimates the selected Algorithm-3 work
+symbolically before building its numerical pair plan, selecting `exact` when
+the estimate is within `extension_budget` (default 1,024 terms) and `folded`
+otherwise. The word `exact` describes the paper's exact extension
+construction, not a globally minimum-bond MPO. `mode="folded"` is the fast
+explicit Algorithm-4 policy; it omits the selected next-order replay from
+Algorithm 3. `mode="hybrid"` retains the full extended approximate
+construction. Historical spellings remain accepted as aliases. `max_bond` limits the temporary
 history bonds before exact compression; `on_exceed="raise"` stops safely, while
 `on_exceed="warn"` continues with a warning.
 
@@ -363,9 +470,16 @@ H = FirstDegreeMPO.from_local_terms(
     symmetry="U1",
     physical_charges={0: 1, 1: 1},
 )
-U = H.exp(-1j * 0.01, order=3, mode="approximate")
+U = H.exp(-1j * 0.01, order=3, mode="hybrid")
 mpo = U.to_mpo()  # Quimb MPO whose tensors contain Symmray U1Array data
 ```
+
+The returned MPO remains native and block-sparse. Its `to_dense()` boundary
+automatically supplies the physical basis-to-charge maps required to restore
+the original computational-basis order after Symmray fuses charge sectors;
+callers do not need to call `unfuse_all()` manually. Numerical
+`sector_aware=True` compression retains the same dense-order behavior on its
+returned Quimb MPO.
 
 The local convention is
 `-q_left + q_right + q_upper - q_lower = 0`. Consequently a first factor that
@@ -454,7 +568,7 @@ H_theta = FirstDegreeMPO.from_pauli_terms(
 U_theta = H_theta.extensive_exponential(
     -1j * time,
     order=2,
-    mode="optimal",
+    mode="exact",
 )
 
 # The compiled MPO still contains Torch tensors connected to theta and time.

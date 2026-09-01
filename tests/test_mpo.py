@@ -12,6 +12,10 @@ from pepsy.operators import (
     FirstDegreeMPO,
     MPOCompressionReport,
     MPOBasis,
+    MPOBlock,
+    MPOBlockPlan,
+    MPOChargeValidationReport,
+    MPOAutomaton,
     MPOBraiding,
     MPOLevel,
     MPOLevelToken,
@@ -21,6 +25,7 @@ from pepsy.operators import (
     MPODifferentiableCompressionReport,
     MPONumericalCompressionReport,
     MPOProductTerm,
+    compress_mpo_product,
     exp_mpo,
 )
 
@@ -41,18 +46,6 @@ def _two_term_mpo():
             MPOProductTerm((1, 2), (z, z)),
         ],
     )
-
-
-def _symmray_mpo_to_dense(mpo):
-    """Unfuse Symmray sectors before comparing in physical basis order."""
-    value = mpo.to_dense()
-    if hasattr(value, "unfuse_all"):
-        value = value.unfuse_all()
-    if hasattr(value, "to_dense"):
-        value = value.to_dense()
-    value = np.asarray(value)
-    dimension = int(round(np.sqrt(value.size)))
-    return value.reshape(dimension, dimension)
 
 
 def test_first_degree_mpo_public_exports_resolve():
@@ -82,6 +75,105 @@ def test_first_degree_mpo_public_exports_resolve():
     assert "CompiledMPOEvolution" in pepsy.operators.__all__
     assert "CompiledMPOExp" in pepsy.operators.__all__
     assert "exp_mpo" in pepsy.operators.__all__
+    assert MPOBlock is pepsy.operators.MPOBlock
+    assert MPOBlockPlan is pepsy.operators.MPOBlockPlan
+    assert MPOChargeValidationReport is pepsy.operators.MPOChargeValidationReport
+    assert "MPOBlockPlan" in pepsy.operators.__all__
+
+
+def test_automaton_block_plan_is_structural_and_inspectable():
+    """Automaton plans expose transitions without retaining operator arrays."""
+    hamiltonian = _two_term_mpo()
+
+    plan = hamiltonian.block_plan
+
+    assert isinstance(plan, MPOBlockPlan)
+    assert plan.kind == "automaton"
+    assert plan.length == hamiltonian.L
+    assert plan.bond_dimensions == tuple(
+        len(levels) for levels in hamiltonian.levels
+    )
+    assert plan.total_blocks == sum(plan.block_counts)
+    assert all(isinstance(block, MPOBlock) for block in plan.blocks(0))
+    assert all(
+        not any(hasattr(item, "shape") for item in block.recipe)
+        for blocks in plan.blocks()
+        for block in blocks
+        if block.recipe
+    )
+    assert hamiltonian.metadata["block_plan"]["total_blocks"] == plan.total_blocks
+
+    automaton = MPOAutomaton.from_product_terms(
+        3,
+        [MPOProductTerm((0, 2), (_paulis()[0], _paulis()[0]))],
+    )
+    assert automaton.block_plan.kind == "automaton"
+    assert (
+        automaton.block_plan.internal_bond_dimensions
+        == automaton.bond_dimensions
+    )
+
+
+def test_higher_order_block_plan_matches_persistent_sparse_blocks():
+    """Higher-order plans describe stored sparse blocks after history rewiring."""
+    hamiltonian = _two_term_mpo()
+    exponential = hamiltonian.extensive_exponential(
+        -0.01j,
+        order=3,
+        mode="folded",
+        history_storage="block_sparse",
+    )
+
+    plan = exponential.block_plan
+
+    assert plan.kind == "history"
+    assert plan.block_counts == exponential.sparse_block_counts
+    assert plan.internal_bond_dimensions == exponential.bond_dimensions
+    assert exponential.metadata["block_plan"]["block_counts"] == plan.block_counts
+    assert exponential.metadata["block_plan"]["structural_sparsity"] == "block"
+
+
+def test_charge_validation_separates_structure_from_native_flow():
+    """Virtual labels validate before native Symmray checks local values."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        2,
+        [
+            MPOProductTerm((0, 1), (raising, lowering), charge=-1),
+            MPOProductTerm((0, 1), (lowering, raising), charge=1),
+        ],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    structural = hamiltonian.block_plan.validate_charges()
+    assert isinstance(structural, MPOChargeValidationReport)
+    assert structural.valid is True
+    assert structural.native is False
+    assert structural.structural_blocks == hamiltonian.block_plan.total_blocks
+
+    complete = hamiltonian.validate_charge_flow()
+    assert complete.valid is True
+    assert complete.native is True
+    assert complete.native_blocks > 0
+    assert hamiltonian.metadata["charge_validation"] == complete.as_dict()
+
+
+def test_charge_validation_rejects_mischarged_nonzero_native_block():
+    """The full validator retains the precise native flow failure."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        2,
+        [MPOProductTerm((0, 1), (raising, raising.T), charge=1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    with pytest.raises(ValueError, match="violates the configured U1 charge flow"):
+        hamiltonian.validate_charge_flow()
 
 
 def test_general_local_operator_term_exactly_decomposes_entangled_support():
@@ -569,6 +661,134 @@ def test_term_centric_compact_mapping_accepts_integer_coefficients():
     assert hasattr(compiled, "to_dense")
 
 
+def test_term_centric_api_accepts_ham_tn_tuple_spellings():
+    """Higher-order terms accept both compact ``ham_tn`` tuple forms."""
+    from pepsy.tensors import OneDMap
+
+    mapper = OneDMap(2, 2, mode="row-major")
+    terms = [
+        ((0, 0), "X", 0.4),
+        (("ZZ", -0.7), ((0, 0), (1, 0))),
+    ]
+    basis = MPOBasis.from_terms(terms, mapper=mapper)
+
+    assert basis.terms[0].sites == (mapper.build()[1][(0, 0)],)
+    assert basis.terms[1].sites == tuple(
+        sorted(mapper.build()[1][site] for site in ((0, 0), (1, 0)))
+    )
+    assert basis.terms[1].coefficient == -0.7
+
+    direct = MPOBasis.from_pauli_terms(
+        3,
+        [(("ZZ", 0.25), (1, 2))],
+    )
+    assert direct.terms[0].sites == (1, 2)
+    assert direct.terms[0].coefficient == 0.25
+
+    square = MPOBasis.from_square_lattice(
+        2,
+        2,
+        [(("ZZ", 0.3), ((0, 0), (1, 0)))],
+    )
+    assert square.terms[0].coefficient == 0.3
+
+
+def test_exp_mpo_accepts_canonical_folded_mode():
+    """The public term facade forwards the canonical Algorithm-4 name."""
+    semantic = exp_mpo(
+        [((0, 1), "XX", 0.7), ((1, 2), "ZZ", -0.2)],
+        0.01,
+        shape=3,
+        order=2,
+        mode="folded",
+        return_semantic=True,
+    )
+
+    assert semantic.metadata["mode"] == "folded"
+    assert semantic.metadata["algorithms"] == (1, 2, 4)
+
+
+def test_compiled_exp_accepts_canonical_and_auto_modes():
+    """Compiled exponential evaluators retain the shared mode vocabulary."""
+    basis = MPOBasis.from_pauli_terms(
+        3,
+        [((0, 1), "XX"), ((1, 2), "ZZ")],
+    )
+
+    folded = basis.compile_exp(order=2, mode="folded")
+    auto = basis.compile_exp(order=3, mode="auto")
+
+    assert folded.mode == "folded"
+    assert auto.mode == "auto"
+    result = auto.exp(0.01, coefficients=np.array([0.7, -0.2]))
+    assert result.metadata["mode"] == "folded"
+    assert result.metadata["requested_mode"] == "auto"
+
+
+def test_exp_mpo_compresses_compiled_terms_to_final_chi():
+    """Term compilation precedes the optional final Quimb compression sweep."""
+    compiled = exp_mpo(
+        [
+            ((0,), "X", 0.4),
+            (("ZZ", -0.7), (1, 2)),
+        ],
+        0.01,
+        shape=3,
+        order=2,
+        mode="optimal",
+        chi=1,
+        cutoff="auto",
+        cutoff_mode="auto",
+        form="left",
+        compress_opts={"renorm": False},
+    )
+
+    assert compiled.bond_sizes() == [1, 1]
+    assert compiled.pepsy_exp_metadata["chi"] == 1
+
+
+def test_exp_mpo_uses_to_backend_before_contraction_and_compression():
+    """The requested backend reaches bound tensors and the final MPO."""
+    torch = pytest.importorskip("torch")
+    coefficient = torch.tensor(0.4, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(-1j * 0.01, dtype=torch.complex128, requires_grad=True)
+    to_backend = pepsy.backend_torch(dtype=torch.complex128)
+    terms = [
+        ((0,), "X", coefficient),
+        (("ZZ", -0.7), (1, 2)),
+    ]
+
+    basis = MPOBasis.from_terms(terms, shape=3, to_backend=to_backend)
+    bound = basis.build()
+    assert all(isinstance(array, torch.Tensor) for array in bound.arrays)
+    assert isinstance(basis.coefficients()[0], torch.Tensor)
+
+    semantic = exp_mpo(
+        terms,
+        step,
+        shape=3,
+        order=2,
+        mode="optimal",
+        to_backend=to_backend,
+    )
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+    compiled = exp_mpo(
+        terms,
+        0.01,
+        shape=3,
+        order=2,
+        mode="optimal",
+        chi=1,
+        cutoff=0.0,
+        to_backend=to_backend,
+    )
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in compiled)
+    assert compiled.bond_sizes() == [1, 1]
+
+
 @pytest.mark.parametrize("site", [0.9, True, np.float64(1.0)])
 def test_product_terms_reject_lossy_site_coercions(site):
     """Product-term sites must never be silently truncated or accept booleans."""
@@ -989,12 +1209,254 @@ def test_history_algorithm_four_reuses_structural_index_plan():
 def test_algorithm_four_mode_skips_expensive_next_order_extension():
     """The fast named policy selects Algorithm 4 without Algorithm 3."""
     H = _two_term_mpo()
-    output = H.extensive_exponential(0.01, order=2, mode="algorithm4")
+    output = H.extensive_exponential(0.01, order=2, mode="folded")
 
-    assert output.metadata["mode"] == "algorithm4"
+    assert output.metadata["mode"] == "folded"
     assert output.metadata["algorithms"] == (1, 2, 4)
     assert output.metadata["extension_terms"] == 0
     assert output.metadata["approximate_history_merges"] > 0
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical", "algorithms"),
+    [
+        ("algorithm4", "folded", (1, 2, 4)),
+        ("paper_algorithm4", "folded", (1, 2, 4)),
+        ("optimal", "exact", (1, 2, 3)),
+        ("paper_optimal", "exact", (1, 2, 3)),
+        ("approximate", "hybrid", (1, 2, 3, 4)),
+        ("paper_approximate", "hybrid", (1, 2, 3, 4)),
+    ],
+)
+def test_legacy_exponential_mode_aliases_normalize_to_canonical_names(
+    alias, canonical, algorithms,
+):
+    """Historical mode spellings remain accepted but metadata is canonical."""
+    output = _two_term_mpo().extensive_exponential(
+        0.01,
+        order=2,
+        mode=alias,
+    )
+
+    assert output.metadata["mode"] == canonical
+    assert output.metadata["algorithms"] == algorithms
+
+
+def test_auto_exponential_mode_uses_order_aware_exact_or_folded_policy():
+    """The automatic policy avoids Algorithm 3 at higher Taylor orders."""
+    H = _two_term_mpo()
+
+    exact = H.extensive_exponential(0.01, order=2, mode="auto")
+    folded = H.extensive_exponential(0.01, order=3, mode="auto")
+
+    assert exact.metadata["requested_mode"] == "auto"
+    assert exact.metadata["mode"] == "exact"
+    assert exact.metadata["algorithms"] == (1, 2, 3)
+    assert folded.metadata["requested_mode"] == "auto"
+    assert folded.metadata["mode"] == "folded"
+    assert folded.metadata["algorithms"] == (1, 2, 4)
+
+
+def test_auto_exponential_mode_uses_symbolic_extension_budget_metadata():
+    """Auto mode selects at the symbolic Algorithm-3 work boundary."""
+    exact = _two_term_mpo().extensive_exponential(
+        0.01,
+        order=2,
+        mode="auto",
+        extension_budget=198,
+    )
+    folded_hamiltonian = _two_term_mpo()
+    folded = folded_hamiltonian.extensive_exponential(
+        0.01,
+        order=2,
+        mode="auto",
+        extension_budget=197,
+    )
+
+    assert exact.metadata["mode"] == "exact"
+    assert exact.metadata["estimated_extension_terms"] == 198
+    assert exact.metadata["mode_reason"] == "within extension budget"
+    assert folded.metadata["mode"] == "folded"
+    assert folded.metadata["estimated_extension_terms"] == 198
+    assert folded.metadata["mode_reason"] == "extension budget exceeded"
+    assert folded_hamiltonian.history_cache_info["extension_plan_orders"] == ()
+
+
+def test_compress_mpo_product_materializes_exact_and_compresses_lazily():
+    """MPO products use a lazy target and return an ordinary Quimb MPO."""
+    qtn = pytest.importorskip("quimb.tensor")
+    A = qtn.MPO_ham_heis(4, j=0.7, bz=0.2)
+    B = qtn.MPO_ham_heis(4, j=0.3, bz=-0.1)
+
+    exact = compress_mpo_product(A, B, chi=None)
+    compressed = compress_mpo_product(
+        A,
+        B,
+        chi=3,
+        method="direct",
+        cutoff="auto",
+        cutoff_mode="auto",
+    )
+
+    np.testing.assert_allclose(
+        exact.to_dense(),
+        A.to_dense() @ B.to_dense(),
+        atol=1.0e-12,
+    )
+    assert exact.bond_sizes() == [4, 16, 4]
+    assert max(compressed.bond_sizes()) <= 3
+    assert compressed.pepsy_mpo_product_metadata["lazy_target"] is True
+    assert compressed.pepsy_mpo_product_metadata["method"] == "direct"
+
+
+def test_compress_mpo_product_reports_native_sector_compression():
+    """Ordered products retain native sectors through their final sweep."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    A = FirstDegreeMPO.from_local_terms(
+        3,
+        [MPOProductTerm((0, 1), (raising, lowering), charge=-1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    B = FirstDegreeMPO.from_local_terms(
+        3,
+        [MPOProductTerm((1, 2), (raising, lowering), charge=-1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    result = compress_mpo_product(
+        A,
+        B,
+        chi=2,
+        method="direct",
+        cutoff=0.0,
+        cutoff_mode="rel",
+        sector_aware=True,
+    )
+
+    metadata = result.pepsy_mpo_product_metadata
+    assert metadata["sector_aware"] is True
+    assert metadata["initial_sector_dimensions"]
+    assert metadata["final_sector_dimensions"]
+    assert all(type(tensor.data).__name__ == "U1Array" for tensor in result.tensors)
+
+    exact = compress_mpo_product(
+        A,
+        B,
+        chi=None,
+        method="direct",
+        sector_aware=True,
+    )
+    np.testing.assert_allclose(
+        exact.to_dense(),
+        A.to_mpo().to_dense() @ B.to_mpo().to_dense(),
+    )
+
+
+def test_compress_mpo_product_dmrg_uses_run_eff_and_src_warm_start(monkeypatch):
+    """DMRG uses cached full-chain FIT sweeps after the optional guess."""
+    qtn = pytest.importorskip("quimb.tensor")
+    from pepsy.fitting import FIT
+
+    A = qtn.MPO_ham_heis(4, j=0.7, bz=0.2)
+    B = qtn.MPO_ham_heis(4, j=0.3, bz=-0.1)
+    run_eff_calls = []
+    fitters = []
+    original_run_eff = FIT.run_eff
+
+    def spy_run_eff(self, *args, **kwargs):
+        run_eff_calls.append(dict(kwargs))
+        fitters.append(self)
+        return original_run_eff(self, *args, **kwargs)
+
+    monkeypatch.setattr(FIT, "run_eff", spy_run_eff)
+    result = compress_mpo_product(
+        A,
+        B,
+        chi=2,
+        method="dmrg2",
+        cutoff=0.0,
+        cutoff_mode="rsum2",
+        guess_method="src",
+        guess_seed=17,
+    )
+
+    assert len(run_eff_calls) == 1
+    assert run_eff_calls[0]["n_iter"] == 4
+    assert run_eff_calls[0]["block_size"] == 2
+    assert run_eff_calls[0]["adaptive_block_sweeps"] == 2
+    assert fitters[0]._sweep_environment_reuse_count >= 1
+    metadata = result.pepsy_mpo_product_metadata
+    assert metadata["guess_method"] == "src"
+    assert metadata["guess_seed"] == 17
+    assert metadata["fit_solver"] == "FIT.run_eff"
+    assert max(result.bond_sizes()) <= 2
+
+
+def test_compress_mpo_product_native_dmrg_restores_mpo_boundary():
+    """Native DMRG results expose Pepsy's computational-basis boundary."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    A = FirstDegreeMPO.from_local_terms(
+        4,
+        [MPOProductTerm((0, 1), (raising, lowering), charge=-1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    B = FirstDegreeMPO.from_local_terms(
+        4,
+        [MPOProductTerm((1, 2), (raising, lowering), charge=-1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    result = compress_mpo_product(
+        A,
+        B,
+        chi=2,
+        method="dmrg2",
+        cutoff=0.0,
+        cutoff_mode="rel",
+        sector_aware=True,
+    )
+
+    dense = result.to_dense()
+    assert isinstance(dense, np.ndarray)
+    assert dense.shape == (16, 16)
+    assert result.pepsy_mpo_product_metadata["fit_solver"] == "FIT.run_eff"
+
+
+def test_compress_mpo_product_rejects_native_src_warm_start():
+    """Randomized SRC does not silently violate native charge sectors."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    lowering = raising.T
+    A = FirstDegreeMPO.from_local_terms(
+        3,
+        [MPOProductTerm((0, 1), (raising, lowering), charge=-1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    B = FirstDegreeMPO.from_local_terms(
+        3,
+        [MPOProductTerm((1, 2), (raising, lowering), charge=-1)],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+
+    with pytest.raises(NotImplementedError, match="SRC.*sector-aware"):
+        compress_mpo_product(
+            A,
+            B,
+            chi=2,
+            method="dmrg2",
+            guess_method="src",
+            sector_aware="auto",
+        )
 
 
 def test_algorithm_four_fused_replay_matches_sequential_reference():
@@ -1578,13 +2040,43 @@ def test_higher_order_block_sparse_symmetry_matches_dense_mpo(
     storage = symmetric_u.metadata["history_storage_blocks"]
     assert storage["stored_blocks"] < storage["total_blocks"]
     np.testing.assert_allclose(
-        _symmray_mpo_to_dense(compiled),
+        compiled.to_dense(),
         dense_u.to_mpo().to_dense(),
     )
     np.testing.assert_allclose(
-        _symmray_mpo_to_dense(symmetric_h.to_mpo()),
+        symmetric_h.to_mpo().to_dense(),
         dense_h.to_mpo().to_dense(),
     )
+
+
+def test_native_symmray_mpo_to_dense_restores_physical_basis_order():
+    """Native MPO dense conversion uses the caller's basis order."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    terms = [
+        MPOProductTerm((1, 2), (raising, raising.T), coefficient=0.4, charge=-1),
+        MPOProductTerm((2,), (np.diag([0.0, 0.2]),), coefficient=0.7),
+    ]
+    symmetric = FirstDegreeMPO.from_local_terms(
+        4,
+        terms,
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    dense = FirstDegreeMPO.from_local_terms(4, terms)
+
+    np.testing.assert_allclose(
+        symmetric.to_mpo().to_dense(),
+        dense.to_mpo().to_dense(),
+    )
+
+    compressed = symmetric.exp(-0.01j, order=2, mode="base").compress_numerical(
+        max_bond=2,
+        cutoff=0.0,
+        sector_aware=True,
+    )
+    assert isinstance(compressed.to_dense(), np.ndarray)
+    assert compressed.to_dense().shape == (16, 16)
 
 
 def test_higher_order_symmetry_rejects_incorrect_virtual_charge():
@@ -1632,7 +2124,7 @@ def test_u1_symmetry_supports_degenerate_physical_sectors():
     )
 
     np.testing.assert_allclose(
-        _symmray_mpo_to_dense(symmetric_u.to_mpo()),
+        symmetric_u.to_mpo().to_dense(),
         dense_u.to_mpo().to_dense(),
     )
 
@@ -1717,7 +2209,7 @@ def test_one_site_u1_exponential_compiles_native_rank_two_array():
 
     assert type(compiled.tensors[0].data).__name__ == "U1Array"
     np.testing.assert_allclose(
-        _symmray_mpo_to_dense(compiled),
+        compiled.to_dense(),
         exponential.arrays[0][0, 0],
     )
 
@@ -1736,7 +2228,7 @@ def test_one_site_u1_zero_operator_retains_native_complex_dtype():
     assert type(compiled.tensors[0].data).__name__ == "U1Array"
     assert np.issubdtype(compiled.tensors[0].data.dtype, np.complexfloating)
     np.testing.assert_array_equal(
-        _symmray_mpo_to_dense(compiled),
+        compiled.to_dense(),
         np.zeros((2, 2)),
     )
 
@@ -1786,8 +2278,8 @@ def test_mpo_basis_preserves_symmetry_for_parameterized_exponential():
     assert compiled_exponential.symmetry == "U1"
     assert compiled_exponential.is_block_sparse
     np.testing.assert_allclose(
-        _symmray_mpo_to_dense(compiled_exponential.to_mpo()),
-        _symmray_mpo_to_dense(exponential.to_mpo()),
+        compiled_exponential.to_mpo().to_dense(),
+        exponential.to_mpo().to_dense(),
     )
 
 
@@ -1870,8 +2362,8 @@ def test_extensive_exponential_optimal_mode_selects_paper_extension():
     explicit = H.extensive_exponential(0.01, order=2, extend=True)
     named = H.extensive_exponential(0.01, order=2, mode="optimal")
 
-    assert explicit.metadata["mode"] == "optimal"
-    assert named.metadata["mode"] == "optimal"
+    assert explicit.metadata["mode"] == "exact"
+    assert named.metadata["mode"] == "exact"
     assert named.metadata["algorithms"] == (1, 2, 3)
     assert named.bond_dimensions == explicit.bond_dimensions
     np.testing.assert_allclose(
@@ -2039,6 +2531,8 @@ def test_extensive_exponential_algorithm_four_is_explicit_and_order_controlled()
 
     assert approximate.metadata["algorithms"] == (1, 2, 4)
     assert approximate.metadata["approximate"] is True
+    assert approximate.metadata["analytical_compression"] == "folded"
+    assert approximate.metadata["numerical_compression"] == "none"
     assert approximate.metadata["approximate_history_merges"] > 0
     assert all(
         approximate_dim <= exact_dim
@@ -2097,6 +2591,127 @@ def test_numerical_compression_validates_max_bond():
     U = _two_term_mpo().extensive_exponential(0.01, order=1)
     with pytest.raises(ValueError, match="max_bond"):
         U.compress_numerical(max_bond=0)
+
+
+def test_native_sector_aware_compression_reports_each_bond_sector():
+    """Native Quimb compression keeps Symmray sectors separate from history."""
+    pytest.importorskip("symmray")
+    raising = np.array([[0.0, 0.0], [1.0, 0.0]])
+    hamiltonian = FirstDegreeMPO.from_local_terms(
+        2,
+        [
+            MPOProductTerm((0, 1), (raising, raising.T), charge=-1),
+            MPOProductTerm((0, 1), (raising.T, raising), charge=1),
+        ],
+        symmetry="U1",
+        physical_charges=(0, 1),
+    )
+    exponential = hamiltonian.exp(-0.01j, order=2, mode="base")
+
+    compressed, report = exponential.compress_numerical(
+        max_bond=2,
+        cutoff=0.0,
+        sector_aware=True,
+        return_report=True,
+    )
+
+    assert report.sector_aware is True
+    assert report.initial_sector_dimensions
+    assert report.final_sector_dimensions
+    assert len(report.initial_sector_block_counts) == exponential.L
+    assert len(report.final_sector_block_counts) == exponential.L
+    assert all(type(tensor.data).__name__ == "U1Array" for tensor in compressed.tensors)
+    assert compressed.pepsy_sector_compression_metadata["sector_aware"] is True
+
+
+def test_dense_sector_aware_compression_does_not_silently_fallback():
+    """Explicit sector-aware compression rejects ordinary dense MPOs."""
+    exponential = _two_term_mpo().exp(-0.01j, order=1)
+
+    with pytest.raises(ValueError, match="native Symmray"):
+        exponential.compress_numerical(
+            max_bond=1,
+            cutoff=0.0,
+            sector_aware=True,
+        )
+
+    _, report = exponential.compress_numerical(
+        max_bond=1,
+        cutoff=0.0,
+        sector_aware="auto",
+        return_report=True,
+    )
+    assert report.sector_aware is False
+    assert report.initial_sector_dimensions == ()
+
+
+def test_exp_progress_reports_stages_timing_and_final_chi(monkeypatch):
+    """Optional MPO progress exposes stage timings and final bond sizes."""
+    import tqdm.auto
+
+    bars = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.total = kwargs["total"]
+            self.n = 0
+            self.postfix_calls = []
+            self.description_calls = []
+            self.closed = False
+            bars.append(self)
+
+        def set_description(self, description, **kwargs):
+            del kwargs
+            self.description = description
+            self.description_calls.append(description)
+
+        def set_postfix(self, postfix, **kwargs):
+            del kwargs
+            self.postfix_calls.append(dict(postfix))
+
+        def refresh(self):
+            return None
+
+        def update(self, amount):
+            self.n += amount
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(tqdm.auto, "tqdm", FakeTqdm)
+    output = _two_term_mpo().exp(
+        -1j * 0.01,
+        order=2,
+        mode="algorithm4",
+        chi=1,
+        progress=True,
+    )
+
+    assert len(bars) == 1
+    assert bars[0].closed is True
+    assert bars[0].n == bars[0].total
+    assert bars[0].kwargs["desc"] == "exp(order=2)"
+    assert bars[0].colour == "magenta"
+    assert bars[0].description == "exp(order=2) | chi-compress (chi=1)"
+    assert "exp(order=2) | A4 analytical-compress" in bars[0].description_calls
+    assert not any(
+        "A4 analytical plan" in description
+        for description in bars[0].description_calls
+    )
+    assert bars[0].postfix_calls[-1]["chi"] == 1
+    assert bars[0].postfix_calls[-1]["maxchi"] <= 1
+    metadata = output.pepsy_exp_metadata
+    assert metadata["progress"] is True
+    assert metadata["timings"]["history"] >= 0.0
+    assert metadata["timings"]["a4_analytical_compress"] >= 0.0
+    assert metadata["timings"]["chi_compress_chi_1"] >= 0.0
+    assert metadata["timing_history"][2] == metadata["timings"]
+    assert metadata["order_seconds"] >= 0.0
+    assert metadata["analytical_compression"] == "folded"
+    assert metadata["numerical_compression"] == "quimb"
+    assert metadata["chi_compression"] == 1
+    assert max(output.bond_sizes(), default=1) <= 1
 
 
 def test_extensive_exponential_mps_expectation_and_application_are_tensor_network_paths(

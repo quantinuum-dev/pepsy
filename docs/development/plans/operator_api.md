@@ -106,7 +106,7 @@ canonical entry points should remain:
 ```python
 # 1D or snake-ordered higher-order MPO
 basis = MPOBasis.from_local_terms(...)
-U = basis.exp(step, order=4, mode="optimal")
+U = basis.exp(step, order=4, mode="exact")
 
 # Fixed-channel, differentiable square-lattice PEPO
 basis = PauliPEPOBasis.compile(..., order=4)

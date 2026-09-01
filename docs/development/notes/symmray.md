@@ -21,8 +21,8 @@ documentation](https://symmray.readthedocs.io/en/latest/index.html), the
 and the installed package. Record what was checked here so a future agent can
 tell verified behavior from a proposed design.
 
-Audit date: **2026-08-24**. The shared Python 3.12 environment reports
-`symmray 0.2.2.dev36+g7d1aa0c69`. This is a development build, so a documented
+Audit date: **2026-08-31**. The shared Python 3.12 environment reports
+`symmray 0.3.2.dev6+ga17699db6`. This is a development build, so a documented
 feature still needs an installed-API probe and a focused regression before it
 becomes a Pepsy dependency or changes a native execution path.
 
@@ -77,6 +77,13 @@ At the beginning of future Symmray-native work:
 4. Run the closest Symmray/fermion regression and the repository lint gate.
 5. Re-check MPS, PEPS/PEPO, and SymDMRG2 separately when the change touches
    contraction ordering, QR/SVD, backend conversion, or debosonization.
+
+The 2026-08-31 MPO audit also confirmed that native Quimb contraction fuses
+Symmray physical legs into packed charge sectors. Pepsy's MPO boundary now
+passes explicit physical `index_maps` to Symmray when converting the fused
+result to dense, restoring computational-basis order without changing the
+native block representation. This adopts the installed public API and is
+covered by an interior-support MPO regression.
 
 This gives the agent a repeatable upgrade path while keeping design intent
 readable for a human maintainer.

@@ -99,6 +99,9 @@ _MPO_EXPORTS = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOChargeValidationReport",
+    "MPOBlock",
+    "MPOBlockPlan",
     "FirstDegreeMPO",
     "CompiledMPOExp",
     "MPOBasis",
@@ -116,6 +119,7 @@ _MPO_CLUSTER_EXPORTS = [
     "MPOClusterProductExpansion",
     "MPOGraphClusterProductExpansion",
     "CompiledMPOClusterProduct",
+    "compress_mpo_product",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_product" for name in _MPO_CLUSTER_EXPORTS})
 _MPO_CLUSTER_COMPATIBILITY_EXPORTS = [
@@ -144,6 +148,7 @@ _SUBMODULES = (
     "hamiltonians",
     "mpo",
     "mpo_semantic",
+    "mpo_block_plan",
     "mpo_higher_order",
     "mpo_automaton",
     "mpo_cluster",

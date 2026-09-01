@@ -5,9 +5,30 @@ import builtins
 import numpy as np
 import pytest
 import quimb
+import quimb.tensor as qtn
 
 import pepsy as py
 from pepsy.tensors.core import OneDMap
+
+
+def test_ham_tn_accepts_shape_alias_for_1d_2d_and_3d_layouts():
+    """The builder's geometry spelling matches the higher-order MPO API."""
+    chain = py.ham_tn(shape=4)
+    assert (chain.Lx, chain.Ly, chain.Lz) == (4, 1, None)
+    assert chain.ndim == 2
+
+    square = py.ham_tn(shape=(2, 3))
+    assert (square.Lx, square.Ly, square.Lz) == (2, 3, None)
+    assert square.L == 6
+
+    cubic = py.ham_tn(shape=(2, 2, 2))
+    assert (cubic.Lx, cubic.Ly, cubic.Lz) == (2, 2, 2)
+    assert cubic.ndim == 3
+
+    with pytest.raises(TypeError, match="shape conflicts.*Lx"):
+        py.ham_tn(shape=(3, 2), Lx=4, Ly=2)
+    with pytest.raises(TypeError, match="shape conflicts.*Lz"):
+        py.ham_tn(shape=(2, 2), Lx=2, Ly=2, Lz=1)
 
 
 def test_build_mpo_single_site_term_works_for_ly1():
@@ -47,6 +68,240 @@ def test_build_mpo_accepts_mapper_override():
 
     assert mpo_from_override.L == 4
     assert np.allclose(mpo_from_override.to_dense(), mpo_from_mapper_builder.to_dense())
+
+
+def test_build_mpo_accepts_location_first_pauli_terms():
+    """String Pauli terms support location-first and paired spellings."""
+    builder = py.ham_tn(Lx=3, Ly=1, data_type="complex128")
+    x_op = quimb.pauli("X", dtype="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+
+    pauli_mpo = builder.build_mpo(
+        [
+            ((0,), "x", 0.5),
+            (("zz", 1.2), (0, 1)),
+        ],
+        compress_each=False,
+    )
+    matrix_mpo = builder.build_mpo(
+        [
+            ((x_op,), (0,), 0.5),
+            ((z_op, z_op), (0, 1), 1.2),
+        ],
+        compress_each=False,
+    )
+
+    assert np.allclose(pauli_mpo.to_dense(), matrix_mpo.to_dense())
+
+
+def test_build_mpo_accepts_bare_2d_pauli_coordinate_with_mapper():
+    """A one-site 2D coordinate can be used without an extra nesting level."""
+    mapper = OneDMap(2, 2, mode="row-major")
+    builder = py.ham_tn(Lx=2, Ly=2, mapper=mapper, data_type="complex128")
+    x_op = quimb.pauli("X", dtype="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+
+    pauli_mpo = builder.build_mpo(
+        [
+            ((0, 0), "X", 0.5),
+            (("ZZ", 1.2), ((0, 0), (1, 0))),
+        ],
+        compress_each=False,
+    )
+    matrix_mpo = builder.build_mpo(
+        [
+            ((x_op,), ((0, 0),), 0.5),
+            ((z_op, z_op), ((0, 0), (1, 0)), 1.2),
+        ],
+        compress_each=False,
+    )
+
+    assert np.allclose(pauli_mpo.to_dense(), matrix_mpo.to_dense())
+
+
+def test_build_mpo_resolves_auto_cutoff_options(monkeypatch):
+    """Auto cutoff options match the MPS dtype policy and rsum2 convention."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+
+    builder = py.ham_tn(Lx=3, Ly=1, data_type="complex64")
+    builder.build_mpo(
+        [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1))],
+        cutoff="auto",
+        cutoff_mode="auto",
+        compress_each=False,
+    )
+
+    assert calls[-1]["cutoff"] == 1.0e-6
+    assert calls[-1]["cutoff_mode"] == "rsum2"
+
+
+def test_ham_builder_converts_generic_mpo_to_configured_backend():
+    """A builder-level backend converter is applied to every MPO tensor."""
+    torch = pytest.importorskip("torch")
+    to_backend = py.backend_torch(dtype=torch.complex128)
+    builder = py.ham_tn(
+        Lx=3,
+        Ly=1,
+        cutoff="auto",
+        cutoff_mode="auto",
+        to_backend=to_backend,
+    )
+    assert builder.data_type == np.dtype("complex128")
+
+    mpo = builder.build_mpo(
+        [((0,), "Y", 0.5), (("ZZ", 1.2), (0, 1))],
+        chi=2,
+        form="left",
+        method="svd",
+        compress_opts={"renorm": False},
+    )
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in mpo)
+    assert mpo.max_bond() <= 2
+
+
+def test_ham_builder_automaton_preserves_shared_structure_on_backend():
+    """Automaton sharing happens before backend conversion and compression."""
+    torch = pytest.importorskip("torch")
+    to_backend = py.backend_torch(dtype=torch.complex128)
+    builder = py.ham_tn(Lx=6, Ly=1, to_backend=to_backend)
+    terms = [
+        ((site,), "X", 0.5)
+        for site in range(builder.L)
+    ] + [
+        (("ZZ", 1.2), (site, site + 1))
+        for site in range(builder.L - 1)
+    ]
+
+    mpo = builder.build_mpo(
+        terms,
+        mode="automaton",
+        chi=4,
+        cutoff=0.0,
+    )
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in mpo)
+    assert mpo.pepsy_automaton.bond_dimensions == (3, 3, 3, 3, 3)
+    assert mpo.max_bond() <= 4
+
+
+def test_build_mpo_automaton_mode_matches_term_mode():
+    """The finite-state automaton mode returns the same operator."""
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    terms = [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "Y", -0.3)]
+
+    term_mpo = builder.build_mpo(terms, compress_each=False, cutoff=0.0)
+    automaton_mpo = builder.build_mpo(
+        terms,
+        mode="automaton",
+        compress_each=False,
+        cutoff=0.0,
+    )
+
+    assert hasattr(automaton_mpo, "pepsy_automaton")
+    assert np.allclose(term_mpo.to_dense(), automaton_mpo.to_dense())
+
+
+def test_build_mpo_automaton_coalesces_duplicate_product_terms():
+    """Equivalent product paths are summed before structural compilation."""
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    terms = [
+        (("ZZ", 1.2), (0, 3)),
+        ((0, 3), "ZZ", 0.8),
+    ]
+
+    term_mpo = builder.build_mpo(terms, compress_each=False, cutoff=0.0)
+    automaton_mpo = builder.build_mpo(
+        terms,
+        mode="automaton",
+        compress_each=False,
+        cutoff=0.0,
+    )
+
+    assert automaton_mpo.pepsy_automaton.bond_dimensions == (3, 3, 3)
+    assert np.allclose(term_mpo.to_dense(), automaton_mpo.to_dense())
+
+
+def test_build_mpo_automaton_removes_identity_factors():
+    """Identity factors do not create unnecessary automaton channels."""
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    identity = np.eye(2, dtype="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [((identity, z_op), (0, 3), 1.5)]
+
+    term_mpo = builder.build_mpo(terms, compress_each=False, cutoff=0.0)
+    automaton_mpo = builder.build_mpo(
+        terms,
+        mode="automaton",
+        compress_each=False,
+        cutoff=0.0,
+    )
+
+    assert automaton_mpo.pepsy_automaton.bond_dimensions == (2, 2, 2)
+    assert np.allclose(term_mpo.to_dense(), automaton_mpo.to_dense())
+
+
+def test_build_mpo_auto_falls_back_before_wide_automaton(monkeypatch):
+    """Auto mode avoids allocating a structurally wide exact automaton."""
+    builder = py.ham_tn(Lx=8, Ly=1, data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [
+        (
+            (np.diag([1.0, 1.0 + index / 100.0]), z_op),
+            (0, builder.L - 1),
+            1.0,
+        )
+        for index in range(65)
+    ]
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("auto mode should select term accumulation here")
+
+    monkeypatch.setattr(builder, "_compile_automaton", fail_compile)
+    mpo = builder.build_mpo(
+        terms,
+        mode="auto",
+        max_bond=1,
+        compress_each=False,
+        cutoff=0.0,
+    )
+
+    assert mpo.max_bond() <= 1
+    assert not hasattr(mpo, "pepsy_automaton")
+
+
+@pytest.mark.parametrize("mode", ["automaton", "auto"])
+def test_build_mpo_automaton_modes_compress_final_mpo_to_chi(monkeypatch, mode):
+    """Both automaton spellings apply chi to the final compiled MPO."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    mpo = builder.build_mpo(
+        [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "Y", -0.3)],
+        mode=mode,
+        chi=2,
+        cutoff=0.0,
+        cutoff_mode="auto",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["max_bond"] == 2
+    assert calls[0]["cutoff_mode"] == "rsum2"
+    assert mpo.max_bond() <= 2
 
 
 def test_build_mpo_and_pepo_accept_native_fermion_terms_with_mapper():
@@ -152,7 +407,7 @@ def test_build_mpo_rejects_legacy_sites_ops_order():
         (((0, 0),), (z_op,), 0.5),
     ]
 
-    with pytest.raises(TypeError, match="Only 2D coordinates are supported"):
+    with pytest.raises(TypeError, match="integer chain indices or 2D coordinates"):
         builder.build_mpo(ints_legacy, compress_each=False)
 
 

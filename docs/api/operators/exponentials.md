@@ -10,6 +10,42 @@ refactoring roadmap, see the [operator and exponential API plan](../../developme
 > when the operator topology is reused. The `step` is the scalar in
 > `exp(step * H)`; it is not automatically a physical time.
 
+## Choose the analytical construction mode
+
+The higher-order history mode is independent of the final numerical `chi`
+compression:
+
+| Mode | Passes | Meaning |
+| --- | --- | --- |
+| `"base"` | Algorithms 1--2 | Conservative exact history path |
+| `"exact"` | Algorithms 1--3 | Include the selected next-order replay |
+| `"folded"` | Algorithms 1, 2, and 4 | Fast Algorithm-4 correction folding |
+| `"hybrid"` | Algorithms 1--4 | Exact extension followed by folding |
+| `"auto"` | Budget-dependent | Symbolic Algorithm-3 estimate: `exact` when it is within `extension_budget`, otherwise `folded` |
+
+The older names `"algorithm4"`, `"optimal"`, and `"approximate"` remain
+accepted as compatibility aliases. `chi` is a separate numerical bond cap;
+it does not select or disable Algorithm 4.
+
+For `mode="auto"`, the estimate is made from reachable symbolic histories
+before the numerical left/right Cartesian pair plan is built. The default
+`extension_budget` is 1,024 selected extension terms and can be overridden:
+
+```python
+U = exp_mpo(
+    terms,
+    -1j * tau,
+    order=4,
+    mode="auto",
+    extension_budget=10_000,
+    return_semantic=True,
+)
+print(U.metadata)
+```
+
+The semantic result records `requested_mode`, `mode`,
+`estimated_extension_terms`, `extension_budget`, and `mode_reason`.
+
 ## Choose the representation
 
 | Goal | Canonical entry point | Result |
@@ -19,6 +55,7 @@ refactoring roadmap, see the [operator and exponential API plan](../../developme
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
 | Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
+| Product of two existing MPOs | `compress_mpo_product(A, B, ...)` | Lazy `A @ B`, then one ordinary compressed MPO |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
 | Quimb MPO interoperability | `semantic_mpo.to_mpo()` | Quimb `MatrixProductOperator` |
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |
@@ -57,18 +94,135 @@ terms = [
 ]
 
 # Returns a Quimb MatrixProductOperator by default.
-U = exp_mpo(terms, -1j * tau, shape=(4, 4), order=4, mode="optimal")
+U = exp_mpo(terms, -1j * tau, shape=(4, 4), order=4, mode="exact")
 ```
+
+The compact tuple spellings used by `ham_tn.build_mpo` are accepted too:
+
+```python
+terms = [
+    ((0, 0), "X", h),
+    (("ZZ", J), ((0, 0), (1, 0))),
+]
+U = exp_mpo(terms, -1j * tau, shape=(4, 4), mode="exact")
+```
+
+When `chi` is supplied, Pepsy first compiles the complete higher-order term
+MPO and then applies one final numerical Quimb compression sweep. Use
+`cutoff="auto"` and `cutoff_mode="auto"` for the dtype-aware cutoff policy
+and `form` / `create_bond` for the main Quimb controls. Other Quimb keywords
+can be passed through `compress_opts`:
+
+```python
+U = exp_mpo(
+    terms,
+    -1j * tau,
+    shape=(4, 4),
+    order=3,
+    chi=64,
+    cutoff="auto",
+    cutoff_mode="auto",
+    form="left",
+    compress_opts={"renorm": False},
+)
+```
+
+To multiply two already-built MPOs while keeping the product intermediate
+lazy, use the separate numerical product facade:
+
+```python
+from pepsy.operators import compress_mpo_product
+
+AB = compress_mpo_product(
+    A,
+    B,
+    chi=64,
+    method="auto",          # direct/SDC for mild products, FIT/DMRG2 otherwise
+    cutoff="auto",
+    cutoff_mode="auto",
+)
+
+AB_exact = compress_mpo_product(A, B, chi=None)  # no numerical compression
+```
+
+`method="dmrg"`, `"dmrg2"`, and `"dmrg3"` use Pepsy's native `FIT` solver;
+`"direct"`, `"dm"`, `"sdc"`, and `"src"` dispatch to Quimb's 1D
+compression methods. This `chi` compression is numerical and separate from
+the analytical history Algorithms 1--4.
+
+The DMRG methods first create a disposable rank-`chi` guess, then refine the
+exact lazy product target with `FIT.run_eff`. The latter reuses its left/right
+environments across full-chain sweeps. The default `guess_method="auto"`
+selects deterministic SDC; dense products can opt into an SRC warm start:
+
+```python
+AB = compress_mpo_product(
+    A,
+    B,
+    chi=64,
+    method="dmrg2",
+    guess_method="src",
+    guess_seed=0,
+)
+```
+
+SRC warm starts are currently dense-only. Native Symmray products retain
+charge-sector structure and should use the default SDC or an explicit
+`guess_method="direct"` until a sector-aware randomized SRC path is
+available. The result metadata records `guess_method`, `guess_seed`, and
+`fit_solver="FIT.run_eff"`.
+
+For a live diagnostic of a large-order build, pass `progress=True`. The bar is
+headed `exp(order=N)` and uses separate colors for history construction,
+analytical algorithm passes, the boundary contraction, and final numerical
+`chi` compression. Algorithm 4 is selected with `mode="folded"` and shown as
+`A4 analytical-compress`; it is an order-controlled analytical history
+reduction, not an SVD or `chi` cutoff.
+The final stage is shown compactly as `chi-compress (chi=...)`; its backend and
+method remain in `numerical_compression`. A call with `order=3` builds order 3
+directly; it does not silently rebuild orders 1 and 2. To compare those
+timings, call the builder once for each order:
+
+```python
+for order in (1, 2, 3):
+    U = exp_mpo(
+        terms,
+        -1j * tau,
+        shape=(4, 4),
+        order=order,
+        mode="base",
+        chi=64,
+        progress=True,
+    )
+```
+
+When enabled, the completed result also stores stage timings in
+`U.pepsy_exp_metadata["timings"]` (or
+`U.pepsy_first_degree.metadata["timings"]` for an uncompressed Quimb MPO, or
+`result.metadata["timings"]` for a semantic MPO). The displayed `maxchi` is
+the actual current/final MPO bond size; `chi` is the requested upper bound.
+The metadata fields `analytical_compression` and `numerical_compression` make
+the two compression layers explicit. `chi=None` means
+`numerical_compression="none"`; it does not disable Algorithms 1, 2, or 4.
+`timing_history` stores the completed stage timings under the requested order,
+and `order_seconds` stores the total elapsed construction time. The bar keeps
+its main description stable while transient site/bond information is placed in
+the postfix, and the completed line includes `order_s`.
 
 `location` can also be a 1D integer site or a sequence of chain sites. In a
 2D/3D term, one coordinate is used for a one-site operator and a sequence of
-coordinates is used for a product operator. Coefficients may be Python
+ coordinates is used for a product operator. Coefficients may be Python
 numbers, Torch/JAX scalars, `MPOParameter` references, or callables supported
 by `MPOBasis`; their slots remain independent even when their structural MPO
 path is shared. Pass a configured `OneDMap` with `mapper=` when a custom
 ordering is needed. Pass `symmetry=` and `physical_charges=` to enable the
 native bosonic block-sparse compilation. Set `return_semantic=True` to keep
 the history-aware `FirstDegreeMPO` instead of materializing the Quimb MPO.
+Pass `to_backend=pepsy.backend_torch(...)` or another array converter to move
+the compiled operator blocks and coefficient assembly onto a backend before
+higher-order contractions; the final ordinary Quimb MPO is checked with
+`apply_to_arrays` as well. `to_backend` is currently for dense MPO execution
+and cannot be combined with native `symmetry=` compilation.
 When `chi` is requested, use `compression="fixed_rank"` (or
 `differentiable=True`) with `return_semantic=True`; ordinary Quimb compression
 cannot preserve the higher-order history metadata.
@@ -132,7 +286,7 @@ U = basis.exp(
     -1j * tau,
     {"J": J, "h": h},
     order=4,
-    mode="optimal",
+    mode="exact",
 )
 ```
 
@@ -141,7 +295,7 @@ has one backend vector in term order:
 
 ```python
 theta = torch.stack((J, h))  # one value per compiled term
-U = basis.exp(-1j * tau, coefficients=theta, order=4, mode="optimal")
+U = basis.exp(-1j * tau, coefficients=theta, order=4, mode="exact")
 ```
 
 `parameters` and `coefficients` are mutually exclusive. A parameter mapping
@@ -170,7 +324,7 @@ basis = MPOBasis.from_square_lattice(
         },
     ],
 )
-compiled = basis.compile_exp(order=4, mode="optimal")
+compiled = basis.compile_exp(order=4, mode="exact")
 U = compiled.exp(-1j * tau, {"J": J, "h": h})
 ```
 
@@ -186,7 +340,7 @@ square-lattice virtual legs rather than an MPO, use `PauliPEPOBasis` instead.
 Compile the order/mode policy once when only coefficients or `step` change:
 
 ```python
-compiled = basis.compile_exp(order=4, mode="optimal")
+compiled = basis.compile_exp(order=4, mode="exact")
 
 U = compiled.exp(-1j * tau, {"J": J, "h": h})
 raw_tensors = compiled.exp_arrays(-1j * tau, {"J": J, "h": h})
@@ -221,6 +375,9 @@ custom operator: step = any backend scalar
 final numerical MPO compression cap. With `chi=None`, the result remains a
 semantic `FirstDegreeMPO`; with `chi` set, the default result is a Quimb MPO.
 Use `differentiable=True` with `chi` for fixed-rank autodiff compression.
+`chi=None` disables only this final numerical compression; the exact or
+analytical history reductions selected by `mode` still run as part of the
+construction.
 
 Set `history_storage="reduced"` to stream local products directly into the
 post-Algorithms-1/2 virtual space. This route supports all four modes,

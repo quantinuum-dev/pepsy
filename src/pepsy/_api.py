@@ -46,6 +46,7 @@ _SYMBOL_MODULES = {
     "guppy_gate_stream": ".interop",
     "internal_inds": ".fitting",
     "build_mpo_from_gates": ".operators",
+    "compress_mpo_product": ".operators",
     "build_cluster_expansion_pepo": ".operators",
     "build_model_cluster_expansion_pepo": ".operators",
     "build_itf_cluster_expansion_pepo": ".operators",

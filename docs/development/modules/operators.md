@@ -23,7 +23,7 @@ These are the names to use in new code.
 
 | Area | Canonical names | Owner |
 | --- | --- | --- |
-| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`) |
+| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`; structural plan implementation: `operators.mpo_block_plan`) |
 | MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
 | Shared report summary | `OperatorReportInfo` and each concrete report's `.api_info` | `operators.diagnostics` |
 | Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct` | `operators.mpo_product` |
@@ -94,6 +94,8 @@ These names are public and documented, but most users should reach them
 through the higher-level basis or plan objects first:
 
 - `MPOLevelToken`, `MPOLevel`: symbolic higher-order MPO history metadata.
+- `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`: backend-neutral
+  virtual-state/local-block structure and charge validation for compiled MPOs.
 - `MPOAutomaton`, `MPOChannel`, `MPOTransition`: exact channel/path assembly.
 - `ClusterLattice` and connected-cluster shape records: geometry planning
   independent of tensor values.
@@ -123,9 +125,9 @@ new examples:
 | `ClusterExpansionBasis` | `MPOClusterProductExpansion` | Historical class alias |
 | `ClusterExpBasis` | `MPOClusterProductExpansion` | Historical class alias |
 | `MPOClusterExpansion` | `MPOClusterProductExpansion` | Historical class alias |
-| `mode="paper_algorithm4"` | `mode="algorithm4"` | Historical mode spelling |
-| `mode="paper_optimal"` | `mode="optimal"` | Historical mode spelling |
-| `mode="paper_approximate"` | `mode="approximate"` | Historical mode spelling |
+| `mode="algorithm4"` / `mode="paper_algorithm4"` | `mode="folded"` | Historical mode spellings |
+| `mode="optimal"` / `mode="paper_optimal"` | `mode="exact"` | Historical mode spellings |
+| `mode="approximate"` / `mode="paper_approximate"` | `mode="hybrid"` | Historical mode spellings |
 
 `ham_tn` is a stable, older Hamiltonian-builder spelling documented in its
 own API page. It should remain available while a future naming review decides

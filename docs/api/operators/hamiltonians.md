@@ -1,7 +1,100 @@
 # `pepsy.operators.hamiltonians`
 
-`ham_tn.build_mpo` retains its original explicit local-operator form. It also
-accepts a `Fermion` model for symmetry-aware MPO construction:
+`ham_tn.build_mpo` accepts explicit local operators or compact Pauli terms and
+returns a standard Quimb MPO. By default it adds terms sequentially; the
+original matrix-based form remains available:
+
+```python
+builder = pepsy.ham_tn(shape=20)
+mpo = builder.build_mpo(
+    [
+        ((pepsy.x,), (10,), 0.5),
+        ((pepsy.z, pepsy.z), (10, 11), 1.2),
+    ],
+    max_bond=64,
+    cutoff="auto",
+    cutoff_mode="auto",
+)
+```
+
+`shape` is the geometry spelling shared with `exp_mpo`: use an integer for a
+1D chain, `(Lx, Ly)` for a 2D lattice, or `(Lx, Ly, Lz)` for a 3D lattice.
+The legacy `Lx=..., Ly=..., Lz=...` spelling remains supported, but cannot
+conflict with `shape` when both are supplied.
+
+Compact Pauli terms can use either requested spelling:
+
+```python
+terms = [
+    ((10,), "X", 0.5),
+    (("ZZ", 1.2), (10, 11)),
+]
+mpo = builder.build_mpo(terms, max_bond=64, cutoff="auto", cutoff_mode="auto")
+```
+
+Set `to_backend` on the builder to convert the finished MPO tensors to a
+selected array backend. The initial local operators are created using
+`data_type`, then the MPO additions and truncations are carried out on the
+selected backend:
+
+```python
+import torch
+
+to_backend = pepsy.backend_torch(dtype=torch.complex128)
+builder = pepsy.ham_tn(Lx=20, Ly=1, to_backend=to_backend)
+mpo = builder.build_mpo(
+    terms,
+    chi=64,
+    form="left",
+    cutoff="auto",
+    cutoff_mode="auto",
+    method="svd",
+)
+assert all(isinstance(tensor.data, torch.Tensor) for tensor in mpo)
+```
+
+When `data_type` is omitted, the builder infers it from the converter's target
+dtype. Without `to_backend`, it defaults to `float64`. `chi` is an alias for
+`max_bond`; `form="left"` is forwarded to Quimb's compressor. Additional
+Quimb compression keywords can be supplied through `compress_opts`.
+
+Use `mode="automaton"` to canonicalize equivalent terms, compile the complete
+list with Pepsy's shared finite-state MPO automaton, and then apply one final
+numerical compression to `chi`. `mode="auto"` makes the same choice when the
+estimated structural width is reasonable, and otherwise uses the sequential
+term route to avoid constructing an unnecessarily wide exact MPO. The default
+`mode="term"` retains sequential term addition and optional compression after
+each term.
+
+The automaton preparation combines duplicate product terms, folds all one-site
+terms acting on the same site, and removes identity factors from two-site
+terms. These are exact algebraic simplifications; `chi` and `cutoff` still
+control only the final numerical compression.
+
+For a 2D builder, locations can be lattice coordinates and are mapped through
+`OneDMap`; a one-site coordinate can be written as `((x, y),)`:
+
+```python
+mapper = pepsy.OneDMap(Lx=4, Ly=4, mode="snake")
+builder = pepsy.ham_tn(shape=(4, 4), mapper=mapper)
+mpo = builder.build_mpo(
+    [
+        (((0, 0),), "X", 0.5),
+        (("ZZ", 1.2), ((0, 0), (1, 0))),
+    ],
+    max_bond=64,
+    cutoff="auto",
+    cutoff_mode="auto",
+)
+```
+
+`cutoff="auto"` selects ``1e-3`` for 16-bit data, ``1e-6`` for
+32-bit/complex64 data, and ``1e-12`` otherwise. `cutoff_mode="auto"` selects
+Pepsy's usual ``rsum2`` policy. `compress_each=True` (the default) applies
+the compression after every term addition; set it to `False` to compress only
+after the complete sum.
+
+The builder also accepts a `Fermion` model for symmetry-aware MPO construction:
 
 ```python
 fermion = pepsy.Fermion(spinful=True, symmetry="U1U1")

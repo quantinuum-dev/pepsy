@@ -77,3 +77,44 @@ cache stores no Torch/JAX arrays or autodiff graph; coefficient rebinding
 recomputes numerical local blocks while reusing the symbolic plan. A scalar
 reference test in `tests/test_mpo.py` covers the batched Algorithm 3 path for
 orders 1--3.
+
+## 2026-08-31 upstream compatibility audit
+
+The active environment reports Quimb
+`1.15.1.dev37+gdf03dbe79` at `df03dbe7989fe19eeb78ca78ea19a87b44da631a`.
+The inspected Quimb APIs are `MatrixProductOperator` construction with
+`shape="lrud"` and `MPO.compress_all(max_bond=None, cutoff=1e-10,
+canonize=True, ..., mode="auto", inplace=False, **compress_opts)`. Pepsy's
+final compression continues to use the narrower `MPO.compress` boundary, so
+this upstream surface is classified **defer** for the progress work. The
+current Quimb changelog's new deterministic `sdc` compression is likewise
+left opt-in through existing `compress_opts`; Pepsy's progress feature only
+observes the stage and final bond sizes.
+
+Focused validation for this change: the new progress/timing regression and
+the related MPO compression/backend tests pass (`21 passed`); Python compile
+and Ruff checks are clean.
+
+## 2026-08-31 native Symmray dense-order audit
+
+The active Pepsy environment reports Quimb
+`1.15.1.dev38+gfcb3998f9`, Autoray `0.11.1.dev1+gc56f64427`, Cotengra
+`0.8.3.dev6+g08fe1a3a1`, and Symmray `0.3.2.dev6+ga17699db6`. The installed
+Symmray API probe confirmed `AbelianArray.to_dense(index_maps=...)` and
+`unfuse_all()`. A native MPO contracted by Quimb is first fused into charge
+sectors; calling its raw Symmray `.to_dense()` without maps returns packed
+sector order, which is not necessarily the original computational basis.
+
+Pepsy now adopts the public `index_maps` API at its Quimb MPO boundary. The
+returned `PepsyMatrixProductOperator` remains an ordinary Quimb
+`MatrixProductOperator` subclass, but restores the physical basis order for
+`to_dense()` and retains the basis metadata after numerical compression clears
+the semantic history attachment. The `unfuse_all()` route remains a narrow
+fallback when metadata cannot be recovered. This is classified as an
+**adopted upstream API with a Pepsy compatibility shim**; no installed
+dependency was modified.
+
+Focused validation includes interior one-/two-site native terms, higher-order
+native histories, and the post-compression native output. The direct dense
+and native outputs now agree in computational-basis order, while the MPO
+tensors remain native Symmray arrays before explicit dense conversion.

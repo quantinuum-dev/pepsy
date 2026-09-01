@@ -148,6 +148,7 @@ build_itf_cluster_expansion_pepo
 build_real_time_cluster_expansion_pepo
 generate_connected_cluster_shapes
 build_mpo_from_gates
+compress_mpo_product
 build_optimizer
 build_pepo_from_gates
 build_tree_operator

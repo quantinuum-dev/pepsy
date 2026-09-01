@@ -36,6 +36,12 @@ from .mpo_semantic import (
     _backend_reference,
     _fixed_rank_svd,
     _multiply_scalar,
+    _resolve_compression_cutoff,
+    _resolve_compression_cutoff_mode,
+    _ensure_pepsy_mpo_boundary,
+    _native_sector_summary,
+    _normalize_sector_aware_request,
+    _resolve_sector_aware,
     _scatter_add_2d,
     _term_from_input,
 )
@@ -54,6 +60,7 @@ __all__ = [
     "ClusterExpansionBasis",
     "ClusterExpBasis",
     "MPOClusterExpansion",
+    "compress_mpo_product",
 ]
 
 
@@ -146,6 +153,423 @@ def _set_partitions(items):
 
 def _identity(dim, *, like):
     return ar.do("eye", int(dim), like=like)
+
+
+def _as_quimb_mpo(mpo):
+    """Return a Quimb MPO while preserving the input tensor backend."""
+
+    if hasattr(mpo, "tensors") and hasattr(mpo, "gate_upper_with_op_lazy"):
+        return mpo
+    converter = getattr(mpo, "to_mpo", None)
+    if converter is None:
+        raise TypeError(
+            "MPO product compression expects a Quimb MPO or an object "
+            "with a to_mpo() method."
+        )
+    result = converter()
+    if not hasattr(result, "tensors") or not hasattr(
+        result,
+        "gate_upper_with_op_lazy",
+    ):
+        raise TypeError("to_mpo() did not return a compatible Quimb MPO.")
+    return result
+
+
+def _mpo_product_bond_sizes(mpo):
+    """Get ordinary MPO bond sizes without converting tensor data."""
+
+    try:
+        return tuple(int(size) for size in mpo.bond_sizes())
+    except (AttributeError, TypeError, ValueError):
+        return tuple(
+            int(mpo.bond_size(site, site + 1))
+            for site in range(int(mpo.L) - 1)
+        )
+
+
+def _mpo_product_reference(*mpos):
+    for mpo in mpos:
+        for tensor in mpo.tensors:
+            return tensor.data
+    raise ValueError("MPO product compression received an empty MPO.")
+
+
+def _has_symmray_data(*mpos):
+    return any(
+        hasattr(tensor.data, "blocks") and hasattr(tensor.data, "indices")
+        for mpo in mpos
+        for tensor in mpo.tensors
+    )
+
+
+def _attach_mpo_product_metadata(mpo, metadata):
+    """Attach copy-safe compression metadata to a Quimb result."""
+
+    setattr(mpo, "pepsy_mpo_product_metadata", dict(metadata))
+    # Quimb tensor networks intentionally have a small core object model and
+    # do not expose a universal metadata field.  The Pepsy-prefixed attribute
+    # above is therefore the stable boundary for ordinary MPO results.
+    return mpo
+
+
+def compress_mpo_product(
+    A,
+    B,
+    *,
+    chi=None,
+    method="auto",
+    cutoff="auto",
+    cutoff_mode="auto",
+    sector_aware="auto",
+    guess_method="auto",
+    guess_seed=None,
+):
+    """Compress the ordered MPO product ``A @ B`` into one ordinary MPO.
+
+    The product is first represented lazily as ``B.gate_upper_with_op_lazy(A)``
+    and only then materialized or compressed.  Thus the intermediate virtual
+    bond structure is never expanded into a dense global operator.  With
+    ``chi=None`` the lazy target is materialized exactly and no numerical
+    truncation is performed.
+
+    Parameters
+    ----------
+    A, B : Quimb MPO or Pepsy semantic MPO
+        Open-boundary MPOs with matching site count and physical dimensions.
+        The returned operator represents ``A @ B``.
+    chi : int or None, optional
+        Final MPO bond cap. ``None`` means exact materialization without
+        compression.
+    method : str, default="auto"
+        Numerical compression method. Supported methods are ``"auto"``,
+        ``"direct"``/``"svd"``, ``"dm"``, ``"sdc"``, ``"src"``,
+        ``"fit"``, ``"dmrg"``, ``"dmrg2"``, and ``"dmrg3"``. The DMRG
+        names use Pepsy's native :class:`FIT` solver with one-, two-, or
+        three-site updates; the other names dispatch to Quimb's 1D
+        compressor.
+    cutoff, cutoff_mode : optional
+        Numerical truncation controls. ``"auto"`` resolves the cutoff from
+        the input dtype and resolves the mode to ``"rsum2"``. ``cutoff`` is
+        ignored for the exact ``chi=None`` materialization.
+    sector_aware : {True, False, "auto"}, default="auto"
+        Preserve and report native Symmray charge sectors during compression.
+        ``True`` rejects a dense product boundary instead of silently falling
+        back to ordinary compression.
+    guess_method : {"auto", "direct", "dm", "sdc", "sdc-oversample", "src", "src-oversample"}, default="auto"
+        Initial rank-``chi`` approximation for the DMRG/FIT methods. ``auto``
+        selects deterministic SDC, which is compatible with native Symmray
+        sectors. ``src`` and ``src-oversample`` are opt-in randomized warm
+        starts for dense MPOs only.
+    guess_seed : optional
+        Random seed forwarded to an SRC warm start. It has no effect for
+        deterministic guess methods and is ignored when ``method`` is not a
+        DMRG/FIT method.
+
+    Notes
+    -----
+    The lazy target keeps backend arrays untouched, so NumPy, Torch, CuPy,
+    JAX, and native Symmray data remain at their respective Quimb/Pepsy
+    boundaries.  Numerical ``chi`` compression is deliberately separate from
+    analytical MPO construction and from symbolic history compression.
+    """
+    # Import Quimb only when this public compression operation is requested.
+    # The rest of the cluster-product module remains usable without importing
+    # the optional 1D compression implementation at module import time.
+    import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+    A = _as_quimb_mpo(A)
+    B = _as_quimb_mpo(B)
+    if int(A.L) != int(B.L):
+        raise ValueError(
+            f"MPO products require equal lengths, got {A.L} and {B.L}."
+        )
+    if not isinstance(method, str):
+        raise TypeError("method must be a string.")
+    requested_method = method
+    method = method.strip().lower()
+    aliases = {
+        "svd": "direct",
+        "dmrg1": "dmrg",
+        "fit-1": "dmrg",
+        "fit-2": "dmrg2",
+        "fit-3": "dmrg3",
+    }
+    method = aliases.get(method, method)
+    allowed = {
+        "auto",
+        "direct",
+        "dm",
+        "sdc",
+        "sdc-oversample",
+        "src",
+        "src-oversample",
+        "fit",
+        "dmrg",
+        "dmrg2",
+        "dmrg3",
+    }
+    if method not in allowed:
+        raise ValueError(
+            "unknown MPO product compression method "
+            f"{requested_method!r}; expected one of "
+            + ", ".join(sorted(allowed))
+            + "."
+        )
+    if chi is not None:
+        if not isinstance(chi, Integral) or int(chi) < 1:
+            raise ValueError("chi must be a positive integer or None.")
+        chi = int(chi)
+
+    if guess_method is None:
+        guess_method = "auto"
+    if not isinstance(guess_method, str):
+        raise TypeError("guess_method must be a string or None.")
+    requested_guess_method = guess_method
+    guess_method = guess_method.strip().lower()
+    guess_aliases = {"svd": "direct", "srcmps": "src"}
+    guess_method = guess_aliases.get(guess_method, guess_method)
+    allowed_guess_methods = {
+        "auto",
+        "direct",
+        "dm",
+        "sdc",
+        "sdc-oversample",
+        "src",
+        "src-oversample",
+    }
+    if guess_method not in allowed_guess_methods:
+        raise ValueError(
+            "unknown MPO product DMRG guess method "
+            f"{requested_guess_method!r}; expected one of "
+            + ", ".join(sorted(allowed_guess_methods))
+            + "."
+        )
+    resolved_guess_method = None
+    fit_environment_reuse_count = None
+
+    reference = _mpo_product_reference(A, B)
+    resolved_cutoff = _resolve_compression_cutoff(cutoff, reference)
+    resolved_cutoff_mode = _resolve_compression_cutoff_mode(cutoff_mode)
+    if method == "auto":
+        if chi is None:
+            resolved_method = "direct"
+        elif _has_symmray_data(A, B):
+            # Keep native block structure inside FIT.  Generic randomized or
+            # successive compressors are useful for dense arrays but should
+            # not be selected automatically for symmetry-aware inputs.
+            resolved_method = "dmrg2"
+        else:
+            raw_bonds = _mpo_product_bond_sizes(A)
+            raw_bonds_b = _mpo_product_bond_sizes(B)
+            raw_max_bond = max(
+                (left * right for left, right in zip(raw_bonds, raw_bonds_b)),
+                default=1,
+            )
+            # A mild product is cheaper and usually sufficiently stable with
+            # deterministic SDC.  Stronger truncation uses a short variational
+            # two-site refinement, initialized from the same lazy target.
+            resolved_method = (
+                "sdc" if raw_max_bond <= 2 * chi else "dmrg2"
+            )
+    else:
+        resolved_method = method
+
+    target = B.copy().gate_upper_with_op_lazy(A.copy())
+    sector_aware_request = _normalize_sector_aware_request(sector_aware)
+    target_sector_summary = _native_sector_summary(target)
+    sector_aware = _resolve_sector_aware(
+        sector_aware_request,
+        target_sector_summary,
+    )
+    if chi is None:
+        # max_bond=None and cutoff=0 are the explicit exact-materialization
+        # contract.  The caller's cutoff is validated and recorded, but never
+        # used to discard a singular value on this branch.
+        result = qtn.tensor_network_1d_compress(
+            target,
+            max_bond=None,
+            cutoff=0.0,
+            cutoff_mode=resolved_cutoff_mode,
+            method="direct",
+            inplace=False,
+        )
+    elif resolved_method in {"dmrg", "dmrg2", "dmrg3", "fit"}:
+        from pepsy.fitting import FIT  # pylint: disable=import-outside-toplevel
+
+        block_size = {
+            "dmrg": 1,
+            "fit": 2,
+            "dmrg2": 2,
+            "dmrg3": 3,
+        }[resolved_method]
+        resolved_guess_method = (
+            "sdc" if guess_method == "auto" else guess_method
+        )
+        if (
+            target_sector_summary is not None
+            and resolved_guess_method.startswith("src")
+        ):
+            raise NotImplementedError(
+                "SRC warm starts are not currently sector-aware for native "
+                "Symmray MPOs; use guess_method='sdc' or 'direct'."
+            )
+        guess_kwargs = {
+            "max_bond": chi,
+            "method": resolved_guess_method,
+            "inplace": False,
+        }
+        if resolved_guess_method.startswith("src"):
+            # SRC is rank-controlled and its base implementation does not
+            # accept cutoff_mode on all supported Quimb versions.
+            guess_kwargs["cutoff"] = 0.0
+            if guess_seed is not None:
+                guess_kwargs["seed"] = guess_seed
+        else:
+            guess_kwargs["cutoff"] = resolved_cutoff
+            guess_kwargs["cutoff_mode"] = resolved_cutoff_mode
+        # The warm start is disposable. The exact lazy target remains the
+        # variational objective passed to FIT, and FIT.run_eff is the only
+        # DMRG refinement entry point so its cached sweep environments are
+        # reused across the full-chain sweeps.
+        guess = qtn.tensor_network_1d_compress(
+            target.copy(),
+            **guess_kwargs,
+        )
+        fitter = FIT(
+            target,
+            p=guess,
+            cutoffs=resolved_cutoff,
+            copy_target=False,
+            inplace=False,
+        )
+        fitter.run_eff(
+            n_iter=4,
+            block_size=block_size,
+            max_bond=chi,
+            cutoff=resolved_cutoff,
+            cutoff_mode=resolved_cutoff_mode,
+            adaptive_block_sweeps=(
+                2 if block_size in {2, 3} else None
+            ),
+        )
+        fit_environment_reuse_count = int(
+            getattr(fitter, "_sweep_environment_reuse_count", 0)
+        )
+        result = fitter.p
+    else:
+        if target_sector_summary is not None and resolved_method.startswith("src"):
+            raise NotImplementedError(
+                "SRC compression is not currently available for native "
+                "Symmray MPOs because its randomized path is not sector-aware."
+            )
+        kwargs = {
+            "max_bond": chi,
+            "method": resolved_method,
+            "inplace": False,
+        }
+        if not resolved_method.startswith("src"):
+            kwargs["cutoff"] = resolved_cutoff
+            kwargs["cutoff_mode"] = resolved_cutoff_mode
+        else:
+            # Quimb's SRC method is rank-controlled and ignores non-zero
+            # cutoffs. Passing zero explicitly suppresses its advisory warning
+            # while the requested/resolved cutoff remains in metadata.
+            kwargs["cutoff"] = 0.0
+        result = qtn.tensor_network_1d_compress(target, **kwargs)
+
+    final_sector_summary = _native_sector_summary(result)
+    if sector_aware and final_sector_summary is None:
+        raise RuntimeError(
+            "sector-aware MPO product compression lost native Symmray "
+            "sector structure."
+        )
+    # ``tensor_network_1d_compress`` may return a new object and therefore
+    # drop arbitrary attributes from the Pepsy source MPO. Retain the local
+    # physical charge map so the Pepsy Quimb MPO boundary can restore
+    # computational-basis order after a later ``to_dense()`` call.
+    source_metadata = next(
+        (
+            candidate
+            for candidate in (A, B)
+            if getattr(candidate, "pepsy_mpo_symmetry", None) is not None
+        ),
+        None,
+    )
+    if source_metadata is not None:
+        result = _ensure_pepsy_mpo_boundary(result)
+        result.pepsy_mpo_symmetry = source_metadata.pepsy_mpo_symmetry
+        result.pepsy_mpo_physical_charges = (
+            source_metadata.pepsy_mpo_physical_charges
+        )
+        result.pepsy_mpo_physical_dimension = (
+            source_metadata.pepsy_mpo_physical_dimension
+        )
+    final_bonds = _mpo_product_bond_sizes(result)
+    metadata = {
+        "operation": "compress_mpo_product",
+        "ordered_product": "A @ B",
+        "requested_method": requested_method,
+        "method": resolved_method,
+        "chi": chi,
+        "cutoff": cutoff,
+        "cutoff_resolved": resolved_cutoff,
+        "cutoff_mode": cutoff_mode,
+        "cutoff_mode_resolved": resolved_cutoff_mode,
+        "initial_bond_dimensions_A": _mpo_product_bond_sizes(A),
+        "initial_bond_dimensions_B": _mpo_product_bond_sizes(B),
+        "final_bond_dimensions": final_bonds,
+        "lazy_target": True,
+        "exact": chi is None,
+        "backend": type(reference).__name__,
+        "sector_aware": sector_aware,
+        "sector_aware_requested": sector_aware_request,
+        "guess_method": (
+            resolved_guess_method
+            if chi is not None
+            and resolved_method in {"dmrg", "dmrg2", "dmrg3", "fit"}
+            else None
+        ),
+        "guess_method_requested": (
+            requested_guess_method
+            if chi is not None
+            and resolved_method in {"dmrg", "dmrg2", "dmrg3", "fit"}
+            else None
+        ),
+        "guess_seed": (
+            guess_seed
+            if chi is not None
+            and resolved_method in {"dmrg", "dmrg2", "dmrg3", "fit"}
+            else None
+        ),
+        "fit_solver": (
+            "FIT.run_eff"
+            if chi is not None
+            and resolved_method in {"dmrg", "dmrg2", "dmrg3", "fit"}
+            else None
+        ),
+        "fit_environment_reuse_count": fit_environment_reuse_count,
+        "initial_sector_dimensions": (
+            ()
+            if target_sector_summary is None
+            else target_sector_summary["bond_sector_dimensions"]
+        ),
+        "final_sector_dimensions": (
+            ()
+            if final_sector_summary is None
+            else final_sector_summary["bond_sector_dimensions"]
+        ),
+        "initial_sector_block_counts": (
+            ()
+            if target_sector_summary is None
+            else target_sector_summary["site_block_counts"]
+        ),
+        "final_sector_block_counts": (
+            ()
+            if final_sector_summary is None
+            else final_sector_summary["site_block_counts"]
+        ),
+    }
+    return _attach_mpo_product_metadata(result, metadata)
 
 
 def _matrix_exponential(matrix):

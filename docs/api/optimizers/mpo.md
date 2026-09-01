@@ -275,22 +275,24 @@ U = basis.exp(
     -1j * dt,
     {"J": J, "hx": hx},
     order=2,
-    mode="optimal",
+    mode="exact",
 )
 # Fast analytical approximation: Algorithms 1, 2, and 4.
 U_fast = basis.exp(
     -1j * dt,
     {"J": J, "hx": hx},
     order=2,
-    mode="algorithm4",
+    mode="folded",
 )
 ```
 
-`mode="base"` applies Algorithms 1--2. `mode="algorithm4"` applies Algorithms
-1, 2, and 4 without the selected next-order replay. `mode="optimal"` applies
-Algorithms 1--3, where Algorithm 3 adds selected order-`N + 1` terms without
-increasing the analytical history bond dimension. `mode="approximate"`
-additionally enables Algorithm 4 after that extension. These modes, together
+`mode="base"` applies Algorithms 1--2. `mode="exact"` applies Algorithms 1--3,
+where Algorithm 3 adds selected order-`N + 1` terms without increasing the
+analytical history bond dimension. `mode="folded"` applies Algorithms 1, 2,
+and 4 without the selected next-order replay. `mode="hybrid"` additionally
+enables Algorithm 4 after the exact extension. `mode="auto"` selects `exact`
+through order 2 and `folded` above order 2. The historical spellings
+`algorithm4`, `optimal`, and `approximate` remain accepted as aliases. These modes, together
 with `order`, `max_bond`, `on_exceed`, `cache_history`, and `history_storage`,
 are shared by `basis.exp()` and `basis.compile_exp()`. The names
 `basis.time_evolution()` and `basis.evolution_mpo()` remain compatibility

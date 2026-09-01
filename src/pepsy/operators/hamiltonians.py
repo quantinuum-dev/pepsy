@@ -21,10 +21,26 @@ from .._internal.formatting import (
 )
 from ..tensors.core import OneDMap
 from ..tensors.bonds import new_native_bond
+from .mpo_automaton import MPOAutomaton
 
 __all__ = [
     "ham_tn",
 ]
+
+_DENSE_MPO_COMPRESS_KEYS = frozenset({
+    "absorb",
+    "bra",
+    "bond_ind",
+    "get",
+    "info",
+    "ltags",
+    "matrix_svals",
+    "method",
+    "renorm",
+    "right_inds",
+    "rtags",
+    "stags",
+})
 
 
 class ham_tn:
@@ -32,19 +48,40 @@ class ham_tn:
 
     Parameters
     ----------
-    Lx : int
-        Number of lattice sites along x.
-    Ly : int
-        Number of lattice sites along y.
+    shape : int or tuple[int, ...], optional
+        Lattice shape. An integer or one-element tuple denotes a 1D chain and
+        is normalized to ``(L, 1)``; two- and three-element tuples denote 2D
+        and 3D lattices. This is an alias for ``Lx``/``Ly``/``Lz`` and cannot
+        disagree with dimensions supplied using those names.
+    Lx : int, optional
+        Number of lattice sites along x. Required with ``Ly`` when ``shape``
+        is omitted.
+    Ly : int, optional
+        Number of lattice sites along y. Use ``Ly=1`` for a 1D chain when
+        using the legacy dimension spelling.
     Lz : int | None, default=None
         Optional number of lattice sites along z. When provided, terms can
         use 3D coordinates ``(x, y, z)`` and the 1D mapping is built in 3D.
-    max_bond : int, default=300
+    max_bond : int, default=256
         Compression cap used after each term addition.
-    cutoff : float, default=1e-12
-        Compression cutoff used after each term addition.
-    data_type : str | numpy.dtype, default="float64"
-        Default dtype used for identity MPO tensors and operators.
+    cutoff : float | {"auto"}, default=1e-12
+        Compression cutoff used after each term addition. ``"auto"`` selects
+        the same dtype-aware cutoff policy as :class:`MpsOptimizer`.
+    cutoff_mode : str | {"auto"} | None, default=None
+        Singular-value cutoff mode used after each term addition. ``"auto"``
+        resolves to Pepsy's ordinary ``"rsum2"`` policy. ``None`` preserves
+        Quimb's default cutoff mode.
+    chi : int | None, default=None
+        Compatibility alias for ``max_bond``.
+    data_type : str | numpy.dtype | None, default=None
+        Dtype used for identity MPO tensors and operators. When omitted,
+        ``to_backend`` is probed for its target dtype; without a converter,
+        ``float64`` is used.
+    to_backend : callable | None, default=None
+        Optional array converter, such as ``pepsy.backend_torch(...)`` or
+        ``pepsy.backend_jax(...)``. Local MPO tensors are placed on this
+        backend before term addition and compression, and are converted once
+        more at the return boundary for safety.
     mapper : pepsy.tensors.core.OneDMap | None, default=None
         Optional preconfigured lattice mapper. When omitted, a default
         ``OneDMap(Lx, Ly, Lz=Lz, mode="snake")`` is constructed.
@@ -78,23 +115,77 @@ class ham_tn:
 
         return Lx, Ly, Lz
 
+    @staticmethod
+    def _normalize_shape(shape):
+        """Normalize the public ``shape`` alias to ``(Lx, Ly, Lz)``."""
+        if isinstance(shape, Integral):
+            values = (int(shape), 1)
+        else:
+            try:
+                values = tuple(shape)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "shape must be an integer or a 1D/2D/3D shape tuple."
+                ) from exc
+            if len(values) == 1:
+                values = (values[0], 1)
+            elif len(values) not in (2, 3):
+                raise ValueError(
+                    "shape must contain one, two, or three dimensions."
+                )
+        if not all(isinstance(value, Integral) for value in values):
+            raise TypeError("shape must contain only integer dimensions.")
+        values = tuple(int(value) for value in values)
+        if any(value < 1 for value in values):
+            raise ValueError("shape dimensions must be >= 1.")
+        if len(values) == 2:
+            return values[0], values[1], None
+        return values
+
+    @staticmethod
+    def _infer_backend_dtype(to_backend):
+        """Infer a NumPy dtype from an array converter's target dtype."""
+        try:
+            sample = to_backend(np.empty(1, dtype=np.float64))
+            dtype_name = ar.get_dtype_name(sample)
+            return np.dtype(dtype_name)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise TypeError(
+                "to_backend must return an array with an inferable dtype; "
+                "pass data_type explicitly if the converter does not expose one."
+            ) from exc
+
     def __init__(
         self,
         Lx=None,
         Ly=None,
         Lz=None,
         *,
+        shape=None,
         L_x=None,
         L_y=None,
         L_z=None,
         max_bond=256,
+        chi=None,
         cutoff=1e-12,
-        data_type="float64",
+        cutoff_mode=None,
+        data_type=None,
+        to_backend=None,
         mapper=None,
     ):
         Lx, Ly, Lz = self._coalesce_dim_names(Lx=Lx, Ly=Ly, Lz=Lz, L_x=L_x, L_y=L_y, L_z=L_z)
+        if shape is not None:
+            shape_lx, shape_ly, shape_lz = self._normalize_shape(shape)
+            supplied = (Lx, Ly, Lz)
+            normalized_shape = (shape_lx, shape_ly, shape_lz)
+            for name, old, new in zip(("Lx", "Ly", "Lz"), supplied, normalized_shape):
+                if old is not None and old != new:
+                    raise TypeError(
+                        f"shape conflicts with supplied {name}: {shape!r} vs {old!r}."
+                    )
+            Lx, Ly, Lz = normalized_shape
         if not isinstance(Lx, Integral) or not isinstance(Ly, Integral):
-            raise TypeError("Lx and Ly must be integers.")
+            raise TypeError("shape or both Lx and Ly must be supplied as integers.")
         if Lx < 1 or Ly < 1:
             raise ValueError("Lx and Ly must be >= 1.")
         if Lz is not None:
@@ -115,15 +206,37 @@ class ham_tn:
 
         if not isinstance(max_bond, Integral):
             raise TypeError("max_bond must be an integer.")
+        if chi is not None:
+            if not isinstance(chi, Integral):
+                raise TypeError("chi must be an integer or None.")
+            if int(max_bond) != 256 and int(max_bond) != int(chi):
+                raise TypeError("Pass only one of max_bond and chi, or use equal values.")
+            max_bond = chi
         if int(max_bond) < 1:
             raise ValueError("max_bond must be >= 1.")
-        cutoff = float(cutoff)
-        if cutoff < 0.0:
-            raise ValueError("cutoff must be >= 0.")
+        if isinstance(cutoff, str):
+            if cutoff.strip().lower() != "auto":
+                raise ValueError("cutoff must be 'auto' or a non-negative number.")
+            cutoff = "auto"
+        else:
+            cutoff = float(cutoff)
+            if cutoff < 0.0:
+                raise ValueError("cutoff must be >= 0.")
+        if cutoff_mode is not None and not isinstance(cutoff_mode, str):
+            raise TypeError("cutoff_mode must be a string or None.")
+        if to_backend is not None and not callable(to_backend):
+            raise TypeError("to_backend must be callable or None.")
 
         self.max_bond = int(max_bond)
         self.cutoff = cutoff
-        self.data_type = np.dtype(data_type)
+        self.cutoff_mode = cutoff_mode
+        self._data_type_explicit = data_type is not None
+        self.data_type = (
+            self._infer_backend_dtype(to_backend)
+            if data_type is None and to_backend is not None
+            else np.dtype("float64") if data_type is None else np.dtype(data_type)
+        )
+        self.to_backend = to_backend
         if mapper is None:
             mapper = OneDMap(
                 self.Lx,
@@ -160,8 +273,10 @@ class ham_tn:
         J=1.0,
         field=1.0,
         max_bond=256,
+        chi=None,
         cutoff=1e-12,
-        data_type="float64",
+        data_type=None,
+        to_backend=None,
         mapper=None,
         compress_each=True,
         cycle_peps=False,
@@ -188,8 +303,10 @@ class ham_tn:
         lattice, edges, cyclic, J, field, compress_each, cycle_peps, cycle_bond_dim, \
         edge_kwargs, show, return_edges, return_mpo, return_pepo
             Forwarded directly to :meth:`build_itf`.
-        max_bond, cutoff, data_type
+        max_bond, chi, cutoff, data_type
             Used to construct the internal builder instance.
+        to_backend : callable | None, default=None
+            Optional array converter stored on the internal builder.
         mapper : pepsy.tensors.core.OneDMap | None, default=None
             Optional mapper forwarded to the internal builder. When omitted,
             the default snake-style mapper is used.
@@ -226,8 +343,10 @@ class ham_tn:
             Ly=Ly,
             Lz=Lz,
             max_bond=max_bond,
+            chi=chi,
             cutoff=cutoff,
             data_type=data_type,
+            to_backend=to_backend,
             mapper=mapper,
         )
         out = builder.build_itf(
@@ -312,6 +431,37 @@ class ham_tn:
             )
         return self.map_inv[coord]
 
+    @staticmethod
+    def _resolve_cutoff(value, dtype):
+        """Resolve a numeric or dtype-aware truncation cutoff."""
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            dtype_name = np.dtype(dtype).name.lower()
+            if "16" in dtype_name:
+                return 1.0e-3
+            if "32" in dtype_name or "complex64" in dtype_name:
+                return 1.0e-6
+            return 1.0e-12
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cutoff must be 'auto' or a non-negative number."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        return value
+
+    @staticmethod
+    def _resolve_cutoff_mode(value):
+        """Resolve ``cutoff_mode='auto'`` to Pepsy's default convention."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError("cutoff_mode must be a string or None.")
+        if value.strip().lower() == "auto":
+            return "rsum2"
+        return value
+
     def _mapped_chain_edges_2d(self, *, require_local=False):
         self._require_2d("_mapped_chain_edges_2d")
         chain_edges = set()
@@ -356,6 +506,16 @@ class ham_tn:
     def _coerce_op(self, op, *, phys_dim, dtype):
         if callable(op) and not hasattr(op, "shape"):
             op = op()
+        if isinstance(op, str):
+            label = op.strip().upper()
+            if phys_dim != 2 or len(label) != 1 or label not in "IXYZ":
+                raise ValueError(
+                    "Pauli labels require phys_dim=2 and must be one of I, X, Y, Z."
+                )
+            if label == "I":
+                op = np.eye(2, dtype=dtype)
+            else:
+                op = quimb.pauli(label, dtype=dtype)
         arr = self._as_matrix(op)
         if arr.shape != (phys_dim, phys_dim):
             raise ValueError(
@@ -375,43 +535,100 @@ class ham_tn:
     def _is_coord_site(site, *, n_dims):
         return is_integral_tuple(site, length=n_dims)
 
+    @staticmethod
+    def _is_pauli_payload(value):
+        """Return whether ``value`` is a compact Pauli label or word."""
+        if isinstance(value, str):
+            labels = tuple(value)
+        elif isinstance(value, (tuple, list)):
+            labels = tuple(value)
+        else:
+            return False
+        return bool(labels) and all(
+            isinstance(label, str)
+            and len(label) == 1
+            and label.upper() in "IXYZ"
+            for label in labels
+        )
+
     def _parse_term(self, term):
         if not isinstance(term, (tuple, list)):
             raise TypeError(
-                "Each term must be tuple/list: (ops, sites) or (ops, sites, coeff)."
+                "Each term must be tuple/list: (ops, sites[, coeff]), "
+                "(sites, paulis, coeff), or ((paulis, coeff), sites)."
             )
         if len(term) not in (2, 3):
             raise ValueError(
-                "Each term must be (ops, sites) or (ops, sites, coeff)."
+                "Each term must be (ops, sites[, coeff]), "
+                "(sites, paulis, coeff), or ((paulis, coeff), sites)."
             )
 
-        ops, sites = term[0], term[1]
+        if (
+            len(term) == 2
+            and isinstance(term[0], (tuple, list))
+            and len(term[0]) == 2
+            and self._is_pauli_payload(term[0][0])
+            and np.isscalar(term[0][1])
+        ):
+            # Convenience form: (("ZZ", J), location).
+            ops, coeff = term[0]
+            sites = term[1]
+        elif len(term) == 3 and self._is_pauli_payload(term[1]):
+            # Convenience form: (location, "ZZ", J).
+            sites, ops, coeff = term
+        else:
+            # Existing explicit local-operator form: (ops, sites[, coeff]).
+            ops, sites = term[0], term[1]
+            coeff = term[2] if len(term) == 3 else 1.0
 
-        coeff = term[2] if len(term) == 3 else 1.0
         if not np.isscalar(coeff):
             raise TypeError("coeff must be a scalar.")
 
-        if isinstance(ops, np.ndarray):
-            ops = (ops,)
-        elif isinstance(ops, tuple):
-            pass
-        else:
+        if isinstance(ops, str):
             ops = tuple(ops)
+        elif isinstance(ops, np.ndarray):
+            ops = (ops,)
+        elif isinstance(ops, (tuple, list)):
+            ops = tuple(ops)
+        elif hasattr(ops, "shape"):
+            ops = (ops,)
+        else:
+            try:
+                ops = tuple(ops)
+            except TypeError:
+                ops = (ops,)
 
-        if not isinstance(sites, (tuple, list)):
+        if isinstance(sites, Integral):
+            sites = (int(sites),)
+        elif not isinstance(sites, (tuple, list)):
             raise TypeError(
-                f"sites must be a tuple/list of {self._coord_label()} coordinates."
+                f"sites must be an integer or tuple/list of {self._coord_label()} coordinates."
             )
-        sites = tuple(sites)
+        else:
+            sites = tuple(sites)
+
+        # Permit a bare 2D/3D coordinate for a one-site Pauli term, while
+        # retaining (0, 1) as two 1D chain sites for a two-site term.
+        if (
+            len(ops) == 1
+            and len(sites) == self._coord_dims()
+            and all(isinstance(site, Integral) for site in sites)
+        ):
+            sites = (sites,)
 
         if len(sites) != len(ops):
             raise ValueError("sites and ops lengths must match.")
         if len(sites) not in (1, 2):
             raise ValueError("Only 1-site and 2-site terms are supported.")
-        if not all(ham_tn._is_coord_site(site, n_dims=self._coord_dims()) for site in sites):
+        if not all(
+            isinstance(site, Integral)
+            or ham_tn._is_coord_site(site, n_dims=self._coord_dims())
+            for site in sites
+        ):
             raise TypeError(
-                f"Only {self._coord_dims()}D coordinates are supported for this builder. "
-                f"Use terms like (({self._coord_label()}),) or a two-site pair."
+                f"Sites must be integer chain indices or {self._coord_dims()}D "
+                f"coordinates. Use terms like (({self._coord_label()}),) or a "
+                "two-site pair."
             )
 
         return sites, ops, coeff
@@ -468,15 +685,161 @@ class ham_tn:
             tensor.modify(data=np.zeros_like(tensor.data, dtype=dtype))
         return mpo
 
+    @staticmethod
+    def _apply_to_backend(tn, to_backend):
+        """Place dense tensor-network arrays on a backend safely."""
+        if to_backend is None:
+            return tn
+        for tensor in tn:
+            data = tensor.data
+            if isinstance(data, np.ndarray) and not data.flags.writeable:
+                tensor.modify(data=np.array(data, copy=True))
+        tn.apply_to_arrays(to_backend)
+        return tn
+
+    @staticmethod
+    def _operator_signature(operator):
+        """Return an exact, hashable signature for a dense local operator."""
+        array = np.ascontiguousarray(np.asarray(operator))
+        return array.shape, array.dtype.str, array.tobytes()
+
+    @staticmethod
+    def _is_zero_scalar(value):
+        try:
+            return bool(value == 0)
+        except (TypeError, ValueError):
+            return False
+
+    def _normalize_automaton_terms(
+        self,
+        ints,
+        *,
+        phys_dim,
+        dtype,
+    ):
+        """Canonicalize local terms before finite-state compilation."""
+        onsite = {}
+        duplicate_terms = {}
+        identity = np.eye(phys_dim, dtype=dtype)
+
+        for term in ints:
+            sites, ops, coeff = self._parse_term(term)
+            chain_ops = [
+                (self.map_site(site), self._coerce_op(op, phys_dim=phys_dim, dtype=dtype))
+                for site, op in zip(sites, ops)
+            ]
+            chain_sites = tuple(site for site, _op in chain_ops)
+            if len(set(chain_sites)) != len(chain_sites):
+                raise ValueError("Duplicate sites in one term are not supported.")
+            chain_ops.sort(key=lambda site_op: site_op[0])
+            non_identity = [
+                (site, op)
+                for site, op in chain_ops
+                if not np.array_equal(op, identity)
+            ]
+
+            if not non_identity:
+                # A product of onsite identities is a global scalar identity.
+                onsite[0] = onsite.get(0, np.zeros_like(identity)) + coeff * identity
+                continue
+
+            if len(non_identity) == 1:
+                site, op = non_identity[0]
+                onsite[site] = onsite.get(site, np.zeros_like(identity)) + coeff * op
+                continue
+
+            mapped_sites = tuple(site for site, _op in non_identity)
+            mapped_ops = tuple(op for _site, op in non_identity)
+            key = (
+                mapped_sites,
+                tuple(self._operator_signature(op) for op in mapped_ops),
+            )
+            if key in duplicate_terms:
+                old_sites, old_ops, old_coeff = duplicate_terms[key]
+                duplicate_terms[key] = (old_sites, old_ops, old_coeff + coeff)
+            else:
+                duplicate_terms[key] = (mapped_sites, mapped_ops, coeff)
+
+        records = []
+        for site in sorted(onsite):
+            operator = np.asarray(onsite[site], dtype=dtype)
+            if not np.array_equal(operator, np.zeros_like(operator)):
+                records.append(((site,), (operator,), 1.0))
+
+        for sites, ops, coeff in duplicate_terms.values():
+            if not self._is_zero_scalar(coeff):
+                records.append((sites, ops, coeff))
+
+        if not records:
+            # Keep the zero Hamiltonian representable by the automaton API.
+            records.append(((0,), (np.zeros_like(identity),), 1.0))
+        return tuple(records)
+
+    def _compile_automaton(self, records, *, phys_dim):
+        """Compile canonical local terms into a trimmed shared automaton.
+
+        The structural pass intentionally stays NumPy-backed so that equal
+        local operators can be fingerprinted and shared even when the final
+        MPO is requested on another array backend.  ``to_backend`` is applied
+        immediately after materializing the MPO, before any numerical
+        compression.
+        """
+        automaton = MPOAutomaton.from_product_terms(
+            self.L,
+            records,
+            phys_dim=phys_dim,
+            share_channels=True,
+        )
+        return automaton.trim()
+
+    def _estimate_automaton_bond_dimensions(self, records, *, phys_dim, dtype):
+        """Estimate structural automaton bond dimensions without allocating it."""
+        identity = np.eye(phys_dim, dtype=dtype)
+        prefixes = [set() for _ in range(max(self.L - 1, 0))]
+
+        for sites, ops, _coeff in records:
+            if len(sites) < 2:
+                continue
+            support = dict(zip(sites, ops))
+            prefix = []
+            for site in range(sites[0], sites[-1]):
+                operator = support.get(site, identity)
+                prefix.append(self._operator_signature(operator))
+                prefixes[site].add((sites[0], tuple(prefix)))
+
+        return tuple(2 + len(cut_prefixes) for cut_prefixes in prefixes)
+
+    def _build_mpo_from_automaton(
+        self,
+        records,
+        *,
+        phys_dim,
+    ):
+        """Compile canonical local terms through the finite-state MPO builder."""
+        automaton = self._compile_automaton(
+            records,
+            phys_dim=phys_dim,
+        )
+        mpo = automaton.to_mpo()
+        self._swap_mpo_phys_inds_(mpo)
+        return mpo, automaton
+
     def build_mpo(
         self,
         ints=None,
         *,
         phys_dim=2,
         max_bond=None,
+        chi=None,
         cutoff=None,
         data_type=None,
         compress_each=True,
+        cutoff_mode=None,
+        form=None,
+        create_bond=False,
+        compress_opts=None,
+        mode="term",
+        to_backend=None,
         mapper=None,
         fermion=None,
         edges=None,
@@ -494,19 +857,52 @@ class ham_tn:
             - ``((op1, op2), (coord1, coord2))``
             - ``((op,), (coord,), coeff)``
             - ``((op1, op2), (coord1, coord2), coeff)``
-            This canonical order is ``(ops, coords, coeff)``. Each coordinate
-            is ``(x, y)`` for 2D builders and ``(x, y, z)`` when ``Lz`` is
-            provided.
+            - ``(location, paulis, coeff)`` such as ``((10,), "X", h)``
+            - ``((paulis, coeff), location)`` such as ``(("ZZ", J), (10, 11))``
+            The existing matrix form uses ``(ops, coords, coeff)``. Pauli
+            forms use one label per location and accept integer chain sites or
+            lattice coordinates. A bare 2D/3D coordinate is accepted for a
+            one-site Pauli term; use ``((x, y),)`` when you want to make the
+            support unambiguous.
         phys_dim : int, default=2
             On-site physical dimension.
         max_bond : int | None, default=None
             MPO compression max bond. Uses instance default when None.
-        cutoff : float | None, default=None
-            MPO compression cutoff. Uses instance default when None.
+        chi : int | None, default=None
+            Alias for ``max_bond``. Supplying both is allowed only when they
+            have the same value.
+        cutoff : float | {"auto"} | None, default=None
+            MPO compression cutoff. Uses instance default when None. ``"auto"``
+            selects a dtype-aware cutoff: ``1e-3`` for 16-bit data,
+            ``1e-6`` for 32-bit/complex64 data, and ``1e-12`` otherwise.
         data_type : str | numpy.dtype | None, default=None
             Operator/MPO dtype. Uses instance default when None.
         compress_each : bool, default=True
             Compress after each term addition. If False, only compress once at end.
+        cutoff_mode : str | {"auto"} | None, default=None
+            Cutoff mode forwarded to Quimb. ``"auto"`` resolves to ``"rsum2"``;
+            None preserves Quimb's default.
+        form : {None, "left", "right", "flat"} | int, default=None
+            Quimb MPO compression form. ``"left"`` is the usual left-to-right
+            sweep; an integer selects the orthogonality center.
+        create_bond : bool, default=False
+            Forwarded to Quimb when compression needs to create an absent bond.
+        compress_opts : mapping | None, default=None
+            Additional keywords forwarded to Quimb's compression, such as
+            ``method``, ``absorb``, ``renorm``, or ``info``. The explicit
+            ``chi``, ``max_bond``, ``cutoff``, ``cutoff_mode``, ``form``, and
+            ``create_bond`` arguments take precedence.
+        mode : {"term", "automaton", "auto"}, default="term"
+            ``"term"`` adds and compresses each term sequentially. The
+            ``"automaton"`` mode first compiles all terms through Pepsy's
+            finite-state MPO automaton and then compresses the resulting MPO.
+            ``"auto"`` selects the automaton when its estimated structural
+            width is reasonable, otherwise it falls back to sequential terms.
+        to_backend : callable | None, default=None
+            Optional per-build array converter. When omitted, the converter
+            configured on the builder is used. Generic MPO tensors are placed
+            on this backend before addition and compression. Native fermion
+            construction forwards it directly to the native builder.
         mapper : pepsy.tensors.core.OneDMap | None, default=None
             Optional mapper override used only for this MPO build. When
             omitted, the builder's configured mapper is used.
@@ -541,7 +937,75 @@ class ham_tn:
             fermion = ints
             ints = None
 
+        to_backend = self.to_backend if to_backend is None else to_backend
+        if to_backend is not None and not callable(to_backend):
+            raise TypeError("to_backend must be callable or None.")
+
+        if chi is not None:
+            if not isinstance(chi, Integral):
+                raise TypeError("chi must be an integer or None.")
+            if max_bond is not None and int(max_bond) != int(chi):
+                raise TypeError("Pass only one of max_bond and chi, or use equal values.")
+            max_bond = chi
+
+        if compress_opts is None:
+            compress_extra = {}
+        elif not isinstance(compress_opts, Mapping):
+            raise TypeError("compress_opts must be a mapping or None.")
+        else:
+            compress_extra = dict(compress_opts)
+
+        if fermion is None:
+            for key in tuple(model_params):
+                if key not in _DENSE_MPO_COMPRESS_KEYS:
+                    continue
+                if key in compress_extra:
+                    raise TypeError(f"compression option {key!r} supplied twice.")
+                compress_extra[key] = model_params.pop(key)
+
+        if "chi" in compress_extra:
+            chi_extra = compress_extra.pop("chi")
+            if chi is not None and int(chi) != int(chi_extra):
+                raise TypeError("conflicting chi values supplied.")
+            if max_bond is not None and int(max_bond) != int(chi_extra):
+                raise TypeError("conflicting max_bond and chi values supplied.")
+            max_bond = chi_extra
+
+        for name in ("max_bond", "cutoff", "cutoff_mode", "form", "create_bond"):
+            if name not in compress_extra:
+                continue
+            value = compress_extra.pop(name)
+            current = {
+                "max_bond": max_bond,
+                "cutoff": cutoff,
+                "cutoff_mode": cutoff_mode,
+                "form": form,
+                "create_bond": create_bond,
+            }[name]
+            if current is not None and current is not False and current != value:
+                raise TypeError(f"conflicting {name} values supplied.")
+            if name == "max_bond":
+                max_bond = value
+            elif name == "cutoff":
+                cutoff = value
+            elif name == "cutoff_mode":
+                cutoff_mode = value
+            elif name == "form":
+                form = value
+            else:
+                create_bond = value
+
+        mode = str(mode).strip().lower().replace("-", "_")
+        if mode not in {"term", "automaton", "auto"}:
+            raise ValueError("mode must be 'term', 'automaton', or 'auto'.")
+        mode_auto = mode == "auto"
+
         if fermion is not None:
+            if mode != "term" or form is not None or create_bond or compress_extra:
+                raise TypeError(
+                    "mode='automaton', form, create_bond, and extra compress_opts "
+                    "are only valid for dense local-term MPO construction."
+                )
             if edges is not None:
                 if ints is not None:
                     raise TypeError(
@@ -560,7 +1024,10 @@ class ham_tn:
                 )
             dtype = self.data_type if data_type is None else np.dtype(data_type)
             max_bond_use = self.max_bond if max_bond is None else int(max_bond)
-            cutoff_use = self.cutoff if cutoff is None else float(cutoff)
+            cutoff_use = self._resolve_cutoff(
+                self.cutoff if cutoff is None else cutoff,
+                dtype,
+            )
             mapper_use = self.mapper if mapper is None else mapper
             fermionic_use = False if fermionic is None else bool(fermionic)
             if charge_sectors and not fermionic_use:
@@ -575,6 +1042,7 @@ class ham_tn:
                 dtype=dtype,
                 fermionic=fermionic_use,
                 charge_sectors=charge_sectors,
+                to_backend=to_backend,
                 **model_params,
             )
 
@@ -588,9 +1056,19 @@ class ham_tn:
         if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
             raise ValueError("phys_dim must be an integer >= 1.")
 
-        dtype = self.data_type if data_type is None else np.dtype(data_type)
+        dtype = (
+            self._infer_backend_dtype(to_backend)
+            if data_type is None and to_backend is not None and not self._data_type_explicit
+            else self.data_type if data_type is None else np.dtype(data_type)
+        )
         max_bond = self.max_bond if max_bond is None else int(max_bond)
-        cutoff = self.cutoff if cutoff is None else float(cutoff)
+        cutoff = self._resolve_cutoff(
+            self.cutoff if cutoff is None else cutoff,
+            dtype,
+        )
+        cutoff_mode = self._resolve_cutoff_mode(
+            self.cutoff_mode if cutoff_mode is None else cutoff_mode,
+        )
         if max_bond < 1:
             raise ValueError("max_bond must be >= 1.")
         if cutoff < 0.0:
@@ -604,19 +1082,83 @@ class ham_tn:
                 Lz=self.Lz,
                 max_bond=self.max_bond,
                 cutoff=self.cutoff,
+                cutoff_mode=self.cutoff_mode,
                 data_type=self.data_type,
+                to_backend=to_backend,
                 mapper=mapper,
             )
 
-        mpo_total = builder._zero_mpo(phys_dim=phys_dim, dtype=dtype)
-        for term in ints:
-            mpo_term = builder._term_to_mpo(term, phys_dim=phys_dim, dtype=dtype)
-            mpo_total = mpo_total + mpo_term
-            if compress_each:
-                mpo_total.compress(max_bond=max_bond, cutoff=cutoff)
+        compress_options = dict(compress_extra)
+        compress_options.update({
+            "max_bond": max_bond,
+            "cutoff": cutoff,
+        })
+        if cutoff_mode is not None:
+            compress_options["cutoff_mode"] = cutoff_mode
+        if form is not None:
+            compress_options["form"] = form
+        if create_bond:
+            compress_options["create_bond"] = create_bond
 
-        if not compress_each:
-            mpo_total.compress(max_bond=max_bond, cutoff=cutoff)
+        automaton_records = None
+        automaton = None
+        if mode in {"automaton", "auto"}:
+            automaton_records = builder._normalize_automaton_terms(
+                tuple(ints),
+                phys_dim=phys_dim,
+                dtype=dtype,
+            )
+            if mode_auto:
+                # Avoid materializing a very wide exact automaton when the
+                # term-by-term route will be substantially smaller.  The
+                # estimate is conservative for repeated prefixes, so common
+                # nearest-neighbour structures still select the automaton.
+                auto_bond_limit = max(64, 4 * max_bond)
+                estimated_bonds = builder._estimate_automaton_bond_dimensions(
+                    automaton_records,
+                    phys_dim=phys_dim,
+                    dtype=dtype,
+                )
+                if max(estimated_bonds, default=1) > auto_bond_limit:
+                    mode = "term"
+                else:
+                    mode = "automaton"
+
+            if mode == "automaton":
+                mpo_total, automaton = builder._build_mpo_from_automaton(
+                    automaton_records,
+                    phys_dim=phys_dim,
+                )
+                if mode_auto and max(automaton.bond_dimensions, default=1) > auto_bond_limit:
+                    mode = "term"
+                else:
+                    if to_backend is not None:
+                        builder._apply_to_backend(mpo_total, to_backend)
+                    mpo_total.compress(**compress_options)
+
+        if mode == "term":
+            term_iter = (
+                tuple((ops, sites, coeff) for sites, ops, coeff in automaton_records)
+                if automaton_records is not None
+                else ints
+            )
+            mpo_total = builder._zero_mpo(phys_dim=phys_dim, dtype=dtype)
+            if to_backend is not None:
+                builder._apply_to_backend(mpo_total, to_backend)
+            for term in term_iter:
+                mpo_term = builder._term_to_mpo(term, phys_dim=phys_dim, dtype=dtype)
+                if to_backend is not None:
+                    builder._apply_to_backend(mpo_term, to_backend)
+                mpo_total = mpo_total + mpo_term
+                if compress_each:
+                    mpo_total.compress(**compress_options)
+
+            if not compress_each:
+                mpo_total.compress(**compress_options)
+        if to_backend is not None:
+            # Keep the return boundary explicit in case a backend operation
+            # materialized an intermediate NumPy array.
+            builder._apply_to_backend(mpo_total, to_backend)
         return mpo_total
 
     def _add_missing_lattice_bonds_(self, pepo):
@@ -1622,6 +2164,7 @@ class ham_tn:
                     max_bond=self.max_bond,
                     cutoff=self.cutoff,
                     data_type=self.data_type,
+                    to_backend=self.to_backend,
                     mapper=OneDMap(self.L_x, self.L_y * n_sub, mode=self.map_mode),
                 )
                 warnings.warn(

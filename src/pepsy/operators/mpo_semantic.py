@@ -22,7 +22,7 @@ contraction and MPS-application code, while retaining a copy of the semantic
 object on the compiled MPO.
 
 The exact paths only use local tensor operations and exact equality checks.
-``mode="algorithm4"`` is deliberately separate because Algorithm 4 changes the
+``mode="folded"`` is deliberately separate because Algorithm 4 changes the
 analytical history representation even though it does not use an SVD cutoff.
 This module targets ordinary NumPy/Autoray-compatible tensors and finite open
 chains. Native bosonic Abelian Symmray output accepts NumPy local blocks;
@@ -33,9 +33,12 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from itertools import product
 from math import factorial
 from numbers import Integral
+import re
+import time
 import warnings
 
 import autoray as ar
@@ -49,6 +52,11 @@ from .mpo_automaton import (
     _backend_reference,  # noqa: F401 - legacy helper imported by mpo_cluster
     _matmul,
     _multiply_scalar,
+)
+from .mpo_block_plan import (
+    MPOBlock,
+    MPOBlockPlan,
+    MPOChargeValidationReport,
 )
 from ._mpo_sparse import (
     SparseVirtualTensor,
@@ -69,6 +77,9 @@ __all__ = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOBlock",
+    "MPOBlockPlan",
+    "MPOChargeValidationReport",
     "FirstDegreeMPO",
 ]
 
@@ -85,6 +96,165 @@ _MAX_HISTORY_TRANSFER_ELEMENTS = 4_000_000
 # cases retain the exact grouped scatter fallback rather than allocating a
 # mostly-zero ``num_terms x left x right x phys x phys`` bank.
 _MAX_FUSED_SLOT_BANK_ELEMENTS = 4_000_000
+
+# ``auto`` is intentionally a conservative work-budget policy: Algorithm 3 is
+# valuable at low order, while its selected next-order replay can dominate
+# high-order builds. Keep the budget explicit so the policy is deterministic
+# and easy to tune independently of Taylor order.
+# ``mode="auto"`` uses a structural Algorithm-3 work budget rather than a
+# Taylor-order threshold.  The budget is deliberately expressed in selected
+# extension terms: it is backend independent and can be evaluated before the
+# numerical left/right pair plan is materialized.
+_DEFAULT_AUTO_EXTENSION_BUDGET = 1_024
+
+
+class _MPOProgress:
+    """Optional progress display for higher-order MPO construction."""
+
+    _STAGE_COLORS = {
+        "history": "cyan",
+        "a3": "yellow",
+        "a1": "yellow",
+        "a2": "yellow",
+        "a4": "red",
+        "boundary": "green",
+        "chi": "magenta",
+    }
+
+    def __init__(self, enabled, *, order=None, chi=None):
+        if not isinstance(enabled, bool):
+            raise TypeError("progress must be a boolean.")
+        self.enabled = enabled
+        self.order = order
+        self.chi = chi
+        self.timings = {}
+        self._bar = None
+        self._stage = None
+        self._stage_start = None
+        self._stage_count = 0
+        self._last_refresh = None
+        self._detail_interval = 0.2
+        self._construction_start = None
+        self.total_seconds = None
+        self._title = "exp" if order is None else f"exp(order={order})"
+        if enabled:
+            from tqdm.auto import tqdm  # pylint: disable=import-outside-toplevel
+
+            self._bar = tqdm(
+                total=1,
+                desc=self._title,
+                unit="stage",
+                leave=True,
+                dynamic_ncols=True,
+                colour="cyan",
+            )
+
+    @classmethod
+    def _stage_color(cls, label):
+        """Return a stable color for a construction stage category."""
+        lowered = str(label).lower()
+        for marker, color in cls._STAGE_COLORS.items():
+            if marker in lowered:
+                return color
+        return "blue"
+
+    def _set_description(self, label, *, refresh=False):
+        """Set the stage description and progress-bar color."""
+        color = self._stage_color(label)
+        # ``colour`` is supported by the tqdm versions Pepsy depends on, but
+        # assigning it separately also keeps this compatible with lightweight
+        # test doubles and older tqdm adapters.
+        self._bar.colour = color
+        self._bar.set_description(f"{self._title} | {label}", refresh=False)
+        if refresh:
+            self._bar.refresh()
+
+    @staticmethod
+    def _timing_key(label):
+        return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+
+    @staticmethod
+    def _bond_details(bond_dimensions):
+        if bond_dimensions is None:
+            return {}
+        dimensions = tuple(int(value) for value in bond_dimensions)
+        return {
+            "maxchi": max(dimensions, default=1),
+            "nbonds": len(dimensions),
+        }
+
+    def start(self, label):
+        """Start a displayed and timed construction stage."""
+        if not self.enabled:
+            return
+        if self._stage is not None:
+            raise RuntimeError(f"progress stage {self._stage!r} is still active.")
+        self._stage = str(label)
+        self._stage_start = time.perf_counter()
+        if self._construction_start is None:
+            self._construction_start = self._stage_start
+        self._last_refresh = self._stage_start
+        self._stage_count += 1
+        self._bar.total = self._stage_count
+        self._set_description(self._stage, refresh=True)
+
+    def detail(self, label=None, *, bond_dimensions=None, **details):
+        """Refresh the display while a stage is still running."""
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        postfix = {
+            "s": f"{now - self._stage_start:.2f}",
+            **self._bond_details(bond_dimensions),
+            **details,
+        }
+        if label is not None:
+            # Keep the main description stable. Changing its width on every
+            # site or bond makes some terminals redraw the bar on new lines.
+            postfix["step"] = str(label)
+        self._bar.set_postfix(postfix, refresh=False)
+        if now - self._last_refresh >= self._detail_interval:
+            self._bar.refresh()
+            self._last_refresh = now
+
+    def finish(self, label=None, *, bond_dimensions=None, **details):
+        """Finish the current stage and record its elapsed time."""
+        if not self.enabled:
+            return None
+        if self._stage is None:
+            return None
+        stage = self._stage if label is None else str(label)
+        elapsed = time.perf_counter() - self._stage_start
+        self.total_seconds = time.perf_counter() - self._construction_start
+        self.timings[self._timing_key(stage)] = float(elapsed)
+        postfix = {
+            "s": f"{elapsed:.2f}",
+            "order_s": f"{self.total_seconds:.2f}",
+            **self._bond_details(bond_dimensions),
+            **details,
+        }
+        self._set_description(stage)
+        self._bar.set_postfix(postfix, refresh=False)
+        self._bar.update(1)
+        self._bar.refresh()
+        self._stage = None
+        self._stage_start = None
+        self._last_refresh = None
+        return elapsed
+
+    def close(self):
+        """Close the optional progress display."""
+        if self._construction_start is not None and self.total_seconds is None:
+            self.total_seconds = time.perf_counter() - self._construction_start
+        if self._bar is not None:
+            self._bar.close()
+
+
+def _make_mpo_progress(progress, *, order=None, chi=None):
+    """Normalize a public progress flag and report ownership."""
+    if isinstance(progress, _MPOProgress):
+        return progress, False
+    return _MPOProgress(progress, order=order, chi=chi), True
 
 
 @dataclass(frozen=True)
@@ -362,6 +532,11 @@ class MPONumericalCompressionReport:
     operator_frobenius_error: object = None
     operator_frobenius_relative_error: object = None
     error_estimator: str | None = None
+    sector_aware: bool = False
+    initial_sector_dimensions: tuple = ()
+    final_sector_dimensions: tuple = ()
+    initial_sector_block_counts: tuple[int, ...] = ()
+    final_sector_block_counts: tuple[int, ...] = ()
 
     @property
     def api_info(self):
@@ -409,6 +584,156 @@ def _check_scalar(value, *, name):
         ndim = np.ndim(value)
     if ndim != 0:
         raise TypeError(f"{name} must be scalar, got ndim={ndim}.")
+
+
+def _resolve_compression_cutoff(cutoff, reference):
+    """Resolve a numeric or dtype-aware numerical compression cutoff."""
+    if isinstance(cutoff, str):
+        if cutoff.strip().lower() != "auto":
+            raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        dtype = getattr(reference, "dtype", None)
+        dtype_name = str(dtype).lower()
+        if "float16" in dtype_name or "bfloat16" in dtype_name:
+            return 1.0e-3
+        if "float32" in dtype_name or "complex64" in dtype_name:
+            return 1.0e-6
+        return 1.0e-12
+    _check_scalar(cutoff, name="cutoff")
+    try:
+        cutoff = float(cutoff)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cutoff must be 'auto' or a non-negative number.") from exc
+    if not np.isfinite(cutoff) or cutoff < 0.0:
+        raise ValueError("cutoff must be 'auto' or a non-negative number.")
+    return cutoff
+
+
+def _resolve_compression_cutoff_mode(cutoff_mode):
+    """Resolve ``cutoff_mode='auto'`` to Pepsy's default convention."""
+    if not isinstance(cutoff_mode, str):
+        raise TypeError("cutoff_mode must be a string.")
+    if cutoff_mode.strip().lower() == "auto":
+        return "rsum2"
+    return cutoff_mode
+
+
+def _normalize_sector_aware_request(value):
+    """Normalize the explicit native sector-compression policy."""
+
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    raise TypeError("sector_aware must be True, False, or 'auto'.")
+
+
+def _native_sector_summary(mpo):
+    """Inspect native Symmray sectors without converting them to dense arrays."""
+
+    tensors = getattr(mpo, "tensors", ())
+    if not tensors:
+        return None
+    data_values = [getattr(tensor, "data", None) for tensor in tensors]
+    if not all(
+        hasattr(data, "blocks") and hasattr(data, "indices")
+        for data in data_values
+    ):
+        return None
+
+    def normalize_sector_charge(charge):
+        if isinstance(charge, tuple):
+            return tuple(normalize_sector_charge(value) for value in charge)
+        if isinstance(charge, Integral):
+            return int(charge)
+        return charge
+
+    bond_sector_dimensions = []
+    for bond in range(1, int(mpo.L)):
+        data = data_values[bond - 1]
+        virtual_position = 0 if bond - 1 == 0 else 1
+        try:
+            index = data.indices[virtual_position]
+            chargemap = index.chargemap
+        except (AttributeError, IndexError, TypeError):
+            return None
+        if not isinstance(chargemap, Mapping):
+            return None
+        bond_sector_dimensions.append(tuple(
+            (normalize_sector_charge(charge), int(dimension))
+            for charge, dimension in chargemap.items()
+        ))
+
+    site_block_counts = tuple(
+        len(data.blocks) if isinstance(data.blocks, Mapping) else None
+        for data in data_values
+    )
+    if any(count is None for count in site_block_counts):
+        return None
+    return {
+        "native": True,
+        "bond_sector_dimensions": tuple(bond_sector_dimensions),
+        "site_block_counts": tuple(int(count) for count in site_block_counts),
+        "total_blocks": sum(site_block_counts),
+    }
+
+
+def _resolve_sector_aware(value, native_summary):
+    """Resolve ``sector_aware`` against the materialized tensor boundary."""
+
+    requested = _normalize_sector_aware_request(value)
+    if requested == "auto":
+        return native_summary is not None
+    if requested and native_summary is None:
+        raise ValueError(
+            "sector_aware=True requires native Symmray MPO tensors; "
+            "dense MPOs use the separate ordinary Quimb compression path."
+        )
+    return requested
+
+
+def _normalize_exp_compress_opts(
+    compress_opts,
+    *,
+    form=None,
+    create_bond=False,
+):
+    """Normalize final numerical-compression options for exponential APIs."""
+    if compress_opts is None:
+        options = {}
+    elif not isinstance(compress_opts, Mapping):
+        raise TypeError("compress_opts must be a mapping or None.")
+    else:
+        options = dict(compress_opts)
+
+    reserved = {
+        "chi",
+        "max_bond",
+        "cutoff",
+        "cutoff_mode",
+        "return_report",
+        "compression",
+        "differentiable",
+        "sector_aware",
+    }
+    duplicated = sorted(reserved.intersection(options))
+    if duplicated:
+        names = ", ".join(duplicated)
+        raise TypeError(
+            f"{names} must be supplied as explicit exponential compression "
+            "arguments, not in compress_opts."
+        )
+
+    if form is not None:
+        if "form" in options and options["form"] != form:
+            raise TypeError("conflicting form values supplied.")
+        options["form"] = form
+    if create_bond:
+        if "create_bond" in options and options["create_bond"] is not True:
+            raise TypeError("conflicting create_bond values supplied.")
+        options["create_bond"] = True
+    return options
 
 
 _SUPPORTED_MPO_SYMMETRIES = frozenset({"U1", "Z2", "U1U1", "Z2Z2"})
@@ -649,6 +974,160 @@ def _dense_virtual_to_sparse(array):
     if not blocks:
         blocks[(0, 0)] = array[0, 0]
     return SparseVirtualTensor(array.shape, blocks)
+
+
+def _native_mpo_dense_index_maps(mpo, semantic, groups, value):
+    """Build physical-basis charge maps for a fused native MPO result.
+
+    Symmray stores a fused index in contiguous sector order.  That order is
+    useful for block operations, but it is not necessarily the caller's
+    computational-basis order.  ``AbelianArray.to_dense(index_maps=...)``
+    accepts the original basis-to-charge map and restores that order without
+    expanding the MPO's virtual or sector blocks first.
+    """
+    if not hasattr(value, "to_dense") or not hasattr(value, "indices"):
+        return None
+    if semantic is not None:
+        if semantic.symmetry is None:
+            return None
+        physical_charges = tuple(semantic.physical_charges)
+        physical_dimension = int(semantic.phys_dim)
+    else:
+        if getattr(mpo, "pepsy_mpo_symmetry", None) is None:
+            return None
+        physical_charges = tuple(
+            getattr(mpo, "pepsy_mpo_physical_charges", ())
+        )
+        physical_dimension = int(
+            getattr(mpo, "pepsy_mpo_physical_dimension", 0)
+        )
+        if not physical_charges or physical_dimension < 1:
+            return None
+    symmetry = getattr(value, "symmetry", None)
+    if symmetry is None or not hasattr(symmetry, "combine"):
+        return None
+
+    try:
+        upper_by_ind = {
+            mpo.upper_ind(site): int(site)
+            for site in mpo.sites
+        }
+        lower_by_ind = {
+            mpo.lower_ind(site): int(site)
+            for site in mpo.sites
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    index_maps = []
+    for axis, group in enumerate(groups):
+        charges_by_site = []
+        for ind in group:
+            site = upper_by_ind.get(ind, lower_by_ind.get(ind))
+            if site is None or site < 0:
+                return None
+            charges_by_site.append(physical_charges)
+
+        index_map = tuple(
+            symmetry.combine(*(
+                charges_by_site[charge_position][state]
+                for charge_position, state in enumerate(states)
+            ))
+            for states in product(
+                range(physical_dimension),
+                repeat=len(charges_by_site),
+            )
+        )
+        if (
+            axis >= len(value.indices)
+            or len(index_map) != value.indices[axis].size_total
+        ):
+            return None
+        index_maps.append(index_map)
+
+    return tuple(index_maps)
+
+
+class _PhysicalBasisDenseMPO:
+    """Mixin restoring computational-basis order for native Symmray MPOs."""
+
+    @staticmethod
+    def _maybe_qarray(value, to_qarray):
+        if to_qarray and ar.infer_backend(value) == "numpy":
+            import quimb as qu  # pylint: disable=import-outside-toplevel
+
+            return qu.qarray(value)
+        return value
+
+    def to_dense(self, *inds_seq, to_qarray=False, **contract_opts):
+        """Convert an MPO to dense order, including native Symmray sectors."""
+        value = super().to_dense(
+            *inds_seq,
+            to_qarray=False,
+            **contract_opts,
+        )
+        semantic = getattr(self, "pepsy_first_degree", None)
+        has_physical_metadata = (
+            semantic is not None
+            or getattr(self, "pepsy_mpo_symmetry", None) is not None
+        )
+        if not hasattr(value, "indices") or not has_physical_metadata:
+            return self._maybe_qarray(value, to_qarray)
+
+        groups = (
+            tuple(tuple(group) for group in inds_seq)
+            if inds_seq
+            else (
+                tuple(self.upper_inds_present),
+                tuple(self.lower_inds_present),
+            )
+        )
+        index_maps = _native_mpo_dense_index_maps(
+            self,
+            semantic,
+            groups,
+            value,
+        )
+        if index_maps is not None:
+            value = value.to_dense(index_maps=index_maps)
+        elif hasattr(value, "unfuse_all"):
+            value = value.unfuse_all()
+            if hasattr(value, "to_dense"):
+                value = value.to_dense()
+
+        return self._maybe_qarray(value, to_qarray)
+
+
+@lru_cache(maxsize=1)
+def _pepsy_mpo_class(base_class):
+    """Return the cached Quimb MPO subclass used at Pepsy's boundary."""
+    return type(
+        "PepsyMatrixProductOperator",
+        (_PhysicalBasisDenseMPO, base_class),
+        {"__module__": __name__},
+    )
+
+
+def _ensure_pepsy_mpo_boundary(mpo):
+    """Install Pepsy's dense-order boundary on a compatible MPO in-place.
+
+    FIT and some Quimb compressors return a fresh base
+    ``MatrixProductOperator`` even when their input was a Pepsy semantic MPO.
+    The tensor data is still the desired result, but the base class does not
+    know how to restore computational-basis order for fused Symmray physical
+    indices.  Changing the Python class is a narrow, in-memory compatibility
+    shim: it does not copy tensor data or alter the tensor network topology.
+    """
+    if isinstance(mpo, _PhysicalBasisDenseMPO):
+        return mpo
+    try:
+        mpo.__class__ = _pepsy_mpo_class(type(mpo))
+    except TypeError as exc:
+        raise TypeError(
+            "could not install Pepsy's MPO boundary wrapper on the "
+            f"compression result of type {type(mpo).__name__}."
+        ) from exc
+    return mpo
 
 
 def _pauli_matrix(label):
@@ -1112,6 +1591,20 @@ def _term_from_input(term):
             parities=term.get("parities"),
             braiding=term.get("braiding"),
         )
+    if (
+        isinstance(term, (tuple, list))
+        and len(term) == 2
+        and isinstance(term[0], (tuple, list))
+        and len(term[0]) == 2
+        and _looks_like_pauli_labels(term[0][0])
+        and _looks_like_scalar(term[0][1])
+    ):
+        # Compact Hamiltonian form: (('ZZ', J), (site0, site1)).
+        return MPOProductTerm(
+            sites=term[1],
+            operators=term[0][0],
+            coefficient=term[0][1],
+        )
     if isinstance(term, (tuple, list)) and len(term) in (2, 3):
         matrix = _as_square_operator(term[1])
         sites = normalize_integer_tuple(term[0], name="sites", allow_scalar=True)
@@ -1128,22 +1621,37 @@ def _term_from_input(term):
         )
     raise TypeError(
         "terms must contain MPOProductTerm values, mappings, or "
-        "(sites, operators[, coefficient]) pairs."
+        "(sites, operators[, coefficient]) / "
+        "((paulis, coefficient), sites) pairs."
     )
 
 
 def _looks_like_pauli_labels(value):
     """Return whether ``value`` is a compact Pauli-label sequence."""
     if isinstance(value, str):
-        return bool(value) and all(len(label) == 1 for label in value)
-    try:
         labels = tuple(value)
-    except TypeError:
-        return False
+    else:
+        try:
+            labels = tuple(value)
+        except TypeError:
+            return False
     return bool(labels) and all(
-        isinstance(label, str) and len(label) == 1
+        isinstance(label, str)
+        and len(label) == 1
+        and label.upper() in "IXYZ"
         for label in labels
     )
+
+
+def _looks_like_scalar(value):
+    """Return whether ``value`` is a scalar-like backend value."""
+    ndim = getattr(value, "ndim", None)
+    if ndim is None:
+        try:
+            ndim = np.ndim(value)
+        except (TypeError, ValueError):
+            return False
+    return ndim == 0
 
 
 def _square_lattice_pauli_term(term, lattice_to_chain):
@@ -1171,12 +1679,23 @@ def _square_lattice_pauli_term(term, lattice_to_chain):
                 coefficient = 1.0
         charge = term.get("charge")
     elif isinstance(term, (tuple, list)) and len(term) in (2, 3):
-        first, second = term[:2]
-        if _looks_like_pauli_labels(first) and not _looks_like_pauli_labels(second):
-            paulis, locations = first, second
+        if (
+            len(term) == 2
+            and isinstance(term[0], (tuple, list))
+            and len(term[0]) == 2
+            and _looks_like_pauli_labels(term[0][0])
+            and _looks_like_scalar(term[0][1])
+        ):
+            # Compact Hamiltonian form: (('ZZ', J), (site0, site1)).
+            paulis, coefficient = term[0]
+            locations = term[1]
         else:
-            locations, paulis = first, second
-        coefficient = term[2] if len(term) == 3 else 1.0
+            first, second = term[:2]
+            if _looks_like_pauli_labels(first) and not _looks_like_pauli_labels(second):
+                paulis, locations = first, second
+            else:
+                locations, paulis = first, second
+            coefficient = term[2] if len(term) == 3 else 1.0
     else:
         raise TypeError(
             "square-lattice Pauli terms must be mappings with 'locations' "
@@ -1332,6 +1851,23 @@ def _generic_term_parts(term):
         }
 
     if isinstance(term, (tuple, list)) and len(term) in (2, 3):
+        if (
+            len(term) == 2
+            and isinstance(term[0], (tuple, list))
+            and len(term[0]) == 2
+            and _looks_like_pauli_labels(term[0][0])
+            and _looks_like_scalar(term[0][1])
+        ):
+            # Compact Hamiltonian form: (('ZZ', J), (site0, site1)).
+            return {
+                "operator": term[0][0],
+                "location": term[1],
+                "coefficient": term[0][1],
+                "string_operators": None,
+                "charge": None,
+                "parities": None,
+                "braiding": None,
+            }
         first, second = term[:2]
         first_is_operator = _looks_like_operator_payload(first)
         second_is_operator = _looks_like_operator_payload(second)
@@ -1372,7 +1908,8 @@ def _generic_term_parts(term):
     raise TypeError(
         "terms must contain MPOProductTerm values, mappings, or "
         "(location, operator[, coefficient]) / "
-        "(operator, location[, coefficient]) pairs."
+        "(operator, location[, coefficient]) / "
+        "((paulis, coefficient), location) pairs."
     )
 
 
@@ -1792,6 +2329,10 @@ class FirstDegreeMPO:
         self.lower_ind_id = lower_ind_id
         self.site_tag_id = site_tag_id
         self.metadata = dict(metadata or {})
+        # The plan is intentionally separate from numerical tensor storage.
+        # Constructors that know the source automaton install an exact plan;
+        # direct array construction builds a conservative plan lazily.
+        self._block_plan = None
         if physical_space is not None and not isinstance(
             physical_space, MPOPhysicalSpace
         ):
@@ -1979,6 +2520,66 @@ class FirstDegreeMPO:
         return all(isinstance(array, SparseVirtualTensor) for array in self._arrays)
 
     @property
+    def block_plan(self):
+        """Return the backend-neutral structural MPO block plan.
+
+        The plan contains virtual-state labels, local block recipes, and
+        optional charge metadata, but never owns local numerical arrays. It
+        can therefore be inspected or cached independently of backend and
+        coefficient rebinding. Dense tensors without a source automaton are
+        represented conservatively by all virtual pairs.
+        """
+        if self._block_plan is None:
+            self._block_plan = MPOBlockPlan.from_semantic(
+                self,
+                kind="history" if self.degree > 1 else "compiled",
+                metadata=(
+                    {"symmetry": self.symmetry}
+                    if self.symmetry is not None
+                    else None
+                ),
+            )
+            self.metadata.setdefault("block_plan", self._block_plan.summary())
+        return self._block_plan
+
+    def validate_charge_flow(self):
+        """Validate symbolic virtual charges and native physical flow.
+
+        The structural plan is checked first without touching numerical values.
+        When Abelian symmetry metadata is configured, ``to_mpo`` then performs
+        the value-level local block check at the native Symmray boundary. No
+        dense global operator is formed by this method.
+        """
+
+        report = self.block_plan.validate_charges(self.symmetry)
+        if self.symmetry is None:
+            self.metadata["charge_validation"] = report.as_dict()
+            return report
+
+        mpo = self.to_mpo()
+        native_summary = _native_sector_summary(mpo)
+        report = replace(
+            report,
+            native=native_summary is not None,
+            native_blocks=(
+                0
+                if native_summary is None
+                else native_summary["total_blocks"]
+            ),
+            native_sectors=(
+                0
+                if native_summary is None
+                else sum(
+                    len(tensor.data.blocks)
+                    for tensor in mpo.tensors
+                )
+            ),
+            message="structural and native physical charge flow are valid",
+        )
+        self.metadata["charge_validation"] = report.as_dict()
+        return report
+
+    @property
     def sparse_block_counts(self):
         """Stored virtual block count per site, or ``None`` for dense tensors."""
         return tuple(
@@ -2034,6 +2635,7 @@ class FirstDegreeMPO:
         out._history_tensor_plan_cache = self._history_tensor_plan_cache
         out._history_reduced_plan_cache = self._history_reduced_plan_cache
         out._base_level_position_cache = self._base_level_position_cache
+        out._block_plan = self._block_plan
         return out
 
     def _bind_arrays(self, arrays):
@@ -2076,6 +2678,7 @@ class FirstDegreeMPO:
         out._history_tensor_plan_cache = self._history_tensor_plan_cache
         out._history_reduced_plan_cache = self._history_reduced_plan_cache
         out._base_level_position_cache = self._base_level_position_cache
+        out._block_plan = self._block_plan
         out._levels = self._levels
         return out
 
@@ -2135,6 +2738,15 @@ class FirstDegreeMPO:
                 result._structural_transitions_from_automaton(automaton)
             )
             result._history_symbolic_cache = None
+        result._block_plan = MPOBlockPlan.from_automaton(
+            automaton,
+            metadata=(
+                {"symmetry": result.symmetry}
+                if result.symmetry is not None
+                else None
+            ),
+        )
+        result.metadata["block_plan"] = result._block_plan.summary()
         return result
 
     @classmethod
@@ -2195,9 +2807,10 @@ class FirstDegreeMPO:
         Each term may be an :class:`MPOProductTerm`, a mapping with
         ``sites`` (or ``locations``), ``paulis`` (or ``operators``), and an
         optional ``coefficient``, or a ``(sites, paulis)``/
-        ``(sites, paulis, coefficient)`` tuple. Pauli strings such as
-        ``"ZXY"`` and label sequences such as ``("Z", "X", "Y")`` are
-        accepted. Sites are zero-based and list the non-identity support.
+        ``(sites, paulis, coefficient)`` tuple. The compact Hamiltonian form
+        ``((paulis, coefficient), sites)`` is accepted as well. Pauli strings
+        such as ``"ZXY"`` and label sequences such as ``("Z", "X", "Y")``
+        are accepted. Sites are zero-based and list the non-identity support.
         """
         return cls.from_local_terms(
             L,
@@ -2265,7 +2878,7 @@ class FirstDegreeMPO:
                     *dense_arrays[1:-1],
                     dense_arrays[-1][:, 0],
                 )
-        mpo = qtn.MatrixProductOperator(
+        mpo = _pepsy_mpo_class(qtn.MatrixProductOperator)(
             compiled_arrays,
             shape="lrud",
             upper_ind_id=self.upper_ind_id,
@@ -2273,6 +2886,10 @@ class FirstDegreeMPO:
             site_tag_id=self.site_tag_id,
         )
         mpo.pepsy_first_degree = self.copy()
+        mpo.pepsy_block_plan = self.block_plan
+        mpo.pepsy_mpo_symmetry = self.symmetry
+        mpo.pepsy_mpo_physical_charges = self.physical_charges
+        mpo.pepsy_mpo_physical_dimension = self.phys_dim
         return mpo
 
     def apply_to_mps(
@@ -2303,6 +2920,7 @@ class FirstDegreeMPO:
         create_bond=False,
         estimate_error=False,
         return_report=False,
+        sector_aware="auto",
         **compress_opts,
     ):
         """Numerically compress the compiled MPO through Quimb.
@@ -2314,18 +2932,23 @@ class FirstDegreeMPO:
         The report records the requested policy and the bond dimensions before
         and after the Quimb sweep.  Set ``estimate_error=True`` to additionally
         contract the Frobenius norm of ``MPO_before - MPO_after`` without
-        densifying either operator.
+        densifying either operator. ``sector_aware='auto'`` uses the native
+        Symmray sector-wise SVD when the compiled MPO has Abelian blocks;
+        ``sector_aware=True`` rejects a dense fallback.
         """
         if max_bond is not None:
             if not isinstance(max_bond, Integral) or int(max_bond) < 1:
                 raise ValueError("max_bond must be a positive integer or None.")
             max_bond = int(max_bond)
-        _check_scalar(cutoff, name="cutoff")
-        cutoff = float(cutoff)
-        if cutoff < 0.0:
-            raise ValueError("cutoff must be non-negative.")
-        if not isinstance(cutoff_mode, str):
-            raise TypeError("cutoff_mode must be a string.")
+        sector_aware_request = _normalize_sector_aware_request(sector_aware)
+        mpo = self.to_mpo()
+        initial_sector_summary = _native_sector_summary(mpo)
+        sector_aware = _resolve_sector_aware(
+            sector_aware_request,
+            initial_sector_summary,
+        )
+        cutoff = _resolve_compression_cutoff(cutoff, mpo[0].data)
+        cutoff_mode = _resolve_compression_cutoff_mode(cutoff_mode)
         if not isinstance(estimate_error, bool):
             raise TypeError("estimate_error must be a boolean.")
         if "max_bond" in compress_opts or "cutoff" in compress_opts:
@@ -2335,7 +2958,6 @@ class FirstDegreeMPO:
             )
 
         reference = self.to_mpo() if estimate_error else None
-        mpo = self.to_mpo()
         initial_bond_dimensions = tuple(int(size) for size in mpo.bond_sizes())
         mpo.compress(
             form=form,
@@ -2346,6 +2968,7 @@ class FirstDegreeMPO:
             **compress_opts,
         )
         final_bond_dimensions = tuple(int(size) for size in mpo.bond_sizes())
+        final_sector_summary = _native_sector_summary(mpo)
         operator_frobenius_error = None
         operator_frobenius_relative_error = None
         error_estimator = None
@@ -2378,10 +3001,38 @@ class FirstDegreeMPO:
             operator_frobenius_error=operator_frobenius_error,
             operator_frobenius_relative_error=operator_frobenius_relative_error,
             error_estimator=error_estimator,
+            sector_aware=sector_aware,
+            initial_sector_dimensions=(
+                ()
+                if initial_sector_summary is None
+                else initial_sector_summary["bond_sector_dimensions"]
+            ),
+            final_sector_dimensions=(
+                ()
+                if final_sector_summary is None
+                else final_sector_summary["bond_sector_dimensions"]
+            ),
+            initial_sector_block_counts=(
+                ()
+                if initial_sector_summary is None
+                else initial_sector_summary["site_block_counts"]
+            ),
+            final_sector_block_counts=(
+                ()
+                if final_sector_summary is None
+                else final_sector_summary["site_block_counts"]
+            ),
         )
         # Numerical truncation invalidates the semantic history attachment.
         mpo.pepsy_first_degree = None
         mpo.pepsy_numerical_compression_report = report
+        mpo.pepsy_sector_compression_metadata = {
+            "requested": sector_aware_request,
+            "sector_aware": sector_aware,
+            "native": initial_sector_summary is not None,
+            "initial": initial_sector_summary,
+            "final": final_sector_summary,
+        }
         if return_report:
             return mpo, report
         return mpo
@@ -2503,6 +3154,7 @@ class FirstDegreeMPO:
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
         **compress_opts,
     ):
         """Compress to a requested MPO bond dimension.
@@ -2516,11 +3168,14 @@ class FirstDegreeMPO:
         The fixed-rank path returns a :class:`FirstDegreeMPO` with invalidated
         analytical histories, while the Quimb path returns an ordinary
         ``MatrixProductOperator``. Numerical compression cannot preserve the
-        pre-compression history table.
+        pre-compression history table. ``sector_aware='auto'`` selects the
+        native sector-wise Quimb/Symmray path when available. Fixed-rank
+        TT-SVD is intentionally not a sector-aware fallback.
         """
         if not isinstance(chi, Integral) or int(chi) < 1:
             raise ValueError("chi must be a positive integer.")
         chi = int(chi)
+        sector_aware = _normalize_sector_aware_request(sector_aware)
         if compression is None:
             compression = "fixed_rank" if differentiable else "quimb"
         if compression not in {"quimb", "fixed_rank"}:
@@ -2532,6 +3187,11 @@ class FirstDegreeMPO:
                 "differentiable=True requires compression='fixed_rank'."
             )
         if compression == "fixed_rank":
+            if sector_aware is True:
+                raise ValueError(
+                    "sector_aware=True is incompatible with "
+                    "compression='fixed_rank'; use compression='quimb'."
+                )
             if compress_opts:
                 unexpected = ", ".join(sorted(compress_opts))
                 raise TypeError(
@@ -2543,6 +3203,7 @@ class FirstDegreeMPO:
             max_bond=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            sector_aware=sector_aware,
             return_report=return_report,
             **compress_opts,
         )
@@ -2560,33 +3221,60 @@ class FirstDegreeMPO:
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
+        progress=False,
         **kwargs,
     ):
         """Build ``exp(step * self)`` and optionally compress the result."""
+        compress_opts = _normalize_exp_compress_opts(
+            compress_opts,
+            form=form,
+            create_bond=create_bond,
+        )
+        progress, owns_progress = _make_mpo_progress(
+            progress,
+            order=order,
+            chi=chi,
+        )
         if chi is None:
-            if compression is not None:
+            if compression is not None or compress_opts or sector_aware is True:
                 raise ValueError(
-                    "compression requires chi; omit it for an uncompressed MPO."
+                    "compression options require chi; omit them for an "
+                    "uncompressed MPO."
                 )
             if return_report:
                 raise ValueError("return_report requires chi compression.")
             result = self.extensive_exponential(
                 step,
                 order=order,
+                progress=progress,
                 **kwargs,
             )
             result.metadata.update({
                 "operation": metadata_operation,
                 "dt": metadata_dt,
                 "exponent": step,
+                "numerical_compression": "none",
             })
+            if owns_progress:
+                progress.close()
             return result
 
         output = self.extensive_exponential(
             step,
             order=order,
+            progress=progress,
             **kwargs,
         )
+        numerical_compression = (
+            "fixed_rank" if differentiable and compression is None
+            else compression or "quimb"
+        )
+        chi_stage = f"chi-compress (chi={int(chi)})"
+        progress.start(chi_stage)
         compressed = output.compress_to_bond(
             chi,
             cutoff=cutoff,
@@ -2594,11 +3282,23 @@ class FirstDegreeMPO:
             compression=compression,
             differentiable=differentiable,
             return_report=return_report,
+            sector_aware=sector_aware,
+            **compress_opts,
         )
         if return_report:
             result, report = compressed
         else:
             result, report = compressed, None
+        final_bond_dimensions = (
+            tuple(int(size) for size in result.bond_sizes())
+            if hasattr(result, "bond_sizes")
+            else tuple(result.bond_dimensions)
+        )
+        progress.finish(
+            chi_stage,
+            bond_dimensions=final_bond_dimensions,
+            chi=int(chi),
+        )
         exponential_metadata = {
             "operation": metadata_operation,
             "dt": metadata_dt,
@@ -2609,8 +3309,26 @@ class FirstDegreeMPO:
                 "fixed_rank" if differentiable and compression is None
                 else compression or "quimb"
             ),
+            "numerical_compression": numerical_compression,
+            "chi_compression": int(chi),
             "differentiable": bool(differentiable),
+            "sector_aware": (
+                getattr(report, "sector_aware", False)
+                if report is not None
+                else getattr(
+                    result,
+                    "pepsy_sector_compression_metadata",
+                    {},
+                ).get("sector_aware", False)
+            ),
         }
+        if progress.enabled:
+            exponential_metadata["progress"] = True
+            exponential_metadata["timings"] = dict(progress.timings)
+            exponential_metadata["timing_history"] = {
+                int(order): dict(progress.timings),
+            }
+            exponential_metadata["order_seconds"] = progress.total_seconds
         for key in (
             "mode",
             "history_storage",
@@ -2619,6 +3337,11 @@ class FirstDegreeMPO:
             "compression_plan_cache_hit",
             "extension_plan_cache_hit",
             "approximation_plan_cache_hit",
+            "analytical_compression",
+            "requested_mode",
+            "estimated_extension_terms",
+            "extension_budget",
+            "mode_reason",
         ):
             if key in output.metadata:
                 exponential_metadata[key] = output.metadata[key]
@@ -2633,6 +3356,8 @@ class FirstDegreeMPO:
             if metadata_operation == "time_evolution":
                 # Keep the attribute used by the original real-time API.
                 result.pepsy_evolution_metadata = exponential_metadata
+        if owns_progress:
+            progress.close()
         return (result, report) if return_report else result
 
     def exp(
@@ -2648,12 +3373,18 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
         chi=None,
         cutoff=1.0e-10,
         cutoff_mode="rel",
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
     ):
         """Build ``exp(step * self)`` with optional final compression.
 
@@ -2672,6 +3403,19 @@ class FirstDegreeMPO:
         differentiable : bool, optional
             With ``chi``, select fixed-rank autodiff compression instead of a
             value-dependent numerical cutoff.
+        form, create_bond : optional
+            Quimb numerical-compression controls used after the analytical
+            higher-order MPO is built.
+        compress_opts : mapping, optional
+            Additional Quimb compression keywords such as ``method``,
+            ``absorb``, ``renorm``, or ``info``.
+        sector_aware : {True, False, "auto"}, default="auto"
+            Use and report native Abelian sector-wise compression when the
+            compiled MPO is backed by Symmray. This never densifies a native
+            symmetric MPO; ``True`` errors if that boundary is unavailable.
+        progress : bool, default=False
+            Show construction stages with elapsed seconds and current MPO
+            bond dimensions.
         """
         step = _resolve_exp_step(step, dt)
         return self._exp_with_compression(
@@ -2686,12 +3430,18 @@ class FirstDegreeMPO:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             compression=compression,
             differentiable=differentiable,
             return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
+            progress=progress,
         )
 
     def time_evolution(
@@ -2706,12 +3456,18 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
         chi=None,
         cutoff=1.0e-10,
         cutoff_mode="rel",
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
     ):
         """Build real-time ``exp(-1j * dt * self)``.
 
@@ -2731,12 +3487,18 @@ class FirstDegreeMPO:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             compression=compression,
             differentiable=differentiable,
             return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
+            progress=progress,
         )
 
     def exp_arrays(
@@ -2752,6 +3514,7 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        extension_budget=None,
     ):
         """Return ``exp(step * self)`` tensors without a Quimb wrapper.
 
@@ -2771,6 +3534,7 @@ class FirstDegreeMPO:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
         ).arrays
 
     def time_evolution_arrays(
@@ -2785,6 +3549,7 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        extension_budget=None,
     ):
         """Return real-time evolution tensors without a semantic wrapper."""
         return self.time_evolution(
@@ -2797,6 +3562,7 @@ class FirstDegreeMPO:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
         ).arrays
 
     def expectation(self, mps, *, contraction_opt=None):
@@ -3206,6 +3972,7 @@ class FirstDegreeMPO:
         *,
         max_bond=None,
         on_exceed="raise",
+        progress=None,
     ):
         """Generate only raw histories reachable from the left boundary.
 
@@ -3281,6 +4048,13 @@ class FirstDegreeMPO:
                     f"site {site}."
                 )
             state_lists.append(tuple(next_states))
+            if progress is not None:
+                progress.detail(
+                    f"history topology {site + 1}/{self.L}",
+                    bond_dimensions=tuple(
+                        len(states) for states in state_lists[1:-1]
+                    ),
+                )
         return state_lists
 
     def _history_topology(
@@ -3290,6 +4064,7 @@ class FirstDegreeMPO:
         max_bond=None,
         on_exceed="raise",
         cache_history=True,
+        progress=None,
     ):
         """Return cached raw history states and whether the cache was used.
 
@@ -3315,6 +4090,7 @@ class FirstDegreeMPO:
                 exponent,
                 max_bond=max_bond if guarded_generation else None,
                 on_exceed=on_exceed if guarded_generation else "ignore",
+                progress=progress,
             )
         if cache_history and not cache_hit:
             self._history_topology_cache[exponent] = state_lists
@@ -3678,6 +4454,7 @@ class FirstDegreeMPO:
         cache_hit,
         execution_plan=None,
         tensor_plan_cache_hit=False,
+        progress=None,
     ):
         """Build raw history tensors using batched local block products."""
         levels = self._history_levels_for_states(state_lists, exponent)
@@ -3700,6 +4477,14 @@ class FirstDegreeMPO:
             arrays.append(array)
             stored_blocks += stored
             total_blocks += total
+            if progress is not None:
+                progress.detail(
+                    f"history tensors {site + 1}/{self.L}",
+                    bond_dimensions=tuple(
+                        len(states) for states in state_lists[1:-1]
+                    ),
+                    blocks=stored_blocks,
+                )
         storage_info = {
             "mode": storage_mode,
             "stored_blocks": stored_blocks,
@@ -3717,6 +4502,7 @@ class FirstDegreeMPO:
         execution_plan=None,
         tensor_plan_cache_hit=False,
         chunk_size=65536,
+        progress=None,
     ):
         """Build raw histories as sparse matrices of local operators.
 
@@ -3772,6 +4558,14 @@ class FirstDegreeMPO:
             arrays.append(tensor)
             stored_blocks += tensor.stored_blocks
             total_blocks += len(left_states) * len(right_states)
+            if progress is not None:
+                progress.detail(
+                    f"history blocks {site + 1}/{self.L}",
+                    bond_dimensions=tuple(
+                        len(states) for states in state_lists[1:-1]
+                    ),
+                    blocks=stored_blocks,
+                )
 
         storage_info = {
             "mode": "block_sparse",
@@ -3790,6 +4584,7 @@ class FirstDegreeMPO:
         max_bond,
         on_exceed,
         sparse,
+        progress=None,
     ):
         """Build non-cached history tensors with batched local products.
 
@@ -3804,12 +4599,14 @@ class FirstDegreeMPO:
             exponent,
             max_bond=max_bond,
             on_exceed=on_exceed,
+            progress=progress,
         )
         return self._batched_history_power_data(
             exponent,
             state_lists=state_lists,
             storage_mode="sparse" if sparse else "streaming",
             cache_hit=False,
+            progress=progress,
         )
 
     @property
@@ -3867,6 +4664,7 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="dense",
+        progress=None,
     ):
         """Build the full virtual-history representation of ``H**exponent``.
 
@@ -3922,6 +4720,7 @@ class FirstDegreeMPO:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 cache_history=cache_history,
+                progress=progress,
             )
             tensor_plan, tensor_plan_cache_hit = (
                 self._history_tensor_execution_plan(
@@ -3937,6 +4736,7 @@ class FirstDegreeMPO:
                 cache_hit=cache_hit,
                 execution_plan=tensor_plan,
                 tensor_plan_cache_hit=tensor_plan_cache_hit,
+                progress=progress,
             )
         if history_storage in {"sparse", "streaming"}:
             if cache_history:
@@ -3945,6 +4745,7 @@ class FirstDegreeMPO:
                     max_bond=max_bond,
                     on_exceed=on_exceed,
                     cache_history=True,
+                    progress=progress,
                 )
                 tensor_plan, tensor_plan_cache_hit = (
                     self._history_tensor_execution_plan(
@@ -3961,6 +4762,7 @@ class FirstDegreeMPO:
                     cache_hit=cache_hit,
                     execution_plan=tensor_plan,
                     tensor_plan_cache_hit=tensor_plan_cache_hit,
+                    progress=progress,
                 )
             return self._stream_history_power_data(
                 exponent,
@@ -3968,6 +4770,7 @@ class FirstDegreeMPO:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 sparse=history_storage == "sparse",
+                progress=progress,
             )
 
         state_lists, cache_hit = self._history_topology(
@@ -3975,6 +4778,7 @@ class FirstDegreeMPO:
             max_bond=max_bond,
             on_exceed=on_exceed,
             cache_history=cache_history,
+            progress=progress,
         )
         tensor_plan, tensor_plan_cache_hit = (
             self._history_tensor_execution_plan(
@@ -3991,6 +4795,7 @@ class FirstDegreeMPO:
             cache_hit=cache_hit,
             execution_plan=tensor_plan,
             tensor_plan_cache_hit=tensor_plan_cache_hit,
+            progress=progress,
         )
 
     def _history_levels_from_tokens(self, schemas, bond, history):
@@ -4550,12 +5355,16 @@ class FirstDegreeMPO:
         max_bond,
         on_exceed,
         cache_history,
+        include_extension=False,
     ):
         """Stream raw histories into a reusable direct-reduced execution plan."""
 
         if cache_history:
             cached = self._history_reduced_plan_cache.get(order)
-            if cached is not None:
+            if cached is not None and (
+                not include_extension
+                or cached.get("includes_extension", False)
+            ):
                 self._check_history_bond_dimensions(
                     cached["raw_bond_dimensions"],
                     max_bond=max_bond,
@@ -4643,16 +5452,19 @@ class FirstDegreeMPO:
                 * reduction_right["column_coefficients"][right_indices]
             )
 
-            fake_levels = [()] * (self.L + 1)
-            fake_levels[site] = raw_levels_left
-            fake_levels[site + 1] = raw_levels_right
-            extension_plan, _ = self._history_extension_plan(
-                fake_levels,
-                order,
-                cache_history=False,
-            )
-            raw_extension = extension_plan["site_plans"][site]
-            extension_terms += extension_plan["selected_terms"]
+            raw_extension = None
+            if include_extension:
+                fake_levels = [()] * (self.L + 1)
+                fake_levels[site] = raw_levels_left
+                fake_levels[site + 1] = raw_levels_right
+                extension_plan, _ = self._history_extension_plan(
+                    fake_levels,
+                    order,
+                    cache_history=False,
+                    materialize=True,
+                )
+                raw_extension = extension_plan["site_plans"][site]
+                extension_terms += extension_plan["selected_terms"]
             reduced_extension = None
             if raw_extension is not None:
                 extension_keep = (
@@ -4726,6 +5538,7 @@ class FirstDegreeMPO:
             "extension_terms": extension_terms,
             "algorithm_one": algorithm_one,
             "algorithm_two": algorithm_two,
+            "includes_extension": bool(include_extension),
         }
         if cache_history:
             self._history_reduced_plan_cache[order] = plan
@@ -4775,6 +5588,7 @@ class FirstDegreeMPO:
         on_exceed,
         cache_history,
         chunk_size=65536,
+        progress=None,
     ):
         """Build final Algorithms-1/2 tensors without raw virtual tensors."""
 
@@ -4783,6 +5597,7 @@ class FirstDegreeMPO:
             max_bond=max_bond,
             on_exceed=on_exceed,
             cache_history=cache_history,
+            include_extension=extend,
         )
         arrays = []
         stored_blocks = 0
@@ -4843,6 +5658,14 @@ class FirstDegreeMPO:
                 )
             arrays.append(tensor)
             stored_blocks += tensor.stored_blocks
+            if progress is not None:
+                progress.detail(
+                    f"reduced history {site + 1}/{self.L}",
+                    bond_dimensions=tuple(
+                        len(levels) for levels in plan["levels"][1:-1]
+                    ),
+                    blocks=stored_blocks,
+                )
 
         storage_info = {
             "mode": "reduced",
@@ -4984,19 +5807,115 @@ class FirstDegreeMPO:
             return position
         return positions["history"].get(level.history)
 
-    def _history_extension_plan(self, levels, order, *, cache_history):
+    def _estimate_history_extension_terms(self, state_lists, order):
+        """Estimate Algorithm-3 terms without building pair arrays.
+
+        Algorithm 3 inserts one level-1 token on the left history and one
+        level-3 token on the right history.  Its numerical executor later
+        forms the Cartesian product of the reachable insertion lists.  This
+        helper performs only that symbolic reachability/counting work, so it
+        can select ``mode="auto"`` before the potentially large pair plan is
+        materialized.  The count uses the same candidate and insertion rules
+        as :meth:`_history_extension_plan`, and is therefore also a useful
+        exact upper-level work estimate for the selected extension batches.
+        """
+        order = int(order)
+        symbolic = self._history_symbolic_data()
+        schemas = symbolic["schemas"]
+        one = MPOLevelToken(1)
+        three = MPOLevelToken(3)
+        reachability_cache = {}
+        estimated_terms = 0
+
+        def flattened_history(state):
+            return tuple(
+                token
+                for factor in state
+                for token in factor.history
+            )
+
+        for site in range(self.L):
+            left_states = state_lists[site]
+            right_states = state_lists[site + 1]
+            left_candidates = []
+            for left_pos, state in enumerate(left_states):
+                history = flattened_history(state)
+                numbers = _history_signature(history)
+                if all(number in (1, 3) for number in numbers) and 3 in numbers:
+                    continue
+                left_candidates.append((left_pos, history, numbers))
+            right_candidates = []
+            for right_pos, state in enumerate(right_states):
+                history = flattened_history(state)
+                numbers = _history_signature(history)
+                if all(number > 1 for number in numbers):
+                    right_candidates.append((right_pos, history, numbers))
+            if not left_candidates or not right_candidates:
+                continue
+
+            left_counts = []
+            for insert_position in range(order + 1):
+                count = 0
+                for _left_pos, history, _numbers in left_candidates:
+                    extended = (
+                        history[:insert_position]
+                        + (one,)
+                        + history[insert_position:]
+                    )
+                    if self._history_tokens_reachable(
+                        schemas,
+                        site,
+                        extended,
+                        reachability_cache,
+                    ) is not None:
+                        count += 1
+                left_counts.append(count)
+
+            right_counts = []
+            for insert_position in range(order + 1):
+                count = 0
+                for _right_pos, history, _numbers in right_candidates:
+                    extended = (
+                        history[:insert_position]
+                        + (three,)
+                        + history[insert_position:]
+                    )
+                    if self._history_tokens_reachable(
+                        schemas,
+                        site + 1,
+                        extended,
+                        reachability_cache,
+                    ) is not None:
+                        count += 1
+                right_counts.append(count)
+
+            estimated_terms += sum(
+                left_count * right_count
+                for left_count in left_counts
+                for right_count in right_counts
+            )
+
+        return int(estimated_terms)
+
+    def _history_extension_plan(
+        self,
+        levels,
+        order,
+        *,
+        cache_history,
+        materialize=False,
+    ):
         """Compile Algorithm 3 as batched local insertion transitions.
 
         The naive pseudocode has a pair of history loops inside every site.
         The selected contribution is separable at the virtual level: for a
         fixed insertion position, one only needs the valid left state list,
         the valid right state list, and the local base-block positions for
-        each factor. Store those short lists and let execution perform one
-        batched physical-matrix product per site. The plan avoids Python
-        objects for every scalar transition, but its flattened site plans
-        still materialize every selected left/right pair; their memory scales
-        with the selected pair count. A future blockwise executor can remove
-        that remaining materialization without changing the symbolic plan.
+        each factor. Store those short lists and let execution stream their
+        Cartesian products in backend-sized chunks. The default plan therefore
+        retains no repeated left/right pair arrays. ``materialize=True`` is a
+        private compatibility path used by the reduced quotient, which needs
+        a flat index list to apply its symbolic axis maps.
         """
         if cache_history:
             cached = self._history_extension_plan_cache.get(order)
@@ -5145,7 +6064,6 @@ class FirstDegreeMPO:
                         )
                         for factor in range(order + 1)
                     )
-                    weight_matrix = left_weights[:, None] * right_weights[None, :]
                     batch = {
                         "site": site,
                         "left_targets": left_targets,
@@ -5154,7 +6072,8 @@ class FirstDegreeMPO:
                         "right_positions": right_positions,
                         "left_identity": left_identity,
                         "right_identity": right_identity,
-                        "weights": weight_matrix,
+                        "left_weights": left_weights,
+                        "right_weights": right_weights,
                     }
                     batches.append(batch)
                     batches_by_site[site].append(batch)
@@ -5164,6 +6083,22 @@ class FirstDegreeMPO:
         for site, site_batches in enumerate(batches_by_site):
             if not site_batches:
                 site_plans.append(None)
+                continue
+
+            if not materialize:
+                # Keep one site-local view of the symbolic batches. The
+                # compatibility arrays below are one-dimensional candidate
+                # lists, never Cartesian products.
+                site_plans.append({
+                    "site": site,
+                    "batches": tuple(site_batches),
+                    "left_targets": np.concatenate(
+                        [batch["left_targets"] for batch in site_batches],
+                    ),
+                    "right_targets": np.concatenate(
+                        [batch["right_targets"] for batch in site_batches],
+                    ),
+                })
                 continue
 
             left_targets = []
@@ -5182,7 +6117,12 @@ class FirstDegreeMPO:
                 right_targets.append(
                     np.tile(batch["right_targets"], left_size),
                 )
-                weights.append(batch["weights"].reshape(-1))
+                weights.append(
+                    (
+                        batch["left_weights"][:, None]
+                        * batch["right_weights"][None, :]
+                    ).reshape(-1),
+                )
                 for factor in range(order + 1):
                     left_positions[factor].append(
                         np.repeat(
@@ -5229,9 +6169,12 @@ class FirstDegreeMPO:
             })
 
         plan = {
+            # ``batches`` and the site-local views refer to the same symbolic
+            # batch dictionaries. No Cartesian arrays are duplicated here.
             "batches": tuple(batches),
             "site_plans": tuple(site_plans),
             "selected_terms": selected_terms,
+            "materialized": bool(materialize),
         }
         if cache_history:
             self._history_extension_plan_cache[order] = plan
@@ -5337,6 +6280,86 @@ class FirstDegreeMPO:
             )
         return product_block
 
+    def _stream_history_extension_site(
+        self,
+        arrays,
+        site_plan,
+        order,
+        dt,
+        *,
+        chunk_size=65536,
+    ):
+        """Evaluate and scatter one site's Algorithm-3 batches in chunks."""
+        if not isinstance(chunk_size, Integral) or int(chunk_size) < 1:
+            raise ValueError("chunk_size must be a positive integer.")
+        chunk_size = int(chunk_size)
+        # Use a roughly square tile so neither side of the Cartesian product
+        # becomes a long-lived array when one candidate list is much larger
+        # than the other.
+        left_chunk_size = max(1, int(chunk_size**0.5))
+        for batch in site_plan["batches"]:
+            left_size = int(batch["left_targets"].size)
+            right_size = int(batch["right_targets"].size)
+            right_chunk_size = max(
+                1,
+                chunk_size // min(left_chunk_size, max(1, left_size)),
+            )
+            for left_start in range(0, left_size, left_chunk_size):
+                left_stop = min(left_start + left_chunk_size, left_size)
+                left_slice = slice(left_start, left_stop)
+                for right_start in range(0, right_size, right_chunk_size):
+                    right_stop = min(right_start + right_chunk_size, right_size)
+                    right_slice = slice(right_start, right_stop)
+                    pair_batch = {
+                        "site": batch["site"],
+                        "left_targets": batch["left_targets"][left_slice],
+                        "right_targets": batch["right_targets"][right_slice],
+                        "left_positions": tuple(
+                            values[left_slice]
+                            for values in batch["left_positions"]
+                        ),
+                        "right_positions": tuple(
+                            values[right_slice]
+                            for values in batch["right_positions"]
+                        ),
+                        "left_identity": tuple(
+                            values[left_slice]
+                            for values in batch["left_identity"]
+                        ),
+                        "right_identity": tuple(
+                            values[right_slice]
+                            for values in batch["right_identity"]
+                        ),
+                    }
+                    values = self._history_local_product_batch(
+                        pair_batch,
+                        order,
+                    )
+                    weights = _as_backend(
+                        batch["left_weights"][left_slice, None]
+                        * batch["right_weights"][None, right_slice],
+                        like=values,
+                    )
+                    values = ar.do(
+                        "multiply",
+                        values,
+                        weights[..., None, None],
+                    )
+                    arrays[batch["site"]] = _scatter_add_2d(
+                        arrays[batch["site"]],
+                        np.repeat(
+                            pair_batch["left_targets"],
+                            right_stop - right_start,
+                        ),
+                        np.tile(
+                            pair_batch["right_targets"],
+                            left_stop - left_start,
+                        ),
+                        _multiply_scalar(dt, values).reshape(
+                            (-1, *values.shape[-2:])
+                        ),
+                    )
+
     def _algorithm_three_extension(
         self,
         arrays,
@@ -5345,6 +6368,7 @@ class FirstDegreeMPO:
         dt,
         *,
         cache_history=True,
+        progress=None,
     ):
         """Add Algorithm 3's selected ``N + 1`` local history transitions.
 
@@ -5358,26 +6382,47 @@ class FirstDegreeMPO:
             order,
             cache_history=cache_history,
         )
+        if progress is not None:
+            progress.detail(
+                f"A3 extension plan (order={order})",
+                terms=plan["selected_terms"],
+            )
         for site_plan in plan["site_plans"]:
             if site_plan is None:
                 continue
             site = site_plan["site"]
-            extension = self._history_local_product_site_batch(
-                site_plan,
-                order,
-            )
-            weights = _as_backend(site_plan["weights"], like=extension)
-            extension = ar.do(
-                "multiply",
-                extension,
-                weights[..., None, None],
-            )
-            arrays[site] = _scatter_add_2d(
-                arrays[site],
-                site_plan["left_targets"],
-                site_plan["right_targets"],
-                _multiply_scalar(dt, extension),
-            )
+            if plan.get("materialized", False):
+                extension = self._history_local_product_site_batch(
+                    site_plan,
+                    order,
+                )
+                weights = _as_backend(site_plan["weights"], like=extension)
+                extension = ar.do(
+                    "multiply",
+                    extension,
+                    weights[..., None, None],
+                )
+                arrays[site] = _scatter_add_2d(
+                    arrays[site],
+                    site_plan["left_targets"],
+                    site_plan["right_targets"],
+                    _multiply_scalar(dt, extension),
+                )
+            else:
+                self._stream_history_extension_site(
+                    arrays,
+                    site_plan,
+                    order,
+                    dt,
+                )
+            if progress is not None:
+                progress.detail(
+                    f"A3 extension site {site + 1}/{self.L}",
+                    bond_dimensions=tuple(
+                        len(bond_levels) for bond_levels in levels[1:-1]
+                    ),
+                    terms=plan["selected_terms"],
+                )
         return plan["selected_terms"], cache_hit
 
     def _history_approximation_plan(self, levels, order, *, cache_history):
@@ -5442,6 +6487,7 @@ class FirstDegreeMPO:
         dt,
         *,
         cache_history=True,
+        progress=None,
     ):
         """Apply the paper's order-controlled approximate compression.
 
@@ -5454,6 +6500,11 @@ class FirstDegreeMPO:
             order,
             cache_history=cache_history,
         )
+        if progress is not None:
+            progress.detail(
+                f"A4 analytical plan (order={order})",
+                actions=len(plan["actions"]),
+            )
         actions_by_bond = [[] for _ in range(self.L + 1)]
         for bond, source, target, number_of_threes in plan["actions"]:
             actions_by_bond[bond].append(
@@ -5518,6 +6569,14 @@ class FirstDegreeMPO:
                 )
             levels[bond] = current
             removed += len(operations)
+            if progress is not None:
+                progress.detail(
+                    f"A4 analytical replay bond {bond}/{self.L}",
+                    bond_dimensions=tuple(
+                        len(bond_levels) for bond_levels in levels[1:-1]
+                    ),
+                    merges=removed,
+                )
         return removed, cache_hit
 
     def _contract_history_boundaries(self, arrays, levels, order):
@@ -5566,6 +6625,10 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=None,
+        extension_budget=None,
+        estimated_extension_terms=None,
+        mode_reason=None,
     ):
         """Construct an arbitrary-order MPO using Algorithms 1--4.
 
@@ -5577,6 +6640,11 @@ class FirstDegreeMPO:
         """
         direct_reduced = history_storage == "reduced"
         if direct_reduced:
+            reduced_stage = (
+                f"history + A1-A{3 if extend else 2} (reduced)"
+            )
+            if progress is not None:
+                progress.start(reduced_stage)
             arrays, levels, history_cache_hit, storage_info = (
                 self._reduced_history_power_data(
                     dt,
@@ -5585,8 +6653,16 @@ class FirstDegreeMPO:
                     max_bond=max_bond,
                     on_exceed=on_exceed,
                     cache_history=cache_history,
+                    progress=progress,
                 )
             )
+            if progress is not None:
+                progress.finish(
+                    reduced_stage,
+                    bond_dimensions=tuple(
+                        len(bond_levels) for bond_levels in levels[1:-1]
+                    ),
+                )
             initial_bond_dimensions = storage_info["initial_bond_dimensions"]
             compression_plan_cache_hit = history_cache_hit
             extension_plan_cache_hit = history_cache_hit if extend else False
@@ -5596,16 +6672,24 @@ class FirstDegreeMPO:
                 for _ in range(storage_info["exact_history_merges"])
             )
         else:
+            if progress is not None:
+                progress.start("history")
             arrays, levels, history_cache_hit, storage_info = self._history_power_data(
                 order,
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 cache_history=cache_history,
                 history_storage=history_storage,
+                progress=progress,
             )
             initial_bond_dimensions = tuple(
                 len(bond_levels) for bond_levels in levels[1:-1]
             )
+            if progress is not None:
+                progress.finish(
+                    "history",
+                    bond_dimensions=initial_bond_dimensions,
+                )
             compression_plan, compression_plan_cache_hit = (
                 self._history_compression_plan(
                     levels,
@@ -5616,6 +6700,8 @@ class FirstDegreeMPO:
             extension_terms = 0
             extension_plan_cache_hit = False
             if extend:
+                if progress is not None:
+                    progress.start("A3 extension")
                 extension_terms, extension_plan_cache_hit = (
                     self._algorithm_three_extension(
                         arrays,
@@ -5623,8 +6709,18 @@ class FirstDegreeMPO:
                         order,
                         dt,
                         cache_history=cache_history,
+                        progress=progress,
                     )
                 )
+                if progress is not None:
+                    progress.finish(
+                        "A3 extension",
+                        bond_dimensions=tuple(
+                            len(bond_levels) for bond_levels in levels[1:-1]
+                        ),
+                    )
+            if progress is not None:
+                progress.start("A1 prefactor")
             self._algorithm_one(
                 arrays,
                 levels,
@@ -5632,14 +6728,31 @@ class FirstDegreeMPO:
                 dt,
                 plan=compression_plan,
             )
+            if progress is not None:
+                progress.finish(
+                    "A1 prefactor",
+                    bond_dimensions=tuple(
+                        len(bond_levels) for bond_levels in levels[1:-1]
+                    ),
+                )
+                progress.start("A2 exact analytical-compress")
             exact_merges = self._algorithm_two(
                 arrays,
                 levels,
                 plan=compression_plan,
             )
+            if progress is not None:
+                progress.finish(
+                    "A2 exact analytical-compress",
+                    bond_dimensions=tuple(
+                        len(bond_levels) for bond_levels in levels[1:-1]
+                    ),
+                )
         approximate_merges = 0
         approximation_plan_cache_hit = False
         if approximate:
+            if progress is not None:
+                progress.start("A4 analytical-compress")
             approximate_merges, approximation_plan_cache_hit = (
                 self._algorithm_four(
                     arrays,
@@ -5647,12 +6760,27 @@ class FirstDegreeMPO:
                     order,
                     dt,
                     cache_history=cache_history,
+                    progress=progress,
                 )
             )
+            if progress is not None:
+                progress.finish(
+                    "A4 analytical-compress",
+                    bond_dimensions=tuple(
+                        len(bond_levels) for bond_levels in levels[1:-1]
+                    ),
+                )
+        if progress is not None:
+            progress.start("boundary")
         self._contract_history_boundaries(arrays, levels, order)
         final_bond_dimensions = tuple(
             len(bond_levels) for bond_levels in levels[1:-1]
         )
+        if progress is not None:
+            progress.finish(
+                "boundary",
+                bond_dimensions=final_bond_dimensions,
+            )
         if all(isinstance(array, SparseVirtualTensor) for array in arrays):
             storage_info = {
                 **storage_info,
@@ -5690,7 +6818,14 @@ class FirstDegreeMPO:
             "exact_history_merges": len(exact_merges),
             "approximate_history_merges": approximate_merges,
             "extension_terms": extension_terms,
+            "estimated_extension_terms": estimated_extension_terms,
+            "extension_budget": extension_budget,
+            "mode_reason": mode_reason,
             "approximate": bool(approximate),
+            "analytical_compression": (
+                "folded" if approximate else "algorithms1-2"
+            ),
+            "numerical_compression": "none",
         }
         output = type(self)(
             arrays,
@@ -5702,6 +6837,19 @@ class FirstDegreeMPO:
             site_tag_id=self.site_tag_id,
             metadata=metadata,
         )
+        output._block_plan = MPOBlockPlan.from_semantic(
+            output,
+            kind="history",
+            metadata={
+                "order": order,
+                "mode": mode,
+                "history_storage": storage_info["mode"],
+                "structural_sparsity": (
+                    "block" if output.is_block_sparse else "conservative"
+                ),
+            },
+        )
+        output.metadata["block_plan"] = output._block_plan.summary()
         report = MPOCompressionReport(
             method="paper-history",
             exact=not approximate,
@@ -5758,6 +6906,8 @@ class FirstDegreeMPO:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
     ):
         """Build the paper's size-extensive higher-order MPO.
 
@@ -5780,16 +6930,18 @@ class FirstDegreeMPO:
         approximate : bool, default=False
             Apply Algorithm 4's order-controlled analytical compression after
             exact history compression. This is not a numerical cutoff.
-        mode : {None, "base", "algorithm4", "optimal", "approximate"}, optional
+        mode : {None, "base", "exact", "folded", "hybrid", "auto"}, optional
             Named construction policy. ``"base"`` selects Algorithms 1--2,
-            ``"algorithm4"`` selects Algorithms 1, 2, and 4,
-            ``"optimal"`` selects the paper's exact extended construction
-            (Algorithms 1--3), and ``"approximate"`` selects the extended
-            construction followed by Algorithm 4. When omitted, the legacy
-            ``extend`` and ``approximate`` flags are used unchanged. The
-            compatibility spellings ``"paper_algorithm4"``,
-            ``"paper_optimal"``, and ``"paper_approximate"`` are accepted but
-            normalized to the canonical names in metadata.
+            ``"exact"`` selects the paper's exact extended construction
+            (Algorithms 1--3), ``"folded"`` selects Algorithms 1, 2, and 4,
+            and ``"hybrid"`` selects Algorithms 1--4. ``"auto"`` uses the
+            exact policy when the symbolic Algorithm-3 work estimate is within
+            ``extension_budget`` and the folded policy otherwise. When omitted,
+            the legacy ``extend`` and
+            ``approximate`` flags are used unchanged. The compatibility names
+            ``"algorithm4"``, ``"optimal"``, ``"approximate"`` and their
+            ``"paper_*"`` spellings are accepted and normalized to the
+            canonical names in metadata.
         max_bond : int, optional
             Maximum temporary history bond dimension allowed during
             construction. This guard applies before exact history compression
@@ -5821,6 +6973,18 @@ class FirstDegreeMPO:
             the result directly into native Symmray charge blocks.
             ``"reduced"`` streams raw history products directly into the
             Algorithms-1/2 quotient and never allocates raw virtual tensors.
+        progress : bool, default=False
+            Show a ``tqdm`` stage bar with elapsed seconds and the current MPO
+            bond dimensions. This reports the requested order as one history
+            stage; it does not redundantly rebuild orders one through
+            ``order``.
+        extension_budget : int, optional
+            Maximum number of symbolically selected Algorithm-3 extension
+            terms allowed by ``mode="auto"``. The estimate is made before
+            the numerical left/right pair plan is materialized. ``None``
+            uses the deterministic default budget of 1,024 terms. Auto mode
+            selects Algorithms 1--3 when the estimate is less than or equal
+            to this budget, and Algorithms 1, 2, and 4 otherwise.
 
         Notes
         -----
@@ -5844,6 +7008,17 @@ class FirstDegreeMPO:
             )
         if not isinstance(cache_history, bool):
             raise TypeError("cache_history must be a boolean.")
+        if extension_budget is None:
+            extension_budget = _DEFAULT_AUTO_EXTENSION_BUDGET
+        elif (
+            not isinstance(extension_budget, Integral)
+            or int(extension_budget) < 1
+        ):
+            raise ValueError(
+                "extension_budget must be a positive integer or None."
+            )
+        else:
+            extension_budget = int(extension_budget)
         if history_storage == "blocks":
             history_storage = "block_sparse"
         if history_storage not in {
@@ -5858,40 +7033,90 @@ class FirstDegreeMPO:
                 "history_storage='streaming' requires cache_history=False; "
                 "use history_storage='auto' for cached construction."
             )
+        estimated_extension_terms = None
+        mode_reason = None
         if mode is not None:
             if not isinstance(mode, str):
                 raise TypeError("mode must be a string or None.")
             mode_aliases = {
                 "base": (False, False, "base"),
-                "algorithm4": (False, True, "algorithm4"),
-                "paper_algorithm4": (False, True, "algorithm4"),
-                "optimal": (True, False, "optimal"),
-                "paper_optimal": (True, False, "optimal"),
-                "approximate": (True, True, "approximate"),
-                "paper_approximate": (True, True, "approximate"),
+                "exact": (True, False, "exact"),
+                "folded": (False, True, "folded"),
+                "hybrid": (True, True, "hybrid"),
+                "algorithm4": (False, True, "folded"),
+                "paper_algorithm4": (False, True, "folded"),
+                "optimal": (True, False, "exact"),
+                "paper_optimal": (True, False, "exact"),
+                "approximate": (True, True, "hybrid"),
+                "paper_approximate": (True, True, "hybrid"),
             }
-            try:
-                mode_extend, mode_approximate, canonical_mode = mode_aliases[mode]
-            except KeyError as exc:
-                allowed = ", ".join(sorted(mode_aliases))
-                raise ValueError(
-                    f"unknown mode {mode!r}; expected one of {allowed}."
-                ) from exc
-            if extend or approximate:
-                raise ValueError(
-                    "mode cannot be combined with extend or approximate flags."
+            requested_mode = mode
+            if mode == "auto":
+                if extend or approximate:
+                    raise ValueError(
+                        "mode='auto' cannot be combined with extend or "
+                        "approximate flags."
+                    )
+                if self.L > 1:
+                    state_lists, _ = self._history_topology(
+                        order,
+                        max_bond=max_bond,
+                        on_exceed=on_exceed,
+                        cache_history=cache_history,
+                        progress=None,
+                    )
+                    estimated_extension_terms = (
+                        self._estimate_history_extension_terms(
+                            state_lists,
+                            order,
+                        )
+                    )
+                else:
+                    # With no virtual bonds Algorithm 3 is represented by
+                    # one additional local Taylor term.
+                    estimated_extension_terms = 1
+                extend = estimated_extension_terms <= extension_budget
+                approximate = not extend
+                canonical_mode = "exact" if extend else "folded"
+                mode_reason = (
+                    "within extension budget"
+                    if extend
+                    else "extension budget exceeded"
                 )
-            extend = mode_extend
-            approximate = mode_approximate
+            else:
+                try:
+                    mode_extend, mode_approximate, canonical_mode = mode_aliases[mode]
+                except KeyError as exc:
+                    allowed = ", ".join(
+                        ["base", "exact", "folded", "hybrid", "auto"]
+                        + sorted(
+                            name for name in mode_aliases
+                            if name not in {"base", "exact", "folded", "hybrid"}
+                        )
+                    )
+                    raise ValueError(
+                        f"unknown mode {mode!r}; expected one of {allowed}."
+                    ) from exc
+                if extend or approximate:
+                    raise ValueError(
+                        "mode cannot be combined with extend or approximate flags."
+                    )
+                extend = mode_extend
+                approximate = mode_approximate
         else:
             canonical_mode = (
-                "approximate" if approximate and extend
-                else "optimal" if extend
-                else "algorithm4" if approximate
+                "hybrid" if approximate and extend
+                else "exact" if extend
+                else "folded" if approximate
                 else "base"
             )
+            requested_mode = None
+        progress, owns_progress = _make_mpo_progress(
+            progress,
+            order=order,
+        )
         if self.L > 1:
-            return self._extensive_history_exponential(
+            output = self._extensive_history_exponential(
                 dt,
                 order=order,
                 extend=extend,
@@ -5901,11 +7126,30 @@ class FirstDegreeMPO:
                 on_exceed=on_exceed,
                 cache_history=cache_history,
                 history_storage=history_storage,
+                progress=progress,
+                extension_budget=(
+                    extension_budget if requested_mode == "auto" else None
+                ),
+                estimated_extension_terms=estimated_extension_terms,
+                mode_reason=mode_reason,
             )
+            if progress.enabled:
+                output.metadata["progress"] = True
+                output.metadata["timings"] = dict(progress.timings)
+                output.metadata["timing_history"] = {
+                    int(order): dict(progress.timings),
+                }
+                output.metadata["order_seconds"] = progress.total_seconds
+            if requested_mode == "auto":
+                output.metadata["requested_mode"] = requested_mode
+            if owns_progress:
+                progress.close()
+            return output
         # A one-site operator has no non-trivial virtual history. Evaluate its
         # requested Taylor polynomial directly, with Algorithm 3's extension
         # represented by one additional local Taylor term.
         effective_order = order + int(extend)
+        progress.start(f"local Taylor order={effective_order}")
         reference = self._arrays[0][0, 0]
         identity = ar.do("eye", self.phys_dim, like=reference)
         h = reference
@@ -5917,7 +7161,7 @@ class FirstDegreeMPO:
                 dt ** power_order / factorial(power_order),
                 power,
             )
-        return type(self)(
+        output = type(self)(
             (data,),
             levels=[[
                 MPOLevel(
@@ -5948,8 +7192,40 @@ class FirstDegreeMPO:
                 "approximate": False,
                 "approximation_requested": bool(approximate),
                 "extension_requested": bool(extend),
+                "estimated_extension_terms": estimated_extension_terms,
+                "extension_budget": (
+                    extension_budget if requested_mode == "auto" else None
+                ),
+                "mode_reason": mode_reason,
             },
         )
+        output._block_plan = MPOBlockPlan.from_semantic(
+            output,
+            kind="history",
+            metadata={
+                "order": effective_order,
+                "mode": canonical_mode,
+                "history_storage": "one-site-local",
+                "structural_sparsity": "conservative",
+            },
+        )
+        output.metadata["block_plan"] = output._block_plan.summary()
+        if requested_mode == "auto":
+            output.metadata["requested_mode"] = requested_mode
+        progress.finish(
+            f"local Taylor order={effective_order}",
+            bond_dimensions=(),
+        )
+        if progress.enabled:
+            output.metadata["progress"] = True
+            output.metadata["timings"] = dict(progress.timings)
+            output.metadata["timing_history"] = {
+                int(effective_order): dict(progress.timings),
+            }
+            output.metadata["order_seconds"] = progress.total_seconds
+        if owns_progress:
+            progress.close()
+        return output
 
     def compress_exact(self, *, inplace=False):
         """Apply exact history/column compression without a numerical cutoff.
@@ -5961,6 +7237,9 @@ class FirstDegreeMPO:
         conservative and cannot introduce a truncation error.
         """
         target = self if inplace else self.copy()
+        # Exact compression changes the virtual state set. Do not let a
+        # copied plan describe the pre-compression bond structure.
+        target._block_plan = None
         if target.is_block_sparse:
             # The standalone exact compressor predates the sparse history
             # executor and performs row/column equality checks by slicing.
@@ -6063,6 +7342,7 @@ class FirstDegreeMPO:
         )
         self._levels[bond].pop(source)
         self._base_level_position_cache = None
+        self._block_plan = None
         self._validate()
         return True
 

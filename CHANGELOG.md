@@ -14,6 +14,52 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added the backend-neutral `MPOBlock` / `MPOBlockPlan` structural inspection
+  layer. First-degree automata and persistent higher-order block-sparse MPOs
+  now expose virtual-state transitions, stored block counts, recipes, and
+  charge metadata without retaining numerical backend arrays.
+
+- Added charge-aware block validation and sector-wise compression diagnostics
+  for higher-order MPOs. `MPOBlockPlan.validate_charges()` checks virtual
+  charge labels before materialization, `FirstDegreeMPO.validate_charge_flow()`
+  invokes the native Symmray local flow check, and
+  `sector_aware="auto"` records native sector dimensions and block counts
+  around final Quimb compression without densifying symmetric tensors.
+
+- Extended `ham_tn.build_mpo` with compact Pauli term spellings, integer chain
+  locations, and dtype-aware `cutoff="auto"` / `cutoff_mode="auto"` options;
+  existing explicit local-operator terms remain supported. Builders now also
+  accept `to_backend=...` and perform generic MPO accumulation and compression
+  on the selected backend, infer `data_type` from that converter, accept
+  `chi`/Quimb compression options, and expose a shared automaton mode that
+  canonicalizes duplicate and identity-containing terms before compilation;
+  `mode="auto"` selects it only when its structural width is reasonable.
+
+- Extended higher-order `MPOBasis` and `exp_mpo` term input with the same
+  compact Pauli tuple spellings as `ham_tn`, and added final-`chi` compression
+  controls including `cutoff="auto"`, `cutoff_mode="auto"`, `form`, and
+  `compress_opts`.
+
+- Added the shared `shape=` geometry alias to `ham_tn`, supporting 1D, 2D,
+  and 3D layouts while retaining the legacy `Lx`/`Ly`/`Lz` spelling.
+
+- Added `to_backend=` to `exp_mpo` and `MPOBasis` term compilation. Operator
+  blocks and coefficient assembly now use the requested backend before
+  higher-order contractions, and ordinary final MPO output is rechecked with
+  `apply_to_arrays` after optional `chi` compression.
+
+- Added opt-in `progress=True` diagnostics to higher-order MPO exponentials.
+  The color-coded bar is labeled `exp(order=N)`, reports history and
+  analytical Algorithm 1--4 stages, and distinguishes Algorithm 4 analytical
+  compression from final numerical `chi` compression. Timing data and the
+  separate `analytical_compression` / `numerical_compression` metadata are
+  retained on the returned MPO.
+
+- Added canonical higher-order exponential modes: `exact` for Algorithm 3,
+  `folded` for Algorithm 4, `hybrid` for Algorithms 3 and 4, and `auto` for
+  the order-aware exact/folded policy. Historical `algorithm4`, `optimal`,
+  and `approximate` spellings remain compatible aliases.
+
 - Updated Quimb compatibility handling to defer the Symmray `safe_inverse`
   shim to older builds, accept Quimb's native long-range simple-update path,
   capability-check generalized-loop options, and adapt loop-series resummation
@@ -90,6 +136,28 @@ Changes for the next release should be added here before the version is bumped.
   FIT initialization, Quimb `LatticeBondMap` periodic-bond naming, and an
   explicit opt-in MPO auto-swap wrapper. These integrations preserve existing
   defaults and fail locally when an optional Quimb capability is unavailable.
+
+### Fixed
+
+- Fixed the native Symmray MPO dense-conversion boundary. Pepsy now supplies
+  the original physical basis-to-charge maps when Quimb contracts fused native
+  sectors, so `to_mpo().to_dense()` and the result of native sector-aware
+  compression use computational-basis order rather than Symmray's packed
+  sector order. The compiled MPO remains block-sparse until dense conversion
+  is explicitly requested.
+- Fixed native DMRG product results to retain Pepsy's MPO dense-conversion
+  boundary after FIT returns a base Quimb MPO. `compress_mpo_product` now
+  records that DMRG refinement uses `FIT.run_eff` and preserves the physical
+  charge maps needed for computational-basis output.
+
+### Changed
+
+- Extended `compress_mpo_product` with `guess_method` and `guess_seed` for
+  DMRG/FIT warm starts. The default deterministic SDC guess is retained;
+  dense-only `src` and `src-oversample` guesses can now initialize the exact
+  lazy target before `FIT.run_eff`. Native Symmray SRC warm starts fail with a
+  clear sector-awareness error rather than attempting unsupported randomized
+  backend operations.
 
 ## [0.4.1] - 2026-08-27
 

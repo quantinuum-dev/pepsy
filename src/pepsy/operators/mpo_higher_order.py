@@ -19,12 +19,14 @@ from .mpo_semantic import (
     MPODifferentiableCompressionReport,
     MPOLocalOperatorTerm,
     MPONumericalCompressionReport,
+    MPOChargeValidationReport,
     MPOCompressionReport,
     MPOLevel,
     MPOLevelToken,
     MPOParameter,
     MPOProductTerm,
 )
+from .mpo_block_plan import MPOBlock, MPOBlockPlan
 from .mpo_basis import CompiledMPOExp, MPOBasis, exp_mpo
 from .mpo_space import MPOBraiding, MPOPhysicalSpace
 
@@ -39,6 +41,9 @@ __all__ = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOChargeValidationReport",
+    "MPOBlock",
+    "MPOBlockPlan",
     "FirstDegreeMPO",
     "CompiledMPOExp",
     "MPOBasis",
