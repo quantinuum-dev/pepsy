@@ -19,6 +19,7 @@ purification = gibbs.mps
 rho = gibbs.to_mpo()                    # normalized, Tr(rho) = 1
 rho_raw = gibbs.to_mpo(normalized=False)
 Z = gibbs.partition_function()
+log_Z = gibbs.log_partition_function()  # natural log, safe for large scales
 ```
 
 The reusable identity purification is also available directly as
@@ -42,7 +43,14 @@ sites. The initial state is a product of Bell pairs
 Tracing the odd ancilla sites produces a positive operator proportional to
 `exp(-beta * H)`. `to_mpo(normalized=True)` divides by its represented trace;
 `partition_function()` returns the physical `Tr(exp(-beta * H))`, including the
-`d**L` factor when normalized Bell pairs are used.
+`d**L` factor when normalized Bell pairs are used. For large or low-temperature
+systems, use `log_partition_function()` to keep the partition-function scale in
+log-space rather than exponentiating it. Internally, ancilla tracing uses
+Quimb's native partial-trace reducer, which preserves Pepsy's MPS exponent in
+MPO metadata. If `contract_opts` are supplied, GibbsMps uses equivalent native
+tag-wise `strip_exponent=True` contractions because those options are not part
+of Quimb's public partial-trace signature. Neither route densifies the
+purification.
 
 ## Terms and lattice layouts
 
@@ -106,6 +114,12 @@ gates with logical sites mapped to the even physical positions of the
 purification. For Hamiltonians with disconnected one-site terms, the
 executable stream additionally contains those exact one-site gates, which do
 not have a Quimb edge-layer record.
+
+The graph-layer ordering is resolved once per preparation and passed explicitly
+to Quimb's scheduler. Stable automatic orderings are cached by the Gibbs
+object, while `trotter_ordering="random"` creates a fresh ordering for each
+preparation. Thus `trotter_layers` describes the exact schedule that is
+replayed, without a second graph-coloring pass.
 
 The default replay mode is `mode="mpo"`, which is appropriate for the
 non-unitary gates and the interleaved physical/ancilla layout. Other ordinary

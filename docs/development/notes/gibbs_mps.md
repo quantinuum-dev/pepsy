@@ -24,9 +24,22 @@ surfaces:
 The installed Quimb `partial_trace_to_mpo` signature is
 `(keep, upper_ind_id='b{}', rescale_sites=True)` and does not expose a
 `contract_tags` keyword. Its implementation nevertheless performs the
-reduction through local tag contractions. `GibbsMps.to_mpo(contract_opts=...)`
-now exposes safe options for those internal `contract_tags` and
-`contract_cumulative` calls while keeping the native method as the default.
+reduction through local tag contractions. It also propagates the live MPS
+global exponent to the returned MPO. `GibbsMps` therefore uses this native
+reducer for both unscaled and Pepsy-rescaled states, keeping the ordinary
+readout on Quimb's optimized path. If explicit contraction options are
+supplied, it uses the equivalent native `contract_tags` and
+`contract_cumulative` operations directly with `strip_exponent=True`, because
+the installed public reducer does not expose those options. This preserves
+scale-aware readout without ever densifying the purification.
+
+The resolved graph-layer ordering is passed back to Quimb explicitly rather
+than asking `LocalHamGen` to color the same interaction graph twice. This is
+important for randomized ordering: the schedule retained in
+`GibbsMps.trotter_layers` is now exactly the schedule used for replay. Stable
+non-random orderings are cached on the Gibbs object because the Hamiltonian
+topology is immutable while coefficients and imaginary time are rebound for
+each preparation.
 
 The compatibility decision is **adopt** for the ordinary dense/Autoray path:
 `bell_to_mps` uses Quimb's `MatrixProductState` constructor and

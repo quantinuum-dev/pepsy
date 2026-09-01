@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 from scipy.linalg import expm
 
 from pepsy import GibbsMps, bell_to_mps
@@ -56,6 +57,81 @@ def test_gibbs_mps_trace_options_keep_the_quimb_mpo_path():
         atol=1.0e-12,
     )
     assert configured.L == state.length
+
+
+def test_gibbs_mps_uses_quimb_native_trace_with_stored_scale(monkeypatch):
+    """Scaled readout stays on Quimb's native partial-trace path."""
+    state = GibbsMps([(("ZZ", 0.3), (0, 1))], shape=2)
+    state.prepare(0.2, n_steps=1, normalize_every=True, cutoff=0.0)
+    calls = []
+    native = state.mps.partial_trace_to_mpo
+
+    def traced(*args, **kwargs):
+        calls.append((args, kwargs))
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(state.mps, "partial_trace_to_mpo", traced)
+    state.to_mpo(normalized=False)
+
+    assert calls
+    assert calls[0][1]["keep"] == state.physical_sites
+
+
+def test_gibbs_mps_reuses_one_resolved_quimb_ordering(monkeypatch):
+    """Metadata and execution share the same graph-layer schedule."""
+    state = GibbsMps(
+        [
+            (("ZZ", 0.7), (0, 1)),
+            (("XX", 0.2), (1, 2)),
+        ],
+        shape=3,
+    )
+    native = qtn.LocalHamGen.get_trotter_gates
+    native_ordering = qtn.LocalHamGen.get_auto_ordering
+    seen = []
+    ordering_calls = []
+
+    def traced(self, x, **kwargs):
+        seen.append(kwargs["ordering"])
+        return native(self, x, **kwargs)
+
+    def traced_ordering(self, *args, **kwargs):
+        ordering_calls.append((args, kwargs))
+        return native_ordering(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.LocalHamGen, "get_trotter_gates", traced)
+    monkeypatch.setattr(qtn.LocalHamGen, "get_auto_ordering", traced_ordering)
+    state.prepare(0.2, n_steps=1, cutoff=0.0)
+    state.prepare(0.2, n_steps=1, cutoff=0.0)
+
+    assert seen == [state.trotter_layers, state.trotter_layers]
+    assert len(ordering_calls) == 1
+
+
+def test_gibbs_mps_random_metadata_matches_executable_schedule():
+    """Randomized layer metadata and gate replay use one draw."""
+    state = GibbsMps(
+        [
+            (("ZZ", 0.7), (0, 1)),
+            (("XX", 0.2), (1, 2)),
+            (("YY", -0.1), (2, 3)),
+            (("ZZ", 0.3), (3, 4)),
+        ],
+        shape=5,
+    )
+    state.prepare(
+        0.2,
+        n_steps=1,
+        trotter_order=1,
+        trotter_ordering="random",
+        trotter_fuse_adjacent=False,
+        cutoff=0.0,
+    )
+
+    assert all(
+        trotter_gate.where in state.trotter_layers[trotter_gate.layer]
+        for trotter_gate in state.trotter_gates
+    )
 
 
 def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
@@ -168,6 +244,33 @@ def test_gibbs_mps_forwards_direct_mps_controls_and_normalization():
     assert state.optimizer.mode == "quimb-direct"
     assert state.optimizer.get_normalizations()
     assert np.isfinite(float(np.real(state.trace())))
+
+
+def test_gibbs_mps_tracks_log_partition_function_through_rescaling():
+    """Log-Z and normalized readout retain scale-control bookkeeping."""
+    terms = [
+        (("ZZ", 0.7), (0, 1)),
+        (("X", -0.2), 0),
+    ]
+    state = GibbsMps(terms, shape=2)
+    state.prepare(
+        0.4,
+        n_steps=1,
+        chi=32,
+        cutoff=0.0,
+        normalize_every=True,
+    )
+
+    z = 4.170801899580418
+    assert state.trace() == pytest.approx(z / 4.0)
+    assert state.partition_function() == pytest.approx(z)
+    assert state.log_partition_function() == pytest.approx(np.log(z))
+    np.testing.assert_allclose(
+        np.asarray(state.to_mpo().to_dense()),
+        np.asarray(state.raw_mpo.to_dense()) / (z / 4.0),
+        atol=1.0e-12,
+    )
+    assert np.trace(np.asarray(state.to_mpo().to_dense())) == pytest.approx(1.0)
 
 
 def test_gibbs_mps_accepts_lattice_terms_through_one_d_map():

@@ -213,6 +213,11 @@ class GibbsMps:
         self.trotter_ordering = None
         self.trotter_fuse_adjacent = None
         self.trotter_alternate = None
+        # ``LocalHamGen.get_auto_ordering`` depends only on the interaction
+        # graph. Keep deterministic orderings so repeated preparations do not
+        # redo the graph coloring work. Random ordering is deliberately not
+        # cached: each request should still produce a fresh randomized path.
+        self._trotter_layers_cache = {}
         self.beta = None
         self.trotter_step = None
         self.n_steps = 0
@@ -425,8 +430,19 @@ class GibbsMps:
             )
 
         if isinstance(ordering, str) or ordering is None:
-            layers = tuple(ham.get_auto_ordering(ordering, group=True))
-            native_ordering = ordering
+            cache_key = ordering
+            if ordering in {"random", "random-ungrouped"}:
+                layers = tuple(ham.get_auto_ordering(ordering, group=True))
+            else:
+                try:
+                    layers = self._trotter_layers_cache[cache_key]
+                except KeyError:
+                    layers = tuple(ham.get_auto_ordering(ordering, group=True))
+                    self._trotter_layers_cache[cache_key] = layers
+            # Pass the already resolved layers back to Quimb. Besides avoiding
+            # a second graph-coloring pass, this makes the metadata and the
+            # executable schedule identical for randomized orderings.
+            native_ordering = layers
         else:
             native_ordering = tuple(tuple(layer) for layer in ordering)
             layers = native_ordering
@@ -722,14 +738,21 @@ class GibbsMps:
         return self._partial_trace_to_mpo()
 
     def _partial_trace_to_mpo(self, contract_opts=None):
-        """Trace ancillas with Quimb's native tag-wise MPO construction."""
+        """Trace ancillas through Quimb, preserving Pepsy scale metadata.
+
+        Quimb's native ``partial_trace_to_mpo`` implementation propagates the
+        MPS global exponent into the returned MPO, so it is the default for
+        both scaled and unscaled states. Explicit contraction options use the
+        equivalent tag-wise route below because the installed public Quimb
+        method does not accept those options.
+        """
         if contract_opts is None:
             return self.mps.partial_trace_to_mpo(
                 keep=self.physical_sites,
                 upper_ind_id="b{}",
                 rescale_sites=True,
             )
-        if not isinstance(contract_opts, Mapping):
+        elif not isinstance(contract_opts, Mapping):
             raise TypeError("contract_opts must be a mapping or None.")
         contract_opts = dict(contract_opts)
         forbidden = {
@@ -759,12 +782,18 @@ class GibbsMps:
         for site in mps.gen_sites_present():
             tag = mps.site_tag(site)
             if site in keep:
-                rho.contract_tags(tag, inplace=True, **contract_opts)
+                rho.contract_tags(
+                    tag,
+                    inplace=True,
+                    strip_exponent=True,
+                    **contract_opts,
+                )
             else:
                 next_site = site + 1 if site < mps.L - 1 else max(keep)
                 rho.contract_cumulative(
                     (tag, mps.site_tag(next_site)),
                     inplace=True,
+                    strip_exponent=True,
                     **contract_opts,
                 )
                 rho.drop_tags(tag)
@@ -791,19 +820,29 @@ class GibbsMps:
     def to_mpo(self, *, normalized=True, contract_opts=None):
         """Trace out ancillas and return the thermal operator as an MPO.
 
-        By default this calls Quimb's native ``partial_trace_to_mpo``. If
-        ``contract_opts`` is supplied, the same tag-wise reduction is used
-        with those options forwarded to Quimb's ``contract_tags`` and
-        ``contract_cumulative`` calls. This allows an explicit contraction
-        optimizer without ever densifying the full purification.
+        By default this uses Quimb's native ``partial_trace_to_mpo`` path,
+        including when Pepsy has stored a global MPS exponent. If
+        ``contract_opts`` is supplied, those options are forwarded to native
+        ``contract_tags`` and ``contract_cumulative`` operations with
+        ``strip_exponent=True``. Neither route densifies the full
+        purification.
         """
         rho = self._partial_trace_to_mpo(contract_opts)
         if not normalized:
             return rho
-        trace = rho.trace()
+        trace = ar.do("real", rho.trace())
         trace_float = _scalar_float(trace, name="thermal trace")
-        if not np.isfinite(trace_float) or abs(trace_float) <= 1.0e-15:
+        if not np.isfinite(trace_float) or trace_float <= 1.0e-15:
             raise FloatingPointError("cannot normalize a zero or non-finite thermal trace.")
+
+        # ``TensorNetwork.exponent`` stores the scale removed from the working
+        # purification. The traced MPO carries twice the MPS amplitude
+        # exponent, but ``MPO.trace()`` contracts only the rescaled tensor
+        # data. Normalize the data trace and clear the metadata so the returned
+        # MPO is represented at unit trace without materializing a potentially
+        # enormous physical scale.
+        if hasattr(rho, "exponent"):
+            rho.exponent = 0.0
         scale = ar.do("divide", 1.0, trace)
         return rho.multiply(scale, inplace=False)
 
@@ -822,14 +861,58 @@ class GibbsMps:
 
     def trace(self, *, contract_opts=None):
         """Return the trace of the raw ancilla-traced operator."""
-        return self._partial_trace_to_mpo(contract_opts).trace()
+        rho = self._partial_trace_to_mpo(contract_opts)
+        trace = rho.trace()
+        exponent = getattr(rho, "exponent", 0.0)
+        if exponent == 0:
+            return trace
+        scale = ar.do("power", 10.0, exponent)
+        return ar.do("multiply", trace, scale)
+
+    @staticmethod
+    def _log_mpo_trace(rho):
+        """Return the natural log of a positive MPO trace in log-space."""
+        trace = ar.do("real", rho.trace())
+        trace_float = _scalar_float(trace, name="thermal trace")
+        if not np.isfinite(trace_float) or trace_float <= 1.0e-15:
+            raise FloatingPointError(
+                "cannot take the log of a zero, negative, or non-finite "
+                "thermal trace."
+            )
+        log_trace = ar.do("log", trace)
+        exponent = getattr(rho, "exponent", 0.0)
+        if exponent != 0:
+            log_trace = ar.do(
+                "add",
+                log_trace,
+                float(exponent) * np.log(10.0),
+            )
+        return log_trace
+
+    def log_partition_function(self, *, contract_opts=None):
+        """Return ``log(Z)`` in natural-log units without exponentiating it.
+
+        The scale removed from a normalized working purification is combined
+        with the rescaled MPO trace in log-space. For normalized Bell pairs,
+        the physical partition function also includes the ``phys_dim**length``
+        factor.
+        """
+        rho = self._partial_trace_to_mpo(contract_opts)
+        log_z = self._log_mpo_trace(rho)
+        if self.normalized:
+            log_z = ar.do(
+                "add",
+                log_z,
+                self.length * np.log(self.phys_dim),
+            )
+        return log_z
 
     def partition_function(self, *, contract_opts=None):
         """Return ``Z = Tr(exp(-beta H))`` represented by the purification."""
-        trace = self.trace(contract_opts=contract_opts)
-        if self.normalized:
-            return ar.do("multiply", trace, self.phys_dim ** self.length)
-        return trace
+        return ar.do(
+            "exp",
+            self.log_partition_function(contract_opts=contract_opts),
+        )
 
     def __repr__(self):
         return (

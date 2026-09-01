@@ -74,6 +74,15 @@ Changes for the next release should be added here before the version is bumped.
   configurable tag-wise trace contraction options, while preserving the
   backend and autodiff paths.
 
+- Added exponent-aware Gibbs-MPS trace bookkeeping and a natural-log
+  `log_partition_function()` readout for stable large-scale partition
+  functions.
+
+- Kept Gibbs-MPS readout on Quimb's native partial-trace path (including
+  Pepsy-rescaled states), and stopped resolving the same Trotter graph
+  ordering twice; randomized ordering metadata now matches the executable
+  replay schedule.
+
 - Updated `GibbsMps` to use Quimb's graph-aware `LocalHamGen` Trotter scheduler
   for first-, second-, and fourth-order product formulas. Connected one-site
   terms are combined into incident edges without leaving the selected backend;
