@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from numbers import Integral
+import warnings
 
 import autoray as ar
 import numpy as np
@@ -730,6 +731,53 @@ def _graph_lattice_from_input(graph, L):
     return ClusterLattice.from_edges(tuple(range(L)), edges, name=name)
 
 
+def _normalize_graph_assembly(value):
+    """Normalize the graph-cluster collection assembly policy."""
+
+    if not isinstance(value, str):
+        raise TypeError(
+            "graph_assembly must be 'auto', 'exact', or 'bounded'."
+        )
+    value = value.strip().lower().replace("-", "_")
+    if value not in {"auto", "exact", "bounded"}:
+        raise ValueError(
+            "graph_assembly must be 'auto', 'exact', or 'bounded'."
+        )
+    return value
+
+
+def _validate_graph_collection_order(value):
+    """Validate the number of non-single graph residuals per collection."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Integral)
+        or isinstance(value, bool)
+        or int(value) < 1
+    ):
+        raise ValueError(
+            "max_collection_order must be a positive integer or None."
+        )
+    return int(value)
+
+
+def _validate_graph_collection_budget(value):
+    """Validate the hard cap used before graph collection materialization."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Integral)
+        or isinstance(value, bool)
+        or int(value) < 1
+    ):
+        raise ValueError(
+            "collection_budget must be a positive integer or None."
+        )
+    return int(value)
+
+
 def _graph_lattice_for_basis(graph, basis):
     """Map coordinate-labelled graph sites to a basis' MPO chain."""
 
@@ -999,6 +1047,12 @@ class MPOClusterExpansionReport:
     cluster_mode: str = "interval"
     graph_cluster_count: int = 0
     graph_loop_counts: tuple[int, ...] = ()
+    graph_assembly: str = "direct"
+    graph_collection_order: int | None = None
+    graph_collection_count: int = 0
+    graph_collection_budget: int | None = None
+    graph_collection_truncated: bool = False
+    graph_frontier_width: int = 0
 
     @property
     def api_info(self):
@@ -1057,6 +1111,11 @@ class MPOClusterProductExpansion:
     local operator-Schmidt ranks and ``max_bond`` applies an explicit fixed
     cap. Use :meth:`compile_exp` for repeated ordered products; it caches only
     interval/factor schedules and never numerical autodiff values.
+
+    For graph inputs, ``graph_assembly`` controls the additional collection
+    expansion caused by crossing or nested graph clusters in the MPO ordering.
+    The default ``"auto"`` policy is exact for small plans and falls back to a
+    reported one-cluster approximation when its finite budget is exceeded.
     """
 
     def __init__(
@@ -1070,11 +1129,19 @@ class MPOClusterProductExpansion:
         max_bond=None,
         graph=None,
         to_backend=None,
+        graph_assembly="auto",
+        max_collection_order=None,
+        collection_budget=128,
     ):
         if not isinstance(L, Integral) or isinstance(L, bool) or int(L) < 1:
             raise ValueError("L must be a positive integer.")
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
+        graph_assembly = _normalize_graph_assembly(graph_assembly)
+        max_collection_order = _validate_graph_collection_order(
+            max_collection_order
+        )
+        collection_budget = _validate_graph_collection_budget(collection_budget)
         self.L = int(L)
         if not isinstance(cluster_size, Integral) or isinstance(cluster_size, bool):
             raise TypeError("cluster_size must be a positive integer.")
@@ -1094,8 +1161,21 @@ class MPOClusterProductExpansion:
             max_bond = int(max_bond)
         self.max_bond = max_bond
         self.to_backend = to_backend
+        self.graph_assembly = graph_assembly
+        self.max_collection_order = max_collection_order
+        self.collection_budget = collection_budget
         self.graph = None if graph is None else _graph_lattice_from_input(graph, self.L)
         self.cluster_mode = "graph" if self.graph is not None else "interval"
+        if self.graph is None and max_collection_order is not None:
+            raise ValueError(
+                "max_collection_order is only valid for graph cluster assembly."
+            )
+        if graph_assembly == "exact" and max_collection_order is not None:
+            raise ValueError(
+                "max_collection_order cannot be combined with "
+                "graph_assembly='exact'."
+            )
+        self._graph_auto_warned = False
         self.factors = tuple(self._normalize_factor(factor) for factor in factors)
         if not self.factors:
             raise ValueError("at least one MPO cluster factor is required.")
@@ -1361,6 +1441,12 @@ class MPOClusterProductExpansion:
             "factor_count": len(self.factors),
             "max_bond": self.max_bond,
             "cutoff": self.cutoff,
+            "graph_assembly": self.graph_assembly,
+            "max_collection_order": self.max_collection_order,
+            "collection_budget": self.collection_budget,
+            "graph_frontier_width": (
+                0 if self.graph is None else self._graph_frontier_width()
+            ),
             "static_matrix_count": self._static_matrix_count,
         }
 
@@ -1673,6 +1759,13 @@ class MPOClusterProductExpansion:
                     "graph residual factorization has incompatible virtual "
                     "ranks across a chain gap."
                 )
+            operator = _as_backend(operator, like=residual)
+            residual_dtype = getattr(residual, "dtype", None)
+            if (
+                residual_dtype is not None
+                and getattr(operator, "dtype", None) != residual_dtype
+            ):
+                operator = ar.do("astype", operator, residual_dtype)
             rank = int(left_rank)
             array = ar.do(
                 "zeros",
@@ -1820,25 +1913,177 @@ class MPOClusterProductExpansion:
                     return True
         return False
 
-    def _graph_cluster_collections(self):
-        """Enumerate non-empty collections of pairwise site-disjoint clusters."""
+    def _bounded_graph_cluster_collections(
+        self,
+        *,
+        max_collection_order=None,
+        budget=None,
+    ):
+        """Enumerate graph collections up to explicit safety limits.
+
+        The returned boolean is true when another collection would have been
+        emitted after ``budget`` was reached. This lets the ``auto`` policy
+        inspect a plan without ever constructing the complete collection list.
+        """
 
         clusters = tuple(
             cluster for cluster in self._graph_clusters if len(cluster) > 1
         )
         collections = []
+        truncated = False
 
         def visit(start, occupied, chosen):
+            nonlocal truncated
             for index in range(start, len(clusters)):
                 cluster = clusters[index]
                 if occupied.intersection(cluster):
                     continue
                 updated = chosen + (cluster,)
+                if (
+                    max_collection_order is not None
+                    and len(updated) > max_collection_order
+                ):
+                    continue
+                if budget is not None and len(collections) >= budget:
+                    truncated = True
+                    return
                 collections.append(updated)
-                visit(index + 1, occupied.union(cluster), updated)
+                if (
+                    max_collection_order is None
+                    or len(updated) < max_collection_order
+                ):
+                    visit(index + 1, occupied.union(cluster), updated)
+                if truncated:
+                    return
 
         visit(0, set(), ())
-        return tuple(collections)
+        return tuple(collections), truncated
+
+    def _graph_cluster_collections(self):
+        """Enumerate all non-empty disjoint graph-cluster collections.
+
+        This unbounded compatibility helper is retained for diagnostics. The
+        public graph assembly path uses the bounded planner below instead of
+        calling it implicitly.
+        """
+
+        collections, _truncated = self._bounded_graph_cluster_collections()
+        return collections
+
+    def _graph_frontier_width(self):
+        """Return the graph-cluster cutwidth in the MPO ordering."""
+
+        clusters = tuple(
+            cluster for cluster in self._graph_clusters if len(cluster) > 1
+        )
+        return max(
+            (
+                sum(min(cluster) < cut <= max(cluster) for cluster in clusters)
+                for cut in range(1, self.L)
+            ),
+            default=0,
+        )
+
+    def _graph_collection_plan(self):
+        """Choose a safe exact or bounded graph assembly plan.
+
+        Exact collection assembly is useful for small custom graphs, but its
+        collection count is a hard scalability boundary for 2D MPO orderings.
+        ``auto`` probes only up to the configured budget and falls back to the
+        explicit one-cluster approximation when that boundary is crossed.
+        """
+
+        if self.graph is None or not self._graph_needs_collection_assembly():
+            return {
+                "strategy": "direct",
+                "collections": (),
+                "collection_order": 1,
+                "collection_count": 0,
+                "collection_truncated": False,
+            }
+
+        if self.graph_assembly == "auto" and self.collection_budget is None:
+            raise ValueError(
+                "graph_assembly='auto' requires a finite collection_budget; "
+                "use graph_assembly='exact' or 'bounded' when disabling "
+                "the safety limit explicitly."
+            )
+
+        if self.graph_assembly == "bounded":
+            collection_order = self.max_collection_order or 1
+            if collection_order == 1:
+                return {
+                    "strategy": "bounded",
+                    "collections": (),
+                    "collection_order": 1,
+                    "collection_count": 0,
+                    "collection_truncated": True,
+                }
+            collections, truncated = self._bounded_graph_cluster_collections(
+                max_collection_order=collection_order,
+                budget=self.collection_budget,
+            )
+            if truncated:
+                raise ValueError(
+                    "bounded graph MPO assembly exceeded collection_budget="
+                    f"{self.collection_budget}; reduce max_collection_order "
+                    "or increase collection_budget explicitly."
+                )
+            return {
+                "strategy": "bounded",
+                "collections": collections,
+                "collection_order": collection_order,
+                "collection_count": len(collections),
+                "collection_truncated": True,
+            }
+
+        collections, truncated = self._bounded_graph_cluster_collections(
+            budget=self.collection_budget,
+        )
+        if self.graph_assembly == "exact":
+            if truncated:
+                raise ValueError(
+                    "exact graph MPO assembly exceeds collection_budget="
+                    f"{self.collection_budget}; use graph_assembly='bounded' "
+                    "for a controlled approximation or set "
+                    "collection_budget=None explicitly."
+                )
+            return {
+                "strategy": "exact",
+                "collections": collections,
+                "collection_order": None,
+                "collection_count": len(collections),
+                "collection_truncated": False,
+            }
+
+        if not truncated:
+            return {
+                "strategy": "exact",
+                "collections": collections,
+                "collection_order": None,
+                "collection_count": len(collections),
+                "collection_truncated": False,
+            }
+
+        if not self._graph_auto_warned:
+            warnings.warn(
+                "graph MPO cluster collection assembly exceeded "
+                f"collection_budget={self.collection_budget}; using the "
+                "bounded one-cluster approximation. Pass "
+                "graph_assembly='exact' to request the full collection plan "
+                "or graph_assembly='bounded' with max_collection_order to "
+                "choose the approximation explicitly.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            self._graph_auto_warned = True
+        return {
+            "strategy": "bounded",
+            "collections": (),
+            "collection_order": 1,
+            "collection_count": 0,
+            "collection_truncated": True,
+        }
 
     @staticmethod
     def _multiply_mpo_cores(left, right):
@@ -1857,7 +2102,7 @@ class MPOClusterProductExpansion:
             ),
         )
 
-    def _assemble_graph_collections(self, residuals):
+    def _assemble_graph_collections(self, residuals, *, collections=None):
         """Assemble crossing/nested graph-cluster products exactly.
 
         The ordinary graph assembly is a direct sum of one cluster path at a
@@ -1878,8 +2123,10 @@ class MPOClusterProductExpansion:
                 residual,
             )
 
+        if collections is None:
+            collections = self._graph_cluster_collections()
         collection_cores = []
-        for collection in self._graph_cluster_collections():
+        for collection in collections:
             occupied = {
                 site
                 for cluster in collection
@@ -2090,12 +2337,26 @@ class MPOClusterProductExpansion:
         self._build_count += 1
         step = _cluster_to_backend(step, self.to_backend)
         residuals = self._residuals(step, parameters)
+        graph_plan = {
+            "strategy": "direct",
+            "collections": (),
+            "collection_order": None,
+            "collection_count": 0,
+            "collection_truncated": False,
+        }
         if self.graph is None:
             arrays, state_lists, cores = self._assemble(residuals)
-        elif self._graph_needs_collection_assembly():
-            arrays, state_lists, cores = self._assemble_graph_collections(residuals)
         else:
-            arrays, state_lists, cores = self._assemble_graph(residuals)
+            graph_plan = self._graph_collection_plan()
+            if graph_plan["strategy"] == "direct":
+                arrays, state_lists, cores = self._assemble_graph(residuals)
+            elif graph_plan["collections"]:
+                arrays, state_lists, cores = self._assemble_graph_collections(
+                    residuals,
+                    collections=graph_plan["collections"],
+                )
+            else:
+                arrays, state_lists, cores = self._assemble_graph(residuals)
         residual_ranks = tuple(
             (interval, tuple(int(core.shape[1]) for core in cores[interval]))
             for interval in sorted(cores)
@@ -2115,6 +2376,34 @@ class MPOClusterProductExpansion:
             cluster_mode=self.cluster_mode,
             graph_cluster_count=len(self._graph_clusters),
             graph_loop_counts=self._graph_loop_counts,
+            graph_assembly=(
+                "interval"
+                if self.graph is None
+                else graph_plan["strategy"]
+            ),
+            graph_collection_order=(
+                None
+                if self.graph is None
+                else graph_plan["collection_order"]
+            ),
+            graph_collection_count=(
+                0
+                if self.graph is None
+                else graph_plan["collection_count"]
+            ),
+            graph_collection_budget=(
+                None
+                if self.graph is None
+                else self.collection_budget
+            ),
+            graph_collection_truncated=(
+                False
+                if self.graph is None
+                else graph_plan["collection_truncated"]
+            ),
+            graph_frontier_width=(
+                0 if self.graph is None else self._graph_frontier_width()
+            ),
         )
         self._last_report = report
         return FirstDegreeMPO(
@@ -2258,6 +2547,9 @@ def exp_mpo_cluster(
     factors=None,
     max_bond=None,
     cutoff=1.0e-12,
+    graph_assembly="auto",
+    max_collection_order=None,
+    collection_budget=128,
     chi=None,
     cutoff_mode="rel",
     compression=None,
@@ -2321,6 +2613,20 @@ def exp_mpo_cluster(
         residual factorization; it is not the final MPO bond cap. ``cutoff``
         is a relative local singular-value cutoff. ``"auto"`` is resolved
         from the local operator dtype.
+    graph_assembly : {"auto", "exact", "bounded"}, default="auto"
+        Assembly policy for crossing or nested graph clusters. ``"auto"``
+        keeps exact collection assembly below ``collection_budget`` and
+        otherwise uses the bounded one-cluster approximation. ``"exact"``
+        raises instead of exceeding the budget. ``"bounded"`` uses
+        ``max_collection_order``.
+    max_collection_order : int, optional
+        Maximum number of non-single graph residuals in one assembled
+        collection when ``graph_assembly="bounded"``. The default is one,
+        which retains every individual graph residual and omits products of
+        multiple graph residuals.
+    collection_budget : int or None, default=128
+        Hard limit on graph-cluster collections inspected or materialized.
+        Set ``None`` only when an explicitly unbounded exact plan is intended.
     chi, cutoff_mode, compression, differentiable, sector_aware, form,
     create_bond, compress_opts : optional
         Optional final numerical MPO compression, using the same semantic
@@ -2353,6 +2659,12 @@ def exp_mpo_cluster(
     ``order``, ``mode``, ``history_storage``, and ``extension_budget`` are not
     accepted because they belong to the separate higher-order MPO history
     family. Here ``cluster_size`` is the spatial expansion control.
+
+    Graph collection assembly is a second, independent approximation axis.
+    It matters only when disjoint graph clusters overlap in the MPO chain
+    ordering. ``graph_assembly="bounded"`` with
+    ``max_collection_order=1`` is the fast graph-MPO mode; use a graph-native
+    PEPO when the full 2D connected expansion is required at scale.
     """
 
     if not isinstance(progress, bool):
@@ -2484,6 +2796,9 @@ def exp_mpo_cluster(
             cutoff=local_cutoff,
             max_bond=max_bond,
             to_backend=to_backend,
+            graph_assembly=graph_assembly,
+            max_collection_order=max_collection_order,
+            collection_budget=collection_budget,
         )
     else:
         normalized_graph = _graph_lattice_from_spec(
@@ -2502,6 +2817,9 @@ def exp_mpo_cluster(
             cutoff=local_cutoff,
             max_bond=max_bond,
             to_backend=to_backend,
+            graph_assembly=graph_assembly,
+            max_collection_order=max_collection_order,
+            collection_budget=collection_budget,
         )
 
     if chi is not None:
@@ -2550,7 +2868,10 @@ def exp_mpo_cluster(
         timings["cluster"] = time.perf_counter() - stage_start
         cluster_report = expansion.last_report
         if progress_bar is not None:
-            progress_bar.set_description("exp_mpo_cluster | cluster")
+            progress_bar.set_description(
+                "exp_mpo_cluster | cluster "
+                f"({cluster_report.graph_assembly})"
+            )
             progress_bar.update(1)
 
         numerical_report = None
@@ -2583,6 +2904,14 @@ def exp_mpo_cluster(
             result_metadata["cluster_report"] = cluster_report
             result_metadata["cluster_mode"] = expansion.cluster_mode
             result_metadata["graph_requested"] = graph is not None
+            if graph is not None:
+                result_metadata["graph_assembly"] = cluster_report.graph_assembly
+                result_metadata["graph_collection_count"] = (
+                    cluster_report.graph_collection_count
+                )
+                result_metadata["graph_collection_truncated"] = (
+                    cluster_report.graph_collection_truncated
+                )
             if numerical_report is not None:
                 result_metadata["numerical_compression_report"] = numerical_report
             if progress:
@@ -2607,6 +2936,13 @@ def exp_mpo_cluster(
             "factor_count": len(expansion.factors),
             "cutoff": expansion.cutoff,
             "max_bond": expansion.max_bond,
+            "graph_assembly": expansion.graph_assembly,
+            "max_collection_order": expansion.max_collection_order,
+            "collection_budget": expansion.collection_budget,
+            "selected_graph_assembly": cluster_report.graph_assembly,
+            "graph_collection_count": cluster_report.graph_collection_count,
+            "graph_collection_truncated": cluster_report.graph_collection_truncated,
+            "graph_frontier_width": cluster_report.graph_frontier_width,
             "chi": chi,
             "compression": (
                 None

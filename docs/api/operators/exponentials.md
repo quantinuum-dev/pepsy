@@ -71,6 +71,14 @@ The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
 
+For graph-aware MPO clusters, `graph_assembly="auto"` protects the 1D
+materialization boundary: it keeps small collection plans exact and falls
+back to a reported bounded one-cluster approximation after its finite
+`collection_budget`. Use `graph_assembly="exact"` when the full result is
+required and `graph_assembly="bounded"` with `max_collection_order` when a
+controlled approximation is preferable. This control is specific to graph
+cluster products and is independent of the local `cluster_size` cutoff.
+
 There are three distinct construction axes: SciPost higher-order MPO history,
 connected MPO cluster size, and PEPO spatial cluster order. In both cluster
 families, `exp(A) @ exp(B) @ exp(C)` is a joint local-residual expansion: the

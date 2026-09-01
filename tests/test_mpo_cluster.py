@@ -1,5 +1,7 @@
 """Tests for the finite MPO cluster-basis expansion."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -506,3 +508,90 @@ def test_interval_cluster_expansion_keeps_explicit_string_operators():
     )
     expected = scipy_linalg.expm(0.1 * _kron_all((x, z, x)))
     np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
+
+
+def test_auto_graph_assembly_bounds_wide_mpo_collection_plans():
+    """Wide graph orderings fall back before materializing all collections."""
+    lattice = ClusterLattice.square(3, 3)
+    terms = [
+        {
+            "operator": "ZZ",
+            "location": (source, target),
+            "coefficient": 0.7,
+        }
+        for source, target in lattice.edges
+    ]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result, report = exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=(3, 3),
+            graph=lattice,
+            cluster_size=2,
+            cutoff=0.0,
+            return_semantic=True,
+            return_report=True,
+        )
+
+    assert any(
+        "bounded one-cluster approximation" in str(item.message)
+        for item in caught
+    )
+    assert report.graph_assembly == "bounded"
+    assert report.graph_collection_order == 1
+    assert report.graph_collection_count == 0
+    assert report.graph_collection_truncated
+    assert report.graph_frontier_width > 0
+    assert result.metadata["cluster_report"] is report
+
+
+def test_exact_graph_assembly_rejects_a_collection_budget_overflow():
+    """Exact graph assembly fails before entering an unsafe large plan."""
+    z = np.diag([1.0, -1.0])
+    lattice = ClusterLattice.square(3, 3)
+    terms = [
+        ((source, target), (z, z), 0.7)
+        for source, target in lattice.edges
+    ]
+
+    with pytest.raises(ValueError, match="exceeds collection_budget"):
+        exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=(3, 3),
+            graph=lattice,
+            cluster_size=2,
+            cutoff=0.0,
+            graph_assembly="exact",
+            collection_budget=10,
+            return_semantic=True,
+        )
+
+
+def test_bounded_graph_assembly_reports_requested_collection_order():
+    """The bounded policy exposes its approximation axis in diagnostics."""
+    x, _z = _paulis()
+    lattice = ClusterLattice.square(2, 2)
+    terms = [
+        ((source, target), (x, x), 0.7)
+        for source, target in lattice.edges
+    ]
+    result, report = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=(2, 2),
+        graph=lattice,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="bounded",
+        max_collection_order=1,
+        return_semantic=True,
+        return_report=True,
+    )
+
+    assert report.graph_assembly == "bounded"
+    assert report.graph_collection_order == 1
+    assert report.graph_collection_truncated
+    assert result.pepsy_cluster_metadata["selected_graph_assembly"] == "bounded"

@@ -74,6 +74,54 @@ genuine two-site cluster even when its MPO span crosses many chain positions.
 The report records `cluster_mode="graph"`, graph counts, loop counts, and
 local residual ranks.
 
+### Graph assembly safety
+
+Crossing or nested graph clusters require products of disjoint residual paths
+when they are represented as an MPO. The default
+`graph_assembly="auto"` probes only up to `collection_budget=128` compatible
+collections. Small plans are assembled exactly. If the budget is exceeded,
+the call emits a `RuntimeWarning` and uses the bounded one-cluster
+approximation, which retains each individual graph residual but omits products
+of multiple graph residuals.
+
+Use the explicit controls when the tradeoff matters:
+
+```python
+# Fast, controlled graph-MPO approximation.
+U = exp_mpo_cluster(
+    terms,
+    -1j * 0.01,
+    shape=(4, 4),
+    graph="square",
+    cluster_size=2,
+    graph_assembly="bounded",
+    max_collection_order=1,
+)
+
+# Require the full collection expansion, but fail before unsafe allocation.
+U = exp_mpo_cluster(
+    terms,
+    -1j * 0.01,
+    shape=(2, 2),
+    graph="square",
+    cluster_size=2,
+    graph_assembly="exact",
+    collection_budget=1000,
+)
+```
+
+`max_collection_order` counts non-single graph residuals in one collection;
+it is separate from `cluster_size`. `graph_assembly="exact"` preserves the
+previous full result, but raises if `collection_budget` is exceeded. Set
+`collection_budget=None` only for an intentionally unbounded small-graph
+calculation. The report exposes the selected assembly mode, collection count,
+frontier width in the MPO ordering, and whether the collection expansion was
+truncated.
+
+For a two-dimensional lattice at scale, prefer the graph-native PEPO active
+representation. An MPO must pay for the lattice-to-chain cutwidth, while a
+PEPO keeps one virtual bond per graph edge.
+
 ## Joint ordered products
 
 For factors `A`, `B`, and `C`, use

@@ -14,6 +14,13 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added bounded graph-cluster assembly controls to `exp_mpo_cluster` and
+  `MPOBasis.compile_graph_cluster_expansion`. The default
+  `graph_assembly="auto"` protects wide MPO orderings with a finite
+  collection budget, while `graph_assembly="exact"` and
+  `graph_assembly="bounded"` make the exact versus controlled-approximation
+  choice explicit and report the selected strategy.
+
 - Added the backend-neutral `MPOBlock` / `MPOBlockPlan` structural inspection
   layer. First-degree automata and persistent higher-order block-sparse MPOs
   now expose virtual-state transitions, stored block counts, recipes, and

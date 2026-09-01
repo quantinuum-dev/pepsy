@@ -1109,6 +1109,9 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        graph_assembly="auto",
+        max_collection_order=None,
+        collection_budget=128,
     ):
         """Build a graph-aware cluster expansion with MPO output.
 
@@ -1121,13 +1124,19 @@ class MPOBasis:
         ``cluster_size`` counts graph sites, not the span in MPO chain
         positions. A long-range two-site graph edge is therefore a genuine
         two-site cluster even when its MPO representation crosses many chain
-        sites.
+        sites. ``graph_assembly`` controls products of disjoint graph
+        residuals whose chain spans cross or nest; ``"auto"`` falls back to a
+        bounded one-cluster approximation when ``collection_budget`` is
+        exceeded.
         """
         compiled = self.compile_graph_cluster_expansion(
             graph=graph,
             cluster_size=cluster_size,
             cutoff=cutoff,
             max_bond=max_bond,
+            graph_assembly=graph_assembly,
+            max_collection_order=max_collection_order,
+            collection_budget=collection_budget,
         )
         return compiled.exp(step, parameters=parameters)
 
@@ -1138,13 +1147,30 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        graph_assembly="auto",
+        max_collection_order=None,
+        collection_budget=128,
     ):
-        """Compile a reusable graph-aware ordered cluster evaluator."""
+        """Compile a reusable graph-aware ordered cluster evaluator.
+
+        ``graph_assembly="exact"`` retains every compatible graph-cluster
+        collection up to ``collection_budget``. Use
+        ``graph_assembly="bounded"`` and ``max_collection_order`` for an
+        explicit approximation on wide MPO orderings.
+        """
         from .mpo_product import (  # pylint: disable=import-outside-toplevel
             MPOGraphClusterProductExpansion,
             _graph_lattice_for_basis,
+            _normalize_graph_assembly,
+            _validate_graph_collection_budget,
+            _validate_graph_collection_order,
         )
 
+        graph_assembly = _normalize_graph_assembly(graph_assembly)
+        max_collection_order = _validate_graph_collection_order(
+            max_collection_order
+        )
+        collection_budget = _validate_graph_collection_budget(collection_budget)
         normalized_graph = _graph_lattice_for_basis(graph, self)
         cache_key = (
             tuple(normalized_graph.sites),
@@ -1152,6 +1178,9 @@ class MPOBasis:
             int(cluster_size),
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
+            graph_assembly,
+            None if max_collection_order is None else int(max_collection_order),
+            None if collection_budget is None else int(collection_budget),
         )
         expansion = self._graph_cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -1161,6 +1190,9 @@ class MPOBasis:
                 cluster_size=cluster_size,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                graph_assembly=graph_assembly,
+                max_collection_order=max_collection_order,
+                collection_budget=collection_budget,
             )
             self._graph_cluster_expansion_cache[cache_key] = expansion
         return expansion.compile_exp()

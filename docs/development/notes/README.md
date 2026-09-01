@@ -18,6 +18,8 @@ user-facing, promote it into `docs/` (tutorials / how-to).
   tensors via `symmray`, and how they bridge into pepsy's tagging conventions.
 - [`fermionic_mpo.md`](fermionic_mpo.md) — Fermionic Fermi-Hubbard MPO
   conventions, the Symmray/Jordan-Wigner bridge, and current validation status.
+- [`mpo_cluster_graph_assembly.md`](mpo_cluster_graph_assembly.md) — Upstream
+  compatibility and bounded graph-collection assembly audit for MPO clusters.
 
 ## Relationship to other docs
 
@@ -34,4 +36,5 @@ quimb
 symmray
 fermionic_mpo
 higher_order_mpo_benchmarks
+mpo_cluster_graph_assembly
 ```
