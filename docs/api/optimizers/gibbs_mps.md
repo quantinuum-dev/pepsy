@@ -63,8 +63,32 @@ terms = [
 terms += [(("X", h), i) for i in range(L)]
 ```
 
-Regular lattice coordinates use `shape` and `map_mode`, or an explicit
-`OneDMap`:
+Regular lattice terms can keep their natural coordinates. If `shape` is
+omitted, `GibbsMps` infers the location dimension and the smallest enclosing
+2D/3D shape from the term locations, then creates a `OneDMap` using
+`map_mode` (defaulting to `"snake"`):
+
+```python
+import quimb.tensor as qtn
+
+edges = qtn.edges_2d_square(Lx, Ly, cyclic=True)
+sites = sorted({site for edge in edges for site in edge})
+terms = [(("zz", J), (u, v)) for (u, v) in edges]
+terms += [(("x", h), site) for site in sites]
+
+gibbs = GibbsMps(terms, map_mode="snake")  # infers shape=(Lx, Ly)
+# Other supported traversals can be selected, for example:
+# gibbs = GibbsMps(terms, map_mode="row-major")
+```
+
+The same inference distinguishes flat integer locations as a 1D chain and
+coordinate tuples such as `(x, y)` or `(x, y, z)` as lattice sites. All terms
+in one Hamiltonian must use the same location dimension. Supply `shape`
+explicitly when the terms do not mention every site or when the intended
+lattice extends beyond the largest coordinate.
+
+Alternatively, regular lattice terms can use explicit `shape` with
+`map_mode`, or an explicit `OneDMap`:
 
 ```python
 gibbs = GibbsMps(

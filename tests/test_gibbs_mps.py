@@ -291,6 +291,37 @@ def test_gibbs_mps_accepts_lattice_terms_through_one_d_map():
     )
 
 
+def test_gibbs_mps_infers_coordinate_dimension_and_shape():
+    """Natural 2D coordinates work without an explicit shape argument."""
+    lx, ly = 3, 4
+    edges = qtn.edges_2d_square(lx, ly, cyclic=True)
+    sites = sorted({site for edge in edges for site in edge})
+    terms = [(("zz", 0.3), (u, v)) for (u, v) in edges]
+    terms += [(("x", -0.1), site) for site in sites]
+
+    state = GibbsMps(terms, map_mode="row-major")
+
+    assert state.shape == (lx, ly)
+    assert state.length == lx * ly
+    assert state.basis.lattice_shape == (lx, ly)
+    assert state.mapper.mode == "row-major"
+    assert state.basis.lattice_to_chain[(1, 0)] == 4
+
+
+def test_gibbs_mps_infers_flat_integer_chain_shape():
+    """Flat integer locations remain an inferred one-dimensional chain."""
+    state = GibbsMps(
+        [
+            (("zz", 0.3), (0, 1)),
+            (("x", -0.1), 0),
+        ]
+    )
+
+    assert state.shape == (2,)
+    assert state.length == 2
+    assert state.basis.lattice_shape is None
+
+
 def test_gibbs_mps_materializes_term_generators_once():
     """Generator-based term input remains available for backend inference."""
     terms = ((("Z", 0.2), site) for site in range(2))

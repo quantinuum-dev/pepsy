@@ -140,7 +140,9 @@ class GibbsMps:
         compact entries such as ``(('ZZ', J), (i, j))`` and mappings such as
         ``{"operator": "X", "location": i, "coefficient": h}``.
     shape : int or tuple, optional
-        Chain length or regular lattice shape.
+        Chain length or regular lattice shape. If omitted, the location
+        structure in ``terms`` is used to infer one-dimensional, 2D, or 3D
+        input and the smallest enclosing shape is selected.
     mapper : OneDMap, optional
         Explicit lattice-to-chain mapper.  It is mutually checked against
         ``shape`` by ``MPOBasis``.
