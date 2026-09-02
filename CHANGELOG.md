@@ -14,6 +14,38 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added `pepsy.fitting.TreeFIT`, a tree-native cached variational fitting
+  engine with directed branch environments, canonical-centre path movement,
+  one-/two-/three-node local blocks, seeded randomized warm starts, and
+  normalized target-overlap diagnostics. Its `run`, `run_eff`, and `run_gate`
+  controls follow the chain FIT calling convention; structural retagging and
+  disposable-target ownership are explicit. Correctly tagged layered targets
+  are grouped by structural node, retaining local layer bonds and multiple
+  inter-node bonds; ambiguous or untagged tensors are rejected. The dedicated
+  path two-layer compressor remains available. `TreeOptimizer` and
+  `TreePepsOptimizer` expose it through `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3`.
+
+- Aligned tree DMRG scheduling with MPS FIT: generic DMRG supports an adaptive
+  larger-block warm-up followed by one-site refinement, named `dmrg1`/`dmrg2`
+  use two-node growth before one-site updates, and `dmrg3` uses three-node
+  growth. `guess-src` now builds a disposable TreeMPO/TreePEPO-applied tree
+  guess and feeds that guess to TreeFIT while retaining the exact target
+  separately; diagnostics expose the schedule and warm-start backend.
+
+- Added `sdc` and `src` compression modes to `TreeOptimizer` and
+  `TreePepsOptimizer`. Path-shaped `TreePeps` states delegate to Quimb's
+  environment compressors; branching trees use a deterministic successive
+  edge sweep or dense randomized-SVD edge splits, with `compression_seed` for
+  reproducibility. The modes preserve TreePeps plan/index metadata and reject
+  charge-unsafe randomized compression for native fermionic TTNs.
+
+- Added path `TreePeps` two-layer operator-state compression. With
+  `compression_layout="auto"`, Quimb's multi-tensor `sdc`, `src`, and `zipup`
+  kernels can compress the separate PEPO and state layers directly; the
+  original fused application remains available with
+  `compression_layout="fused"`, while `"two_layer"` requires an explicit
+  path topology.
+
 - Made the MPS SDC surface explicit and regression-tested: bare
   `mode="sdc"` / `mode="sdc-oversample"` aliases normalize to Quimb's
   successive deterministic compressors, and the same methods are available

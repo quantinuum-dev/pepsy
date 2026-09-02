@@ -5,6 +5,7 @@ import pytest
 import quimb as qu
 import quimb.tensor as qtn
 
+from pepsy.fitting import TreeFIT
 from pepsy.optimizers import (
     MpsOptimizer,
     TreePeps,
@@ -72,6 +73,238 @@ def test_chain_compression_matches_mps_svd_when_cap_is_sufficient():
     np.testing.assert_allclose(tree_vector, mps_vector, atol=1e-10, rtol=1e-10)
     assert tree.last_report["truncated"]
     assert tree.validate(check_canonical=True) is tree
+
+
+@pytest.mark.parametrize("compression_mode", ("sdc", "src", "zipup"))
+def test_path_compression_modes_use_seeded_quimb_kernels(compression_mode):
+    """Path TreePeps exposes Quimb's multi-tensor methods safely."""
+
+    plan = _path_plan((1, 6))
+    state = TreePeps.rand(plan, bond_dim=3, seed=19)
+    first = TreePepsOptimizer(
+        state,
+        mode=compression_mode,
+        chi=1,
+        cutoff=0.0,
+        compression_seed=23,
+        track_infidelity=False,
+        run=False,
+    )
+    second = first.copy()
+    first.apply_gate(_cnot(), (0, 5))
+    second.apply_gate(_cnot(), (0, 5))
+
+    assert first.compression_mode == compression_mode
+    assert first.state.max_bond() <= 1
+    assert first.validate(check_canonical=True) is first
+    np.testing.assert_allclose(
+        first.state.to_statevector(), second.state.to_statevector()
+    )
+
+
+@pytest.mark.parametrize("compression_mode", ("sdc", "src", "zipup"))
+def test_path_two_layer_and_fused_operator_application_agree(compression_mode):
+    """Path compression can retain either the MPO-MPS or fused application."""
+
+    plan = _path_plan((1, 5))
+    state = TreePeps.rand(plan, bond_dim=2, seed=31)
+    operator = TreeSubPepo.from_operator(_path_plan((1, 5)), _cnot(), support=(1, 4))
+    expected = np.asarray(operator.to_dense().data).reshape(32, 32) @ state.to_statevector()
+
+    two_layer = TreePepsOptimizer(
+        state,
+        chi=4,
+        cutoff=0.0,
+        compression_mode=compression_mode,
+        compression_seed=29,
+        compression_layout="two_layer",
+        run=False,
+        track_infidelity=False,
+    )
+    fused = two_layer.copy()
+    fused.compression_layout = "fused"
+
+    two_layer.apply(operator)
+    fused.apply(operator)
+
+    np.testing.assert_allclose(two_layer.to_dense(), expected, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(fused.to_dense(), expected, atol=1e-10, rtol=1e-10)
+    assert two_layer.last_report["compression_layout"] == "two_layer"
+    assert fused.last_report["compression_layout"] == "fused"
+    assert two_layer.validate(check_canonical=True) is two_layer
+    assert fused.validate(check_canonical=True) is fused
+
+
+def test_path_two_layer_layout_rejects_branching_tree():
+    """The two-layer Quimb path adapter never silently linearizes a tree."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    state = TreePeps.from_plan(plan)
+    operator = TreePepo.from_operator(plan, _cnot(), support=(0, 4))
+    with pytest.raises(NotImplementedError, match="path TreePeps"):
+        operator.apply_to(
+            state,
+            compress=True,
+            max_bond=2,
+            cutoff=0.0,
+            compression_mode="sdc",
+            compression_layout="two_layer",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "fit_n_iter", "expected_block_size"),
+    (("dmrg1", 3, 2), ("dmrg2", 1, 2), ("dmrg3", 1, 3)),
+)
+def test_tree_peps_dmrg_uses_tree_fit_engine(
+    mode, fit_n_iter, expected_block_size
+):
+    """TreePEPS DMRG modes fit an exact PEPO target with cached environments."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode=mode,
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=fit_n_iter,
+        fit_init_strategy="direct",
+        fit_overlap_diagnostics=True,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["backend"] == "tree_fit"
+    assert diagnostics["block_size"] == expected_block_size
+    assert diagnostics["requested_block_size"] == expected_block_size
+    if mode == "dmrg1":
+        assert diagnostics["block_size_trace"] == (2, 2, 1)
+        assert diagnostics["adaptive_sweeps"] == 2
+        assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert diagnostics["cache"]["hits"] > 0
+    assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+@pytest.mark.parametrize("strategy", ("random", "random_expand"))
+def test_tree_peps_dmrg_random_fit_guess_is_seeded(strategy):
+    """TreePEPS DMRG random guesses remain disposable and reproducible."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    kwargs = dict(
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy=strategy,
+        fit_init_rand_strength=1.0e-4,
+        fit_init_seed=17,
+        track_infidelity=False,
+        run=False,
+    )
+    first = TreePepsOptimizer(TreePeps.from_plan(plan), **kwargs)
+    second = TreePepsOptimizer(TreePeps.from_plan(plan), **kwargs)
+    first.apply_gate(_cnot(), (0, 4))
+    second.apply_gate(_cnot(), (0, 4))
+
+    diagnostics = first.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy"] == strategy
+    assert diagnostics["random_initialization"] is True
+    assert diagnostics["random_initialization_info"]["enabled"] is True
+    np.testing.assert_allclose(first.to_dense(), second.to_dense())
+    assert first.validate(check_canonical=True) is first
+
+
+def test_tree_peps_dmrg_guess_src_uses_tree_pepo_warm_start():
+    """TreePEPS ``guess-src`` applies the disposable operator-state path."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(TreePepsPlan.from_shape((2, 3))),
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="guess-src",
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy"] == "guess_src"
+    assert diagnostics["guess_backend"] == "tree_pepo"
+    assert diagnostics["guess_used"] is True
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_tree_peps_generic_dmrg_warmup_then_refinement():
+    """Generic TreePEPS DMRG uses the MPS-style two-site handoff."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(TreePepsPlan.from_shape((2, 3))),
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=4,
+        fit_adaptive_sweeps=2,
+        fit_init_strategy="guess-src",
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["block_size_trace"] == (2, 2, 1, 1)
+    assert diagnostics["adaptive_sweeps"] == 2
+    assert diagnostics["one_site_refinement_sweeps"] == 2
+
+
+def test_tree_peps_dmrg_fits_explicit_sub_treepepo():
+    """The DMRG backend also handles an already-factorized TreeSubPepo."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    operator = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 4))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        fit_overlap_diagnostics=True,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_sub_treepepo(operator)
+
+    assert optimizer.get_fit_diagnostics()["backend"] == "tree_fit"
+    assert optimizer.get_fit_diagnostics()["local_fidelity"] > 1.0 - 1.0e-10
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_tree_fit_center_motion_validates_once_per_sweep():
+    """TreeFIT avoids a whole-tree validation for every local block update."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    state = TreePeps.from_plan(plan)
+    fit = TreeFIT(state.copy(), state, max_bond=2, cutoffs=0.0)
+    original_validate = fit.p.validate
+    calls = []
+
+    def count_validate(*args, **kwargs):
+        calls.append(kwargs.get("check_canonical", False))
+        return original_validate(*args, **kwargs)
+
+    fit.p.validate = count_validate
+    fit.run_eff(n_iter=2, block_size=2)
+
+    assert calls == [True, True]
 
 
 def test_direct_optimizer_routes_over_the_tree_geodesic_exactly():

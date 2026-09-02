@@ -25,6 +25,57 @@ high-level order in each path: own and validate the target/state, prepare
 effective environments, update the requested sites, then record optional
 fidelity or timing diagnostics.
 
+Tree-shaped states use the companion `pepsy.fitting.TreeFIT` class. It keeps
+the same target/guess ownership model and `run`/`run_eff`/`run_gate` vocabulary,
+but caches a directed overlap environment for every tree edge and moves the
+canonical centre along tree geodesics. Connected one-, two-, and three-node
+local blocks are supported; untouched branch messages survive local updates.
+The tree optimizer wrappers select it with `mode="dmrg"`, `"dmrg1"`, `"dmrg2"`,
+or `"dmrg3"`.
+
+```python
+from pepsy.fitting import TreeFIT
+
+fit = TreeFIT(target_tree, guess_tree, max_bond=chi, cutoffs=1e-12)
+fit.run_gate(
+    active_span,
+    n_iter=4,
+    block_size=2,
+    adaptive_block_sweeps=2,
+    sweep_sequence="RL",
+)
+updated = fit.p
+diagnostics = fit.fit_diagnostics(overlap=True)
+```
+
+TreeFIT keeps the target fixed and does not normalize it. Its optional overlap
+diagnostic is a normalized target overlap; optimizer-level local/cumulative
+compression fidelity remains the canonical norm-survival ledger, accumulated
+in log form so large MPO/TreeMPO scale factors do not overflow or get mistaken
+for discarded weight. `TreeFIT.run()` is the FIT-compatible full-tree
+convenience call and delegates to the cached `TreeFIT.run_eff()` engine;
+`run_gate(region, ...)` remains the active-span entry point used by the
+optimizers. TreeFIT accepts fused targets and correctly tagged layered targets.
+Every target tensor must belong to exactly one structural node group; local
+layer bonds stay within a group, while one or more bonds between groups must
+follow the fitted tree edges. Ambiguous or untagged layer tensors are
+rejected. The separate operator-state two-layer target can still use the
+path-only `TreePeps` `sdc`/`src`/`zipup` compressor.
+
+`adaptive_block_sweeps=2` gives the same warm-up/refinement schedule as the
+MPS FIT engine: two- or three-node updates for the warm-up, followed by
+one-node sweeps. `adaptive_until_rank=True` keeps the larger block until the
+active physical rank ceilings are reached. Tree optimizer `dmrg1` and `dmrg2`
+use two-node warm-up blocks, while `dmrg3` uses three-node blocks; each named
+mode then refines with one-node updates.
+
+`retag=True` aligns structural node tags on the copied target with the fitted
+tree while preserving tensor order and physical/site tags. Layered targets use
+the same structural tags to assign every layer tensor to its node group.
+`copy_target=False`
+is available when an optimizer has created a disposable target and can transfer
+ownership safely.
+
 For circuit compression, set `range_int=(xmin, xmax)` and use:
 
 ```python

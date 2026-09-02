@@ -9,9 +9,36 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ..._internal.quimb import quimb_1d_compression_function
 from .plan import TreePepsPlan
 
 __all__ = ["TreePepo", "TreeSubPepo"]
+
+
+_PATH_TWO_LAYER_COMPRESSION_MODES = frozenset(
+    {"direct", "dm", "sdc", "src", "zipup"}
+)
+_AUTO_TWO_LAYER_COMPRESSION_MODES = frozenset({"sdc", "src", "zipup"})
+
+
+def _normalize_compression_layout(layout):
+    """Normalize how an operator and state are presented to compression."""
+
+    if layout is None:
+        return "auto"
+    layout = str(layout).strip().lower().replace("-", "_")
+    aliases = {
+        "2layer": "two_layer",
+        "two_layers": "two_layer",
+        "two_layered": "two_layer",
+        "fused_layer": "fused",
+    }
+    layout = aliases.get(layout, layout)
+    if layout not in {"auto", "fused", "two_layer"}:
+        raise ValueError(
+            "compression_layout must be 'auto', 'fused', or 'two_layer'."
+        )
+    return layout
 
 
 class TreePepo(qtn.TensorNetworkGenOperator):
@@ -1066,6 +1093,10 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         cutoff=1e-10,
         cutoff_mode="rsum2",
         reduced=True,
+        compression_mode="direct",
+        compression_seed=None,
+        compression_layout="auto",
+        info_c=None,
         _active_sites=None,
     ):
         """Apply this operator and return a valid ``TreePeps`` state.
@@ -1073,11 +1104,15 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         The input physical leg is contracted site-by-site.  At every tree
         edge, the state and operator bonds are then fused into one state bond,
         which prevents the result from becoming a two-graph tensor network.
-        Compression is opt-in and happens only after the complete operator has
-        been applied.
+        Compression is opt-in.  ``compression_layout="fused"`` retains this
+        fused application path.  ``"two_layer"`` passes a path-shaped
+        operator-state network directly to Quimb's 1D compressor, and
+        ``"auto"`` selects that path for Quimb's multi-tensor methods while
+        retaining the fused fallback elsewhere.
         """
 
         from .state import TreePeps
+        from .state import _normalize_compression_mode
 
         if not isinstance(state, TreePeps):
             raise TypeError("TreePepo.apply_to requires a TreePeps state")
@@ -1095,6 +1130,44 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 active_sites = frozenset(state.sites)
             elif not self.operator_span.issubset(active_sites):
                 raise ValueError("active_sites must contain the complete operator span")
+        compression_mode = _normalize_compression_mode(compression_mode)
+        compression_layout = _normalize_compression_layout(compression_layout)
+        if compression_layout == "two_layer":
+            if not state.plan.is_mps_topology:
+                raise NotImplementedError(
+                    "compression_layout='two_layer' requires a path "
+                    "TreePeps topology."
+                )
+            if compression_mode not in _PATH_TWO_LAYER_COMPRESSION_MODES:
+                raise ValueError(
+                    "two-layer path compression requires compression_mode in "
+                    "{'direct', 'dm', 'sdc', 'src', 'zipup'}"
+                )
+        use_two_layer = (
+            (compress or max_bond is not None)
+            and state.plan.is_mps_topology
+            and len(active_sites) > 1
+            and (
+                compression_layout == "two_layer"
+                or (
+                    compression_layout == "auto"
+                    and compression_mode in _AUTO_TWO_LAYER_COMPRESSION_MODES
+                )
+            )
+        )
+        if use_two_layer:
+            return self._apply_to_path_1d(
+                state,
+                active_sites=active_sites,
+                center=center,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                compression_mode=compression_mode,
+                compression_seed=compression_seed,
+                inplace=inplace,
+                info_c=info_c,
+            )
         tensors = []
         for q in state.sites:
             if q not in active_sites:
@@ -1167,10 +1240,177 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 reduced=reduced,
+                compression_mode=compression_mode,
+                compression_seed=compression_seed,
+                info_c=info_c,
             )
         if inplace:
             return _replace_tree_peps(state, result)
         return result
+
+    def _apply_to_path_1d(
+        self,
+        state,
+        *,
+        active_sites,
+        center,
+        max_bond,
+        cutoff,
+        cutoff_mode,
+        compression_mode,
+        compression_seed=None,
+        inplace=False,
+        info_c=None,
+    ):
+        """Apply and compress an operator-state path as one Quimb 1D TN.
+
+        The state and operator tensors retain separate virtual layers.  Their
+        input physical legs are joined with private indices and the operator
+        output legs are renamed to the state's physical indices.  Quimb then
+        sees the standard MPO-MPS layout: multiple tensors grouped by one site
+        tag, with only the state output legs and state boundary bonds open.
+        """
+
+        from .state import TreePeps
+
+        if not isinstance(state, TreePeps):
+            raise TypeError("state must be a TreePeps")
+        if not state.plan.is_mps_topology:
+            raise NotImplementedError(
+                "two-layer Quimb compression requires a path TreePeps topology"
+            )
+        if compression_mode not in _PATH_TWO_LAYER_COMPRESSION_MODES:
+            raise ValueError(
+                "two-layer path compression requires compression_mode in "
+                "{'direct', 'dm', 'sdc', 'src', 'zipup'}"
+            )
+        if cutoff is None:
+            cutoff = 1e-10
+        cutoff = float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative")
+        if max_bond is not None:
+            max_bond = int(max_bond)
+            if max_bond < 1:
+                raise ValueError("max_bond must be at least one")
+        if compression_mode in {"sdc", "src"} and max_bond is None:
+            if not (compression_mode == "sdc" and cutoff == 0.0):
+                raise ValueError(
+                    f"compression_mode={compression_mode!r} requires a finite "
+                    "max_bond/chi"
+                )
+
+        active_sites = frozenset(
+            state.plan.resolve_site(site) for site in active_sites
+        )
+        if not active_sites or not state.plan.is_connected(active_sites):
+            raise ValueError("active_sites must form a connected path region")
+        endpoints = sorted(
+            site
+            for site in active_sites
+            if sum(
+                neighbor in active_sites
+                for neighbor in state.plan.neighbors(site)
+            ) <= 1
+        )
+        if len(endpoints) != 2:
+            raise ValueError(
+                "two-layer path compression requires a non-trivial path region"
+            )
+        order = state.plan.path(endpoints[0], endpoints[1])
+        if set(order) != set(active_sites):
+            raise ValueError("active_sites must be a connected path region")
+
+        tensors = []
+        for site in order:
+            state_tensor = state.node_tensor(site).copy()
+            operator_tensor = self.node_tensor(site).copy()
+            state_physical = state.site_ind(site)
+            input_link = qtn.rand_uuid()
+            # A custom TreePepo may use a different coordinate-tag format.
+            # Add the state's canonical site tag explicitly so both layers
+            # are grouped by the same Quimb 1D site selector.
+            operator_tensor.add_tag(state.site_tag(site))
+            state_tensor.reindex_({state_physical: input_link})
+            operator_tensor.reindex_(
+                {
+                    self.input_ind(site): input_link,
+                    self.output_ind(site): state_physical,
+                }
+            )
+
+            # The selected TreePepo span may have identity operator bonds at
+            # its boundary.  They are not part of the result state and must be
+            # sliced away before the temporary 1D network is compressed.
+            for neighbor in state.plan.neighbors(site):
+                if neighbor in active_sites:
+                    continue
+                operator_bond = self.bond(site, neighbor)
+                if operator_tensor.ind_size(operator_bond) != 1:
+                    raise ValueError(
+                        "a two-layer path application requires operator bonds "
+                        "outside the active span to have dimension one"
+                    )
+                operator_tensor = operator_tensor.isel({operator_bond: 0})
+            tensors.extend((state_tensor, operator_tensor))
+
+        temporary = qtn.TensorNetwork(tensors)
+        temporary.exponent = (
+            float(getattr(state, "exponent", 0.0))
+            + float(getattr(self, "exponent", 0.0))
+        )
+        compressor = quimb_1d_compression_function(compression_mode)
+        if not callable(compressor):
+            raise NotImplementedError(
+                f"Quimb compression method {compression_mode!r} is not "
+                "available in the installed build"
+            )
+        options = {
+            "max_bond": max_bond,
+            "cutoff": cutoff,
+            "site_tags": [state.site_tag(site) for site in order],
+            "permute_arrays": False,
+            "canonize": True,
+            "inplace": False,
+        }
+        if compression_mode in {"direct", "dm", "sdc", "zipup"}:
+            options["cutoff_mode"] = cutoff_mode
+        if compression_mode == "src" and compression_seed is not None:
+            options["seed"] = int(compression_seed)
+        result = compressor(temporary, **options)
+
+        work = state if inplace else state.copy()
+        for site in order:
+            tag = state.site_tag(site)
+            tids = tuple(result.tag_map[tag])
+            if len(tids) != 1:
+                raise ValueError(
+                    f"path compressor did not preserve one tensor for site {site}"
+                )
+            compressed = result.tensor_map[tids[0]]
+            work.node_tensor(site).modify(
+                data=compressed.data,
+                inds=compressed.inds,
+                tags=work.node_tensor(site).tags,
+                left_inds=compressed.left_inds,
+            )
+        work.exponent = getattr(result, "exponent", temporary.exponent)
+        work._canonical_region = None
+        if center is None:
+            center = state.orthogonality_center
+            if center is None:
+                center = state.plan.root
+        center = state.plan.resolve_site(center)
+        work.canonize_to(
+            center,
+            inplace=True,
+            info_c=info_c,
+            _force_full=True,
+        )
+        work.validate(check_canonical=True)
+        if inplace:
+            return work
+        return work
 
     def expectation(self, state, *, normalized=True, **apply_opts):
         """Evaluate ``<state|self|state>`` through the application boundary."""

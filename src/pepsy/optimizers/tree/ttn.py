@@ -65,15 +65,27 @@ def _normalize_compression_mode(mode):
         "densitymatrix": "dm",
     }
     mode = aliases.get(mode, mode)
-    if mode not in {"direct", "dm"}:
-        raise ValueError("compression_mode must be 'direct' or 'dm'.")
+    if mode not in {"direct", "dm", "sdc", "src"}:
+        raise ValueError(
+            "compression_mode must be 'direct', 'dm', 'sdc', or 'src'."
+        )
     return mode
 
 
 def _compression_method(mode):
     """Return the dense Quimb split method for a compression mode."""
 
-    return "svd:eig" if _normalize_compression_mode(mode) == "dm" else "svd"
+    mode = _normalize_compression_mode(mode)
+    if mode == "dm":
+        return "svd:eig"
+    if mode == "src":
+        # A general tree cannot use Quimb's chain-only SRC environment sweep,
+        # but its local truncations can safely use the same randomized-SVD
+        # sketch. ``TreeOptimizer`` applies this successively over tree edges.
+        return "svd:rand"
+    # ``direct`` and ``sdc`` both use the tree-native successive edge sweep.
+    # The latter is the deterministic tree analogue of Quimb's 1D SDC.
+    return "svd"
 
 
 def _native_rank_safe_qr(array, backend):
@@ -2158,6 +2170,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         absorb="right",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
         _reduction_proven=False,
     ):
         """Compress the tree edge ``a -> b`` in place.
@@ -2179,14 +2192,23 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for the two-sided reduced path.
         ``compression_mode="direct"`` uses the standard SVD, while
         ``compression_mode="dm"`` uses Quimb's density-matrix-equivalent
-        ``svd:eig`` decomposition on the local canonical core. The latter is
-        currently available for dense trees only.
+        ``svd:eig`` decomposition on the local canonical core. ``"sdc"``
+        selects the deterministic successive tree-edge sweep and ``"src"``
+        selects a successive randomized-SVD tree sweep. These tree modes are
+        distinct from Quimb's chain-only environment compressors; a full
+        Cholesky projected tree compressor remains a separate future method.
         """
         compression_mode = _normalize_compression_mode(compression_mode)
         if compression_mode == "dm" and self.fermionic:
             raise NotImplementedError(
                 "compression_mode='dm' is currently available for dense "
                 "tree tensors only; use compression_mode='direct' for "
+                "native fermionic trees."
+            )
+        if compression_mode == "src" and self.fermionic:
+            raise NotImplementedError(
+                "compression_mode='src' is currently available for dense "
+                "tree tensors only; randomized SVD is not charge-safe for "
                 "native fermionic trees."
             )
 
@@ -2222,6 +2244,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 absorb=absorb,
                 reduced=reduced,
                 method=_compression_method(compression_mode),
+                **(
+                    {"seed": int(compression_seed)}
+                    if compression_mode == "src" and compression_seed is not None
+                    else {}
+                ),
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
@@ -2236,6 +2263,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         center=None,
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
     ):
         """Compress the complete tree with a centre-oriented SVD sweep.
 
@@ -2267,6 +2295,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             when no centre is known.
         reduced : bool, optional
             Use the reduced two-sided edge compression path where available.
+        compression_mode : {"direct", "dm", "sdc", "src"}, optional
+            Dense tree-edge decomposition. ``"sdc"`` uses the deterministic
+            successive tree sweep and ``"src"`` uses randomized SVD per edge.
+        compression_seed : int, optional
+            Seed for ``compression_mode="src"``.
 
         Returns
         -------
@@ -2313,6 +2346,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 absorb="right",
                 reduced=reduced,
                 compression_mode=compression_mode,
+                compression_seed=compression_seed,
             )
 
         # ``compress_edge_`` conservatively clears the global centre when the
@@ -2432,7 +2466,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._canonical_region = frozenset({target})
         return self
 
-    def shift_orthogonality_center(self, new, *, absorb="right"):
+    def shift_orthogonality_center(
+        self, new, *, absorb="right", _skip_validate=False,
+    ):
         """Move the tracked orthogonality centre to node ``new`` in place.
 
         The tree analogue of :meth:`quimb.tensor.MatrixProductState.shift_orthogonality_center`:
@@ -2447,7 +2483,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
           once to the O(N) :meth:`canonize_around_node_`.
 
         Returns ``self`` so moves can be chained.
+
+        ``_skip_validate`` is an internal hot-path control for local fitting
+        engines that validate once after a complete sweep. The default keeps
+        the historical validation behavior of this state class.
         """
+        del _skip_validate  # TreeTensorNetwork does not validate per movement.
         if new not in self._plan.children:
             raise ValueError(f"{new!r} is not a node of the tree.")
         cur = self.orthogonality_center

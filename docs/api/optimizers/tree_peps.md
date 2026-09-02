@@ -144,10 +144,27 @@ updated = gate.apply_to(state, compress=True, max_bond=8)
 value = gate.expectation(state)
 ```
 
+For an explicit path-method selection, the same call can retain both layers
+until Quimb compresses them:
+
+```python
+updated = gate.apply_to(
+    state,
+    compress=True,
+    compression_mode="zipup",
+    compression_layout="two_layer",
+    max_bond=8,
+)
+```
+
 `TreePepo` is a generic tree operator with separate input/output physical
-legs. `TreeSubPepo` records the physical support and its connected tree span;
-applying it fuses operator bonds into the state tree before optional
-canonical compression. The full design and the future
+legs. `TreeSubPepo` records the physical support and its connected tree span.
+The default `compression_layout="auto"` preserves the fused operator/state
+application for ordinary and branching updates, while path updates using
+Quimb's multi-tensor methods can retain the separate operator and state
+layers until compression. Use `compression_layout="fused"` to force the
+original fused path, or `"two_layer"` to require the path-only MPO-MPS-style
+path. The full design and the future
 `TreePepsStabOptimizer` interface are documented in the development plan.
 
 `TreePepsOptimizer` owns a state copy by default and supports the two update
@@ -202,11 +219,66 @@ the replacement is installed. By default the replacement is copied; use
 Compression is selected independently from the operator route with
 `compression_mode="direct"` (the default SVD decomposition) or
 `compression_mode="dm"` (Quimb's density-matrix-equivalent `svd:eig`
-decomposition of the local fused compression core). In either case the state
-is canonicalized around the active span first, the PEPO is fused locally with
-the state, and only then are the combined tree bonds truncated. No global
+decomposition of the local fused compression core). `compression_mode="zipup"`
+is also available for path operator-state compression. In fused mode the
+state is canonicalized around the active span first, the PEPO is fused locally
+with the state, and only then are the combined tree bonds truncated. In
+two-layer mode, the state and PEPO tensors are grouped by the same site tags
+and passed to Quimb's 1D compressor as an MPO-MPS-like network. No global
 dense lattice state is formed. For convenience, `mode="dm"` is accepted as a
 shorthand for direct TreePepo routing with `compression_mode="dm"`.
+
+`mode="sdc"`, `mode="src"`, and `mode="zipup"` are also accepted shorthands
+for direct TreePepo routing with the corresponding compression mode. On an
+explicit path topology, `compression_layout="auto"` uses Quimb's actual 1D
+SDC/SRC/ZipUp kernels with the separate operator and state layers, then
+restores the TreePeps plan, tags, exponent, and canonical metadata. On a
+branching topology, `sdc` uses the tree's deterministic successive edge sweep
+and `src` uses randomized SVD per edge; neither silently invokes a chain-only
+environment algorithm, while `zipup` is path-only. Truncating path `sdc`/`src`
+requires finite `chi`/`max_bond` (`sdc` with zero cutoff may still be used as a
+lossless canonicalization), and `compression_seed=...` makes randomized
+results reproducible. The paper's full projected Cholesky (CBC) tree
+compressor is not represented by these aliases and remains a separate future
+method.
+
+### TreePEPS FIT / DMRG
+
+`TreePepsOptimizer` also exposes the tree-native `TreeFIT` engine through
+`mode="dmrg"` and the `dmrg1`/`dmrg2`/`dmrg3` aliases. The exact fused
+operator-state target is built on a disposable copy, then fitted on the
+active connected tree span with cached directed branch environments:
+
+```python
+optimizer = TreePepsOptimizer(
+    state,
+    mode="dmrg2",
+    chi=16,
+    fit_n_iter=3,
+    fit_init_strategy="guess-src",
+)
+optimizer.apply_gate(gate, where=(0, 5))
+report = optimizer.get_fit_diagnostics()
+```
+
+Generic `dmrg` uses `fit_block_size=2` and its configured adaptive warm-up.
+`dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
+three-node warm-up blocks; all named modes then refine with one-node sweeps.
+The remaining controls are `fit_adaptive_sweeps`, `fit_min_iter`, `fit_rtol`,
+`fit_patience`, `fit_sweep_sequence`,
+`fit_init_rand_strength`, and `fit_init_seed`. Initial guesses may be
+`"direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-dm"`, `"random"`, or
+`"random_expand"`; random policies are disposable, seeded, and active-span
+only. `get_fit_diagnostics()` reports the cache hit/miss counts, block size,
+convergence, and optional normalized target overlap when
+`fit_overlap_diagnostics=True`.
+
+This DMRG path currently builds the exact TreePEPO/TreeMPO target as a fused
+TreeFIT target. TreeFIT also accepts a correctly tagged layered target when
+each layer tensor belongs to exactly one structural node group; local layer
+bonds remain inside that group and inter-group bonds must follow the tree.
+The separate two-layer operator-state path remains available for the direct
+`sdc`/`src`/`zipup` compressors above when that Quimb path is desired.
 
 ## TreeTensorNetwork API parity
 

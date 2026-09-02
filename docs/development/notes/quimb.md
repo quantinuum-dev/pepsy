@@ -96,3 +96,45 @@ to the user gate, never to internal routing SWAPs.
   164 passed and 1 skipped, with Ruff clean. Generalized-loop options are now
   capability-checked with a focused error on older Quimb signatures. The full
   headless suite passed with 3100 passed and 39 skipped.
+
+## 2026-09-02 tree SDC/SRC audit
+
+- The installed Quimb build is `1.15.1.dev39+g369d09b9d`. Its concrete 1D
+  compressors expose both `sdc` and seeded `src`, while the arbitrary-geometry
+  compressor does not expose either environment algorithm.
+- `TreePeps` path operator application now adapts the separate PEPO and state
+  layers into a plain temporary `TensorNetwork` with shared site tags, then
+  reinstalls Quimb's one-tensor-per-site result into the geometry-owning
+  wrapper. `compression_layout="fused"` retains the earlier fused path.
+  Branching `TreePeps` and `TreeOptimizer` retain their native tree sweep;
+  `src` uses only the local dense `svd:rand` split there.
+- This is an API/dispatch integration, not a generalized implementation of
+  the paper's CBC algorithm. CBC needs projected Cholesky environments and a
+  distinct leaves-to-root / root-to-leaves precomputation, so it remains an
+  explicit future compression method rather than an alias.
+
+## 2026-09-02 TreeFIT environment-cache audit
+
+- Installed versions probed in the active Pepsy environment: Quimb
+  `1.15.1.dev39+g369d09b9d`, Autoray `0.11.1.dev1+gc56f64427`, Cotengra
+  `0.8.3.dev6+g08fe1a3a1`, and Symmray `0.3.2.dev6+ga17699db6`.
+- API probes confirmed `TensorNetwork.contract(..., output_inds=...,
+  strip_exponent=...)`, `TensorNetwork.norm(..., strip_exponent=...)`, and
+  `tensor_split(..., method=..., cutoff_mode=..., bond_ind=...)` are available.
+  The installed `quimb.tensor.tn1d.compress` exposes concrete `sdc`, `src`,
+  `fit`, and `zipup` functions with explicit `seed` support where applicable.
+- Decision: adopt Quimb's stripped-exponent and concrete 1D compressor surfaces
+  for their existing MPS/TreePeps path integrations; defer applying a 1D
+  compressor to arbitrary trees. TreeFIT keeps its own directed branch
+  messages because a branching tree has no single 1D sweep boundary.
+- TreeFIT was checked against fresh direct contractions for one-, two-, and
+  three-node effective blocks and every directed message. Cache invalidation
+  was checked after both local tensor updates and orthogonality-centre path
+  movement, including effective blocks that depend on a changed exterior
+  branch message. Fused and correctly tagged layered targets were checked,
+  including multiple target bonds across one tree edge and stripped exponents.
+- Focused validation after the cache fix: `499 passed, 4 skipped` across the
+  Tree/TreePeps suites; `217 passed` public API/MPS FIT checks; Ruff,
+  compilation, and `git diff --check` clean. A full-suite attempt remains
+  subject to the repository's known macOS Matplotlib `_macosx` abort in an
+  unrelated Hamiltonian drawing test; the isolated headless test passes.

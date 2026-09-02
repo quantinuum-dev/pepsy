@@ -592,6 +592,74 @@ The combined `tree_mpo_direct` and `tree_mpo_dm` names select both the true
 TreeMPO route and its compression method, so a conflicting explicit
 `compression_mode` is rejected.
 
+`compression_mode="sdc"` selects the deterministic successive tree-edge
+sweep already used by the tree canonical-compression machinery. It is the
+tree-safe analogue of Quimb's 1D SDC environment compressor, not a claim that
+the chain algorithm has been applied to a branching tree. `compression_mode="src"`
+selects a successive randomized-SVD split on each dense tree edge and accepts
+`compression_seed=...` for reproducible sketches. Native fermionic trees reject
+`src` because an ungraded randomized sketch cannot preserve Symmray charge
+sectors. These modes expose safe tree behavior; they do not yet implement the
+paper's full projected Cholesky (CBC) precomputation for general TTNs.
+
+### Tree-native FIT / DMRG
+
+`pepsy.fitting.TreeFIT` is the cached local variational fitting kernel for a
+`TreeTensorNetwork`. It has the same separation of target, disposable initial
+guess, bounded local updates, ownership controls, and diagnostics as
+`pepsy.FIT`, but replaces the chain's left/right environments with one cached
+directed overlap message for each tree edge:
+
+```python
+from pepsy.fitting import TreeFIT
+
+fit = TreeFIT(target, guess, max_bond=32, cutoffs=1e-12)
+fit.run_gate(
+    active_nodes,
+    n_iter=4,
+    block_size=2,       # 1, 2, or 3 connected tree nodes
+    sweep_sequence="RL",
+)
+updated = fit.p
+report = fit.fit_diagnostics(overlap=True)
+```
+
+Before each local solve, the kernel moves the orthogonality centre along the
+unique tree path. Only messages whose branch intersects a changed local block
+or centre path are invalidated, so untouched branches retain their cached
+entanglement environments. `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
+engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
+`dmrg` uses `fit_block_size` (two by default) and its configured adaptive
+warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
+three-node warm-up blocks; all named modes then refine with one-node sweeps.
+
+The optimizer options `fit_n_iter`, `fit_adaptive_sweeps`, `fit_min_iter`, `fit_rtol`,
+`fit_patience`, `fit_sweep_sequence`, `fit_init_strategy`,
+`fit_init_rand_strength`, and `fit_init_seed` are forwarded to TreeFIT.
+`fit_init_strategy="direct"` keeps the current state as the initial guess;
+`"guess-src"`, `"guess-sdc"`, and `"guess-dm"` use a disposable compressed
+warm start; `"random"` perturbs only active tensors and `"random_expand"`
+also grows active bonds towards the exact target rank, capped by `chi`.
+Randomized guesses remain deterministic for a fixed seed. Dense TreeFIT
+updates preserve canonical metadata and the represented exponent; no implicit
+normalization is performed on a non-unitary target.
+
+TreeFIT accepts `retag=True` for structural node-tag alignment and
+`copy_target=False` for an explicitly disposable target. Its target may be a
+fused tree network or a correctly tagged layered tree network. Every target
+tensor must belong to exactly one structural node group; local layer bonds
+stay inside a group, and one or more inter-group bonds must follow the fitted
+tree edges. Ambiguous or untagged layer tensors are rejected rather than
+dropped. The separate two-layer path compressor remains the `TreePeps`
+`sdc`/`src`/`zipup` route when that direct Quimb path is desired.
+
+TreeFIT's opt-in `overlap=True` diagnostic is the normalized directional
+overlap with its fixed target. It is distinct from the optimizer's
+`norm_diagnostics()` local and cumulative retained-norm proxy, which is
+computed from canonical-centre norm ratios and stored in logarithmic form to
+avoid underflow. Thus an MPO/TreeMPO identity normalization scale is not
+silently treated as compression fidelity.
+
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
 Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
 once from the live state dtype: `1e-6` for 32-bit data and `1e-12` for 64-bit
@@ -671,9 +739,10 @@ textual MPS gate aliases are not normalized by the tree gate parser. Native
 fermionic trajectories may use native gates/MPOs, but Pauli/control events
 require a model-native observable or projector.
 
-MPS execution modes such as `svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`, and
-`mix` are chain algorithms and are intentionally not copied into
-`TreeOptimizer`. Tree layout is part of the TTN geometry and is selected with
+MPS execution modes such as `svd`, `mpo`, `swap`, `perm`, `su`, and `mix` are
+chain algorithms and are intentionally not copied into `TreeOptimizer`.
+Tree-native `dmrg`/`dmrg1`/`dmrg2`/`dmrg3` are provided by `TreeFIT` instead.
+Tree layout is part of the TTN geometry and is selected with
 `tree=`/`layout=` at construction. `TreeStabOptimizer` uses
 `tree_mpo_direct` or `tree_mpo_dm` for its numerical coefficient updates,
 delegating the active-span TreeMPO contraction to this class while keeping

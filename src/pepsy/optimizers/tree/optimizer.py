@@ -50,6 +50,8 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...fitting import TreeFIT
+from ...fitting.tree import _randomize_tree_guess
 from ...backends import (
     backend_infer,
     backend_signatures_compatible,
@@ -409,7 +411,7 @@ class TreeOptimizer:
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
         convention, ``"rsum2"``. Use ``"rel"`` for a relative
         largest-singular-value threshold.
-    mode : {"auto", "direct", "dm", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
+    mode : {"auto", "direct", "dm", "sdc", "src", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
         Gate/operator route and state-compression method. ``"direct"`` uses
         dense local factorization and the specialised gate-SVD/QR path;
         ``"dm"`` is its density-matrix-compression shorthand. These dense
@@ -422,13 +424,21 @@ class TreeOptimizer:
         already made of explicit chain-MPO entries. ``"mpo"`` remains the
         legacy two-site chain-MPO factorization mode. Explicit sub-MPO
         entries are accepted in the other legacy modes for compatibility.
+        ``"sdc"`` and ``"src"`` are shorthands for automatic routing with
+        deterministic or randomized successive tree-edge compression.
+        ``"dmrg"`` and ``"dmrg1"``/``"dmrg2"``/``"dmrg3"`` select the
+        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` and
+        ``dmrg2`` use two-node warm-up blocks, ``dmrg3`` uses three-node
+        warm-up blocks, and all named modes refine with one-node sweeps.
         Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
         ``"tree_mpo_dem"`` and ``"tree_mpo"`` compatibility spellings.
-    compression_mode : {"direct", "dm"}
+    compression_mode : {"direct", "dm", "sdc", "src"}
         Decomposition used when truncating the already fused state/operator
         network. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
         density-matrix-equivalent ``svd:eig`` decomposition on the local
-        canonical compression core. This does not build a global dense state.
+        canonical compression core; ``"sdc"`` uses the deterministic
+        successive tree sweep and ``"src"`` uses randomized SVD per dense
+        tree edge. These modes do not build a global dense state.
     structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
     max_arity : int, None, or iterable of ints
@@ -499,6 +509,17 @@ class TreeOptimizer:
         its norm-based progress readout. This is enabled by default for
         compatibility with direct TreeOptimizer use, but can be disabled for
         non-unitary transfer-operator streams where norm changes are physical.
+    compression_seed : int, optional
+        Seed forwarded to randomized tree-edge compression when
+        ``compression_mode='src'``. It is ignored by deterministic modes.
+    fit_block_size : {1, 2, 3}, default=2
+        Generic ``dmrg`` local block size. Named aliases select their own
+        warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
+    fit_n_iter : int, default=2
+        Number of TreeFIT sweeps per fitted gate window.
+    fit_adaptive_sweeps : int, default=2
+        Number of larger-block warm-up sweeps for generic ``dmrg``. Named
+        ``dmrg1`` uses two warm-up sweeps, matching MpsOptimizer.
     max_intermediate_bond : int, optional
         Conservative preflight limit for the untruncated crossing-bond bound.
         When set, eager replay raises :class:`MemoryError` before tensor work if
@@ -566,13 +587,18 @@ class TreeOptimizer:
             "tree_mpo_eig": "tree_mpo_dm",
         }
         mode = aliases.get(mode, mode)
+        if mode == "fit":
+            mode = "dmrg"
+        if mode in {"dmrg", "dmrg1", "dmrg2", "dmrg3"}:
+            return mode
         if mode not in {
-            "auto", "direct", "dm", "mpo", "submpo",
+            "auto", "direct", "dm", "sdc", "src", "mpo", "submpo",
             "tree_mpo_direct", "tree_mpo_dm",
         }:
             raise ValueError(
-                "mode must be one of 'auto', 'direct', 'dm', 'mpo', "
-                "'submpo', 'tree_mpo_direct', or 'tree_mpo_dm'."
+                "mode must be one of 'auto', 'direct', 'dm', 'sdc', 'src', 'mpo', "
+                "'submpo', 'dmrg', 'dmrg1', 'dmrg2', 'dmrg3', "
+                "'tree_mpo_direct', or 'tree_mpo_dm'."
             )
         return mode
 
@@ -657,6 +683,12 @@ class TreeOptimizer:
                  cutoff=_DEFAULT_CUTOFF,
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
                  compression_mode="direct",
+                 compression_seed=None,
+                 fit_block_size=2, fit_n_iter=2, fit_adaptive_sweeps=2,
+                 fit_min_iter=None, fit_rtol=None, fit_patience=1,
+                 fit_init_strategy="guess-src",
+                 fit_init_rand_strength=0.0, fit_init_seed=0,
+                 fit_sweep_sequence="RL", fit_overlap_diagnostics=False,
                  two_site_mode=None,
                  structure="quality", max_arity=2,
                  top_arity=_DEFAULT_TOP_ARITY,
@@ -822,13 +854,13 @@ class TreeOptimizer:
 
         compression_mode = self._normalize_compression_mode(compression_mode)
         raw_mode = self._normalize_mode(mode)
-        if raw_mode == "dm":
-            if compression_mode not in {"direct", "dm"}:
+        if raw_mode in {"dm", "sdc", "src"}:
+            if compression_mode not in {"direct", raw_mode}:
                 raise ValueError(
-                    "mode='dm' cannot be combined with a different "
-                    "compression_mode."
+                    f"mode={raw_mode!r} cannot be combined with a "
+                    "different compression_mode."
                 )
-            compression_mode = "dm"
+            compression_mode = raw_mode
             raw_mode = "auto"
         compression_mode = self._compression_for_mode(
             raw_mode, compression_mode
@@ -838,7 +870,54 @@ class TreeOptimizer:
         self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
         self.mode = self._normalize_mode(raw_mode)
+        self._dmrg_mode_alias = (
+            self.mode if self.mode in {"dmrg1", "dmrg2", "dmrg3"} else None
+        )
+        if self.mode in {"dmrg1", "dmrg2", "dmrg3"}:
+            self.mode = "dmrg"
         self.compression_mode = compression_mode
+        if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {1, 2, 3}:
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        self.fit_block_size = int(fit_block_size)
+        if not isinstance(fit_n_iter, Integral) or int(fit_n_iter) < 1:
+            raise ValueError("fit_n_iter must be a positive integer.")
+        self.fit_n_iter = int(fit_n_iter)
+        if (
+            not isinstance(fit_adaptive_sweeps, Integral)
+            or int(fit_adaptive_sweeps) < 1
+        ):
+            raise ValueError("fit_adaptive_sweeps must be a positive integer.")
+        self.fit_adaptive_sweeps = int(fit_adaptive_sweeps)
+        self.fit_min_iter = fit_min_iter
+        self.fit_rtol = fit_rtol
+        if not isinstance(fit_patience, Integral) or int(fit_patience) < 1:
+            raise ValueError("fit_patience must be a positive integer.")
+        self.fit_patience = int(fit_patience)
+        self.fit_init_strategy = str(fit_init_strategy).strip().lower().replace("-", "_")
+        self.fit_init_rand_strength = float(fit_init_rand_strength)
+        if (
+            not np.isfinite(self.fit_init_rand_strength)
+            or self.fit_init_rand_strength < 0.0
+        ):
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            )
+        if isinstance(fit_init_seed, bool) or not isinstance(fit_init_seed, Integral):
+            raise TypeError("fit_init_seed must be an integer.")
+        self.fit_init_seed = int(fit_init_seed)
+        self.fit_sweep_sequence = fit_sweep_sequence
+        self.fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        self.fit_diagnostics = []
+        self._last_fit_diagnostics = None
+        if compression_seed is not None:
+            if isinstance(compression_seed, bool) or not isinstance(
+                compression_seed, Integral
+            ):
+                raise TypeError("compression_seed must be an integer or None.")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError("compression_seed must be non-negative.")
+        self.compression_seed = compression_seed
         if two_site_mode is not None:
             legacy_mode = self._normalize_mode(two_site_mode)
             if self.mode != "auto" and self.mode != legacy_mode:
@@ -2050,6 +2129,18 @@ class TreeOptimizer:
             cutoff_mode=self.cutoff_mode,
             mode=self.mode,
             compression_mode=self.compression_mode,
+            compression_seed=self.compression_seed,
+            fit_block_size=self.fit_block_size,
+            fit_n_iter=self.fit_n_iter,
+            fit_adaptive_sweeps=self.fit_adaptive_sweeps,
+            fit_min_iter=self.fit_min_iter,
+            fit_rtol=self.fit_rtol,
+            fit_patience=self.fit_patience,
+            fit_init_strategy=self.fit_init_strategy,
+            fit_init_rand_strength=self.fit_init_rand_strength,
+            fit_init_seed=self.fit_init_seed,
+            fit_sweep_sequence=self.fit_sweep_sequence,
+            fit_overlap_diagnostics=self.fit_overlap_diagnostics,
             structure=self.structure,
             max_arity=self.max_arity,
             top_arity=self.top_arity,
@@ -2802,6 +2893,7 @@ class TreeOptimizer:
             "cumulative_relative_discarded_weight": cumulative_loss,
             "max_edge_discarded_weight": max_edge_loss,
             "max_edge_discarded_fraction": max_edge_fraction,
+            "fit_diagnostics": deepcopy(active.get("fit_diagnostics")),
             **bond_record,
         })
         if self.profile:
@@ -2891,11 +2983,253 @@ class TreeOptimizer:
                 "gate, or supply an explicit TreeMPO event."
             )
 
+    def _fit_block_size(self):
+        """Resolve a named DMRG mode to its requested warm-up block size."""
+
+        if self._dmrg_mode_alias is not None:
+            # DMRG1 is the MPS-compatible one-site algorithm with a bounded
+            # two-site growth warm-up. DMRG2/3 retain their requested larger
+            # local blocks before the common one-site refinement phase.
+            return {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3}[self._dmrg_mode_alias]
+        return self.fit_block_size
+
+    @staticmethod
+    def _normalize_fit_init_strategy(strategy):
+        """Normalize a TreeFIT disposable initial-guess policy."""
+
+        strategy = str(strategy).strip().lower().replace("-", "_")
+        if strategy == "auto":
+            strategy = "guess_src"
+        if strategy in {"direct", "random", "random_expand"}:
+            return strategy
+        if strategy.startswith("guess_") and strategy[6:] in {
+            "direct", "dm", "sdc", "src"
+        }:
+            return strategy
+        raise ValueError(
+            "fit_init_strategy must be one of 'auto', 'direct', 'random', "
+            "'random_expand', or 'guess-<method>'."
+        )
+
+    def _tree_fit_initial_guess(self, target, region, *, operator=None):
+        """Build a disposable TreeFIT guess without replacing the target.
+
+        For a TreeMPO-backed gate, ``guess-src`` follows the requested
+        ``sub_treempo @ tree`` route: the operator is applied to a private
+        copy of the current tree and compressed with the tree-native SRC
+        edge sweep. The exact target is kept separate and is never reused as
+        the FIT initial state.
+        """
+
+        strategy = self._normalize_fit_init_strategy(self.fit_init_strategy)
+        if strategy in {"random", "random_expand"}:
+            guess, random_info = _randomize_tree_guess(
+                self.tn,
+                region,
+                target=target,
+                max_bond=self.chi,
+                strength=self.fit_init_rand_strength,
+                expand=strategy == "random_expand",
+                seed=self.fit_init_seed,
+            )
+            return guess, strategy, random_info
+        if strategy == "direct" or strategy == "guess_direct":
+            return self.tn.copy(), strategy, None
+        method = strategy[6:]
+        if operator is not None:
+            guess_optimizer = self.copy()
+            guess_optimizer.mode = "auto"
+            guess_optimizer._dmrg_mode_alias = None
+            guess_optimizer.compression_mode = method
+            guess_optimizer.chi = self.chi
+            guess_optimizer.cutoff = self.cutoff
+            guess_optimizer.track_infidelity = False
+            guess_optimizer.track_truncation = False
+            guess_optimizer._norm_tracking_enabled = False
+            # ``fit_init_seed`` owns the disposable FIT warm start. Keep it
+            # separate from ``compression_seed``, which controls ordinary
+            # live-state tree compression.
+            guess_optimizer.compression_seed = self.fit_init_seed
+            guess_optimizer.apply_subtreempo(
+                operator,
+                getattr(operator, "operator_support", None),
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                track_norm=False,
+                _validate_backend=False,
+            )
+            return guess_optimizer.tn, strategy, None, "tree_mpo"
+        guess = target.copy()
+        guess.compress(
+            max_bond=self.chi,
+            cutoff=self.cutoff,
+            cutoff_mode=self.cutoff_mode,
+            compression_mode=method,
+            compression_seed=self.fit_init_seed,
+        )
+        return guess, strategy, None, "target_compress"
+
+    def _build_tree_fit_target(self, gate, logical_where):
+        """Apply a gate exactly through a disposable TreeMPO target."""
+
+        from .operators import TreeMPO
+
+        gate = self._as_state_backend(gate)
+        tree_mpo = TreeMPO.from_gate(
+            self.plan,
+            gate,
+            logical_where,
+            fermionic=bool(getattr(self.tn, "fermionic", False)),
+            symmetry=getattr(self.tn, "symmetry", None),
+            dtype=self.backend_dtype,
+        )
+
+        trial = self.copy()
+        trial.mode = "auto"
+        trial._dmrg_mode_alias = None
+        trial.chi = None
+        trial.cutoff = 0.0
+        trial.track_infidelity = False
+        trial.track_truncation = False
+        trial._norm_tracking_enabled = False
+        trial.apply_subtreempo(
+            tree_mpo,
+            tree_mpo.operator_support,
+            max_bond=None,
+            cutoff=0.0,
+            track_norm=False,
+            _validate_backend=False,
+        )
+        return trial.tn, tree_mpo
+
+    def _run_tree_fit(self, target, region, support, *, operator=None):
+        """Fit one exact tree target and install it atomically."""
+
+        guess_result = self._tree_fit_initial_guess(
+            target,
+            region,
+            operator=operator,
+        )
+        if len(guess_result) == 3:
+            guess, strategy, random_info = guess_result
+            guess_backend = None
+        else:
+            guess, strategy, random_info, guess_backend = guess_result
+        split_method = "direct" if self.compression_mode == "sdc" else self.compression_mode
+        block_size = self._fit_block_size()
+        fit = TreeFIT(
+            target,
+            guess,
+            max_bond=self.chi,
+            cutoffs=self.cutoff,
+            cutoff_mode=self.cutoff_mode,
+            split_method=split_method,
+            split_seed=(
+                self.compression_seed
+                if self.compression_seed is not None else self.fit_init_seed
+            ),
+            inplace=True,
+        )
+        active_block_size = min(block_size, len(region))
+        if (
+            self._dmrg_mode_alias == "dmrg1"
+            and block_size == 2
+            and fit._active_bonds_at_rank_targets(region, state=self.tn)
+        ):
+            active_block_size = 1
+        if (
+            self._dmrg_mode_alias == "dmrg1"
+            and active_block_size == 2
+            and len(region) > 2
+            and not fit._active_bonds_at_rank_targets(region, state=self.tn)
+            and self.fit_n_iter < 3
+        ):
+            raise ValueError(
+                "mode='dmrg1' requires fit_n_iter >= 3 for an under-capacity "
+                "tree window: two block-growth sweeps and one-site refinement."
+            )
+        adaptive_sweeps = (
+            2 if self._dmrg_mode_alias == "dmrg1"
+            else self.fit_adaptive_sweeps
+        )
+        fit.run_gate(
+            region,
+            n_iter=self.fit_n_iter,
+            block_size=active_block_size,
+            sweep_sequence=self.fit_sweep_sequence,
+            min_iter=self.fit_min_iter,
+            rtol=self.fit_rtol,
+            patience=self.fit_patience,
+            adaptive_block_sweeps=adaptive_sweeps,
+            adaptive_until_rank=(
+                self._dmrg_mode_alias is None
+                and not (
+                    active_block_size in {2, 3}
+                    and len(region) > active_block_size
+                )
+            ),
+        )
+        diagnostics = fit.fit_diagnostics(overlap=self.fit_overlap_diagnostics)
+        diagnostics.update(
+            {
+                "backend": "tree_fit",
+                "support": tuple(support),
+                "region": tuple(sorted(region)),
+                "fit_init_strategy": strategy,
+                "fit_init_strategy_requested": self.fit_init_strategy,
+                "guess_used": strategy != "direct",
+                "guess_method": (
+                    strategy[6:] if strategy.startswith("guess_") else strategy
+                ),
+                "random_initialization": bool(
+                    random_info and random_info["enabled"]
+                ),
+                "random_initialization_info": random_info,
+                "block_size": active_block_size,
+                "requested_block_size": block_size,
+                "adaptive_sweeps": fit.adaptive_sweeps_run,
+                "one_site_refinement_sweeps": fit.one_site_sweeps_run,
+                "block_size_trace": tuple(fit.block_size_trace),
+                "guess_backend": guess_backend,
+                "target_layout": "fused",
+            }
+        )
+        self.tn = fit.p
+        self._invalidate_state_norm_cache()
+        self.plan = self.tn.plan
+        self._last_fit_diagnostics = diagnostics
+        self.fit_diagnostics.append(deepcopy(diagnostics))
+        if self._active_update is not None:
+            self._active_update["fit_diagnostics"] = deepcopy(diagnostics)
+            self._record_transient_bond(
+                int(target.max_bond()),
+                phase="fit.target",
+            )
+        return self
+
+    def _apply_gate_dmrg_impl(self, gate, logical_where):
+        """Apply a gate through an exact target and tree-local FIT sweeps."""
+
+        logical_where = _normalize_where(logical_where)
+        where = self._validate_support(logical_where)
+        self._check_operator_limits(where)
+        target, operator = self._build_tree_fit_target(gate, logical_where)
+        nodes = [self.plan.node_of_qubit[q] for q in logical_where]
+        region = frozenset(self.tn.steiner_nodes(nodes))
+        return self._run_tree_fit(
+            target,
+            region,
+            logical_where,
+            operator=operator,
+        )
+
     def _apply_gate_impl(
         self, gate, where, *, renormalize=False, track_norm=True
     ):
         """Apply a gate without opening a nested diagnostic update."""
         logical_where = _normalize_where(where)
+        if self.mode == "dmrg":
+            return self._apply_gate_dmrg_impl(gate, logical_where)
         where = self._validate_support(logical_where)
         self._check_operator_limits(where)
         if len(logical_where) == 2 and logical_where[0] == logical_where[1]:
@@ -3200,6 +3534,7 @@ class TreeOptimizer:
         progbar=False,
         mode=None,
         compression_mode=None,
+        compression_seed=None,
         non_unitary=False,
         normalize_every=False,
         normalize_final=False,
@@ -3241,7 +3576,7 @@ class TreeOptimizer:
             truncation proxy ``1 - (norm / reference_norm)**2``; the reference
             is established at run start and reset after control/non-unitary
             events.
-        mode : {"auto", "direct", "dm", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
+        mode : {"auto", "direct", "dm", "sdc", "src", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
             Optional persistent gate/sub-MPO replay selection: a supplied
             value updates :attr:`mode` before replay and remains active for
             future runs and copies. ``"submpo"`` validates an explicit chain
@@ -3249,9 +3584,17 @@ class TreeOptimizer:
             TreeMPO routing. ``"tree"``/``"ttn"`` are deprecated no-op
             compatibility selectors for shared coefficient frontends.
             ``"dm"`` selects automatic gate routing with density-matrix
-            compression.
-        compression_mode : {"direct", "dm"} | None, default=None
+            compression. ``"sdc"`` and ``"src"`` select automatic routing
+            with deterministic or randomized successive tree-edge
+            compression, respectively. ``"dmrg"`` selects TreeFIT with the
+            configured adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
+            use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
+            warm-up blocks; each named schedule then performs one-node
+            refinement.
+        compression_mode : {"direct", "dm", "sdc", "src"} | None, default=None
             Persistent decomposition used for fused-network truncation.
+        compression_seed : int | None, default=None
+            Override the configured randomized-compression seed for this run.
         non_unitary : bool, default=False
             Mark the stream as non-unitary when using automatic working-scale
             control.
@@ -3297,9 +3640,23 @@ class TreeOptimizer:
                 )
             else:
                 requested_mode = self._normalize_mode(requested_mode_raw)
-                if requested_mode == "dm":
+                if requested_mode in {"dm", "sdc", "src"}:
+                    self._dmrg_mode_alias = None
+                    if compression_mode is not None:
+                        requested_compression = self._normalize_compression_mode(
+                            compression_mode
+                        )
+                        if requested_compression not in {"direct", requested_mode}:
+                            raise ValueError(
+                                f"mode={requested_mode!r} cannot be combined "
+                                "with a different compression_mode."
+                            )
                     self.mode = "auto"
-                    self.compression_mode = "dm"
+                    self.compression_mode = requested_mode
+                    # The shorthand owns the compression choice. The
+                    # explicit ``direct`` value is only the neutral default
+                    # accepted alongside it and must not overwrite it below.
+                    compression_mode = None
                 else:
                     requested_compression = (
                         None if compression_mode is None
@@ -3308,6 +3665,7 @@ class TreeOptimizer:
                     if requested_mode in {
                         "tree_mpo_direct", "tree_mpo_dm"
                     }:
+                        self._dmrg_mode_alias = None
                         expected = (
                             "dm" if requested_mode == "tree_mpo_dm"
                             else "direct"
@@ -3323,7 +3681,12 @@ class TreeOptimizer:
                         self.mode = requested_mode
                         self.compression_mode = expected
                     else:
-                        self.mode = self._normalize_mode(requested_mode)
+                        if requested_mode in {"dmrg1", "dmrg2", "dmrg3"}:
+                            self._dmrg_mode_alias = requested_mode
+                            self.mode = "dmrg"
+                        else:
+                            self._dmrg_mode_alias = None
+                            self.mode = requested_mode
         if compression_mode is not None:
             if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
                 normalized_compression = self._normalize_compression_mode(
@@ -3342,6 +3705,15 @@ class TreeOptimizer:
                 self.compression_mode = self._normalize_compression_mode(
                     compression_mode
                 )
+        if compression_seed is not None:
+            if isinstance(compression_seed, bool) or not isinstance(
+                compression_seed, Integral
+            ):
+                raise TypeError("compression_seed must be an integer or None.")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError("compression_seed must be non-negative.")
+            self.compression_seed = compression_seed
         non_unitary = bool(non_unitary)
         if track_infidelity is not None:
             self.track_infidelity = bool(track_infidelity)
@@ -3388,6 +3760,8 @@ class TreeOptimizer:
                 child_kwargs.setdefault("mode", mode)
             if compression_mode is not None:
                 child_kwargs.setdefault("compression_mode", compression_mode)
+            if compression_seed is not None:
+                child_kwargs.setdefault("compression_seed", compression_seed)
             child_kwargs.setdefault("track_infidelity", track_infidelity)
             child_kwargs.setdefault("progbar", progbar)
             stream = self._trajectory_gate_stream() if gates is None else gates
@@ -3715,7 +4089,12 @@ class TreeOptimizer:
         )
         try:
             with self._thread_ctx():
-                result = self._apply_1q_impl(gate, q, renormalize=renormalize)
+                if self.mode == "dmrg":
+                    result = self._apply_gate_dmrg_impl(gate, (q,))
+                    if renormalize:
+                        self.normalize()
+                else:
+                    result = self._apply_1q_impl(gate, q, renormalize=renormalize)
         except Exception:
             if started:
                 self._abort_update()
@@ -3800,7 +4179,9 @@ class TreeOptimizer:
         )
         try:
             with self._thread_ctx():
-                if self._gate_route(2) == "treempo":
+                if self.mode == "dmrg":
+                    result = self._apply_gate_dmrg_impl(gate, logical_where)
+                elif self._gate_route(2) == "treempo":
                     result = self._apply_gate_tree_mpo_impl(
                         gate,
                         logical_where,
@@ -4671,7 +5052,7 @@ class TreeOptimizer:
 
     def _compress_edge_with_diagnostics(
         self, u, v, *, max_bond=None, cutoff=None, reduced=True,
-        reduction_proven=False, compression_mode=None,
+        reduction_proven=False, compression_mode=None, compression_seed=None,
     ):
         """Compress one live tree edge and record its truncation diagnostics."""
         profile_started = time.perf_counter() if self.profile else None
@@ -4682,6 +5063,8 @@ class TreeOptimizer:
         compression_mode = self._normalize_compression_mode(
             self.compression_mode if compression_mode is None else compression_mode
         )
+        if compression_seed is None:
+            compression_seed = self.compression_seed
         bond_before = self.tn.bond(u, v)
         before_bond = int(self.tn.ind_size(bond_before))
         lossless = (
@@ -4731,6 +5114,7 @@ class TreeOptimizer:
             u, v, max_bond=max_bond, cutoff=cutoff, absorb="right",
             cutoff_mode=self.cutoff_mode, reduced=reduced,
             compression_mode=compression_mode,
+            compression_seed=compression_seed,
             _reduction_proven=reduction_proven,
         )
         bond_after = self.tn.bond(u, v)
@@ -4778,9 +5162,15 @@ class TreeOptimizer:
                 or parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in parameters
             )
+            supports_compression_seed = any(
+                parameter.name == "compression_seed"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
         except (TypeError, ValueError):
             supports_proof = True
             supports_compression_mode = True
+            supports_compression_seed = True
         kwargs = {
             "max_bond": max_bond,
             "cutoff": cutoff,
@@ -4790,6 +5180,8 @@ class TreeOptimizer:
             kwargs["reduction_proven"] = reduction_proven
         if supports_compression_mode:
             kwargs["compression_mode"] = self.compression_mode
+        if supports_compression_seed:
+            kwargs["compression_seed"] = self.compression_seed
         return method(u, v, **kwargs)
 
     def _metadata_aware_reduction(self, u, v):
@@ -5118,6 +5510,35 @@ class TreeOptimizer:
             "subtree", _normalize_where(where), track_norm=track_norm
         )
         try:
+            if self.mode == "dmrg":
+                logical_where = _normalize_where(where)
+                trial = self.copy()
+                trial.mode = "auto"
+                trial._dmrg_mode_alias = None
+                trial.chi = None
+                trial.cutoff = 0.0
+                trial.track_infidelity = False
+                trial.track_truncation = False
+                trial._norm_tracking_enabled = False
+                trial._apply_subtree_operator_impl(
+                    op,
+                    logical_where,
+                    max_bond=None,
+                    cutoff=0.0,
+                    renormalize=False,
+                )
+                nodes = [
+                    self.plan.node_of_qubit[q] for q in logical_where
+                ]
+                region = frozenset(self.tn.steiner_nodes(nodes))
+                result = self._run_tree_fit(
+                    trial.tn,
+                    region,
+                    logical_where,
+                )
+                if renormalize:
+                    self.normalize()
+                return result
             result = self._apply_subtree_operator_impl(
                 op, where, max_bond=max_bond, cutoff=cutoff,
                 renormalize=renormalize,
@@ -5227,6 +5648,34 @@ class TreeOptimizer:
             "subtreempo", declared, track_norm=track_norm
         )
         try:
+            if self.mode == "dmrg":
+                trial = self.copy()
+                trial.mode = "auto"
+                trial._dmrg_mode_alias = None
+                trial.chi = None
+                trial.cutoff = 0.0
+                trial.track_infidelity = False
+                trial.track_truncation = False
+                trial._norm_tracking_enabled = False
+                trial.apply_subtreempo(
+                    tree_mpo,
+                    declared,
+                    max_bond=None,
+                    cutoff=0.0,
+                    track_norm=False,
+                    _validate_backend=False,
+                )
+                active_nodes = tuple(
+                    self.plan.node_of_qubit[site] for site in active_support
+                )
+                region = frozenset(self.tn.steiner_nodes(active_nodes))
+                self._run_tree_fit(
+                    trial.tn,
+                    region,
+                    active_support,
+                    operator=tree_mpo,
+                )
+                return self
             with self._thread_ctx():
                 active_nodes = tuple(
                     self.plan.node_of_qubit[site] for site in active_support
@@ -7132,6 +7581,17 @@ class TreeOptimizer:
             cutoff_mode=self.cutoff_mode,
             mode=self.mode,
             compression_mode=self.compression_mode,
+            compression_seed=self.compression_seed,
+            fit_block_size=self.fit_block_size,
+            fit_n_iter=self.fit_n_iter,
+            fit_min_iter=self.fit_min_iter,
+            fit_rtol=self.fit_rtol,
+            fit_patience=self.fit_patience,
+            fit_init_strategy=self.fit_init_strategy,
+            fit_init_rand_strength=self.fit_init_rand_strength,
+            fit_init_seed=self.fit_init_seed,
+            fit_sweep_sequence=self.fit_sweep_sequence,
+            fit_overlap_diagnostics=self.fit_overlap_diagnostics,
             structure=self.structure,
             max_arity=self.max_arity,
             top_arity=self.top_arity,
@@ -7182,6 +7642,9 @@ class TreeOptimizer:
         other._norm_log_survival = self._norm_log_survival
         other._norm_tracking_enabled = self._norm_tracking_enabled
         other.profile_events = deepcopy(self.profile_events)
+        other._dmrg_mode_alias = self._dmrg_mode_alias
+        other.fit_diagnostics = deepcopy(self.fit_diagnostics)
+        other._last_fit_diagnostics = deepcopy(self._last_fit_diagnostics)
         other._attach_profile_sink()
         return other
 
@@ -7396,6 +7859,13 @@ class TreeOptimizer:
     def get_projection_diagnostics(self):
         """Return projection norm/support/span/bond diagnostics in order."""
         return self.projection_diagnostics
+
+    def get_fit_diagnostics(self):
+        """Return the latest TreeFIT diagnostic record, if available."""
+
+        return None if self._last_fit_diagnostics is None else deepcopy(
+            self._last_fit_diagnostics
+        )
 
     @classmethod
     def find_tree_layout(cls, gates, n=None, *, structure="quality",

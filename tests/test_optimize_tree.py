@@ -18,6 +18,7 @@ from pepsy.optimizers.tree import (
 )
 from pepsy.optimizers.tree.optimizer import _contract_two_tensors
 from pepsy.optimizers.tree.ttn import _native_qr_block_scaled
+from pepsy.fitting import TreeFIT
 
 
 def test_tree_mpo_higher_order_term_routes_and_replays_natively():
@@ -84,6 +85,450 @@ def test_tree_mpo_higher_order_term_routes_and_replays_natively():
         rtol=1e-11,
         atol=1e-11,
     )
+
+
+@pytest.mark.parametrize("compression_mode", ("sdc", "src"))
+def test_tree_successive_compression_modes_are_reproducible(compression_mode):
+    """Tree compression modes preserve the tree sweep and randomized seed API."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    kwargs = dict(
+        n=5,
+        tree=plan,
+        mode=compression_mode,
+        chi=1,
+        cutoff=0.0,
+        compression_seed=23,
+        track_infidelity=False,
+        run=False,
+    )
+    first = TreeOptimizer(None, **kwargs)
+    second = TreeOptimizer(None, **kwargs)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    first.apply_gate(cnot, (0, 4), track_norm=False)
+    second.apply_gate(cnot, (0, 4), track_norm=False)
+
+    assert first.mode == "auto"
+    assert first.compression_mode == compression_mode
+    assert first.tn.max_bond() <= 1
+    assert first.tn.validate(check_canonical=True) is first.tn
+    np.testing.assert_allclose(first.to_dense(), second.to_dense())
+
+
+@pytest.mark.parametrize(
+    ("mode", "fit_n_iter", "expected_block_size"),
+    (("dmrg1", 3, 2), ("dmrg2", 1, 2), ("dmrg3", 1, 3)),
+)
+def test_tree_optimizer_dmrg_uses_tree_fit_engine(
+    mode, fit_n_iter, expected_block_size
+):
+    """TreeOptimizer DMRG aliases use cached tree-local FIT updates."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        mode=mode,
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=fit_n_iter,
+        fit_init_strategy="guess-src",
+        fit_overlap_diagnostics=True,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(
+        np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0],
+             [0, 0, 0, 1], [0, 0, 1, 0]],
+            dtype=complex,
+        ),
+        (0, 4),
+        track_norm=False,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["backend"] == "tree_fit"
+    assert diagnostics["block_size"] == expected_block_size
+    assert diagnostics["requested_block_size"] == expected_block_size
+    if mode == "dmrg1":
+        assert diagnostics["block_size_trace"] == (2, 2, 1)
+        assert diagnostics["adaptive_sweeps"] == 2
+        assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert diagnostics["guess_backend"] == "tree_mpo"
+    assert diagnostics["cache"]["hits"] > 0
+    assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+    assert optimizer.tn.validate(check_canonical=True) is optimizer.tn
+
+
+def test_tree_optimizer_generic_dmrg_warmup_then_refinement():
+    """Generic tree DMRG uses the MPS-style two-site handoff."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=4,
+        fit_adaptive_sweeps=2,
+        fit_init_strategy="guess-src",
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(
+        np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0],
+             [0, 0, 0, 1], [0, 0, 1, 0]],
+            dtype=complex,
+        ),
+        (0, 4),
+        track_norm=False,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["block_size_trace"] == (2, 2, 1, 1)
+    assert diagnostics["adaptive_sweeps"] == 2
+    assert diagnostics["one_site_refinement_sweeps"] == 2
+
+
+def test_tree_optimizer_guess_src_uses_fit_init_seed(monkeypatch):
+    """TreeMPO disposable guesses use the FIT-specific randomized seed."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        compression_seed=11,
+        fit_init_seed=37,
+        fit_init_strategy="guess-src",
+        track_infidelity=False,
+        run=False,
+    )
+    target, operator = optimizer._build_tree_fit_target(
+        np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0],
+             [0, 0, 0, 1], [0, 0, 1, 0]],
+            dtype=complex,
+        ),
+        (0, 4),
+    )
+    nodes = [plan.node_of_qubit[0], plan.node_of_qubit[4]]
+    region = frozenset(optimizer.tn.steiner_nodes(nodes))
+    observed = []
+    original = TreeOptimizer.apply_subtreempo
+
+    def capture_seed(self, *args, **kwargs):
+        observed.append(self.compression_seed)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(TreeOptimizer, "apply_subtreempo", capture_seed)
+    optimizer._tree_fit_initial_guess(target, region, operator=operator)
+
+    assert observed == [37]
+
+
+@pytest.mark.parametrize("strategy", ("random", "random_expand"))
+def test_tree_optimizer_dmrg_random_fit_guess_is_seeded(strategy):
+    """Tree DMRG exposes the same disposable randomized-guess policy as MPS."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    kwargs = dict(
+        n=5,
+        tree=plan,
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy=strategy,
+        fit_init_rand_strength=1.0e-4,
+        fit_init_seed=17,
+        track_infidelity=False,
+        run=False,
+    )
+    first = TreeOptimizer(None, **kwargs)
+    second = TreeOptimizer(None, **kwargs)
+    gate = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0],
+         [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    first.apply_gate(gate, (0, 4), track_norm=False)
+    second.apply_gate(gate, (0, 4), track_norm=False)
+
+    diagnostics = first.get_fit_diagnostics()
+    assert diagnostics["fit_init_strategy"] == strategy
+    assert diagnostics["random_initialization"] is True
+    assert diagnostics["random_initialization_info"]["enabled"] is True
+    np.testing.assert_allclose(first.to_dense(), second.to_dense())
+    assert first.tn.validate(check_canonical=True) is first.tn
+
+
+def test_tree_fit_environment_cache_reuses_untouched_branches():
+    """TreeFIT caches directed branch overlaps between local updates."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    initial = TreeTensorNetwork.from_plan(plan)
+    target_optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        run=False,
+        tn=initial,
+    )
+    target_optimizer.apply_gate(
+        np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0],
+             [0, 0, 0, 1], [0, 0, 1, 0]],
+            dtype=complex,
+        ),
+        (0, 4),
+        track_norm=False,
+    )
+
+    fit = TreeFIT(target_optimizer.tn, initial, max_bond=2, cutoffs=0.0)
+    region = initial.steiner_nodes(
+        [plan.node_of_qubit[0], plan.node_of_qubit[4]]
+    )
+    fit.run_gate(region, n_iter=1, block_size=2)
+    diagnostics = fit.fit_diagnostics(overlap=True)
+
+    assert diagnostics["cache"]["messages"] > 0
+    assert diagnostics["cache"]["hits"] > 0
+    assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+
+
+def test_tree_fit_invalidates_effective_cache_through_branch_dependencies():
+    """A disjoint effective block is invalidated when its exterior message changes."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    target = TreeTensorNetwork.rand(plan, D=2, seed=51, canonicalize=True)
+    state = TreeTensorNetwork.rand(plan, D=2, seed=52, canonicalize=True)
+    fit = TreeFIT(target, state, max_bond=2, cutoffs=0.0)
+    changed = plan.node_of_qubit[0]
+    disjoint = plan.node_of_qubit[4]
+
+    fit._canonicalize_for_block((disjoint,), disjoint)
+    fit._effective_block((disjoint,))
+    assert (disjoint,) in fit._effective_cache
+
+    fit.fit_block((changed,))
+
+    assert (disjoint,) not in fit._effective_cache
+
+
+def test_tree_fit_overlap_respects_represented_exponents():
+    """Fidelity divides represented target/state scale before reporting."""
+
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.from_plan(plan)
+    target = state.copy()
+    state.exponent = 3.0
+    target.exponent = 3.0
+
+    diagnostics = TreeFIT(
+        target,
+        state,
+        max_bond=1,
+        cutoffs=0.0,
+    ).fit_diagnostics(overlap=True)
+
+    assert diagnostics["local_fidelity"] == pytest.approx(1.0)
+
+
+def test_tree_fit_run_api_matches_fit_positional_controls_and_verbose_trace():
+    """TreeFIT keeps FIT's run/run_eff positional controls and trace behavior."""
+
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    target = TreeTensorNetwork.rand(plan, D=2, seed=33)
+    fit = TreeFIT(target, target.copy(), max_bond=2, cutoffs=0.0)
+
+    fit.run(1, True)
+
+    assert len(fit.fidelity_trace) == 1
+    assert fit.fit_diagnostics(overlap=True)["local_fidelity"] > 1.0 - 1.0e-10
+    fit.run_eff(1, True)
+    assert len(fit.fidelity_trace) == 1
+
+
+@pytest.mark.parametrize("block_size", (2, 3))
+def test_tree_fit_adaptive_block_warmup_then_one_site_refinement(block_size):
+    """TreeFIT mirrors FIT's larger-block warm-up schedule."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    initial = TreeTensorNetwork.from_plan(plan)
+    target = TreeTensorNetwork.rand(plan, D=2, seed=34)
+    fit = TreeFIT(target, initial, max_bond=2, cutoffs=0.0)
+
+    fit.run_eff(
+        n_iter=4,
+        block_size=block_size,
+        adaptive_block_sweeps=2,
+        sweep_sequence="RL",
+    )
+
+    assert fit.iterations_run == 4
+    assert fit.adaptive_sweeps_run == 2
+    assert fit.one_site_sweeps_run == 2
+    assert fit.block_size_trace == [block_size, block_size, 1, 1]
+    diagnostics = fit.fit_diagnostics()
+    assert diagnostics["adaptive_sweeps"] == 2
+    assert diagnostics["one_site_refinement_sweeps"] == 2
+
+
+def test_tree_fit_retag_aligns_structural_tags_without_mutating_target():
+    """FIT-style retagging is private, ordered, and preserves physical tags."""
+
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.from_plan(plan, node_tag_id="N{}")
+    target = TreeTensorNetwork.from_plan(plan, node_tag_id="T{}")
+    original_tags = tuple(tuple(tensor.tags) for tensor in target.tensors)
+    info = {}
+
+    fit = TreeFIT(target, state, retag=True, info=info)
+
+    assert info["retagged"] is True
+    assert tuple(tuple(tensor.tags) for tensor in target.tensors) == original_tags
+    assert all(
+        fit.tn.node_tag(node) == state.node_tag(node)
+        for node in plan.nodes()
+    )
+    assert fit.tn.validate() is fit.tn
+
+
+def test_tree_fit_rejects_different_tree_topology():
+    """Same node labels are insufficient when target and state edges differ."""
+
+    state_plan = TreePlan(
+        0,
+        {0: (1, 2), 1: (3,), 2: (), 3: ()},
+        {0: None, 1: 0, 2: 0, 3: 1},
+        {2: 0, 3: 1},
+    )
+    target_plan = TreePlan(
+        0,
+        {0: (1, 3), 1: (2,), 2: (), 3: ()},
+        {0: None, 1: 0, 2: 1, 3: 0},
+        {2: 0, 3: 1},
+    )
+    state = TreeTensorNetwork.from_plan(state_plan)
+    target = TreeTensorNetwork.from_plan(target_plan)
+
+    with pytest.raises(ValueError, match="same tree topology"):
+        TreeFIT(target, state)
+
+
+def test_tree_fit_rejects_disconnected_public_regions():
+    """TreePlan regions use the same connectivity contract as TreePepsPlan."""
+
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.from_plan(plan)
+    fit = TreeFIT(state.copy(), state)
+    nodes = tuple(plan.nodes())
+    disconnected = (nodes[0], nodes[-1])
+
+    if fit.p.node_path(disconnected[0], disconnected[1]) == disconnected:
+        pytest.skip("selected nodes happen to be adjacent in this plan")
+    with pytest.raises(ValueError, match="connected"):
+        fit.fit_block(disconnected)
+    with pytest.raises(ValueError, match="connected"):
+        fit.run_gate(disconnected, n_iter=1)
+
+
+def test_tree_fit_accepts_correctly_tagged_layered_target():
+    """TreeFIT contracts local target layers without dropping their tensors."""
+
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.from_plan(plan)
+    target = state.copy()
+    node = plan.node_of_qubit[0]
+    backbone = target.node_tensor(node)
+    layer_ind = "target_layer_bond"
+    backbone.modify(
+        data=np.expand_dims(backbone.data, -1),
+        inds=backbone.inds + (layer_ind,),
+    )
+    target |= qtn.Tensor(
+        np.ones((1,)),
+        inds=(layer_ind,),
+        tags=backbone.tags,
+    )
+    parent, child = next(
+        (parent, child)
+        for parent, children in plan.children.items()
+        for child in children
+    )
+    inter_node_layer = "target_inter_node_layer"
+    target |= qtn.Tensor(
+        np.ones((1,)),
+        inds=(inter_node_layer,),
+        tags=target.node_tensor(parent).tags,
+    )
+    target |= qtn.Tensor(
+        np.ones((1,)),
+        inds=(inter_node_layer,),
+        tags=target.node_tensor(child).tags,
+    )
+
+    fit = TreeFIT(target, state, max_bond=1, cutoffs=0.0)
+
+    assert fit.target_layout == "layered"
+    assert len(fit._target_tensors[node]) == 2
+    assert len(fit._target_bonds[(parent, child)]) == 2
+    fit.run_eff(1)
+    assert fit.fit_diagnostics(overlap=True)["local_fidelity"] == pytest.approx(1.0)
+
+
+def test_tree_fit_rejects_untagged_layered_target():
+    """Layer tensors without structural ownership are rejected clearly."""
+
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.from_plan(plan)
+    target = state.copy()
+    target |= qtn.Tensor(np.ones((1,)), inds=("unused_layer",))
+
+    with pytest.raises(ValueError, match="exactly one structural node tag"):
+        TreeFIT(target, state)
+
+
+def test_tree_fit_accepts_plain_tagged_layered_tensor_network_target():
+    """A tagged Quimb target can use the fitted tree as its geometry source."""
+
+    plan = TreePlan.from_order(range(3), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.from_plan(plan)
+    target = qtn.TensorNetwork([tensor.copy() for tensor in state.tensors])
+    node = plan.node_of_qubit[0]
+    layer_tags = state.node_tensor(node).tags
+    target |= qtn.Tensor(
+        np.ones((1,)),
+        inds=("plain_layer_bond",),
+        tags=layer_tags,
+    )
+    target |= qtn.Tensor(
+        np.ones((1,)),
+        inds=("plain_layer_bond",),
+        tags=layer_tags,
+    )
+
+    fit = TreeFIT(target, state, max_bond=1, cutoffs=0.0)
+
+    assert fit.target_layout == "layered"
+    fit.run_eff(1)
+    assert fit.fit_diagnostics(overlap=True)["local_fidelity"] == pytest.approx(1.0)
 # -- exact statevector reference ----------------------------------------------
 
 
