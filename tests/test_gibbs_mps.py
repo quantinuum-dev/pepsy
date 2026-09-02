@@ -308,6 +308,79 @@ def test_gibbs_mps_infers_coordinate_dimension_and_shape():
     assert state.basis.lattice_to_chain[(1, 0)] == 4
 
 
+def test_gibbs_mps_infers_triangular_coordinate_graph():
+    """Graph geometry comes from the supplied triangular edge list."""
+    lx, ly = 2, 3
+    edges = qtn.edges_2d_triangular(lx, ly, cyclic=True)
+    sites = sorted({site for edge in edges for site in edge})
+    terms = [(("zz", 0.3), (u, v)) for (u, v) in edges]
+    terms += [(("x", -0.1), site) for site in sites]
+
+    state = GibbsMps(terms, map_mode="snake")
+    state.prepare(
+        beta=0.05,
+        n_steps=1,
+        trotter_order=1,
+        trotter_fuse_adjacent=False,
+        cutoff=0.0,
+    )
+
+    assert state.shape == (lx, ly)
+    assert state.length == lx * ly
+    assert len(state._trotter_ham.terms) == len(set(edges))
+    assert state.trotter_gates
+
+
+def test_gibbs_mps_fuses_connected_onsite_terms_into_pair_terms():
+    """Onsite terms are combined before the Quimb Trotter schedule."""
+    state = GibbsMps(
+        [
+            (("ZZ", 0.7), (0, 1)),
+            (("X", 0.2), 0),
+            (("Z", -0.1), 0),
+            (("X", 0.3), 1),
+        ],
+        shape=2,
+    )
+    state.prepare(
+        beta=0.2,
+        n_steps=1,
+        trotter_order=1,
+        trotter_fuse_adjacent=False,
+        cutoff=0.0,
+    )
+
+    identity = np.eye(2)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+    expected = (
+        0.7 * np.kron(z, z)
+        + 0.2 * np.kron(x, identity)
+        - 0.1 * np.kron(z, identity)
+        + 0.3 * np.kron(identity, x)
+    )
+    np.testing.assert_allclose(
+        np.asarray(state._trotter_ham.get_gate((0, 1))),
+        expected,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        np.asarray(state.trotter_gates[0].U),
+        expm(-0.1 * expected),
+        atol=1.0e-12,
+    )
+    assert len(state.trotter_gates) == 1
+    assert len(state.gates) == 1
+
+
+def test_gibbs_mps_defaults_to_direct_replay_mode():
+    """The public default uses the explicit direct-mode spelling."""
+    state = GibbsMps([(("ZZ", 0.2), (0, 1))], shape=2)
+    state.prepare(beta=0.1, n_steps=1, cutoff=0.0)
+
+    assert state.optimizer.mode == "quimb-direct"
+
+
 def test_gibbs_mps_infers_flat_integer_chain_shape():
     """Flat integer locations remain an inferred one-dimensional chain."""
     state = GibbsMps(

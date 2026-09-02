@@ -14,6 +14,11 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Made `mode="direct"` the explicit GibbsMps default while retaining
+  `mode="mpo"` as a compatibility alias for the same direct Quimb replay.
+  Added coverage for inferred map ordering, triangular coordinate graphs, and
+  connected one-site term fusion.
+
 - Added `pepsy.fitting.TreeFIT`, a tree-native cached variational fitting
   engine with directed branch environments, canonical-centre path movement,
   one-/two-/three-node local blocks, seeded randomized warm starts, and
@@ -24,7 +29,6 @@ Changes for the next release should be added here before the version is bumped.
   inter-node bonds; ambiguous or untagged tensors are rejected. The dedicated
   path two-layer compressor remains available. `TreeOptimizer` and
   `TreePepsOptimizer` expose it through `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3`.
-
 - Aligned tree DMRG scheduling with MPS FIT: generic DMRG supports an adaptive
   larger-block warm-up followed by one-site refinement, named `dmrg1`/`dmrg2`
   use two-node growth before one-site updates, and `dmrg3` uses three-node

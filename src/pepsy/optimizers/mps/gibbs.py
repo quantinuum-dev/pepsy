@@ -508,7 +508,7 @@ class GibbsMps:
         dt=None,
         n_steps=None,
         chi=64,
-        mode="mpo",
+        mode="direct",
         contraction_opt="auto-hq",
         cutoff="auto",
         cutoff_mode="auto",
@@ -544,7 +544,8 @@ class GibbsMps:
         ``contraction_opt``, and the normalization options are the common
         direct ``MpsOptimizer`` controls; all other constructor and run
         options can be forwarded through ``optimizer_kwargs`` and
-        ``run_kwargs``.
+        ``run_kwargs``. The default replay mode is ``mode="direct"``;
+        ``mode="mpo"`` remains an alias for the same Quimb compressor.
         """
         beta_float = _scalar_float(beta, name="beta")
         if beta_float < 0.0:
@@ -586,7 +587,7 @@ class GibbsMps:
         if beta_float == 0.0:
             n_steps = 0
         if mode is None:
-            mode = "mpo"
+            mode = "direct"
         mode_name = str(mode).strip().lower().replace("_", "-")
         if mode_name in {"exact", "perm", "su", "mix"}:
             raise ValueError(

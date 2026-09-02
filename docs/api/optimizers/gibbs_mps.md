@@ -145,13 +145,18 @@ object, while `trotter_ordering="random"` creates a fresh ordering for each
 preparation. Thus `trotter_layers` describes the exact schedule that is
 replayed, without a second graph-coloring pass.
 
-The default replay mode is `mode="mpo"`, which is appropriate for the
+The default replay mode is `mode="direct"`, which is appropriate for the
 non-unitary gates and the interleaved physical/ancilla layout. Other ordinary
 open-boundary `MpsOptimizer` compression modes can be selected. `GibbsMps`
 always sets `non_unitary=True`; unitary stabilization and unitary overlap
 diagnostics are not used. `to_backend` is forwarded through term compilation,
 Bell-pair construction, generated exponentials, MPS replay, and ancilla
 tracing.
+
+The `mode="mpo"` spelling remains accepted as a compatibility alias for the
+same Quimb direct compressor. `mode="dmrg"`, `mode="svd"`, and other ordinary
+open-boundary MPS modes can be selected when a different compression path is
+needed.
 
 Common compression controls can be passed directly:
 
