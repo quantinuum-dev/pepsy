@@ -107,6 +107,8 @@ _MPO_EXPORTS = [
     "CompiledMPOExp",
     "MPOBasis",
     "exp_mpo",
+    "TrotterMPOReport",
+    "exp_trotter",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_higher_order" for name in _MPO_EXPORTS})
 _MPO_COMPATIBILITY_EXPORTS = ["CompiledMPOEvolution"]
@@ -153,6 +155,7 @@ _SUBMODULES = (
     "mpo_semantic",
     "mpo_block_plan",
     "mpo_higher_order",
+    "mpo_trotter",
     "mpo_automaton",
     "mpo_cluster",
     "mpo_product",

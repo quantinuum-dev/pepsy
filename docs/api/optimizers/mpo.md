@@ -27,6 +27,20 @@ non-contiguous supports such as `(0, 1, 3)`. The gate matrix has dimension
 `mode="mpo"` uses the symmetry-aware SVD route and therefore follows that
 one-/two-site restriction.
 
+The dense MPO compression backend exposes the same Quimb compressor family as
+`MpsOptimizer`. `mode="src"` is equivalent to `mode="quimb-src"`, and the
+legacy-qualified `mode="mpo-src"` spelling is equivalent as well. The same
+aliases are available for `direct`, `dm`, `zipup`, `zipup-first`,
+`zipup-oversample`, `src`, `src-first`, `src-oversample`, `srcmps`,
+`srcmps-first`, `srcmps-oversample`, `sdc`, `sdc-oversample`, `fit-zipup`,
+`fit-projector`, and `fit-oversample`. Use the qualified `quimb-fit` or
+`mpo-fit` spelling for Quimb's FIT compressor because bare `mode="fit"`
+remains the historical DMRG alias. These modes compress the ket and bra
+physical layers independently through `gate_nonlocal_opt`; they do not turn
+MPO evolution into an MPS-only `mix`, `su`, `perm`, or `swap` algorithm. On a
+native Symmray MPO, all of these aliases intentionally select the existing
+block-aware SVD path so no dense auxiliary MPO is constructed.
+
 For an explicit neutral term collection, arbitrary one- or multi-site support
 is accepted:
 
@@ -105,13 +119,27 @@ update, so a named mode does not waste additional sweeps on a complete pair.
 The generic `mode="dmrg"` path remains unchanged and continues to use
 `fit_block_size` and `fit_three_site_sweeps` directly.
 
-For dense named `dmrg1` and `dmrg3` growth windows, FIT starts from an isolated
-chi-capped direct MPO replay of the current gate batch by default. Disable this
-with `fit_mpo_guess=False` to use the direct current-MPO FIT guess. The replay
-order is controlled by `fit_mpo_guess_order`, which defaults to
+For dense DMRG windows, FIT uses an isolated compressed MPO warm start by
+default. The policy is controlled by `fit_init_strategy`: `"direct"` uses the
+current MPO, `"guess-src"` (also written `"guess_src"`) uses Quimb's seeded
+source compressor, `"guess-<method>"` accepts any of the MPO compressor names,
+and `"random"` / `"random_expand"` provide deterministic dense random starts.
+The exact FIT target is always built separately from the unmodified current
+MPO. `fit_init_seed` controls the guess seed and `fit_init_rand_strength`
+controls the explicit random strategies. `fit_mpo_guess=False` remains a
+compatibility switch that disables the source guess for named
+`dmrg1`/`dmrg2`/`dmrg3` schedules; use the explicit random or direct strategy
+when that legacy switch is disabled.
+The replay order is controlled by `fit_mpo_guess_order`, which defaults to
 `"lower_upper"` (bra then ket); `"upper_lower"` (ket then bra) is also
 available. In this API the lower MPO layer is bra and the upper layer is ket.
-Native Symmray MPOs retain their native warm-start path.
+Native Symmray MPOs retain their block-aware FIT warm start rather than being
+converted to dense random or Quimb source guesses.
+
+The selected and requested initialization policies, compressor name, and
+randomization details are available in `get_fit_diagnostics()` and
+`get_fit_history()` under `fit_init_strategy`, `guess_method`,
+`random_initialization`, and the compatibility field `mpo_fit_guess_used`.
 
 As with MPS DMRG, `n_iter` counts FIT sweeps. `mode="mpo"` applies each gate
 with one direct MPO compression step and does not perform variational sweeps;

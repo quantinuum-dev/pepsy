@@ -3969,15 +3969,72 @@ def gate_with_submpo(
     # split off and compress the affected region
     sub_site_tags = [p.site_tag(s) for s in range(si, sf + 1)]
     _, subpsi = p.partition(sub_site_tags, which="any", inplace=True)
-    qtn.tensor_network_1d_compress(
-        subpsi,
-        site_tags=sub_site_tags,
-        method=method,
-        # the sub TN can't be automatically permuted when missing sites
-        permute_arrays=False,
-        inplace=True,
-        **compress_opts,
-    )
+    # Some Quimb wrappers perform a nested compression whose default
+    # ``permute_arrays=True`` assumes a complete MPS-like physical-index
+    # family. An interior MPO partition contains both ket and bra families,
+    # so reproduce those wrappers explicitly with the local site tags and
+    # disable permutation at every compression level. This is the same
+    # semantic operation as the native wrapper, but remains valid for an MPO
+    # layer with the other physical family still present in each tensor.
+    method_norm = str(method).strip().lower()
+    max_bond = compress_opts.get("max_bond")
+    if (
+        max_bond is not None
+        and method_norm in {"zipup-first", "zipup-oversample"}
+    ):
+        qtn.tensor_network_1d_compress(
+            subpsi,
+            method="zipup",
+            max_bond=2 * max_bond,
+            cutoff=compress_opts.get("cutoff", 0.0),
+            site_tags=sub_site_tags,
+            canonize=True,
+            sweep_reverse=True,
+            permute_arrays=False,
+            optimize=compress_opts.get("optimize", "auto-hq"),
+            inplace=True,
+        )
+        qtn.tensor_network_1d_compress(
+            subpsi,
+            method="direct",
+            max_bond=max_bond,
+            cutoff=compress_opts.get("cutoff", 0.0),
+            cutoff_mode=compress_opts.get("cutoff_mode", "rsum2"),
+            site_tags=sub_site_tags,
+            canonize=False,
+            permute_arrays=False,
+            optimize=compress_opts.get("optimize", "auto-hq"),
+            inplace=True,
+        )
+    elif max_bond is not None and method_norm in {"fit-zipup", "fit-projector"}:
+        guess_method = method_norm.removeprefix("fit-")
+        qtn.tensor_network_1d_compress(
+            subpsi,
+            method="fit",
+            max_bond=max_bond,
+            cutoff=0.0,
+            bsz=1,
+            max_iterations=8,
+            site_tags=sub_site_tags,
+            permute_arrays=False,
+            inplace=True,
+            tn_fit={
+                "method": guess_method,
+                "cutoff": compress_opts.get("cutoff", 0.0),
+                "canonize": guess_method != "projector",
+                "permute_arrays": False,
+            },
+        )
+    else:
+        qtn.tensor_network_1d_compress(
+            subpsi,
+            site_tags=sub_site_tags,
+            method=method,
+            # the sub TN can't be automatically permuted when missing sites
+            permute_arrays=False,
+            inplace=True,
+            **compress_opts,
+        )
 
     if info is not None:
         if compress_opts.get("sweep_reverse", False):

@@ -30,6 +30,7 @@ from .mpo_semantic import (
 from .mpo_block_plan import MPOBlock, MPOBlockPlan
 from .mpo_basis import CompiledMPOExp, MPOBasis, exp_mpo
 from .mpo_space import MPOBraiding, MPOPhysicalSpace
+from .mpo_trotter import TrotterMPOReport, exp_trotter
 
 __all__ = [
     "MPOParameter",
@@ -50,4 +51,6 @@ __all__ = [
     "CompiledMPOExp",
     "MPOBasis",
     "exp_mpo",
+    "TrotterMPOReport",
+    "exp_trotter",
 ]

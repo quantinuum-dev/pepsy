@@ -56,6 +56,7 @@ The semantic result records `requested_mode`, `mode`,
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
 | One-shot connected-cluster MPO | `exp_mpo_cluster(terms, step, ...)` | Quimb MPO or semantic cluster MPO |
 | One-shot ordered MPO cluster product | `exp_mpo_cluster_product(factors, step, ...)` | Quimb MPO or semantic joint cluster MPO |
+| Native Trotter gate-product MPO | `exp_trotter(terms, step, ...)` | Quimb `MatrixProductOperator` |
 | Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
 | Product of two existing MPOs | `compress_mpo_product(A, B, ...)` | Lazy `A @ B`, then one ordinary compressed MPO |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
@@ -105,6 +106,53 @@ ordered target is formed on each small connected support and inserted into one
 MPO or PEPO topology. It is not sequential multiplication of three separately
 truncated full-lattice layers. See the [MPO cluster guide](mpo_cluster.md)
 and [PEPO cluster guide](cluster_expansion.md).
+
+## Native Trotter gate-product MPO
+
+Use `exp_trotter` when the desired construction is an ordered local-gate
+product rather than the analytical history expansion used by `exp_mpo`:
+
+```python
+from pepsy.operators import exp_trotter
+
+terms = [
+    (("ZZ", J), (0, 1)),
+    (("X", h), 0),
+]
+
+U = exp_trotter(
+    terms,
+    -1j * tau,
+    shape=L,
+    order=2,
+    steps=8,
+    chi=64,
+    mode="mpo",
+    progress=True,
+)
+```
+
+The `step` is the overall exponent in `exp(step * H)`. `steps` subdivides
+that exponent internally, so increasing it reduces the Trotter error without
+changing the target time. `order` accepts `1`, `2`, or `4`; `ordering` may be
+`"sort"`, another Quimb ordering name, `None`, or an explicit sequence of
+commuting layers. `fuse_adjacent` and `alternate` are passed to the native
+schedule. `cutoff="auto"` selects a dtype-aware cutoff and
+`cutoff_mode="auto"` resolves to Pepsy's default `"rsum2"` convention. Quimb's
+[`LocalHamGen.get_trotter_gates`](https://quimb.readthedocs.io/en/latest/autoapi/quimb/tensor/tnag/tebd/index.html#quimb.tensor.tnag.tebd.LocalHamGen.get_trotter_gates)
+generates the layer-aware `TrotterGate` stream, and Pepsy's `MpoOptimizer`
+replays that stream on an identity MPO. Thus `mode` can select `"mpo"`,
+`"svd"`, `"dmrg"`, `"dmrg1"`, `"dmrg2"`, or `"dmrg3"`.
+
+The input accepts the same term-centric `shape`, `mapper`, `map_mode`,
+`parameters`, and `coefficients` surface as `exp_mpo`. Native Trotter terms
+must currently be one- or two-site ordinary bosonic terms. Isolated one-site
+terms are exponentiated separately and included in the same gate stream.
+`to_backend` is applied at local-Hamiltonian, gate, identity-MPO, and final
+MPO boundaries. Set `return_report=True` for a `TrotterMPOReport`, or inspect
+the attached `pepsy_trotter_optimizer` and `pepsy_trotter_gates` for detailed
+diagnostics. This function intentionally returns a Quimb MPO and has no
+semantic-history return mode.
 
 ## Term-centric MPO construction
 

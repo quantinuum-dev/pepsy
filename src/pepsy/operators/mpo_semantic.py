@@ -2500,6 +2500,8 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
         "mapper": mapper,
         "chain_to_lattice": None if chain_maps is None else dict(chain_maps[0]),
         "lattice_to_chain": None if chain_maps is None else dict(chain_maps[1]),
+        "location_mode": "chain" if located_terms[0][0] == 1 else "lattice",
+        "shape_inferred": shape is None and mapper is None,
     }
     return chain_length, tuple(compiled), metadata
 

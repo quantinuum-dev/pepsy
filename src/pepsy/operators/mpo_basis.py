@@ -837,6 +837,8 @@ class MPOBasis:
         self._lattice_mapper = None
         self._lattice_to_chain = None
         self._chain_to_lattice = None
+        self._location_mode = "chain"
+        self._shape_inferred = False
         self._build_count = 0
         self._compiled_evolution_cache = {}
         self._cluster_expansion_cache = {}
@@ -867,10 +869,15 @@ class MPOBasis:
         ``{"xyz": (((0, 0), (1, 0), (0, 1)), coefficient)}``.
         ``shape`` may be an integer chain length or a 2D/3D lattice shape. If
         it is omitted, the smallest shape containing all term locations is
-        inferred. When ``mapper`` is supplied, flat integer locations are
-        also accepted as already-mapped chain positions. Common supports are
-        canonicalized before the shared MPO automaton is built, while each
-        coefficient remains an independent slot for autodiff.
+        inferred. Integer locations are already-mapped chain positions and
+        need no mapper. Coordinate locations are mapped with ``mapper`` or,
+        when it is omitted, an internally constructed ``OneDMap`` using
+        ``map_mode``. A single 1D site should be written as a bare integer;
+        a tuple such as ``(x, y)`` is a coordinate when one local operator is
+        supplied. Do not mix chain indices and coordinates in one call.
+        Common supports are canonicalized before the shared MPO automaton is
+        built, while each coefficient remains an independent slot for
+        autodiff.
         """
         length, normalized_terms, metadata = _compile_generic_terms(
             terms,
@@ -884,6 +891,8 @@ class MPOBasis:
             basis._lattice_mapper = metadata["mapper"]
             basis._lattice_to_chain = metadata["lattice_to_chain"]
             basis._chain_to_lattice = metadata["chain_to_lattice"]
+        basis._location_mode = metadata["location_mode"]
+        basis._shape_inferred = metadata["shape_inferred"]
         return basis
 
     @classmethod
@@ -963,6 +972,8 @@ class MPOBasis:
         basis._lattice_mapper = mapper
         basis._lattice_to_chain = dict(lattice_to_chain)
         basis._chain_to_lattice = dict(chain_to_lattice)
+        basis._location_mode = "lattice"
+        basis._shape_inferred = False
         return basis
 
     @property
@@ -974,6 +985,11 @@ class MPOBasis:
     def lattice_shape(self):
         """Return the compiled ``(lx, ly)`` shape, or ``None`` for chain input."""
         return self._lattice_shape
+
+    @property
+    def location_mode(self):
+        """Return ``"chain"`` or ``"lattice"`` for the parsed locations."""
+        return self._location_mode
 
     @property
     def lattice_to_chain(self):
@@ -1015,6 +1031,8 @@ class MPOBasis:
             "topology_bond_dimensions": self.bond_dimensions,
             "vectorized_slot_groups": len(self._vectorized_slot_groups),
             "lattice_shape": self._lattice_shape,
+            "location_mode": self._location_mode,
+            "shape_inferred": getattr(self, "_shape_inferred", False),
             "lattice_mode": (
                 None if self._lattice_mapper is None else self._lattice_mapper.mode
             ),
@@ -1139,7 +1157,7 @@ class MPOBasis:
         collection_budget=128,
         assembly="direct",
         assembly_chi=None,
-        assembly_batch_size=None,
+        assembly_batch_size="auto",
         assembly_cutoff=None,
         assembly_cutoff_mode="auto",
         assembly_form="left",
@@ -1202,7 +1220,7 @@ class MPOBasis:
         collection_budget=128,
         assembly="direct",
         assembly_chi=None,
-        assembly_batch_size=None,
+        assembly_batch_size="auto",
         assembly_cutoff=None,
         assembly_cutoff_mode="auto",
         assembly_form="left",
@@ -1262,7 +1280,7 @@ class MPOBasis:
             None if collection_budget is None else int(collection_budget),
             assembly,
             None if assembly_chi is None else int(assembly_chi),
-            None if assembly_batch_size is None else int(assembly_batch_size),
+            assembly_batch_size,
             assembly_cutoff,
             assembly_cutoff_mode,
             assembly_form,

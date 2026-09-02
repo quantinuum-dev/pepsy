@@ -32,6 +32,159 @@ def test_mpo_optimizer_accepts_svd_mode():
 
 
 @pytest.mark.parametrize(
+    ("mode", "expected_method"),
+    [
+        ("src", "src"),
+        ("quimb-src", "src"),
+        ("mpo-src", "src"),
+        ("zipup", "zipup"),
+        ("zipup-first", "zipup-first"),
+        ("fit-zipup", "fit-zipup"),
+        ("fit-projector", "fit-projector"),
+        ("quimb-fit", "fit"),
+    ],
+)
+def test_mpo_optimizer_accepts_mps_quimb_compression_mode_aliases(
+    monkeypatch, mode, expected_method
+):
+    """MPO mode aliases dispatch through the selected Quimb compressor."""
+    calls = []
+    original = py.optimizers.mpo.optimizer.gate_nonlocal_opt
+
+    def recording_gate_nonlocal_opt(*args, **kwargs):
+        calls.append(kwargs["method"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        py.optimizers.mpo.optimizer,
+        "gate_nonlocal_opt",
+        recording_gate_nonlocal_opt,
+    )
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=4,
+        mode=mode,
+    )
+
+    out = opt.run(
+        n_iter=1,
+        cutoff=0.0,
+        fidelity_samples=0,
+        compression_seed=17,
+    )
+
+    assert out.max_bond() <= 4
+    assert calls == [expected_method, expected_method]
+
+
+def test_mpo_optimizer_submpo_method_overrides_mpo_mode():
+    """The MPS-compatible sub-MPO method override works for MPO replay."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=4,
+        mode="mpo",
+    )
+
+    out = opt.run(
+        cutoff=0.0,
+        fidelity_samples=0,
+        submpo_method="src",
+        compression_seed=31,
+    )
+
+    assert out.max_bond() <= 4
+
+
+def test_mpo_optimizer_quimb_mode_preserves_dense_torch_backend():
+    """Quimb MPO modes operate on already-prepared non-NumPy gate arrays."""
+    torch = pytest.importorskip("torch")
+    backend = py.backend_torch(dtype=torch.complex128, device="cpu")
+    mpo = qtn.MPO_identity(5, dtype="complex128")
+    mpo.apply_to_arrays(backend)
+    gate = backend(qu.CNOT())
+
+    out = py.MpoOptimizer(
+        mpo,
+        gates=[(gate, (0, 4))],
+        chi=4,
+        mode="src",
+    ).run(cutoff=0.0, fidelity_samples=0, compression_seed=37)
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in out)
+    assert out.max_bond() <= 4
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_method", "expected_used"),
+    [
+        ("direct", None, False),
+        ("guess-src", "src", True),
+        ("guess_zipup", "zipup", True),
+    ],
+)
+def test_mpo_dmrg_fit_initial_guess_strategies(
+    strategy, expected_method, expected_used
+):
+    """MPO DMRG exposes the MPS-style disposable FIT guess policies."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_rand(5, bond_dim=1, phys_dim=2, dtype="complex128", seed=812),
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=4,
+        mode="dmrg2",
+    )
+
+    out = opt.run(
+        n_iter=2,
+        cutoff=0.0,
+        fidelity_samples=0,
+        fit_init_strategy=strategy,
+        fit_init_rand_strength=0.01,
+        fit_init_seed=19,
+    )
+
+    diagnostics = opt.get_fit_diagnostics()
+    assert out.max_bond() <= 4
+    assert diagnostics["fit_init_strategy"] == (
+        "guess_src" if strategy == "guess-src" else strategy
+    )
+    assert diagnostics["guess_method"] == expected_method
+    assert diagnostics["guess_used"] is expected_used
+    assert diagnostics["mpo_fit_guess_used"] is expected_used
+
+
+def test_mpo_dmrg_random_expand_fit_initial_guess_is_seeded():
+    """Random-expanded MPO FIT guesses grow only the disposable copy."""
+    initial = qtn.MPO_rand(
+        5, bond_dim=1, phys_dim=2, dtype="complex128", seed=813
+    )
+    opt = py.MpoOptimizer(
+        initial,
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=4,
+        mode="dmrg2",
+    )
+
+    out = opt.run(
+        n_iter=2,
+        cutoff=0.0,
+        fidelity_samples=0,
+        fit_init_strategy="random_expand",
+        fit_init_rand_strength=0.01,
+        fit_init_seed=23,
+    )
+
+    diagnostics = opt.get_fit_diagnostics()
+    assert out.max_bond() <= 4
+    assert diagnostics["fit_init_strategy"] == "random_expand"
+    assert diagnostics["guess_used"] is False
+    assert diagnostics["random_initialization"]["enabled"] is True
+    assert diagnostics["random_initialization"]["bonds"]
+    assert initial.max_bond() == 1
+
+
+@pytest.mark.parametrize(
     ("mode", "expected_block", "expected_warmup", "requested_warmup"),
     [
         ("dmrg1", 2, 2, 5),
@@ -722,6 +875,7 @@ def test_mpo_optimizer_reports_fit_controls_and_timing():
         fit_finite_check=True,
         timing=True,
         fit_collect_split_diagnostics=True,
+        fit_overlap_diagnostics=True,
     )
 
     fit_diagnostics = opt.get_fit_diagnostics()
@@ -730,6 +884,8 @@ def test_mpo_optimizer_reports_fit_controls_and_timing():
     assert fit_diagnostics["iterations"] >= 1
     assert fit_diagnostics["convergence_reason"] is not None
     assert fit_diagnostics["final_norm"] is not None
+    assert fit_diagnostics["fit_overlap_diagnostics"] is True
+    assert fit_diagnostics["fit_overlap_fidelity"] is not None
     assert fit_diagnostics["timing"]
     assert timing["status"] == "complete"
     assert timing["fit_calls"] == 1

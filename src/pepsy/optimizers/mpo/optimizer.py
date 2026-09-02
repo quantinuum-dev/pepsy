@@ -25,7 +25,11 @@ but differing in *how* local gate updates are compressed back to bond ``chi``:
   left-compress to ``chi``;
 * ``mode="mpo"``  — use :func:`pepsy.operators.gates.gate_nonlocal_opt` to
   apply each multi-site layer independently on the ket and bra families.
-  Symmray MPOs use the block-aware SVD path instead.
+  The bare Quimb compressor names (for example ``"src"``, ``"srcmps"``,
+  and ``"zipup"``) and their ``"quimb-"`` / ``"mpo-"`` spellings are
+  accepted as mode aliases. Use ``"quimb-fit"`` or ``"mpo-fit"`` for
+  Quimb's FIT compressor because bare ``"fit"`` remains the historical DMRG
+  alias. Symmray MPOs use the block-aware SVD path instead.
 
 The class also tracks a running "normalized-norm" proxy
 ``sqrt(<O|O> / <O0|O0>)`` that equals ``1`` for purely unitary two-sided
@@ -44,12 +48,60 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
+from ..._internal.random import backend_random_array
+from ..._internal.quimb import require_quimb_1d_compression_method
 from ..._internal.validation import normalize_integer_tuple
-from ...tensors.core import tn_norm
+from ...tensors.core import tn_fidelity, tn_norm
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
 __all__ = ["MpoChannelEvent", "MpoOptimizer"]
+
+
+# Keep this list aligned with MpsOptimizer's Quimb compression surface. These
+# methods are MPO-applicable because ``gate_nonlocal_opt`` compresses the
+# selected physical layer as a one-dimensional sub-MPO. MPS-only modes such as
+# ``mix``, ``su``, ``perm``, and ``swap`` deliberately remain state-specific.
+_MPO_COMPRESSION_METHODS = frozenset(
+    {
+        "direct",
+        "dm",
+        "zipup",
+        "zipup-first",
+        "zipup-oversample",
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "sdc",
+        "sdc-oversample",
+        "fit",
+        "fit-zipup",
+        "fit-projector",
+        "fit-oversample",
+    }
+)
+_FIT_INIT_STRATEGIES = frozenset(
+    {"auto", "direct", "random", "random_expand", "svd_guess"}
+    | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
+)
+_DEFAULT_FIT_INIT_STRATEGY = "guess_src"
+_MPO_METHODS_IGNORE_CUTOFF_MODE = frozenset({"src", "srcmps"})
+_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps"})
+_MPO_METHODS_USE_SEED = frozenset(
+    {
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit",
+        "fit-oversample",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -258,10 +310,12 @@ class MpoOptimizer:
         ``chi`` with an empty gate queue.
     chi : int
         Working bond dimension used by all compression backends.
-    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo"}, default="dmrg"
-        Execution backend for local updates (see module docstring). The dense
-        ``mode="mpo"`` path supports arbitrary one-dimensional gate supports;
-        ``"svd"`` and ``"dmrg"`` retain their one- and two-site update paths.
+    mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo", "quimb-<method>"}, default="dmrg"
+        Execution backend for local updates (see module docstring). Bare
+        Quimb compression methods such as ``"src"`` are accepted as aliases
+        for ``"quimb-src"``. The dense Quimb path supports arbitrary
+        one-dimensional gate supports; ``"svd"`` and ``"dmrg"`` retain
+        their one- and two-site update paths.
     ind_id_k : str, default="k{}"
         Site-index format string for the ket physical leg family.
     ind_id_b : str, default="b{}"
@@ -289,7 +343,18 @@ class MpoOptimizer:
 
     _DMRG_MODE_ALIASES = {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3}
     _ALLOWED_MODES = frozenset(
-        {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo"}
+        {
+            "dmrg",
+            "dmrg1",
+            "dmrg2",
+            "dmrg3",
+            "svd",
+            "mpo",
+            "quimb",
+        }
+        | _MPO_COMPRESSION_METHODS
+        | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
+        | {f"quimb-{method}" for method in _MPO_COMPRESSION_METHODS}
     )
 
     @staticmethod
@@ -354,12 +419,79 @@ class MpoOptimizer:
         mode_norm = str(mode).strip().lower()
         # Keep one maintained DMRG/FIT implementation while retaining the
         # requested named schedule separately in ``_dmrg_mode_alias``.
-        if mode_norm in cls._DMRG_MODE_ALIASES:
+        if mode_norm == "fit" or mode_norm in cls._DMRG_MODE_ALIASES:
             mode_norm = "dmrg"
+        elif mode_norm in _MPO_COMPRESSION_METHODS:
+            mode_norm = f"quimb-{mode_norm}"
         if mode_norm not in cls._ALLOWED_MODES:
             supported = ", ".join(sorted(cls._ALLOWED_MODES))
             raise ValueError(f"Unknown mode: {mode}. Supported modes: {supported}")
         return mode_norm
+
+    @classmethod
+    def _is_mpo_mode(cls, mode):
+        """Return whether ``mode`` selects Quimb sub-MPO compression."""
+        mode_norm = str(mode).strip().lower()
+        return (
+            mode_norm in {"mpo", "quimb"}
+            or mode_norm in _MPO_COMPRESSION_METHODS - {"fit"}
+            or mode_norm.startswith(("mpo-", "quimb-"))
+        )
+
+    @classmethod
+    def _mode_mpo_method(cls, mode):
+        """Return the Quimb compressor encoded by an MPO mode name."""
+        mode_norm = str(mode).strip().lower()
+        if mode_norm in {"mpo", "quimb"}:
+            return "direct"
+        if mode_norm in _MPO_COMPRESSION_METHODS - {"fit"}:
+            return cls._normalize_submpo_method(mode_norm)
+        for prefix in ("quimb-", "mpo-"):
+            if mode_norm.startswith(prefix):
+                return cls._normalize_submpo_method(mode_norm[len(prefix) :])
+        return "direct"
+
+    def _resolve_mpo_method(self, method):
+        """Resolve an explicit compressor or the current MPO mode."""
+        if method is None:
+            return self._mode_mpo_method(self.mode)
+        return self._normalize_submpo_method(method)
+
+    @classmethod
+    def _normalize_submpo_method(cls, method):
+        """Validate and normalize a Quimb sub-MPO compression method."""
+        method_norm = str(method).strip().lower()
+        if method_norm not in _MPO_COMPRESSION_METHODS:
+            raise ValueError(f"Unknown subMPO method: {method}")
+        require_quimb_1d_compression_method(method_norm)
+        return method_norm
+
+    @staticmethod
+    def _submpo_compress_options(method, *, cutoff, cutoff_mode, max_bond, seed):
+        """Build compressor options compatible with the selected Quimb method."""
+        options = {
+            "max_bond": max_bond,
+            "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff,
+        }
+        if cutoff_mode is not None and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE:
+            options["cutoff_mode"] = cutoff_mode
+        if seed is not None and method in _MPO_METHODS_USE_SEED:
+            options["seed"] = int(seed)
+        return options
+
+    @staticmethod
+    def _validate_fit_init_strategy(strategy):
+        """Normalize the FIT initial-guess construction policy."""
+        strategy = str(strategy).strip().lower()
+        if strategy.startswith("guess-"):
+            strategy = "guess_" + strategy[len("guess-") :]
+        strategy = {"mpo": "svd_guess"}.get(strategy, strategy)
+        if strategy not in _FIT_INIT_STRATEGIES:
+            raise ValueError(
+                "fit_init_strategy must be one of 'auto', 'direct', "
+                "'random', 'random_expand', or 'guess-<method>'."
+            )
+        return strategy
 
     @classmethod
     def _dmrg_alias_block_size(cls, mode):
@@ -1278,8 +1410,11 @@ class MpoOptimizer:
         cutoff_mode="rsum2",
         layer_order="upper_lower",
         max_bond=None,
+        method="direct",
+        seed=None,
     ):
         """Apply and compress both physical MPO layers in a chosen order."""
+        method = self._normalize_submpo_method(method)
         g_k, g_b = self._prepare_nonlocal_gate_pair(
             gate,
             len(where),
@@ -1301,19 +1436,24 @@ class MpoOptimizer:
             payload = prepared[which]
             if payload is None:
                 continue
+            compress_options = self._submpo_compress_options(
+                method,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                max_bond=max_bond,
+                seed=seed,
+            )
             p = gate_nonlocal_opt(
                 p,
                 payload,
                 where,
                 which=which,
-                method="direct",
+                method=method,
                 info={},
                 inplace=True,
                 ind_id_k=self.ind_id_k,
                 ind_id_b=self.ind_id_b,
-                max_bond=max_bond,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
+                **compress_options,
             )
         return p
 
@@ -1326,11 +1466,19 @@ class MpoOptimizer:
         cutoff,
         cutoff_mode="rsum2",
         layer_order="lower_upper",
+        method="src",
+        seed=None,
     ):
-        """Build a capped MPO replay to initialize a local MPO FIT update."""
+        """Build a capped compressed MPO replay for a local FIT guess.
+
+        The replay is deliberately isolated from both the exact FIT target and
+        the live MPO. ``method`` therefore controls only the disposable warm
+        start, while FIT still receives the uncapped target built by the DMRG
+        target path.
+        """
         guess = p.copy()
         active_sites = []
-        for G_i, where_i in zip(batch_G, batch_where):
+        for index, (G_i, where_i) in enumerate(zip(batch_G, batch_where)):
             gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
             active_sites.extend(where)
             if len(where) == 1:
@@ -1354,11 +1502,271 @@ class MpoOptimizer:
                     cutoff_mode=cutoff_mode,
                     layer_order=layer_order,
                     max_bond=self.chi,
+                    method=method,
+                    seed=None if seed is None else int(seed) + index,
                 )
         if active_sites:
             xmin, xmax = min(active_sites), max(active_sites)
             guess.canonize([xmax], cur_orthog=(xmin, xmax))
         return guess
+
+    @staticmethod
+    def _fit_random_data(data, shape, *, strength, rng):
+        """Generate deterministic random data on the tensor's backend."""
+        dtype_name = str(getattr(data, "dtype", "float64")).lower()
+        if "complex64" in dtype_name:
+            dtype = np.complex64
+        elif "complex" in dtype_name:
+            dtype = np.complex128
+        elif "float32" in dtype_name:
+            dtype = np.float32
+        else:
+            dtype = np.float64
+        return backend_random_array(
+            shape,
+            like=data,
+            dtype=dtype,
+            scale=float(strength),
+            rng=rng,
+        )
+
+    def _build_randomized_fit_guess(
+        self,
+        p,
+        where,
+        *,
+        block_size,
+        rand_strength,
+        expand=True,
+        seed=0,
+    ):
+        """Prepare a dense MPO FIT guess with deterministic random data.
+
+        The exact target is always constructed from the unmodified live MPO.
+        Random data is restricted to the disposable guess: ``random``
+        perturbs existing active tensors, while ``random_expand`` also adds
+        directions on active bonds below their physical/``chi`` ceiling.
+        Native Symmray data is left to its block-aware FIT warm start because
+        dense random padding would destroy charge-sector metadata.
+        """
+        info = {
+            "enabled": False,
+            "rand_strength": float(rand_strength),
+            "bonds": [],
+            "sites": [],
+            "expanded": bool(expand),
+            "reason": None,
+        }
+        if int(block_size) not in {2, 3}:
+            info["reason"] = "one_site_fit"
+            return p, info
+        if self._has_symmray_data(p) or any(
+            self._is_fermionic_array(tensor.data) for tensor in p
+        ):
+            info["reason"] = "native_sector_growth"
+            return p, info
+        if float(rand_strength) == 0.0:
+            info["reason"] = "disabled"
+            return p, info
+
+        xmin, xmax = min(where), max(where)
+        guess = p.copy()
+        rng = np.random.default_rng(int(seed))
+        bonds = []
+        if expand:
+            target_sizes = FIT._active_bond_rank_targets(  # pylint: disable=protected-access
+                p,
+                xmin,
+                xmax,
+                self.chi,
+            )
+            if target_sizes is None:
+                info["reason"] = "no_active_rank_targets"
+                return p, info
+            for site, target_size in zip(range(xmin, xmax), target_sizes):
+                current_size = int(p.bond_size(site, site + 1))
+                target_size = int(target_size)
+                if current_size < target_size:
+                    bonds.append((site, current_size, target_size))
+            if not bonds:
+                info["reason"] = "already_at_target"
+                return p, info
+
+            import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+            by_target = {}
+            for site, current_size, target_size in bonds:
+                by_target.setdefault(target_size, []).append(
+                    (site, current_size, target_size)
+                )
+            for target_size, target_bonds in by_target.items():
+                bond_inds = [
+                    guess.bond(site, site + 1)
+                    for site, _, _ in target_bonds
+                ]
+                qtn.TensorNetwork.expand_bond_dimension(
+                    guess,
+                    target_size,
+                    mode="zeros",
+                    inds_to_expand=bond_inds,
+                    inplace=True,
+                )
+                for site, current_size, _ in target_bonds:
+                    bond = guess.bond(site, site + 1)
+                    for tensor in guess.tensors:
+                        if bond not in tensor.inds:
+                            continue
+                        axis = tensor.inds.index(bond)
+                        old_slices = [slice(None)] * tensor.ndim
+                        old_slices[axis] = slice(0, current_size)
+                        old_data = tensor.data[tuple(old_slices)]
+                        random_shape = list(tensor.shape)
+                        random_shape[axis] = target_size - current_size
+                        random_data = self._fit_random_data(
+                            tensor.data,
+                            random_shape,
+                            strength=rand_strength,
+                            rng=rng,
+                        )
+                        tensor.modify(
+                            data=ar.do(
+                                "concatenate",
+                                (old_data, random_data),
+                                axis=axis,
+                            )
+                        )
+        else:
+            for site in range(xmin, xmax + 1):
+                tensor = guess[site]
+                random_data = self._fit_random_data(
+                    tensor.data,
+                    tensor.shape,
+                    strength=rand_strength,
+                    rng=rng,
+                )
+                tensor.modify(data=ar.do("add", tensor.data, random_data))
+                info["sites"].append(int(site))
+
+        guess.canonize([xmax], cur_orthog=(xmin, xmax))
+        info["enabled"] = True
+        info["bonds"] = [
+            {
+                "bond": int(site),
+                "current_rank": int(current_size),
+                "target_rank": int(target_size),
+                "new_rank": int(guess.bond_size(site, site + 1)),
+            }
+            for site, current_size, target_size in bonds
+        ]
+        return guess, info
+
+    def _prepare_fit_initial_guess(
+        self,
+        p,
+        gates,
+        wheres,
+        *,
+        block_size,
+        strategy,
+        fit_mpo_guess,
+        rand_strength,
+        seed,
+        cutoff,
+        cutoff_mode,
+        layer_order="lower_upper",
+    ):
+        """Select a disposable FIT initial guess for an MPO update."""
+        requested_strategy = self._validate_fit_init_strategy(strategy)
+        random_info = {
+            "enabled": False,
+            "rand_strength": float(rand_strength),
+            "bonds": [],
+            "sites": [],
+            "expanded": False,
+            "reason": "direct",
+        }
+        result = {
+            "fit_guess": p,
+            "strategy": "direct",
+            "requested_strategy": requested_strategy,
+            "guess_method": None,
+            "guess_used": False,
+            "svd_guess_used": False,
+            "guess_backend": None,
+            "random_initialization": random_info,
+        }
+
+        # Symmray/fermionic MPOs must retain their native sectors. The native
+        # FIT kernel already grows and splits those sectors safely, so a dense
+        # Quimb source or random guess is not a valid substitution here.
+        if self._has_symmray_data(p) or any(
+            self._is_fermionic_array(tensor.data) for tensor in p
+        ):
+            random_info["reason"] = "native_sector_growth"
+            return result
+
+        if requested_strategy == "auto":
+            selected_strategy = _DEFAULT_FIT_INIT_STRATEGY
+        else:
+            selected_strategy = requested_strategy
+
+        # Preserve the established legacy switch: disabling ``fit_mpo_guess``
+        # disables the implicit default source guess for named schedules, but
+        # never overrides an explicit fit_init_strategy choice.
+        is_named_window = self._dmrg_mode_alias in {"dmrg1", "dmrg2", "dmrg3"}
+        raw_strategy = str(strategy).strip().lower()
+        if (
+            not fit_mpo_guess
+            and is_named_window
+            and raw_strategy in {"auto", _DEFAULT_FIT_INIT_STRATEGY, "guess-src"}
+        ):
+            selected_strategy = "direct"
+
+        if selected_strategy == "svd_guess":
+            guess_method = "direct"
+        elif selected_strategy.startswith("guess_"):
+            guess_method = selected_strategy[len("guess_") :]
+        else:
+            guess_method = None
+
+        if guess_method is not None:
+            fit_guess = self._build_mpo_fit_guess(
+                p,
+                gates,
+                wheres,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                layer_order=layer_order,
+                method=guess_method,
+                seed=seed,
+            )
+            result.update(
+                fit_guess=fit_guess,
+                strategy=selected_strategy,
+                guess_method=guess_method,
+                guess_used=True,
+                svd_guess_used=True,
+                guess_backend=f"quimb-{guess_method}",
+            )
+            random_info["reason"] = selected_strategy
+            return result
+
+        if selected_strategy in {"random", "random_expand"}:
+            start = min(site for where in wheres for site in where)
+            stop = max(site for where in wheres for site in where)
+            fit_guess, random_info = self._build_randomized_fit_guess(
+                p,
+                (start, stop),
+                block_size=block_size,
+                rand_strength=rand_strength,
+                expand=selected_strategy == "random_expand",
+                seed=int(seed),
+            )
+            result["fit_guess"] = fit_guess
+            result["strategy"] = selected_strategy
+            result["random_initialization"] = random_info
+
+        return result
 
     @staticmethod
     def _parse_gate_entry(G_i, where_i):
@@ -1791,6 +2199,33 @@ class MpoOptimizer:
             at_target = False
         return 1 if at_target else active
 
+    def _fit_overlap_diagnostics(self, target, fitted):
+        """Return an optional direct overlap readout against a FIT target."""
+        contraction_opt = self.contraction_opt
+        if contraction_opt is None or (
+            isinstance(contraction_opt, str)
+            and contraction_opt.strip().lower() in {"auto", "auto-hq"}
+        ):
+            contraction_opt = "greedy"
+        try:
+            overlap = tn_fidelity(
+                target.copy(),
+                fitted.copy(),
+                contraction_opt=contraction_opt,
+            )
+            overlap = float(ar.do("real", overlap))
+            return {
+                "fit_overlap_fidelity": overlap,
+                "fit_overlap_infidelity": max(0.0, 1.0 - overlap),
+                "fit_overlap_error": None,
+            }
+        except Exception as exc:  # diagnostic only; FIT result remains valid
+            return {
+                "fit_overlap_fidelity": None,
+                "fit_overlap_infidelity": None,
+                "fit_overlap_error": f"{type(exc).__name__}: {exc}",
+            }
+
     def _record_fit_diagnostics(
         self,
         fit,
@@ -1800,8 +2235,13 @@ class MpoOptimizer:
         step,
         mpo_fit_guess_used=False,
         mpo_fit_guess_order=None,
+        fit_initialization=None,
+        fit_overlap=None,
+        fit_overlap_diagnostics=False,
     ):
         """Store a compact diagnostic record for the latest MPO FIT call."""
+        fit_initialization = dict(fit_initialization or {})
+        fit_overlap = dict(fit_overlap or {})
         record = {
             "step": int(step),
             "where": tuple(int(site) for site in where),
@@ -1819,6 +2259,29 @@ class MpoOptimizer:
             ),
             "mpo_fit_guess_used": bool(mpo_fit_guess_used),
             "mpo_fit_guess_order": mpo_fit_guess_order,
+            "svd_guess_used": bool(
+                fit_initialization.get("svd_guess_used", False)
+            ),
+            "fit_init_strategy": fit_initialization.get(
+                "strategy", "direct"
+            ),
+            "fit_init_strategy_requested": fit_initialization.get(
+                "requested_strategy", "direct"
+            ),
+            "guess_used": bool(fit_initialization.get("guess_used", False)),
+            "guess_method": fit_initialization.get("guess_method"),
+            "guess_backend": fit_initialization.get("guess_backend"),
+            "random_initialization": fit_initialization.get(
+                "random_initialization",
+                {
+                    "enabled": False,
+                    "reason": "direct",
+                },
+            ),
+            "fit_overlap_diagnostics": bool(fit_overlap_diagnostics),
+            "fit_overlap_fidelity": fit_overlap.get("fit_overlap_fidelity"),
+            "fit_overlap_infidelity": fit_overlap.get("fit_overlap_infidelity"),
+            "fit_overlap_error": fit_overlap.get("fit_overlap_error"),
         }
         timing_records = getattr(fit, "_take_timing_records", None)
         if callable(timing_records):
@@ -2141,6 +2604,10 @@ class MpoOptimizer:
         fit_target_strategy="auto",
         fit_mpo_guess=True,
         fit_mpo_guess_order="lower_upper",
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=0.0,
+        fit_init_seed=0,
+        fit_overlap_diagnostics=False,
         transactional_steps=True,
         fit_fallback=None,
     ):
@@ -2169,6 +2636,18 @@ class MpoOptimizer:
         fit_mpo_guess_order = self._validate_fit_mpo_guess_order(
             fit_mpo_guess_order
         )
+        fit_init_strategy = self._validate_fit_init_strategy(fit_init_strategy)
+        fit_init_rand_strength = float(fit_init_rand_strength)
+        if not np.isfinite(fit_init_rand_strength) or fit_init_rand_strength < 0.0:
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            )
+        if not isinstance(fit_init_seed, Integral) or isinstance(fit_init_seed, bool):
+            raise ValueError("fit_init_seed must be an integer.")
+        fit_init_seed = int(fit_init_seed)
+        if fit_init_seed < 0:
+            raise ValueError("fit_init_seed must be non-negative.")
+        fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
         transactional_steps = bool(transactional_steps)
 
         p = self.p
@@ -2257,15 +2736,20 @@ class MpoOptimizer:
                 direct_runner = self._run_mpo if (
                     fit_fallback == "mpo" and not self._has_symmray_data(p)
                 ) else self._run_svd
-                direct_runner(
-                    G_seq[step_start:step_end],
-                    where_seq[step_start:step_end],
+                direct_kwargs = dict(
                     progbar=False,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     fidelity_samples=0,
                     finite_check=finite_check,
                     fit_target_strategy=fit_target_strategy,
+                )
+                if fit_fallback == "mpo" and not self._has_symmray_data(p):
+                    direct_kwargs["method"] = "direct"
+                direct_runner(
+                    G_seq[step_start:step_end],
+                    where_seq[step_start:step_end],
+                    **direct_kwargs,
                 )
                 p = self.p
                 self.fallback_events.append(
@@ -2363,36 +2847,25 @@ class MpoOptimizer:
                         xmax,
                         fit_block_size,
                     )
-                    mpo_fit_guess_used = False
-                    fit_guess = p
-                    is_named_mpo_guess_window = (
-                        (
-                            self._dmrg_mode_alias == "dmrg1"
-                            and active_fit_block_size == 2
-                        )
-                        or (
-                            self._dmrg_mode_alias == "dmrg3"
-                            and active_fit_block_size == 3
-                        )
+                    fit_initialization = self._prepare_fit_initial_guess(
+                        p,
+                        [G_seq[idx]],
+                        [where],
+                        block_size=active_fit_block_size,
+                        strategy=fit_init_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        rand_strength=fit_init_rand_strength,
+                        seed=(
+                            int(fit_init_seed)
+                            + 1000003 * int(idx)
+                            + 1009 * int(xmin)
+                            + int(xmax)
+                        ),
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        layer_order=fit_mpo_guess_order,
                     )
-                    if (
-                        fit_mpo_guess
-                        and is_named_mpo_guess_window
-                        and not self._has_symmray_data(p)
-                        and not any(
-                            self._is_fermionic_array(tensor.data)
-                            for tensor in p
-                        )
-                    ):
-                        fit_guess = self._build_mpo_fit_guess(
-                            p,
-                            [G_seq[idx]],
-                            [where],
-                            cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                            layer_order=fit_mpo_guess_order,
-                        )
-                        mpo_fit_guess_used = True
+                    fit_guess = fit_initialization["fit_guess"]
                     fit = FIT(
                         p_g,
                         p=fit_guess,
@@ -2429,17 +2902,27 @@ class MpoOptimizer:
                             target_norm=expected_norm,
                             where=(xmin, xmax),
                         )
+                        fit_overlap = (
+                            self._fit_overlap_diagnostics(p_g, fit.p)
+                            if fit_overlap_diagnostics
+                            else {}
+                        )
                         self._record_fit_diagnostics(
                             fit,
                             where=(xmin, xmax),
                             block_size=active_fit_block_size,
                             step=idx + 1,
-                            mpo_fit_guess_used=mpo_fit_guess_used,
+                            mpo_fit_guess_used=fit_initialization[
+                                "svd_guess_used"
+                            ],
                             mpo_fit_guess_order=(
                                 fit_mpo_guess_order
-                                if mpo_fit_guess_used
+                                if fit_initialization["svd_guess_used"]
                                 else None
                             ),
+                            fit_initialization=fit_initialization,
+                            fit_overlap=fit_overlap,
+                            fit_overlap_diagnostics=fit_overlap_diagnostics,
                         )
                         idx += 1
                         advanced = 1
@@ -2483,36 +2966,25 @@ class MpoOptimizer:
                         xmax,
                         fit_block_size,
                     )
-                    mpo_fit_guess_used = False
-                    fit_guess = p
-                    is_named_mpo_guess_window = (
-                        (
-                            self._dmrg_mode_alias == "dmrg1"
-                            and active_fit_block_size == 2
-                        )
-                        or (
-                            self._dmrg_mode_alias == "dmrg3"
-                            and active_fit_block_size == 3
-                        )
+                    fit_initialization = self._prepare_fit_initial_guess(
+                        p,
+                        batch_G,
+                        batch_where,
+                        block_size=active_fit_block_size,
+                        strategy=fit_init_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        rand_strength=fit_init_rand_strength,
+                        seed=(
+                            int(fit_init_seed)
+                            + 1000003 * int(idx)
+                            + 1009 * int(xmin)
+                            + int(xmax)
+                        ),
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        layer_order=fit_mpo_guess_order,
                     )
-                    if (
-                        fit_mpo_guess
-                        and is_named_mpo_guess_window
-                        and not self._has_symmray_data(p)
-                        and not any(
-                            self._is_fermionic_array(tensor.data)
-                            for tensor in p
-                        )
-                    ):
-                        fit_guess = self._build_mpo_fit_guess(
-                            p,
-                            batch_G,
-                            batch_where,
-                            cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                            layer_order=fit_mpo_guess_order,
-                        )
-                        mpo_fit_guess_used = True
+                    fit_guess = fit_initialization["fit_guess"]
                     fit = FIT(
                         p_g,
                         p=fit_guess,
@@ -2549,17 +3021,27 @@ class MpoOptimizer:
                             target_norm=expected_norm,
                             where=(xmin, xmax),
                         )
+                        fit_overlap = (
+                            self._fit_overlap_diagnostics(p_g, fit.p)
+                            if fit_overlap_diagnostics
+                            else {}
+                        )
                         self._record_fit_diagnostics(
                             fit,
                             where=(xmin, xmax),
                             block_size=active_fit_block_size,
                             step=idx + 1,
-                            mpo_fit_guess_used=mpo_fit_guess_used,
+                            mpo_fit_guess_used=fit_initialization[
+                                "svd_guess_used"
+                            ],
                             mpo_fit_guess_order=(
                                 fit_mpo_guess_order
-                                if mpo_fit_guess_used
+                                if fit_initialization["svd_guess_used"]
                                 else None
                             ),
+                            fit_initialization=fit_initialization,
+                            fit_overlap=fit_overlap,
+                            fit_overlap_diagnostics=fit_overlap_diagnostics,
                         )
                         advanced = next_idx - idx
                         idx = next_idx
@@ -2765,14 +3247,17 @@ class MpoOptimizer:
         fidelity_samples=10,
         finite_check=False,
         fit_target_strategy="auto",
+        method=None,
+        compression_seed=None,
     ):
         """Sweep the gate stream with :func:`gate_nonlocal_opt` compression.
 
         Multi-site gates are routed through ``gate_nonlocal_opt`` independently
-        on the upper (ket) and lower (bra) MPO families using
-        ``method="direct"``. One-site gates are applied directly via
+        on the upper (ket) and lower (bra) MPO families using the selected
+        Quimb compressor. One-site gates are applied directly via
         :meth:`_apply_gate_pair`.
         """
+        method = self._resolve_mpo_method(method)
         p = self.p
         two_qubit_count = 0
         nonlocal_count = 0
@@ -2872,22 +3357,42 @@ class MpoOptimizer:
                     ind_id=self.ind_id_k,
                 )
                 if g_k is not None:
+                    compress_options = self._submpo_compress_options(
+                        method,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        max_bond=self.chi,
+                        seed=(
+                            None
+                            if compression_seed is None
+                            else int(compression_seed) + int(idx)
+                        ),
+                    )
                     p = gate_nonlocal_opt(
                         p, g_k, where,
-                        which="upper", method="direct",
+                        which="upper", method=method,
                         info=self.info_c, inplace=True,
                         ind_id_k=self.ind_id_k, ind_id_b=self.ind_id_b,
-                        max_bond=self.chi, cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
+                        **compress_options,
                     )
                 if g_b is not None:
+                    compress_options = self._submpo_compress_options(
+                        method,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        max_bond=self.chi,
+                        seed=(
+                            None
+                            if compression_seed is None
+                            else int(compression_seed) + int(idx)
+                        ),
+                    )
                     p = gate_nonlocal_opt(
                         p, g_b, where,
-                        which="lower", method="direct",
+                        which="lower", method=method,
                         info=self.info_c, inplace=True,
                         ind_id_k=self.ind_id_k, ind_id_b=self.ind_id_b,
-                        max_bond=self.chi, cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
+                        **compress_options,
                     )
                 self.p = p
                 if expected_norm is not None:
@@ -2931,6 +3436,8 @@ class MpoOptimizer:
         n_iter=6,
         *,
         mode=None,
+        compression_seed=None,
+        submpo_method=None,
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
@@ -2953,6 +3460,10 @@ class MpoOptimizer:
         fit_target_strategy="auto",
         fit_mpo_guess=True,
         fit_mpo_guess_order="lower_upper",
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_rand_strength=0.0,
+        fit_init_seed=0,
+        fit_overlap_diagnostics=False,
         layout=None,
         layout_order="quality",
         layout_kwargs=None,
@@ -2968,8 +3479,18 @@ class MpoOptimizer:
         n_iter : int, default=6
             Inner iterations for DMRG ``FIT`` updates on two-site gates.
             Ignored by ``svd`` mode.
-        mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo"} | None, default=None
-            Optional mode override for this run.
+        mode : {"dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "mpo", "quimb-<method>"} | None, default=None
+            Optional mode override for this run. Bare Quimb method names
+            such as ``"src"`` are accepted as aliases for ``"quimb-src"``.
+        compression_seed : int | None, default=None
+            Deterministic seed forwarded to randomized Quimb compression modes
+            such as ``"src"`` and ``"fit"``. The gate position is mixed into
+            the per-update seed.
+        submpo_method : str | None, default=None
+            Optional Quimb compression override for an MPO-mode run. This is
+            the MPO analogue of `MpsOptimizer`'s ``submpo_method``; for
+            example, ``mode="mpo", submpo_method="src"`` is equivalent to
+            ``mode="src"``.
         progbar : bool, default=False
             Show tqdm progress bar.
         cutoff : float | {"auto"}, default=1e-12
@@ -3030,15 +3551,33 @@ class MpoOptimizer:
             Dense MPO targets use lazy layered gate tensors by default;
             native Symmray targets use the block-aware MPO representation.
         fit_mpo_guess : bool, default=True
-            For dense named DMRG1 and DMRG3 growth windows, initialize FIT
-            from an isolated, chi-capped direct MPO replay of the current
-            gate batch. This does not replace the exact FIT target or live
-            MPO. Native Symmray MPOs retain their native warm-start path.
+            Legacy compatibility switch for the implicit ``"guess-src"``
+            initial-guess policy in named DMRG windows. This does not replace
+            the exact FIT target or live MPO. Set ``fit_init_strategy``
+            explicitly to control all windows.
         fit_mpo_guess_order : {"lower_upper", "upper_lower"}, default="lower_upper"
             Layer order for the isolated MPO guess. ``"lower_upper"`` means
             bra then ket; ``"upper_lower"`` means ket then bra. In this API
             the lower layer is bra and the upper layer is ket. Aliases
             ``"bra_ket"`` and ``"ket_bra"`` are accepted.
+        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}, default="guess-src"
+            Select the disposable FIT initial guess. ``"direct"`` uses the
+            current MPO, ``"random"`` perturbs existing active tensors,
+            ``"random_expand"`` also seeds newly expanded active bonds, and
+            ``"guess-<method>"`` uses a Quimb compressor such as
+            ``"guess-src"`` on an isolated MPO replay. ``"auto"`` selects
+            ``"guess-src"``. Native Symmray/fermionic MPOs retain their
+            sector-preserving direct FIT warm start.
+        fit_init_rand_strength : float, default=0.0
+            Noise scale used by the explicit ``"random"`` and
+            ``"random_expand"`` initial-guess strategies.
+        fit_init_seed : int, default=0
+            Deterministic seed for randomized FIT guesses and Quimb source
+            compression methods used by ``fit_init_strategy``.
+        fit_overlap_diagnostics : bool, default=False
+            Contract each successful fitted MPO against its disposable exact
+            target and record target-overlap fidelity. This adds one extra
+            tensor-network contraction per FIT update.
         layout : mapping | sequence | str | None, default=None
             Optional persistent logical-to-physical layout. A string selects a
             gate-stream layout order; a mapping or sequence supplies an
@@ -3112,6 +3651,29 @@ class MpoOptimizer:
         fit_mpo_guess_order = self._validate_fit_mpo_guess_order(
             fit_mpo_guess_order
         )
+        fit_init_strategy = self._validate_fit_init_strategy(fit_init_strategy)
+        fit_init_rand_strength = float(fit_init_rand_strength)
+        if not np.isfinite(fit_init_rand_strength) or fit_init_rand_strength < 0.0:
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            )
+        if not isinstance(fit_init_seed, Integral) or isinstance(fit_init_seed, bool):
+            raise ValueError("fit_init_seed must be an integer.")
+        fit_init_seed = int(fit_init_seed)
+        if fit_init_seed < 0:
+            raise ValueError("fit_init_seed must be non-negative.")
+        fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        if compression_seed is not None:
+            if not isinstance(compression_seed, Integral) or isinstance(
+                compression_seed, bool
+            ):
+                raise ValueError("compression_seed must be an integer or None.")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError("compression_seed must be non-negative.")
+        mpo_method_override = None
+        if submpo_method is not None:
+            mpo_method_override = self._normalize_submpo_method(submpo_method)
         atomic = bool(atomic)
         timing = bool(timing)
         timing_sync_device = bool(timing_sync_device)
@@ -3223,6 +3785,10 @@ class MpoOptimizer:
                     fit_target_strategy=fit_target_strategy,
                     fit_mpo_guess=fit_mpo_guess,
                     fit_mpo_guess_order=fit_mpo_guess_order,
+                    fit_init_strategy=fit_init_strategy,
+                    fit_init_rand_strength=fit_init_rand_strength,
+                    fit_init_seed=fit_init_seed,
+                    fit_overlap_diagnostics=fit_overlap_diagnostics,
                     transactional_steps=transactional_steps,
                     fit_fallback=fit_fallback,
                 )
@@ -3327,7 +3893,7 @@ class MpoOptimizer:
             }
             return self.p
 
-        if self.mode == "mpo":
+        if self._is_mpo_mode(self.mode):
             # ``gate_nonlocal_opt`` creates a dense auxiliary sub-MPO and its
             # generic compression currently loses multi-sector Symmray bond
             # metadata. Reuse the block-aware local SVD route for these MPOs.
@@ -3369,6 +3935,12 @@ class MpoOptimizer:
                     fidelity_samples=fidelity_samples,
                     finite_check=fit_finite_check,
                     fit_target_strategy=fit_target_strategy,
+                    method=(
+                        mpo_method_override
+                        if mpo_method_override is not None
+                        else self._mode_mpo_method(self.mode)
+                    ),
+                    compression_seed=compression_seed,
                 )
             except Exception as exc:
                 self.last_run_status = "failed"

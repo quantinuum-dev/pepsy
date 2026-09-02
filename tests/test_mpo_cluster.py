@@ -405,6 +405,61 @@ def test_exp_mpo_cluster_matches_term_centric_exp_mpo_surface():
     assert result.pepsy_cluster_metadata["cluster_mode"] == "interval"
 
 
+def test_exp_mpo_cluster_infers_chain_or_coordinate_terms_and_mapper():
+    """The facade maps coordinates internally while preserving 1D terms."""
+    coordinate_terms = [
+        (("zz", 0.7), ((0, 0), (1, 0))),
+        (("x", -0.2), (1, 1)),
+    ]
+    common = {
+        "step": 0.01,
+        "shape": (2, 2),
+        "graph": "square",
+        "cyclic": False,
+        "cluster_size": 2,
+        "cutoff": 0.0,
+        "graph_assembly": "bounded",
+        "max_collection_order": 1,
+    }
+    inferred = exp_mpo_cluster(coordinate_terms, **common)
+    inferred_shape = exp_mpo_cluster(
+        coordinate_terms,
+        **{key: value for key, value in common.items() if key != "shape"},
+    )
+    mapper = OneDMap(2, 2, mode="snake")
+    _chain_to_lattice, lattice_to_chain = mapper.build()
+    mapped_terms = [
+        (("zz", 0.7), (lattice_to_chain[(0, 0)], lattice_to_chain[(1, 0)])),
+        (("x", -0.2), lattice_to_chain[(1, 1)]),
+    ]
+    explicit_mapper = exp_mpo_cluster(
+        mapped_terms,
+        mapper=mapper,
+        **common,
+    )
+
+    np.testing.assert_allclose(
+        inferred.to_dense(),
+        inferred_shape.to_dense(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        inferred.to_dense(),
+        explicit_mapper.to_dense(),
+        atol=1.0e-12,
+    )
+
+    chain = exp_mpo_cluster(
+        [(("zz", 0.7), (0, 1)), (("x", -0.2), 2)],
+        0.01,
+        shape=3,
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    assert chain.L == 3
+    assert chain.pepsy_cluster_metadata["cluster_mode"] == "interval"
+
+
 def test_exp_mpo_cluster_preserves_requested_backend_and_coefficients():
     """The term facade applies ``to_backend`` before local cluster work."""
     torch = pytest.importorskip("torch")
@@ -557,6 +612,37 @@ def test_exp_mpo_cluster_accepts_square_graph_shorthand_and_cyclic_edges():
     np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
 
 
+def test_exp_mpo_cluster_auto_graph_follows_term_location_mode():
+    """The compact auto graph selects chain or square from parsed terms."""
+    lattice_terms = [
+        (("XX", 0.2), ((0, 0), (1, 0))),
+        (("X", -0.1), (0, 1)),
+    ]
+    lattice, lattice_report = exp_mpo_cluster(
+        lattice_terms,
+        0.01,
+        shape=(2, 2),
+        graph="auto",
+        cluster_size=2,
+        cutoff=0.0,
+        return_report=True,
+    )
+    assert lattice_report.cluster_mode == "graph"
+    assert lattice.pepsy_cluster_metadata["graph_inferred"] == "square"
+
+    chain, chain_report = exp_mpo_cluster(
+        [(("XX", 0.2), (0, 1)), (("X", -0.1), 0)],
+        0.01,
+        shape=2,
+        graph="auto",
+        cluster_size=2,
+        cutoff=0.0,
+        return_report=True,
+    )
+    assert chain_report.cluster_mode == "graph"
+    assert chain.pepsy_cluster_metadata["graph_inferred"] == "chain"
+
+
 def test_interval_cluster_expansion_keeps_explicit_string_operators():
     """Term-centric cluster construction retains fermionic gap operators."""
     x, z = _paulis()
@@ -699,6 +785,31 @@ def test_streaming_graph_assembly_compresses_between_path_batches():
     assert report.assembly_peak_bond_dimensions
     assert max(report.initial_bond_dimensions) <= 64
     assert streamed.pepsy_cluster_metadata["assembly"] == "streaming"
+
+
+def test_streaming_graph_assembly_resolves_auto_batch_size():
+    """The default streaming batch policy is adaptive and observable."""
+    x, z = _paulis()
+    result, report = exp_mpo_cluster(
+        [
+            ((0, 1), (x, x), 0.7),
+            ((1, 2), (z, z), -0.3),
+        ],
+        0.04,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=64,
+        return_report=True,
+    )
+
+    assert report.assembly_batch_size == "auto"
+    assert report.assembly_resolved_batch_size == 2
+    assert (
+        result.pepsy_cluster_metadata["assembly_resolved_batch_size"] == 2
+    )
 
 
 def test_streaming_graph_assembly_handles_collection_paths():

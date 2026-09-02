@@ -886,15 +886,45 @@ def _validate_assembly_batch_size(value):
 
     if value is None:
         return None
+    if isinstance(value, str):
+        if value.strip().lower() == "auto":
+            return "auto"
+        raise ValueError(
+            "assembly_batch_size must be a positive integer, 'auto', or None."
+        )
     if (
         not isinstance(value, Integral)
         or isinstance(value, bool)
         or int(value) < 1
     ):
         raise ValueError(
-            "assembly_batch_size must be a positive integer or None."
+            "assembly_batch_size must be a positive integer, 'auto', or None."
         )
     return int(value)
+
+
+def _resolve_assembly_batch_size(value, path_count, *, frontier_width=0):
+    """Resolve an adaptive streaming batch size for a graph path plan.
+
+    ``None`` deliberately retains the historical path-at-a-time behavior.
+    The ``"auto"`` policy uses a modest batch on ordinary cutwidths and
+    reduces it for wide graph frontiers, balancing SVD overhead against the
+    temporary bond growth caused by adding several paths at once.
+    """
+
+    if path_count < 1:
+        return 1
+    if value is None:
+        return 1
+    if value != "auto":
+        return int(value)
+    if frontier_width >= 1024:
+        target = 8
+    elif frontier_width >= 512:
+        target = 16
+    else:
+        target = 32
+    return min(path_count, target)
 
 
 def _validate_graph_collection_order(value):
@@ -929,10 +959,37 @@ def _validate_graph_collection_budget(value):
     return int(value)
 
 
+def _resolve_graph_name(graph, basis):
+    """Normalize a compact graph name, including layout-aware ``"auto"``."""
+
+    if not isinstance(graph, str):
+        return None
+    graph_name = graph.strip().lower().replace("-", "_").replace(" ", "_")
+    if graph_name != "auto":
+        return graph_name
+    if basis is None or basis.location_mode == "chain":
+        return "chain"
+    if basis.lattice_shape is not None and len(basis.lattice_shape) == 2:
+        return "square"
+    raise ValueError(
+        "graph='auto' supports chain terms or 2D lattice terms; "
+        "pass graph='chain' or an explicit graph for 3D terms."
+    )
+
+
 def _graph_lattice_for_basis(graph, basis):
     """Map coordinate-labelled graph sites to a basis' MPO chain."""
 
     from .pepo_dense import ClusterLattice  # pylint: disable=import-outside-toplevel
+
+    if isinstance(graph, str):
+        graph_name = _resolve_graph_name(graph, basis)
+        return _graph_lattice_from_spec(
+            graph_name,
+            shape=basis.lattice_shape,
+            length=basis.L,
+            basis=basis,
+        )
 
     if graph is None:
         if basis.lattice_shape is not None and len(basis.lattice_shape) == 2:
@@ -1019,7 +1076,7 @@ def _graph_lattice_from_spec(graph, *, shape, length, basis, cyclic=False):
             return _graph_lattice_from_input(graph, length)
         return _graph_lattice_for_basis(graph, basis)
 
-    graph_name = graph.strip().lower().replace("-", "_").replace(" ", "_")
+    graph_name = _resolve_graph_name(graph, basis)
     if graph_name == "square":
         lattice_shape = shape
         if lattice_shape is None and basis is not None:
@@ -1059,7 +1116,7 @@ def _graph_lattice_from_spec(graph, *, shape, length, basis, cyclic=False):
         )
     else:
         raise ValueError(
-            "graph must be 'chain', 'square', an explicit ClusterLattice, "
+            "graph must be 'auto', 'chain', 'square', an explicit ClusterLattice, "
             "a (sites, edges) pair, or a graph mapping."
         )
 
@@ -1209,7 +1266,8 @@ class MPOClusterExpansionReport:
     graph_planner_state_budget: int | None = None
     assembly: str = "direct"
     assembly_chi: int | None = None
-    assembly_batch_size: int | None = None
+    assembly_batch_size: int | str | None = None
+    assembly_resolved_batch_size: int | None = None
     assembly_compression_count: int = 0
     assembly_peak_bond_dimensions: tuple[int, ...] = ()
     assembly_cutoff: float | str | None = None
@@ -1306,7 +1364,7 @@ class MPOClusterProductExpansion:
         collection_budget=128,
         assembly="direct",
         assembly_chi=None,
-        assembly_batch_size=None,
+        assembly_batch_size="auto",
         assembly_cutoff=None,
         assembly_cutoff_mode="auto",
         assembly_form="left",
@@ -1340,7 +1398,7 @@ class MPOClusterProductExpansion:
             )
         if assembly == "direct" and (
             assembly_chi is not None
-            or assembly_batch_size is not None
+            or assembly_batch_size not in (None, "auto")
             or assembly_cutoff is not None
             or assembly_form != "left"
         ):
@@ -2243,7 +2301,11 @@ class MPOClusterProductExpansion:
                 assembly_cutoff,
                 _backend_reference(tuple(residuals.values())),
             )
-        batch_size = self.assembly_batch_size or 1
+        batch_size = _resolve_assembly_batch_size(
+            self.assembly_batch_size,
+            len(paths),
+            frontier_width=self._graph_frontier_width(),
+        )
         for start in range(0, len(paths), batch_size):
             batch = paths[start : start + batch_size]
             batch_path_cores = []
@@ -2311,6 +2373,7 @@ class MPOClusterProductExpansion:
                 for cluster in sorted(residual_ranks)
             ),
             "compression_count": compression_count,
+            "resolved_batch_size": batch_size,
             "peak_bond_dimensions": tuple(peak_bond_dimensions),
             "cutoff": assembly_cutoff,
             "resolved_cutoff": assembly_cutoff,
@@ -3006,6 +3069,7 @@ class MPOClusterProductExpansion:
             assembled_semantic = None
             assembly_compression_count = 0
             assembly_peak_bond_dimensions = ()
+            assembly_resolved_batch_size = None
             assembly_cutoff = None
             assembly_cutoff_mode = self.assembly_cutoff_mode
             assembly_form = self.assembly_form
@@ -3015,6 +3079,7 @@ class MPOClusterProductExpansion:
             bond_dimensions = tuple(semantic.bond_dimensions)
             assembled_semantic = semantic
             assembly_compression_count = streaming_info["compression_count"]
+            assembly_resolved_batch_size = streaming_info["resolved_batch_size"]
             assembly_peak_bond_dimensions = streaming_info[
                 "peak_bond_dimensions"
             ]
@@ -3080,6 +3145,7 @@ class MPOClusterProductExpansion:
             assembly=self.assembly,
             assembly_chi=self.assembly_chi,
             assembly_batch_size=self.assembly_batch_size,
+            assembly_resolved_batch_size=assembly_resolved_batch_size,
             assembly_compression_count=assembly_compression_count,
             assembly_peak_bond_dimensions=assembly_peak_bond_dimensions,
             assembly_cutoff=assembly_cutoff,
@@ -3112,6 +3178,9 @@ class MPOClusterProductExpansion:
                 "assembly": report.assembly,
                 "assembly_chi": report.assembly_chi,
                 "assembly_batch_size": report.assembly_batch_size,
+                "assembly_resolved_batch_size": (
+                    report.assembly_resolved_batch_size
+                ),
                 "assembly_compression_count": (
                     report.assembly_compression_count
                 ),
@@ -3150,6 +3219,9 @@ class MPOClusterProductExpansion:
                 "assembly": report.assembly,
                 "assembly_chi": report.assembly_chi,
                 "assembly_batch_size": report.assembly_batch_size,
+                "assembly_resolved_batch_size": (
+                    report.assembly_resolved_batch_size
+                ),
                 "assembly_compression_count": (
                     report.assembly_compression_count
                 ),
@@ -3299,7 +3371,7 @@ def exp_mpo_cluster(
     collection_budget=128,
     assembly="direct",
     assembly_chi=None,
-    assembly_batch_size=None,
+    assembly_batch_size="auto",
     assembly_cutoff=None,
     assembly_cutoff_mode="auto",
     assembly_form="left",
@@ -3338,12 +3410,21 @@ def exp_mpo_cluster(
         The scalar in ``exp(step * H)``. ``dt`` is the compatibility spelling
         used by the rest of the MPO API; pass only one of them.
     shape, mapper, map_mode, parameters, coefficients, phys_dim : optional
-        Shared term-centric parsing and coefficient controls. ``coefficients``
-        is mutually exclusive with ``parameters`` and overrides the parsed
-        term coefficient slots, matching :func:`exp_mpo`.
+        Shared term-centric parsing and coefficient controls. Integer
+        locations are interpreted as already-mapped 1D chain sites and do
+        not require a mapper. Coordinate locations are recognized as lattice
+        sites; when ``mapper`` is omitted, a ``OneDMap`` is constructed from
+        ``shape`` using ``map_mode`` (``"snake"`` by default). A single 1D
+        site should be written as a bare integer, while a coordinate site is
+        written as a tuple such as ``(x, y)``. Do not mix chain indices and
+        lattice coordinates in one call. ``coefficients`` is mutually
+        exclusive with ``parameters`` and overrides the parsed term
+        coefficient slots, matching :func:`exp_mpo`.
     cluster_size : int, default=2
         Largest connected interval or graph cluster retained.
-    graph : optional
+    graph : {"auto", "chain", "square"}, optional
+        ``"auto"`` selects ``"chain"`` for integer term locations and
+        ``"square"`` for 2D coordinate term locations. Alternatively use
         ``"chain"`` or ``"square"`` for the common geometries, or a
         :class:`ClusterLattice`, ``(sites, edges)`` pair, or mapping. For
         coordinate-labelled graphs, supply ``shape`` or a lattice-aware
@@ -3390,9 +3471,10 @@ def exp_mpo_cluster(
     assembly_chi : int, optional
         Working bond cap used by ``assembly="streaming"``. This is separate
         from ``chi``, which is an optional final Quimb numerical compression.
-    assembly_batch_size : int, optional
+    assembly_batch_size : int, "auto", or None, optional
         Number of graph residual paths accumulated before each streaming SVD.
-        The default is one path at a time.
+        The default ``"auto"`` selects up to 32 paths, reducing the batch for
+        very wide graph frontiers. ``None`` retains path-at-a-time assembly.
     assembly_cutoff : float, "auto", or None, optional
         Optional numerical cutoff for intermediate streaming SVDs. ``None``
         retains backend-differentiable fixed-rank streaming. A numeric value
@@ -3564,6 +3646,12 @@ def exp_mpo_cluster(
                 for site in term.sites
             ) + 1
 
+    graph_requested = graph is not None
+    graph_inferred = None
+    if isinstance(graph, str) and graph.strip().lower() == "auto":
+        graph_inferred = _resolve_graph_name(graph, reference_basis)
+        graph = graph_inferred
+
     if graph is None:
         if isinstance(cyclic, (bool, np.bool_)):
             cyclic_requested = bool(cyclic)
@@ -3710,7 +3798,8 @@ def exp_mpo_cluster(
             result_metadata["exp_mpo_cluster"] = True
             result_metadata["cluster_report"] = cluster_report
             result_metadata["cluster_mode"] = expansion.cluster_mode
-            result_metadata["graph_requested"] = graph is not None
+            result_metadata["graph_requested"] = graph_requested
+            result_metadata["graph_inferred"] = graph_inferred
             if graph is not None:
                 result_metadata["graph_assembly"] = cluster_report.graph_assembly
                 result_metadata["graph_collection_count"] = (
@@ -3738,7 +3827,8 @@ def exp_mpo_cluster(
         output.pepsy_cluster_report = cluster_report
         cluster_metadata = {
             "cluster_mode": expansion.cluster_mode,
-            "graph_requested": graph is not None,
+            "graph_requested": graph_requested,
+            "graph_inferred": graph_inferred,
             "cluster_size": expansion.cluster_size,
             "factor_count": len(expansion.factors),
             "cutoff": expansion.cutoff,
@@ -3756,6 +3846,9 @@ def exp_mpo_cluster(
             "assembly": cluster_report.assembly,
             "assembly_chi": cluster_report.assembly_chi,
             "assembly_batch_size": cluster_report.assembly_batch_size,
+            "assembly_resolved_batch_size": (
+                cluster_report.assembly_resolved_batch_size
+            ),
             "assembly_compression_count": (
                 cluster_report.assembly_compression_count
             ),
@@ -3813,7 +3906,7 @@ def exp_mpo_cluster_product(
     collection_budget=128,
     assembly="direct",
     assembly_chi=None,
-    assembly_batch_size=None,
+    assembly_batch_size="auto",
     assembly_cutoff=None,
     assembly_cutoff_mode="auto",
     assembly_form="left",

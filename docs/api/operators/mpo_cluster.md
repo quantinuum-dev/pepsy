@@ -22,7 +22,7 @@ U = exp_mpo_cluster(
     -1j * 0.01,
     shape=(4, 4),
     cluster_size=3,
-    graph="square",
+    graph="auto",
     cyclic=True,
 )
 ```
@@ -40,6 +40,39 @@ default returns a Quimb MPO. `max_bond` caps each analytical residual
 factorization, while `chi` is an optional final numerical MPO compression.
 `to_backend` is applied to local operators, the step, resolved coefficients,
 intermediate tensor contractions, and the final Quimb tensor boundary.
+
+The term parser recognizes the location convention from the term itself:
+
+```python
+# 1D chain terms: integer sites are already chain positions.
+chain_terms = [(("ZZ", J), (i, i + 1)) for i in range(L - 1)]
+chain_terms += [(("X", h), i) for i in range(L)]
+U_chain = exp_mpo_cluster(chain_terms, -1j * dt, shape=L)
+
+# 2D lattice terms: coordinates are mapped internally. ``mapper`` is
+# optional; ``map_mode`` selects the default OneDMap traversal.
+lattice_terms = [(("ZZ", J), edge) for edge in edges]
+lattice_terms += [(("X", h), site) for site in sites]
+U_lattice = exp_mpo_cluster(
+    lattice_terms,
+    -1j * dt,
+    shape=(Lx, Ly),
+    graph="square",
+    map_mode="snake",
+    cyclic=True,
+)
+```
+
+Pass `mapper=OneDMap(Lx, Ly, mode=...)` when a custom ordering is required;
+it is not needed for the default mapping. A single 1D site is written as a
+bare integer, while `(x, y)` denotes one 2D coordinate when the term has one
+local operator. One call should use one convention consistently rather than
+mixing chain indices and coordinates.
+
+For the common geometries, `graph="auto"` selects a chain graph for integer
+locations and a square graph for 2D coordinate locations. It preserves the
+meaning of `cyclic`: a chain becomes a ring, while a square lattice becomes
+periodic in both directions. Use an explicit graph for custom or 3D topology.
 
 The history-only keywords `order`, `mode`, `history_storage`, and
 `extension_budget` are deliberately not accepted here. They have no safe
@@ -138,14 +171,16 @@ U = exp_mpo_cluster(
     cluster_size=4,
     assembly="streaming",
     assembly_chi=64,
-    assembly_batch_size=8,
+    assembly_batch_size="auto",
 )
 ```
 
 `assembly_chi` is a working MPO bond cap and is independent of the optional
-final `chi` compression. `assembly_batch_size=1` gives path-at-a-time
-accumulation; larger batches reduce the number of SVD sweeps while keeping
-the intermediate direct sum bounded. Streaming builds local path cores and
+final `chi` compression. `assembly_batch_size="auto"` selects up to 32 paths
+per batch and reduces that size for very wide graph frontiers;
+`assembly_batch_size=1` gives path-at-a-time accumulation. Larger batches
+reduce the number of SVD sweeps while keeping the intermediate direct sum
+bounded. Streaming builds local path cores and
 inserts the batch directly into the accumulator's virtual direct sum; it does
 not construct a temporary full-chain MPO for each path or batch. It then
 applies a semantic fixed-rank TT-SVD after each batch. Streaming therefore
@@ -157,7 +192,8 @@ those products are a different graph-collection approximation axis. If the
 planner selected an exact or higher-order bounded collection plan, streaming
 batches those collection paths as well. The returned report records the
 planner, frontier-state work, number of streaming compressions, peak
-pre-compression bond dimensions, and final working bond dimensions.
+pre-compression bond dimensions, the requested and resolved batch sizes, and
+final working bond dimensions.
 
 For a cutoff-aware working boundary, add `assembly_cutoff`:
 
