@@ -273,6 +273,9 @@ Bare Quimb method names and their `quimb-<method>` qualified forms are passed
 to Quimb's native 1D compression dispatcher. The legacy `mpo-<method>` names
 remain accepted as aliases. The bare `fit` name is reserved for DMRG; use
 `quimb-fit` when selecting Quimb's one-site FIT compressor.
+This includes bare `mode="sdc"` and `mode="sdc-oversample"`, which normalize to
+the corresponding `quimb-*` modes. They are version-gated through Quimb's
+compressor registry and never silently fall back to another method.
 Oversampled methods retain Quimb's two-stage structure: an intermediate larger
 bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
@@ -338,7 +341,9 @@ Quimb-specific guess methods retain their native direct fallback. The available 
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
 `fit-projector`, `fit-oversample`, `sdc`, and `sdc-oversample`. The latter two
 require a Quimb build containing the corresponding successive deterministic
-compressor. `auto` selects `guess-src` in both phases;
+compressor. They are also valid FIT warm-start policies as
+`fit_init_strategy="guess-sdc"` and `fit_init_strategy="guess-sdc-oversample"`.
+`auto` selects `guess-src` in both phases;
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).
 Native Symmray and fermionic paths use their graded sector-growth route without

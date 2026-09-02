@@ -22,8 +22,11 @@ mpo = opt.run(progbar=False)
 
 For dense MPOs, `mode="mpo"` accepts one- or multi-site dense gates, including
 non-contiguous supports such as `(0, 1, 3)`. The gate matrix has dimension
-`2**len(where)` by `2**len(where)` for qubit sites. `mode="svd"` and
-`mode="dmrg"` retain their one-/two-site replay contracts. Native Symmray
+`2**len(where)` by `2**len(where)` for qubit sites. Bare/default two-site gates
+use Quimb's native `gate_sandwich_with_auto_swap(..., dagger=True)` route,
+including automatic swaps for non-local supports. Explicit ket/bra pairs and
+multi-site gates retain the dedicated layer-compression path. `mode="svd"`
+and `mode="dmrg"` retain their one-/two-site replay contracts. Native Symmray
 `mode="mpo"` uses the symmetry-aware SVD route and therefore follows that
 one-/two-site restriction.
 
@@ -36,10 +39,11 @@ aliases are available for `direct`, `dm`, `zipup`, `zipup-first`,
 `fit-projector`, and `fit-oversample`. Use the qualified `quimb-fit` or
 `mpo-fit` spelling for Quimb's FIT compressor because bare `mode="fit"`
 remains the historical DMRG alias. These modes compress the ket and bra
-physical layers independently through `gate_nonlocal_opt`; they do not turn
-MPO evolution into an MPS-only `mix`, `su`, `perm`, or `swap` algorithm. On a
-native Symmray MPO, all of these aliases intentionally select the existing
-block-aware SVD path so no dense auxiliary MPO is constructed.
+physical layers independently through `gate_nonlocal_opt` except for the
+native bare/default two-site `mode="mpo"` route described above; they do not
+turn MPO evolution into an MPS-only `mix`, `su`, `perm`, or `swap` algorithm.
+On a native Symmray MPO, all of these aliases intentionally select the
+existing block-aware SVD path so no dense auxiliary MPO is constructed.
 
 For an explicit neutral term collection, arbitrary one- or multi-site support
 is accepted:
@@ -89,6 +93,36 @@ for native Symmray MPOs, while `mode="dmrg"` and the named DMRG schedules use
 native block-aware FIT; the
 optimizer does not require a dense conversion of the input MPO.
 
+For dense Quimb gate payloads, the public MPO convention is output/input
+ordering. Internally the effective ket operator is therefore `G.T`. The exact
+dense mappings are:
+
+```text
+G                 -> G.T @ O @ G.conj()
+(G, None)         -> G.T @ O
+(None, B)         -> O @ B.conj()
+(G, B)            -> G.T @ O @ B.conj()
+```
+
+Thus the bare entry is the API shorthand for unitary conjugation, but it is
+not the same raw-array convention as `MpsOptimizer`. To apply a standard
+linear-algebra operator `A` as `A @ O @ A†`, pass `A.T` as the MPO gate. To
+apply `A† @ O @ A`, pass `A.conj()`. Native Symmray gates carry their own
+graded metadata and follow the native block-aware path rather than this dense
+transpose rule. `MpoChannelEvent` uses the explicit standard mapping
+`sum_a w_a K_a @ O @ K_a†`.
+
+Backend conversion is explicit and state-derived, matching the MPS helper:
+
+```python
+gate = opt.to_backend(gate)
+```
+
+The converter follows the live MPO's backend, dtype, and device and returns an
+already-compatible payload by identity. Dense payloads cannot be generically
+cast into a native Symmray MPO because charge and fermionic metadata would be
+lost; construct those gates natively instead.
+
 For MPO DMRG, `fit_block_size=2` is the default native two-site FIT update.
 `fit_block_size=3` enables the corresponding three-site effective tensor and
 two direction-aware SVD splits; an interval containing only two sites
@@ -106,18 +140,24 @@ The named modes are schedule aliases over this same MPO/FIT implementation:
 
 | mode | warm-up block | warm-up policy | following sweeps |
 | --- | --- | --- | --- |
-| `dmrg1` | two-site | exactly two sweeps, unless the active window is already at its attainable rank ceiling | one-site FIT |
+| `dmrg1` | two-site | exactly two sweeps, unless the active window or full MPO is already at its attainable rank ceiling | one-site FIT; phase latches after full-chain saturation |
 | `dmrg2` | two-site | `fit_adaptive_sweeps` (default two) | one-site FIT |
 | `dmrg3` | three-site | `fit_adaptive_sweeps` (default two) | one-site FIT |
 
 The aliases normalize the backend to `opt.mode == "dmrg"` while retaining the
 requested schedule in `opt._dmrg_mode_alias`, matching `MpsOptimizer`'s API
 shape. Passing `fit_block_size` does not override a named mode; the mode's
-block size is authoritative. `fit_single_pair_fast_path=True` (the default)
-advances an adjacent two-site gate after its single exact local variational
-update, so a named mode does not waste additional sweeps on a complete pair.
-The generic `mode="dmrg"` path remains unchanged and continues to use
-`fit_block_size` and `fit_three_site_sweeps` directly.
+block size is authoritative. `fit_single_pair_fast_path=False` is the default,
+matching `MpsOptimizer`; `dmrg2` still enables the automatic shortcut for an
+adjacent two-site window, while setting the option to `True` enables it for
+every DMRG schedule. The generic `mode="dmrg"` path now follows the MPS
+schedule as well: two- or three-site FIT uses `fit_adaptive_sweeps` as an
+adaptive block warm-up and hands the remaining `n_iter` budget to one-site
+refinement. For a long-range window, the generic schedule uses the fixed
+canonical handoff after the block phase, matching the MPS behavior. As in
+`MpsOptimizer`, an under-capacity `dmrg1` window spanning at least three sites
+requires `n_iter >= 3` so its two growth sweeps have room for one-site
+refinement.
 
 For dense DMRG windows, FIT uses an isolated compressed MPO warm start by
 default. The policy is controlled by `fit_init_strategy`: `"direct"` uses the
@@ -148,7 +188,7 @@ non-local gate even when they use the same `chi` and SVD cutoff.
 
 ## Norm and run diagnostics
 
-Every two-site compression records an automatic norm-survival event. The
+Every compressed multi-site segment records an automatic norm-survival event. The
 event compares the observed canonical-center norm after compression with the
 expected norm of the uncompressed gate target. For a provably unitary default
 `U O U†` gate, the expected value is read from the live canonical center, so no
@@ -172,7 +212,16 @@ represented MPO norm is reported separately as `norm`/`state_norm`, while
 `cumulative_norm` is only the square-root retained-compression proxy. The
 progress bar's `~F` field uses the cumulative compression fidelity.
 `get_fidelities()` remains the legacy normalized-MPO-norm history and is not
-the compression ledger.
+the compression ledger. Norms are reported at their physical scale: for an
+identity MPO on `L` qubits, `norm_sq`/`state_norm_sq` are `2**L` and
+`norm`/`state_norm` are `sqrt(2**L)`. Event fields
+`expected_norm_sq`, `observed_norm_sq`, and `target_norm_sq` expose the same
+unscaled squared norms; their ratios, rather than unit-normalized values, form
+the local and cumulative fidelity metrics. Every compressed multi-site
+`mode="mpo"` event contributes an event with the same local-fidelity fields.
+The event also retains the scaled norm measurements as
+`*_norm_mantissa`/`*_norm_exponent`; local ratios are formed from those pairs in
+log space before any display-scale reconstruction.
 
 If lower-level code accesses `opt.p` and moves its canonical centre directly,
 call `opt.sync_canonicalization()` before resuming replay so `opt.info_c` is
@@ -182,10 +231,14 @@ measured.
 
 DMRG FIT controls are exposed directly through `run`: `fit_min_iter`,
 `fit_rtol`, `fit_patience`, `fit_finite_check`, `timing`,
-`timing_sync_device`, and `fit_collect_split_diagnostics`. The latest local
-FIT record is available from `get_fit_diagnostics()`, the complete replay
-history from `get_fit_history()`, and the run-level timing/status record from
-`get_run_timing()`.
+`timing_sync_device`, and `fit_collect_split_diagnostics`. Timing is opt-in;
+`timing=False` does not read the profiling clock or construct a device
+synchronizer. With `timing=True`, `get_run_timing()` follows the MPS schema
+with `stages`, per-sweep `fit_steps`, aggregate `fit_totals`, backend metadata,
+and the latest `fit_diagnostics` record. The compact legacy `fit_calls` and
+`fallback` fields remain available. The latest local FIT record is available
+from `get_fit_diagnostics()`, and the complete replay history from
+`get_fit_history()`.
 
 `atomic=True` restores the optimizer state when replay fails. Set
 `fit_fallback="svd"` or `fit_fallback="mpo"` to restore the pre-run state and

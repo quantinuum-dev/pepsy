@@ -1,11 +1,14 @@
 """Tests for :mod:`pepsy.optimizers.mpo.optimizer`."""
 
+import types
+
 import numpy as np
 import pytest
 import quimb as qu
 import quimb.tensor as qtn
 
 import pepsy as py
+import pepsy.optimizers.mpo.optimizer as mpo_optimizer_module
 
 
 def test_mpo_optimizer_exported():
@@ -14,6 +17,24 @@ def test_mpo_optimizer_exported():
     assert "optimizers" in py.__all__
     assert py.MpoOptimizer is not None
     assert py.optimizers.mpo is not None
+
+
+def test_mpo_backend_info_only_relaxes_same_backend_dtype_mixes():
+    """MPO metadata must not hide a genuine mixed-backend state."""
+    torch = pytest.importorskip("torch")
+    mixed_backend = qtn.MPO_identity(3, dtype="complex128")
+    mixed_backend[0].modify(
+        data=torch.as_tensor(mixed_backend[0].data, dtype=torch.complex128)
+    )
+
+    with pytest.raises(TypeError, match="one compatible backend"):
+        py.MpoOptimizer._backend_info_for(mixed_backend)  # pylint: disable=protected-access
+
+    mixed_dtype = qtn.MPO_identity(3, dtype="complex128")
+    mixed_dtype[0].modify(
+        data=np.asarray(mixed_dtype[0].data, dtype=np.complex64)
+    )
+    assert py.MpoOptimizer._backend_info_for(mixed_dtype)["backend"] == "numpy"  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize("where", [(0.9,), (True,), (0, 0)])
@@ -114,6 +135,59 @@ def test_mpo_optimizer_quimb_mode_preserves_dense_torch_backend():
 
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in out)
     assert out.max_bond() <= 4
+
+
+def test_mpo_optimizer_to_backend_matches_live_mpo_backend():
+    """The public MPO converter follows backend, dtype, and device metadata."""
+    torch = pytest.importorskip("torch")
+    backend = py.backend_torch(dtype=torch.complex64, device="cpu")
+    mpo = qtn.MPO_identity(3, dtype="complex128")
+    mpo.apply_to_arrays(backend)
+    opt = py.MpoOptimizer(mpo, gates=[], chi=4, mode="svd")
+
+    converted = opt.to_backend(np.eye(4, dtype=np.complex128))
+
+    assert isinstance(converted, torch.Tensor)
+    assert converted.dtype == torch.complex64
+    assert str(converted.device) == "cpu"
+    assert opt.to_backend(converted) is converted
+
+
+def test_mpo_norm_events_compare_scaled_pairs_without_reconstructing_norms():
+    """Extreme physical norms still produce a valid local fidelity ratio."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(3, dtype="complex128"), gates=[], chi=4, mode="svd"
+    )
+
+    event = opt._record_norm_event(
+        "scaled_test",
+        expected_norm=(1.0, 400.0),
+        observed_norm=(1.0, 400.0),
+        target_norm=(1.0, 400.0),
+    )
+
+    assert event["valid"] is True
+    assert event["local_fidelity"] == pytest.approx(1.0)
+    assert event["expected_norm_mantissa"] == pytest.approx(1.0)
+    assert event["expected_norm_exponent"] == pytest.approx(400.0)
+    assert np.isinf(event["expected_norm"])
+
+
+def test_mpo_norm_events_keep_zero_observed_norm_as_zero_fidelity():
+    """A zero retained norm is valid loss, not an invalid measurement."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(3, dtype="complex128"), gates=[], chi=4, mode="svd"
+    )
+
+    event = opt._record_norm_event(
+        "zero_test",
+        expected_norm=(1.0, 4.0),
+        observed_norm=(0.0, 0.0),
+    )
+
+    assert event["valid"] is True
+    assert event["local_fidelity"] == pytest.approx(0.0)
+    assert event["local_infidelity"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -229,7 +303,82 @@ def test_mpo_optimizer_dmrg_mode_aliases_select_fit_schedule(
     assert calls[0]["block_size"] == expected_block
     assert calls[0]["adaptive_block_sweeps"] == expected_warmup
     assert calls[0]["adaptive_until_rank"] is False
+    # The optional fast path is disabled by default, just as in
+    # MpsOptimizer. The fixture is non-adjacent, so dmrg2's automatic
+    # adjacent-pair exception does not apply.
+    assert calls[0]["single_pair_fast_path"] is False
+
+
+def test_mpo_dmrg2_enables_mps_compatible_adjacent_pair_fast_path(monkeypatch):
+    """Named dmrg2 keeps the MPS adjacent-pair shortcut."""
+    calls = []
+    original_run_gate = py.FIT.run_gate
+
+    def recording_run_gate(self, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_run_gate(self, *args, **kwargs)
+
+    monkeypatch.setattr(py.FIT, "run_gate", recording_run_gate)
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (1, 2))],
+        chi=2,
+        mode="dmrg2",
+    )
+    opt.run(n_iter=2, progbar=False, cutoff=0.0, fidelity_samples=0)
+
+    assert calls
     assert calls[0]["single_pair_fast_path"] is True
+
+
+def test_mpo_dmrg1_latches_one_site_phase_after_rank_saturation():
+    """DMRG1 keeps later adjacent windows in the one-site phase."""
+    rng = np.random.default_rng(20260902)
+    first, _ = np.linalg.qr(
+        rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    )
+    second, _ = np.linalg.qr(
+        rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    )
+    opt = py.MpoOptimizer(
+        qtn.MPO_rand(3, bond_dim=1, phys_dim=2, dtype="complex128", seed=8),
+        gates=[(first, (0, 2)), (second, (0, 1))],
+        chi=2,
+        mode="dmrg1",
+    )
+    opt.run(
+        n_iter=3,
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        fit_rtol=None,
+        timing=True,
+    )
+
+    assert [
+        record["block_size"] for record in opt.get_run_timing()["fit_steps"]
+    ] == [2, 2, 1, 1, 1, 1]
+    assert opt.get_fit_diagnostics()["dmrg1_one_site_locked"] is True
+
+
+@pytest.mark.parametrize("n_iter", [1, 2])
+def test_mpo_dmrg1_growth_requires_room_for_one_site_refinement(n_iter):
+    """DMRG1 rejects under-capacity long-range windows without refinement."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(5, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=2,
+        mode="dmrg1",
+    )
+
+    with pytest.raises(ValueError, match="n_iter >= 3"):
+        opt.run(
+            n_iter=n_iter,
+            progbar=False,
+            cutoff=0.0,
+            fidelity_samples=0,
+            fit_rtol=None,
+        )
 
 
 def test_mpo_optimizer_dmrg_mode_alias_set_mode_tracks_schedule():
@@ -485,6 +634,26 @@ def test_mpo_optimizer_channel_sum_reports_trace_preservation_separately():
     assert opt.norm_diagnostics()["events"] == 1
 
 
+def test_mpo_channel_event_uses_standard_kraus_orientation():
+    """Kraus payloads represent the documented ``K O K.H`` action."""
+    operator = np.array(
+        [[1.0 + 0.2j, 0.3 - 0.1j], [-0.4 + 0.5j, 0.7 + 0.6j]],
+        dtype=np.complex128,
+    )
+    initial = qtn.MPO_identity(2, dtype="complex128")
+    event = py.MpoOptimizer.kraus_event((operator,), 0)
+    out = py.MpoOptimizer(
+        initial,
+        gates=[event],
+        chi=4,
+        mode="svd",
+    ).run(progbar=False, cutoff=0.0, fidelity_samples=0)
+
+    full_operator = np.kron(operator, np.eye(2))
+    expected = full_operator @ initial.to_dense() @ full_operator.conj().T
+    np.testing.assert_allclose(out.to_dense(), expected, atol=1.0e-12)
+
+
 def test_mpo_optimizer_dmrg_handles_nonlocal_channel_sum():
     """A two-site Kraus sum remains executable through the DMRG backend."""
     identity = np.eye(4, dtype=np.complex128)
@@ -720,6 +889,7 @@ def test_mpo_optimizer_empty_norm_diagnostics_use_none_for_compression():
     assert diagnostics["cumulative_infidelity"] is None
     assert diagnostics["cumulative_norm"] is None
     assert diagnostics["norm"] == pytest.approx(diagnostics["state_norm"])
+    assert diagnostics["norm_sq"] == pytest.approx(2**4)
 
 
 def test_mpo_optimizer_canonize_mpo_accepts_supported_where_shapes():
@@ -891,6 +1061,90 @@ def test_mpo_optimizer_reports_fit_controls_and_timing():
     assert timing["fit_calls"] == 1
 
 
+def test_mpo_generic_dmrg_uses_mps_block_then_one_site_schedule():
+    """Generic MPO DMRG follows the MPS adaptive warm-up handoff."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(5, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 4))],
+        chi=2,
+        mode="dmrg",
+    )
+    opt.run(
+        n_iter=4,
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        fit_min_iter=1,
+        fit_rtol=None,
+        fit_adaptive_sweeps=2,
+    )
+
+    diagnostics = opt.get_fit_diagnostics()
+    assert diagnostics["adaptive_sweeps"] == 2
+    assert diagnostics["one_site_refinement_sweeps"] == 2
+
+
+def test_mpo_timing_is_opt_in_and_mps_shaped(monkeypatch):
+    """MPO timing has the MPS schema and no untimed clock side effects."""
+    untimed = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    def fail_clock():
+        raise AssertionError("timing=False must not read the profiling clock")
+
+    def fail_synchronizer(*_args, **_kwargs):
+        raise AssertionError(
+            "timing=False must not construct a device synchronizer"
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            mpo_optimizer_module,
+            "time",
+            types.SimpleNamespace(perf_counter=fail_clock),
+        )
+        patch.setattr(
+            mpo_optimizer_module.FIT,
+            "_make_backend_synchronizer",
+            fail_synchronizer,
+        )
+        untimed.run(
+            progbar=False,
+            cutoff=0.0,
+            fidelity_samples=0,
+            timing=False,
+            timing_sync_device=True,
+        )
+
+    assert untimed.get_run_timing() is None
+
+    timed = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="dmrg",
+    )
+    timed.run(
+        n_iter=2,
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        timing=True,
+    )
+    timing = timed.get_run_timing()
+    assert timing["event_count"] == 1
+    assert timing["stages"]["dmrg.prepare"]["calls"] == 1
+    assert timing["stages"]["dmrg.target"]["calls"] == 1
+    assert timing["stages"]["dmrg.fit"]["calls"] == 1
+    assert timing["fit_totals"]["calls"] == 1
+    assert timing["fit_steps"]
+    assert timing["backend"] == "numpy"
+
+
 @pytest.mark.parametrize(("mode", "block_size"), [("dmrg1", 2), ("dmrg3", 3)])
 @pytest.mark.parametrize("fit_mpo_guess", [True, False])
 def test_mpo_named_dmrg_optional_mpo_fit_guess(mode, block_size, fit_mpo_guess):
@@ -967,7 +1221,7 @@ def test_mpo_fit_guess_layer_order(monkeypatch, order, expected_layers):
     )
 
     opt.run(
-        n_iter=2,
+        n_iter=3,
         progbar=False,
         cutoff=0.0,
         fidelity_samples=0,
@@ -1296,6 +1550,71 @@ def test_mpo_mode_complex_gate_pair_sides_match_dense_action():
         atol=1e-10,
         rtol=1e-10,
     )
+
+
+def test_mpo_mode_bare_two_site_gate_uses_native_dagger_sandwich(monkeypatch):
+    """The direct MPO path uses Quimb's dagger-aware auto-swap method."""
+    calls = []
+    original = qtn.MatrixProductOperator.gate_sandwich_with_auto_swap
+
+    def recording_gate_sandwich(self, *args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qtn.MatrixProductOperator,
+        "gate_sandwich_with_auto_swap",
+        recording_gate_sandwich,
+    )
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="mpo",
+    )
+    opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+
+    assert len(calls) == 1
+    assert calls[0][0][1] == (0, 3)
+    assert calls[0][1]["dagger"] is True
+    assert calls[0][1]["swap_back"] is True
+
+
+def test_mpo_mode_multisite_compression_records_local_fidelity():
+    """Multi-site MPO compression contributes to the norm-fidelity ledger."""
+    rng = np.random.default_rng(20260902)
+    gate, _ = np.linalg.qr(
+        rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
+    )
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(gate, (0, 1, 3))],
+        chi=64,
+        mode="mpo",
+    )
+    opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+
+    events = opt.get_norm_events()
+    assert len(events) == 1
+    assert events[0]["where"] == (0, 1, 3)
+    assert events[0]["expected_norm_sq"] == pytest.approx(2**4)
+    assert events[0]["observed_norm_sq"] == pytest.approx(2**4)
+    assert events[0]["local_fidelity"] == pytest.approx(1.0, abs=1e-10)
+
+
+def test_mpo_unitary_norm_overshoot_guard_rejects_inconsistent_metadata():
+    """A dense unitary compression event cannot report a real norm overshoot."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(3, dtype="complex128"), gates=[], chi=4, mode="mpo"
+    )
+    with pytest.raises(FloatingPointError, match="exceeds its expected norm"):
+        opt._record_norm_event(
+            "mpo_compression",
+            expected_norm=1.0,
+            observed_norm=np.sqrt(1.01),
+            unitary=True,
+        )
+    assert opt.get_norm_events() == []
 
 
 def test_mpo_optimizer_mpo_mode_unitary_evolution_preserves_norm():

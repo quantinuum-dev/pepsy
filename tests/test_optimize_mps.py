@@ -827,6 +827,65 @@ def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
     assert optimizer.mode == f"quimb-{method}"
 
 
+def test_mps_optimizer_bare_sdc_mode_normalizes_to_quimb_sdc():
+    """The bare SDC spelling is a first-class MPS compression mode."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="sdc",
+    )
+    assert optimizer.mode == "quimb-sdc"
+
+    if not mps_optimizer_module._quimb_compression_method_available("sdc"):
+        with pytest.raises(NotImplementedError, match="sdc compressor"):
+            optimizer.run(progbar=False, cutoff=1.0e-12)
+        return
+
+    out = optimizer.run(
+        progbar=False,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+    assert out.max_bond() <= 2
+
+
+@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
+def test_mps_optimizer_sdc_fit_init_strategies_are_version_gated(method):
+    """SDC is available both as a mode and as a FIT warm-start method."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        [(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="dmrg2",
+    )
+    supported = mps_optimizer_module._quimb_compression_method_available(method)
+
+    if not supported:
+        with pytest.raises(NotImplementedError, match="sdc compressor"):
+            optimizer.run(
+                progbar=False,
+                n_iter=2,
+                fit_rtol=None,
+                fit_init_strategy=f"guess-{method}",
+                stabilize_unitary=False,
+            )
+        return
+
+    out = optimizer.run(
+        progbar=False,
+        n_iter=2,
+        fit_rtol=None,
+        fit_init_strategy=f"guess-{method}",
+        stabilize_unitary=False,
+    )
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert out.max_bond() <= 2
+    assert diagnostics["fit_init_strategy"] == f"guess_{method}"
+    assert diagnostics["guess_method"] == method
+    assert diagnostics["guess_used"] is True
+
+
 @pytest.mark.parametrize(
     "mode, method",
     [

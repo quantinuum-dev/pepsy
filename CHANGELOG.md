@@ -14,6 +14,22 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Made the MPS SDC surface explicit and regression-tested: bare
+  `mode="sdc"` / `mode="sdc-oversample"` aliases normalize to Quimb's
+  successive deterministic compressors, and the same methods are available
+  as `fit_init_strategy="guess-sdc"` / `"guess-sdc-oversample"`, with strict
+  Quimb version gating and no silent fallback.
+
+- Aligned `MpoOptimizer` with the MPS DMRG scheduling and timing APIs. Generic
+  DMRG now uses adaptive block warm-up followed by one-site refinement,
+  `dmrg2` retains the adjacent-pair fast path, timing exposes the MPS-shaped
+  stage/FIT schema, and MPO norm diagnostics retain physical `2**L` scale via
+  explicit squared-norm fields and scale-safe mantissa/exponent event pairs.
+  Dense direct two-site MPO replay also uses Quimb's dagger-aware auto-swap
+  sandwich when available, while local fidelity events now cover compressed
+  multi-site MPO paths. `MpoOptimizer.to_backend(...)` now mirrors the
+  state-derived MPS conversion helper for backend, dtype, and device routing.
+
 - Extended `exp_mpo_cluster`, `exp_mpo_cluster_product`, and the reusable MPO
   cluster expansion with native bosonic Abelian block-sparse output through
   `MPOPhysicalSpace` / `symmetry` metadata. Direct assembly now retains sparse
