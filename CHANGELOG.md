@@ -14,6 +14,14 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Extended `exp_mpo_cluster`, `exp_mpo_cluster_product`, and the reusable MPO
+  cluster expansion with native bosonic Abelian block-sparse output through
+  `MPOPhysicalSpace` / `symmetry` metadata. Direct assembly now retains sparse
+  virtual blocks and compiles them through the existing Symmray boundary.
+  Streaming assembly also supports directional adaptive TT-SVD through
+  `assembly_cutoff`, `assembly_cutoff_mode`, and `assembly_form`, while
+  preserving fixed-rank backend-autodiff streaming when no cutoff is given.
+
 - Extended `GibbsMps` with the reusable `bell_to_mps` Quimb constructor and
   configurable tag-wise trace contraction options, while preserving the
   backend and autodiff paths.
@@ -32,10 +40,23 @@ Changes for the next release should be added here before the version is bumped.
 
 - Added bounded graph-cluster assembly controls to `exp_mpo_cluster` and
   `MPOBasis.compile_graph_cluster_expansion`. The default
-  `graph_assembly="auto"` protects wide MPO orderings with a finite
-  collection budget, while `graph_assembly="exact"` and
+  `graph_assembly="auto"` uses a cutwidth-aware frontier planner before
+  materializing collections, while `graph_assembly="exact"` and
   `graph_assembly="bounded"` make the exact versus controlled-approximation
   choice explicit and report the selected strategy.
+
+- Added opt-in streaming graph-path assembly to `exp_mpo_cluster` and
+  `MPOBasis.compile_graph_cluster_expansion`. `assembly="streaming"`
+  inserts local graph-path cores directly into the accumulator in bounded
+  batches, applies a semantic fixed-rank SVD after each batch through
+  `assembly_chi`, and avoids temporary path or batch MPOs while reporting the
+  working compression diagnostics.
+
+- Added the product-named one-shot `exp_mpo_cluster_product(factors, step, ...)`
+  facade for ordered `exp(A) @ exp(B) @ ...` MPO cluster expansions. It shares
+  the term parsing, graph/cyclic, streaming, backend, report, and final
+  compression controls of `exp_mpo_cluster` while making the factor list
+  explicit.
 
 - Added the backend-neutral `MPOBlock` / `MPOBlockPlan` structural inspection
   layer. First-degree automata and persistent higher-order block-sparse MPOs

@@ -42,12 +42,17 @@ from .mpo_semantic import (
     _resolve_exp_step,
     _normalize_exp_compress_opts,
     _ensure_pepsy_mpo_boundary,
+    _dense_virtual_to_sparse,
     _native_sector_summary,
+    _normalize_mpo_physical_charges,
+    _normalize_mpo_symmetry,
     _normalize_sector_aware_request,
     _resolve_sector_aware,
     _scatter_add_2d,
     _term_from_input,
 )
+from .mpo_space import MPOPhysicalSpace
+from ._mpo_sparse import SparseVirtualTensor
 from .diagnostics import OperatorReportInfo
 
 __all__ = [
@@ -65,6 +70,7 @@ __all__ = [
     "MPOClusterExpansion",
     "compress_mpo_product",
     "exp_mpo_cluster",
+    "exp_mpo_cluster_product",
 ]
 
 
@@ -746,6 +752,151 @@ def _normalize_graph_assembly(value):
     return value
 
 
+def _normalize_mpo_assembly(value):
+    """Normalize the global MPO materialization strategy."""
+
+    if not isinstance(value, str):
+        raise TypeError("assembly must be 'direct' or 'streaming'.")
+    value = value.strip().lower().replace("-", "_")
+    if value not in {"direct", "streaming"}:
+        raise ValueError("assembly must be 'direct' or 'streaming'.")
+    return value
+
+
+def _validate_assembly_cutoff(value):
+    """Validate an optional cutoff used by intermediate streaming SVDs."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().lower() != "auto":
+            raise ValueError(
+                "assembly_cutoff must be 'auto' or a non-negative number."
+            )
+        return "auto"
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "assembly_cutoff must be 'auto' or a non-negative number."
+        ) from exc
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "assembly_cutoff must be 'auto' or a non-negative number."
+        )
+    return value
+
+
+def _normalize_assembly_cutoff_mode(value):
+    """Validate the cutoff conventions supported by semantic TT-SVD."""
+    value = _resolve_compression_cutoff_mode(value)
+    if value not in {"rel", "abs", "sum1", "sum2", "rsum1", "rsum2"}:
+        raise ValueError(
+            "assembly_cutoff_mode must be one of rel, abs, sum1, sum2, "
+            "rsum1, rsum2, or auto."
+        )
+    return value
+
+
+def _normalize_assembly_form(value):
+    """Normalize the directional semantic TT-SVD sweep."""
+    if value is None:
+        return "left"
+    if not isinstance(value, str):
+        raise TypeError("assembly_form must be 'left' or 'right'.")
+    value = value.strip().lower().replace("-", "_")
+    if value not in {"left", "right"}:
+        raise ValueError("assembly_form must be 'left' or 'right'.")
+    return value
+
+
+def _resolve_cluster_physical_space(
+    phys_dim,
+    *,
+    symmetry=None,
+    physical_charges=None,
+    fermionic=False,
+    physical_space=None,
+):
+    """Normalize cluster-native physical-sector metadata."""
+    if physical_space is not None:
+        if not isinstance(physical_space, MPOPhysicalSpace):
+            raise TypeError(
+                "physical_space must be an MPOPhysicalSpace or None."
+            )
+        if symmetry is not None or physical_charges is not None or fermionic:
+            raise ValueError(
+                "physical_space cannot be combined with symmetry, "
+                "physical_charges, or fermionic metadata."
+            )
+        if physical_space.phys_dim != int(phys_dim):
+            raise ValueError(
+                f"physical_space has phys_dim={physical_space.phys_dim}, "
+                f"but cluster terms use phys_dim={int(phys_dim)}."
+            )
+        if physical_space.fermionic:
+            raise NotImplementedError(
+                "fermionic native block-sparse cluster MPOs are not yet "
+                "supported; use the ordinary MPO path."
+            )
+        return physical_space
+
+    if symmetry is None:
+        if physical_charges is not None:
+            raise ValueError("physical_charges requires symmetry metadata.")
+        if fermionic:
+            raise ValueError("fermionic=True requires symmetry metadata.")
+        return MPOPhysicalSpace(int(phys_dim))
+
+    symmetry = _normalize_mpo_symmetry(symmetry)
+    if physical_charges is None:
+        raise ValueError("symmetry requires physical_charges.")
+    physical_charges = _normalize_mpo_physical_charges(
+        physical_charges,
+        int(phys_dim),
+        symmetry,
+    )
+    if fermionic:
+        raise NotImplementedError(
+            "fermionic native block-sparse cluster MPOs are not yet "
+            "supported; use the ordinary MPO path."
+        )
+    return MPOPhysicalSpace(
+        int(phys_dim),
+        symmetry=symmetry,
+        physical_charges=physical_charges,
+    )
+
+
+def _validate_assembly_chi(value):
+    """Validate the working bond cap used by streaming assembly."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Integral)
+        or isinstance(value, bool)
+        or int(value) < 1
+    ):
+        raise ValueError("assembly_chi must be a positive integer or None.")
+    return int(value)
+
+
+def _validate_assembly_batch_size(value):
+    """Validate the number of paths accumulated before streaming SVD."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Integral)
+        or isinstance(value, bool)
+        or int(value) < 1
+    ):
+        raise ValueError(
+            "assembly_batch_size must be a positive integer or None."
+        )
+    return int(value)
+
+
 def _validate_graph_collection_order(value):
     """Validate the number of non-single graph residuals per collection."""
 
@@ -1053,6 +1204,21 @@ class MPOClusterExpansionReport:
     graph_collection_budget: int | None = None
     graph_collection_truncated: bool = False
     graph_frontier_width: int = 0
+    graph_planner: str = "none"
+    graph_planner_state_count: int = 0
+    graph_planner_state_budget: int | None = None
+    assembly: str = "direct"
+    assembly_chi: int | None = None
+    assembly_batch_size: int | None = None
+    assembly_compression_count: int = 0
+    assembly_peak_bond_dimensions: tuple[int, ...] = ()
+    assembly_cutoff: float | str | None = None
+    assembly_cutoff_mode: str = "rsum2"
+    assembly_form: str = "left"
+    assembly_discarded_weights: tuple[float, ...] = ()
+    symmetry: str | None = None
+    physical_charges: tuple = ()
+    native_block_sparse: bool = False
 
     @property
     def api_info(self):
@@ -1114,8 +1280,14 @@ class MPOClusterProductExpansion:
 
     For graph inputs, ``graph_assembly`` controls the additional collection
     expansion caused by crossing or nested graph clusters in the MPO ordering.
-    The default ``"auto"`` policy is exact for small plans and falls back to a
-    reported one-cluster approximation when its finite budget is exceeded.
+    The default ``"auto"`` policy counts collections with a cutwidth-aware
+    chain-frontier dynamic program, materializes small plans exactly, and
+    falls back to a reported one-cluster approximation when its finite budget
+    or planner work limit is exceeded. ``assembly="streaming"`` inserts local
+    graph-path cores directly into the accumulator in bounded batches. By
+    default it applies a backend-native fixed-rank TT-SVD after each batch;
+    ``assembly_cutoff`` switches to a cutoff-aware semantic TT-SVD, with
+    ``assembly_form`` selecting the sweep direction.
     """
 
     def __init__(
@@ -1132,6 +1304,16 @@ class MPOClusterProductExpansion:
         graph_assembly="auto",
         max_collection_order=None,
         collection_budget=128,
+        assembly="direct",
+        assembly_chi=None,
+        assembly_batch_size=None,
+        assembly_cutoff=None,
+        assembly_cutoff_mode="auto",
+        assembly_form="left",
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         if not isinstance(L, Integral) or isinstance(L, bool) or int(L) < 1:
             raise ValueError("L must be a positive integer.")
@@ -1142,6 +1324,30 @@ class MPOClusterProductExpansion:
             max_collection_order
         )
         collection_budget = _validate_graph_collection_budget(collection_budget)
+        assembly = _normalize_mpo_assembly(assembly)
+        assembly_chi = _validate_assembly_chi(assembly_chi)
+        assembly_batch_size = _validate_assembly_batch_size(
+            assembly_batch_size
+        )
+        assembly_cutoff = _validate_assembly_cutoff(assembly_cutoff)
+        assembly_cutoff_mode = _normalize_assembly_cutoff_mode(
+            assembly_cutoff_mode
+        )
+        assembly_form = _normalize_assembly_form(assembly_form)
+        if assembly == "streaming" and assembly_chi is None:
+            raise ValueError(
+                "assembly='streaming' requires a positive assembly_chi."
+            )
+        if assembly == "direct" and (
+            assembly_chi is not None
+            or assembly_batch_size is not None
+            or assembly_cutoff is not None
+            or assembly_form != "left"
+        ):
+            raise ValueError(
+                "streaming assembly options require "
+                "assembly='streaming'."
+            )
         self.L = int(L)
         if not isinstance(cluster_size, Integral) or isinstance(cluster_size, bool):
             raise TypeError("cluster_size must be a positive integer.")
@@ -1164,8 +1370,18 @@ class MPOClusterProductExpansion:
         self.graph_assembly = graph_assembly
         self.max_collection_order = max_collection_order
         self.collection_budget = collection_budget
+        self.assembly = assembly
+        self.assembly_chi = assembly_chi
+        self.assembly_batch_size = assembly_batch_size
+        self.assembly_cutoff = assembly_cutoff
+        self.assembly_cutoff_mode = assembly_cutoff_mode
+        self.assembly_form = assembly_form
         self.graph = None if graph is None else _graph_lattice_from_input(graph, self.L)
         self.cluster_mode = "graph" if self.graph is not None else "interval"
+        if self.assembly == "streaming" and self.graph is None:
+            raise ValueError(
+                "assembly='streaming' currently requires graph cluster mode."
+            )
         if self.graph is None and max_collection_order is not None:
             raise ValueError(
                 "max_collection_order is only valid for graph cluster assembly."
@@ -1176,6 +1392,7 @@ class MPOClusterProductExpansion:
                 "graph_assembly='exact'."
             )
         self._graph_auto_warned = False
+        self._graph_collection_plan_cache = {}
         self.factors = tuple(self._normalize_factor(factor) for factor in factors)
         if not self.factors:
             raise ValueError("at least one MPO cluster factor is required.")
@@ -1191,6 +1408,22 @@ class MPOClusterProductExpansion:
         self.phys_dim = int(phys_dim)
         if self.phys_dim < 1:
             raise ValueError("phys_dim must be positive.")
+        self.physical_space = _resolve_cluster_physical_space(
+            self.phys_dim,
+            symmetry=symmetry,
+            physical_charges=physical_charges,
+            fermionic=fermionic,
+            physical_space=physical_space,
+        )
+        if (
+            self.assembly == "streaming"
+            and self.physical_space.symmetry is not None
+        ):
+            raise ValueError(
+                "streaming assembly with native symmetry is not yet "
+                "supported because intermediate SVDs must remain sector-aware; "
+                "use assembly='direct' for a native block-sparse MPO."
+            )
         for factor in self.factors:
             for term in factor.terms:
                 if any(site < 0 or site >= self.L for site in term.sites):
@@ -1444,6 +1677,15 @@ class MPOClusterProductExpansion:
             "graph_assembly": self.graph_assembly,
             "max_collection_order": self.max_collection_order,
             "collection_budget": self.collection_budget,
+            "assembly": self.assembly,
+            "assembly_chi": self.assembly_chi,
+            "assembly_batch_size": self.assembly_batch_size,
+            "assembly_cutoff": self.assembly_cutoff,
+            "assembly_cutoff_mode": self.assembly_cutoff_mode,
+            "assembly_form": self.assembly_form,
+            "symmetry": self.physical_space.symmetry,
+            "native_block_sparse": self.physical_space.symmetry is not None,
+            "graph_planner": "frontier_dp" if self.graph is not None else "none",
             "graph_frontier_width": (
                 0 if self.graph is None else self._graph_frontier_width()
             ),
@@ -1802,6 +2044,15 @@ class MPOClusterProductExpansion:
             span_cores.append(cluster_cores[index])
         return tuple(span_cores)
 
+    def _assembly_array(self, shape, *, like):
+        """Create a dense or sparse virtual accumulator for one site."""
+        if (
+            self.physical_space.symmetry is not None
+            and _backend_name(like) in {"builtins", "numpy"}
+        ):
+            return SparseVirtualTensor(shape, like=like)
+        return ar.do("zeros", shape, like=like)
+
     def _residuals(self, step, parameters):
         if self.graph is not None:
             return self._graph_residuals(step, parameters)
@@ -1820,16 +2071,24 @@ class MPOClusterProductExpansion:
             residuals[interval] = residual
         return residuals
 
-    def _assemble_graph(self, residuals):
+    def _assemble_graph(self, residuals, *, clusters=None):
         """Assemble graph residuals into a finite open-chain MPO."""
 
+        if clusters is None:
+            clusters = (
+                cluster
+                for cluster in residuals
+                if len(cluster) > 1
+            )
+        else:
+            clusters = tuple(
+                cluster for cluster in clusters if len(cluster) > 1
+            )
         cores = {}
-        for cluster, residual in residuals.items():
-            if len(cluster) == 1:
-                continue
+        for cluster in clusters:
             cores[cluster] = self._graph_span_cores(
                 cluster,
-                residual,
+                residuals[cluster],
                 residuals=residuals,
                 include_background=True,
             )
@@ -1850,8 +2109,7 @@ class MPOClusterProductExpansion:
         for site in range(self.L):
             left_states = state_lists[site]
             right_states = state_lists[site + 1]
-            array = ar.do(
-                "zeros",
+            array = self._assembly_array(
                 (len(left_states), len(right_states), self.phys_dim, self.phys_dim),
                 like=reference,
             )
@@ -1890,6 +2148,176 @@ class MPOClusterProductExpansion:
             )
             arrays.append(array)
         return tuple(arrays), state_lists, cores
+
+    def _graph_path_cores(self, residuals, cluster):
+        """Build one full-chain residual path without materializing an MPO."""
+
+        span_cores = self._graph_span_cores(
+            cluster,
+            residuals[cluster],
+            residuals=residuals,
+            include_background=True,
+        )
+        start, end = min(cluster), max(cluster)
+        background = tuple(
+            ar.do(
+                "reshape",
+                residuals[(site,)],
+                (1, 1, self.phys_dim, self.phys_dim),
+            )
+            for site in range(self.L)
+        )
+        return background[:start] + span_cores + background[end + 1 :], span_cores
+
+    def _graph_collection_path_cores(
+        self,
+        residuals,
+        collection,
+        residual_cores,
+    ):
+        """Build one full-chain path for a compatible cluster collection."""
+
+        occupied = {
+            site
+            for cluster in collection
+            for site in cluster
+        }
+        local_cores = []
+        for site in range(self.L):
+            factors = []
+            for cluster in collection:
+                if min(cluster) <= site <= max(cluster):
+                    factors.append(
+                        residual_cores[cluster][site - min(cluster)]
+                    )
+            if site not in occupied:
+                factors.append(
+                    ar.do(
+                        "reshape",
+                        residuals[(site,)],
+                        (1, 1, self.phys_dim, self.phys_dim),
+                    )
+                )
+            local = factors[0]
+            for factor in factors[1:]:
+                local = self._multiply_mpo_cores(local, factor)
+            local_cores.append(local)
+        return tuple(local_cores)
+
+    def _assemble_graph_streaming(
+        self,
+        residuals,
+        *,
+        graph_plan,
+    ):
+        """Assemble graph paths in bounded batches with semantic TT-SVD."""
+
+        collection_paths = bool(graph_plan["collections"])
+        paths = (
+            graph_plan["collections"]
+            if collection_paths
+            else tuple(
+                cluster for cluster in self._graph_clusters if len(cluster) > 1
+            )
+        )
+        rail_arrays, _state_lists, _cores = self._assemble_graph(
+            residuals,
+            clusters=(),
+        )
+        accumulator = FirstDegreeMPO(
+            rail_arrays,
+            degree=self.cluster_size,
+            physical_space=self.physical_space,
+            metadata={
+                "operation": "cluster_expansion_streaming",
+                "history_valid": False,
+            },
+        )
+        peak_bond_dimensions = list(accumulator.bond_dimensions)
+        residual_ranks = {}
+        compression_count = 0
+        discarded_weights = []
+        assembly_cutoff = self.assembly_cutoff
+        if isinstance(assembly_cutoff, str):
+            assembly_cutoff = _resolve_compression_cutoff(
+                assembly_cutoff,
+                _backend_reference(tuple(residuals.values())),
+            )
+        batch_size = self.assembly_batch_size or 1
+        for start in range(0, len(paths), batch_size):
+            batch = paths[start : start + batch_size]
+            batch_path_cores = []
+            if collection_paths:
+                batch_residual_cores = {}
+                for collection in batch:
+                    for cluster in collection:
+                        if cluster not in batch_residual_cores:
+                            batch_residual_cores[cluster] = self._graph_span_cores(
+                                cluster,
+                                residuals[cluster],
+                            )
+                for collection in batch:
+                    for cluster in collection:
+                        residual_ranks[cluster] = tuple(
+                            int(core.shape[1])
+                            for core in batch_residual_cores[cluster]
+                        )
+                    path_cores = self._graph_collection_path_cores(
+                        residuals,
+                        collection,
+                        batch_residual_cores,
+                    )
+                    batch_path_cores.append(path_cores)
+            else:
+                for cluster in batch:
+                    path_cores, residual_cores = self._graph_path_cores(
+                        residuals,
+                        cluster,
+                    )
+                    residual_ranks[cluster] = tuple(
+                        int(core.shape[1]) for core in residual_cores
+                    )
+                    batch_path_cores.append(path_cores)
+            accumulator = accumulator._add_path_cores_batch(batch_path_cores)
+            peak_bond_dimensions = [
+                max(current, int(size))
+                for current, size in zip(
+                    peak_bond_dimensions,
+                    accumulator.bond_dimensions,
+                )
+            ]
+            if assembly_cutoff is None:
+                accumulator, compression_report = accumulator.compress_fixed_rank(
+                    self.assembly_chi,
+                    form=self.assembly_form,
+                    return_report=True,
+                )
+            else:
+                accumulator, compression_report = accumulator.compress_adaptive(
+                    self.assembly_chi,
+                    cutoff=assembly_cutoff,
+                    cutoff_mode=self.assembly_cutoff_mode,
+                    form=self.assembly_form,
+                    return_report=True,
+                )
+                discarded_weights.extend(
+                    compression_report.discarded_weights
+                )
+            compression_count += 1
+
+        return accumulator, {
+            "residual_ranks": tuple(
+                (cluster, residual_ranks[cluster])
+                for cluster in sorted(residual_ranks)
+            ),
+            "compression_count": compression_count,
+            "peak_bond_dimensions": tuple(peak_bond_dimensions),
+            "cutoff": assembly_cutoff,
+            "resolved_cutoff": assembly_cutoff,
+            "cutoff_mode": self.assembly_cutoff_mode,
+            "form": self.assembly_form,
+            "discarded_weights": tuple(discarded_weights),
+        }
 
     def _graph_needs_collection_assembly(self):
         """Whether disjoint graph clusters have overlapping chain spans."""
@@ -1970,6 +2398,139 @@ class MPOClusterProductExpansion:
         collections, _truncated = self._bounded_graph_cluster_collections()
         return collections
 
+    def _graph_collection_frontier_plan(
+        self,
+        *,
+        max_collection_order=None,
+        budget=None,
+    ):
+        """Count compatible collections with a chain-frontier dynamic program.
+
+        Clusters are introduced in MPO-chain order. The state stores only the
+        selected clusters whose spans still cross the current introduction
+        point, together with their occupied graph sites and collection order.
+        Expired clusters are discarded before the next introduction, so the
+        state width is controlled by the cluster cutwidth rather than by the
+        total number of graph clusters. ``budget`` is a count cap used only to
+        decide whether exact collection materialization is safe.
+        """
+
+        clusters = tuple(
+            cluster for cluster in self._graph_clusters if len(cluster) > 1
+        )
+        if not clusters:
+            return {
+                "planner": "frontier_dp",
+                "collection_count": 0,
+                "state_count": 1,
+                "state_budget": None,
+                "overflow": False,
+            }
+
+        state_budget = max(
+            4096,
+            32 * (128 if budget is None else int(budget)),
+        )
+        state_budget = min(state_budget, 1_000_000)
+        count_cap = None if budget is None else int(budget) + 2
+        cluster_masks = tuple(
+            sum(1 << int(site) for site in cluster)
+            for cluster in clusters
+        )
+        order = tuple(
+            sorted(
+                range(len(clusters)),
+                key=lambda index: (
+                    min(clusters[index]),
+                    max(clusters[index]),
+                    index,
+                ),
+            )
+        )
+        states = (
+            {(0, 0, 0): 1}
+            if max_collection_order is not None
+            else {(0, 0): 1}
+        )
+        max_state_count = 1
+        processed = []
+
+        def add_count(target, key, value):
+            updated = target.get(key, 0) + value
+            if count_cap is not None:
+                updated = min(updated, count_cap)
+            target[key] = updated
+
+        for cluster_index in order:
+            start = min(clusters[cluster_index])
+            expired = tuple(
+                index
+                for index in processed
+                if max(clusters[index]) < start
+            )
+            next_states = {}
+            cluster_mask = cluster_masks[cluster_index]
+            cluster_bit = 1 << cluster_index
+            for state, count in states.items():
+                if max_collection_order is None:
+                    active, occupied = state
+                    collection_order = None
+                else:
+                    active, occupied, collection_order = state
+                for expired_index in expired:
+                    expired_bit = 1 << expired_index
+                    if active & expired_bit:
+                        active ^= expired_bit
+                        occupied ^= cluster_masks[expired_index]
+
+                if max_collection_order is None:
+                    excluded = (active, occupied)
+                else:
+                    excluded = (active, occupied, collection_order)
+                add_count(next_states, excluded, count)
+
+                can_select = not (occupied & cluster_mask)
+                if (
+                    can_select
+                    and (
+                        max_collection_order is None
+                        or collection_order < max_collection_order
+                    )
+                ):
+                    selected = (
+                        active | cluster_bit,
+                        occupied | cluster_mask,
+                    )
+                    if max_collection_order is not None:
+                        selected = (*selected, collection_order + 1)
+                    add_count(next_states, selected, count)
+
+            max_state_count = max(max_state_count, len(next_states))
+            if len(next_states) > state_budget:
+                return {
+                    "planner": "frontier_dp",
+                    "collection_count": (
+                        None if budget is None else int(budget) + 1
+                    ),
+                    "state_count": max_state_count,
+                    "state_budget": state_budget,
+                    "overflow": True,
+                }
+            states = next_states
+            processed.append(cluster_index)
+
+        total = sum(states.values())
+        if count_cap is not None:
+            total = min(total, count_cap)
+        collection_count = total - 1  # remove the empty collection
+        return {
+            "planner": "frontier_dp",
+            "collection_count": collection_count,
+            "state_count": max_state_count,
+            "state_budget": state_budget,
+            "overflow": False,
+        }
+
     def _graph_frontier_width(self):
         """Return the graph-cluster cutwidth in the MPO ordering."""
 
@@ -1985,12 +2546,27 @@ class MPOClusterProductExpansion:
         )
 
     def _graph_collection_plan(self):
+        """Return a cached graph collection plan for this topology."""
+
+        cache_key = (
+            self.graph_assembly,
+            self.max_collection_order,
+            self.collection_budget,
+        )
+        if cache_key not in self._graph_collection_plan_cache:
+            self._graph_collection_plan_cache[cache_key] = (
+                self._build_graph_collection_plan()
+            )
+        return self._graph_collection_plan_cache[cache_key]
+
+    def _build_graph_collection_plan(self):
         """Choose a safe exact or bounded graph assembly plan.
 
         Exact collection assembly is useful for small custom graphs, but its
         collection count is a hard scalability boundary for 2D MPO orderings.
-        ``auto`` probes only up to the configured budget and falls back to the
-        explicit one-cluster approximation when that boundary is crossed.
+        A cutwidth-aware frontier dynamic program counts compatible
+        collections first; explicit collection materialization is attempted
+        only when that count is within the configured budget.
         """
 
         if self.graph is None or not self._graph_needs_collection_assembly():
@@ -2000,6 +2576,9 @@ class MPOClusterProductExpansion:
                 "collection_order": 1,
                 "collection_count": 0,
                 "collection_truncated": False,
+                "planner": "none",
+                "planner_state_count": 0,
+                "planner_state_budget": None,
             }
 
         if self.graph_assembly == "auto" and self.collection_budget is None:
@@ -2018,7 +2597,23 @@ class MPOClusterProductExpansion:
                     "collection_order": 1,
                     "collection_count": 0,
                     "collection_truncated": True,
+                    "planner": "none",
+                    "planner_state_count": 0,
+                    "planner_state_budget": None,
                 }
+            planning = self._graph_collection_frontier_plan(
+                max_collection_order=collection_order,
+                budget=self.collection_budget,
+            )
+            if planning["overflow"] or (
+                self.collection_budget is not None
+                and planning["collection_count"] > self.collection_budget
+            ):
+                raise ValueError(
+                    "bounded graph MPO assembly exceeded its frontier-planner "
+                    "budget; reduce max_collection_order or increase "
+                    "collection_budget explicitly."
+                )
             collections, truncated = self._bounded_graph_cluster_collections(
                 max_collection_order=collection_order,
                 budget=self.collection_budget,
@@ -2035,18 +2630,41 @@ class MPOClusterProductExpansion:
                 "collection_order": collection_order,
                 "collection_count": len(collections),
                 "collection_truncated": True,
+                "planner": planning["planner"],
+                "planner_state_count": planning["state_count"],
+                "planner_state_budget": planning["state_budget"],
             }
 
-        collections, truncated = self._bounded_graph_cluster_collections(
+        planning = self._graph_collection_frontier_plan(
             budget=self.collection_budget,
         )
+        planner_overflow = planning["overflow"]
+        budget_exceeded = (
+            self.collection_budget is not None
+            and planning["collection_count"] > self.collection_budget
+        )
         if self.graph_assembly == "exact":
+            if planner_overflow:
+                raise ValueError(
+                    "exact graph MPO assembly exceeded the frontier-planner "
+                    f"state budget={planning['state_budget']}; use "
+                    "graph_assembly='bounded' for a controlled approximation "
+                    "or choose an MPO ordering with smaller cutwidth."
+                )
+            if budget_exceeded:
+                raise ValueError(
+                    "exact graph MPO assembly exceeds collection_budget="
+                    f"{self.collection_budget}; use graph_assembly='bounded' "
+                    "for a controlled approximation or increase the budget."
+                )
+            collections, truncated = self._bounded_graph_cluster_collections(
+                budget=self.collection_budget,
+            )
             if truncated:
                 raise ValueError(
                     "exact graph MPO assembly exceeds collection_budget="
                     f"{self.collection_budget}; use graph_assembly='bounded' "
-                    "for a controlled approximation or set "
-                    "collection_budget=None explicitly."
+                    "for a controlled approximation or increase the budget."
                 )
             return {
                 "strategy": "exact",
@@ -2054,16 +2672,28 @@ class MPOClusterProductExpansion:
                 "collection_order": None,
                 "collection_count": len(collections),
                 "collection_truncated": False,
+                "planner": planning["planner"],
+                "planner_state_count": planning["state_count"],
+                "planner_state_budget": planning["state_budget"],
             }
 
-        if not truncated:
-            return {
-                "strategy": "exact",
-                "collections": collections,
-                "collection_order": None,
-                "collection_count": len(collections),
-                "collection_truncated": False,
-            }
+        if not planner_overflow and not budget_exceeded:
+            collections, truncated = self._bounded_graph_cluster_collections(
+                budget=self.collection_budget,
+            )
+            if truncated:
+                budget_exceeded = True
+            else:
+                return {
+                    "strategy": "exact",
+                    "collections": collections,
+                    "collection_order": None,
+                    "collection_count": len(collections),
+                    "collection_truncated": False,
+                    "planner": planning["planner"],
+                    "planner_state_count": planning["state_count"],
+                    "planner_state_budget": planning["state_budget"],
+                }
 
         if not self._graph_auto_warned:
             warnings.warn(
@@ -2083,6 +2713,9 @@ class MPOClusterProductExpansion:
             "collection_order": 1,
             "collection_count": 0,
             "collection_truncated": True,
+            "planner": planning["planner"],
+            "planner_state_count": planning["state_count"],
+            "planner_state_budget": planning["state_budget"],
         }
 
     @staticmethod
@@ -2168,8 +2801,7 @@ class MPOClusterProductExpansion:
         for site in range(self.L):
             left_states = state_lists[site]
             right_states = state_lists[site + 1]
-            array = ar.do(
-                "zeros",
+            array = self._assembly_array(
                 (len(left_states), len(right_states), self.phys_dim, self.phys_dim),
                 like=reference,
             )
@@ -2287,8 +2919,7 @@ class MPOClusterProductExpansion:
         for site in range(self.L):
             left_states = state_lists[site]
             right_states = state_lists[site + 1]
-            array = ar.do(
-                "zeros",
+            array = self._assembly_array(
                 (len(left_states), len(right_states), self.phys_dim, self.phys_dim),
                 like=reference,
             )
@@ -2344,11 +2975,20 @@ class MPOClusterProductExpansion:
             "collection_count": 0,
             "collection_truncated": False,
         }
+        streaming_info = None
         if self.graph is None:
             arrays, state_lists, cores = self._assemble(residuals)
         else:
             graph_plan = self._graph_collection_plan()
-            if graph_plan["strategy"] == "direct":
+            if self.assembly == "streaming":
+                semantic, streaming_info = self._assemble_graph_streaming(
+                    residuals,
+                    graph_plan=graph_plan,
+                )
+                arrays = semantic.arrays
+                state_lists = None
+                cores = None
+            elif graph_plan["strategy"] == "direct":
                 arrays, state_lists, cores = self._assemble_graph(residuals)
             elif graph_plan["collections"]:
                 arrays, state_lists, cores = self._assemble_graph_collections(
@@ -2357,11 +2997,31 @@ class MPOClusterProductExpansion:
                 )
             else:
                 arrays, state_lists, cores = self._assemble_graph(residuals)
-        residual_ranks = tuple(
-            (interval, tuple(int(core.shape[1]) for core in cores[interval]))
-            for interval in sorted(cores)
-        )
-        bond_dimensions = tuple(len(states) for states in state_lists[1:-1])
+        if streaming_info is None:
+            residual_ranks = tuple(
+                (interval, tuple(int(core.shape[1]) for core in cores[interval]))
+                for interval in sorted(cores)
+            )
+            bond_dimensions = tuple(len(states) for states in state_lists[1:-1])
+            assembled_semantic = None
+            assembly_compression_count = 0
+            assembly_peak_bond_dimensions = ()
+            assembly_cutoff = None
+            assembly_cutoff_mode = self.assembly_cutoff_mode
+            assembly_form = self.assembly_form
+            assembly_discarded_weights = ()
+        else:
+            residual_ranks = streaming_info["residual_ranks"]
+            bond_dimensions = tuple(semantic.bond_dimensions)
+            assembled_semantic = semantic
+            assembly_compression_count = streaming_info["compression_count"]
+            assembly_peak_bond_dimensions = streaming_info[
+                "peak_bond_dimensions"
+            ]
+            assembly_cutoff = streaming_info["cutoff"]
+            assembly_cutoff_mode = streaming_info["cutoff_mode"]
+            assembly_form = streaming_info["form"]
+            assembly_discarded_weights = streaming_info["discarded_weights"]
         report = MPOClusterExpansionReport(
             cluster_size=self.cluster_size,
             factor_count=len(self.factors),
@@ -2404,17 +3064,104 @@ class MPOClusterProductExpansion:
             graph_frontier_width=(
                 0 if self.graph is None else self._graph_frontier_width()
             ),
+            graph_planner=(
+                "none" if self.graph is None else graph_plan["planner"]
+            ),
+            graph_planner_state_count=(
+                0
+                if self.graph is None
+                else graph_plan["planner_state_count"]
+            ),
+            graph_planner_state_budget=(
+                None
+                if self.graph is None
+                else graph_plan["planner_state_budget"]
+            ),
+            assembly=self.assembly,
+            assembly_chi=self.assembly_chi,
+            assembly_batch_size=self.assembly_batch_size,
+            assembly_compression_count=assembly_compression_count,
+            assembly_peak_bond_dimensions=assembly_peak_bond_dimensions,
+            assembly_cutoff=assembly_cutoff,
+            assembly_cutoff_mode=assembly_cutoff_mode,
+            assembly_form=assembly_form,
+            assembly_discarded_weights=assembly_discarded_weights,
+            symmetry=self.physical_space.symmetry,
+            physical_charges=(
+                ()
+                if self.physical_space.physical_charges is None
+                else tuple(self.physical_space.physical_charges)
+            ),
+            native_block_sparse=(
+                self.physical_space.symmetry is not None
+                and all(
+                    isinstance(array, SparseVirtualTensor)
+                    or _backend_name(array) in {"builtins", "numpy"}
+                    for array in arrays
+                )
+            ),
         )
         self._last_report = report
+        if assembled_semantic is not None:
+            assembled_semantic.metadata.update({
+                "operation": "cluster_expansion",
+                "cluster_size": self.cluster_size,
+                "factor_count": len(self.factors),
+                "cluster_report": report,
+                "history_valid": False,
+                "assembly": report.assembly,
+                "assembly_chi": report.assembly_chi,
+                "assembly_batch_size": report.assembly_batch_size,
+                "assembly_compression_count": (
+                    report.assembly_compression_count
+                ),
+                "assembly_peak_bond_dimensions": (
+                    report.assembly_peak_bond_dimensions
+                ),
+                "assembly_cutoff": report.assembly_cutoff,
+                "assembly_cutoff_mode": report.assembly_cutoff_mode,
+                "assembly_form": report.assembly_form,
+                "assembly_discarded_weights": (
+                    report.assembly_discarded_weights
+                ),
+            })
+            return assembled_semantic
+        if self.physical_space.symmetry is not None and all(
+            isinstance(array, SparseVirtualTensor)
+            or _backend_name(array) in {"builtins", "numpy"}
+            for array in arrays
+        ):
+            arrays = tuple(
+                array
+                if isinstance(array, SparseVirtualTensor)
+                else _dense_virtual_to_sparse(array)
+                for array in arrays
+            )
         return FirstDegreeMPO(
             arrays,
             degree=self.cluster_size,
+            physical_space=self.physical_space,
             metadata={
                 "operation": "cluster_expansion",
                 "cluster_size": self.cluster_size,
                 "factor_count": len(self.factors),
                 "cluster_report": report,
                 "history_valid": False,
+                "assembly": report.assembly,
+                "assembly_chi": report.assembly_chi,
+                "assembly_batch_size": report.assembly_batch_size,
+                "assembly_compression_count": (
+                    report.assembly_compression_count
+                ),
+                "assembly_peak_bond_dimensions": (
+                    report.assembly_peak_bond_dimensions
+                ),
+                "assembly_cutoff": report.assembly_cutoff,
+                "assembly_cutoff_mode": report.assembly_cutoff_mode,
+                "assembly_form": report.assembly_form,
+                "assembly_discarded_weights": (
+                    report.assembly_discarded_weights
+                ),
             },
         )
 
@@ -2550,6 +3297,12 @@ def exp_mpo_cluster(
     graph_assembly="auto",
     max_collection_order=None,
     collection_budget=128,
+    assembly="direct",
+    assembly_chi=None,
+    assembly_batch_size=None,
+    assembly_cutoff=None,
+    assembly_cutoff_mode="auto",
+    assembly_form="left",
     chi=None,
     cutoff_mode="rel",
     compression=None,
@@ -2627,17 +3380,44 @@ def exp_mpo_cluster(
     collection_budget : int or None, default=128
         Hard limit on graph-cluster collections inspected or materialized.
         Set ``None`` only when an explicitly unbounded exact plan is intended.
+    assembly : {"direct", "streaming"}, default="direct"
+        Global graph-path materialization strategy. ``"direct"`` constructs
+        the analytical MPO in one pass. ``"streaming"`` accumulates
+        independent graph residual paths in batches and applies a semantic
+        fixed-rank SVD after each batch, keeping the working MPO bounded.
+        Streaming currently applies to individual graph residual paths and
+        therefore requires a bounded one-cluster graph assembly plan.
+    assembly_chi : int, optional
+        Working bond cap used by ``assembly="streaming"``. This is separate
+        from ``chi``, which is an optional final Quimb numerical compression.
+    assembly_batch_size : int, optional
+        Number of graph residual paths accumulated before each streaming SVD.
+        The default is one path at a time.
+    assembly_cutoff : float, "auto", or None, optional
+        Optional numerical cutoff for intermediate streaming SVDs. ``None``
+        retains backend-differentiable fixed-rank streaming. A numeric value
+        or ``"auto"`` enables adaptive rank selection. The tensor arithmetic
+        remains on the requested backend, but dynamic rank selection is not
+        suitable for compiled/JIT traces.
+    assembly_cutoff_mode : {"rel", "abs", "sum1", "sum2", "rsum1", "rsum2", "auto"}
+        Interpretation of ``assembly_cutoff``. ``"auto"`` resolves to
+        ``"rsum2"``.
+    assembly_form : {"left", "right"}, default="left"
+        Direction of the intermediate semantic TT-SVD sweep.
     chi, cutoff_mode, compression, differentiable, sector_aware, form,
     create_bond, compress_opts : optional
         Optional final numerical MPO compression, using the same semantic
         boundary as :func:`exp_mpo`. ``chi`` is separate from ``max_bond``.
         With ``return_semantic=True``, use ``compression="fixed_rank"`` or
         ``differentiable=True`` to retain a semantic result.
-    symmetry, physical_charges, fermionic, physical_space : optional
-        Native Symmray and graded history metadata are intentionally rejected
-        here. The analytical cluster assembler currently produces ordinary
-        dense-backend MPO blocks; use the higher-order ``exp_mpo`` path for
-        native block-sparse history construction.
+    symmetry, physical_charges, physical_space : optional
+        Native bosonic Abelian sector metadata. Direct cluster assembly keeps
+        virtual operator blocks sparse and compiles them through Symmray at
+        the Quimb boundary. Supported symmetries are ``"U1"``, ``"Z2"``,
+        ``"U1U1"``, and ``"Z2Z2"``. Native compilation currently requires
+        NumPy local blocks. ``fermionic=True`` remains unsupported here
+        because its string/sign history is not yet encoded by the cluster
+        assembler.
     to_backend : callable, optional
         Converter applied to parsed local operators, the exponential step,
         and resolved scalar coefficients before local exponentials, residual
@@ -2665,19 +3445,14 @@ def exp_mpo_cluster(
     ordering. ``graph_assembly="bounded"`` with
     ``max_collection_order=1`` is the fast graph-MPO mode; use a graph-native
     PEPO when the full 2D connected expansion is required at scale.
+
+    Streaming assembly is a third, numerical approximation axis. It preserves
+    the selected bounded graph-path sum when ``assembly_chi`` is unbounded in
+    practice, but finite intermediate SVD truncation can change the result.
     """
 
     if not isinstance(progress, bool):
         raise TypeError("progress must be a boolean.")
-    if symmetry is not None or physical_charges is not None or fermionic:
-        raise NotImplementedError(
-            "native symmetry and graded MPO metadata are not currently "
-            "supported by exp_mpo_cluster; use exp_mpo for that path."
-        )
-    if physical_space is not None:
-        raise NotImplementedError(
-            "physical_space is not currently supported by exp_mpo_cluster."
-        )
     if not isinstance(differentiable, bool):
         raise TypeError("differentiable must be a boolean.")
     sector_aware = _normalize_sector_aware_request(sector_aware)
@@ -2746,8 +3521,19 @@ def exp_mpo_cluster(
                 to_backend=to_backend,
             )
             cluster_factors.append(factor)
-            if reference_basis is None and basis is not None:
-                reference_basis = basis
+            if basis is not None:
+                if reference_basis is None:
+                    reference_basis = basis
+                elif basis.L != reference_basis.L:
+                    raise ValueError(
+                        "all ordered MPO factor bases must have matching "
+                        "chain lengths."
+                    )
+                elif basis.phys_dim != reference_basis.phys_dim:
+                    raise ValueError(
+                        "all ordered MPO factor bases must have matching "
+                        "physical dimensions."
+                    )
         cluster_factors = tuple(cluster_factors)
 
     reference = _cluster_factor_reference(cluster_factors)
@@ -2799,6 +3585,16 @@ def exp_mpo_cluster(
             graph_assembly=graph_assembly,
             max_collection_order=max_collection_order,
             collection_budget=collection_budget,
+            assembly=assembly,
+            assembly_chi=assembly_chi,
+            assembly_batch_size=assembly_batch_size,
+            assembly_cutoff=assembly_cutoff,
+            assembly_cutoff_mode=assembly_cutoff_mode,
+            assembly_form=assembly_form,
+            symmetry=symmetry,
+            physical_charges=physical_charges,
+            fermionic=fermionic,
+            physical_space=physical_space,
         )
     else:
         normalized_graph = _graph_lattice_from_spec(
@@ -2820,6 +3616,16 @@ def exp_mpo_cluster(
             graph_assembly=graph_assembly,
             max_collection_order=max_collection_order,
             collection_budget=collection_budget,
+            assembly=assembly,
+            assembly_chi=assembly_chi,
+            assembly_batch_size=assembly_batch_size,
+            assembly_cutoff=assembly_cutoff,
+            assembly_cutoff_mode=assembly_cutoff_mode,
+            assembly_form=assembly_form,
+            symmetry=symmetry,
+            physical_charges=physical_charges,
+            fermionic=fermionic,
+            physical_space=physical_space,
         )
 
     if chi is not None:
@@ -2870,7 +3676,8 @@ def exp_mpo_cluster(
         if progress_bar is not None:
             progress_bar.set_description(
                 "exp_mpo_cluster | cluster "
-                f"({cluster_report.graph_assembly})"
+                f"({cluster_report.graph_assembly}, "
+                f"{cluster_report.assembly})"
             )
             progress_bar.update(1)
 
@@ -2943,6 +3750,27 @@ def exp_mpo_cluster(
             "graph_collection_count": cluster_report.graph_collection_count,
             "graph_collection_truncated": cluster_report.graph_collection_truncated,
             "graph_frontier_width": cluster_report.graph_frontier_width,
+            "graph_planner": cluster_report.graph_planner,
+            "graph_planner_state_count": cluster_report.graph_planner_state_count,
+            "graph_planner_state_budget": cluster_report.graph_planner_state_budget,
+            "assembly": cluster_report.assembly,
+            "assembly_chi": cluster_report.assembly_chi,
+            "assembly_batch_size": cluster_report.assembly_batch_size,
+            "assembly_compression_count": (
+                cluster_report.assembly_compression_count
+            ),
+            "assembly_peak_bond_dimensions": (
+                cluster_report.assembly_peak_bond_dimensions
+            ),
+            "assembly_cutoff": cluster_report.assembly_cutoff,
+            "assembly_cutoff_mode": cluster_report.assembly_cutoff_mode,
+            "assembly_form": cluster_report.assembly_form,
+            "assembly_discarded_weights": (
+                cluster_report.assembly_discarded_weights
+            ),
+            "symmetry": cluster_report.symmetry,
+            "physical_charges": cluster_report.physical_charges,
+            "native_block_sparse": cluster_report.native_block_sparse,
             "chi": chi,
             "compression": (
                 None
@@ -2963,3 +3791,101 @@ def exp_mpo_cluster(
     finally:
         if progress_bar is not None:
             progress_bar.close()
+
+
+def exp_mpo_cluster_product(
+    factors,
+    step=None,
+    *,
+    shape=None,
+    mapper=None,
+    map_mode="snake",
+    parameters=None,
+    dt=None,
+    phys_dim=None,
+    cluster_size=2,
+    graph=None,
+    cyclic=False,
+    max_bond=None,
+    cutoff=1.0e-12,
+    graph_assembly="auto",
+    max_collection_order=None,
+    collection_budget=128,
+    assembly="direct",
+    assembly_chi=None,
+    assembly_batch_size=None,
+    assembly_cutoff=None,
+    assembly_cutoff_mode="auto",
+    assembly_form="left",
+    chi=None,
+    cutoff_mode="rel",
+    compression=None,
+    differentiable=False,
+    sector_aware="auto",
+    symmetry=None,
+    physical_charges=None,
+    fermionic=False,
+    physical_space=None,
+    to_backend=None,
+    return_semantic=False,
+    return_report=False,
+    form=None,
+    create_bond=False,
+    compress_opts=None,
+    progress=False,
+):
+    """Build a one-shot joint ordered MPO cluster product.
+
+    This is the product-named convenience facade for
+    ``exp_mpo_cluster(..., factors=factors)``. The factors are applied in
+    their supplied order, so ``(A, B, C)`` constructs the local connected
+    approximation to ``exp(A) @ exp(B) @ exp(C)``. Each factor may be an
+    :class:`MPOClusterFactor`, an :class:`MPOBasis`, a term iterable, or a
+    mapping with ``terms`` and an optional factor ``coefficient``.
+
+    All graph, cyclic, streaming, backend, report, and final numerical
+    compression options intentionally match :func:`exp_mpo_cluster`. Term
+    ``coefficients`` are configured within each factor; use
+    :class:`MPOParameter` and ``parameters`` for repeated parameterized
+    evaluations.
+    """
+    return exp_mpo_cluster(
+        step=step,
+        shape=shape,
+        mapper=mapper,
+        map_mode=map_mode,
+        parameters=parameters,
+        dt=dt,
+        phys_dim=phys_dim,
+        cluster_size=cluster_size,
+        graph=graph,
+        cyclic=cyclic,
+        factors=factors,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        graph_assembly=graph_assembly,
+        max_collection_order=max_collection_order,
+        collection_budget=collection_budget,
+        assembly=assembly,
+        assembly_chi=assembly_chi,
+        assembly_batch_size=assembly_batch_size,
+        assembly_cutoff=assembly_cutoff,
+        assembly_cutoff_mode=assembly_cutoff_mode,
+        assembly_form=assembly_form,
+        chi=chi,
+        cutoff_mode=cutoff_mode,
+        compression=compression,
+        differentiable=differentiable,
+        sector_aware=sector_aware,
+        symmetry=symmetry,
+        physical_charges=physical_charges,
+        fermionic=fermionic,
+        physical_space=physical_space,
+        to_backend=to_backend,
+        return_semantic=return_semantic,
+        return_report=return_report,
+        form=form,
+        create_bond=create_bond,
+        compress_opts=compress_opts,
+        progress=progress,
+    )

@@ -22,6 +22,7 @@ _CANONICAL_OWNERS = {
     "MPOGraphClusterProductExpansion": ".mpo_product",
     "CompiledMPOClusterProduct": ".mpo_product",
     "exp_mpo_cluster": ".mpo_product",
+    "exp_mpo_cluster_product": ".mpo_product",
     "ActivePEPOBlocks": ".pepo_cluster",
     "GraphActivePEPOBlocks": ".pepo_cluster",
     "PauliPEPOBasis": ".pepo_cluster",
@@ -108,11 +109,13 @@ def test_operator_family_facades_keep_construction_domains_separate():
     assert operators.FirstDegreeMPO is mpo_semantic.FirstDegreeMPO
     assert operators.MPOClusterProductExpansion is mpo_product.MPOClusterProductExpansion
     assert operators.CompiledMPOClusterProduct is mpo_product.CompiledMPOClusterProduct
+    assert operators.exp_mpo_cluster_product is mpo_product.exp_mpo_cluster_product
     assert operators.MPOClusterBasisExpansion is mpo_product.MPOClusterProductExpansion
     assert operators.CompiledMPOClusterExp is mpo_product.CompiledMPOClusterProduct
     assert operators.MPOGraphClusterBasisExpansion is mpo_product.MPOGraphClusterProductExpansion
     assert mpo_cluster.MPOClusterBasisExpansion is mpo_product.MPOClusterProductExpansion
     assert mpo_cluster.CompiledMPOClusterExp is mpo_product.CompiledMPOClusterProduct
+    assert mpo_cluster.exp_mpo_cluster_product is mpo_product.exp_mpo_cluster_product
     assert pepo_cluster.ClusterExpansionPlan is pepo_dense.ClusterExpansionPlan
     assert pepo_cluster.ClusterLattice is pepo_dense.ClusterLattice
     assert pepo_geometry.ClusterLattice is pepo_dense.ClusterLattice

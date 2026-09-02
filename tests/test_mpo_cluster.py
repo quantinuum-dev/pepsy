@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import pytest
 
+from pepsy.tensors import OneDMap
 from pepsy.operators import (
     ClusterLattice,
     ClusterBasisExpansion,
@@ -14,9 +15,12 @@ from pepsy.operators import (
     MPOClusterFactor,
     MPOGraphClusterBasisExpansion,
     MPOParameter,
+    MPOPhysicalSpace,
     MPOProductTerm,
     exp_mpo_cluster,
+    exp_mpo_cluster_product,
 )
+from pepsy.operators.mpo_semantic import FirstDegreeMPO
 
 
 scipy_linalg = pytest.importorskip("scipy.linalg")
@@ -258,6 +262,33 @@ def test_graph_cluster_expansion_maps_square_coordinates_and_preserves_factor_or
     assert expansion.last_report.cluster_mode == "graph"
 
 
+def test_graph_cluster_expansion_accepts_mapped_chain_locations_with_shape():
+    """A OneDMap accepts terms already expressed in MPO-chain positions."""
+    x, z = _paulis()
+    mapper = OneDMap(2, 2, mode="snake")
+    terms = [
+        (("zz", 0.7), (0, 1)),
+        (("x", -0.2), (2,)),
+    ]
+    result = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=(2, 2),
+        mapper=mapper,
+        graph="square",
+        cyclic=True,
+        cluster_size=2,
+    )
+    generator = 0.7 * _kron_all((z, z, np.eye(2), np.eye(2)))
+    generator += -0.2 * _kron_all((np.eye(2), np.eye(2), x, np.eye(2)))
+    assert result.L == 4
+    np.testing.assert_allclose(
+        result.to_dense(),
+        scipy_linalg.expm(0.01 * generator),
+        atol=1.0e-11,
+    )
+
+
 def test_graph_cluster_expansion_keeps_products_of_crossing_long_range_clusters():
     """Disjoint long-range clusters may nest in the MPO chain ordering."""
     x, _z = _paulis()
@@ -466,6 +497,37 @@ def test_exp_mpo_cluster_maps_coordinate_graphs_and_supports_ordered_factors():
     assert mapping[(1, 1)] == 2
 
 
+def test_exp_mpo_cluster_product_is_the_one_shot_three_factor_surface():
+    """The product-named facade builds the ordered A-B-C cluster target."""
+    x, z = _paulis()
+    factors = (
+        MPOClusterFactor([((0, 1), (x, x))], coefficient=0.2),
+        MPOClusterFactor([((1, 2), (z, z))], coefficient=-0.3),
+        MPOClusterFactor([((0, 1), (z, x))], coefficient=0.4),
+    )
+    result, report = exp_mpo_cluster_product(
+        factors,
+        dt=0.05,
+        shape=3,
+        cluster_size=3,
+        cutoff=0.0,
+        return_report=True,
+    )
+    identity = np.eye(2)
+    operator_a = _kron_all((x, x, identity))
+    operator_b = _kron_all((identity, z, z))
+    operator_c = _kron_all((z, x, identity))
+    expected = (
+        scipy_linalg.expm(0.05 * 0.2 * operator_a)
+        @ scipy_linalg.expm(0.05 * -0.3 * operator_b)
+        @ scipy_linalg.expm(0.05 * 0.4 * operator_c)
+    )
+
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
+    assert report.factor_count == 3
+    assert result.pepsy_cluster_metadata["factor_count"] == 3
+
+
 def test_exp_mpo_cluster_accepts_square_graph_shorthand_and_cyclic_edges():
     """Shape plus a compact graph name is enough for periodic square graphs."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
@@ -595,3 +657,290 @@ def test_bounded_graph_assembly_reports_requested_collection_order():
     assert report.graph_collection_order == 1
     assert report.graph_collection_truncated
     assert result.pepsy_cluster_metadata["selected_graph_assembly"] == "bounded"
+
+
+def test_streaming_graph_assembly_compresses_between_path_batches():
+    """Streaming path accumulation stays bounded and preserves a lossless case."""
+    x, z = _paulis()
+    terms = [
+        ((0, 1), (x, x), 0.7),
+        ((1, 2), (z, z), -0.3),
+    ]
+    direct = exp_mpo_cluster(
+        terms,
+        0.04,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    streamed, report = exp_mpo_cluster(
+        terms,
+        0.04,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=64,
+        assembly_batch_size=1,
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        direct.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.assembly == "streaming"
+    assert report.assembly_chi == 64
+    assert report.assembly_batch_size == 1
+    assert report.assembly_compression_count == 2
+    assert report.assembly_peak_bond_dimensions
+    assert max(report.initial_bond_dimensions) <= 64
+    assert streamed.pepsy_cluster_metadata["assembly"] == "streaming"
+
+
+def test_streaming_graph_assembly_handles_collection_paths():
+    """Streaming also batches exact graph-collection paths on small graphs."""
+    x, _z = _paulis()
+    graph = ClusterLattice.from_edges(
+        range(4),
+        ((0, 1), (1, 2), (2, 3), (3, 0)),
+        name="cycle",
+    )
+    terms = [
+        ((0, 1), (x, x), 0.7),
+        ((1, 2), (x, x), -0.3),
+        ((2, 3), (x, x), 0.2),
+        ((3, 0), (x, x), 0.1),
+    ]
+    direct = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=4,
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="exact",
+        collection_budget=64,
+    )
+    streamed, report = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=4,
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="exact",
+        collection_budget=64,
+        assembly="streaming",
+        assembly_chi=64,
+        assembly_batch_size=2,
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        direct.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.graph_collection_count > 0
+    assert report.graph_planner == "frontier_dp"
+    assert report.graph_planner_state_count > 0
+    assert report.assembly_compression_count > 0
+
+
+def test_frontier_planner_counts_cycle_collections_without_materializing_them():
+    """The cutwidth-aware count agrees with the small explicit inventory."""
+    x, _z = _paulis()
+    graph = ClusterLattice.from_edges(
+        range(4),
+        ((0, 1), (1, 2), (2, 3), (3, 0)),
+        name="cycle",
+    )
+    expansion = MPOGraphClusterBasisExpansion.from_local_terms(
+        4,
+        [((source, target), (x, x), 0.7) for source, target in graph.edges],
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="exact",
+        collection_budget=64,
+    )
+
+    planning = expansion._graph_collection_frontier_plan(budget=64)
+    collections, truncated = expansion._bounded_graph_cluster_collections(
+        budget=64,
+    )
+
+    assert not planning["overflow"]
+    assert planning["collection_count"] == len(collections)
+    assert not truncated
+    assert planning["state_count"] > 0
+
+
+def test_batched_path_insertion_matches_repeated_exact_mpo_addition():
+    """Direct batched insertion preserves the additive MPO semantics."""
+    x, z = _paulis()
+    identity = np.eye(2)
+    rail = FirstDegreeMPO(
+        [identity.reshape(1, 1, 2, 2)] * 3,
+        degree=2,
+    )
+    paths = [
+        tuple(operator.reshape(1, 1, 2, 2) for operator in (x, identity, z)),
+        tuple(operator.reshape(1, 1, 2, 2) for operator in (identity, z, x)),
+    ]
+    batched = rail._add_path_cores_batch(paths)
+    repeated = rail
+    for path in paths:
+        repeated = repeated.add(FirstDegreeMPO(path, degree=2))
+
+    np.testing.assert_allclose(
+        batched.to_mpo().to_dense(),
+        repeated.to_mpo().to_dense(),
+        atol=1.0e-12,
+    )
+
+
+def test_streaming_graph_assembly_validates_working_cap_options():
+    """Streaming options have an explicit, non-overlapping API contract."""
+    x, _z = _paulis()
+    terms = [((0, 1), (x, x), 0.7)]
+    with pytest.raises(ValueError, match="requires a positive assembly_chi"):
+        exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=2,
+            graph="chain",
+            cluster_size=2,
+            assembly="streaming",
+        )
+    with pytest.raises(ValueError, match="require assembly='streaming'"):
+        exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=2,
+            graph="chain",
+            cluster_size=2,
+            assembly_chi=8,
+        )
+
+
+def test_streaming_graph_assembly_preserves_backend_autodiff():
+    """Intermediate streaming SVDs remain on the requested backend."""
+    torch = pytest.importorskip("torch")
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    semantic = exp_mpo_cluster(
+        [((0, 1), (x, x), coefficient)],
+        step,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=8,
+        assembly_batch_size=1,
+        to_backend=lambda value: torch.as_tensor(value, dtype=torch.float64),
+        return_semantic=True,
+    )
+
+    assert all(isinstance(array, torch.Tensor) for array in semantic.arrays)
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+
+def test_cluster_direct_assembly_compiles_native_symmetry_blocks():
+    """Cluster MPOs retain native Symmray blocks for neutral terms."""
+    _x, z = _paulis()
+    terms = [
+        ((0,), (z,), 0.2),
+        ((0, 1), (z, z), -0.3),
+    ]
+    ordinary = exp_mpo_cluster(
+        terms,
+        0.02,
+        shape=3,
+        cluster_size=2,
+    )
+    native, report = exp_mpo_cluster(
+        terms,
+        0.02,
+        shape=3,
+        cluster_size=2,
+        symmetry="U1",
+        physical_charges=(0, 1),
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(
+        native.to_dense(),
+        ordinary.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.symmetry == "U1"
+    assert report.physical_charges == (0, 1)
+    assert report.native_block_sparse
+    assert native.pepsy_mpo_symmetry == "U1"
+    assert native.pepsy_first_degree.is_block_sparse
+    assert all(hasattr(tensor.data, "blocks") for tensor in native)
+
+
+def test_cluster_native_physical_space_and_adaptive_streaming_api():
+    """Physical-space metadata and cutoff-aware streaming share one API."""
+    _x, z = _paulis()
+    terms = [
+        ((0, 1), (z, z), 0.7),
+        ((1, 2), (z, z), -0.3),
+    ]
+    native = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        physical_space=MPOPhysicalSpace(
+            2,
+            symmetry="U1",
+            physical_charges=(0, 1),
+        ),
+    )
+    assert native.pepsy_mpo_symmetry == "U1"
+
+    direct = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    streamed, report = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=32,
+        assembly_batch_size=1,
+        assembly_cutoff=1.0e-12,
+        assembly_cutoff_mode="auto",
+        assembly_form="right",
+        return_report=True,
+    )
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        direct.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.assembly_cutoff == 1.0e-12
+    assert report.assembly_cutoff_mode == "rsum2"
+    assert report.assembly_form == "right"
+    assert report.assembly_compression_count == 2
+    assert len(report.assembly_discarded_weights) > 0

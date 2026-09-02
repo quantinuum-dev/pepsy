@@ -16,6 +16,7 @@ compatibility facade.
 
 from .mpo_semantic import (
     FirstDegreeMPO,
+    MPOAdaptiveCompressionReport,
     MPODifferentiableCompressionReport,
     MPOLocalOperatorTerm,
     MPONumericalCompressionReport,
@@ -41,6 +42,7 @@ __all__ = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOAdaptiveCompressionReport",
     "MPOChargeValidationReport",
     "MPOBlock",
     "MPOBlockPlan",

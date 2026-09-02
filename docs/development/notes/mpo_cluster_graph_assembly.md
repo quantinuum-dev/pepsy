@@ -30,30 +30,72 @@ Classification:
 - Long-range graph-gap dtype promotion: **compatibility shim**; gap operators
   are explicitly aligned to the residual backend dtype before scatter-add so
   real identity backgrounds cannot discard complex real-time components.
-- Full cutwidth/treewidth dynamic programming: **defer**; the current release
-  uses a bounded, explicit graph-collection approximation instead.
+- Frontier/cutwidth dynamic programming: **adopt** for collection counting and
+  safety planning. Full tree-decomposition-based tensor assembly remains a
+  future optimization; the current planner still materializes the actual
+  collection list only when its count is within the configured budget.
 
 ## Assembly policy
 
-`graph_assembly="auto"` probes only up to the finite
-`collection_budget=128`. It keeps small collection plans exact and emits a
-`RuntimeWarning` before switching to the one-cluster bounded approximation.
-`graph_assembly="exact"` raises on budget overflow, while
-`graph_assembly="bounded"` exposes `max_collection_order` for a deliberate
-approximation.
+`graph_assembly="auto"` first counts compatible collections with a
+chain-frontier dynamic program. It explicitly materializes the collection
+list only when the count is within the finite `collection_budget=128`; a
+planner state-work overflow also selects the bounded one-cluster
+approximation. `graph_assembly="exact"` raises on a planner or collection
+budget overflow, while `graph_assembly="bounded"` exposes
+`max_collection_order` for a deliberate approximation.
 
 The selected mode, collection count, frontier width, budget, and truncation
 flag are retained in `MPOClusterExpansionReport` and returned MPO metadata.
 
+## Streaming materialization
+
+`assembly="streaming"` is an independent numerical working-memory boundary.
+It builds only local cores for each selected graph residual path (or each
+selected collection path), inserts a bounded batch directly into the
+accumulator's virtual direct sum, and applies fixed-rank semantic TT-SVD with
+`assembly_chi` before continuing. No temporary path or batch MPO is built. The
+local residual matrices and their operator-Schmidt factorizations are
+unchanged.
+
+For a direct or bounded one-cluster graph plan, the streamed result is the
+singleton rail plus an additive sum of individual residual paths. It does not
+implicitly recover products of compatible paths that the direct shared-rail
+assembly can represent. For exact or higher-order bounded collection plans,
+the collection paths are themselves streamed, so the untruncated result
+matches that selected collection plan up to floating-point accumulation order.
+Finite `assembly_chi` truncation is therefore an additional, order-sensitive
+approximation. `assembly_batch_size` trades SVD frequency against the peak
+pre-compression direct-sum bond dimension.
+
+## Native blocks and adaptive streaming
+
+Direct graph-cluster results now accept the same bosonic Abelian physical
+metadata as the higher-order MPO boundary: `symmetry`, `physical_charges`, or
+an `MPOPhysicalSpace`. NumPy virtual tensors are converted to retained
+`SparseVirtualTensor` blocks before `FirstDegreeMPO.to_mpo()` invokes the
+existing Symmray adapter. This preserves the sparse virtual topology and
+avoids a dense Symmray virtual-index fallback. The supported symmetries are
+`U1`, `Z2`, `U1U1`, and `Z2Z2`; fermionic string/sign histories are still not
+implemented for graph clusters.
+
+Streaming accepts `assembly_cutoff`, `assembly_cutoff_mode`, and
+`assembly_form`. With no cutoff it keeps the backend-native fixed-rank SVD
+policy. With a cutoff it performs an adaptive semantic TT-SVD after each
+batch and reports the discarded singular-value weights. Rank selection is
+discrete; compiled/JIT Torch/JAX users should leave the cutoff unset when
+they need a fully traceable construction.
+
 ## Validation
 
-- `tests/test_mpo_cluster.py`: 22 passed.
-- Focused MPO/operator regression set: 166 passed.
+- `tests/test_mpo_cluster.py`: 37 passed.
+- MPO semantic and cluster regression set: 169 passed.
 - Ruff checks passed for the modified source and test files.
 - `git diff --check` passed.
 
-The bounded path reduces the notebook-shaped 4x4 periodic square call from
-the previous unbounded collection assembly to approximately 0.09 seconds on
-this environment. A full exact 4x4 periodic cluster-size-3 plan still has
-about 1.54 million compatible collections and should remain explicitly
-opt-in only.
+The notebook-shaped 4x4 periodic square call with 424 graph clusters,
+`assembly="streaming"`, and a working cap of 64 takes approximately 3 seconds
+on the CPU Torch backend in this environment. The frontier planner reaches
+its bounded state-work guard at 4,369 states (limit 4,096), selects the
+bounded one-cluster fallback, and never materializes the large collection
+list. Full exact collection plans remain explicitly opt-in for small graphs.

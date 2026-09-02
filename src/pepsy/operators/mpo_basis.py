@@ -867,9 +867,10 @@ class MPOBasis:
         ``{"xyz": (((0, 0), (1, 0), (0, 1)), coefficient)}``.
         ``shape`` may be an integer chain length or a 2D/3D lattice shape. If
         it is omitted, the smallest shape containing all term locations is
-        inferred. Common supports are canonicalized before the shared MPO
-        automaton is built, while each coefficient remains an independent
-        slot for autodiff.
+        inferred. When ``mapper`` is supplied, flat integer locations are
+        also accepted as already-mapped chain positions. Common supports are
+        canonicalized before the shared MPO automaton is built, while each
+        coefficient remains an independent slot for autodiff.
         """
         length, normalized_terms, metadata = _compile_generic_terms(
             terms,
@@ -1041,6 +1042,10 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Build a local exact cluster expansion from this term basis.
 
@@ -1059,6 +1064,10 @@ class MPOBasis:
             int(cluster_size),
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
+            symmetry,
+            repr(physical_charges),
+            bool(fermionic),
+            repr(physical_space),
         )
         expansion = self._cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -1067,6 +1076,10 @@ class MPOBasis:
                 cluster_size=cluster_size,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                symmetry=symmetry,
+                physical_charges=physical_charges,
+                fermionic=fermionic,
+                physical_space=physical_space,
             )
             self._cluster_expansion_cache[cache_key] = expansion
         return expansion.exp(step, parameters=parameters)
@@ -1077,6 +1090,10 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Return a reusable compiled evaluator for local cluster products."""
 
@@ -1088,6 +1105,10 @@ class MPOBasis:
             int(cluster_size),
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
+            symmetry,
+            repr(physical_charges),
+            bool(fermionic),
+            repr(physical_space),
         )
         expansion = self._cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -1096,6 +1117,10 @@ class MPOBasis:
                 cluster_size=cluster_size,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                symmetry=symmetry,
+                physical_charges=physical_charges,
+                fermionic=fermionic,
+                physical_space=physical_space,
             )
             self._cluster_expansion_cache[cache_key] = expansion
         return expansion.compile_exp()
@@ -1112,6 +1137,16 @@ class MPOBasis:
         graph_assembly="auto",
         max_collection_order=None,
         collection_budget=128,
+        assembly="direct",
+        assembly_chi=None,
+        assembly_batch_size=None,
+        assembly_cutoff=None,
+        assembly_cutoff_mode="auto",
+        assembly_form="left",
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Build a graph-aware cluster expansion with MPO output.
 
@@ -1125,9 +1160,14 @@ class MPOBasis:
         positions. A long-range two-site graph edge is therefore a genuine
         two-site cluster even when its MPO representation crosses many chain
         sites. ``graph_assembly`` controls products of disjoint graph
-        residuals whose chain spans cross or nest; ``"auto"`` falls back to a
-        bounded one-cluster approximation when ``collection_budget`` is
-        exceeded.
+        residuals whose chain spans cross or nest; ``"auto"`` first uses a
+        cutwidth-aware frontier planner and falls back to a bounded
+        one-cluster approximation when its finite budget or planner work
+        limit is exceeded. ``assembly="streaming"`` builds local residual
+        cores, inserts bounded batches directly into the accumulator, and
+        applies a semantic fixed-rank SVD after each batch;
+        ``assembly_chi`` and ``assembly_batch_size`` control that working
+        boundary.
         """
         compiled = self.compile_graph_cluster_expansion(
             graph=graph,
@@ -1137,6 +1177,16 @@ class MPOBasis:
             graph_assembly=graph_assembly,
             max_collection_order=max_collection_order,
             collection_budget=collection_budget,
+            assembly=assembly,
+            assembly_chi=assembly_chi,
+            assembly_batch_size=assembly_batch_size,
+            assembly_cutoff=assembly_cutoff,
+            assembly_cutoff_mode=assembly_cutoff_mode,
+            assembly_form=assembly_form,
+            symmetry=symmetry,
+            physical_charges=physical_charges,
+            fermionic=fermionic,
+            physical_space=physical_space,
         )
         return compiled.exp(step, parameters=parameters)
 
@@ -1150,23 +1200,52 @@ class MPOBasis:
         graph_assembly="auto",
         max_collection_order=None,
         collection_budget=128,
+        assembly="direct",
+        assembly_chi=None,
+        assembly_batch_size=None,
+        assembly_cutoff=None,
+        assembly_cutoff_mode="auto",
+        assembly_form="left",
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Compile a reusable graph-aware ordered cluster evaluator.
 
         ``graph_assembly="exact"`` retains every compatible graph-cluster
         collection up to ``collection_budget``. Use
         ``graph_assembly="bounded"`` and ``max_collection_order`` for an
-        explicit approximation on wide MPO orderings.
+        explicit approximation on wide MPO orderings. ``assembly="streaming"``
+        is a separate working-memory control that inserts graph-path cores
+        directly into the accumulator in batches, without temporary path or
+        batch MPOs.
         """
         from .mpo_product import (  # pylint: disable=import-outside-toplevel
             MPOGraphClusterProductExpansion,
             _graph_lattice_for_basis,
             _normalize_graph_assembly,
+            _normalize_mpo_assembly,
+            _validate_assembly_batch_size,
+            _validate_assembly_chi,
+            _normalize_assembly_cutoff_mode,
+            _normalize_assembly_form,
+            _validate_assembly_cutoff,
             _validate_graph_collection_budget,
             _validate_graph_collection_order,
         )
 
         graph_assembly = _normalize_graph_assembly(graph_assembly)
+        assembly = _normalize_mpo_assembly(assembly)
+        assembly_chi = _validate_assembly_chi(assembly_chi)
+        assembly_batch_size = _validate_assembly_batch_size(
+            assembly_batch_size
+        )
+        assembly_cutoff = _validate_assembly_cutoff(assembly_cutoff)
+        assembly_cutoff_mode = _normalize_assembly_cutoff_mode(
+            assembly_cutoff_mode
+        )
+        assembly_form = _normalize_assembly_form(assembly_form)
         max_collection_order = _validate_graph_collection_order(
             max_collection_order
         )
@@ -1181,6 +1260,16 @@ class MPOBasis:
             graph_assembly,
             None if max_collection_order is None else int(max_collection_order),
             None if collection_budget is None else int(collection_budget),
+            assembly,
+            None if assembly_chi is None else int(assembly_chi),
+            None if assembly_batch_size is None else int(assembly_batch_size),
+            assembly_cutoff,
+            assembly_cutoff_mode,
+            assembly_form,
+            symmetry,
+            repr(physical_charges),
+            bool(fermionic),
+            repr(physical_space),
         )
         expansion = self._graph_cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -1193,6 +1282,16 @@ class MPOBasis:
                 graph_assembly=graph_assembly,
                 max_collection_order=max_collection_order,
                 collection_budget=collection_budget,
+                assembly=assembly,
+                assembly_chi=assembly_chi,
+                assembly_batch_size=assembly_batch_size,
+                assembly_cutoff=assembly_cutoff,
+                assembly_cutoff_mode=assembly_cutoff_mode,
+                assembly_form=assembly_form,
+                symmetry=symmetry,
+                physical_charges=physical_charges,
+                fermionic=fermionic,
+                physical_space=physical_space,
             )
             self._graph_cluster_expansion_cache[cache_key] = expansion
         return expansion.compile_exp()

@@ -24,9 +24,9 @@ These are the names to use in new code.
 | Area | Canonical names | Owner |
 | --- | --- | --- |
 | Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`; structural plan implementation: `operators.mpo_block_plan`) |
-| MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
+| MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport`, `MPOAdaptiveCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
 | Shared report summary | `OperatorReportInfo` and each concrete report's `.api_info` | `operators.diagnostics` |
-| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct`, `exp_mpo_cluster` | `operators.mpo_product` |
+| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct`, `exp_mpo_cluster`, `exp_mpo_cluster_product` | `operators.mpo_product` |
 | PEPO active results | `ActivePEPOBlocks`, `GraphActivePEPOBlocks` | `operators.pepo_cluster` (implementation: `operators.pepo_active`) |
 | Square-lattice PEPO exponential | `PauliPEPOTerm`, `PauliPEPOBasis`, `CompiledPEPOExp` | `operators.pepo_cluster` (implementation: `operators.pepo_basis`) |
 | Dense/graph PEPO clusters | `ClusterExpansionPlan`, `GraphClusterExpansionPlan`, `ClusterExpansionReport`, `ClusterLattice`, `ConnectedClusterShape`, `GraphConnectedClusterShape` | `operators.pepo_cluster` (implementation: `operators.pepo_dense`; planner boundary: `operators.pepo_geometry`) |

@@ -22,7 +22,7 @@ different abstraction levels:
 | Fixed-channel PEPO exponential | `PauliPEPOBasis`, `CompiledPEPOExp` in `operators.pepo_cluster` | Differentiable square-lattice PEPO with value-independent Pauli channels |
 | Dense PEPO cluster expansion | `ClusterExpansionPlan` and graph plans in `operators.pepo_cluster` | Factor local connected residuals for a finite model or graph |
 | Ordered PEPO products | `PEPOClusterProductExpansion` in `operators.pepo_cluster` | Jointly construct `exp(A) @ exp(B) @ exp(C) @ ...` |
-| Ordered MPO products | `MPOClusterFactor` and `MPOClusterProductExpansion` in `operators.mpo_product` | Jointly construct local ordered exponential factors on a chain/graph |
+| Ordered MPO products | `MPOClusterFactor`, `MPOClusterProductExpansion`, and `exp_mpo_cluster_product` in `operators.mpo_product` | Jointly construct local ordered exponential factors on a chain/graph |
 | Native Pauli MPO | `PauliMPO` in `operators.pauli_mpo` | Sparse Pauli-basis operator algebra and conversion to an MPO |
 
 These are not all the same algorithm. In particular:

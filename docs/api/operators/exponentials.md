@@ -55,6 +55,7 @@ The semantic result records `requested_mode`, `mode`,
 | One MPO exponential | `basis.exp(step, parameters=...)` | Semantic `FirstDegreeMPO` |
 | Repeated MPO exponentials | `basis.compile_exp(...).exp(step, ...)` | Cached `CompiledMPOExp` call plus semantic MPO |
 | One-shot connected-cluster MPO | `exp_mpo_cluster(terms, step, ...)` | Quimb MPO or semantic cluster MPO |
+| One-shot ordered MPO cluster product | `exp_mpo_cluster_product(factors, step, ...)` | Quimb MPO or semantic joint cluster MPO |
 | Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
 | Product of two existing MPOs | `compress_mpo_product(A, B, ...)` | Lazy `A @ B`, then one ordinary compressed MPO |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
@@ -72,12 +73,30 @@ do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
 
 For graph-aware MPO clusters, `graph_assembly="auto"` protects the 1D
-materialization boundary: it keeps small collection plans exact and falls
-back to a reported bounded one-cluster approximation after its finite
-`collection_budget`. Use `graph_assembly="exact"` when the full result is
-required and `graph_assembly="bounded"` with `max_collection_order` when a
-controlled approximation is preferable. This control is specific to graph
-cluster products and is independent of the local `cluster_size` cutoff.
+materialization boundary: a cutwidth-aware chain-frontier dynamic program
+counts compatible collections, keeps small plans exact, and falls back to a
+reported bounded one-cluster approximation when its finite
+`collection_budget` or planner work budget is exceeded. Use
+`graph_assembly="exact"` when the full result is required and
+`graph_assembly="bounded"` with `max_collection_order` when a controlled
+approximation is preferable. This control is specific to graph cluster
+products and is independent of the local `cluster_size` cutoff.
+
+For wide graph MPOs, `assembly="streaming"` provides a separate working-memory
+boundary. It inserts local graph-path cores directly into the accumulator in
+batches and applies a semantic fixed-rank SVD to `assembly_chi` after each
+batch, without constructing temporary batch MPOs. This is an explicit
+intermediate truncation axis, distinct from final `chi` compression; see the
+[MPO cluster guide](mpo_cluster.md#streaming-graph-path-assembly).
+
+Set `assembly_cutoff` to use adaptive singular-value-dependent intermediate
+ranks, with `assembly_cutoff_mode` and `assembly_form` controlling the cutoff
+convention and sweep direction. Tensor arithmetic remains on the requested
+backend, although the discrete rank decision is not suitable for compiled/JIT
+traces. Leaving `assembly_cutoff=None` preserves backend-differentiable
+fixed-rank streaming. Direct cluster assembly also supports native bosonic
+Symmray blocks through `symmetry` and `physical_charges` (or
+`MPOPhysicalSpace`).
 
 There are three distinct construction axes: SciPost higher-order MPO history,
 connected MPO cluster size, and PEPO spatial cluster order. In both cluster

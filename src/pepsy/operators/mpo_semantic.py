@@ -77,6 +77,7 @@ __all__ = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOAdaptiveCompressionReport",
     "MPOBlock",
     "MPOBlockPlan",
     "MPOChargeValidationReport",
@@ -578,6 +579,40 @@ class MPODifferentiableCompressionReport:
         )
 
 
+@dataclass(frozen=True)
+class MPOAdaptiveCompressionReport:
+    """Report a cutoff-aware backend TT-SVD compression.
+
+    This path is intended for bounded intermediate assembly, where the
+    semantic MPO must remain available for another addition. Unlike the
+    fixed-rank path, ranks depend on the singular values, so rank selection is
+    a discrete control decision and cannot be safely staged inside a compiled
+    trace.
+    """
+
+    method: str
+    form: str
+    max_bond: int
+    cutoff: float | None
+    cutoff_mode: str
+    initial_bond_dimensions: tuple[int, ...]
+    final_bond_dimensions: tuple[int, ...]
+    truncated: bool
+    discarded_weights: tuple[float, ...] = ()
+    differentiable: bool = False
+
+    @property
+    def api_info(self):
+        """Return the stable cross-family report summary."""
+        return OperatorReportInfo(
+            family="mpo",
+            algorithm="adaptive_compression",
+            representation="semantic_mpo",
+            truncated=self.truncated,
+            differentiable=self.differentiable,
+        )
+
+
 def _check_scalar(value, *, name):
     ndim = getattr(value, "ndim", None)
     if ndim is None:
@@ -843,6 +878,217 @@ def _fixed_rank_svd(matrix):
     )
     with config.activated():
         return ar.do("linalg.svd", matrix)
+
+
+_TT_SVD_CUTOFF_MODES = frozenset(
+    {"rel", "abs", "sum1", "sum2", "rsum1", "rsum2"}
+)
+
+
+def _normalize_tt_svd_form(form):
+    """Normalize the directional form used by semantic TT-SVD."""
+    if form is None:
+        return "left"
+    if not isinstance(form, str):
+        raise TypeError("form must be 'left' or 'right'.")
+    form = form.strip().lower().replace("-", "_")
+    if form not in {"left", "right"}:
+        raise ValueError("form must be 'left' or 'right'.")
+    return form
+
+
+def _normalize_tt_svd_cutoff_mode(cutoff_mode):
+    """Validate the cutoff convention shared with Quimb's SVD split."""
+    cutoff_mode = _resolve_compression_cutoff_mode(cutoff_mode)
+    if cutoff_mode not in _TT_SVD_CUTOFF_MODES:
+        allowed = ", ".join(sorted(_TT_SVD_CUTOFF_MODES))
+        raise ValueError(
+            f"cutoff_mode must be one of {allowed} or 'auto'; got "
+            f"{cutoff_mode!r}."
+        )
+    return cutoff_mode
+
+
+def _host_singular_values(singular_values):
+    """Read a singular spectrum for rank selection without moving tensors."""
+    values = singular_values
+    if hasattr(values, "detach"):
+        values = values.detach().cpu().numpy()
+    elif _backend_name(values) == "cupy":
+        values = values.get()
+    try:
+        return np.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "adaptive semantic TT-SVD requires concrete singular values; "
+            "use fixed-rank compression inside a JAX or other compiled trace."
+        ) from exc
+
+
+def _select_tt_svd_rank(singular_values, cutoff, cutoff_mode):
+    """Select a cutoff rank using the same conventions as Quimb."""
+    values = _host_singular_values(singular_values)
+    size = int(values.shape[0])
+    if cutoff is None or cutoff == 0.0 or size <= 1:
+        return size
+    values = np.abs(values.astype(float, copy=False))
+    if cutoff_mode == "rel":
+        return max(1, int(np.count_nonzero(values > cutoff * values[0])))
+    if cutoff_mode == "abs":
+        return max(1, int(np.count_nonzero(values > cutoff)))
+
+    squared = values * values
+    linear = values
+    if cutoff_mode in {"sum2", "rsum2"}:
+        tail = np.concatenate((np.cumsum(squared[::-1])[::-1], [0.0]))
+        threshold = float(cutoff)
+        if cutoff_mode == "rsum2":
+            threshold *= float(np.sum(squared))
+    else:
+        tail = np.concatenate((np.cumsum(linear[::-1])[::-1], [0.0]))
+        threshold = float(cutoff)
+        if cutoff_mode == "rsum1":
+            threshold *= float(np.sum(linear))
+
+    for rank in range(1, size + 1):
+        if tail[rank] <= threshold:
+            return rank
+    return size
+
+
+def _tt_svd_arrays(
+    source_arrays,
+    max_bond,
+    *,
+    cutoff=None,
+    cutoff_mode="rel",
+    form="left",
+    adaptive=False,
+):
+    """Compress dense MPO cores with a directional TT-SVD sweep."""
+    source_arrays = tuple(source_arrays)
+    length = len(source_arrays)
+    if length == 1:
+        return source_arrays, (), ()
+    form = _normalize_tt_svd_form(form)
+    arrays = [None] * length
+    discarded_weights = []
+
+    if form == "left":
+        carry = None
+        for site, array in enumerate(source_arrays[:-1]):
+            combined = array if carry is None else ar.do(
+                "tensordot", carry, array, axes=([1], [0])
+            )
+            left_dim, right_dim, phys_up, phys_down = combined.shape
+            matrix_data = ar.do(
+                "transpose", combined, (0, 2, 3, 1)
+            )
+            matrix = ar.do(
+                "reshape",
+                matrix_data,
+                (int(left_dim) * int(phys_up) * int(phys_down), int(right_dim)),
+            )
+            u, singular_values, vh = _fixed_rank_svd(matrix)
+            rank = min(max_bond, int(singular_values.shape[0]))
+            if adaptive:
+                rank = min(
+                    rank,
+                    _select_tt_svd_rank(
+                        singular_values,
+                        cutoff,
+                        cutoff_mode,
+                    ),
+                )
+                discarded_weights.append(
+                    float(
+                        np.linalg.norm(
+                            _host_singular_values(singular_values)[rank:]
+                        )
+                    )
+                )
+            u = u[:, :rank]
+            singular_values = singular_values[:rank]
+            vh = vh[:rank, :]
+            local = ar.do(
+                "reshape",
+                u,
+                (int(left_dim), int(phys_up), int(phys_down), rank),
+            )
+            arrays[site] = ar.do("transpose", local, (0, 3, 1, 2))
+            carry = ar.do(
+                "multiply",
+                ar.do("reshape", singular_values, (rank, 1)),
+                vh,
+            )
+        arrays[-1] = ar.do(
+            "tensordot", carry, source_arrays[-1], axes=([1], [0])
+        )
+    else:
+        carry = None
+        for site in range(length - 1, 0, -1):
+            combined = source_arrays[site] if carry is None else ar.do(
+                "transpose",
+                ar.do(
+                    "tensordot",
+                    source_arrays[site],
+                    carry,
+                    axes=([1], [0]),
+                ),
+                (0, 3, 1, 2),
+            )
+            left_dim, right_dim, phys_up, phys_down = combined.shape
+            matrix_data = ar.do(
+                "transpose", combined, (0, 2, 3, 1)
+            )
+            matrix = ar.do(
+                "reshape",
+                matrix_data,
+                (int(left_dim), int(phys_up) * int(phys_down) * int(right_dim)),
+            )
+            u, singular_values, vh = _fixed_rank_svd(matrix)
+            rank = min(max_bond, int(singular_values.shape[0]))
+            if adaptive:
+                rank = min(
+                    rank,
+                    _select_tt_svd_rank(
+                        singular_values,
+                        cutoff,
+                        cutoff_mode,
+                    ),
+                )
+                discarded_weights.append(
+                    float(
+                        np.linalg.norm(
+                            _host_singular_values(singular_values)[rank:]
+                        )
+                    )
+                )
+            u = u[:, :rank]
+            singular_values = singular_values[:rank]
+            vh = vh[:rank, :]
+            right_factor = ar.do(
+                "multiply",
+                ar.do("reshape", singular_values, (rank, 1)),
+                vh,
+            )
+            right_factor = ar.do(
+                "reshape",
+                right_factor,
+                (rank, int(phys_up), int(phys_down), int(right_dim)),
+            )
+            arrays[site] = ar.do(
+                "transpose", right_factor, (0, 3, 1, 2)
+            )
+            carry = u
+        first = ar.do(
+            "tensordot", source_arrays[0], carry, axes=([1], [0])
+        )
+        arrays[0] = ar.do("transpose", first, (0, 3, 1, 2))
+
+    return tuple(arrays), tuple(
+        int(array.shape[1]) for array in arrays[:-1]
+    ), tuple(discarded_weights)
 
 
 _UNSET = object()
@@ -2022,7 +2268,13 @@ def _expand_term_collection(terms):
     return tuple(expanded)
 
 
-def _location_dimensions(location, num_factors, expected_ndim=None):
+def _location_dimensions(
+    location,
+    num_factors,
+    expected_ndim=None,
+    *,
+    mapper=None,
+):
     """Normalize locations and identify whether they are chain or lattice sites."""
     if _is_integral_value(location):
         return 1, (int(location),)
@@ -2037,7 +2289,11 @@ def _location_dimensions(location, num_factors, expected_ndim=None):
     if all(_is_integral_value(value) for value in values):
         # A single local operator at (x, y) or (x, y, z) is one lattice site.
         # Multiple factors at flat integer locations are the conventional 1D form.
-        if num_factors == 1 and expected_ndim in (2, 3):
+        if (
+            num_factors == 1
+            and expected_ndim in (2, 3)
+            and not (mapper is not None and len(values) != expected_ndim)
+        ):
             return expected_ndim, (tuple(int(value) for value in values),)
         if num_factors == 1 and expected_ndim is None and len(values) in (2, 3):
             return len(values), (tuple(int(value) for value in values),)
@@ -2133,8 +2389,11 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
             raw["location"],
             num_factors,
             expected_ndim=expected_ndim,
+            mapper=mapper,
         )
-        if expected_ndim is not None and ndim != expected_ndim:
+        if expected_ndim is not None and ndim != expected_ndim and not (
+            mapper is not None and ndim == 1
+        ):
             raise ValueError(
                 f"locations have dimension {ndim}, but configured shape is "
                 f"{shape_tuple}."
@@ -3059,7 +3318,13 @@ class FirstDegreeMPO:
             return mpo, report
         return mpo
 
-    def compress_fixed_rank(self, max_bond, *, return_report=False):
+    def compress_fixed_rank(
+        self,
+        max_bond,
+        *,
+        form="left",
+        return_report=False,
+    ):
         """Compress with a fixed-rank, backend-differentiable TT-SVD sweep.
 
         This is the autodiff-oriented numerical path. It selects at most
@@ -3077,6 +3342,7 @@ class FirstDegreeMPO:
         if not isinstance(max_bond, Integral) or int(max_bond) < 1:
             raise ValueError("max_bond must be a positive integer.")
         max_bond = int(max_bond)
+        form = _normalize_tt_svd_form(form)
         initial_bond_dimensions = tuple(self.bond_dimensions)
 
         if self.L == 1:
@@ -3085,6 +3351,7 @@ class FirstDegreeMPO:
                 "operation": "fixed_rank_compression",
                 "history_valid": False,
                 "max_bond": max_bond,
+                "form": form,
             })
             report = MPODifferentiableCompressionReport(
                 method="fixed-rank-tt-svd",
@@ -3098,51 +3365,10 @@ class FirstDegreeMPO:
             return (output, report) if return_report else output
 
         source_arrays = self.arrays
-        arrays = []
-        carry = None
-        for site, array in enumerate(source_arrays[:-1]):
-            if site == 0:
-                combined = array
-            else:
-                combined = ar.do("tensordot", carry, array, axes=([1], [0]))
-
-            left_dim, right_dim, phys_up, phys_down = combined.shape
-            matrix_data = ar.do(
-                "transpose",
-                combined,
-                (0, 2, 3, 1),
-            )
-            matrix = ar.do(
-                "reshape",
-                matrix_data,
-                (int(left_dim) * int(phys_up) * int(phys_down), int(right_dim)),
-            )
-            u, singular_values, vh = _fixed_rank_svd(matrix)
-            rank = min(max_bond, int(singular_values.shape[0]))
-            u = u[:, :rank]
-            singular_values = singular_values[:rank]
-            vh = vh[:rank, :]
-
-            local = ar.do(
-                "reshape",
-                u,
-                (int(left_dim), int(phys_up), int(phys_down), rank),
-            )
-            local = ar.do("transpose", local, (0, 3, 1, 2))
-            arrays.append(local)
-            carry = ar.do(
-                "multiply",
-                ar.do("reshape", singular_values, (rank, 1)),
-                vh,
-            )
-
-        # Absorb the final tensor without another factorization. Its right
-        # boundary is retained, preserving the normalized MPO layout.
-        arrays.append(
-            ar.do("tensordot", carry, source_arrays[-1], axes=([1], [0]))
-        )
-        final_bond_dimensions = tuple(
-            int(array.shape[1]) for array in arrays[:-1]
+        arrays, final_bond_dimensions, _discarded_weights = _tt_svd_arrays(
+            source_arrays,
+            max_bond,
+            form=form,
         )
         output = type(self)(
             arrays,
@@ -3154,6 +3380,7 @@ class FirstDegreeMPO:
                 "operation": "fixed_rank_compression",
                 "history_valid": False,
                 "max_bond": max_bond,
+                "form": form,
             },
         )
         report = MPODifferentiableCompressionReport(
@@ -3162,6 +3389,87 @@ class FirstDegreeMPO:
             initial_bond_dimensions=initial_bond_dimensions,
             final_bond_dimensions=final_bond_dimensions,
             truncated=final_bond_dimensions != initial_bond_dimensions,
+        )
+        output.metadata["compression_report"] = report
+        output.compression_report = report
+        return (output, report) if return_report else output
+
+    def compress_adaptive(
+        self,
+        max_bond,
+        *,
+        cutoff=1.0e-10,
+        cutoff_mode="rsum2",
+        form="left",
+        return_report=False,
+    ):
+        """Compress with a cutoff-aware semantic TT-SVD sweep.
+
+        This is the bounded-assembly counterpart to Quimb's numerical MPO
+        compression: it returns a new semantic MPO so another path batch can
+        be inserted without first materializing a temporary Quimb MPO. Rank
+        selection is a discrete control-flow decision. Singular values are
+        read only for that decision and tensor arithmetic remains on the
+        source backend, but compiled/JIT traces should use
+        :meth:`compress_fixed_rank` instead.
+        """
+        if not isinstance(max_bond, Integral) or int(max_bond) < 1:
+            raise ValueError("max_bond must be a positive integer.")
+        max_bond = int(max_bond)
+        if self.symmetry is not None:
+            raise ValueError(
+                "adaptive semantic TT-SVD cannot preserve native symmetry; "
+                "use sector-aware Quimb compression instead."
+            )
+        form = _normalize_tt_svd_form(form)
+        cutoff_mode = _normalize_tt_svd_cutoff_mode(cutoff_mode)
+        if cutoff is None:
+            resolved_cutoff = None
+        else:
+            resolved_cutoff = _resolve_compression_cutoff(
+                cutoff,
+                self.arrays[0],
+            )
+        source_arrays = self.arrays
+        initial_bond_dimensions = tuple(self.bond_dimensions)
+        if self.L == 1:
+            arrays = source_arrays
+            final_bond_dimensions = initial_bond_dimensions
+            discarded_weights = ()
+        else:
+            arrays, final_bond_dimensions, discarded_weights = _tt_svd_arrays(
+                source_arrays,
+                max_bond,
+                cutoff=resolved_cutoff,
+                cutoff_mode=cutoff_mode,
+                form=form,
+                adaptive=True,
+            )
+        output = type(self)(
+            arrays,
+            degree=self.degree,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            site_tag_id=self.site_tag_id,
+            metadata={
+                "operation": "adaptive_compression",
+                "history_valid": False,
+                "max_bond": max_bond,
+                "cutoff": resolved_cutoff,
+                "cutoff_mode": cutoff_mode,
+                "form": form,
+            },
+        )
+        report = MPOAdaptiveCompressionReport(
+            method="adaptive-tt-svd",
+            form=form,
+            max_bond=max_bond,
+            cutoff=resolved_cutoff,
+            cutoff_mode=cutoff_mode,
+            initial_bond_dimensions=initial_bond_dimensions,
+            final_bond_dimensions=final_bond_dimensions,
+            truncated=final_bond_dimensions != initial_bond_dimensions,
+            discarded_weights=discarded_weights,
         )
         output.metadata["compression_report"] = report
         output.compression_report = report
@@ -3695,6 +4003,144 @@ class FirstDegreeMPO:
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
             metadata={"operation": "add"},
+        )
+
+    def _add_path_cores(self, path_cores):
+        """Add one open-boundary path without constructing a path MPO.
+
+        ``path_cores`` contains full-chain ``(left, right, up, down)`` cores
+        with singleton boundary bonds. This is the memory-bounded companion
+        to :meth:`add`: the path is inserted directly into the accumulator's
+        virtual direct sum, so no temporary :class:`FirstDegreeMPO` and no
+        batch block-diagonal tensor are required.
+        """
+        return self._add_path_cores_batch((path_cores,))
+
+    def _add_path_cores_batch(self, paths):
+        """Insert several open-boundary paths in one accumulator allocation.
+
+        The result is the direct sum of ``self`` and all supplied paths, but
+        unlike repeated :meth:`add` calls it allocates the expanded
+        accumulator only once. Each path remains a tuple of local cores; no
+        temporary batch ``FirstDegreeMPO`` or batch block-diagonal MPO is
+        constructed.
+        """
+        normalized_paths = []
+        for path in paths:
+            path = tuple(path)
+            if len(path) != self.L:
+                raise ValueError(f"path_cores must have length {self.L}.")
+            path = tuple(
+                _as_4d(array, site=site, length=self.L)
+                for site, array in enumerate(path)
+            )
+            if path[0].shape[0] != 1 or path[-1].shape[1] != 1:
+                raise ValueError("path_cores must have singleton boundary bonds.")
+            if any(
+                core.shape[-2:] != (self.phys_dim, self.phys_dim)
+                for core in path
+            ):
+                raise ValueError(
+                    "path physical dimensions must match the accumulator."
+                )
+            normalized_paths.append(path)
+        normalized_paths = tuple(normalized_paths)
+        if not normalized_paths:
+            return self.copy()
+
+        self_arrays = self.arrays
+        if self.L == 1:
+            result = self_arrays[0]
+            for path in normalized_paths:
+                result = result + path[0]
+            arrays = (result,)
+        else:
+            arrays = [
+                _concat(
+                    (self_arrays[0], *(path[0] for path in normalized_paths)),
+                    axis=1,
+                ),
+            ]
+            for site in range(1, self.L - 1):
+                left = self_arrays[site]
+                path_cores = tuple(path[site] for path in normalized_paths)
+                path_left_offsets = []
+                path_right_offsets = []
+                left_offset = 0
+                right_offset = 0
+                for path in path_cores:
+                    path_left_offsets.append(left_offset)
+                    path_right_offsets.append(right_offset)
+                    left_offset += int(path.shape[0])
+                    right_offset += int(path.shape[1])
+                path_block = _zeros(
+                    (left_offset, right_offset, *left.shape[2:]),
+                    like=left,
+                )
+                rows = []
+                columns = []
+                values = []
+                for path, left_start, right_start in zip(
+                    path_cores,
+                    path_left_offsets,
+                    path_right_offsets,
+                ):
+                    path_left, path_right = int(path.shape[0]), int(path.shape[1])
+                    rows.append(
+                        np.repeat(
+                            np.arange(path_left, dtype=int) + left_start,
+                            path_right,
+                        )
+                    )
+                    columns.append(
+                        np.tile(
+                            np.arange(path_right, dtype=int) + right_start,
+                            path_left,
+                        )
+                    )
+                    values.append(
+                        ar.do(
+                            "reshape",
+                            path,
+                            (path_left * path_right, self.phys_dim, self.phys_dim),
+                        )
+                    )
+                path_block = _scatter_add_2d(
+                    path_block,
+                    np.concatenate(rows),
+                    np.concatenate(columns),
+                    ar.do("concatenate", tuple(values), axis=0),
+                )
+                top = _concat(
+                    (
+                        left,
+                        _zeros((left.shape[0], right_offset, *left.shape[2:]), like=left),
+                    ),
+                    axis=1,
+                )
+                bottom = _concat(
+                    (
+                        _zeros((left_offset, left.shape[1], *left.shape[2:]), like=left),
+                        path_block,
+                    ),
+                    axis=1,
+                )
+                arrays.append(_concat((top, bottom), axis=0))
+            arrays.append(
+                _concat(
+                    (self_arrays[-1], *(path[-1] for path in normalized_paths)),
+                    axis=0,
+                )
+            )
+
+        return type(self)(
+            arrays,
+            degree=self.degree,
+            **self._symmetry_options(),
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            site_tag_id=self.site_tag_id,
+            metadata={"operation": "add_path", "history_valid": False},
         )
 
     def product(self, other, *, kind="ordinary"):

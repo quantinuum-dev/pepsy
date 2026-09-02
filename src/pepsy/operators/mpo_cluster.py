@@ -21,6 +21,7 @@ from .mpo_product import (
     MPOGraphClusterProductExpansion,
     MPOGraphClusterBasisExpansion,
     exp_mpo_cluster,
+    exp_mpo_cluster_product,
     _graph_lattice_for_basis,  # noqa: F401 - compatibility helper
     _graph_lattice_from_input,  # noqa: F401 - compatibility helper
 )
@@ -39,4 +40,5 @@ __all__ = [
     "ClusterExpBasis",
     "MPOClusterExpansion",
     "exp_mpo_cluster",
+    "exp_mpo_cluster_product",
 ]
