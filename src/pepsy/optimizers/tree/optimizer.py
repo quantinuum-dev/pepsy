@@ -15,14 +15,13 @@ binary tree below a ternary virtual root, but flatter ``k``-ary trees
 * single-qubit gates are absorbed into their physical-site tensor (no bond growth); a
   unitary one-qubit gate preserves the tree canonical form regardless of where
   the orthogonality centre sits;
-* two-qubit gates on sites ``a`` and ``b`` are SVD-split into two factors
-  joined by a virtual bond; the factors are absorbed into the two site nodes and
-  the virtual bond is *threaded exactly* (no truncation) along the tree path
-  from ``a`` to ``b``.  Only once both factors are in place is a single
-  canonical compression sweep run back along the path, truncating every
-  touched bond to ``chi`` -- so each truncation sees the complete gate, which
-  is markedly more accurate under a finite ``chi`` than truncating each hop as
-  the bond is threaded (Seitz et al., Figs. 3-6).
+* ordinary gate-stream entries are lowered to a true :class:`TreeMPO`, whose
+  operator bonds are routed losslessly through the active canonical Steiner
+  region before the affected state bonds are compressed; the operator and state
+  are never lowered to a chain MPO for this path;
+* the explicit low-level two-qubit compatibility method retains the Seitz et
+  al. two-factor SVD/QR path kernel: both gate factors are installed before a
+  single canonical compression sweep truncates the touched bonds.
 
 The orthogonality centre is tracked as a node id and moved *smartly* along the
 tree geodesic with per-edge canonicalisation, mirroring the
@@ -51,7 +50,11 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ...fitting import TreeFIT
-from ...fitting.tree import _randomize_tree_guess
+from ...fitting.tree import (
+    _build_layered_operator_state_target,
+    _layered_target_bond_sizes,
+    _randomize_tree_guess,
+)
 from ...backends import (
     backend_infer,
     backend_signatures_compatible,
@@ -330,11 +333,6 @@ _DEFAULT_CUTOFF = "auto"
 _DEFAULT_CUTOFF_MODE = "auto"
 _DEFAULT_MAX_OPERATOR_QUBITS = 8
 _DEFAULT_MAX_SUBTREE_NODES = 128
-# Dense local gate factorization is deliberately kept small. Wider operators
-# should use the TreeMPO route, which factorizes on the active Steiner subtree
-# without first creating one large local dense factorization in the update
-# kernel.
-_DIRECT_GATE_MAX_QUBITS = 4
 
 
 def _normalize_control_where(where):
@@ -383,10 +381,11 @@ def _normalize_measure_axes(pauli, where):
 class TreeOptimizer:
     """Replay a bundled gate stream on a rooted tree tensor network.
 
-    The constructor defaults are performance-oriented: ordinary two-site
-    gates use the direct routed kernel (``mode="auto"``), small tree
-    contractions are capped to one BLAS/OpenMP thread (``threads=1``), and
-    full singular-spectrum diagnostics are disabled
+    The constructor defaults are performance-oriented: ordinary gate entries
+    are converted to a TreeMPO and routed through ``apply_subtreempo`` on
+    their active canonical Steiner region, small tree contractions are capped
+    to one BLAS/OpenMP thread (``threads=1``), and full singular-spectrum
+    diagnostics are disabled
     (``track_truncation=False``). Enable those diagnostics explicitly when
     collecting truncation reports; the one-time warning in that case is
     intentional because it describes the additional SVD work.
@@ -412,18 +411,16 @@ class TreeOptimizer:
         convention, ``"rsum2"``. Use ``"rel"`` for a relative
         largest-singular-value threshold.
     mode : {"auto", "direct", "dm", "sdc", "src", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
-        Gate/operator route and state-compression method. ``"direct"`` uses
-        dense local factorization and the specialised gate-SVD/QR path;
-        ``"dm"`` is its density-matrix-compression shorthand. These dense
-        routes accept at most four-qubit gate entries. ``"tree_mpo_direct"``
-        and ``"tree_mpo_dm"`` build a true :class:`TreeMPO` on the active
-        Steiner subtree and apply it with :meth:`apply_subtreempo`; the
-        suffix selects direct SVD or density-matrix compression. ``"auto"``
-        uses the dense route through four qubits and promotes wider gates to
-        ``"tree_mpo_direct"``. ``"submpo"`` declares that the stream is
-        already made of explicit chain-MPO entries. ``"mpo"`` remains the
-        legacy two-site chain-MPO factorization mode. Explicit sub-MPO
-        entries are accepted in the other legacy modes for compatibility.
+        Gate/operator route and state-compression method. Ordinary gate
+        entries in ``"auto"``, ``"direct"``, ``"dm"``, ``"sdc"``,
+        ``"src"``, and ``"mpo"`` are converted to a true :class:`TreeMPO`
+        and applied with :meth:`apply_subtreempo` on the active Steiner
+        subtree; the compression spelling selects the configured tree
+        decomposition. ``"tree_mpo_direct"`` and ``"tree_mpo_dm"`` retain
+        explicit route names and select direct SVD or density-matrix
+        compression. ``"submpo"`` declares that the stream is already made
+        of explicit chain-MPO entries. Explicit sub-MPO entries are accepted
+        in the other legacy modes for compatibility.
         ``"sdc"`` and ``"src"`` are shorthands for automatic routing with
         deterministic or randomized successive tree-edge compression.
         ``"dmrg"`` and ``"dmrg1"``/``"dmrg2"``/``"dmrg3"`` select the
@@ -433,8 +430,8 @@ class TreeOptimizer:
         Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
         ``"tree_mpo_dem"`` and ``"tree_mpo"`` compatibility spellings.
     compression_mode : {"direct", "dm", "sdc", "src"}
-        Decomposition used when truncating the already fused state/operator
-        network. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
+        Decomposition used by ordinary tree compression and TreeFIT local
+        splits. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
         density-matrix-equivalent ``svd:eig`` decomposition on the local
         canonical compression core; ``"sdc"`` uses the deterministic
         successive tree sweep and ``"src"`` uses randomized SVD per dense
@@ -602,20 +599,42 @@ class TreeOptimizer:
             )
         return mode
 
+    _PROGBAR_COLORS = {
+        # Keep the two primary colors aligned with MpsOptimizer. The tree
+        # implementation has additional compression spellings, but they are
+        # still either a DMRG/FIT or MPO-style replay.
+        "dmrg": "#1f77b4",
+        "mpo": "#2ca02c",
+    }
+
+    def _progress_mode_name(self):
+        """Return the active short mode name shown by a replay bar."""
+
+        mode = str(self.mode).strip().lower().replace("-", "_")
+        if mode == "dmrg":
+            return self._dmrg_mode_alias or "dmrg"
+        if mode in {"dmrg1", "dmrg2", "dmrg3"}:
+            return mode
+        if mode == "tree_mpo_dm":
+            return "dm"
+        if mode in {"auto", "direct", "mpo", "submpo", "tree_mpo_direct"}:
+            compression_mode = str(self.compression_mode).strip().lower()
+            if compression_mode in {"direct", "dm", "sdc", "src"}:
+                return compression_mode
+            return "direct"
+        return mode
+
     def _gate_route(self, width):
         """Return the implementation route for an ordinary dense gate.
 
-        ``mode`` is intentionally resolved here rather than at construction:
-        automatic replay can choose the small dense kernel for local gates and
-        the geometry-aware TreeMPO kernel for wider supports.
+        Ordinary TreeOptimizer gates use the geometry-aware TreeMPO kernel.
+        Keeping this decision here means construction-time and run-time mode
+        overrides share one gate-to-TreeMPO path. Explicit ``submpo`` remains
+        reserved for chain-MPO stream events.
         """
-        if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
-            return "treempo"
-        if self.mode == "auto":
-            return "dense" if width <= _DIRECT_GATE_MAX_QUBITS else "treempo"
         if self.mode == "submpo":
             return "submpo"
-        return "dense"
+        return "treempo"
 
     def _compression_for_mode(self, mode, compression_mode):
         """Resolve a mode's optional compression suffix.
@@ -635,7 +654,7 @@ class TreeOptimizer:
 
     @staticmethod
     def _normalize_compression_mode(mode):
-        """Validate the decomposition used for fused-network truncation."""
+        """Validate the decomposition used for tree-state truncation."""
 
         return _normalize_compression_mode(mode)
 
@@ -1333,6 +1352,17 @@ class TreeOptimizer:
         digits = exponent[1:] if sign else exponent
         digits = digits.lstrip("0") or "0"
         return f"{mantissa}e{sign}{digits}"
+
+    @staticmethod
+    def _format_progress_scalar(value):
+        """Format a fidelity value with the MPS progress-bar precision."""
+
+        return f"{float(value):.6f}"
+
+    def _cumulative_fidelity(self):
+        """Return the cumulative retained-norm fidelity for display."""
+
+        return float(fidelity_from_log(self._norm_log_survival))
 
     def _phys(self, q):
         return self.tn.site_ind(q)
@@ -2937,30 +2967,66 @@ class TreeOptimizer:
         return result
 
     def _apply_gate_tree_mpo_impl(
-        self, gate, logical_where, where, *, renormalize=False, track_norm=True
+        self, gate, logical_where, *, renormalize=False, track_norm=True
     ):
         """Apply an ordinary gate through a true TreeMPO active span."""
         from .operators import TreeMPO
 
+        logical_where = _normalize_where(logical_where)
+        where = self._validate_support(logical_where)
+        self._check_operator_limits(where)
         gate = self._as_state_backend(gate)
         factor_started = (
             self._profile_phase_start() if len(logical_where) > 1 else None
         )
-        tree_mpo = TreeMPO.from_gate(
-            self.plan,
-            gate,
-            where,
-            fermionic=bool(getattr(self.tn, "fermionic", False)),
-            symmetry=getattr(self.tn, "symmetry", None),
-            dtype=self.backend_dtype,
+        cache_source = gate
+        cache_key = (
+            "treempo_gate",
+            id(cache_source),
+            _array_backend_signature(cache_source),
+            tuple(where),
+            self.n,
+            bool(getattr(self.tn, "fermionic", False)),
+            getattr(self.tn, "symmetry", None),
         )
+        cached = self._gate_factor_cache.get(cache_key)
+        cache_hit = cached is not None and cached[0] is cache_source
+        if cache_hit:
+            tree_mpo = cached[1]
+        else:
+            tree_mpo = TreeMPO.from_gate(
+                self.plan,
+                gate,
+                where,
+                fermionic=bool(getattr(self.tn, "fermionic", False)),
+                symmetry=getattr(self.tn, "symmetry", None),
+                dtype=self.backend_dtype,
+            )
+            self._cache_gate_factorization(cache_key, cache_source, tree_mpo)
         self._profile_phase_event(
             "gate_factorization",
             factor_started,
             route="treempo",
+            cache_hit=cache_hit,
             support=tuple(logical_where),
             operator_bond=tree_mpo.max_bond(),
         )
+        if self.mode == "dmrg":
+            target = _build_layered_operator_state_target(self.tn, tree_mpo)
+            region = frozenset(
+                self.tn.steiner_nodes(
+                    [self.plan.node_of_qubit[q] for q in where]
+                )
+            )
+            self._run_tree_fit(
+                target,
+                region,
+                logical_where,
+                operator=tree_mpo,
+            )
+            if renormalize:
+                self.normalize()
+            return self
         self.apply_subtreempo(
             tree_mpo,
             tree_mpo.operator_support,
@@ -2972,16 +3038,6 @@ class TreeOptimizer:
         if renormalize:
             self.normalize()
         return self
-
-    def _check_direct_gate_width(self, width):
-        """Reject wide dense gates from the bounded local direct route."""
-        if width > _DIRECT_GATE_MAX_QUBITS:
-            raise ValueError(
-                f"mode={self.mode!r} supports dense direct gates on at most "
-                f"{_DIRECT_GATE_MAX_QUBITS} qubits; got {width}. Use "
-                "mode='tree_mpo_direct' or mode='tree_mpo_dm' for a wider "
-                "gate, or supply an explicit TreeMPO event."
-            )
 
     def _fit_block_size(self):
         """Resolve a named DMRG mode to its requested warm-up block size."""
@@ -3070,37 +3126,22 @@ class TreeOptimizer:
         return guess, strategy, None, "target_compress"
 
     def _build_tree_fit_target(self, gate, logical_where):
-        """Apply a gate exactly through a disposable TreeMPO target."""
+        """Build an exact layered operator--state TreeFIT target."""
 
         from .operators import TreeMPO
 
         gate = self._as_state_backend(gate)
+        where = self._validate_support(logical_where)
         tree_mpo = TreeMPO.from_gate(
             self.plan,
             gate,
-            logical_where,
+            where,
             fermionic=bool(getattr(self.tn, "fermionic", False)),
             symmetry=getattr(self.tn, "symmetry", None),
             dtype=self.backend_dtype,
         )
 
-        trial = self.copy()
-        trial.mode = "auto"
-        trial._dmrg_mode_alias = None
-        trial.chi = None
-        trial.cutoff = 0.0
-        trial.track_infidelity = False
-        trial.track_truncation = False
-        trial._norm_tracking_enabled = False
-        trial.apply_subtreempo(
-            tree_mpo,
-            tree_mpo.operator_support,
-            max_bond=None,
-            cutoff=0.0,
-            track_norm=False,
-            _validate_backend=False,
-        )
-        return trial.tn, tree_mpo
+        return _build_layered_operator_state_target(self.tn, tree_mpo), tree_mpo
 
     def _run_tree_fit(self, target, region, support, *, operator=None):
         """Fit one exact tree target and install it atomically."""
@@ -3191,7 +3232,7 @@ class TreeOptimizer:
                 "one_site_refinement_sweeps": fit.one_site_sweeps_run,
                 "block_size_trace": tuple(fit.block_size_trace),
                 "guess_backend": guess_backend,
-                "target_layout": "fused",
+                "target_layout": fit.target_layout,
             }
         )
         self.tn = fit.p
@@ -3201,26 +3242,32 @@ class TreeOptimizer:
         self.fit_diagnostics.append(deepcopy(diagnostics))
         if self._active_update is not None:
             self._active_update["fit_diagnostics"] = deepcopy(diagnostics)
+            target_edges = tuple(
+                (node0, node1)
+                for node0 in sorted(region)
+                for node1 in self.tn.neighbors(node0)
+                if node1 in region and node0 < node1
+            )
             self._record_transient_bond(
-                int(target.max_bond()),
+                max(
+                    _layered_target_bond_sizes(target, self.tn, target_edges)
+                    .values(),
+                    default=1,
+                ),
                 phase="fit.target",
             )
         return self
 
-    def _apply_gate_dmrg_impl(self, gate, logical_where):
-        """Apply a gate through an exact target and tree-local FIT sweeps."""
+    def _apply_gate_dmrg_impl(
+        self, gate, logical_where, *, renormalize=False, track_norm=True
+    ):
+        """Apply a gate through the shared TreeMPO-to-TreeFIT path."""
 
-        logical_where = _normalize_where(logical_where)
-        where = self._validate_support(logical_where)
-        self._check_operator_limits(where)
-        target, operator = self._build_tree_fit_target(gate, logical_where)
-        nodes = [self.plan.node_of_qubit[q] for q in logical_where]
-        region = frozenset(self.tn.steiner_nodes(nodes))
-        return self._run_tree_fit(
-            target,
-            region,
+        return self._apply_gate_tree_mpo_impl(
+            gate,
             logical_where,
-            operator=operator,
+            renormalize=renormalize,
+            track_norm=track_norm,
         )
 
     def _apply_gate_impl(
@@ -3229,7 +3276,12 @@ class TreeOptimizer:
         """Apply a gate without opening a nested diagnostic update."""
         logical_where = _normalize_where(where)
         if self.mode == "dmrg":
-            return self._apply_gate_dmrg_impl(gate, logical_where)
+            return self._apply_gate_dmrg_impl(
+                gate,
+                logical_where,
+                renormalize=renormalize,
+                track_norm=track_norm,
+            )
         where = self._validate_support(logical_where)
         self._check_operator_limits(where)
         if len(logical_where) == 2 and logical_where[0] == logical_where[1]:
@@ -3247,12 +3299,9 @@ class TreeOptimizer:
             return self._apply_gate_tree_mpo_impl(
                 gate,
                 logical_where,
-                where,
                 renormalize=renormalize,
                 track_norm=track_norm,
             )
-        if route == "dense" and self.mode == "direct":
-            self._check_direct_gate_width(len(logical_where))
         if route == "submpo" and len(logical_where) > 1:
             raise ValueError(
                 "mode='submpo' accepts explicit sub-MPO stream events, not "
@@ -3571,11 +3620,11 @@ class TreeOptimizer:
         gates : bundled gate stream, optional
             Replacement stream to replay. If omitted, replay the queued stream.
         progbar : bool, default=False
-            Show a tqdm progress bar with the two-qubit gate count. When
-            ``track_infidelity`` is enabled, also report the norm-based
-            truncation proxy ``1 - (norm / reference_norm)**2``; the reference
-            is established at run start and reset after control/non-unitary
-            events.
+            Show a tqdm progress bar with the active mode, two-qubit event
+            count, cumulative retained-norm fidelity (``~F``), and live
+            maximum bond. The bar uses the same core readout as
+            :class:`MpsOptimizer`; tree-specific ``kq``, ``ctrl``, and
+            explicit-operator ``mpo`` counters are added when present.
         mode : {"auto", "direct", "dm", "sdc", "src", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
             Optional persistent gate/sub-MPO replay selection: a supplied
             value updates :attr:`mode` before replay and remains active for
@@ -3592,7 +3641,8 @@ class TreeOptimizer:
             warm-up blocks; each named schedule then performs one-node
             refinement.
         compression_mode : {"direct", "dm", "sdc", "src"} | None, default=None
-            Persistent decomposition used for fused-network truncation.
+            Persistent decomposition used for TreeMPO state truncation and
+            layered TreeFIT local splits.
         compression_seed : int | None, default=None
             Override the configured randomized-compression seed for this run.
         non_unitary : bool, default=False
@@ -3807,24 +3857,25 @@ class TreeOptimizer:
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
+            progress_mode = self._progress_mode_name()
             pbar = tqdm(
                 total=len(self.G),
-                desc="tree",
+                desc=progress_mode,
                 leave=True,
                 position=0,
                 ascii=True,
-                colour="GREEN",
+                colour=(
+                    self._PROGBAR_COLORS["dmrg"]
+                    if progress_mode.startswith("dmrg")
+                    else self._PROGBAR_COLORS["mpo"]
+                ),
             )
 
         one_qubit_count = 0
         two_qubit_count = 0
         multi_qubit_count = 0
         control_count = 0
-        progress_reference_norm = (
-            self.norm()
-            if pbar is not None and self.track_infidelity
-            else None
-        )
+        submpo_count = 0
         previous_norm_tracking = self._norm_tracking_enabled
         # A non-unitary stream changes the physical norm for reasons other
         # than compression. Do not present that scale change as retained
@@ -3854,7 +3905,7 @@ class TreeOptimizer:
                         cutoff=self.cutoff,
                         _validate_backend=False,
                     )
-                    multi_qubit_count += 1
+                    submpo_count += 1
                 elif event_type == "submpo":
                     # Reuse the public sub-MPO implementation so stream
                     # replay gets the two-site factor fast path as well as
@@ -3870,7 +3921,7 @@ class TreeOptimizer:
                         max_bond=self.chi,
                         cutoff=self.cutoff,
                     )
-                    multi_qubit_count += 1
+                    submpo_count += 1
                 else:
                     control_count += 1
                     started = self._begin_update(event_type, support)
@@ -3894,34 +3945,17 @@ class TreeOptimizer:
                 if pbar is not None:
                     postfix = {
                         "2q": two_qubit_count,
+                        "~F": self._format_progress_scalar(
+                            self._cumulative_fidelity()
+                        ),
+                        "bnd": self.tn.max_bond(),
                     }
-                    if self.track_infidelity:
-                        # Use the same squared survival proxy for every
-                        # backend. Control and explicitly non-unitary events
-                        # change the physical norm for reasons unrelated to
-                        # truncation, so reset the reference after those
-                        # events.
-                        state_norm = self.norm()
-                        reset_progress = non_unitary or event_type != "gate"
-                        if reset_progress:
-                            truncation_infidelity = 0.0
-                            progress_reference_norm = state_norm
-                        elif progress_reference_norm in (None, 0.0):
-                            truncation_infidelity = 0.0
-                        else:
-                            truncation_infidelity = infidelity_from_log(
-                                log_fidelity_from_norms(
-                                    state_norm,
-                                    progress_reference_norm,
-                                )
-                            )
-                        postfix["infidelity"] = self._format_progress_infidelity(
-                            truncation_infidelity
-                        )
                     if multi_qubit_count:
                         postfix["kq"] = multi_qubit_count
                     if control_count:
                         postfix["ctrl"] = control_count
+                    if submpo_count:
+                        postfix["mpo"] = submpo_count
                     pbar.set_postfix(postfix)
                     pbar.update(1)
         finally:
@@ -4090,9 +4124,17 @@ class TreeOptimizer:
         try:
             with self._thread_ctx():
                 if self.mode == "dmrg":
-                    result = self._apply_gate_dmrg_impl(gate, (q,))
-                    if renormalize:
-                        self.normalize()
+                    result = self._apply_gate_dmrg_impl(
+                        gate,
+                        (q,),
+                        renormalize=renormalize,
+                        track_norm=track_norm,
+                    )
+                elif self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+                    result = self._apply_gate_tree_mpo_impl(
+                        gate, (q,), renormalize=renormalize,
+                        track_norm=track_norm,
+                    )
                 else:
                     result = self._apply_1q_impl(gate, q, renormalize=renormalize)
         except Exception:
@@ -4159,19 +4201,17 @@ class TreeOptimizer:
     def apply_2q(self, gate, qa, qb, *, track_norm=True):
         """Apply a two-qubit gate to physical sites ``qa`` and ``qb``.
 
-        Following Seitz et al. (Figs. 3-6): SVD-split the gate into two factors
-        joined by a virtual bond, absorb the left factor into leaf ``a`` and the
-        right into leaf ``b``, threading the virtual bond *exactly* through the
-        intermediate nodes along the tree geodesic.  Only once **both** factors
-        are present is a single canonical compression sweep run back along the
-        path, so every bond truncation sees the complete gate. ``tree_mpo_direct``
-        and ``tree_mpo_dm`` instead construct a true TreeMPO and route its
-        active Steiner subtree; the mode choice is honored for direct API calls
-        as well as bundled streams.
+        This low-level method retains the specialized two-factor path kernel
+        for compatibility with callers that explicitly use ``apply_2q``.
+        Ordinary ``apply_gate`` calls and bundled gate streams use the shared
+        ``TreeMPO -> apply_subtreempo`` route, which factorizes on the active
+        canonical Steiner region. ``tree_mpo_direct`` and ``tree_mpo_dm`` also
+        select that route here; ``submpo`` remains reserved for explicit chain
+        MPO events.
         """
         self._invalidate_state_norm_cache()
         logical_where = _normalize_where((qa, qb))
-        where = self._validate_support(logical_where)
+        self._validate_support(logical_where)
         if logical_where[0] == logical_where[1]:
             raise ValueError("A two-qubit gate needs two distinct qubits.")
         started = self._begin_update(
@@ -4180,13 +4220,14 @@ class TreeOptimizer:
         try:
             with self._thread_ctx():
                 if self.mode == "dmrg":
-                    result = self._apply_gate_dmrg_impl(gate, logical_where)
-                elif self._gate_route(2) == "treempo":
-                    result = self._apply_gate_tree_mpo_impl(
+                    result = self._apply_gate_dmrg_impl(
                         gate,
                         logical_where,
-                        where,
                         track_norm=track_norm,
+                    )
+                elif self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+                    result = self._apply_gate_tree_mpo_impl(
+                        gate, logical_where, track_norm=track_norm
                     )
                 else:
                     result = self._apply_2q_impl(gate, *logical_where)
@@ -4221,15 +4262,15 @@ class TreeOptimizer:
         return ar.do("reshape", gate, (da, db, da, db))
 
     def _apply_2q_impl(self, gate, qa, qb, *, max_bond=None, cutoff=None):
-        """Apply a two-site gate using the selected direct or MPO route.
+        """Apply a two-site gate using the legacy low-level route.
 
         ``mode='direct'`` splits the gate locally and ``mode='mpo'`` lets Quimb
         make the equivalent two-tensor MPO. Both immediately enter the same
         two-factor attach/QR-thread/compress kernel. ``'auto'`` and ``'dm'``
-        select local direct factorization. The ``tree_mpo_*`` modes are handled
-        by :meth:`_apply_gate_tree_mpo_impl` so they never fall through to the
-        chain-MPO implementation. ``'submpo'`` is reserved for explicit
-        sub-MPO stream events and cannot be used with a dense gate.
+        select local direct factorization. Ordinary ``apply_gate`` calls do not
+        use this compatibility helper: they are lowered to a true TreeMPO and
+        passed to :meth:`apply_subtreempo`. ``'submpo'`` is reserved for
+        explicit sub-MPO stream events and cannot be used with a dense gate.
         """
         if self.mode == "submpo":
             raise ValueError(
@@ -4238,9 +4279,8 @@ class TreeOptimizer:
             )
         if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
             logical_where = _normalize_where((qa, qb))
-            where = self._validate_support(logical_where)
             return self._apply_gate_tree_mpo_impl(
-                gate, logical_where, where, track_norm=True
+                gate, logical_where, track_norm=True
             )
         gate = self._as_state_backend(gate)
         if self.mode in {"auto", "direct"}:
@@ -5649,32 +5689,25 @@ class TreeOptimizer:
         )
         try:
             if self.mode == "dmrg":
-                trial = self.copy()
-                trial.mode = "auto"
-                trial._dmrg_mode_alias = None
-                trial.chi = None
-                trial.cutoff = 0.0
-                trial.track_infidelity = False
-                trial.track_truncation = False
-                trial._norm_tracking_enabled = False
-                trial.apply_subtreempo(
-                    tree_mpo,
-                    declared,
-                    max_bond=None,
-                    cutoff=0.0,
-                    track_norm=False,
-                    _validate_backend=False,
-                )
+                # Keep the exact DMRG target in operator--state form. The
+                # TreeMPO is still the source of the complete
+                # ``sub_treempo @ tree_state`` action, but its virtual layer
+                # is not fused into the fitted target.
                 active_nodes = tuple(
                     self.plan.node_of_qubit[site] for site in active_support
                 )
+                target = _build_layered_operator_state_target(
+                    self.tn, tree_mpo
+                )
                 region = frozenset(self.tn.steiner_nodes(active_nodes))
                 self._run_tree_fit(
-                    trial.tn,
+                    target,
                     region,
                     active_support,
                     operator=tree_mpo,
                 )
+                if started:
+                    self._finish_update()
                 return self
             with self._thread_ctx():
                 active_nodes = tuple(

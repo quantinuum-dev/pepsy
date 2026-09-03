@@ -144,6 +144,14 @@ updated = gate.apply_to(state, compress=True, max_bond=8)
 value = gate.expectation(state)
 ```
 
+`TreePepo` is the normal/full tree-PEPS operator, while `TreeSubPepo` is its
+support/span-aware sub-operator—the PEPS analogue of an MPS sub-MPO. The
+canonical method and event names are `apply_sub_treepepo` and
+`sub_treepepo_event`; MPS-style compatibility spellings
+`apply_sub_treepepsmpo` and `sub_treepepsmpo_event` are accepted and resolve to
+the same implementation. The full-operator event also accepts the matching
+`tree_pepsmpo_event` spelling. No second MPO representation is created.
+
 For an explicit path-method selection, the same call can retain both layers
 until Quimb compresses them:
 
@@ -180,10 +188,14 @@ subtree = TreePepsOptimizer(state, mode="sub_treepepo", chi=16)
 subtree.apply(subop)
 ```
 
-Direct gates are factorized over the unique tree path between their sites.
-`TreeSubPepo` updates fuse the complete connected span before one localized
-leaf-to-center compression sweep. Both paths keep intermediate routing
-lossless and use `left_inds`-aware canonical movement.
+Direct gates are first built as normal `TreePepo` operators and wrapped in a
+`TreeSubPepo`, then routed over the unique connected tree span. This mirrors
+MPS `sub_mpo`: the complete span is injected before one localized
+leaf-to-center compression sweep. Full `TreePepo` inputs remain the normal
+operator path. Both paths keep intermediate routing lossless and use
+`left_inds`-aware canonical movement. For compatibility with MPS code,
+`sub_treepepsmpo` is accepted as an alias for `sub_treepepo`; the normal/full
+operator remains `TreePepo` (or a `tree_pepo` stream event).
 
 The optimizer also owns a persistent, replayable stream. Install or extend
 it without executing the state, then call `run()` when ready:
@@ -245,9 +257,9 @@ method.
 ### TreePEPS FIT / DMRG
 
 `TreePepsOptimizer` also exposes the tree-native `TreeFIT` engine through
-`mode="dmrg"` and the `dmrg1`/`dmrg2`/`dmrg3` aliases. The exact fused
-operator-state target is built on a disposable copy, then fitted on the
-active connected tree span with cached directed branch environments:
+`mode="dmrg"` and the `dmrg1`/`dmrg2`/`dmrg3` aliases. The exact layered
+operator-state target is built from disposable tensor copies, then fitted on
+the active connected tree span with cached directed branch environments:
 
 ```python
 optimizer = TreePepsOptimizer(
@@ -270,13 +282,20 @@ The remaining controls are `fit_adaptive_sweeps`, `fit_min_iter`, `fit_rtol`,
 `"direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-dm"`, `"random"`, or
 `"random_expand"`; random policies are disposable, seeded, and active-span
 only. `get_fit_diagnostics()` reports the cache hit/miss counts, block size,
-convergence, and optional normalized target overlap when
+convergence, and the MPS-compatible retained-centre-norm `local_fidelity`.
+TreeFIT records one terminal centre norm per sweep in
+`local_norm_trace` (with stripped mantissa/exponent pairs in
+`local_norm_stripped_trace`). A genuine normalized target overlap is optional
+and is reported separately as `target_fidelity`/`target_infidelity` (with
+`fit_overlap_fidelity`/`fit_overlap_infidelity` aliases) when
 `fit_overlap_diagnostics=True`.
 
-This DMRG path currently builds the exact TreePEPO/TreeMPO target as a fused
-TreeFIT target. TreeFIT also accepts a correctly tagged layered target when
-each layer tensor belongs to exactly one structural node group; local layer
-bonds remain inside that group and inter-group bonds must follow the tree.
+This DMRG path builds the exact TreePEPO target as a correctly tagged layered
+operator--state network: state and TreePEPO virtual bonds remain separate,
+and only the physical input/output legs are joined. TreeFIT also accepts
+fused targets and other correctly tagged layered targets when each layer
+tensor belongs to exactly one structural node group; local layer bonds remain
+inside that group and inter-group bonds must follow the tree.
 The separate two-layer operator-state path remains available for the direct
 `sdc`/`src`/`zipup` compressors above when that Quimb path is desired.
 
@@ -310,13 +329,15 @@ replay begins. `TreePepsOptimizer.find_tree_layout(...)` and
 convenience entry points.
 
 Pass `progbar=True` to `run()` for a replay bar matching the MPS optimizer's
-compression readout. It reports the latest local fidelity as `F`, the
-log-accumulated retained fidelity as `~F`, the live maximum bond as `bnd`, and
-event counts such as `2q`; it does not display the live state norm. `F` and
-`~F` are retained-norm compression proxies, not directional overlaps with a
-target state. They are available after replay as
-`norm_diagnostics()["local_fidelity"]` and
-`norm_diagnostics()["cumulative_fidelity"]`, with matching infidelity fields.
+compression readout. It reports the active mode, exact two-qubit gate count
+`2q`, cumulative retained fidelity as `~F`, and the live maximum bond as `bnd`;
+it does not display the live state norm. `~F` is a retained-norm compression
+proxy, not a directional overlap with a target state. The latest local
+fidelity remains available after replay as
+`norm_diagnostics()["local_fidelity"]`, alongside
+`norm_diagnostics()["cumulative_fidelity"]` and the matching infidelity fields.
+Tree-specific `kq` and `pepo` counters are included when multi-site gates or
+explicit PEPO events occur.
 
 As with the state, TreePeps truncation history records exact bond dimensions;
 it does not claim a scalar discarded-weight fidelity unless a caller performs

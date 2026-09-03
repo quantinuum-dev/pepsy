@@ -17,7 +17,11 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting import TreeFIT
-from ...fitting.tree import _randomize_tree_guess
+from ...fitting.tree import (
+    _build_layered_operator_state_target,
+    _layered_target_bond_sizes,
+    _randomize_tree_guess,
+)
 from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
@@ -54,9 +58,11 @@ class TreePepsOptimizer:
 
     ``compression_layout="auto"`` selects the two-layer path network for
     Quimb's multi-tensor methods and keeps the fused representation for other
-    cases.  Use ``"fused"`` or ``"two_layer"`` to select explicitly.  The
-    optimizer owns an independent state copy by default and mutates that live
-    state when :meth:`apply` or :meth:`apply_gate` is called. ``mode="dmrg"``
+    ordinary compression cases.  The DMRG/TreeFIT route always builds a
+    layered operator--state target. Use ``"fused"`` or ``"two_layer"`` to
+    select the ordinary compression layout explicitly. The optimizer owns an
+    independent state copy by default and mutates that live state when
+    :meth:`apply` or :meth:`apply_gate` is called. ``mode="dmrg"``
     and its ``dmrg1``/``dmrg2``/``dmrg3`` aliases select the cached
     tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` and
     ``dmrg2`` use two-node warm-up blocks, ``dmrg3`` uses three-node warm-up
@@ -68,8 +74,20 @@ class TreePepsOptimizer:
         "sub_tree_pepo": "sub_treepepo",
         "subtree_pepo": "sub_treepepo",
         "subtree": "sub_treepepo",
+        # MPS-style compatibility spelling.  The canonical PEPS name is
+        # ``sub_treepepo`` because the operator is a tree PEPO, not a chain
+        # MPO.
+        "sub_treepepsmpo": "sub_treepepo",
+        "sub_tree_peps_mpo": "sub_treepepo",
+        "subtreepepsmpo": "sub_treepepo",
+        "subtree_peps_mpo": "sub_treepepo",
     }
     _DMRG_MODE_ALIASES = {"dmrg1": 1, "dmrg2": 2, "dmrg3": 3}
+    _PROGBAR_COLORS = {
+        # Match MpsOptimizer's DMRG and MPO-family colors.
+        "dmrg": "#1f77b4",
+        "mpo": "#2ca02c",
+    }
     _STREAM_EVENT_ALIASES = {
         "gate": "gate",
         "dense": "gate",
@@ -81,6 +99,16 @@ class TreePepsOptimizer:
         "sub_tree_pepo": "sub_treepepo",
         "subtree_pepo": "sub_treepepo",
         "subtreepepo": "sub_treepepo",
+        "sub_treepepsmpo": "sub_treepepo",
+        "sub_tree_peps_mpo": "sub_treepepo",
+        "subtreepepsmpo": "sub_treepepo",
+        "subtree_peps_mpo": "sub_treepepo",
+        # The normal/full PEPS operator is ``tree_pepo``.  These aliases make
+        # the MPS-style naming available at the stream boundary only.
+        "tree_pepsmpo": "tree_pepo",
+        "tree_peps_mpo": "tree_pepo",
+        "treepepsmpo": "tree_pepo",
+        "treepeps_mpo": "tree_pepo",
     }
 
     def __init__(
@@ -293,6 +321,31 @@ class TreePepsOptimizer:
             TreePepsOptimizer._normalize_mode(raw_mode),
             compression_mode,
         )
+
+    def _progress_mode_name(self, mode=None, compression_mode=None):
+        """Return the active short mode name shown by a replay bar."""
+
+        explicit_mode = mode is not None
+        raw_mode = self.mode if mode is None else str(mode)
+        raw_mode = raw_mode.strip().lower().replace("-", "_")
+        raw_mode = self._MODE_ALIASES.get(raw_mode, raw_mode)
+        if raw_mode == "fit":
+            raw_mode = "dmrg"
+        if raw_mode in self._DMRG_MODE_ALIASES:
+            return raw_mode
+        if raw_mode == "dmrg":
+            return self._dmrg_mode_alias or "dmrg"
+        if raw_mode in {"dm", "sdc", "src", "zipup"}:
+            return raw_mode
+        if raw_mode in {"auto", "direct", "sub_treepepo"}:
+            if compression_mode is not None:
+                selected = _normalize_compression_mode(compression_mode)
+            elif explicit_mode:
+                selected = "direct"
+            else:
+                selected = self.compression_mode
+            return selected
+        return raw_mode
 
     @staticmethod
     def _normalize_max_bond(max_bond):
@@ -1052,8 +1105,14 @@ class TreePepsOptimizer:
         return ("sub_treepepo", operator)
 
     pepo_event = tree_pepo_event
+    tree_pepsmpo_event = tree_pepo_event
+    tree_peps_mpo_event = tree_pepo_event
+    treepepsmpo_event = tree_pepo_event
     subtree_pepo_event = sub_treepepo_event
     sub_tree_pepo_event = sub_treepepo_event
+    sub_treepepsmpo_event = sub_treepepo_event
+    sub_tree_peps_mpo_event = sub_treepepo_event
+    subtreepepsmpo_event = sub_treepepo_event
 
     @property
     def gate_stream(self):
@@ -1354,11 +1413,7 @@ class TreePepsOptimizer:
     ):
         """Fit an exact disposable PEPO target with the tree-native FIT kernel."""
 
-        target = operator.apply_to(
-            self.state,
-            compress=False,
-            _active_sites=span,
-        )
+        target = _build_layered_operator_state_target(self.state, operator)
         guess, strategy, random_info = self._tree_fit_initial_guess(
             operator,
             span,
@@ -1446,7 +1501,7 @@ class TreePepsOptimizer:
                 "one_site_refinement_sweeps": fit.one_site_sweeps_run,
                 "block_size_trace": tuple(fit.block_size_trace),
                 "guess_backend": "tree_pepo" if strategy.startswith("guess_") else None,
-                "target_layout": "fused",
+                "target_layout": fit.target_layout,
             }
         )
         self._last_fit_diagnostics = deepcopy(diagnostics)
@@ -1514,7 +1569,11 @@ class TreePepsOptimizer:
                 compression_mode=compression_mode,
                 compression_layout=compression_layout,
             )
-            uncompressed_bonds = self._bond_sizes(fit_target, edges)
+            uncompressed_bonds = _layered_target_bond_sizes(
+                fit_target,
+                self.state,
+                edges,
+            )
             transient_max_bond = max(uncompressed_bonds.values(), default=1)
             use_two_layer = False
         else:
@@ -1758,11 +1817,11 @@ class TreePepsOptimizer:
         # decompositions. Convert the resulting operator back to the live
         # state's backend before the strict operator validation boundary.
         operator = self.to_backend(operator)
-        return self._apply_operator(
-            operator,
-            support,
-            operator.operator_span,
-            mode=route_mode,
+        suboperator = TreeSubPepo(operator, support)
+        return self.apply_sub_treepepo(
+            suboperator,
+            _mode=route_mode,
+            _report_mode=route_mode,
             compress=compress,
             center=center,
             max_bond=max_bond,
@@ -1785,6 +1844,7 @@ class TreePepsOptimizer:
         operator,
         *,
         _mode=None,
+        _report_mode=None,
         compress=True,
         center=None,
         max_bond=_UNSET,
@@ -1802,11 +1862,15 @@ class TreePepsOptimizer:
         if operator.plan_signature != plan_signature(self.plan):
             raise ValueError("operator and optimizer must use the same tree plan")
         route_mode = self.mode if _mode is None else _mode
+        report_mode = (
+            "dmrg" if route_mode == "dmrg"
+            else "sub_treepepo" if _report_mode is None else _report_mode
+        )
         return self._apply_operator(
             operator.operator,
             operator.support,
             operator.span,
-            mode="dmrg" if route_mode == "dmrg" else "sub_treepepo",
+            mode=report_mode,
             compress=compress,
             center=center,
             max_bond=max_bond,
@@ -1826,6 +1890,11 @@ class TreePepsOptimizer:
 
     apply_subtree_pepo = apply_sub_treepepo
     apply_sub_tree_pepo = apply_sub_treepepo
+    # MPS-style compatibility spellings.  These all use the same
+    # support/span-aware TreeSubPepo -> TreePepo application path.
+    apply_sub_treepepsmpo = apply_sub_treepepo
+    apply_sub_tree_peps_mpo = apply_sub_treepepo
+    apply_subtreepepsmpo = apply_sub_treepepo
 
     def apply_subtree_operator(self, operator, where=None, **kwargs):
         """Apply a complete or support-declared TreePePO operator.
@@ -2075,13 +2144,21 @@ class TreePepsOptimizer:
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
+            progress_mode = self._progress_mode_name(
+                mode=mode,
+                compression_mode=compression_mode,
+            )
             pbar = tqdm(
                 total=len(self._gate_stream),
-                desc=self.mode,
+                desc=progress_mode,
                 leave=True,
                 position=0,
                 ascii=True,
-                colour="GREEN",
+                colour=(
+                    self._PROGBAR_COLORS["dmrg"]
+                    if progress_mode.startswith("dmrg")
+                    else self._PROGBAR_COLORS["mpo"]
+                ),
             )
 
         two_qubit_count = 0
@@ -2109,11 +2186,12 @@ class TreePepsOptimizer:
                         support = tuple(
                             operator.operator_support or operator.sites
                         )
-                    if len(support) == 2:
-                        two_qubit_count += 1
-                    elif len(support) > 2:
-                        multi_site_count += 1
-                    if kind != "gate":
+                    if kind == "gate":
+                        if len(support) == 2:
+                            two_qubit_count += 1
+                        elif len(support) > 2:
+                            multi_site_count += 1
+                    else:
                         pepo_count += 1
 
                     postfix = {
@@ -2121,15 +2199,8 @@ class TreePepsOptimizer:
                         "bnd": self.max_bond(),
                     }
                     if track_norm:
-                        postfix.update(
-                            {
-                                "F": self._format_progress_scalar(
-                                    self._last_local_fidelity
-                                ),
-                                "~F": self._format_progress_scalar(
-                                    self._cumulative_fidelity()
-                                ),
-                            }
+                        postfix["~F"] = self._format_progress_scalar(
+                            self._cumulative_fidelity()
                         )
                     if multi_site_count:
                         postfix["kq"] = multi_site_count

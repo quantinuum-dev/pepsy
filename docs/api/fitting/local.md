@@ -48,12 +48,23 @@ updated = fit.p
 diagnostics = fit.fit_diagnostics(overlap=True)
 ```
 
-TreeFIT keeps the target fixed and does not normalize it. Its optional overlap
-diagnostic is a normalized target overlap; optimizer-level local/cumulative
-compression fidelity remains the canonical norm-survival ledger, accumulated
-in log form so large MPO/TreeMPO scale factors do not overflow or get mistaken
-for discarded weight. `TreeFIT.run()` is the FIT-compatible full-tree
-convenience call and delegates to the cached `TreeFIT.run_eff()` engine;
+TreeFIT keeps the target fixed and does not normalize it. After each sweep it
+reads one norm from the terminal canonical-centre tensor, just as MPS FIT does;
+`local_norm_trace` and `sweep_norm_trace` contain those values, while
+`local_norm_stripped_trace` preserves each `(mantissa, exponent)` pair. Its
+`local_fidelity` is the clipped squared ratio of retained centre norm to the
+target norm, and `local_infidelity` is the matching `1 - local_fidelity` value.
+This is a local norm-survival diagnostic, not a directional target overlap.
+`fit_diagnostics(overlap=True)` additionally performs the expensive full
+target contraction and reports its genuine normalized value as
+`target_fidelity`/`target_infidelity` (also available as the MPS-compatible
+`fit_overlap_fidelity`/`fit_overlap_infidelity`); it never replaces
+`local_fidelity`.
+Optimizer-level cumulative compression fidelity remains the canonical
+norm-survival ledger, accumulated in log form so large MPO/TreeMPO scale
+factors do not overflow or get mistaken for discarded weight. `TreeFIT.run()`
+is the FIT-compatible full-tree convenience call and delegates to the cached
+`TreeFIT.run_eff()` engine;
 `run_gate(region, ...)` remains the active-span entry point used by the
 optimizers. TreeFIT accepts fused targets and correctly tagged layered targets.
 Every target tensor must belong to exactly one structural node group; local
@@ -61,6 +72,12 @@ layer bonds stay within a group, while one or more bonds between groups must
 follow the fitted tree edges. Ambiguous or untagged layer tensors are
 rejected. The separate operator-state two-layer target can still use the
 path-only `TreePeps` `sdc`/`src`/`zipup` compressor.
+
+The tree optimizers construct their DMRG/DMRG-alias targets in this layered
+form: the state and operator tree bonds remain separate, with only the
+operator input and output physical legs joined. Fused targets remain accepted
+for callers that already have one, and the direct path compressor retains its
+own two-layer route.
 
 `adaptive_block_sweeps=2` gives the same warm-up/refinement schedule as the
 MPS FIT engine: two- or three-node updates for the warm-up, followed by

@@ -74,14 +74,30 @@ def _randomize_tree_guess(
 
     rng = np.random.default_rng(int(seed))
     if expand and target is not None:
+        tree_edges = tuple(
+            (node0, node1)
+            for node0 in _nodes_of(guess)
+            for node1 in _neighbors_of(guess, node0)
+            if node0 < node1
+        )
+        target_bond_sizes = None
+        if not hasattr(target, "bond"):
+            target_bond_sizes = _layered_target_bond_sizes(
+                target,
+                guess,
+                tree_edges,
+            )
         planned = []
-        for node0, node1 in getattr(guess.plan, "tree_edges", ()):
+        for node0, node1 in tree_edges:
             if node0 not in region or node1 not in region:
                 continue
             fitted_bond = guess.bond(node0, node1)
-            target_bond = target.bond(node0, node1)
             current = int(guess.ind_size(fitted_bond))
-            target_rank = int(target.ind_size(target_bond))
+            if target_bond_sizes is None:
+                target_bond = target.bond(node0, node1)
+                target_rank = int(target.ind_size(target_bond))
+            else:
+                target_rank = int(target_bond_sizes[(node0, node1)])
             if max_bond is not None:
                 target_rank = min(target_rank, int(max_bond))
             if target_rank > current:
@@ -264,6 +280,112 @@ def _scale_stripped(mantissa, exponent):
         return np.inf if float(exponent) >= 0.0 else 0.0
 
 
+def _build_layered_operator_state_target(state, operator):
+    """Build a layered operator--state target without fusing tree bonds.
+
+    The state and operator retain independent virtual tree layers. At a
+    physical node, only the operator input and state physical leg are joined
+    through a fresh internal index; the operator output is renamed to the
+    state's physical index. This is the tree equivalent of the ordinary
+    two-layer MPS operator application network and is accepted by ``TreeFIT``
+    as a correctly tagged layered target.
+    """
+
+    if getattr(operator, "tree_networks", None) is not None and len(
+        operator.tree_networks
+    ) != 1:
+        raise ValueError(
+            "layered TreeFIT targets require one operator tensor network"
+        )
+
+    state_tensors = []
+    operator_tensors = []
+    state_node_tag = getattr(state, "node_tag", None)
+    if not callable(state_node_tag):
+        state_node_tag = lambda node: f"N{node}"
+
+    plan = state.plan
+    for node in _nodes_of(state):
+        state_tensor = _tensor_of(state, node).copy()
+        operator_tensor = operator.node_tensor(node).copy()
+        qubit_of_node = getattr(plan, "qubit_of_node", None)
+        if qubit_of_node is None:
+            qubit = node
+        else:
+            qubit = qubit_of_node.get(node)
+        if qubit is not None:
+            physical = state.site_ind(qubit)
+            intermediate = f"_pepsy_fit_input_{qtn.rand_uuid()}"
+            if callable(getattr(operator, "input_ind", None)):
+                operator_input = operator.input_ind(qubit)
+                operator_output = operator.output_ind(qubit)
+            else:
+                # TreeMPO follows the generalized-operator convention where
+                # ``lower`` is the ket input and ``upper`` is the output.
+                operator_input = operator.lower_ind(qubit)
+                operator_output = operator.upper_ind(qubit)
+            state_tensor.reindex_({physical: intermediate})
+            operator_tensor.reindex_({
+                operator_input: intermediate,
+                operator_output: physical,
+            })
+        operator_tensor.modify(
+            tags=set(operator_tensor.tags) | {state_node_tag(node)}
+        )
+        state_tensors.append(state_tensor)
+        operator_tensors.append(operator_tensor)
+
+    state_layer = qtn.TensorNetwork(state_tensors)
+    operator_layer = qtn.TensorNetwork(operator_tensors)
+    state_layer.reindex_({
+        index: qtn.rand_uuid() for index in state_layer.inner_inds()
+    })
+    operator_layer.reindex_({
+        index: qtn.rand_uuid() for index in operator_layer.inner_inds()
+    })
+    target = qtn.TensorNetwork([
+        *state_layer.tensors,
+        *operator_layer.tensors,
+    ])
+    target.exponent = (
+        _exponent_value(state) + _exponent_value(operator)
+    )
+    return target
+
+
+def _layered_target_bond_sizes(target, state, edges):
+    """Return product dimensions of layered target bonds across tree edges."""
+
+    tag_map = getattr(target, "tag_map", {})
+    state_node_tag = getattr(state, "node_tag", None)
+    if not callable(state_node_tag):
+        state_node_tag = lambda node: f"N{node}"
+    groups = {
+        node: tuple(
+            target.tensor_map[tid]
+            for tid in tag_map.get(state_node_tag(node), ())
+        )
+        for node in _nodes_of(state)
+    }
+    result = {}
+    for edge in edges:
+        node0, node1 = edge
+        shared = set()
+        for tensor0 in groups.get(node0, ()):
+            for tensor1 in groups.get(node1, ()):
+                shared.update(qtn.bonds(tensor0, tensor1))
+        dimension = 1
+        for index in shared:
+            tensor = next(
+                tensor
+                for tensor in groups[node0] + groups[node1]
+                if index in tensor.inds
+            )
+            dimension *= int(tensor.ind_size(index))
+        result[tuple(edge)] = dimension
+    return result
+
+
 class TreeFIT:
     """Locally fit a bounded-bond tree tensor network to a target tree.
 
@@ -398,6 +520,11 @@ class TreeFIT:
         self.last_relative_change = None
         self.last_norm = None
         self.last_overlap = None
+        self.final_center_site = None
+        self.local_norm_trace = []
+        self.local_norm_stripped_trace = []
+        self.sweep_norm_trace = []
+        self._target_norm_stripped = None
         self.adaptive_sweeps_run = 0
         self.one_site_sweeps_run = 0
         self.block_size_trace = []
@@ -953,6 +1080,155 @@ class TreeFIT:
         )
 
     @staticmethod
+    def _center_norm_stripped(network, center=None):
+        """Read one canonical centre norm as ``(mantissa, exponent)``.
+
+        This is the tree equivalent of FIT's terminal MPS tensor readout.  A
+        canonical exterior cancels, so only the centre tensor is contracted;
+        the network exponent is kept separately to avoid materialising a
+        large represented norm.  Native fermionic trees provide a graded
+        one-tensor contraction which must be used instead of ``Tensor.H``.
+        """
+
+        if center is None:
+            center = getattr(network, "orthogonality_center", None)
+        if center is None:
+            region = getattr(network, "canonical_region", None)
+            if region is not None and len(region) == 1:
+                center = next(iter(region))
+        if center is None:
+            raise RuntimeError(
+                "TreeFIT requires a tracked single canonical centre for "
+                "local norm diagnostics."
+            )
+
+        fermionic_center_norm = getattr(
+            network, "_fermionic_center_norm_squared", None
+        )
+        if bool(getattr(network, "fermionic", False)) and callable(
+            fermionic_center_norm
+        ):
+            squared = _scalar_value(fermionic_center_norm(center))
+            value = float(np.sqrt(max(0.0, float(np.real(squared)))))
+        else:
+            tensor = _tensor_of(network, center)
+            squared = qtn.tensor_contract(tensor.H, tensor, output_inds=[])
+            squared = _scalar_value(squared)
+            value = float(np.sqrt(max(0.0, float(np.real(squared)))))
+        return value, _exponent_value(network), center
+
+    @staticmethod
+    def _log_norm_pair(norm_pair):
+        """Return ``log(norm)`` from a stripped norm pair."""
+
+        mantissa, exponent = norm_pair
+        mantissa = abs(float(mantissa))
+        if mantissa == 0.0:
+            return -np.inf
+        return float(np.log(mantissa) + float(exponent) * np.log(10.0))
+
+    @staticmethod
+    def _relative_log_change(log_current, log_previous):
+        """Return a scale-safe relative change between two positive norms."""
+
+        if log_current == log_previous:
+            return 0.0
+        if not np.isfinite(log_current) or not np.isfinite(log_previous):
+            return 1.0
+        # This is |a-b| / max(a, b), evaluated without constructing a or b.
+        return float(-np.expm1(-abs(float(log_current - log_previous))))
+
+    def _target_norm_stripped_for_center(self, center):
+        """Return the target norm without contracting its full overlap path.
+
+        Fused native tree targets can be moved to ``center`` and read from one
+        tensor just like the fitted state.  A plain or layered Quimb target
+        does not own tree canonical metadata, so it uses one cached norm
+        fallback.  The fallback is outside the per-sweep fitted-state path
+        and is never used for the routine local norm readout itself.
+        """
+
+        if self._target_norm_stripped is not None:
+            return self._target_norm_stripped
+
+        target = self.tn
+        if (
+            self.target_layout == "fused"
+            and callable(getattr(target, "shift_orthogonality_center", None))
+            and callable(getattr(target, "node_tensor", None))
+        ):
+            work = target.copy()
+            try:
+                work.shift_orthogonality_center(center, _skip_validate=True)
+            except TypeError:
+                work.shift_orthogonality_center(center)
+            local_mantissa, _, _ = self._center_norm_stripped(work, center)
+            self._target_norm_stripped = (
+                local_mantissa,
+                _exponent_value(work),
+            )
+            return self._target_norm_stripped
+
+        # Layered and plain tagged targets can have more than one tensor or
+        # more than one bond crossing a structural edge, so they cannot use a
+        # TreeTensorNetwork centre readout without first changing their
+        # topology.  Cache this exceptional compatibility fallback once.
+        mantissa, exponent = target.norm(strip_exponent=True)
+        self._target_norm_stripped = (
+            float(abs(_scalar_value(mantissa))),
+            float(exponent),
+        )
+        return self._target_norm_stripped
+
+    def _local_norm_fidelity(self):
+        """Return MPS-style retained-centre-norm fidelity for the latest sweep."""
+
+        if self.local_norm_stripped_trace:
+            local_pair = self.local_norm_stripped_trace[-1]
+            center = self.final_center_site
+        else:
+            try:
+                local_mantissa, local_exponent, center = (
+                    self._center_norm_stripped(self.p)
+                )
+            except (RuntimeError, ValueError, KeyError):
+                return None
+            local_pair = (local_mantissa, local_exponent)
+        if center is None:
+            return None
+        try:
+            target_pair = self._target_norm_stripped_for_center(center)
+        except (RuntimeError, TypeError, ValueError, KeyError):
+            return None
+        log_local = self._log_norm_pair(local_pair)
+        log_target = self._log_norm_pair(target_pair)
+        if log_local == -np.inf and log_target == -np.inf:
+            return 1.0
+        if not np.isfinite(log_local) or not np.isfinite(log_target):
+            return 0.0
+        log_fidelity = 2.0 * (log_local - log_target)
+        if log_fidelity >= 0.0:
+            return 1.0
+        if log_fidelity < np.log(np.finfo(float).tiny):
+            return 0.0
+        return float(np.exp(log_fidelity))
+
+    def _record_local_norm(self):
+        """Record one terminal canonical-centre norm for the latest sweep."""
+
+        mantissa, exponent, center = self._center_norm_stripped(
+            self.p, self.final_center_site
+        )
+        pair = (mantissa, exponent)
+        represented = _scale_stripped(mantissa, exponent)
+        self.final_center_site = center
+        self.local_norm_stripped_trace.append(pair)
+        self.local_norm_trace.append(represented)
+        self.sweep_norm_trace.append(represented)
+        self.last_norm = represented
+        return pair
+
+    @staticmethod
     def _log_stripped_norm(network):
         """Return ``log(norm)`` without materializing a large scale."""
 
@@ -1151,14 +1427,21 @@ class TreeFIT:
         warm-up followed by one-site refinement. ``adaptive_until_rank``
         extends that warm-up until the active physical rank ceilings are
         reached, and ``final_one_site_sweeps`` adds optional one-site polish.
-        ``verbose=True`` records one normalized target fidelity per completed
-        sweep, matching the chain FIT diagnostic behavior. When
+        ``verbose=True`` records one retained-centre-norm fidelity per
+        completed sweep, matching the chain FIT diagnostic behavior. When
         ``adaptive_block_sweeps`` is supplied, the first requested number of
         sweeps use ``block_size`` and the remaining sweeps use one-site
         refinement. ``adaptive_until_rank=True`` keeps the larger block until
         the active tree edges reach their target/max-bond ceilings, subject to
         the minimum warm-up. ``final_one_site_sweeps`` adds fixed-rank polish
         sweeps after the requested iterations.
+
+        The per-sweep ``local_norm_trace`` is read from the final canonical
+        centre tensor, matching MPS FIT. It is not a full-tree contraction;
+        the corresponding stripped ``(mantissa, exponent)`` values are kept
+        in ``local_norm_stripped_trace``. ``fidelity_trace`` records the
+        retained-centre-norm fidelity. A genuine full target overlap is an
+        optional :meth:`fit_diagnostics` diagnostic only.
         """
 
         if isinstance(region, Integral):
@@ -1219,8 +1502,14 @@ class TreeFIT:
         stable = 0
         self.iterations_run = 0
         self.fidelity_trace = []
+        self.local_norm_trace = []
+        self.local_norm_stripped_trace = []
+        self.sweep_norm_trace = []
         self.last_relative_change = None
+        self.last_norm = None
         self.last_overlap = None
+        self.final_center_site = None
+        self._target_norm_stripped = None
         self.converged = False
         self.convergence_reason = None
         self.adaptive_sweeps_run = 0
@@ -1277,21 +1566,17 @@ class TreeFIT:
             self.final_direction = directions[-1]
             self.final_center_site = getattr(self.p, "orthogonality_center", None)
             self.p.validate(check_canonical=True)
-            norm = self._network_norm(self.p)
-            self.last_norm = norm
+            local_pair = self._record_local_norm()
+            local_norm_log = self._log_norm_pair(local_pair)
             if verbose:
-                self.fidelity_trace.append(self._normalized_overlap_fidelity())
+                self.fidelity_trace.append(self._local_norm_fidelity())
             if rtol is not None:
-                try:
-                    self.last_overlap = self._global_overlap()
-                    objective = max(
-                        0.0, 1.0 - self._normalized_overlap_fidelity()
-                    )
-                except Exception:  # pragma: no cover - backend diagnostic fallback
-                    objective = norm
+                warmup_incomplete = False
+                warmup_finished_with_refinement = False
+                adaptive_rank_incomplete = False
                 if previous is not None:
-                    relative_change = abs(objective - previous) / max(
-                        abs(previous), 1e-300
+                    relative_change = self._relative_log_change(
+                        local_norm_log, previous
                     )
                     self.last_relative_change = float(relative_change)
                     warmup_incomplete = (
@@ -1331,9 +1616,9 @@ class TreeFIT:
                     stable = 0
                     self.last_relative_change = None
                 else:
-                    previous = objective
+                    previous = local_norm_log
             else:
-                previous = norm
+                previous = local_norm_log
 
             if (
                 adaptive_until_rank
@@ -1371,9 +1656,9 @@ class TreeFIT:
                     self.p, "orthogonality_center", None
                 )
                 self.p.validate(check_canonical=True)
-                self.last_norm = self._network_norm(self.p)
+                self._record_local_norm()
                 if verbose:
-                    self.fidelity_trace.append(self._normalized_overlap_fidelity())
+                    self.fidelity_trace.append(self._local_norm_fidelity())
         if self.converged is False and self.convergence_reason is None:
             self.convergence_reason = "max_iter"
         return self
@@ -1445,14 +1730,56 @@ class TreeFIT:
         )
 
     def fit_diagnostics(self, *, overlap=False):
-        """Return a copy-safe summary of the latest tree FIT run."""
+        """Return a copy-safe summary of the latest tree FIT run.
 
+        ``local_fidelity`` is the MPS-compatible retained-centre-norm
+        fidelity and is always available when a canonical centre can be read.
+        ``overlap=True`` additionally requests the expensive genuine overlap
+        with the full target; that value is reported as ``target_fidelity``
+        and never replaces the local norm diagnostic.
+        """
+
+        local_pair = (
+            self.local_norm_stripped_trace[-1]
+            if self.local_norm_stripped_trace
+            else None
+        )
+        if local_pair is None:
+            try:
+                local_mantissa, local_exponent, center = (
+                    self._center_norm_stripped(self.p)
+                )
+                local_pair = (local_mantissa, local_exponent)
+                if self.final_center_site is None:
+                    self.final_center_site = center
+            except (RuntimeError, ValueError, KeyError):
+                local_pair = None
+        local_norm = (
+            None if local_pair is None
+            else _scale_stripped(*local_pair)
+        )
+        local_fidelity = self._local_norm_fidelity()
         result = {
             "iterations": int(self.iterations_run),
             "converged": bool(self.converged),
             "convergence_reason": self.convergence_reason,
             "relative_change": self.last_relative_change,
-            "final_norm": self.last_norm,
+            "final_norm": self.last_norm if self.last_norm is not None else local_norm,
+            "final_norm_mantissa": (
+                None if local_pair is None else float(local_pair[0])
+            ),
+            "final_norm_exponent": (
+                None if local_pair is None else float(local_pair[1])
+            ),
+            "local_norm": self.last_norm if self.last_norm is not None else local_norm,
+            "local_norm_trace": tuple(self.local_norm_trace),
+            "local_norm_stripped_trace": tuple(self.local_norm_stripped_trace),
+            "sweep_norm_trace": tuple(self.sweep_norm_trace),
+            "local_fidelity": local_fidelity,
+            "local_infidelity": (
+                None if local_fidelity is None
+                else float(max(0.0, 1.0 - local_fidelity))
+            ),
             "adaptive_sweeps": int(self.adaptive_sweeps_run),
             "one_site_refinement_sweeps": int(self.one_site_sweeps_run),
             "block_size_trace": tuple(self.block_size_trace),
@@ -1467,19 +1794,31 @@ class TreeFIT:
                 overlap_value = _scale_stripped(
                     overlap_mantissa, overlap_exponent
                 )
-                fidelity = self._normalized_overlap_fidelity()
+                target_fidelity = self._normalized_overlap_fidelity()
                 result.update({
                     "overlap": overlap_value,
-                    "local_fidelity": float(fidelity),
-                    "local_infidelity": float(max(0.0, 1.0 - fidelity)),
+                    "target_fidelity": float(target_fidelity),
+                    "target_infidelity": float(
+                        max(0.0, 1.0 - target_fidelity)
+                    ),
+                    # Keep the MpsOptimizer naming available for callers
+                    # which request the optional exact FIT overlap.
+                    "fit_overlap_fidelity": float(target_fidelity),
+                    "fit_overlap_infidelity": float(
+                        max(0.0, 1.0 - target_fidelity)
+                    ),
+                    "fit_overlap_error": None,
                     "overlap_mantissa": overlap_mantissa,
                     "overlap_exponent": overlap_exponent,
                 })
             except Exception as exc:  # diagnostics must not invalidate a fit
                 result.update({
                     "overlap": None,
-                    "local_fidelity": None,
-                    "local_infidelity": None,
+                    "target_fidelity": None,
+                    "target_infidelity": None,
+                    "fit_overlap_fidelity": None,
+                    "fit_overlap_infidelity": None,
+                    "fit_overlap_error": str(exc),
                     "overlap_error": str(exc),
                 })
         return result

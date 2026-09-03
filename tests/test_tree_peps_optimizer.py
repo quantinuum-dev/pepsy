@@ -184,6 +184,7 @@ def test_tree_peps_dmrg_uses_tree_fit_engine(
         assert diagnostics["block_size_trace"] == (2, 2, 1)
         assert diagnostics["adaptive_sweeps"] == 2
         assert diagnostics["one_site_refinement_sweeps"] == 1
+    assert diagnostics["target_layout"] == "layered"
     assert diagnostics["cache"]["hits"] > 0
     assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
     assert optimizer.validate(check_canonical=True) is optimizer
@@ -522,6 +523,34 @@ def test_optimizer_stream_event_forms_and_common_aliases():
     assert copied.gate_stream[0][1] is queued.gate_stream[0][1]
 
 
+def test_peps_mps_style_sub_treepepsmpo_aliases_share_pepo_route():
+    """PEPS MPO-style names resolve to the canonical TreeSubPepo API."""
+    plan = _path_plan((1, 3))
+    state = TreePeps.from_plan(plan)
+    subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 2))
+    optimizer = TreePepsOptimizer(state, chi=None, cutoff=0.0, run=False)
+
+    assert optimizer.apply_sub_treepepsmpo(subop) is optimizer
+    assert optimizer.last_report["mode"] == "sub_treepepo"
+
+    queued = TreePepsOptimizer(
+        state,
+        gates=[
+            ("sub_treepepsmpo", subop),
+            ("tree_pepsmpo", TreePepo.identity(plan)),
+        ],
+        chi=None,
+        cutoff=0.0,
+        run=False,
+    )
+    assert [entry[0] for entry in queued.gate_stream] == [
+        "sub_treepepo",
+        "tree_pepo",
+    ]
+    queued.run()
+    assert queued.validate(check_canonical=True) is queued
+
+
 def test_optimizer_rejects_queued_backend_mismatches_atomically():
     torch = pytest.importorskip("torch")
     plan = _path_plan((1, 2))
@@ -690,12 +719,65 @@ def test_optimizer_progress_bar_reports_fidelities_not_live_norm(monkeypatch):
     assert descriptors == ["direct"]
     assert len(postfixes) == 2
     assert all("norm" not in postfix for postfix in postfixes)
-    assert all("F" in postfix and "~F" in postfix for postfix in postfixes)
+    assert all("~F" in postfix and "F" not in postfix for postfix in postfixes)
     assert all("bnd" in postfix for postfix in postfixes)
     assert postfixes[-1]["2q"] == 1
     diagnostics = optimizer.norm_diagnostics()
     assert diagnostics["local_fidelity"] is not None
     assert diagnostics["cumulative_fidelity"] is not None
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("direct", "direct"),
+        ("dm", "dm"),
+        ("sdc", "sdc"),
+        ("src", "src"),
+        ("zipup", "zipup"),
+        ("dmrg", "dmrg"),
+        ("dmrg1", "dmrg1"),
+        ("dmrg2", "dmrg2"),
+        ("dmrg3", "dmrg3"),
+    ],
+)
+def test_optimizer_progress_bar_uses_mps_mode_names(monkeypatch, mode, expected):
+    """TreePEPS replay bars expose the active MPS-compatible mode name."""
+
+    import tqdm as tqdm_module
+
+    descriptors = []
+
+    class FakeProgress:
+        def __init__(self, *args, **kwargs):
+            del args
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, _postfix):
+            pass
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tqdm_module, "tqdm", FakeProgress)
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(_path_plan((1, 2))),
+        gates=[(np.eye(2, dtype=complex), 0)],
+        run=False,
+        mode="direct",
+        chi=2,
+        cutoff=0.0,
+    )
+    optimizer.set_gates([(np.eye(2, dtype=complex), 0)])
+    # Test the label selection independently of the compression implementation.
+    monkeypatch.setattr(optimizer, "apply_gate", lambda *_args, **_kwargs: optimizer)
+
+    optimizer.run(progbar=True, mode=mode)
+
+    assert descriptors == [expected]
 
 
 def test_optimizer_layout_preflight_and_convergence_helpers():

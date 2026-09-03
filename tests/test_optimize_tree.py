@@ -161,8 +161,10 @@ def test_tree_optimizer_dmrg_uses_tree_fit_engine(
         assert diagnostics["adaptive_sweeps"] == 2
         assert diagnostics["one_site_refinement_sweeps"] == 1
     assert diagnostics["guess_backend"] == "tree_mpo"
+    assert diagnostics["target_layout"] == "layered"
     assert diagnostics["cache"]["hits"] > 0
     assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+    assert optimizer._active_update is None
     assert optimizer.tn.validate(check_canonical=True) is optimizer.tn
 
 
@@ -238,6 +240,35 @@ def test_tree_optimizer_guess_src_uses_fit_init_seed(monkeypatch):
     optimizer._tree_fit_initial_guess(target, region, operator=operator)
 
     assert observed == [37]
+
+
+def test_tree_optimizer_dmrg_target_keeps_operator_and_state_layers():
+    """Tree DMRG builds a non-fused operator--state target for TreeFIT."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        track_infidelity=False,
+        run=False,
+    )
+    target, _operator = optimizer._build_tree_fit_target(
+        np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0],
+             [0, 0, 0, 1], [0, 0, 1, 0]],
+            dtype=complex,
+        ),
+        (0, 4),
+    )
+
+    assert len(target.tensors) == 2 * len(optimizer.tn.tensors)
+    fit = TreeFIT(target, optimizer.tn.copy(), max_bond=2, cutoffs=0.0)
+    assert fit.target_layout == "layered"
+    assert all(len(group) == 2 for group in fit._target_tensors.values())
 
 
 @pytest.mark.parametrize("strategy", ("random", "random_expand"))
@@ -360,9 +391,39 @@ def test_tree_fit_run_api_matches_fit_positional_controls_and_verbose_trace():
     fit.run(1, True)
 
     assert len(fit.fidelity_trace) == 1
-    assert fit.fit_diagnostics(overlap=True)["local_fidelity"] > 1.0 - 1.0e-10
+    diagnostics = fit.fit_diagnostics(overlap=True)
+    assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+    assert diagnostics["target_fidelity"] > 1.0 - 1.0e-10
+    assert diagnostics["fit_overlap_fidelity"] == pytest.approx(
+        diagnostics["target_fidelity"]
+    )
     fit.run_eff(1, True)
     assert len(fit.fidelity_trace) == 1
+
+
+def test_tree_fit_local_norm_diagnostics_do_not_contract_full_state(monkeypatch):
+    """TreeFIT local fidelity uses one terminal centre tensor per sweep."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    target = TreeTensorNetwork.rand(plan, D=2, seed=330, canonicalize=True)
+    fit = TreeFIT(target, target.copy(), max_bond=2, cutoffs=0.0)
+
+    def fail_full_path(*args, **kwargs):
+        raise AssertionError("routine TreeFIT diagnostics used a full contraction")
+
+    monkeypatch.setattr(fit, "_network_norm", fail_full_path)
+    monkeypatch.setattr(fit, "_global_overlap", fail_full_path)
+    monkeypatch.setattr(fit.tn, "norm", fail_full_path)
+
+    fit.run_eff(n_iter=2, verbose=True, block_size=1, rtol=0.0)
+    diagnostics = fit.fit_diagnostics()
+
+    assert len(fit.local_norm_trace) == 2
+    assert len(fit.local_norm_stripped_trace) == 2
+    assert len(fit.sweep_norm_trace) == 2
+    assert len(fit.fidelity_trace) == 2
+    assert diagnostics["local_fidelity"] == pytest.approx(1.0)
+    assert "target_fidelity" not in diagnostics
 
 
 @pytest.mark.parametrize("block_size", (2, 3))
@@ -815,26 +876,72 @@ def test_tree_mpo_gate_modes_use_tree_mpo_not_chain_submpo(monkeypatch):
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
-def test_tree_direct_gate_mode_stays_dense_for_four_qubits(monkeypatch):
-    """The bounded direct route does not promote a four-qubit gate to TreeMPO."""
-    rng = np.random.default_rng(922)
-    opt = TreeOptimizer(None, n=6, chi=64, cutoff=0.0, mode="direct", run=False)
+@pytest.mark.parametrize("mode", ("auto", "direct", "dm", "sdc", "src", "mpo"))
+def test_tree_ordinary_gate_modes_all_lower_to_subtreempo(monkeypatch, mode):
+    """Every ordinary gate mode shares the TreeMPO active-region kernel."""
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        None,
+        n=4,
+        chi=8,
+        cutoff=0.0,
+        mode=mode,
+        run=False,
+    )
+    routed = []
+    apply_subtreempo = opt.apply_subtreempo
 
-    def unexpected_tree_mpo(*args, **kwargs):
-        raise AssertionError("direct gate route unexpectedly built a TreeMPO")
+    def traced_apply_subtreempo(tree_mpo, *args, **kwargs):
+        routed.append(tree_mpo)
+        return apply_subtreempo(tree_mpo, *args, **kwargs)
 
-    monkeypatch.setattr(opt, "_apply_gate_tree_mpo_impl", unexpected_tree_mpo)
-    opt.apply_gate(_rand_unitary(4, rng), (0, 2, 4, 5))
+    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    opt.apply_gate(cnot, (0, 3))
 
+    assert routed
+    assert isinstance(routed[0], TreeMPO)
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
-def test_tree_direct_gate_mode_rejects_wider_dense_gate():
-    """Wide dense gates provide an actionable TreeMPO route recommendation."""
-    opt = TreeOptimizer(None, n=5, mode="direct", run=False)
+def test_tree_gate_mode_uses_subtreempo_for_four_qubits(monkeypatch):
+    """Ordinary dense gates enter the TreeMPO route, including four sites."""
+    rng = np.random.default_rng(922)
+    opt = TreeOptimizer(None, n=6, chi=64, cutoff=0.0, mode="direct", run=False)
 
-    with pytest.raises(ValueError, match="tree_mpo_direct"):
-        opt.apply_gate(np.eye(32, dtype=complex), tuple(range(5)))
+    routed = []
+    apply_subtreempo = opt.apply_subtreempo
+
+    def traced_apply_subtreempo(tree_mpo, *args, **kwargs):
+        routed.append(tree_mpo)
+        return apply_subtreempo(tree_mpo, *args, **kwargs)
+
+    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    opt.apply_gate(_rand_unitary(4, rng), (0, 2, 4, 5))
+
+    assert routed
+    assert isinstance(routed[0], TreeMPO)
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_gate_mode_routes_wider_dense_gate_through_tree_mpo(monkeypatch):
+    """Wide ordinary gates use the TreeMPO route without a width cliff."""
+    opt = TreeOptimizer(None, n=5, chi=8, cutoff=0.0, mode="direct", run=False)
+    routed = []
+    apply_subtreempo = opt.apply_subtreempo
+
+    def traced_apply_subtreempo(tree_mpo, *args, **kwargs):
+        routed.append(tree_mpo)
+        return apply_subtreempo(tree_mpo, *args, **kwargs)
+
+    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    opt.apply_gate(np.eye(32, dtype=complex), tuple(range(5)))
+
+    assert routed
+    assert isinstance(routed[0], TreeMPO)
+    assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
 def test_tree_mpo_run_mode_updates_route_and_compression():
@@ -4097,6 +4204,7 @@ def test_tree_run_progbar_reports_infidelity(monkeypatch):
     class _FakeTqdm:
         def __init__(self, **kwargs):
             self.total = kwargs["total"]
+            self.desc = kwargs["desc"]
             self.n = 0
             self.postfix_calls = []
             progress_instances.append(self)
@@ -4127,11 +4235,61 @@ def test_tree_run_progbar_reports_infidelity(monkeypatch):
     progress = progress_instances[-1]
     assert progress.total == 2
     assert progress.n == 2
+    assert progress.desc == "direct"
     last = progress.postfix_calls[-1]
-    assert {"2q", "infidelity"} <= set(last)
+    assert {"2q", "~F", "bnd"} <= set(last)
+    assert "infidelity" not in last
     # kq is only shown when multi-qubit (>2) gates are present.
     assert "kq" not in last
     assert last["2q"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("direct", "direct"),
+        ("dm", "dm"),
+        ("sdc", "sdc"),
+        ("src", "src"),
+        ("mpo", "direct"),
+        ("tree_mpo_dm", "dm"),
+        ("dmrg", "dmrg"),
+        ("dmrg1", "dmrg1"),
+        ("dmrg2", "dmrg2"),
+        ("dmrg3", "dmrg3"),
+    ],
+)
+def test_tree_progress_bar_uses_mps_mode_names(monkeypatch, mode, expected):
+    """Tree replay bars expose the same active mode names as MPS bars."""
+
+    descriptors = []
+
+    class _FakeTqdm:
+        def __init__(self, **kwargs):
+            descriptors.append(kwargs["desc"])
+
+        def set_postfix(self, _postfix):
+            pass
+
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm)
+    )
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    optimizer = TreeOptimizer(None, n=2, mode=mode, run=False)
+    optimizer.set_gates([(h, 0)])
+    # The mode label is selected when the bar is created; avoid making this
+    # label-only regression test depend on each compression backend.
+    monkeypatch.setattr(optimizer, "apply_gate", lambda *_args, **_kwargs: optimizer)
+
+    optimizer.run(progbar=True)
+
+    assert descriptors == [expected]
 
 
 def test_threads_setting_preserves_result():
