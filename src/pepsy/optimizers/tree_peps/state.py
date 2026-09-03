@@ -219,6 +219,12 @@ class TreePeps(qtn.TensorNetworkGenVector):
         return self._tree_peps_plan
 
     @property
+    def map_mode(self) -> str | None:
+        """Canonical lattice spanning-tree mode, if the plan has one."""
+
+        return self.plan.map_mode
+
+    @property
     def plan_signature(self):
         """Immutable geometry signature used by state/operator adapters."""
 
@@ -280,7 +286,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
 
     @property
     def is_branching(self) -> bool:
-        """Whether this state has a rank-four, three-virtual-bond site."""
+        """Whether this state has a site with at least three virtual bonds."""
 
         return self.plan.is_branching
 
@@ -306,8 +312,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
         """Whether the rooted TreePeps has at most two children per site.
 
         A degree-three root is allowed by default, matching the binary-tree
-        convention used by :class:`TreeTensorNetwork` while retaining the
-        TreePeps hard limit of three total virtual bonds.
+        convention used by :class:`TreeTensorNetwork`. ``span-middle`` may
+        additionally use degree-four backbone sites.
         """
 
         root = self.plan.root
@@ -580,8 +586,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
     def validate(self, *, check_canonical=False, tol=1e-9):
         """Validate tags, physical legs, and the live virtual tree graph."""
 
-        if self.plan.max_virtual_degree > 3 or self.plan.max_degree > 3:
-            raise ValueError("TreePeps tensors may have at most three virtual bonds")
+        if self.plan.max_virtual_degree > 4 or self.plan.max_degree > 4:
+            raise ValueError("TreePeps tensors may have at most four virtual bonds")
 
         physical_counts = Counter()
         virtual_counts = Counter()
@@ -595,10 +601,10 @@ class TreePeps(qtn.TensorNetworkGenVector):
             }
             if not required_tags.issubset(tensor.tags):
                 raise ValueError(f"tensor at site {q} is missing TreePeps tags")
-            if len(tensor.inds) > 4:
+            if len(tensor.inds) > 5:
                 raise ValueError(
-                    f"tensor at site {q} exceeds TreePeps rank four "
-                    "(one physical leg plus three virtual bonds)"
+                    f"tensor at site {q} exceeds TreePeps rank five "
+                    "(one physical leg plus four virtual bonds)"
                 )
             physical = self.site_ind_1d(q)
             if physical not in tensor.inds:

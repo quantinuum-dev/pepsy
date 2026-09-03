@@ -158,6 +158,12 @@ returns a bond-one TTNO that can be applied directly to a native
 `OneDMap` is the shared source of truth for regular 2D/3D coordinate layouts;
 the tree and MPS geometric layout finders consume its row/column, snake,
 alternate-x/y/z, folded-snake, and generalized Hilbert traversals directly.
+For a tree-native layout, the short canonical spelling is
+`map_mode="coarse-alternate-x"` (or another `coarse-*` preset). It describes
+the lattice coarsening/traversal used to label the leaves and is available as
+`map_mode` on the resulting `TreePlan`, `TreeTensorNetwork`, and `TreeMPO`.
+Pass the same plan through state, operator, and optimizer construction so all
+three components share one binary-tree geometry.
 
 `TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, in the same way that
 `TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
@@ -190,6 +196,50 @@ For native Symmray operators, addition uses a charge-aware TreePlan direct
 sum; it does not use Quimb's dense-axis padding. A chain MPO, when needed, is
 constructed separately with the model-level `to_mpo(...)`.
 `add_MPO(...)` remains a compatibility alias for `add_TreeMPO(...)`.
+
+`TreeMPO.ascii_tree()` returns a compact Quimb-inspired native drawing, and
+`TreeMPO.show()` prints only this clean native tree by default, with one bond
+dimension per branch. When a
+`TreeLayoutFinder` with `lattice_shape=` is attached, the operator also keeps
+the physical coordinate map and term supports for display:
+
+```python
+print(tree_operator.ascii_tree())
+tree_operator.show(bond_dims=True)
+tree_operator.show(layout="both")  # physical lattice above native tree
+```
+
+Hamiltonian builders attach this layout metadata automatically when their
+lattice shape is known. For a manually constructed operator, pass the finder
+explicitly:
+
+```python
+finder = TreeLayoutFinder(
+    supports=terms,
+    n=16,
+    lattice_shape=(4, 4),
+)
+tree_operator = TreeMPO.from_terms(
+    plan,
+    terms,
+    layout_finder=finder,
+)
+tree_operator.show(layout="lattice")
+```
+
+`layout="tree"` (the default) keeps the output to the native ASCII tree.
+`layout="auto"` remains an explicit convenience option that shows both
+sections when this metadata is available. `ascii_lattice()` shows
+the physical site array and a compact support list; `plot_layout()` or
+`show(layout="plot")` gives the Matplotlib tent view with the physical lattice,
+tree hierarchy, and term connectivity.
+
+Dense `TreeMPO` objects also provide exact `+`, `-`, scalar multiplication,
+and operator composition with `@` while retaining the native TreePlan
+network. Composition does not lower either operand to a chain MPO; use
+`compress(...)` explicitly to truncate the resulting tree bonds. Composition
+of native graded fermionic operators is intentionally guarded until a graded
+fused-bond kernel is available.
 
 `canonicalize(center=..., info_c=...)` performs lossless tree QR
 canonicalization. The tree-native source of truth is `canonical_region` plus
@@ -1030,6 +1080,14 @@ tree_folded = finder.run(order="folded-snake")
 tree_hilbert = finder.run(order="hilbert")
 tree_coarse = finder.run(order="coarse-alternate-x")
 tree_quality = finder.run(order="quality")
+
+# Equivalent one-string spelling for the tree geometry:
+tree_coarse = TreeLayoutFinder(
+    gates,
+    n=36,
+    lattice_shape=(6, 6),
+    map_mode="coarse-alternate-x",
+).run()
 ```
 
 The supported 2D geometric presets include `"row-major"`, `"snake"`,
@@ -1080,6 +1138,7 @@ tree_plan = TreePlan.from_order(
     structure="balanced",
     max_arity=2,
     top_arity=3,
+    map_mode="coarse-alternate-x",
 )
 
 zigzag3d = TreeLayoutFinder.lattice_order(
