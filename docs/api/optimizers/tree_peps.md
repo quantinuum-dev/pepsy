@@ -216,8 +216,15 @@ The accepted event forms are `(gate, where)`, tagged
 `("gate", gate, where)`, a `TreePepo`, or a `TreeSubPepo`; mapping forms with
 `kind`, `gate`/`where`, or `operator` keys are also accepted. `run()` without
 arguments replays the currently queued stream, while `run(gates)` preserves
-the older one-shot spelling by replacing the queue first. The normalized
-stream is available as `gate_stream`. Convenience methods `apply_1q`,
+the older one-shot spelling by replacing the queue first. `run(mode=...,
+compression_mode=...)` uses the same persistent selection model: the route
+and compression mode are normalized and stored before replay, and the
+resolved pair is passed to every queued gate, full `TreePepo`, and
+`TreeSubPepo` event. Thus `run(mode="sdc")` persists
+`mode="direct", compression_mode="sdc"` and applies that compression to
+explicit sub-operator entries as well. The `sub_treepepsmpo` spelling is
+normalized to the canonical `sub_treepepo` route. The normalized stream is
+available as `gate_stream`. Convenience methods `apply_1q`,
 `apply_2q`, `apply_multi_site`, and `apply_pepo` match the corresponding
 optimizer vocabulary.
 

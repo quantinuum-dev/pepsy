@@ -486,6 +486,75 @@ def test_optimizer_owns_a_persistent_stream_and_supports_replacement():
         optimizer.set_state(TreePeps.from_plan(_path_plan((1, 3))))
 
 
+@pytest.mark.parametrize(
+    ("requested_mode", "expected_mode", "expected_compression"),
+    [
+        ("direct", "direct", "direct"),
+        ("auto", "auto", "direct"),
+        ("dm", "direct", "dm"),
+        ("sdc", "direct", "sdc"),
+        ("src", "direct", "src"),
+        ("zipup", "direct", "zipup"),
+        ("sub_treepepsmpo", "sub_treepepo", "direct"),
+        ("dmrg", "dmrg", "direct"),
+    ],
+)
+def test_run_persists_all_tree_peps_modes(
+    requested_mode, expected_mode, expected_compression
+):
+    """run(mode=...) stores the canonical route and compression selection."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(_path_plan((1, 2))),
+        mode="direct",
+        compression_mode="direct",
+        run=False,
+    )
+
+    optimizer.run(mode=requested_mode)
+
+    assert optimizer.mode == expected_mode
+    assert optimizer.compression_mode == expected_compression
+
+
+def test_run_persists_an_explicit_compression_override():
+    """A compression-only run override remains active for later replays."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(_path_plan((1, 2))),
+        mode="direct",
+        run=False,
+    )
+
+    optimizer.run(compression_mode="sdc")
+
+    assert optimizer.mode == "direct"
+    assert optimizer.compression_mode == "sdc"
+
+
+def test_run_mode_shorthand_applies_to_explicit_sub_treepepo():
+    """Shorthand compression reaches explicit PEPO stream events."""
+
+    plan = _path_plan((1, 3))
+    subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 2))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        gates=[TreePepsOptimizer.sub_treepepo_event(subop)],
+        mode="direct",
+        compression_mode="direct",
+        chi=1,
+        cutoff=0.0,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.run(mode="sdc")
+
+    assert optimizer.mode == "direct"
+    assert optimizer.compression_mode == "sdc"
+    assert optimizer.last_report["compression_mode"] == "sdc"
+
+
 def test_optimizer_stream_event_forms_and_common_aliases():
     plan = _path_plan((1, 3))
     state = TreePeps.from_plan(plan)

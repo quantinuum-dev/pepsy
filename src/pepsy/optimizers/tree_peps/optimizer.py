@@ -2097,6 +2097,10 @@ class TreePepsOptimizer:
         ``normalize_every`` may be ``True`` (after every event) or a positive
         integer interval. ``non_unitary`` disables norm-ledger collection;
         explicit ``normalize_final`` still normalizes the represented state.
+        ``mode`` and ``compression_mode`` overrides are normalized, stored on
+        the optimizer, and used consistently for every queued event;
+        ``dm``/``sdc``/``src``/``zipup`` are direct-routing compression
+        shorthands.
         ``progbar=True`` shows the active event count, latest local fidelity,
         cumulative retained fidelity, and live maximum bond. The progress bar
         intentionally does not display the live state norm.
@@ -2104,17 +2108,39 @@ class TreePepsOptimizer:
 
         if gates is not None:
             self.set_gates(gates)
+        raw_mode = self.mode if mode is None else str(mode)
+        raw_mode = raw_mode.strip().lower().replace("-", "_")
+        raw_mode = self._MODE_ALIASES.get(raw_mode, raw_mode)
+        # Bare compression names own their compression choice, just as they
+        # do at construction time. In particular, ``run(mode="sdc")`` must
+        # replace a previously selected ``src``/``dm`` mode unless the caller
+        # explicitly supplies a conflicting compression_mode (which is
+        # rejected by _resolve_modes).
+        if mode is not None and raw_mode in {"dm", "sdc", "src", "zipup"}:
+            mode_compression = (
+                "direct" if compression_mode is None else compression_mode
+            )
+        else:
+            mode_compression = (
+                self.compression_mode
+                if compression_mode is None else compression_mode
+            )
+        selected_mode, selected_compression = self._resolve_modes(
+            raw_mode,
+            mode_compression,
+        )
         if mode is not None:
-            raw_mode = str(mode).strip().lower().replace("-", "_")
-            if raw_mode == "fit":
-                self._dmrg_mode_alias = None
-                self.mode = "dmrg"
-            elif raw_mode in self._DMRG_MODE_ALIASES:
-                self._dmrg_mode_alias = raw_mode
-                self.mode = "dmrg"
-            elif raw_mode == "dmrg":
-                self._dmrg_mode_alias = None
-                self.mode = "dmrg"
+            self._dmrg_mode_alias = (
+                raw_mode if raw_mode in self._DMRG_MODE_ALIASES else None
+            )
+        self.mode = selected_mode
+        self.compression_mode = selected_compression
+        # Pass canonical, resolved values into each event below. This is
+        # important for explicit TreeSubPepo entries: passing the shorthand
+        # alone would normalize the route to ``direct`` and otherwise leave
+        # the old self.compression_mode in effect.
+        mode = selected_mode
+        compression_mode = selected_compression
         if compression_seed is not None:
             if isinstance(compression_seed, bool) or not isinstance(
                 compression_seed, Integral

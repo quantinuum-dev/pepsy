@@ -202,6 +202,36 @@ def test_tree_optimizer_generic_dmrg_warmup_then_refinement():
     assert diagnostics["one_site_refinement_sweeps"] == 2
 
 
+def test_tree_optimizer_explicit_dmrg_subtreempo_finishes_norm_event():
+    """Explicit TreeMPO DMRG updates close the optimizer norm transaction."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    gate = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0],
+         [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    operator = TreeMPO.from_gate(plan, gate, (0, 4), cutoff=0.0)
+    optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        track_infidelity=True,
+        run=False,
+    )
+
+    optimizer.apply_subtreempo(operator, (0, 4))
+
+    assert optimizer._active_update is None
+    assert len(optimizer.get_norm_events()) == 1
+    assert optimizer.get_norm_events()[0]["kind"] == "subtreempo"
+
+
 def test_tree_optimizer_guess_src_uses_fit_init_seed(monkeypatch):
     """TreeMPO disposable guesses use the FIT-specific randomized seed."""
 

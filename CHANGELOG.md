@@ -261,6 +261,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Fixed TreeMPO DMRG update finalization so explicit `apply_subtreempo` calls
+  close their active norm ledger and record diagnostics. Fixed
+  `TreePepsOptimizer.run(mode=...)` persistence for all route/compression
+  aliases and propagated shorthand compression modes to explicit `TreeSubPepo`
+  stream events.
+
 - Fixed backend preservation through higher-order sparse history materialization.
   Empty sparse virtual tensors now retain a backend reference, backend-native
   zero/equality operations no longer silently fall back to NumPy, and the
