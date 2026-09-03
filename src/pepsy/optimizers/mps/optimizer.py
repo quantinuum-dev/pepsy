@@ -6733,7 +6733,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if L <= 1:
             raise ValueError("cannot cap the only site of a length-1 MPS.")
 
-        vec_arr = np.asarray(vec, dtype=complex).ravel()
+        # Cap vectors are state contractions rather than operator payloads.
+        # The stream parser historically normalized them to complex dtype,
+        # which made a real Torch MPS fail at the contraction boundary even
+        # for the ordinary real vectors used to sum or project a binary leg.
+        # Preserve genuinely complex caps, but discard an exactly-zero
+        # imaginary part so the vector follows the live MPS backend/dtype.
+        vec_arr = np.asarray(vec).ravel()
+        if np.iscomplexobj(vec_arr) and np.all(np.imag(vec_arr) == 0):
+            vec_arr = np.asarray(np.real(vec_arr))
         phys_ind = p.site_ind(q)
         phys_dim = p.ind_size(phys_ind)
         if vec_arr.shape[0] != phys_dim:

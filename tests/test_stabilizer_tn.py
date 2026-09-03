@@ -514,6 +514,79 @@ def test_simulator_full_circuit_matches_dense():
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_trainable_one_qubit_dense_gate_keeps_torch_autodiff():
+    """A Torch ``D(p)`` survives frame mapping and MPS replay."""
+    torch = pytest.importorskip("torch")
+    from pepsy import backend_torch
+
+    p = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+    d_gate = torch.diag(
+        torch.stack((torch.tensor(1.0, dtype=torch.float64), 1.0 - 2.0 * p))
+    ).to(torch.complex128)
+    stream = [
+        ("cnot", 0, 1),
+        ("h", 0),
+        (d_gate, (0,)),
+        ("h", 0),
+        ("cnot", 0, 1),
+    ]
+
+    sim = MpsStabOptimizer(
+        2,
+        stream,
+        to_backend=backend_torch(dtype=torch.complex128),
+    ).run()
+    coefficients = sim.p.to_dense().reshape(-1)
+    torch.testing.assert_close(
+        coefficients,
+        torch.tensor([0.8, 0.0, 0.0, 0.2], dtype=torch.complex128),
+    )
+    assert coefficients.requires_grad
+
+    coefficients[3].real.backward()
+    assert p.grad is not None
+    assert p.grad.item() == pytest.approx(1.0, abs=1e-12)
+
+
+def test_identity_frame_cap_keeps_torch_autodiff():
+    """The native identity-frame cap contracts MPS tensors, not NumPy dense data."""
+    torch = pytest.importorskip("torch")
+    from pepsy import backend_torch
+
+    p = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+    d_gate = torch.diag(
+        torch.stack((torch.tensor(1.0, dtype=torch.float64), 1.0 - 2.0 * p))
+    ).to(torch.complex128)
+    sim = MpsStabOptimizer(
+        2,
+        [("h", 0), (d_gate, (0,)), ("h", 0)],
+        to_backend=backend_torch(dtype=torch.complex128),
+    ).run()
+
+    cap_vec = torch.tensor(
+        [1.0, 0.0], dtype=torch.float64, requires_grad=True
+    )
+    sim.cap(0, cap_vec)
+    coefficients = sim.p.to_dense().reshape(-1)
+    assert sim.n == 1
+    assert isinstance(coefficients, torch.Tensor)
+    assert coefficients.requires_grad
+    torch.testing.assert_close(
+        coefficients,
+        torch.tensor([0.8, 0.0], dtype=torch.complex128),
+    )
+
+    gate_grad, cap_grad = torch.autograd.grad(
+        coefficients[0].real,
+        (p, cap_vec),
+    )
+    assert gate_grad.item() == pytest.approx(-1.0, abs=1e-12)
+    torch.testing.assert_close(
+        cap_grad,
+        torch.tensor([0.8, 0.2], dtype=torch.float64),
+    )
+
+
 @pytest.mark.parametrize(
     ("pivot", "frame"),
     [

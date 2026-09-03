@@ -83,6 +83,23 @@ def test_torch_float_backend_drops_only_zero_imaginary_part_without_warning():
     assert not [warning for warning in caught if "discards the imaginary part" in str(warning.message)]
 
 
+def test_torch_backend_preserves_graph_when_dtype_casting_existing_tensor():
+    """The default converter mode keeps graph-bearing tensors connected."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(dtype=torch.complex128, device="cpu")
+    value = torch.tensor([2.0, 3.0], dtype=torch.float64, requires_grad=True)
+
+    converted = to_backend(value)
+    loss = converted.real.square().sum()
+    loss.backward()
+
+    assert converted.dtype is torch.complex128
+    torch.testing.assert_close(
+        value.grad,
+        torch.tensor([4.0, 6.0], dtype=torch.float64),
+    )
+
+
 def test_to_float_handles_backend_scalar_without_numpy_coercion():
     class BackendScalar:
         shape = ()

@@ -4533,6 +4533,100 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Backend helpers (place |nu> gates/MPOs on the configured backend)
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _as_native_gate_matrix(gate, n_qubits):
+        """Normalize dense-gate shape without converting backend arrays.
+
+        The dense validation/classification helpers intentionally operate on
+        NumPy arrays. This shape-only adapter is used at replay time so a
+        differentiable backend tensor can reach the native one-qubit path
+        unchanged. Non-array inputs fall back to the historical validator.
+        """
+        n_qubits = int(n_qubits)
+        shape = getattr(gate, "shape", None)
+        if shape is not None:
+            shape = tuple(int(size) for size in shape)
+            dimension = 2**n_qubits
+            if shape == (dimension, dimension):
+                return gate
+            expected_shape = (2,) * (2 * n_qubits)
+            if shape == expected_shape:
+                return gate.reshape(dimension, dimension)
+        return _as_gate_matrix(gate, n_qubits)
+
+    @staticmethod
+    def _gate_requires_grad(gate) -> bool:
+        """Return whether a backend gate advertises an autodiff history."""
+        return bool(getattr(gate, "requires_grad", False))
+
+    @staticmethod
+    def _backend_scalar_is_exact_zero(value) -> bool:
+        """Test a scalar value for an exact zero without touching its graph."""
+        detached = getattr(value, "detach", None)
+        if callable(detached):
+            value = detached()
+        try:
+            return bool(np.asarray(ar.to_numpy(value)).item() == 0)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _backend_scalar_has_nonzero_grad(value) -> bool:
+        """Return whether a Torch scalar has a locally nonzero derivative.
+
+        This is used only to distinguish structurally zero matrix entries from
+        trainable entries that happen to evaluate to zero at an endpoint. It
+        performs metadata inspection and ``autograd.grad`` queries, never a
+        backward mutation of the caller's leaf gradients.
+        """
+        if not bool(getattr(value, "requires_grad", False)):
+            return False
+        grad_fn = getattr(value, "grad_fn", None)
+        if grad_fn is None:
+            # A leaf scalar is itself a trainable coordinate.
+            return True
+        leaves = []
+        pending = [grad_fn]
+        visited = set()
+        while pending:
+            function = pending.pop()
+            if function in visited:
+                continue
+            visited.add(function)
+            variable = getattr(function, "variable", None)
+            if variable is not None:
+                leaves.append(variable)
+                continue
+            pending.extend(
+                parent
+                for parent, _multiplicity in getattr(function, "next_functions", ())
+                if parent is not None
+            )
+        if not leaves:
+            return True
+        try:
+            import torch
+
+            gradients = []
+            for component in (value.real, value.imag):
+                gradients.extend(
+                    torch.autograd.grad(
+                        component,
+                        leaves,
+                        allow_unused=True,
+                        retain_graph=True,
+                    )
+                )
+            return any(
+                gradient is not None
+                and bool(torch.any(gradient.detach() != 0).item())
+                for gradient in gradients
+            )
+        except (RuntimeError, TypeError):
+            # Be conservative if a backend does not expose a traversable
+            # scalar graph: retaining the term is safer than losing a VJP.
+            return True
+
     def _state_backend_like(self):
         """Return a representative live coefficient-MPS array."""
         for tensor in getattr(self.state.p, "tensors", ()):
@@ -5062,7 +5156,10 @@ class MpsStabOptimizer:
             # matrix form: (gate_tensor, where)
             gate, where = entry
             where = _normalize_sites(where)
-            self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
+            # Keep a trainable backend matrix native. ``_as_gate_matrix`` is
+            # deliberately a NumPy/classification helper and would detach a
+            # Torch gate before its Pauli coefficients reach ``|nu>``.
+            self._apply_matrix(self._as_native_gate_matrix(gate, len(where)), where)
             return
 
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
@@ -6322,18 +6419,17 @@ class MpsStabOptimizer:
     def cap(self, where, vec, *, absorb="left") -> "MpsStabOptimizer":
         """Contract one physical qubit with ``vec`` and shorten the simulator.
 
-        This is a correctness-first physical cap: it reconstructs the dense
-        statevector, contracts the selected physical leg, and rebuilds a valid
-        identity-tableau STN on ``n - 1`` qubits.  The operation is therefore
-        guarded by :attr:`max_dense_cap_qubits`; use structured weighted-XOR or
-        coin streams for scalable DEM-style capping.
+        With an identity basis frame, the physical leg is contracted directly
+        into neighboring MPS tensors, preserving backend/autodiff vectors. A
+        non-identity frame is lowered to an ordinary backend-native MPS first,
+        so the cap remains backend-native for both constant and trainable data.
         """
+        absorb = _normalize_absorb(absorb)
         if not self._layout_is_identity():
             raise ValueError(
                 "physical cap is not supported after installing an STN static "
                 "layout, because cap changes the logical qubit set and MPS length."
             )
-        _normalize_absorb(absorb)
         sites = _normalize_sites(where)
         if len(sites) != 1:
             raise ValueError("cap expects exactly one qubit site.")
@@ -6346,35 +6442,121 @@ class MpsStabOptimizer:
         limit = self.max_dense_cap_qubits
         if limit is not None and n > limit:
             raise ValueError(
-                f"physical cap would densely rebuild an {n}-qubit state, exceeding "
+                f"physical cap register has {n} qubits, exceeding "
                 f"max_dense_cap_qubits={limit}. Use a structured capped stream "
                 "or raise the limit explicitly."
             )
-        vec_arr = np.asarray(vec, dtype=self.dtype).ravel()
-        if vec_arr.shape != (2,):
+
+        shape = getattr(vec, "shape", None)
+        if shape is None:
+            vec_arr = np.asarray(vec, dtype=self.dtype).ravel()
+        else:
+            vec_arr = vec.reshape(-1)
+        if tuple(int(size) for size in getattr(vec_arr, "shape", ())) != (2,):
             raise ValueError(
-                f"cap vector must have length 2 for a qubit, got shape {vec_arr.shape}."
+                "cap vector must have length 2 for a qubit, got shape "
+                f"{getattr(vec_arr, 'shape', None)}."
             )
 
-        dense = self.to_statevector().reshape([2] * n)
-        capped = np.tensordot(dense, vec_arr, axes=([q], [0])).reshape(-1)
-        split_opts = {"cutoff": self.cutoff}
-        if self.chi is not None:
-            split_opts["max_bond"] = self.chi
-        p = qtn.MatrixProductState.from_dense(
-            capped,
-            dims=[2] * (n - 1),
-            **split_opts,
+        if self.state.is_identity_frame():
+            p = self.state.p
+            phys_ind = p.site_ind(q)
+            if p.ind_size(phys_ind) != 2:
+                raise ValueError(f"cap site {q} does not have physical dimension 2.")
+            if absorb == "left":
+                neighbour = q - 1 if q > 0 else q + 1
+            else:
+                neighbour = q + 1 if q < n - 1 else q - 1
+
+            self._canonize_p(neighbour)
+            new_center = neighbour if neighbour < q else neighbour - 1
+            cap_tensor = qtn.Tensor(
+                self._to_state_backend(vec_arr),
+                inds=(phys_ind,),
+            )
+            site_tensor = p[p.site_tag(q)]
+            neighbour_tensor = p[p.site_tag(neighbour)]
+            merged = qtn.tensor_contract(site_tensor, cap_tensor, neighbour_tensor)
+
+            site_ind_id = p.site_ind_id
+            site_tag_id = p.site_tag_id
+            p.delete(p.site_tag(q))
+            p.delete(p.site_tag(neighbour))
+            merged.modify(tags=(p.site_tag(neighbour),))
+            p |= merged
+
+            temp_reindex = {
+                site_ind_id.format(old): f"__pepsy_cap_k{old - 1}"
+                for old in range(q + 1, n)
+            }
+            temp_retag = {
+                site_tag_id.format(old): f"__pepsy_cap_I{old - 1}"
+                for old in range(q + 1, n)
+            }
+            if temp_reindex:
+                p.reindex_(temp_reindex)
+                p.retag_(temp_retag)
+            final_reindex = {
+                f"__pepsy_cap_k{i}": site_ind_id.format(i)
+                for i in range(q, n - 1)
+            }
+            final_retag = {
+                f"__pepsy_cap_I{i}": site_tag_id.format(i)
+                for i in range(q, n - 1)
+            }
+            if final_reindex:
+                p.reindex_(final_reindex)
+                p.retag_(final_retag)
+
+            p = p.view_as_(
+                qtn.MatrixProductState,
+                L=n - 1,
+                cyclic=False,
+                site_ind_id=site_ind_id,
+                site_tag_id=site_tag_id,
+            )
+            import stim
+
+            tableau = stim.TableauSimulator()
+            tableau.set_num_qubits(n - 1)
+            self.state = STNState.from_tableau_and_state(
+                tableau,
+                p,
+                dtype=self.dtype,
+            )
+            self.logical_order = list(range(n - 1))
+            self._logical_to_mps = {q: q for q in self.logical_order}
+            self.state.info["cur_orthog"] = (new_center, new_center)
+            self.backend_info()
+            self._localizer_cache.clear()
+            self._invalidate_infidelity()
+            self._record()
+            return self
+
+        # Lower a nontrivial physical frame to an ordinary backend-native MPS
+        # before capping. This avoids any dense statevector reconstruction and
+        # retains the exact physical semantics of the cap.
+        if (
+            self.to_backend is None
+            and self._gate_requires_grad(vec_arr)
+            and self.backend == "numpy"
+        ):
+            raise ValueError(
+                "A trainable physical cap requires a configured native backend "
+                "converter (for example to_backend=backend_torch(...))."
+            )
+        physical = self.to_mps(mode="exact", logical_order=True)
+        lowered = MpsStabOptimizer.from_mps(
+            physical,
+            chi=self.chi,
+            cutoff=self.cutoff,
+            max_dense_cap_qubits=self.max_dense_cap_qubits,
+            to_backend=self.to_backend,
         )
-        converter = self.to_backend or self._backend_converter
-        if converter is not None:
-            p.apply_to_arrays(converter)
-
-        import stim
-
-        tableau = stim.TableauSimulator()
-        tableau.set_num_qubits(n - 1)
-        self.state = STNState.from_tableau_and_state(tableau, p, dtype=self.dtype)
+        lowered.cap(q, vec_arr, absorb=absorb)
+        self.state = lowered.state
+        self.logical_order = list(range(self.state.n))
+        self._logical_to_mps = {q: q for q in self.logical_order}
         self.backend_info()
         self._localizer_cache.clear()
         self._invalidate_infidelity()
@@ -7372,6 +7554,17 @@ class MpsStabOptimizer:
 
     def _apply_matrix(self, gate: np.ndarray, where) -> None:
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
+        gate = self._as_native_gate_matrix(gate, len(where))
+        if self._gate_requires_grad(gate):
+            if len(where) != 1:
+                raise ValueError(
+                    "Autodiff dense gate matrices currently support one qubit; "
+                    "decompose a trainable multi-qubit gate into native stream "
+                    "events or provide a coefficient-frame sub-MPO."
+                )
+            self._apply_trainable_one_qubit_gate(gate, where[0])
+            return
+
         gate = _as_gate_matrix(gate, len(where))
         dim = gate.shape[0]
         nq = int(round(math.log2(dim)))
@@ -7404,6 +7597,112 @@ class MpsStabOptimizer:
         # General k-qubit gate (any k, unitary or non-unitary): decompose into
         # Paulis and act on the coefficient MPS via the frame map.
         self._apply_dense_gate(gate, where, unitary=gate_is_unitary)
+
+    def _apply_trainable_one_qubit_gate(self, gate, where) -> None:
+        """Apply a trainable one-qubit matrix without leaving the backend.
+
+        For ``G = c_I I + c_X X + c_Y Y + c_Z Z``, the tableau frame maps each
+        Pauli to a signed Pauli string on ``|nu>``. The frame/sign metadata is
+        discrete and remains host-side; the four coefficients stay as backend
+        scalars, so the MPS update retains the caller's autodiff graph.
+        """
+        shape = tuple(int(size) for size in getattr(gate, "shape", ()))
+        if shape != (2, 2):
+            raise ValueError(
+                "A trainable one-qubit dense gate must have shape (2, 2), "
+                f"got {shape}."
+            )
+
+        g00, g01 = gate[0, 0], gate[0, 1]
+        g10, g11 = gate[1, 0], gate[1, 1]
+        coefficients = (
+            (g00 + g11) / 2,
+            (g01 + g10) / 2,
+            (g10 - g01) / (2j),
+            (g00 - g11) / 2,
+        )
+        if (
+            self._backend_scalar_is_exact_zero(g01)
+            and self._backend_scalar_is_exact_zero(g10)
+            and not self._backend_scalar_has_nonzero_grad(g01)
+            and not self._backend_scalar_has_nonzero_grad(g10)
+        ):
+            # Preserve the diagonal I/Z coefficients even when one is zero at
+            # the current parameter value: its derivative may be nonzero.
+            selected = (("I", coefficients[0]), ("Z", coefficients[3]))
+        else:
+            selected = tuple(zip("IXYZ", coefficients))
+        preserve_zero_gradient = any(
+            self._backend_scalar_has_nonzero_grad(coefficient)
+            and self._backend_scalar_is_exact_zero(coefficient)
+            for _axis, coefficient in selected
+        )
+        mapped = []
+        local_site = None
+        local_matrix = None
+        local_candidate = True
+        for axis, coefficient in selected:
+            physical = pauli_string((axis,), (int(where),), self.n)
+            frame_terms, sign = hermitian_pauli_terms(
+                self.state.frame_pauli(physical)
+            )
+            weight = coefficient * sign
+            mapped.append((weight, frame_terms))
+            if not local_candidate:
+                continue
+            if not frame_terms:
+                term_site = local_site
+                term_matrix = self._bk_const("I2", _I2)
+            elif len(frame_terms) == 1:
+                term_site, term_axis = next(iter(frame_terms.items()))
+                term_site = int(term_site)
+                term_matrix = self._bk_const(
+                    "P" + str(term_axis).upper(),
+                    pauli_matrix(term_axis),
+                )
+            else:
+                local_candidate = False
+                continue
+            if local_site is None:
+                local_site = term_site
+            elif term_site != local_site:
+                local_candidate = False
+                continue
+            contribution = weight * term_matrix
+            local_matrix = (
+                contribution
+                if local_matrix is None
+                else local_matrix + contribution
+            )
+
+        if local_candidate:
+            if local_matrix is None:
+                # This is possible only for an exactly-zero matrix. Preserve
+                # the backend state structure while retaining the operation's
+                # scalar graph if one exists.
+                self.state.p = 0.0 * self.state.p
+            elif local_site is None:
+                self.state.p = local_matrix[0, 0] * self.state.p
+            else:
+                self.state.p.gate_(
+                    local_matrix,
+                    self._mps_site(local_site),
+                    contract=True,
+                )
+            self._record()
+            return
+
+        # Do not coalesce here: ``_coalesce_operator_sum`` intentionally casts
+        # weights to Python complex for its constant-gate path. The branch
+        # reducer below accepts backend scalar weights and therefore preserves
+        # Torch/JAX autodiff.
+        self._record(
+            self._apply_operator_sum(
+                mapped,
+                unitary=False,
+                preserve_autodiff_zero=preserve_zero_gradient,
+            )
+        )
 
     def _apply_dense_gate(
         self, gate: np.ndarray, where, *, unitary: bool = False
@@ -7514,7 +7813,12 @@ class MpsStabOptimizer:
         return self._nonunitary_compression_infidelity(target_norm)
 
     def _apply_operator_sum(
-        self, branches, *, unitary: bool, target_norm: Optional[float] = None
+        self,
+        branches,
+        *,
+        unitary: bool,
+        target_norm: Optional[float] = None,
+        preserve_autodiff_zero: bool = False,
     ) -> Optional[float]:
         """Apply ``M = sum_j w_j (prod_i P_i)`` to the coefficient MPS ``p``.
 
@@ -7549,10 +7853,19 @@ class MpsStabOptimizer:
 
         def combine(left, right, max_bond):
             result = left + right
-            result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            preserve_zero = (
+                preserve_autodiff_zero
+                and (max_bond is None or max_bond >= len(branches))
+            )
+            if not preserve_zero:
+                result.compress(max_bond=max_bond, cutoff=self.cutoff)
             return result
 
         def build(max_bond):
+            preserve_zero = (
+                preserve_autodiff_zero
+                and (max_bond is None or max_bond >= len(branches))
+            )
             # Binary-carry accumulation produces a balanced addition tree while
             # retaining only one partial sum per level (O(log(branches)) live
             # partials instead of materializing every branch MPS at once).
@@ -7561,11 +7874,19 @@ class MpsStabOptimizer:
                 branch = p.copy()
                 for site, axis in self._mps_terms(sites).items():
                     branch.gate_(self._bk_const("P" + axis, pauli_matrix(axis)), site, contract=True)
-                branch = w * branch
+                # Scale one tensor instead of using MPS scalar multiplication.
+                # The latter routes through Quimb's exponent normalization and
+                # can produce NaNs for an exact zero backend coefficient,
+                # especially at a trainable probability endpoint.
+                first = branch[branch.site_tag(0)]
+                first.modify(data=first.data * w)
 
                 level = 0
                 while level < len(partials) and partials[level] is not None:
-                    branch = combine(partials[level], branch, max_bond)
+                    if preserve_zero:
+                        branch = partials[level] + branch
+                    else:
+                        branch = combine(partials[level], branch, max_bond)
                     partials[level] = None
                     level += 1
                 if level == len(partials):
@@ -7582,7 +7903,8 @@ class MpsStabOptimizer:
                     if result is None
                     else combine(result, partial, max_bond)
                 )
-            result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            if not preserve_zero:
+                result.compress(max_bond=max_bond, cutoff=self.cutoff)
             return result
 
         if self.mode in self._DMRG_MODES:
@@ -7592,9 +7914,19 @@ class MpsStabOptimizer:
                 self._mps_sites(sorted(logical_support)),
             )
         else:
-            self.state.p = build(None if self.mode == "exact" else self.chi)
-            # compress() leaves the rebuilt MPS canonical with the centre at site 0.
-            self.state.info["cur_orthog"] = (0, 0)
+            max_bond = None if self.mode == "exact" else self.chi
+            preserve_zero = (
+                preserve_autodiff_zero
+                and (max_bond is None or max_bond >= len(branches))
+            )
+            self.state.p = build(max_bond)
+            # A padded direct sum has no canonical centre until a later
+            # operation requests one. The regular compressed path is already
+            # canonical with the centre at site 0.
+            self.state.info["cur_orthog"] = (
+                None if preserve_zero
+                else (0, 0)
+            )
         if unitary:
             observed_infidelity = self._unitary_infidelity()
             self._record_compression_norm_event(

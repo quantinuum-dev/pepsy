@@ -324,7 +324,13 @@ def reset_default_backends():
 
 
 def backend_torch(device="cpu", dtype=None, requires_grad=False):
-    """Return a converter that materializes arrays as torch tensors."""
+    """Return a converter that materializes arrays as torch tensors.
+
+    Existing Torch tensors keep their autograd history when
+    ``requires_grad=False`` (the default); NumPy and other inputs remain
+    ordinary non-trainable tensors. Set ``requires_grad=True`` to create or
+    re-leaf converted inputs explicitly.
+    """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "backend_torch requires optional dependency 'torch'. "
@@ -372,8 +378,11 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
 
         if requires_grad:
             out.requires_grad_(True)
-        else:
-            out.requires_grad_(False)
+        # With ``requires_grad=False``, preserve an existing Torch tensor's
+        # autograd history. This is the normal backend-conversion mode for
+        # user-supplied trainable gates/vectors. Calling ``requires_grad_(False)``
+        # after a dtype/device cast is illegal for a non-leaf tensor and would
+        # contradict the graph-preserving contract.
 
         return out
 
