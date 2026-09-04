@@ -82,7 +82,7 @@ def _normalize_build_mode(mode, *, tree=False):
             "analytic": "analytic",
             "automaton": "analytic",
             "automata": "analytic",
-            "auto": "analytic",
+            "auto": "auto",
             "direct": "analytic",
             "direct_sum": "analytic",
         }
@@ -105,12 +105,14 @@ def _normalize_build_mode(mode, *, tree=False):
     return aliases.get(mode, mode)
 
 
-def _resolve_compression_request(compress, mode, *, tree=False):
-    """Resolve the shared ``compress=`` and ``mode=`` conversion API.
+def _resolve_compression_request(compress, mode=None, *, tree=False):
+    """Resolve the canonical ``compress=`` conversion API.
 
     ``compress`` is normally a boolean.  The string forms are a compact
     strategy spelling: ``compress="term"`` selects sequential terms and
     ``compress="automaton"`` selects the finite-state/analytic route.
+    ``mode=`` remains a compatibility alias for callers using the older
+    separate strategy keyword.
     """
     if isinstance(compress, str):
         mode = compress
@@ -120,8 +122,14 @@ def _resolve_compression_request(compress, mode, *, tree=False):
     elif not isinstance(compress, (bool, np.bool_)):
         raise TypeError(
             "compress must be a bool, None, or the strategy string "
-            "'term'/'automaton'."
+            "'term'/'automaton'/'auto'."
         )
+    if mode is None:
+        # A boolean is deliberately only the compression switch.  The
+        # default construction is workload-aware and performs one final
+        # compression after the complete sum.  ``compress='term'`` is the
+        # explicit opt-in for incremental compression.
+        mode = "auto"
     return _normalize_build_mode(mode, tree=tree), bool(compress)
 
 
@@ -939,7 +947,7 @@ class ham_tn:
         form=None,
         create_bond=False,
         compress_opts=None,
-        mode="term",
+        mode=None,
         to_backend=_DEFAULT_BACKEND,
         mapper=None,
         map_mode=None,
@@ -979,15 +987,17 @@ class ham_tn:
             ``1e-6`` for 32-bit/complex64 data, and ``1e-12`` otherwise.
         data_type : str | numpy.dtype | None, default=None
             Operator/MPO dtype. Uses instance default when None.
-        compress : bool | {"term", "automaton"}, default=True
-            Whether to compress the result. The string forms select the
-            corresponding build strategy and enable compression. Use
-            ``mode=`` when selecting a strategy independently from whether
-            compression is enabled.
+        compress : bool | {"term", "automaton", "auto"}, default=True
+            Whether to compress the result. ``True`` selects the workload-
+            aware automatic route and performs one final compression after
+            the complete sum. ``"automaton"`` forces the shared finite-state
+            route, while ``"term"`` explicitly compresses after each added
+            term. ``"auto"`` is the explicit spelling of the default route.
         compress_each : bool | None, default=None
             Deprecated compatibility spelling for the old API. ``True``
             compresses after each sequential term; ``False`` compresses once
-            after the complete sum. Prefer ``compress=`` and ``mode=``.
+            after the complete sum. Prefer the strategy-bearing
+            ``compress=`` spelling.
         cutoff_mode : str | {"auto"} | None, default=None
             Cutoff mode forwarded to Quimb. ``"auto"`` resolves to ``"rsum2"``;
             None preserves Quimb's default.
@@ -1001,13 +1011,10 @@ class ham_tn:
             ``method``, ``absorb``, ``renorm``, or ``info``. The explicit
             ``chi``, ``max_bond``, ``cutoff``, ``cutoff_mode``, ``form``, and
             ``create_bond`` arguments take precedence.
-        mode : {"term", "automaton", "analytic", "auto"}, default="term"
-            ``"term"`` adds and compresses each term sequentially. The
-            ``"automaton"`` mode first compiles all terms through Pepsy's
-            finite-state MPO automaton and then compresses the resulting MPO.
-            ``"analytic"`` is an alias for ``"automaton"``.
-            ``"auto"`` selects the automaton when its estimated structural
-            width is reasonable, otherwise it falls back to sequential terms.
+        mode : str | None, default=None
+            Deprecated compatibility alias for selecting the build strategy.
+            Prefer ``compress="term"``, ``compress="automaton"``, or
+            ``compress="auto"``.
         to_backend : callable | None, default=None
             Optional per-build array converter. When omitted, the converter
             configured on the builder is used; passing ``None`` explicitly
@@ -1120,13 +1127,15 @@ class ham_tn:
         if legacy_compress_each:
             compress_each = bool(compress_each)
             compression_enabled = True
-            mode = _normalize_build_mode(mode)
+            mode = _normalize_build_mode("term" if mode is None else mode)
         else:
             mode, compression_enabled = _resolve_compression_request(
                 compress,
                 mode,
             )
-            compress_each = compression_enabled
+            # Automatic and automaton assembly are compressed once, after the
+            # complete sum. Only the explicit term strategy is incremental.
+            compress_each = compression_enabled and mode == "term"
         if mode not in {"term", "automaton", "auto"}:
             raise ValueError(
                 "mode must be 'term', 'automaton', 'analytic', or 'auto'."
@@ -1171,7 +1180,11 @@ class ham_tn:
                 mapper=mapper_use,
                 max_bond=max_bond_use,
                 cutoff=cutoff_use,
-                compress=compression_enabled and compress_each,
+                compress=(
+                    compression_enabled
+                    if not legacy_compress_each
+                    else compression_enabled and compress_each
+                ),
                 dtype=dtype,
                 fermionic=fermionic_use,
                 charge_sectors=charge_sectors,
@@ -1262,13 +1275,10 @@ class ham_tn:
                     automaton_records,
                     phys_dim=phys_dim,
                 )
-                if mode_auto and max(automaton.bond_dimensions, default=1) > auto_bond_limit:
-                    mode = "term"
-                else:
-                    if to_backend is not None:
-                        builder._apply_to_backend(mpo_total, to_backend)
-                    if compression_enabled:
-                        mpo_total.compress(**compress_options)
+                if to_backend is not None:
+                    builder._apply_to_backend(mpo_total, to_backend)
+                if compression_enabled:
+                    mpo_total.compress(**compress_options)
 
         if mode == "term":
             term_iter = (
@@ -1433,7 +1443,7 @@ class ham_tn:
         data_type=None,
         compress=True,
         compress_each=None,
-        mode="term",
+        mode=None,
         cycle_peps=False,
         cycle_bond_dim=1,
         mapper=None,
@@ -1666,6 +1676,66 @@ class ham_tn:
         tree_map_mode = mode_name if mode_name.startswith("coarse-") else None
         return TreePlan.from_order(order, map_mode=tree_map_mode), mapper
 
+    def _raw_tree_term_supports(self, ints):
+        """Return public term supports without touching their operator data."""
+        if isinstance(ints, Mapping):
+            entries = ints.keys()
+            supports = []
+            for support in entries:
+                support = (support,) if isinstance(support, Integral) else tuple(support)
+                if not support:
+                    raise ValueError("tree term supports must not be empty.")
+                supports.append(support)
+            return tuple(supports)
+        try:
+            return tuple(
+                tuple(sites)
+                for sites, _ops, _coeff in (
+                    self._parse_term(term) for term in tuple(ints)
+                )
+            )
+        except TypeError as exc:
+            raise TypeError("tree terms must be a sequence or mapping.") from exc
+
+    def _auto_tree_mpo_plan(self, ints, *, max_bond):
+        """Choose a TreePlan from the operator support hypergraph.
+
+        This is a bounded workload-aware search, not a claim of global
+        optimality.  The selected finder is retained by ``TreeMPO`` so the
+        layout can be inspected and reused by later tree algorithms.
+        """
+        from ..optimizers.tree.layout import TreeLayoutFinder
+
+        base_plan, mapper = self._tree_plan_from_map_mode(None)
+        supports = tuple(
+            tuple(self._tree_site(base_plan, site, mapper=mapper) for site in support)
+            for support in self._raw_tree_term_supports(ints)
+        )
+        shape = (self.Lx, self.Ly) if self.Lz is None else (
+            self.Lx, self.Ly, self.Lz
+        )
+        map_inv = mapper.build()[1]
+
+        def lattice_site(*coordinate):
+            return map_inv[tuple(coordinate)]
+
+        finder = TreeLayoutFinder(
+            supports=supports,
+            n=self.L,
+            objective="hypergraph",
+            max_arity=(2, 3, 4),
+            chi=max_bond,
+            lattice_shape=shape,
+            lattice_site=lattice_site,
+        )
+        plan = finder.run(
+            chi=max_bond,
+            refine=None,
+            topology_refine=None,
+            search=None,
+        )
+        return plan, mapper, finder
+
     def _tree_layout_finder_for_operator(self, plan, supports, *, mapper):
         """Build display/search metadata matching a TreeMPO's lattice labels."""
         from ..optimizers.tree.layout import TreeLayoutFinder
@@ -1699,6 +1769,34 @@ class ham_tn:
             tree_order=plan.tree_order,
         )
 
+    def _auto_tree_pepo_plan(self, ints, *, max_bond):
+        """Choose a TreePepsPlan from the term-support workload."""
+        from ..optimizers.tree_peps.layout import TreePepsLayoutFinder
+        from ..optimizers.tree_peps.plan import TreePepsPlan
+
+        shape = (self.Lx, self.Ly) if self.Lz is None else (
+            self.Lx, self.Ly, self.Lz
+        )
+        # The builder's map remains the logical coordinate convention.  The
+        # finder is then free to change only the retained physical tree.
+        source_plan = TreePepsPlan.from_shape(shape, order=self.map_mode)
+        supports = tuple(
+            tuple(source_plan.resolve_site(site) for site in support)
+            for support in self._raw_tree_term_supports(ints)
+        )
+        finder = TreePepsLayoutFinder(
+            source_plan,
+            supports=supports,
+            objective="hybrid",
+            max_virtual_degree=None,
+            # Keep the implicit conversion responsive.  The public finder
+            # still exposes larger ``max_iter``/refinement budgets when a
+            # deeper layout search is wanted.
+            max_iter=min(16, max(8, (self.L - 1) // 2)),
+        )
+        plan = finder.run(refine=True)
+        return plan, finder
+
     def to_tree_mpo(
         self,
         plan=None,
@@ -1710,7 +1808,7 @@ class ham_tn:
         chi=None,
         cutoff=None,
         data_type=None,
-        mode="analytic",
+        mode=None,
         compress=True,
         compress_opts=None,
         compress_order="rank",
@@ -1725,22 +1823,26 @@ class ham_tn:
 
         ``plan`` owns the tree geometry when supplied. Otherwise ``plan`` may
         be omitted and the first positional argument is interpreted as the
-        terms; ``map_mode`` then builds a default binary ``TreePlan`` from a
-        geometric traversal. Ordinary dense terms are factorized directly
+        terms; the automatic route chooses a workload-aware ``TreePlan`` from
+        their support graph, while explicit ``map_mode`` builds a default
+        binary plan from a geometric traversal. Ordinary dense terms are
+        factorized directly
         over their TreePlan Steiner subtrees; no chain MPO is built or
         attached. When ``fermion`` is supplied, its native
         ``build_tree_operator`` route is used instead.
 
-        ``mode="analytic"`` factorizes the complete term collection and
-        compresses once at the end. ``mode="term"`` builds one native
-        operator per term and compresses after every addition. ``"auto"`` and
-        ``"automaton"`` are aliases for ``"analytic"`` here: native tree
-        operators do not need a chain automaton.
+        ``compress=True`` (the default) selects the workload-aware native
+        state-diagram route and compresses once after the complete term
+        collection. When no explicit ``plan`` or ``map_mode`` is supplied,
+        its layout finder also adapts the TreePlan to the term supports.
+        ``compress="automaton"`` forces that full native assembly, while
+        ``compress="term"`` builds one native operator per term and compresses
+        after every addition. ``compress=False`` disables numerical
+        compression. ``compress="auto"`` is the explicit spelling of the
+        default automatic route.
 
-        ``compress`` is a boolean compression switch shared by all ``to_*``
-        methods. As a shorthand, ``compress="term"`` or
-        ``compress="automaton"`` selects the corresponding mode and enables
-        compression.
+        ``mode=`` remains a compatibility alias for the older separate
+        strategy keyword; new code should put the strategy in ``compress=``.
 
         ``compress_opts`` currently accepts the native TreeMPO compression
         option ``order`` (``"rank"`` or ``"depth"``). The common
@@ -1756,11 +1858,6 @@ class ham_tn:
                 raise TypeError("Pass either a TreePlan or terms, not both as positional arguments.")
             ints = plan
             plan = None
-        if plan is None:
-            plan, mapper_use = self._tree_plan_from_map_mode(map_mode)
-        else:
-            mapper_use = self._tree_mapper_for_mode(map_mode) if map_mode is not None else self.mapper
-        self._validate_tree_plan(plan)
         build_mode, compress = _resolve_compression_request(
             compress,
             mode,
@@ -1783,6 +1880,30 @@ class ham_tn:
         )
         if max_bond < 1:
             raise ValueError("max_bond must be >= 1.")
+
+        layout_finder = None
+        if plan is None:
+            if (
+                build_mode in {"analytic", "auto"}
+                and map_mode is None
+                and ints is not None
+                and fermion is None
+                and not isinstance(ints, SymHamiltonian)
+            ):
+                if not isinstance(ints, Mapping):
+                    ints = tuple(ints)
+                plan, mapper_use, layout_finder = self._auto_tree_mpo_plan(
+                    ints,
+                    max_bond=max_bond,
+                )
+            else:
+                plan, mapper_use = self._tree_plan_from_map_mode(map_mode)
+        else:
+            mapper_use = (
+                self._tree_mapper_for_mode(map_mode)
+                if map_mode is not None else self.mapper
+            )
+        self._validate_tree_plan(plan)
 
         if compress_opts is None:
             compress_extra = {}
@@ -1885,17 +2006,18 @@ class ham_tn:
             dtype=dtype,
             mapper=mapper_use,
         )
-        layout_finder = self._tree_layout_finder_for_operator(
-            plan,
-            terms,
-            mapper=mapper_use,
-        )
+        if layout_finder is None:
+            layout_finder = self._tree_layout_finder_for_operator(
+                plan,
+                terms,
+                mapper=mapper_use,
+            )
         compress_options = {
             "max_bond": max_bond,
             "cutoff": cutoff,
             "order": compress_order,
         }
-        if build_mode == "analytic":
+        if build_mode in {"analytic", "auto"}:
             operator = TreeMPO.from_terms(
                 plan,
                 terms,
@@ -1949,7 +2071,7 @@ class ham_tn:
         cutoff=None,
         cutoff_mode=None,
         data_type=None,
-        mode="analytic",
+        mode=None,
         compress=True,
         form=None,
         center=None,
@@ -1970,16 +2092,19 @@ class ham_tn:
         are factorized over their minimal tree spans and never pass through a
         chain MPO or a full dense lattice operator.
 
-        ``mode="analytic"`` factorizes all terms and compresses once at the
-        end. ``mode="term"`` adds one factorized term at a time and compresses
-        after every addition. ``"auto"`` and ``"automaton"`` are aliases for
-        ``"analytic"`` because the native tree route does not build a chain
-        automaton.
+        ``compress=True`` (the default) selects the workload-aware native
+        state-diagram route and compresses once after all terms are assembled.
+        When no explicit ``plan``, retained-tree ``map_mode``, or
+        ``tree_order`` is supplied, its layout finder adapts the spanning tree
+        to the term supports.
+        ``compress="automaton"`` forces the same full native assembly, while
+        ``compress="term"`` adds one factorized term at a time and compresses
+        after every addition. ``compress=False`` disables numerical
+        compression. ``compress="auto"`` is the explicit spelling of the
+        default automatic route.
 
-        ``compress`` is a boolean compression switch shared by all ``to_*``
-        methods. As a shorthand, ``compress="term"`` or
-        ``compress="automaton"`` selects the corresponding mode and enables
-        compression.
+        ``mode=`` remains a compatibility alias for the older separate
+        strategy keyword; new code should put the strategy in ``compress=``.
 
         ``compress_opts`` accepts the native PEPO options ``form``, ``center``,
         and ``reduced``. The common ``max_bond``, ``cutoff``, and
@@ -1994,38 +2119,6 @@ class ham_tn:
                 raise TypeError("Pass either a TreePepsPlan or terms, not both as positional arguments.")
             ints = plan
             plan = None
-        if plan is None:
-            from ..optimizers.tree_peps.plan import _normalize_span_mode
-
-            shape = (self.Lx, self.Ly) if self.Lz is None else (
-                self.Lx, self.Ly, self.Lz
-            )
-            requested_mode = self.map_mode if map_mode is None else map_mode
-            span_mode = _normalize_span_mode(requested_mode)
-            if span_mode is not None:
-                if tree_order is not None:
-                    raise TypeError(
-                        "map_mode='span-*' and tree_order cannot both be "
-                        "supplied; use one retained-tree mode"
-                    )
-                # A PEPO's logical ids retain the builder's chain map, while
-                # its virtual geometry is selected independently by span-*.
-                plan = TreePepsPlan.from_shape(
-                    shape,
-                    order=self.map_mode,
-                    map_mode=span_mode,
-                )
-            else:
-                # Compatibility route for the pre-span API: one generic
-                # map_mode still controls both logical and retained orders.
-                order = requested_mode
-                tree_order_use = order if tree_order is None else tree_order
-                plan = TreePepsPlan.from_shape(
-                    shape,
-                    order=order,
-                    tree_order=tree_order_use,
-                )
-        self._validate_tree_plan(plan, tree_peps=True)
         build_mode, compress = _resolve_compression_request(
             compress,
             mode,
@@ -2048,6 +2141,53 @@ class ham_tn:
         )
         if max_bond < 1:
             raise ValueError("max_bond must be >= 1.")
+        if ints is None:
+            raise ValueError("ints must be provided.")
+
+        if plan is None:
+            from ..optimizers.tree_peps.plan import _normalize_span_mode
+
+            shape = (self.Lx, self.Ly) if self.Lz is None else (
+                self.Lx, self.Ly, self.Lz
+            )
+            if (
+                build_mode in {"analytic", "auto"}
+                and map_mode is None
+                and tree_order is None
+            ):
+                if not isinstance(ints, Mapping):
+                    ints = tuple(ints)
+                plan, _planning_finder = self._auto_tree_pepo_plan(
+                    ints,
+                    max_bond=max_bond,
+                )
+            else:
+                requested_mode = self.map_mode if map_mode is None else map_mode
+                span_mode = _normalize_span_mode(requested_mode)
+                if span_mode is not None:
+                    if tree_order is not None:
+                        raise TypeError(
+                            "map_mode='span-*' and tree_order cannot both be "
+                            "supplied; use one retained-tree mode"
+                        )
+                    # A PEPO's logical ids retain the builder's chain map, while
+                    # its virtual geometry is selected independently by span-*.
+                    plan = TreePepsPlan.from_shape(
+                        shape,
+                        order=self.map_mode,
+                        map_mode=span_mode,
+                    )
+                else:
+                    # Compatibility route for the pre-span API: one generic
+                    # map_mode still controls both logical and retained orders.
+                    order = requested_mode
+                    tree_order_use = order if tree_order is None else tree_order
+                    plan = TreePepsPlan.from_shape(
+                        shape,
+                        order=order,
+                        tree_order=tree_order_use,
+                    )
+        self._validate_tree_plan(plan, tree_peps=True)
         if compress_opts is None:
             compress_extra = {}
         elif not isinstance(compress_opts, Mapping):
@@ -2078,8 +2218,6 @@ class ham_tn:
         )
         if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
             raise ValueError("phys_dim must be an integer >= 1.")
-        if ints is None:
-            raise ValueError("ints must be provided.")
         terms = self._normalize_tree_terms(
             plan,
             ints,
@@ -2100,7 +2238,7 @@ class ham_tn:
             compress_options["form"] = form
         if center is not None:
             compress_options["center"] = center
-        if build_mode == "analytic":
+        if build_mode in {"analytic", "auto"}:
             operator = TreePepo.from_terms(
                 plan,
                 terms,

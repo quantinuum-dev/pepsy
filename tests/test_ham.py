@@ -1,6 +1,7 @@
 """Regression tests for :mod:`pepsy.operators.hamiltonians` builders."""
 
 import builtins
+import inspect
 
 import numpy as np
 import pytest
@@ -244,6 +245,50 @@ def test_ham_tn_conversion_modes_select_sequential_or_analytic_builds():
     assert np.allclose(tree_pepo_term.to_dense(), tree_pepo_analytic.to_dense())
     assert isinstance(tree_mpo_term, TreeMPO)
     assert isinstance(tree_pepo_term, TreePEPO)
+
+
+def test_ham_tn_compress_is_canonical_strategy_control():
+    """The old separate mode selector is compatibility-only by default."""
+    for name in ("to_mpo", "to_pepo", "to_tree_mpo", "to_tree_pepo"):
+        parameter = inspect.signature(getattr(py.ham_tn, name)).parameters["mode"]
+        assert parameter.default is None
+
+
+def test_ham_tn_default_compress_assembles_then_compresses_once(monkeypatch):
+    """The boolean default is a final-compression automatic policy."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+    builder = py.ham_tn(shape=4, data_type="complex128")
+    mpo = builder.to_mpo(
+        [((quimb.pauli("X", dtype="complex128"),), (0,), 0.5),
+         ((quimb.pauli("Z", dtype="complex128"),), (3,), 0.25)],
+        cutoff=0.0,
+    )
+
+    assert len(calls) == 1
+    assert hasattr(mpo, "pepsy_automaton")
+
+
+def test_ham_tn_tree_automatic_layout_uses_term_supports():
+    """Automatic native tree conversion retains its workload-aware finder."""
+    builder = py.ham_tn(shape=(3, 3), data_type="complex128")
+    z_op = quimb.pauli("Z", dtype="complex128")
+    terms = [((z_op, z_op), ((0, 0), (2, 2)), 1.0)]
+
+    tree_mpo = builder.to_tree_mpo(terms, compress="automaton", cutoff=0.0)
+    tree_pepo = builder.to_tree_pepo(terms, compress="automaton", cutoff=0.0)
+
+    assert tree_mpo.layout_finder is not None
+    assert tree_mpo.validate()
+    assert tree_pepo.layout_finder is not None
+    assert tree_pepo.validate()
+    assert tree_pepo.plan.tree_edges
 
 
 def test_ham_tn_map_mode_and_backend_overrides_are_per_conversion():

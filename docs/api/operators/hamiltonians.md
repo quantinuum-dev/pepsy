@@ -1,8 +1,9 @@
 # `pepsy.operators.hamiltonians`
 
 `ham_tn.to_mpo` accepts explicit local operators or compact Pauli terms and
-returns a standard Quimb MPO. By default it adds terms sequentially; the
-original matrix-based form remains available:
+returns a standard Quimb MPO. By default it selects a workload-aware exact
+construction and applies one final compression; the original matrix-based
+form remains available:
 
 ```python
 builder = pepsy.ham_tn(shape=20)
@@ -61,13 +62,15 @@ dtype. Without `to_backend`, it defaults to `float64`. `chi` is an alias for
 `max_bond`; `form="left"` is forwarded to Quimb's compressor. Additional
 Quimb compression keywords can be supplied through `compress_opts`.
 
-Use `mode="automaton"` to canonicalize equivalent terms, compile the complete
-list with Pepsy's shared finite-state MPO automaton, and then apply one final
-numerical compression to `chi`. `mode="auto"` makes the same choice when the
-estimated structural width is reasonable, and otherwise uses the sequential
-term route to avoid constructing an unnecessarily wide exact MPO. The default
-`mode="term"` retains sequential term addition and optional compression after
-each term. `mode="analytic"` is an explicit alias for `mode="automaton"`.
+Use `compress="automaton"` to canonicalize equivalent terms, compile the
+complete list with Pepsy's shared finite-state MPO automaton, and then apply
+one final numerical compression to `chi`. `compress=True` is the same
+workload-aware automatic policy as `compress="auto"`: it uses the automaton
+when its estimated structural width is reasonable, and otherwise uses a
+sequential term sum with one final compression. `compress="term"` is the
+explicit incremental policy and compresses after each term. `compress=False`
+disables numerical compression. The older separate `mode=` keyword remains
+accepted for compatibility.
 
 The automaton preparation combines duplicate product terms, folds all one-site
 terms acting on the same site, and removes identity factors from two-site
@@ -93,13 +96,12 @@ mpo = builder.to_mpo(
 
 `cutoff="auto"` selects ``1e-3`` for 16-bit data, ``1e-6`` for
 32-bit/complex64 data, and ``1e-12`` otherwise. `cutoff_mode="auto"` selects
-Pepsy's usual ``rsum2`` policy. `compress=True` (the default) applies the
-compression after every sequential term addition. New code should use the
-common `compress=` and
-`mode=` spelling: `compress=False` disables compression, while
-`compress="term"` and `compress="automaton"` select the sequential and
-finite-state routes respectively. The old `compress_each=` spelling remains
-available for compatibility.
+Pepsy's usual ``rsum2`` policy. `compress=True` (the default) is the same
+policy as `compress="auto"`: it selects the shared finite-state route when its
+structural width is reasonable and otherwise uses a sequential term sum with
+one final compression. `compress="term"` is the explicit after-each-term
+policy, while `compress="automaton"` forces the finite-state route. The old
+`mode=` and `compress_each=` spellings remain available for compatibility.
 
 The builder is the shared configuration point for these common conversion
 defaults. A conversion can override its traversal or compression locally
@@ -127,27 +129,37 @@ tree_pepo = builder.to_tree_pepo(
 )
 ```
 
-`to_tree_mpo` builds a binary `TreePlan` automatically when no plan is passed;
-`map_mode` for this route uses the canonical `coarse-*` geometric vocabulary,
-for example `"coarse-alternate-x"`, and the resulting `TreeMPO.map_mode` is
-available on the operator and its plan. `to_tree_pepo` similarly builds a
-`TreePepsPlan`, but its canonical `map_mode` is one of `"span-up"`,
+`to_tree_mpo` builds a workload-aware `TreePlan` automatically when no plan or
+mapping is passed; explicit `map_mode` for this route uses the canonical
+`coarse-*` geometric vocabulary, for example `"coarse-alternate-x"`, and the
+resulting `TreeMPO.map_mode` is available on the operator and its plan.
+`to_tree_pepo` similarly builds a workload-aware `TreePepsPlan`, but its
+canonical `map_mode` is one of `"span-up"`,
 `"span-down"`, `"span-out"`, or `"span-middle"`. That mode controls the
 retained physical spanning tree; the builder's ordinary map remains the
 logical site order. Both resulting state/operator families report the same
 mode through `.map_mode` when they share a plan. Historical generic PEPO map
 spellings remain accepted for compatibility. Both native methods accept
-`mode="analytic"` (the
-default) to assemble all native term channels and compress once, or
-`mode="term"` to add and compress one term at a time; `"auto"` and
-`"automaton"` are aliases for the analytic native route. The native tree
-compression options are `order="rank"` or `order="depth"` for `TreeMPO`, and
-`form`, `center`, and `reduced` for `TreePEPO`; common `max_bond`, `cutoff`,
-and `cutoff_mode` values come from `ham_tn` unless overridden. For a consistent
-conversion API, `compress=` is accepted by all four `to_*` methods: it is a
-boolean switch or the strategy shorthand `"term"`/`"automaton"`. Passing
-`to_backend=None` explicitly disables a builder-level backend converter for
-one conversion.
+`compress=True` (the default, equivalent to `compress="auto"`) chooses the
+workload-aware native state-diagram route and compresses once after the
+complete sum. With no explicit `plan`, `map_mode`, or `tree_order`, the same
+policy chooses a TreePlan/TreePepsPlan from the term-support graph; an explicit
+plan or mapping always wins. `compress="automaton"` forces full native
+assembly and one final compression, while `compress="term"` adds and
+compresses one term at a time. The native tree compression options are
+`order="rank"` or
+`order="depth"` for `TreeMPO`, and `form`, `center`, and `reduced` for
+`TreePEPO`; common `max_bond`, `cutoff`, and `cutoff_mode` values come from
+`ham_tn` unless overridden. For a consistent conversion API, `compress=` is
+the single canonical strategy control accepted by all four `to_*` methods:
+use `True`, `False`, or the explicit strategy strings
+`"term"`/`"automaton"`/`"auto"`. Passing `to_backend=None` explicitly
+disables a builder-level backend converter for one conversion.
+
+Automatic tree mapping is a bounded workload search over legal arities and
+spanning-tree seeds; it is deterministic for a fixed term list, but it is not
+a claim of a globally optimal tree (that problem is combinatorial). The
+selected operator retains its layout finder for inspection and later reuse.
 
 The builder also accepts a `Fermion` model for symmetry-aware MPO construction:
 
