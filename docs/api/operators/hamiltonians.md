@@ -59,23 +59,27 @@ assert all(isinstance(tensor.data, torch.Tensor) for tensor in mpo)
 
 When `data_type` is omitted, the builder infers it from the converter's target
 dtype. Without `to_backend`, it defaults to `float64`. `chi` is an alias for
-`max_bond`; `form="left"` is forwarded to Quimb's compressor. Additional
-Quimb compression keywords can be supplied through `compress_opts`.
+`max_bond`; `form="left"` is forwarded to Quimb's compressor. An omitted
+`max_bond` inherits the builder cap, while `max_bond=None` or `False` disables
+numerical compression. Additional Quimb compression keywords can be supplied
+through `compress_opts`.
 
 Use `compress="automaton"` to canonicalize equivalent terms, compile the
 complete list with Pepsy's shared finite-state MPO automaton, and then apply
-one final numerical compression to `chi`. `compress=True` is the same
-workload-aware automatic policy as `compress="auto"`: it uses the automaton
-when its estimated structural width is reasonable, and otherwise uses a
-sequential term sum with one final compression. `compress="term"` is the
-explicit incremental policy and compresses after each term. `compress=False`
-disables numerical compression. The older separate `mode=` keyword remains
-accepted for compatibility.
+one final numerical compression to `chi` when a bond cap is active.
+`compress=True` is the same workload-aware automatic policy as
+`compress="auto"`: it uses the automaton when its estimated structural width
+is reasonable, and otherwise uses a sequential term sum with compression
+after every term. `compress="term"` is the explicit incremental policy and
+also compresses after every term. `compress=False`, `max_bond=None`, and
+`max_bond=False` disable numerical compression while preserving the selected
+exact construction. The older separate `mode=` keyword remains accepted for
+compatibility.
 
 The automaton preparation combines duplicate product terms, folds all one-site
 terms acting on the same site, and removes identity factors from two-site
-terms. These are exact algebraic simplifications; `chi` and `cutoff` still
-control only the final numerical compression.
+terms. These are exact algebraic simplifications; `chi` and `cutoff` control
+the numerical compression sweep(s) selected by the construction strategy.
 
 For a 2D builder, locations can be lattice coordinates and are mapped through
 `OneDMap`; a one-site coordinate can be written as `((x, y),)`:
@@ -140,17 +144,20 @@ retained physical spanning tree; the builder's ordinary map remains the
 logical site order. Both resulting state/operator families report the same
 mode through `.map_mode` when they share a plan. Historical generic PEPO map
 spellings remain accepted for compatibility. Both native methods accept
-`compress=True` (the default, equivalent to `compress="auto"`) chooses the
-workload-aware native state-diagram route and compresses once after the
-complete sum. With no explicit `plan`, `map_mode`, or `tree_order`, the same
-policy chooses a TreePlan/TreePepsPlan from the term-support graph; an explicit
-plan or mapping always wins. `compress="automaton"` forces full native
-assembly and one final compression, while `compress="term"` adds and
-compresses one term at a time. The native tree compression options are
+`compress=True` (the default, equivalent to `compress="auto"`) and choose the
+workload-aware native state-diagram route. Automaton assembly receives one
+final compression; term assembly compresses after every added term. With no
+explicit `plan`, `map_mode`, or `tree_order`, the same policy chooses a
+TreePlan/TreePepsPlan from the term-support graph; an explicit plan or mapping
+always wins. `compress="automaton"` forces full native assembly, while
+`compress="term"` adds and compresses one term at a time. These numerical
+compressions require an effective bond cap. The native tree compression options are
 `order="rank"` or
 `order="depth"` for `TreeMPO`, and `form`, `center`, and `reduced` for
 `TreePEPO`; common `max_bond`, `cutoff`, and `cutoff_mode` values come from
-`ham_tn` unless overridden. For a consistent conversion API, `compress=` is
+`ham_tn` unless overridden. An omitted `max_bond` inherits that builder cap;
+`max_bond=None` or `False` disables numerical compression. For a consistent
+conversion API, `compress=` is
 the single canonical strategy control accepted by all four `to_*` methods:
 use `True`, `False`, or the explicit strategy strings
 `"term"`/`"automaton"`/`"auto"`. Passing `to_backend=None` explicitly

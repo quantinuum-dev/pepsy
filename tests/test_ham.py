@@ -247,6 +247,50 @@ def test_ham_tn_conversion_modes_select_sequential_or_analytic_builds():
     assert isinstance(tree_pepo_term, TreePEPO)
 
 
+def test_ham_tn_term_mode_compresses_after_each_term(monkeypatch):
+    """Term accumulation applies the bond cap after every addition."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    terms = [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "Y", -0.3)]
+    builder.to_mpo(terms, compress="term", chi=2, cutoff=0.0)
+
+    assert len(calls) == len(terms)
+    assert all(call["max_bond"] == 2 for call in calls)
+
+
+@pytest.mark.parametrize("max_bond", [None, False])
+def test_ham_tn_automaton_skips_numerical_compression_without_bond_cap(
+    monkeypatch, max_bond
+):
+    """An exact automaton build does not run an unbounded compression sweep."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    builder.to_mpo(
+        [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1))],
+        compress="automaton",
+        max_bond=max_bond,
+        cutoff=0.0,
+    )
+
+    assert calls == []
+
+
 def test_ham_tn_compress_is_canonical_strategy_control():
     """The old separate mode selector is compatibility-only by default."""
     for name in ("to_mpo", "to_pepo", "to_tree_mpo", "to_tree_pepo"):

@@ -33,12 +33,14 @@ Changes for the next release should be added here before the version is bumped.
 
 - Unified the Hamiltonian `to_*` conversion surface around the single
   strategy-bearing `compress=` control. `compress=True`/`"auto"` now select a
-  workload-aware full-sum construction with one final compression;
-  `compress="automaton"` forces shared/state-diagram assembly, while
-  `compress="term"` is the explicit after-each-term strategy. `compress=False`
-  disables compression; `mode=` and `compress_each=` remain compatibility
-  spellings. Automatic native tree conversions also choose a layout from the
-  interaction supports when no plan or mapping is supplied.
+  workload-aware construction: automaton assembly gets one final compression,
+  while the term route compresses after every term. `compress="automaton"`
+  forces shared/state-diagram assembly, while `compress="term"` is the
+  explicit after-each-term strategy. `compress=False`, `max_bond=None`, and
+  `max_bond=False` disable numerical compression; `mode=` and
+  `compress_each=` remain compatibility spellings. Automatic native tree
+  conversions also choose a layout from the interaction supports when no plan
+  or mapping is supplied.
   `TreeMPO.show()` now keeps the clean native ASCII tree as its default, and
   `TreePEPO` retains its `TreePepsLayoutFinder` metadata through later
   operations.

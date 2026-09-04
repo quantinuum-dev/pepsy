@@ -54,6 +54,16 @@ class _InheritBackend:
 _DEFAULT_BACKEND = _InheritBackend()
 
 
+class _InheritMaxBond:
+    """Signature-friendly sentinel for inheriting the builder bond cap."""
+
+    def __repr__(self):
+        return "inherit"
+
+
+_DEFAULT_MAX_BOND = _InheritMaxBond()
+
+
 def _normalize_map_mode_name(mode):
     """Normalize a public geometric mapping spelling for tree dispatch."""
     if not isinstance(mode, str):
@@ -126,11 +136,38 @@ def _resolve_compression_request(compress, mode=None, *, tree=False):
         )
     if mode is None:
         # A boolean is deliberately only the compression switch.  The
-        # default construction is workload-aware and performs one final
-        # compression after the complete sum.  ``compress='term'`` is the
-        # explicit opt-in for incremental compression.
+        # default construction is workload-aware.  The selected automaton
+        # route gets one final compression, while a selected term route gets
+        # compression after each addition.  ``compress='term'`` is the
+        # explicit opt-in for incremental construction.
         mode = "auto"
     return _normalize_build_mode(mode, tree=tree), bool(compress)
+
+
+def _normalize_optional_max_bond(value, *, name="max_bond"):
+    """Normalize an optional operator bond cap.
+
+    ``None`` and ``False`` explicitly disable numerical bond compression.
+    The caller uses ``_DEFAULT_MAX_BOND`` when it wants to inherit the
+    builder-level cap instead.
+    """
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a positive integer, None, or False.")
+    if not isinstance(value, Integral):
+        raise TypeError(f"{name} must be a positive integer, None, or False.")
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1.")
+    return value
+
+
+def _resolve_max_bond(value, default):
+    """Resolve a conversion bond cap, preserving explicit no-cap values."""
+    if value is _DEFAULT_MAX_BOND:
+        value = default
+    return _normalize_optional_max_bond(value)
 
 
 class ham_tn:
@@ -152,11 +189,13 @@ class ham_tn:
     Lz : int | None, default=None
         Optional number of lattice sites along z. When provided, terms can
         use 3D coordinates ``(x, y, z)`` and the 1D mapping is built in 3D.
-    max_bond : int, default=256
-        Compression cap used after each term addition.
+    max_bond : int | None | False, default=256
+        Compression cap used after term additions or final assembly. ``None``
+        and ``False`` disable numerical compression for conversions.
     cutoff : float | {"auto"}, default="auto"
-        Compression cutoff used after each term addition. ``"auto"`` selects
-        the same dtype-aware cutoff policy as :class:`MpsOptimizer`.
+        Compression cutoff used by the selected numerical compression sweep.
+        ``"auto"`` selects the same dtype-aware cutoff policy as
+        :class:`MpsOptimizer`.
     cutoff_mode : str | {"auto"} | None, default=None
         Singular-value cutoff mode used after each term addition. ``"auto"``
         resolves to Pepsy's ordinary ``"rsum2"`` policy. ``None`` preserves
@@ -300,16 +339,15 @@ class ham_tn:
             dims_str = "Lx * Ly" if self.L_z is None else "Lx * Ly * Lz"
             raise ValueError(f"MPO construction requires {dims_str} >= 2.")
 
-        if not isinstance(max_bond, Integral):
-            raise TypeError("max_bond must be an integer.")
         if chi is not None:
-            if not isinstance(chi, Integral):
-                raise TypeError("chi must be an integer or None.")
-            if int(max_bond) != 256 and int(max_bond) != int(chi):
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond not in (None, False, 256)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
                 raise TypeError("Pass only one of max_bond and chi, or use equal values.")
             max_bond = chi
-        if int(max_bond) < 1:
-            raise ValueError("max_bond must be >= 1.")
+        max_bond = _normalize_optional_max_bond(max_bond)
         if isinstance(cutoff, str):
             if cutoff.strip().lower() != "auto":
                 raise ValueError("cutoff must be 'auto' or a non-negative number.")
@@ -323,7 +361,7 @@ class ham_tn:
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
 
-        self.max_bond = int(max_bond)
+        self.max_bond = max_bond
         self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
         self._data_type_explicit = data_type is not None
@@ -937,7 +975,7 @@ class ham_tn:
         ints=None,
         *,
         phys_dim=2,
-        max_bond=None,
+        max_bond=_DEFAULT_MAX_BOND,
         chi=None,
         cutoff=None,
         data_type=None,
@@ -976,9 +1014,10 @@ class ham_tn:
             support unambiguous.
         phys_dim : int, default=2
             On-site physical dimension.
-        max_bond : int | None, default=None
-            MPO compression max bond. Uses instance default when None.
-        chi : int | None, default=None
+        max_bond : int | None | False, default=inherit
+            MPO compression max bond. An omitted value inherits the builder
+            default; ``None`` or ``False`` disables numerical compression.
+        chi : int | None | False, default=None
             Alias for ``max_bond``. Supplying both is allowed only when they
             have the same value.
         cutoff : float | {"auto"} | None, default=None
@@ -989,10 +1028,13 @@ class ham_tn:
             Operator/MPO dtype. Uses instance default when None.
         compress : bool | {"term", "automaton", "auto"}, default=True
             Whether to compress the result. ``True`` selects the workload-
-            aware automatic route and performs one final compression after
-            the complete sum. ``"automaton"`` forces the shared finite-state
-            route, while ``"term"`` explicitly compresses after each added
-            term. ``"auto"`` is the explicit spelling of the default route.
+            aware automatic route. Automaton assembly is compressed once
+            after the complete sum; term assembly is compressed after every
+            added term. These numerical compressions run only when an
+            effective bond cap is set. ``"automaton"`` forces the shared
+            finite-state route, while ``"term"`` explicitly selects
+            per-term accumulation. ``"auto"`` is the explicit spelling of
+            the default route.
         compress_each : bool | None, default=None
             Deprecated compatibility spelling for the old API. ``True``
             compresses after each sequential term; ``False`` compresses once
@@ -1068,9 +1110,12 @@ class ham_tn:
             mapper = self._mapper_for_mode(map_mode)
 
         if chi is not None:
-            if not isinstance(chi, Integral):
-                raise TypeError("chi must be an integer or None.")
-            if max_bond is not None and int(max_bond) != int(chi):
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
                 raise TypeError("Pass only one of max_bond and chi, or use equal values.")
             max_bond = chi
 
@@ -1091,9 +1136,17 @@ class ham_tn:
 
         if "chi" in compress_extra:
             chi_extra = compress_extra.pop("chi")
-            if chi is not None and int(chi) != int(chi_extra):
+            chi_extra_limit = _normalize_optional_max_bond(chi_extra, name="chi")
+            if (
+                chi is not None
+                and _normalize_optional_max_bond(chi, name="chi") != chi_extra_limit
+            ):
                 raise TypeError("conflicting chi values supplied.")
-            if max_bond is not None and int(max_bond) != int(chi_extra):
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_extra_limit
+            ):
                 raise TypeError("conflicting max_bond and chi values supplied.")
             max_bond = chi_extra
 
@@ -1108,7 +1161,15 @@ class ham_tn:
                 "form": form,
                 "create_bond": create_bond,
             }[name]
-            if current is not None and current is not False and current != value:
+            if name == "max_bond":
+                if (
+                    current is not _DEFAULT_MAX_BOND
+                    and current not in (None, False)
+                    and _normalize_optional_max_bond(current)
+                    != _normalize_optional_max_bond(value)
+                ):
+                    raise TypeError(f"conflicting {name} values supplied.")
+            elif current is not None and current is not False and current != value:
                 raise TypeError(f"conflicting {name} values supplied.")
             if name == "max_bond":
                 max_bond = value
@@ -1165,7 +1226,8 @@ class ham_tn:
                     "fermion must provide the Fermion.build_mpo interface."
                 )
             dtype = self.data_type if data_type is None else np.dtype(data_type)
-            max_bond_use = self.max_bond if max_bond is None else int(max_bond)
+            max_bond_use = _resolve_max_bond(max_bond, self.max_bond)
+            compression_active = compression_enabled and max_bond_use is not None
             cutoff_use = self._resolve_cutoff(
                 self.cutoff if cutoff is None else cutoff,
                 dtype,
@@ -1181,9 +1243,9 @@ class ham_tn:
                 max_bond=max_bond_use,
                 cutoff=cutoff_use,
                 compress=(
-                    compression_enabled
+                    compression_active
                     if not legacy_compress_each
-                    else compression_enabled and compress_each
+                    else compression_active and compress_each
                 ),
                 dtype=dtype,
                 fermionic=fermionic_use,
@@ -1207,7 +1269,14 @@ class ham_tn:
             if data_type is None and to_backend is not None and not self._data_type_explicit
             else self.data_type if data_type is None else np.dtype(data_type)
         )
-        max_bond = self.max_bond if max_bond is None else int(max_bond)
+        max_bond = _resolve_max_bond(max_bond, self.max_bond)
+        compression_enabled = compression_enabled and max_bond is not None
+        if not legacy_compress_each:
+            # ``auto`` can become the term route after the structural width
+            # estimate, so derive the schedule from the selected route.
+            compress_each = compression_enabled and mode == "term"
+        else:
+            compress_each = compression_enabled and compress_each
         cutoff = self._resolve_cutoff(
             self.cutoff if cutoff is None else cutoff,
             dtype,
@@ -1215,8 +1284,6 @@ class ham_tn:
         cutoff_mode = self._resolve_cutoff_mode(
             self.cutoff_mode if cutoff_mode is None else cutoff_mode,
         )
-        if max_bond < 1:
-            raise ValueError("max_bond must be >= 1.")
         if cutoff < 0.0:
             raise ValueError("cutoff must be >= 0.")
 
@@ -1259,7 +1326,7 @@ class ham_tn:
                 # term-by-term route will be substantially smaller.  The
                 # estimate is conservative for repeated prefixes, so common
                 # nearest-neighbour structures still select the automaton.
-                auto_bond_limit = max(64, 4 * max_bond)
+                auto_bond_limit = max(64, 4 * (max_bond or 256))
                 estimated_bonds = builder._estimate_automaton_bond_dimensions(
                     automaton_records,
                     phys_dim=phys_dim,
@@ -1438,7 +1505,7 @@ class ham_tn:
         ints=None,
         *,
         phys_dim=2,
-        max_bond=None,
+        max_bond=_DEFAULT_MAX_BOND,
         cutoff=None,
         data_type=None,
         compress=True,
@@ -1465,9 +1532,10 @@ class ham_tn:
         ``OneDMap`` override and cannot be combined with ``mapper``. The
         per-call ``to_backend`` override follows :meth:`to_mpo`, including
         explicit ``None`` to keep the result on NumPy/Symmray arrays.
-        ``compress`` and ``mode`` follow :meth:`to_mpo`. The compatibility
-        spelling ``compress_each=`` remains accepted but is not used by new
-        code.
+        ``compress`` and ``mode`` follow :meth:`to_mpo`. An omitted
+        ``max_bond`` inherits the builder cap; ``max_bond=None`` or ``False``
+        disables numerical compression. The compatibility spelling
+        ``compress_each=`` remains accepted but is not used by new code.
         """
         self._require_2d("to_pepo")
         mpo = self.to_mpo(
@@ -1804,7 +1872,7 @@ class ham_tn:
         *,
         map_mode=None,
         phys_dim=2,
-        max_bond=None,
+        max_bond=_DEFAULT_MAX_BOND,
         chi=None,
         cutoff=None,
         data_type=None,
@@ -1832,14 +1900,16 @@ class ham_tn:
         ``build_tree_operator`` route is used instead.
 
         ``compress=True`` (the default) selects the workload-aware native
-        state-diagram route and compresses once after the complete term
-        collection. When no explicit ``plan`` or ``map_mode`` is supplied,
-        its layout finder also adapts the TreePlan to the term supports.
-        ``compress="automaton"`` forces that full native assembly, while
-        ``compress="term"`` builds one native operator per term and compresses
-        after every addition. ``compress=False`` disables numerical
-        compression. ``compress="auto"`` is the explicit spelling of the
-        default automatic route.
+        state-diagram route. Automaton assembly is compressed once after the
+        complete term collection; term assembly is compressed after every
+        added term. These numerical compressions run only when an effective
+        bond cap is set. When no explicit ``plan`` or ``map_mode`` is
+        supplied, its layout finder also adapts the TreePlan to the term
+        supports. ``compress="automaton"`` forces that full native assembly,
+        while ``compress="term"`` builds one native operator per term.
+        ``compress=False`` disables numerical compression, and
+        ``max_bond=None`` or ``False`` does the same. ``compress="auto"`` is
+        the explicit spelling of the default automatic route.
 
         ``mode=`` remains a compatibility alias for the older separate
         strategy keyword; new code should put the strategy in ``compress=``.
@@ -1864,7 +1934,12 @@ class ham_tn:
             tree=True,
         )
         if chi is not None:
-            if max_bond is not None and int(max_bond) != int(chi):
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
                 raise TypeError("Pass only one of max_bond and chi, or use equal values.")
             max_bond = chi
         backend = self.to_backend if to_backend is _DEFAULT_BACKEND else to_backend
@@ -1873,13 +1948,13 @@ class ham_tn:
             if data_type is None and backend is not None and not self._data_type_explicit
             else self.data_type if data_type is None else np.dtype(data_type)
         )
-        max_bond = self.max_bond if max_bond is None else int(max_bond)
+        max_bond = _resolve_max_bond(max_bond, self.max_bond)
+        compression_enabled = compress and max_bond is not None
+        layout_max_bond = max_bond if max_bond is not None else 256
         cutoff = self._resolve_cutoff(
             self.cutoff if cutoff is None else cutoff,
             dtype,
         )
-        if max_bond < 1:
-            raise ValueError("max_bond must be >= 1.")
 
         layout_finder = None
         if plan is None:
@@ -1894,7 +1969,7 @@ class ham_tn:
                     ints = tuple(ints)
                 plan, mapper_use, layout_finder = self._auto_tree_mpo_plan(
                     ints,
-                    max_bond=max_bond,
+                    max_bond=layout_max_bond,
                 )
             else:
                 plan, mapper_use = self._tree_plan_from_map_mode(map_mode)
@@ -1949,7 +2024,7 @@ class ham_tn:
                 tree=plan,
                 max_bond=max_bond,
                 cutoff=cutoff,
-                compress=compress,
+                compress=compression_enabled,
                 dtype=dtype,
                 fermionic=fermionic_use,
                 charge_sectors=charge_sectors,
@@ -1986,7 +2061,7 @@ class ham_tn:
                 ints,
                 max_bond=max_bond,
                 cutoff=cutoff,
-                compress=compress,
+                compress=compression_enabled,
                 dtype=dtype,
                 fermionic=True,
                 to_backend=backend,
@@ -2028,7 +2103,7 @@ class ham_tn:
                 layout_finder=layout_finder,
             )
             self._apply_tree_backend(operator, backend)
-            if compress:
+            if compression_enabled:
                 operator.compress(**compress_options)
             return operator
 
@@ -2046,12 +2121,12 @@ class ham_tn:
             self._apply_tree_backend(term_operator, backend)
             if operator is None:
                 operator = term_operator
-                if compress:
+                if compression_enabled:
                     operator.compress(**compress_options)
             else:
                 operator = operator.add_TreeMPO(
                     term_operator,
-                    compress=compress,
+                    compress=compression_enabled,
                     **compress_options,
                 )
         return operator
@@ -2066,7 +2141,7 @@ class ham_tn:
         map_mode=None,
         tree_order=None,
         phys_dim=2,
-        max_bond=None,
+        max_bond=_DEFAULT_MAX_BOND,
         chi=None,
         cutoff=None,
         cutoff_mode=None,
@@ -2093,15 +2168,16 @@ class ham_tn:
         chain MPO or a full dense lattice operator.
 
         ``compress=True`` (the default) selects the workload-aware native
-        state-diagram route and compresses once after all terms are assembled.
-        When no explicit ``plan``, retained-tree ``map_mode``, or
-        ``tree_order`` is supplied, its layout finder adapts the spanning tree
-        to the term supports.
-        ``compress="automaton"`` forces the same full native assembly, while
-        ``compress="term"`` adds one factorized term at a time and compresses
-        after every addition. ``compress=False`` disables numerical
-        compression. ``compress="auto"`` is the explicit spelling of the
-        default automatic route.
+        state-diagram route. Automaton assembly is compressed once after all
+        terms are assembled; term assembly is compressed after every added
+        term. These numerical compressions run only when an effective bond
+        cap is set. When no explicit ``plan``, retained-tree ``map_mode``, or
+        ``tree_order`` is supplied, its layout finder adapts the spanning
+        tree to the term supports. ``compress="automaton"`` forces the same
+        full native assembly, while ``compress="term"`` adds one factorized
+        term at a time. ``compress=False`` disables numerical compression,
+        and ``max_bond=None`` or ``False`` does the same. ``compress="auto"``
+        is the explicit spelling of the default automatic route.
 
         ``mode=`` remains a compatibility alias for the older separate
         strategy keyword; new code should put the strategy in ``compress=``.
@@ -2125,7 +2201,12 @@ class ham_tn:
             tree=True,
         )
         if chi is not None:
-            if max_bond is not None and int(max_bond) != int(chi):
+            chi_limit = _normalize_optional_max_bond(chi, name="chi")
+            if (
+                max_bond is not _DEFAULT_MAX_BOND
+                and max_bond not in (None, False)
+                and _normalize_optional_max_bond(max_bond) != chi_limit
+            ):
                 raise TypeError("Pass only one of max_bond and chi, or use equal values.")
             max_bond = chi
         backend = self.to_backend if to_backend is _DEFAULT_BACKEND else to_backend
@@ -2134,13 +2215,13 @@ class ham_tn:
             if data_type is None and backend is not None and not self._data_type_explicit
             else self.data_type if data_type is None else np.dtype(data_type)
         )
-        max_bond = self.max_bond if max_bond is None else int(max_bond)
+        max_bond = _resolve_max_bond(max_bond, self.max_bond)
+        compression_enabled = compress and max_bond is not None
+        layout_max_bond = max_bond if max_bond is not None else 256
         cutoff = self._resolve_cutoff(
             self.cutoff if cutoff is None else cutoff,
             dtype,
         )
-        if max_bond < 1:
-            raise ValueError("max_bond must be >= 1.")
         if ints is None:
             raise ValueError("ints must be provided.")
 
@@ -2159,7 +2240,7 @@ class ham_tn:
                     ints = tuple(ints)
                 plan, _planning_finder = self._auto_tree_pepo_plan(
                     ints,
-                    max_bond=max_bond,
+                    max_bond=layout_max_bond,
                 )
             else:
                 requested_mode = self.map_mode if map_mode is None else map_mode
@@ -2247,7 +2328,7 @@ class ham_tn:
                 layout_finder=layout_finder,
             )
             self._apply_tree_backend(operator, backend)
-            if compress:
+            if compression_enabled:
                 operator.compress(**compress_options)
             return operator
 
@@ -2263,12 +2344,12 @@ class ham_tn:
             self._apply_tree_backend(term_operator, backend)
             if operator is None:
                 operator = term_operator
-                if compress:
+                if compression_enabled:
                     operator.compress(**compress_options)
             else:
                 operator = operator.add_operator(
                     term_operator,
-                    compress=compress,
+                    compress=compression_enabled,
                     **compress_options,
                 )
         return operator
