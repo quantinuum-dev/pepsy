@@ -1,9 +1,9 @@
 # `pepsy.operators.hamiltonians`
 
 `ham_tn.to_mpo` accepts explicit local operators or compact Pauli terms and
-returns a standard Quimb MPO. By default it selects a workload-aware exact
-construction and applies one final compression; the original matrix-based
-form remains available:
+returns a standard Quimb MPO. By default it adds and compresses one term at a
+time, which keeps intermediate bonds bounded; the workload-aware automatic
+construction remains available explicitly:
 
 ```python
 builder = pepsy.ham_tn(shape=20)
@@ -64,17 +64,16 @@ dtype. Without `to_backend`, it defaults to `float64`. `chi` is an alias for
 numerical compression. Additional Quimb compression keywords can be supplied
 through `compress_opts`.
 
-Use `compress="automaton"` to canonicalize equivalent terms, compile the
-complete list with Pepsy's shared finite-state MPO automaton, and then apply
-one final numerical compression to `chi` when a bond cap is active.
-`compress=True` is the same workload-aware automatic policy as
-`compress="auto"`: it uses the automaton when its estimated structural width
-is reasonable, and otherwise uses a sequential term sum with compression
-after every term. `compress="term"` is the explicit incremental policy and
-also compresses after every term. `compress=False`, `max_bond=None`, and
-`max_bond=False` disable numerical compression while preserving the selected
-exact construction. The older separate `mode=` keyword remains accepted for
-compatibility.
+Use `compress="term"` (the default) to add and compress each term
+sequentially. Use `compress="automaton"` to canonicalize equivalent terms,
+compile the complete list with Pepsy's shared finite-state MPO automaton, and
+then apply one final numerical compression to `chi` when a bond cap is active.
+`compress=True` and `compress="auto"` explicitly select the workload-aware
+automatic policy: they use the automaton when its estimated structural width
+is reasonable, and otherwise use a sequential term sum. `compress=False`,
+`max_bond=None`, and `max_bond=False` disable numerical compression while
+preserving the selected exact construction. The older separate `mode=`
+keyword remains accepted for compatibility.
 
 The automaton preparation combines duplicate product terms, folds all one-site
 terms acting on the same site, and removes identity factors from two-site
@@ -100,12 +99,11 @@ mpo = builder.to_mpo(
 
 `cutoff="auto"` selects ``1e-3`` for 16-bit data, ``1e-6`` for
 32-bit/complex64 data, and ``1e-12`` otherwise. `cutoff_mode="auto"` selects
-Pepsy's usual ``rsum2`` policy. `compress=True` (the default) is the same
-policy as `compress="auto"`: it selects the shared finite-state route when its
-structural width is reasonable and otherwise uses a sequential term sum with
-one final compression. `compress="term"` is the explicit after-each-term
-policy, while `compress="automaton"` forces the finite-state route. The old
-`mode=` and `compress_each=` spellings remain available for compatibility.
+Pepsy's usual ``rsum2`` policy. For local-term construction,
+`compress="term"` is the default after-each-term policy. `compress=True` or
+`compress="auto"` explicitly selects the workload-aware automatic route,
+while `compress="automaton"` forces the finite-state route. The old `mode=`
+and `compress_each=` spellings remain available for compatibility.
 
 The builder is the shared configuration point for these common conversion
 defaults. A conversion can override its traversal or compression locally
@@ -144,14 +142,15 @@ retained physical spanning tree; the builder's ordinary map remains the
 logical site order. Both resulting state/operator families report the same
 mode through `.map_mode` when they share a plan. Historical generic PEPO map
 spellings remain accepted for compatibility. Both native methods accept
-`compress=True` (the default, equivalent to `compress="auto"`) and choose the
-workload-aware native state-diagram route. Automaton assembly receives one
-final compression; term assembly compresses after every added term. With no
-explicit `plan`, `map_mode`, or `tree_order`, the same policy chooses a
+`compress="term"` by default and add/compress one term at a time.
+`compress=True` or `compress="auto"` explicitly chooses the workload-aware
+native state-diagram route; it uses one final compression for automaton
+assembly and per-term compression for term assembly. With no explicit `plan`,
+`map_mode`, or `tree_order`, the automatic route chooses a
 TreePlan/TreePepsPlan from the term-support graph; an explicit plan or mapping
-always wins. `compress="automaton"` forces full native assembly, while
-`compress="term"` adds and compresses one term at a time. These numerical
-compressions require an effective bond cap. The native tree compression options are
+always wins. `compress="automaton"` forces full native assembly. These
+numerical compressions require an effective bond cap. The native tree
+compression options are
 `order="rank"` or
 `order="depth"` for `TreeMPO`, and `form`, `center`, and `reduced` for
 `TreePEPO`; common `max_bond`, `cutoff`, and `cutoff_mode` values come from

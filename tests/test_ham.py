@@ -298,8 +298,15 @@ def test_ham_tn_compress_is_canonical_strategy_control():
         assert parameter.default is None
 
 
-def test_ham_tn_default_compress_assembles_then_compresses_once(monkeypatch):
-    """The boolean default is a final-compression automatic policy."""
+def test_ham_tn_to_builder_defaults_are_term_by_term():
+    """All public ``to_*`` builders default to sequential term construction."""
+    for name in ("to_mpo", "to_pepo", "to_tree_mpo", "to_tree_pepo"):
+        parameter = inspect.signature(getattr(py.ham_tn, name)).parameters["compress"]
+        assert parameter.default == "term"
+
+
+def test_ham_tn_default_compresses_after_each_term(monkeypatch):
+    """The omitted compression strategy is the incremental term policy."""
     calls = []
     original_compress = qtn.MatrixProductOperator.compress
 
@@ -312,6 +319,28 @@ def test_ham_tn_default_compress_assembles_then_compresses_once(monkeypatch):
     mpo = builder.to_mpo(
         [((quimb.pauli("X", dtype="complex128"),), (0,), 0.5),
          ((quimb.pauli("Z", dtype="complex128"),), (3,), 0.25)],
+        cutoff=0.0,
+    )
+
+    assert len(calls) == 2
+    assert not hasattr(mpo, "pepsy_automaton")
+
+
+def test_ham_tn_explicit_true_keeps_automatic_route(monkeypatch):
+    """Explicit ``compress=True`` retains the compatibility auto policy."""
+    calls = []
+    original_compress = qtn.MatrixProductOperator.compress
+
+    def capture_compress(mpo, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_compress(mpo, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
+    builder = py.ham_tn(shape=4, data_type="complex128")
+    mpo = builder.to_mpo(
+        [((quimb.pauli("X", dtype="complex128"),), (0,), 0.5),
+         ((quimb.pauli("Z", dtype="complex128"),), (3,), 0.25)],
+        compress=True,
         cutoff=0.0,
     )
 

@@ -1,6 +1,8 @@
 """Regression tests for builder-side structural operator compression."""
 
 import importlib
+import sys
+import types
 
 import numpy as np
 import quimb
@@ -151,6 +153,124 @@ def test_term_compression_preconditions_each_sequential_svd(monkeypatch):
         "structural", "compress",
         "structural", "compress",
     ]
+
+
+def test_term_builder_progress_bar_reports_chi_and_transient_peak(monkeypatch):
+    """Term progress follows the MPS style and exposes direct-sum growth."""
+    bars = []
+
+    class FakeProgressBar:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.postfixes = []
+            self.updates = []
+            self.closed = False
+            bars.append(self)
+
+        def set_postfix(self, postfix):
+            self.postfixes.append(dict(postfix))
+
+        def update(self, value):
+            self.updates.append(value)
+
+        def close(self):
+            self.closed = True
+
+    tqdm_module = types.ModuleType("tqdm")
+    tqdm_module.tqdm = FakeProgressBar
+    monkeypatch.setitem(sys.modules, "tqdm", tqdm_module)
+
+    builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
+    builder.to_mpo(
+        [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "X", -0.3)],
+        compress="term",
+        max_bond=1,
+        cutoff=0.0,
+        progbar=True,
+    )
+
+    assert len(bars) == 1
+    bar = bars[0]
+    assert bar.kwargs == {
+        "total": 3,
+        "desc": "mpo-term",
+        "leave": True,
+        "position": 0,
+        "ascii": True,
+        "colour": "#2ca02c",
+    }
+    assert bar.updates == [1, 1, 1]
+    assert bar.closed
+    assert any(postfix["chi"] == "1/1" for postfix in bar.postfixes)
+    assert any("peak" in postfix for postfix in bar.postfixes)
+
+
+def test_tree_builder_progress_bars_use_the_same_mps_style(monkeypatch):
+    """Tree term builders expose matching progress controls and postfixes."""
+    bars = []
+
+    class FakeProgressBar:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.postfixes = []
+            self.updates = []
+            self.closed = False
+            bars.append(self)
+
+        def set_postfix(self, postfix):
+            self.postfixes.append(dict(postfix))
+
+        def update(self, value):
+            self.updates.append(value)
+
+        def close(self):
+            self.closed = True
+
+    tqdm_module = types.ModuleType("tqdm")
+    tqdm_module.tqdm = FakeProgressBar
+    monkeypatch.setitem(sys.modules, "tqdm", tqdm_module)
+
+    z_op = quimb.pauli("Z", dtype="complex128")
+    tree_builder = py.ham_tn(shape=4, data_type="complex128")
+    tree_builder.to_tree_mpo(
+        py.TreePlan.from_order([0, 1, 2, 3]),
+        [((z_op, z_op), (0, 3), 1.2), ((z_op, z_op), (0, 2), 0.8)],
+        mode="term",
+        max_bond=2,
+        cutoff=0.0,
+        progbar=True,
+    )
+
+    pepo_builder = py.ham_tn(shape=(3, 3), data_type="complex128")
+    pepo_builder.to_tree_pepo(
+        [
+            ((z_op, z_op), ((0, 0), (2, 2)), 1.2),
+            ((z_op, z_op), ((0, 1), (2, 1)), 0.8),
+        ],
+        map_mode="span-up",
+        mode="term",
+        max_bond=2,
+        cutoff=0.0,
+        progbar=True,
+    )
+
+    assert [bar.kwargs["desc"] for bar in bars] == [
+        "tree-mpo-term",
+        "tree-pepo-term",
+    ]
+    assert all(
+        bar.kwargs["leave"]
+        and bar.kwargs["position"] == 0
+        and bar.kwargs["ascii"]
+        and bar.kwargs["colour"] == "#2ca02c"
+        for bar in bars
+    )
+    assert all(bar.kwargs["total"] == 2 for bar in bars)
+    assert all(bar.updates == [1, 1] and bar.closed for bar in bars)
+    assert all(
+        any("chi" in postfix for postfix in bar.postfixes)
+        for bar in bars
+    )
 
 
 def test_tree_builders_use_structural_compression_without_a_bond_cap():

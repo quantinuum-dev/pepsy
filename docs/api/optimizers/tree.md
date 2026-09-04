@@ -188,6 +188,13 @@ pass, so direct-sum term assembly does not carry redundant states into every
 parent tensor. Native Symmray/fermionic networks are left on their existing
 charge-preserving QR/SVD route.
 
+`ham_tn.to_tree_mpo(...)` defaults to `compress="term"`, so it adds and
+compresses one term at a time. Pass `compress=True` or `compress="auto"` for
+the workload-aware route, or `compress="automaton"` to force full native
+assembly. Pass `progbar=True` for the same MPS-style construction bar. Term
+mode advances once per added term and reports the current `chi` against the
+requested cap; the progress-bar default is `False`.
+
 `add_TreeMPO(..., compress=True)` first builds the tree direct sum and then runs
 the same native tree SVD sweep; its compression options are `max_bond`,
 `cutoff`, and `order`. The default `order="rank"` is a deterministic greedy

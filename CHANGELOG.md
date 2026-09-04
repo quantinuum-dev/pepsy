@@ -32,11 +32,13 @@ Changes for the next release should be added here before the version is bumped.
   print the physical lattice and term supports above its native tree view.
 
 - Unified the Hamiltonian `to_*` conversion surface around the single
-  strategy-bearing `compress=` control. `compress=True`/`"auto"` now select a
-  workload-aware construction: automaton assembly gets one final compression,
-  while the term route compresses after every term. `compress="automaton"`
-  forces shared/state-diagram assembly, while `compress="term"` is the
-  explicit after-each-term strategy. `compress=False`, `max_bond=None`, and
+  strategy-bearing `compress=` control. The public `to_mpo`, `to_pepo`,
+  `to_tree_mpo`, and `to_tree_pepo` builders now default to
+  `compress="term"`, adding and compressing one term at a time.
+  `compress=True`/`"auto"` explicitly select a workload-aware construction:
+  automaton assembly gets one final compression, while the term route
+  compresses after every term. `compress="automaton"` forces
+  shared/state-diagram assembly. `compress=False`, `max_bond=None`, and
   `max_bond=False` disable numerical compression; `mode=` and
   `compress_each=` remain compatibility spellings. Automatic native tree
   conversions also choose a layout from the interaction supports when no plan

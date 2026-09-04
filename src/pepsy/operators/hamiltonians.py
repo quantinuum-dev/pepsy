@@ -68,6 +68,16 @@ class _InheritMaxBond:
 _DEFAULT_MAX_BOND = _InheritMaxBond()
 
 
+class _DefaultTermCompression(str):
+    """Signature-friendly sentinel for the term-by-term builder default."""
+
+    def __new__(cls):
+        return super().__new__(cls, "term")
+
+
+_DEFAULT_COMPRESSION = _DefaultTermCompression()
+
+
 def _normalize_map_mode_name(mode):
     """Normalize a public geometric mapping spelling for tree dispatch."""
     if not isinstance(mode, str):
@@ -128,7 +138,13 @@ def _resolve_compression_request(compress, mode=None, *, tree=False):
     ``mode=`` remains a compatibility alias for callers using the older
     separate strategy keyword.
     """
-    if isinstance(compress, str):
+    if compress is _DEFAULT_COMPRESSION:
+        # Keep ``mode=`` usable when the public ``compress`` argument is
+        # omitted, while making the new public default explicitly term-wise.
+        compress = True
+        if mode is None:
+            mode = "term"
+    elif isinstance(compress, str):
         mode = compress
         compress = True
     elif compress is None:
@@ -140,10 +156,7 @@ def _resolve_compression_request(compress, mode=None, *, tree=False):
         )
     if mode is None:
         # A boolean is deliberately only the compression switch.  The
-        # default construction is workload-aware.  The selected automaton
-        # route gets one final compression, while a selected term route gets
-        # compression after each addition.  ``compress='term'`` is the
-        # explicit opt-in for incremental construction.
+        # explicit boolean route remains workload-aware for compatibility.
         mode = "auto"
     return _normalize_build_mode(mode, tree=tree), bool(compress)
 
@@ -172,6 +185,63 @@ def _resolve_max_bond(value, default):
     if value is _DEFAULT_MAX_BOND:
         value = default
     return _normalize_optional_max_bond(value)
+
+
+_OPERATOR_PROGBAR_COLOR = "#2ca02c"
+
+
+def _make_operator_progress(progbar, total, *, desc):
+    """Create an MPS-style operator-construction progress bar."""
+    if not progbar:
+        return None
+    from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+    return tqdm(
+        total=total,
+        desc=desc,
+        leave=True,
+        position=0,
+        ascii=True,
+        colour=_OPERATOR_PROGBAR_COLOR,
+    )
+
+
+def _operator_max_bond(operator):
+    """Read an operator's current maximum virtual bond safely."""
+    try:
+        return int(operator.max_bond())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _set_operator_progress_postfix(progress_bar, operator, *, cap, peak=None):
+    """Show current/capped ``chi`` and any pre-compression peak."""
+    if progress_bar is None:
+        return
+    current = _operator_max_bond(operator)
+    postfix = {
+        "chi": (
+            f"{current}/{cap}"
+            if current is not None and cap is not None
+            else current if current is not None else "?"
+        ),
+    }
+    if peak is not None and current is not None and peak > current:
+        postfix["peak"] = peak
+    progress_bar.set_postfix(postfix)
+
+
+def _advance_operator_progress(progress_bar, operator, *, cap, peak=None):
+    """Update an operator-construction progress bar after one work unit."""
+    if progress_bar is None:
+        return
+    _set_operator_progress_postfix(
+        progress_bar,
+        operator,
+        cap=cap,
+        peak=peak,
+    )
+    progress_bar.update(1)
 
 
 class ham_tn:
@@ -983,7 +1053,7 @@ class ham_tn:
         chi=None,
         cutoff=None,
         data_type=None,
-        compress=True,
+        compress=_DEFAULT_COMPRESSION,
         compress_each=None,
         cutoff_mode=None,
         form=None,
@@ -997,6 +1067,7 @@ class ham_tn:
         edges=None,
         fermionic=None,
         charge_sectors=False,
+        progbar=False,
         **model_params,
     ):
         """Convert user interactions to a one-dimensional MPO.
@@ -1030,15 +1101,14 @@ class ham_tn:
             ``1e-6`` for 32-bit/complex64 data, and ``1e-12`` otherwise.
         data_type : str | numpy.dtype | None, default=None
             Operator/MPO dtype. Uses instance default when None.
-        compress : bool | {"term", "automaton", "auto"}, default=True
-            Whether to compress the result. ``True`` selects the workload-
-            aware automatic route. Automaton assembly is compressed once
-            after the complete sum; term assembly is compressed after every
-            added term. These numerical compressions run only when an
-            effective bond cap is set. ``"automaton"`` forces the shared
-            finite-state route, while ``"term"`` explicitly selects
-            per-term accumulation. ``"auto"`` is the explicit spelling of
-            the default route.
+        compress : bool | {"term", "automaton", "auto"}, default="term"
+            Whether to compress the result. The default ``"term"`` performs
+            sequential accumulation and compresses after every added term.
+            These numerical compressions run only when an effective bond cap
+            is set. ``True`` and ``"auto"`` select the workload-aware
+            automatic route for compatibility; ``"automaton"`` forces the
+            shared finite-state route. Automaton assembly is compressed once
+            after the complete sum.
         compress_each : bool | None, default=None
             Deprecated compatibility spelling for the old API. ``True``
             compresses after each sequential term; ``False`` compresses once
@@ -1067,6 +1137,10 @@ class ham_tn:
             disables that converter for this build. Generic MPO tensors are
             placed on this backend before addition and compression. Native
             fermion construction forwards it directly to the native builder.
+        progbar : bool, default=False
+            Show an MPS-style ``tqdm`` progress bar. Term-by-term builds
+            advance once per term and report the current ``chi`` together
+            with any temporary pre-compression peak bond.
         mapper : pepsy.tensors.core.OneDMap | None, default=None
             Optional mapper override used only for this MPO build. When
             omitted, the builder's configured mapper is used.
@@ -1187,7 +1261,11 @@ class ham_tn:
                 create_bond = value
 
         legacy_compress_each = compress_each is not None
-        if legacy_compress_each and compress not in (None, True):
+        if (
+            legacy_compress_each
+            and compress is not _DEFAULT_COMPRESSION
+            and compress not in (None, True)
+        ):
             raise TypeError("Pass only one of compress and compress_each.")
         if legacy_compress_each:
             compress_each = bool(compress_each)
@@ -1320,6 +1398,7 @@ class ham_tn:
         automaton_records = None
         automaton = None
         structural_applied = False
+        progress_bar = None
         if mode in {"automaton", "auto"}:
             automaton_records = builder._normalize_automaton_terms(
                 tuple(ints),
@@ -1343,6 +1422,11 @@ class ham_tn:
                     mode = "automaton"
 
             if mode == "automaton":
+                progress_bar = _make_operator_progress(
+                    progbar,
+                    1,
+                    desc="mpo",
+                )
                 mpo_total, automaton = builder._build_mpo_from_automaton(
                     automaton_records,
                     phys_dim=phys_dim,
@@ -1359,8 +1443,17 @@ class ham_tn:
                         method="auto",
                     )
                     structural_applied = True
+                peak_bond = _operator_max_bond(mpo_total)
                 if compression_enabled:
                     mpo_total.compress(**compress_options)
+                _advance_operator_progress(
+                    progress_bar,
+                    mpo_total,
+                    cap=max_bond,
+                    peak=peak_bond,
+                )
+                if progress_bar is not None:
+                    progress_bar.close()
 
         if mode == "term":
             term_iter = (
@@ -1368,14 +1461,21 @@ class ham_tn:
                 if automaton_records is not None
                 else ints
             )
+            progress_bar = _make_operator_progress(
+                progbar,
+                len(term_iter) if hasattr(term_iter, "__len__") else None,
+                desc="mpo-term",
+            )
             mpo_total = builder._zero_mpo(phys_dim=phys_dim, dtype=dtype)
             if to_backend is not None:
                 builder._apply_to_backend(mpo_total, to_backend)
+            peak_bond = None
             for term in term_iter:
                 mpo_term = builder._term_to_mpo(term, phys_dim=phys_dim, dtype=dtype)
                 if to_backend is not None:
                     builder._apply_to_backend(mpo_term, to_backend)
                 mpo_total = mpo_total + mpo_term
+                peak_bond = _operator_max_bond(mpo_total)
                 if compression_enabled and compress_each:
                     if to_backend is None:
                         # Sequential direct sums can recreate parallel
@@ -1387,6 +1487,12 @@ class ham_tn:
                         )
                         structural_applied = True
                     mpo_total.compress(**compress_options)
+                _advance_operator_progress(
+                    progress_bar,
+                    mpo_total,
+                    cap=max_bond,
+                    peak=peak_bond,
+                )
 
             if compression_enabled and not compress_each:
                 if to_backend is None:
@@ -1396,6 +1502,14 @@ class ham_tn:
                     )
                     structural_applied = True
                 mpo_total.compress(**compress_options)
+            _set_operator_progress_postfix(
+                progress_bar,
+                mpo_total,
+                cap=max_bond,
+                peak=peak_bond,
+            )
+            if progress_bar is not None:
+                progress_bar.close()
         if to_backend is not None:
             # Keep the return boundary explicit in case a backend operation
             # materialized an intermediate NumPy array.
@@ -1542,7 +1656,7 @@ class ham_tn:
         max_bond=_DEFAULT_MAX_BOND,
         cutoff=None,
         data_type=None,
-        compress=True,
+        compress=_DEFAULT_COMPRESSION,
         compress_each=None,
         mode=None,
         cycle_peps=False,
@@ -1554,6 +1668,7 @@ class ham_tn:
         fermionic=None,
         charge_sectors=False,
         to_backend=_DEFAULT_BACKEND,
+        progbar=False,
         **model_params,
     ):
         """Convert interactions or a native fermion model to a PEPO.
@@ -1566,10 +1681,13 @@ class ham_tn:
         ``OneDMap`` override and cannot be combined with ``mapper``. The
         per-call ``to_backend`` override follows :meth:`to_mpo`, including
         explicit ``None`` to keep the result on NumPy/Symmray arrays.
-        ``compress`` and ``mode`` follow :meth:`to_mpo`. An omitted
-        ``max_bond`` inherits the builder cap; ``max_bond=None`` or ``False``
-        disables numerical compression. The compatibility spelling
+        ``compress`` and ``mode`` follow :meth:`to_mpo`; omitted ``compress``
+        defaults to ``"term"``. An omitted ``max_bond`` inherits the builder
+        cap; ``max_bond=None`` or ``False`` disables numerical compression.
+        The compatibility spelling
         ``compress_each=`` remains accepted but is not used by new code.
+        ``progbar=True`` forwards the MPS-style construction progress bar to
+        :meth:`to_mpo`.
         """
         self._require_2d("to_pepo")
         mpo = self.to_mpo(
@@ -1581,6 +1699,7 @@ class ham_tn:
             compress=compress,
             compress_each=compress_each,
             mode=mode,
+            progbar=progbar,
             mapper=mapper,
             map_mode=map_mode,
             fermion=fermion,
@@ -1911,7 +2030,7 @@ class ham_tn:
         cutoff=None,
         data_type=None,
         mode=None,
-        compress=True,
+        compress=_DEFAULT_COMPRESSION,
         compress_opts=None,
         compress_order="rank",
         fermion=None,
@@ -1919,6 +2038,7 @@ class ham_tn:
         fermionic=None,
         charge_sectors=False,
         to_backend=_DEFAULT_BACKEND,
+        progbar=False,
         **model_params,
     ):
         """Convert interactions directly to a native :class:`TreeMPO`.
@@ -1933,17 +2053,17 @@ class ham_tn:
         attached. When ``fermion`` is supplied, its native
         ``build_tree_operator`` route is used instead.
 
-        ``compress=True`` (the default) selects the workload-aware native
-        state-diagram route. Automaton assembly is compressed once after the
-        complete term collection; term assembly is compressed after every
-        added term. These numerical compressions run only when an effective
-        bond cap is set. When no explicit ``plan`` or ``map_mode`` is
-        supplied, its layout finder also adapts the TreePlan to the term
-        supports. ``compress="automaton"`` forces that full native assembly,
-        while ``compress="term"`` builds one native operator per term.
+        ``compress="term"`` (the default) builds one native operator per term
+        and compresses after every addition. ``True`` and ``compress="auto"``
+        select the workload-aware native state-diagram route for compatibility.
+        Automaton assembly is compressed once after the complete term
+        collection; term assembly is compressed after every added term. These
+        numerical compressions run only when an effective bond cap is set.
+        When the automatic route has no explicit ``plan`` or ``map_mode``, its
+        layout finder also adapts the TreePlan to the term supports.
+        ``compress="automaton"`` forces that full native assembly.
         ``compress=False`` disables numerical compression, and
-        ``max_bond=None`` or ``False`` does the same. ``compress="auto"`` is
-        the explicit spelling of the default automatic route.
+        ``max_bond=None`` or ``False`` does the same.
 
         ``mode=`` remains a compatibility alias for the older separate
         strategy keyword; new code should put the strategy in ``compress=``.
@@ -1951,6 +2071,8 @@ class ham_tn:
         ``compress_opts`` currently accepts the native TreeMPO compression
         option ``order`` (``"rank"`` or ``"depth"``). The common
         ``max_bond`` and ``cutoff`` defaults are inherited from ``ham_tn``.
+        ``progbar=True`` shows MPS-style term-construction progress with the
+        current ``chi`` and requested cap.
         """
         from ..optimizers.tree import TreeMPO, build_tree_operator
         from ..tensors.symmetric import SymHamiltonian
@@ -1962,6 +2084,7 @@ class ham_tn:
                 raise TypeError("Pass either a TreePlan or terms, not both as positional arguments.")
             ints = plan
             plan = None
+        default_term = compress is _DEFAULT_COMPRESSION and mode is None
         build_mode, compress = _resolve_compression_request(
             compress,
             mode,
@@ -2033,6 +2156,12 @@ class ham_tn:
             )
         if compress_order not in {"rank", "depth"}:
             raise ValueError("compress_order must be 'rank' or 'depth'.")
+
+        # Native fermion and SymHamiltonian builders do not expose the dense
+        # sequential factorization route. Keep their omitted-argument
+        # behavior analytic while the dense public default is term-wise.
+        if default_term and (fermion is not None or isinstance(ints, SymHamiltonian)):
+            build_mode = "analytic"
 
         if fermion is not None:
             if build_mode == "term":
@@ -2127,6 +2256,11 @@ class ham_tn:
             "order": compress_order,
         }
         if build_mode in {"analytic", "auto"}:
+            progress_bar = _make_operator_progress(
+                progbar,
+                1,
+                desc="tree-mpo",
+            )
             operator = TreeMPO.from_terms(
                 plan,
                 terms,
@@ -2150,9 +2284,23 @@ class ham_tn:
                     bond_getter=operator.bond,
                     method="auto",
                 )
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=_operator_max_bond(operator),
+            )
+            if progress_bar is not None:
+                progress_bar.close()
             return operator
 
         operator = None
+        progress_bar = _make_operator_progress(
+            progbar,
+            len(terms),
+            desc="tree-mpo-term",
+        )
+        peak_bond = None
         for support, term in terms.items():
             term_operator = TreeMPO.from_terms(
                 plan,
@@ -2166,6 +2314,7 @@ class ham_tn:
             self._apply_tree_backend(term_operator, backend)
             if operator is None:
                 operator = term_operator
+                peak_bond = _operator_max_bond(operator)
                 if compression_enabled:
                     operator.compress(**compress_options)
             else:
@@ -2174,6 +2323,13 @@ class ham_tn:
                     compress=compression_enabled,
                     **compress_options,
                 )
+                peak_bond = _operator_max_bond(operator)
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=peak_bond,
+            )
         if backend is None and not compression_enabled:
             _structural_compress_tree(
                 operator,
@@ -2185,6 +2341,14 @@ class ham_tn:
                 bond_getter=operator.bond,
                 method="auto",
             )
+        _set_operator_progress_postfix(
+            progress_bar,
+            operator,
+            cap=max_bond,
+            peak=peak_bond,
+        )
+        if progress_bar is not None:
+            progress_bar.close()
         return operator
 
     to_treempo = to_tree_mpo
@@ -2203,12 +2367,13 @@ class ham_tn:
         cutoff_mode=None,
         data_type=None,
         mode=None,
-        compress=True,
+        compress=_DEFAULT_COMPRESSION,
         form=None,
         center=None,
         reduced=True,
         compress_opts=None,
         to_backend=_DEFAULT_BACKEND,
+        progbar=False,
     ):
         """Convert interactions directly to a native :class:`TreePEPO`.
 
@@ -2223,17 +2388,18 @@ class ham_tn:
         are factorized over their minimal tree spans and never pass through a
         chain MPO or a full dense lattice operator.
 
-        ``compress=True`` (the default) selects the workload-aware native
-        state-diagram route. Automaton assembly is compressed once after all
-        terms are assembled; term assembly is compressed after every added
-        term. These numerical compressions run only when an effective bond
-        cap is set. When no explicit ``plan``, retained-tree ``map_mode``, or
-        ``tree_order`` is supplied, its layout finder adapts the spanning
-        tree to the term supports. ``compress="automaton"`` forces the same
-        full native assembly, while ``compress="term"`` adds one factorized
-        term at a time. ``compress=False`` disables numerical compression,
-        and ``max_bond=None`` or ``False`` does the same. ``compress="auto"``
-        is the explicit spelling of the default automatic route.
+        ``compress="term"`` (the default) adds one factorized term at a time
+        and compresses after each addition. ``True`` and
+        ``compress="auto"`` select the workload-aware native state-diagram
+        route for compatibility. Automaton assembly is compressed once after
+        all terms are assembled; term assembly is compressed after every
+        added term. These numerical compressions run only when an effective
+        bond cap is set. When the automatic route has no explicit ``plan``,
+        retained-tree ``map_mode``, or ``tree_order``, its layout finder adapts
+        the spanning tree to the term supports. ``compress="automaton"``
+        forces the same full native assembly. ``compress=False`` disables
+        numerical compression, and ``max_bond=None`` or ``False`` does the
+        same.
 
         ``mode=`` remains a compatibility alias for the older separate
         strategy keyword; new code should put the strategy in ``compress=``.
@@ -2241,6 +2407,8 @@ class ham_tn:
         ``compress_opts`` accepts the native PEPO options ``form``, ``center``,
         and ``reduced``. The common ``max_bond``, ``cutoff``, and
         ``cutoff_mode`` defaults are inherited from ``ham_tn``.
+        ``progbar=True`` shows MPS-style term-construction progress with the
+        current ``chi`` and requested cap.
         """
         from ..optimizers.tree_peps import TreePepo
 
@@ -2376,6 +2544,11 @@ class ham_tn:
         if center is not None:
             compress_options["center"] = center
         if build_mode in {"analytic", "auto"}:
+            progress_bar = _make_operator_progress(
+                progbar,
+                1,
+                desc="tree-pepo",
+            )
             operator = TreePepo.from_terms(
                 plan,
                 terms,
@@ -2397,9 +2570,23 @@ class ham_tn:
                     bond_getter=operator.bond,
                     method="auto",
                 )
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=_operator_max_bond(operator),
+            )
+            if progress_bar is not None:
+                progress_bar.close()
             return operator
 
         operator = None
+        progress_bar = _make_operator_progress(
+            progbar,
+            len(terms),
+            desc="tree-pepo-term",
+        )
+        peak_bond = None
         for support, term in terms.items():
             term_operator = TreePepo.from_terms(
                 plan,
@@ -2411,6 +2598,7 @@ class ham_tn:
             self._apply_tree_backend(term_operator, backend)
             if operator is None:
                 operator = term_operator
+                peak_bond = _operator_max_bond(operator)
                 if compression_enabled:
                     operator.compress(**compress_options)
             else:
@@ -2419,6 +2607,13 @@ class ham_tn:
                     compress=compression_enabled,
                     **compress_options,
                 )
+                peak_bond = _operator_max_bond(operator)
+            _advance_operator_progress(
+                progress_bar,
+                operator,
+                cap=max_bond,
+                peak=peak_bond,
+            )
         if backend is None and not compression_enabled:
             _structural_compress_tree(
                 operator,
@@ -2430,6 +2625,14 @@ class ham_tn:
                 bond_getter=operator.bond,
                 method="auto",
             )
+        _set_operator_progress_postfix(
+            progress_bar,
+            operator,
+            cap=max_bond,
+            peak=peak_bond,
+        )
+        if progress_bar is not None:
+            progress_bar.close()
         return operator
 
     to_treepepsmpo = to_tree_pepo

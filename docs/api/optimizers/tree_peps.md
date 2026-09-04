@@ -190,6 +190,13 @@ channels, and leaves the retained tree geometry unchanged. Backend tensors
 that carry autodiff or native symmetry metadata continue through their
 existing compression paths.
 
+`ham_tn.to_tree_pepo(...)` defaults to `compress="term"`, so it adds and
+compresses one term at a time. Pass `compress=True` or `compress="auto"` for
+the workload-aware route, or `compress="automaton"` to force full native
+assembly. Pass `progbar=True` for the matching MPS-style construction bar.
+Term mode advances once per added term and reports the current `chi` against
+the requested cap; the progress-bar default is `False`.
+
 For an explicit path-method selection, the same call can retain both layers
 until Quimb compresses them:
 
