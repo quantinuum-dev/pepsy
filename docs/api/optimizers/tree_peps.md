@@ -183,6 +183,13 @@ canonical method and event names are `apply_sub_treepepo` and
 the same implementation. The full-operator event also accepts the matching
 `tree_pepsmpo_event` spelling. No second MPO representation is created.
 
+Dense `TreePEPO` term sums also receive an exact structural edge sweep before
+their center-oriented SVD compression. The sweep is restricted to NumPy
+arrays, removes proportional and roundoff-safe linearly dependent boundary
+channels, and leaves the retained tree geometry unchanged. Backend tensors
+that carry autodiff or native symmetry metadata continue through their
+existing compression paths.
+
 For an explicit path-method selection, the same call can retain both layers
 until Quimb compresses them:
 

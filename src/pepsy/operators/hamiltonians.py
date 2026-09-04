@@ -22,6 +22,10 @@ from .._internal.formatting import (
 )
 from ..tensors.core import OneDMap
 from ..tensors.bonds import new_native_bond
+from ._structural_compression import (
+    _structural_compress_mpo,
+    _structural_compress_tree,
+)
 from .mpo_automaton import MPOAutomaton
 
 __all__ = [
@@ -1315,6 +1319,7 @@ class ham_tn:
 
         automaton_records = None
         automaton = None
+        structural_applied = False
         if mode in {"automaton", "auto"}:
             automaton_records = builder._normalize_automaton_terms(
                 tuple(ints),
@@ -1344,6 +1349,16 @@ class ham_tn:
                 )
                 if to_backend is not None:
                     builder._apply_to_backend(mpo_total, to_backend)
+                elif automaton is not None:
+                    # Remove exact boundary dependencies before the optional
+                    # numerical sweep. This is the dense analogue of
+                    # deparallelization/delinearization and leaves the
+                    # public builder API and automaton route unchanged.
+                    _structural_compress_mpo(
+                        mpo_total,
+                        method="auto",
+                    )
+                    structural_applied = True
                 if compression_enabled:
                     mpo_total.compress(**compress_options)
 
@@ -1362,14 +1377,33 @@ class ham_tn:
                     builder._apply_to_backend(mpo_term, to_backend)
                 mpo_total = mpo_total + mpo_term
                 if compression_enabled and compress_each:
+                    if to_backend is None:
+                        # Sequential direct sums can recreate parallel
+                        # boundary channels at every addition. Reduce them
+                        # before paying for this term's numerical SVD.
+                        _structural_compress_mpo(
+                            mpo_total,
+                            method="auto",
+                        )
+                        structural_applied = True
                     mpo_total.compress(**compress_options)
 
             if compression_enabled and not compress_each:
+                if to_backend is None:
+                    _structural_compress_mpo(
+                        mpo_total,
+                        method="auto",
+                    )
+                    structural_applied = True
                 mpo_total.compress(**compress_options)
         if to_backend is not None:
             # Keep the return boundary explicit in case a backend operation
             # materialized an intermediate NumPy array.
             builder._apply_to_backend(mpo_total, to_backend)
+        elif not structural_applied:
+            # The explicit term route can also leave exact dependencies after
+            # its additions. This is a no-op for an already reduced network.
+            _structural_compress_mpo(mpo_total, method="auto")
         return mpo_total
 
     def build_mpo(self, ints=None, **kwargs):
@@ -2105,6 +2139,17 @@ class ham_tn:
             self._apply_tree_backend(operator, backend)
             if compression_enabled:
                 operator.compress(**compress_options)
+            elif backend is None:
+                _structural_compress_tree(
+                    operator,
+                    root=operator.plan.root,
+                    parent=operator.plan.parent,
+                    children=operator.plan.children,
+                    nodes=operator.plan.nodes(),
+                    tensor_getter=operator.node_tensor,
+                    bond_getter=operator.bond,
+                    method="auto",
+                )
             return operator
 
         operator = None
@@ -2129,6 +2174,17 @@ class ham_tn:
                     compress=compression_enabled,
                     **compress_options,
                 )
+        if backend is None and not compression_enabled:
+            _structural_compress_tree(
+                operator,
+                root=operator.plan.root,
+                parent=operator.plan.parent,
+                children=operator.plan.children,
+                nodes=operator.plan.nodes(),
+                tensor_getter=operator.node_tensor,
+                bond_getter=operator.bond,
+                method="auto",
+            )
         return operator
 
     to_treempo = to_tree_mpo
@@ -2330,6 +2386,17 @@ class ham_tn:
             self._apply_tree_backend(operator, backend)
             if compression_enabled:
                 operator.compress(**compress_options)
+            elif backend is None:
+                _structural_compress_tree(
+                    operator,
+                    root=operator.plan.root,
+                    parent=operator.plan.parent,
+                    children=operator.plan.children,
+                    nodes=operator.sites,
+                    tensor_getter=operator.node_tensor,
+                    bond_getter=operator.bond,
+                    method="auto",
+                )
             return operator
 
         operator = None
@@ -2352,6 +2419,17 @@ class ham_tn:
                     compress=compression_enabled,
                     **compress_options,
                 )
+        if backend is None and not compression_enabled:
+            _structural_compress_tree(
+                operator,
+                root=operator.plan.root,
+                parent=operator.plan.parent,
+                children=operator.plan.children,
+                nodes=operator.sites,
+                tensor_getter=operator.node_tensor,
+                bond_getter=operator.bond,
+                method="auto",
+            )
         return operator
 
     to_treepepsmpo = to_tree_pepo

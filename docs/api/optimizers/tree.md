@@ -180,6 +180,14 @@ separately with the model-level `to_mpo(...)`; it is not stored on `TreeMPO`.
 checks every stored TTNO network against the
 TreePlan; `validate(check_canonical=True)` also checks the tracked operator
 `left_inds` directions when a canonical region is known.
+
+Dense `TreeMPO` builder outputs run the same exact structural boundary sweep
+over the rooted tree before the native tree SVD. It reduces proportional and
+roundoff-safe linearly dependent edge channels in a leaf-to-root and reverse
+pass, so direct-sum term assembly does not carry redundant states into every
+parent tensor. Native Symmray/fermionic networks are left on their existing
+charge-preserving QR/SVD route.
+
 `add_TreeMPO(..., compress=True)` first builds the tree direct sum and then runs
 the same native tree SVD sweep; its compression options are `max_bond`,
 `cutoff`, and `order`. The default `order="rank"` is a deterministic greedy

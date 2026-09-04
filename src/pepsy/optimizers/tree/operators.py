@@ -29,6 +29,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...operators._structural_compression import _structural_compress_tree
 from .layout import TreeLayoutFinder, TreePlan
 from ._display import ascii_lattice, ascii_tree
 
@@ -1956,13 +1957,35 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         cutoff = float(cutoff)
         reports = []
         for network in self.tree_networks:
-            reports.append(_compress_tree_operator(
+            raw_bond = max(
+                (network.ind_size(index) for index in network.inner_inds()),
+                default=1,
+            )
+            structural_report = _structural_compress_tree(
+                network,
+                root=self.plan.root,
+                parent=self.plan.parent,
+                children=self.plan.children,
+                nodes=self.plan.nodes(),
+                tensor_getter=lambda node: _tree_operator_tensor(network, node),
+                bond_getter=lambda node, neighbor: _tree_operator_bond(
+                    network, self.plan, node, neighbor,
+                ),
+                method="auto",
+            )
+            report = _compress_tree_operator(
                 network,
                 self.plan,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 order=order,
-            ))
+            )
+            report["structural"] = structural_report
+            # Report the pre-structural dimension as the raw dimension, so
+            # rank_reduced includes the exact pass as well as numerical SVD.
+            report["raw_max_bond"] = raw_bond
+            report["rank_reduced"] = report["final_max_bond"] < raw_bond
+            reports.append(report)
         self.cutoff = cutoff
         self.compressed = True
         self.pepsy_compression_report = reports[0] if len(reports) == 1 else reports

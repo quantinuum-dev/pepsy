@@ -10,6 +10,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ..._internal.quimb import quimb_1d_compression_function
+from ...operators._structural_compression import _structural_compress_tree
 from ..tree._display import ascii_tree
 from .plan import TreePepsPlan
 
@@ -1086,6 +1087,20 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             if center is None:
                 center = self.plan.root
         center = self.plan.resolve_site(center)
+        # TreePEPO direct sums can contain repeated boundary vectors even
+        # when no numerical bond cap is requested. Remove those exact dense
+        # dependencies before the existing native edge SVD sweep. Non-NumPy
+        # data (including native symmetric tensors) is left untouched.
+        _structural_compress_tree(
+            self,
+            root=self.plan.root,
+            parent=self.plan.parent,
+            children=self.plan.children,
+            nodes=self.sites,
+            tensor_getter=self.node_tensor,
+            bond_getter=self.bond,
+            method="auto",
+        )
         self.shift_orthogonality_center(center, info_c=info_c)
         order = sorted(
             (q for q in self.sites if q != center),
