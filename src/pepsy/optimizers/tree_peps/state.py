@@ -15,8 +15,8 @@ from ..._internal.quimb import (
     require_quimb_1d_compression_method,
 )
 from ._compression import (
+    iter_tree_compression_order,
     normalize_tree_compression_order,
-    tree_compression_order,
     tree_edge_rank_key,
 )
 from .plan import TreePepsPlan
@@ -1475,7 +1475,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             _skip_validate=True,
         )
 
-        edge_order = tree_compression_order(
+        edge_order = iter_tree_compression_order(
             self.plan,
             center=center,
             nodes=self.sites,
@@ -1597,25 +1597,30 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 return cutoff
 
             def descend(node, parent):
-                children = [
+                pending = {
                     neighbor
                     for neighbor in work.plan.neighbors(node)
                     if neighbor in region and neighbor != parent
-                ]
-                if order == "rank":
-                    children.sort(
-                        key=lambda child: (
-                            *tree_edge_rank_key(
-                                work.node_tensor(node),
-                                work.node_tensor(child),
-                                work.bond(node, child),
+                }
+                while pending:
+                    if order == "rank":
+                        # Re-score after each completed branch: its
+                        # compression can reduce a bond on ``node`` and
+                        # change the cost of the remaining siblings.
+                        child = min(
+                            pending,
+                            key=lambda candidate: (
+                                *tree_edge_rank_key(
+                                    work.node_tensor(node),
+                                    work.node_tensor(candidate),
+                                    work.bond(node, candidate),
+                                ),
+                                int(candidate),
                             ),
-                            int(child),
                         )
-                    )
-                else:
-                    children.sort()
-                for child in children:
+                    else:
+                        child = min(pending)
+                    pending.remove(child)
                     work._compress_edge_inplace(
                         node,
                         child,

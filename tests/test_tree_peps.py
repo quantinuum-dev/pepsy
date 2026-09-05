@@ -11,6 +11,7 @@ from pepsy.optimizers import (
     TreePepo,
     TreePepsOptimizer,
 )
+from pepsy.optimizers.tree_peps._compression import iter_tree_compression_order
 
 pytestmark = pytest.mark.smoke
 
@@ -336,6 +337,54 @@ def test_tree_peps_rank_compression_batches_validation_and_keeps_layout():
     depth.compress(max_bond=1, cutoff=0.0, order="depth")
     assert depth.max_bond() <= 1
     assert depth.is_canonical_form()
+
+
+def test_tree_rank_schedule_recomputes_after_each_reduction():
+    """Rank ordering must read dimensions changed by the previous SVD."""
+    class FakeTensor:
+        def __init__(self, inds, dims):
+            self.inds = tuple(inds)
+            self.dims = dims
+
+        def ind_size(self, ind):
+            return self.dims[ind]
+
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    dims = {f"p{site}": 2 for site in range(plan.size)}
+    dims.update(
+        {
+            f"b{min(site0, site1)}_{max(site0, site1)}": 4
+            for site0, site1 in plan.tree_edges
+        }
+    )
+    tensors = {
+        site: FakeTensor(
+            [f"p{site}"]
+            + [
+                f"b{min(site, neighbor)}_{max(site, neighbor)}"
+                for neighbor in plan.neighbors(site)
+            ],
+            dims,
+        )
+        for site in range(plan.size)
+    }
+
+    def bond(site0, site1):
+        return f"b{min(site0, site1)}_{max(site0, site1)}"
+
+    schedule = iter_tree_compression_order(
+        plan,
+        center=plan.root,
+        nodes=range(plan.size),
+        order="rank",
+        tensor_getter=tensors.__getitem__,
+        bond_getter=bond,
+    )
+    assert next(schedule) == (3, 2)
+    # A completed compression can change a bond incident on a remaining
+    # branch. The next choice must see that live dimension.
+    dims["b0_5"] = 100
+    assert next(schedule) == (4, 1)
 
 
 def test_tree_pepo_rank_and_depth_compression_preserve_exact_operator():

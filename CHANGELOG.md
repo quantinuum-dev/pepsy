@@ -18,8 +18,10 @@ Changes for the next release should be added here before the version is bumped.
   `TreePEPO` compression. The default `order="rank"` removes the currently
   cheapest legal leaf branch using live physical/virtual dimensions, while
   `order="depth"` preserves the previous farthest-first schedule. TreePeps
-  full sweeps now batch their expensive whole-network validation to one final
-  canonicality check; standalone edge operations retain validation by default.
+  full sweeps now re-score after each completed reduction and batch their
+  expensive whole-network validation to one final canonicality check;
+  localized `TreePepsOptimizer` sweeps re-score sibling branches in the same
+  way. Standalone edge operations retain validation by default.
 
 - Canonicalized tree layout names across the public handoff: TreeMPO,
   TreeTensorNetwork, and TreeOptimizer accept `map_mode="coarse-*"` for

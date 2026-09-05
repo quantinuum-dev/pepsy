@@ -33,17 +33,41 @@ def tree_compression_order(
     tensor_getter,
     bond_getter,
 ):
-    """Return a safe, geometry-aware leaf-to-center edge schedule.
+    """Return a snapshot of a safe leaf-to-center edge schedule.
 
-    ``rank`` is a cheap live-rank heuristic.  It only considers leaves of the
-    still-active connected tree, then scores the next edge using the current
-    tensor dimensions and bond dimension.  Thus a reduced child branch is
-    visible to the next decision, while every edge is still eliminated toward
-    the selected center.  ``depth`` retains the simple farthest-first order.
+    For compression code that performs an SVD between choices, use
+    :func:`iter_tree_compression_order` so ``order="rank"`` can inspect the
+    dimensions after each reduction. This tuple helper remains useful for
+    diagnostics and callers that need a fixed, non-mutating schedule.
+    """
 
-    The function deliberately receives tensor and bond accessors rather than a
-    concrete network class: TreePeps and TreePepo have different physical-leg
-    conventions but share this tree scheduling rule.
+    return tuple(
+        iter_tree_compression_order(
+            plan,
+            center=center,
+            nodes=nodes,
+            order=order,
+            tensor_getter=tensor_getter,
+            bond_getter=bond_getter,
+        )
+    )
+
+
+def iter_tree_compression_order(
+    plan,
+    *,
+    center,
+    nodes,
+    order="rank",
+    tensor_getter,
+    bond_getter,
+):
+    """Yield the next safe edge using the dimensions currently in memory.
+
+    The caller must perform the yielded compression before requesting the
+    next edge.  This is deliberately an iterator rather than a precomputed
+    tuple: an SVD can reduce the shared bond and change the cost of every
+    remaining edge incident on the same target tensor.
     """
 
     order = normalize_tree_compression_order(order)
@@ -54,20 +78,7 @@ def tree_compression_order(
             "tree compression requires a connected node set containing center"
         )
 
-    if order == "depth":
-        return tuple(
-            (
-                node,
-                plan.path(node, center)[1],
-            )
-            for node in sorted(
-                (node for node in nodes if node != center),
-                key=lambda node: (-len(plan.path(node, center)), int(node)),
-            )
-        )
-
     remaining = set(nodes)
-    schedule = []
     while len(remaining) > 1:
         leaves = [
             node
@@ -78,25 +89,26 @@ def tree_compression_order(
         if not leaves:
             raise ValueError("tree compression requires a connected node set")
 
-        scored = []
+        candidates = []
         for node in leaves:
             neighbor = next(
                 neighbor
                 for neighbor in plan.neighbors(node)
                 if neighbor in remaining
             )
-            tensor = tensor_getter(node)
-            target = tensor_getter(neighbor)
-            bond = bond_getter(node, neighbor)
-            scored.append(
-                (*tree_edge_rank_key(tensor, target, bond), int(node), node, neighbor)
-            )
+            if order == "rank":
+                tensor = tensor_getter(node)
+                target = tensor_getter(neighbor)
+                bond = bond_getter(node, neighbor)
+                key = tree_edge_rank_key(tensor, target, bond)
+            else:
+                # Farthest-first is the deterministic compatibility policy.
+                key = (-len(plan.path(node, center)),)
+            candidates.append((*key, int(node), node, neighbor))
 
-        _, _, _, _, node, neighbor = min(scored)
-        schedule.append((node, neighbor))
+        *_, node, neighbor = min(candidates)
+        yield node, neighbor
         remaining.remove(node)
-
-    return tuple(schedule)
 
 
 def tree_edge_rank_key(tensor, target, bond):

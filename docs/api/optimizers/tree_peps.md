@@ -302,6 +302,13 @@ and passed to Quimb's 1D compressor as an MPO-MPS-like network. No global
 dense lattice state is formed. For convenience, `mode="dm"` is accepted as a
 shorthand for direct TreePepo routing with `compression_mode="dm"`.
 
+For branching updates, `TreePepsOptimizer` applies the complete operator to
+the active connected span before truncating it. Its native leaf-to-center
+sweep re-scores the remaining legal branches after every SVD/QR reduction, so
+the next choice sees the current live bond dimensions; exterior branches are
+not compressed. This is a geometry-aware local SVD policy, not a global search
+over all possible tree gauges or layouts.
+
 `mode="sdc"`, `mode="src"`, and `mode="zipup"` are also accepted shorthands
 for direct TreePepo routing with the corresponding compression mode. On an
 explicit path topology, `compression_layout="auto"` uses Quimb's actual 1D

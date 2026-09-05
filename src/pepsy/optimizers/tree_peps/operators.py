@@ -12,7 +12,10 @@ import quimb.tensor as qtn
 from ..._internal.quimb import quimb_1d_compression_function
 from ...operators._structural_compression import _structural_compress_tree
 from ..tree._display import ascii_tree
-from ._compression import normalize_tree_compression_order, tree_compression_order
+from ._compression import (
+    iter_tree_compression_order,
+    normalize_tree_compression_order,
+)
 from .plan import TreePepsPlan
 
 __all__ = ["TreePEPO", "TreeSubPEPO", "TreePepo", "TreeSubPepo"]
@@ -1120,8 +1123,9 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             _validate=False,
         )
         # Structural reduction can change live dimensions before the final
-        # SVDs. Recompute the rank-aware schedule after that exact pass.
-        edge_order = tree_compression_order(
+        # SVDs. The iterator also recomputes the rank choice after every
+        # subsequent edge reduction.
+        edge_order = iter_tree_compression_order(
             self.plan,
             center=center,
             nodes=self.sites,
