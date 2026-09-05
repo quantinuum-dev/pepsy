@@ -2605,6 +2605,7 @@ class ham_tn:
                 operator = operator.add_operator(
                     term_operator,
                     compress=compression_enabled,
+                    _validate=False,
                     **compress_options,
                 )
                 peak_bond = _operator_max_bond(operator)
@@ -2625,6 +2626,7 @@ class ham_tn:
                 bond_getter=operator.bond,
                 method="auto",
             )
+            operator.validate()
         _set_operator_progress_postfix(
             progress_bar,
             operator,

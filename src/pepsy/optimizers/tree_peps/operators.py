@@ -828,6 +828,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         inplace=False,
         info_c=None,
         _force_full=False,
+        _validate=True,
         **canonize_opts,
     ):
         q = self.plan.resolve_site(site)
@@ -845,7 +846,8 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         )
         work._canonical_region = frozenset({q})
         work._set_isometry_metadata_from_region({q})
-        work.validate(check_canonical=True)
+        if _validate:
+            work.validate(check_canonical=True)
         work._sync_info_c(info_c)
         return work
 
@@ -1030,6 +1032,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         absorb="right",
         reduced=True,
         info_c=None,
+        _validate=True,
         **compress_opts,
     ):
         q0, q1 = self._edge_sites(site0, site1)
@@ -1057,7 +1060,8 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         )
         self._track_edge_center(q0, q1, absorb, previous=previous)
         self._sync_info_c(info_c)
-        self.validate()
+        if _validate:
+            self.validate()
         return self
 
     def compress(
@@ -1101,7 +1105,11 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             bond_getter=self.bond,
             method="auto",
         )
-        self.shift_orthogonality_center(center, info_c=info_c)
+        self.shift_orthogonality_center(
+            center,
+            info_c=info_c,
+            _validate=False,
+        )
         order = sorted(
             (q for q in self.sites if q != center),
             key=lambda q: (-len(self.plan.path(q, center)), q),
@@ -1116,6 +1124,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 cutoff_mode=cutoff_mode,
                 absorb="right",
                 reduced=reduced,
+                _validate=False,
             )
         self._canonical_region = frozenset({center})
         self._set_isometry_metadata_from_region({center})
@@ -1130,6 +1139,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         inplace=False,
         negate=False,
         compress=False,
+        _validate=True,
         **compress_opts,
     ):
         """Add another matching ``TreePepo`` exactly by direct sum.
@@ -1194,7 +1204,8 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         network._canonical_region = None
         for site in network.sites:
             network.node_tensor(site).modify(left_inds=None)
-        network.validate()
+        if _validate:
+            network.validate()
         if compress:
             network.compress(**compress_opts)
         if inplace:

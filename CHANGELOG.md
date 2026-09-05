@@ -43,6 +43,11 @@ Changes for the next release should be added here before the version is bumped.
   `compress_each=` remain compatibility spellings. Automatic native tree
   conversions also choose a layout from the interaction supports when no plan
   or mapping is supplied.
+
+- Batched internal `TreePEPO` validation across each full compression sweep.
+  Standalone edge compression still validates by default, while term-by-term
+  and one-shot builder paths avoid repeating the quadratic whole-network
+  topology check after every compressed edge.
   `TreeMPO.show()` now keeps the clean native ASCII tree as its default, and
   `TreePEPO` retains its `TreePepsLayoutFinder` metadata through later
   operations.

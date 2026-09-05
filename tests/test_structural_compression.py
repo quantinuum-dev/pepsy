@@ -353,3 +353,42 @@ def test_tree_builders_use_structural_compression_without_a_bond_cap():
         dtype=np.dtype("complex128"),
     )
     assert np.allclose(tree_pepo.to_dense(), raw_tree_pepo.to_dense())
+
+
+def test_tree_pepo_compress_validates_once_after_the_full_sweep(monkeypatch):
+    """TreePEPO does not re-run its quadratic validation for every edge."""
+    from pepsy.optimizers import TreePEPO, TreePepsPlan
+
+    z_op = quimb.pauli("Z", dtype="complex128")
+    builder = py.ham_tn(shape=(3, 3), data_type="complex128")
+    terms = [
+        ((z_op, z_op), ((0, 0), (2, 2)), 1.2),
+        ((z_op, z_op), ((0, 1), (2, 1)), 0.8),
+    ]
+    plan = TreePepsPlan.from_shape((3, 3), map_mode="span-up")
+    normalized = builder._normalize_tree_terms(
+        plan,
+        terms,
+        phys_dim=2,
+        dtype=np.dtype("complex128"),
+    )
+    operator = TreePEPO.from_terms(
+        plan,
+        normalized,
+        dims=2,
+        dtype=np.dtype("complex128"),
+    )
+
+    calls = []
+    original_validate = TreePEPO.validate
+
+    def capture_validate(target, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_validate(target, *args, **kwargs)
+
+    monkeypatch.setattr(TreePEPO, "validate", capture_validate)
+    operator.compress(max_bond=2, cutoff=1e-12)
+
+    assert len(calls) == 1
+    assert all(call.get("check_canonical") for call in calls)
+    assert operator.validate()
