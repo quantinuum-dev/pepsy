@@ -12,6 +12,7 @@ import quimb.tensor as qtn
 from ..._internal.quimb import quimb_1d_compression_function
 from ...operators._structural_compression import _structural_compress_tree
 from ..tree._display import ascii_tree
+from ._compression import normalize_tree_compression_order, tree_compression_order
 from .plan import TreePepsPlan
 
 __all__ = ["TreePEPO", "TreeSubPEPO", "TreePepo", "TreeSubPepo"]
@@ -1073,9 +1074,16 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         cutoff=1e-10,
         cutoff_mode="rsum2",
         reduced=True,
+        order="rank",
         info_c=None,
     ):
-        """Compress operator bonds inward toward ``center``."""
+        """Compress operator bonds inward toward ``center``.
+
+        ``order="rank"`` greedily removes the currently cheapest leaf
+        branch using live tensor dimensions, while preserving the fixed
+        ``TreePepsPlan`` topology. ``order="depth"`` keeps the simple
+        farthest-first schedule for reproducibility and comparison.
+        """
 
         if form is not None:
             if center is not None:
@@ -1091,6 +1099,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             if center is None:
                 center = self.plan.root
         center = self.plan.resolve_site(center)
+        order = normalize_tree_compression_order(order)
         # TreePEPO direct sums can contain repeated boundary vectors even
         # when no numerical bond cap is requested. Remove those exact dense
         # dependencies before the existing native edge SVD sweep. Non-NumPy
@@ -1110,12 +1119,17 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             info_c=info_c,
             _validate=False,
         )
-        order = sorted(
-            (q for q in self.sites if q != center),
-            key=lambda q: (-len(self.plan.path(q, center)), q),
+        # Structural reduction can change live dimensions before the final
+        # SVDs. Recompute the rank-aware schedule after that exact pass.
+        edge_order = tree_compression_order(
+            self.plan,
+            center=center,
+            nodes=self.sites,
+            order=order,
+            tensor_getter=self.node_tensor,
+            bond_getter=self.bond,
         )
-        for q in order:
-            toward = self.plan.path(q, center)[1]
+        for q, toward in edge_order:
             self.compress_edge_(
                 q,
                 toward,
@@ -1305,7 +1319,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             layout_finder=self.layout_finder or other.layout_finder,
         )
         if compress:
-            result.compress(max_bond=max_bond, cutoff=cutoff)
+            result.compress(max_bond=max_bond, cutoff=cutoff, order=order)
         if inplace:
             self.__dict__.clear()
             self.__dict__.update(result.__dict__)
@@ -1359,6 +1373,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         compression_mode="direct",
         compression_seed=None,
         compression_layout="auto",
+        order="rank",
         info_c=None,
         _active_sites=None,
     ):
@@ -1395,6 +1410,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 raise ValueError("active_sites must contain the complete operator span")
         compression_mode = _normalize_compression_mode(compression_mode)
         compression_layout = _normalize_compression_layout(compression_layout)
+        order = normalize_tree_compression_order(order)
         if compression_layout == "two_layer":
             if not state.plan.is_mps_topology:
                 raise NotImplementedError(
@@ -1505,6 +1521,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 reduced=reduced,
                 compression_mode=compression_mode,
                 compression_seed=compression_seed,
+                order=order,
                 info_c=info_c,
             )
         if inplace:

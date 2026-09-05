@@ -2405,8 +2405,9 @@ class ham_tn:
         strategy keyword; new code should put the strategy in ``compress=``.
 
         ``compress_opts`` accepts the native PEPO options ``form``, ``center``,
-        and ``reduced``. The common ``max_bond``, ``cutoff``, and
-        ``cutoff_mode`` defaults are inherited from ``ham_tn``.
+        ``reduced``, and ``order`` (``"rank"`` or ``"depth"``). The common
+        ``max_bond``, ``cutoff``, and ``cutoff_mode`` defaults are inherited
+        from ``ham_tn``.
         ``progbar=True`` shows MPS-style term-construction progress with the
         current ``chi`` and requested cap.
         """
@@ -2511,6 +2512,9 @@ class ham_tn:
                 center = value
         if "reduced" in compress_extra:
             reduced = compress_extra.pop("reduced")
+        compress_order = compress_extra.pop("order", "rank")
+        if compress_order not in {"rank", "depth"}:
+            raise ValueError("TreePEPO compression order must be 'rank' or 'depth'.")
         if compress_extra:
             names = ", ".join(sorted(compress_extra))
             raise TypeError(
@@ -2538,6 +2542,7 @@ class ham_tn:
             "cutoff": cutoff,
             "cutoff_mode": cutoff_mode,
             "reduced": reduced,
+            "order": compress_order,
         }
         if form is not None:
             compress_options["form"] = form

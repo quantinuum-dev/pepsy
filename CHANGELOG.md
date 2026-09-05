@@ -14,6 +14,13 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- Added a geometry-aware rank scheduling policy to native `TreePeps` and
+  `TreePEPO` compression. The default `order="rank"` removes the currently
+  cheapest legal leaf branch using live physical/virtual dimensions, while
+  `order="depth"` preserves the previous farthest-first schedule. TreePeps
+  full sweeps now batch their expensive whole-network validation to one final
+  canonicality check; standalone edge operations retain validation by default.
+
 - Canonicalized tree layout names across the public handoff: TreeMPO,
   TreeTensorNetwork, and TreeOptimizer accept `map_mode="coarse-*"` for
   lattice coarsening/traversal, while TreePEPO, TreePeps, and

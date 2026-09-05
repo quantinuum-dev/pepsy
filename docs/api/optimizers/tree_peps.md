@@ -160,7 +160,12 @@ store each proven outward isometry in the tensor's Quimb-compatible
 when those local proofs already establish the required edge gauge. A
 multi-site canonical region can be reduced to a center before the path move,
 and the center-oriented compression sweep performs the inward edge reductions
-without a redundant full-tree QR. Callers that already use Quimb-style
+without a redundant full-tree QR. Native tree compression uses the same kind
+of live rank-aware scheduling as `TreeMPO`: at each step it chooses among the
+current leaves using the physical and virtual dimensions, then removes that
+branch toward the selected center. Pass `order="depth"` to retain the
+deterministic farthest-first schedule. The plan and lattice layout are never
+changed by either policy. Callers that already use Quimb-style
 optimizer state can pass a mutable `info_c` mapping to synchronize
 `cur_orthog`, `canonical_region`, `isometry_map`, and `left_inds` snapshots.
 

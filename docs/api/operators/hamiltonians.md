@@ -152,8 +152,9 @@ always wins. `compress="automaton"` forces full native assembly. These
 numerical compressions require an effective bond cap. The native tree
 compression options are
 `order="rank"` or
-`order="depth"` for `TreeMPO`, and `form`, `center`, and `reduced` for
-`TreePEPO`; common `max_bond`, `cutoff`, and `cutoff_mode` values come from
+`order="depth"` for both native `TreeMPO` and `TreePEPO` compression, and
+`form`, `center`, and `reduced` are also accepted by `TreePEPO`; common
+`max_bond`, `cutoff`, and `cutoff_mode` values come from
 `ham_tn` unless overridden. An omitted `max_bond` inherits that builder cap;
 `max_bond=None` or `False` disables numerical compression. For a consistent
 conversion API, `compress=` is

@@ -313,6 +313,65 @@ def test_tree_peps_moves_from_canonical_region_using_left_inds():
     assert state.validate(check_canonical=True)
 
 
+def test_tree_peps_rank_compression_batches_validation_and_keeps_layout():
+    """Full native compression chooses legal branches and validates once."""
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    state = TreePeps.rand(plan, bond_dim=2, seed=23, canonicalize=True)
+    validate_calls = []
+    original_validate = state.validate
+
+    def capture_validate(*args, **kwargs):
+        validate_calls.append(kwargs.get("check_canonical", False))
+        return original_validate(*args, **kwargs)
+
+    state.validate = capture_validate
+    state.compress(max_bond=1, cutoff=0.0, order="rank")
+
+    assert validate_calls == [True]
+    assert state.max_bond() <= 1
+    assert state.plan_signature == TreePeps.from_plan(plan).plan_signature
+    assert state.is_canonical_form()
+
+    depth = TreePeps.rand(plan, bond_dim=2, seed=23, canonicalize=True)
+    depth.compress(max_bond=1, cutoff=0.0, order="depth")
+    assert depth.max_bond() <= 1
+    assert depth.is_canonical_form()
+
+
+def test_tree_pepo_rank_and_depth_compression_preserve_exact_operator():
+    """Both fixed-topology TreePEPO schedules preserve an uncapped operator."""
+    plan = TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    x = np.array([[0, 1], [1, 0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    source = TreePepo.from_terms(
+        plan,
+        {
+            (0, 5): np.kron(x, z),
+            (1, 4): np.kron(z, x),
+        },
+    )
+    expected = np.asarray(source.to_dense().data)
+
+    for order in ("rank", "depth"):
+        compressed = source.copy()
+        compressed.compress(max_bond=None, cutoff=0.0, order=order)
+        np.testing.assert_allclose(
+            np.asarray(compressed.to_dense().data), expected, atol=1e-10, rtol=1e-10
+        )
+        assert compressed.is_canonical_form()
+
+        bounded = source.copy()
+        bounded.compress(max_bond=1, cutoff=0.0, order=order)
+        assert bounded.max_bond() <= 1
+        assert bounded.is_canonical_form()
+
+    with pytest.raises(ValueError, match="tree compression order"):
+        source.copy().compress(max_bond=1, order="invalid")
+    with pytest.raises(ValueError, match="tree compression order"):
+        TreePeps.rand(plan, bond_dim=2, seed=24).compress(
+            max_bond=1, cutoff=0.0, order="invalid"
+        )
+
 def test_tree_peps_supports_three_dimensional_coordinate_tags():
     plan = TreePepsPlan.from_shape((2, 1, 2), topology="path")
     state = TreePeps.from_plan(plan)

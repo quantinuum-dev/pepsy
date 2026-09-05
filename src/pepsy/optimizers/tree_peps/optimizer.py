@@ -2284,6 +2284,7 @@ class TreePepsOptimizer:
         cutoff_mode=None,
         compression_mode=None,
         compression_seed=None,
+        order="rank",
     ):
         """Compress the whole tree or only a selected gate-like span.
 
@@ -2291,6 +2292,8 @@ class TreePepsOptimizer:
         used after a gate update. It canonicalizes only the minimal requested
         span when ``span=True`` and leaves exterior virtual bonds untouched.
         With no sites, the complete tree is compressed toward ``center``.
+        ``order="rank"`` uses live tree dimensions to choose the next branch;
+        ``order="depth"`` retains the deterministic farthest-first schedule.
         """
 
         max_bond = self.chi if max_bond is _UNSET else self._normalize_max_bond(max_bond)
@@ -2316,6 +2319,7 @@ class TreePepsOptimizer:
                     self.compression_seed
                     if compression_seed is None else compression_seed
                 ),
+                order=order,
                 info_c=self.info_c,
             )
         else:
@@ -2334,6 +2338,7 @@ class TreePepsOptimizer:
                     self.compression_seed
                     if compression_seed is None else compression_seed
                 ),
+                order=order,
                 inplace=True,
                 info_c=self.info_c,
             )

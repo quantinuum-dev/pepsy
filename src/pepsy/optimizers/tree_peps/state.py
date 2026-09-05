@@ -14,6 +14,11 @@ from ..._internal.quimb import (
     quimb_1d_compression_function,
     require_quimb_1d_compression_method,
 )
+from ._compression import (
+    normalize_tree_compression_order,
+    tree_compression_order,
+    tree_edge_rank_key,
+)
 from .plan import TreePepsPlan
 
 __all__ = ["TreePeps"]
@@ -1306,6 +1311,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         compression_mode="direct",
         compression_seed=None,
         info_c=None,
+        _validate=True,
         **compress_opts,
     ):
         """In-place compression of one edge with canonical-center tracking.
@@ -1330,6 +1336,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             compression_mode=compression_mode,
             compression_seed=compression_seed,
             info_c=info_c,
+            _validate=_validate,
             **compress_opts,
         )
 
@@ -1346,6 +1353,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         compression_mode="direct",
         compression_seed=None,
         info_c=None,
+        _validate=True,
         **compress_opts,
     ):
         q0 = self.plan.resolve_site(site0)
@@ -1398,7 +1406,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
         )
         self._track_edge_center(q0, q1, absorb, previous=previous)
         self._sync_info_c(info_c)
-        self.validate()
+        if _validate:
+            self.validate()
         return self
 
     def _track_edge_center(self, q0, q1, absorb, *, previous):
@@ -1420,9 +1429,17 @@ class TreePeps(qtn.TensorNetworkGenVector):
         reduced=True,
         compression_mode="direct",
         compression_seed=None,
+        order="rank",
         info_c=None,
     ):
-        """Compress the tree inward toward a selected canonical center."""
+        """Compress the tree inward toward a selected canonical center.
+
+        ``order="rank"`` greedily removes the currently cheapest leaf
+        branch from the live tree, using physical and virtual dimensions
+        after each reduction. ``order="depth"`` retains the simple
+        farthest-first schedule. Both policies preserve the selected
+        ``TreePepsPlan`` topology.
+        """
 
         if form is not None:
             if center is not None:
@@ -1438,6 +1455,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             if center is None:
                 center = self.plan.root
         center = self.plan.resolve_site(center)
+        order = normalize_tree_compression_order(order)
         compression_mode = _normalize_compression_mode(compression_mode)
         if compression_mode in {"sdc", "src", "zipup"} and self.plan.is_mps_topology:
             self._compress_path_region_1d(
@@ -1451,14 +1469,21 @@ class TreePeps(qtn.TensorNetworkGenVector):
             self._canonical_region = None
             self.canonize_to(center, inplace=True, info_c=info_c, _force_full=True)
             return self
-        self.shift_orthogonality_center(center, info_c=info_c)
-
-        order = sorted(
-            (q for q in self.sites if q != center),
-            key=lambda q: (-len(self.plan.path(q, center)), q),
+        self.shift_orthogonality_center(
+            center,
+            info_c=info_c,
+            _skip_validate=True,
         )
-        for q in order:
-            toward = self.plan.path(q, center)[1]
+
+        edge_order = tree_compression_order(
+            self.plan,
+            center=center,
+            nodes=self.sites,
+            order=order,
+            tensor_getter=self.node_tensor,
+            bond_getter=self.bond,
+        )
+        for q, toward in edge_order:
             self._compress_edge_inplace(
                 q,
                 toward,
@@ -1469,6 +1494,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 reduced=reduced,
                 compression_mode=compression_mode,
                 compression_seed=compression_seed,
+                _validate=False,
             )
         # The inward sweep has already established the defining isometries.
         # Record the final center directly instead of running a second full
@@ -1491,6 +1517,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         reduced=True,
         compression_mode="direct",
         compression_seed=None,
+        order="rank",
         inplace=False,
         info_c=None,
     ):
@@ -1522,6 +1549,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         center = work.plan.resolve_site(center)
         if center not in region:
             raise ValueError("center must lie inside the compressed subtree")
+        order = normalize_tree_compression_order(order)
 
         compression_mode = _normalize_compression_mode(compression_mode)
         if compression_mode in {"sdc", "src", "zipup"} and work.plan.is_mps_topology:
@@ -1569,11 +1597,24 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 return cutoff
 
             def descend(node, parent):
-                children = sorted(
+                children = [
                     neighbor
                     for neighbor in work.plan.neighbors(node)
                     if neighbor in region and neighbor != parent
-                )
+                ]
+                if order == "rank":
+                    children.sort(
+                        key=lambda child: (
+                            *tree_edge_rank_key(
+                                work.node_tensor(node),
+                                work.node_tensor(child),
+                                work.bond(node, child),
+                            ),
+                            int(child),
+                        )
+                    )
+                else:
+                    children.sort()
                 for child in children:
                     work._compress_edge_inplace(
                         node,
@@ -1585,6 +1626,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
                         reduced=reduced,
                         compression_mode=compression_mode,
                         compression_seed=compression_seed,
+                        _validate=False,
                     )
                     descend(child, node)
                     work.canonize_edge_(child, node, absorb="right")
@@ -1609,6 +1651,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
         reduced=True,
         compression_mode="direct",
         compression_seed=None,
+        order="rank",
         info_c=None,
     ):
         """In-place alias for :meth:`compress_subtree`."""
@@ -1623,6 +1666,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
             reduced=reduced,
             compression_mode=compression_mode,
             compression_seed=compression_seed,
+            order=order,
             inplace=True,
             info_c=info_c,
         )

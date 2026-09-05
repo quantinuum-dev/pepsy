@@ -149,6 +149,7 @@ def test_ham_tn_supports_direct_tree_map_mode_conversion():
         terms,
         map_mode="coarse-alternate-x",
         form="left",
+        compress_opts={"order": "depth"},
     )
 
     assert builder.map_mode == "row-major"

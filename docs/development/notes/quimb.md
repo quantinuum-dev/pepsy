@@ -168,3 +168,26 @@ to the user gate, never to internal routing SWAPs.
   TreeMPO, TreePEPS, and public API suites; the updated `tn_stab.ipynb` also
   executes end to end. Documentation build was not completed because the
   active environment is missing the optional `autoapi` Sphinx extension.
+
+## 2026-09-04 TreePeps / TreePEPO compression audit
+
+- The active environment reports Quimb `1.15.1.dev39+g369d09b9d`, Autoray
+  `0.11.1.dev1+gc56f64427`, Cotengra `0.8.3.dev6+g08fe1a3a1`, and Symmray
+  `0.3.2.dev6+ga17699db6`. Probes reconfirmed that generic arbitrary-geometry
+  compression exposes local `compress_between`/`canonize_between` only; the
+  environment compressors remain a path-only integration.
+- Native `TreePeps` and `TreePEPO` compression now use a fixed-topology,
+  live-rank leaf schedule by default. The scheduler scores current physical
+  and virtual dimensions after each legal leaf reduction, with a deterministic
+  `order="depth"` compatibility schedule. This is layout-aware through the
+  retained `TreePepsPlan` paths and never relayouts an entangled state.
+- Full TreePeps sweeps now defer the expensive whole-network validation until
+  the final canonicality check, matching the already-batched TreePEPO path;
+  standalone edge operations still validate by default. The public TreePEPO
+  application, composition, Hamiltonian builder, and TreePeps optimizer
+  surfaces forward the order selection.
+- Focused validation after the change: the TreePeps state/optimizer suite
+  passed `90` tests with one existing Quimb warning; Python compilation was
+  clean. The implementation remains SVD-based on arbitrary trees; Quimb's
+  path-only SDC/SRC/ZipUp and the paper's projected-Cholesky CBC algorithm are
+  unchanged.
