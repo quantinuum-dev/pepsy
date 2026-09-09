@@ -48,6 +48,7 @@ _SYMBOL_MODULES = {
     "SweepOptimizer": ".sweep",
     "TreeLayoutFinder": ".tree",
     "TreeMPO": ".tree",
+    "SubTreeMPO": ".tree",
     "TreeOptimizer": ".tree",
     "TreePlan": ".tree",
     "build_tree_operator": ".tree",

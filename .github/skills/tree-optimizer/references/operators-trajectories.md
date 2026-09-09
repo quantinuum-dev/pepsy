@@ -6,7 +6,7 @@ replay backed by `TreeOptimizer`.
 
 ## Tree-native MPO API
 
-`TreeOptimizer.apply_sub_mpotree` is the primary gate-to-TreeMPO entry point.
+`TreeOptimizer.apply_sub_mpotree` is the primary gate-to-SubTreeMPO entry point.
 Ordinary gate replay and explicit TreeMPO application share it across modes.
 Keep `apply_subtreempo` / `apply_sub_tree_mpo` / `apply_subttno` as aliases;
 `sub_mpotree_event` retains the established stream marker. The FIT traversal
@@ -25,7 +25,14 @@ declared sector maps after sparse contraction, and explicitly unpack Symmray
 blocks before Autoray host conversion. Fused or trimmed charge bases are not
 the full physical output basis. Keep this expansion confined to dense readout.
 
-Only builder-proven unchanged exterior identities permit support-based
+Local gates build `SubTreeMPO` directly on their Steiner subtree. Its exterior
+identity action is implicit; never allocate a full TreeMPO identity layer
+and strip it afterward. Preserve original node IDs, physical tags, input/output
+indices, compact copies, and region-local validation. FIT targets have state
+tensors alone outside the operator region. Full `TreeMPO` remains the general
+operator representation with the distinct proof rule below.
+
+For full TreeMPO objects, only builder-proven unchanged exterior identities permit support-based
 elision. Keep this proof through copies, identity-preserving conjugation and
 internal backend conversion; drop to full-tree application after exterior
 tensor changes or for unproven external operators. After unmanaged in-place

@@ -103,6 +103,39 @@ def test_incremental_fit_matches_full_branch_sweeps(schedule):
     fast.p.validate(check_canonical=True)
 
 
+def test_cached_messages_survive_nonadjacent_block_updates_and_rank_changes():
+    """Compare every directed cache entry against a whole-branch contraction."""
+    plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=3, seed=813)
+    optimizer = TreeOptimizer(None, state=state, run=False)
+    rng = np.random.default_rng(814)
+    gate = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
+    target, _ = optimizer._build_tree_fit_target(gate, (0, 2, 5))
+    fit = TreeFIT(target, state, max_bond=2, cutoffs=0., traversal="auto")
+    edges = [(u, v) for u in fit.nodes for v in fit.p.neighbors(u)]
+    blocks = {
+        1: [(n,) for n in fit.nodes],
+        2: fit._connected_edges(fit.nodes),
+        3: fit._connected_triples(fit.nodes),
+    }
+    for edge in edges:
+        fit._message(*edge)
+    reused = 0
+    for size in (3, 1, 2, 3, 2, 1, 3, 1, 2):
+        block = blocks[size][int(rng.integers(len(blocks[size])))]
+        previous = dict(fit._messages)
+        fit.fit_block(block, center=block[-1])
+        reused += sum(previous[edge] is tensor for edge, tensor in fit._messages.items())
+        for edge in edges:
+            expected = _full_branch_message(fit, *edge)
+            actual = fit._message(*edge).transpose(*expected.inds)
+            np.testing.assert_allclose(actual.data, expected.data, atol=1e-10, rtol=1e-10)
+        assert len(fit._messages) == len(edges)
+        assert not fit._effective_cache
+    assert reused > 0
+    assert fit.p.is_canonical_form()
+
+
 @pytest.mark.parametrize("traversal", ["depth", "auto"])
 def test_incremental_fit_preserves_even_native_fermionic_state(monkeypatch, traversal):
     pytest.importorskip("symmray")
@@ -334,6 +367,33 @@ def test_fit_skips_interior_qr_and_reuses_sweep_order(backend, block_size, monke
     np.testing.assert_allclose(fast.p.to_dense(), reference.p.to_dense(), atol=1e-9)
     np.testing.assert_allclose(fast.local_norm_trace, reference.local_norm_trace, atol=1e-9)
     fast.p.validate(check_canonical=True)
+
+
+@pytest.mark.parametrize("gauge", ["contained", "equal", "unknown"])
+def test_fit_region_preparation_does_not_collapse_block(gauge, monkeypatch):
+    plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=2, seed=719)
+    path = plan.node_path(plan.node_of_qubit[0], plan.node_of_qubit[5])
+    block = tuple(path[:3])
+    fit = TreeFIT(state, state, max_bond=16, cutoffs=0.)
+    fit.p.canonize_subtree_(block[:2] if gauge == "contained" else block)
+    if gauge == "unknown":
+        fit.p.invalidate_canonical_form()
+    before = fit.p.to_dense()
+    outside = next(n for n in fit.p.neighbors(block[-1]) if n not in block)
+    message = fit._message(outside, block[-1])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("FIT must not collapse its block before replacing it")
+
+    monkeypatch.setattr(fit.p, "shift_orthogonality_center", forbidden)
+    if gauge != "unknown":
+        monkeypatch.setattr(fit.p, "canonize_subtree_", forbidden)
+    fit.fit_block(block, center=block[-1])
+    np.testing.assert_allclose(fit.p.to_dense(), before, atol=1e-11)
+    assert fit.p.is_canonical_form(block[-1])
+    if gauge != "unknown":
+        assert fit._message(outside, block[-1]) is message
 
 
 def test_three_node_fit_accepts_an_endpoint_center():

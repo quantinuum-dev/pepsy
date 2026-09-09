@@ -27,8 +27,8 @@ nodes of **any arity**; binary is the default, see *Non-binary trees* below)
 whose leaves carry physical qubit indices. An optional ``root_qubit`` is instead
 carried by the top tensor; all other physical sites remain leaves. A bundled gate stream
 `[(gate, where), ...]` is replayed. `where` is an integer or distinct integer
-support. All ordinary gates lower to TreeMPO and `apply_sub_mpotree`;
-`apply_subtree_operator` remains an explicit lower-level interface.
+support. All ordinary gates lower to compact SubTreeMPO and `apply_sub_mpotree`;
+`apply_subtree_operator` uses that same compact boundary in every mode.
 
 Preferred public handoff:
 
@@ -225,12 +225,15 @@ one-node case.
 ## Ordinary gate routing and local FIT
 
 Ordinary gate streams in `auto`, `direct`, `dm`, `sdc`, `src`, `zipup`,
-`mpo`, and DMRG modes build a TreeMPO and use `apply_sub_mpotree`. Explicit
+`mpo`, and DMRG modes build a SubTreeMPO and use `apply_sub_mpotree`. Explicit
 `submpo` still declares chain-MPO entries. Keep the target and disposable
 FIT guess separate; `guess-zipup` is an opt-in tree warm start.
 TreeFIT rejects odd-parity fermionic tensors because their graded local
 projection is unsupported; use native `direct` or `zipup` for those states.
 
+- Local gates use `SubTreeMPO.from_gate` on the Steiner subtree only.
+  Preserve original tags; never allocate exterior identities, even temporarily.
+  See `references/operators-trajectories.md` for the compact operator contract.
 - `direct` QR-routes the complete operator before canonical SVD compression.
   `dm` changes the local split to `svd:eig`. Dense `src` contracts product-noise
   complementary environments; `sdc` builds deterministic low-rank environments.
@@ -252,7 +255,6 @@ projection is unsupported; use native `direct` or `zipup` for those states.
 ## Low-level two-qubit gate = exact threading + one compression sweep
 
 This is the paper's accuracy point (Figs. 3-6) -- do not regress it.
-
 1. SVD-split the gate into left/right factors joined by a virtual bond
    (`cutoff=0.0`, exact rank `k <= 4`).
 2. Move the centre to physical node `a`, absorb the left factor into `a`.
@@ -299,24 +301,17 @@ parent blob -- this is exact up to the truncation.
 `apply_subtree_operator(op, where, *, max_bond=None, cutoff=None,
 renormalize=False)` applies a general operator on `k >= 1` qubits in one shot --
 a `k`-qubit gate, a multi-site **non-unitary / Kraus** operator, or a whole
-**Trotter block**. DMRG/zipup lower to TreeMPO and `apply_sub_mpotree`.
-The other modes retain this lower-level exact factor-and-route preparation,
-then compress the completed state. The following canonical sweep describes
-direct/DM; SRC/SDC instead use successive environments on the routed state.
+**Trotter block**. Every mode lowers to SubTreeMPO and `apply_sub_mpotree`.
+SRC/SDC use the original operator/state layers, never an already-routed
+enlarged state. The following canonical sweep describes direct/DM only.
 
 1. `snodes = _steiner_nodes(site_nodes)` -- minimal connected subtree spanning
    the target physical nodes.
-2. Move the centre onto a target physical node
-   (`_move_center(site_nodes[0])`, incremental)
-   so the **whole exterior is isometric toward the subtree**.
-3. Factor `op` into an exact tree-MPO on the same Steiner tree by packing each
-   `(output,input)` physical pair into a dimension-four leg and applying
-   leaf-to-hub SVDs.
-4. Absorb the tree-MPO into copied local state tensors. For each
-   `_peel_order(snodes)` edge, QR-split the child message while retaining all
-   physical and exterior state legs, then contract its new state bond into the
-   parent together with the old state/operator bonds. No dense state tensor for
-   the whole Steiner subtree is formed; the last node is the hub.
+2. Prepare only the exterior; reuse a contained canonical region or stop
+   an incoming center at the first entry into the subtree.
+3. Factor `op` into a compact SubTreeMPO using exact leaf-to-hub SVDs.
+4. QR-route child messages into parents, retaining physical and exterior
+   state legs. No dense state for the entire subtree is formed.
 5. Install every routed Q factor with its ``left_inds`` isometry metadata.
    Dense trees and charge-aligned native Symmray trees can then recover the
    hub centre through the normal canonical state machine without repeating
@@ -327,6 +322,12 @@ direct/DM; SRC/SDC instead use successive environments on the routed state.
    the destination tensor's live ``left_inds`` proves the required isometry;
    native graded SVD keeps Symmray's multiplet policy (chi may be exceeded).
    `renormalize=True` renormalises afterwards (for Kraus/projection).
+
+Native DM must reject before update accounting or tensor changes. Compact
+one-site unitaries are certified from their current physical matrix and
+absorbed without moving the canonical region or losing `left_inds` proofs;
+native odd operators retain the general graded route. Never infer unitarity
+from `track_norm`, a gate name, or a stale cached operator flag.
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator
@@ -488,8 +489,7 @@ The safety-net tests are `test_tree_matches_statevector` (untruncated fidelity
 must stay exactly 1.0), the multi-site / sibling / measurement regressions, and
 the state-handoff/backend cases: exact product TTN/MPS mounting, rejected
 entangled relayouts, native Torch controls/readout, and mixed-backend rejection.
-Add a regression test for every new behaviour and prefer `structure="balanced"`
-plans when a test needs deterministic sibling relationships.
+Add regressions for new behaviour; use `structure="balanced"` for deterministic siblings.
 
 For noisy trajectory changes, also run:
 

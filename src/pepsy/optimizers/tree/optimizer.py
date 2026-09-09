@@ -15,7 +15,7 @@ binary tree below a ternary virtual root, but flatter ``k``-ary trees
 * single-qubit gates are absorbed into their physical-site tensor (no bond growth); a
   unitary one-qubit gate preserves the tree canonical form regardless of where
   the orthogonality centre sits;
-* ordinary gate-stream entries are lowered to a true :class:`TreeMPO`, whose
+* ordinary gate-stream entries are lowered to a compact :class:`SubTreeMPO`, whose
   operator bonds are routed losslessly through the active canonical Steiner
   region before the affected state bonds are compressed; the operator and state
   are never lowered to a chain MPO for this path;
@@ -2592,6 +2592,14 @@ class TreeOptimizer:
         unitary update, but not for a general Kraus/filter operator whose
         physical norm is expected to change.
         """
+        if self.tn.fermionic and self.compression_mode == "dm":
+            # Reject before diagnostics, center preparation, or exact routing
+            # can alter the state. Native DM has no supported local split.
+            raise NotImplementedError(
+                "compression_mode='dm' is currently available for dense "
+                "tree tensors only; use compression_mode='direct' for "
+                "native fermionic trees."
+            )
         if self._active_update is not None:
             return False
         live_before = (
@@ -2743,8 +2751,8 @@ class TreeOptimizer:
     def _apply_gate_tree_mpo_impl(
         self, gate, logical_where, *, renormalize=False, track_norm=True
     ):
-        """Apply an ordinary gate through a true TreeMPO active span."""
-        from .operators import TreeMPO
+        """Build only the gate's Steiner operator region, never exterior identities."""
+        from .operators import SubTreeMPO
 
         logical_where = _normalize_where(logical_where)
         where = self._validate_support(logical_where)
@@ -2778,7 +2786,7 @@ class TreeOptimizer:
         if cache_hit:
             tree_mpo = cached[1]
         else:
-            tree_mpo = TreeMPO.from_gate(
+            tree_mpo = SubTreeMPO.from_gate(
                 self.plan,
                 gate,
                 where,
@@ -2912,11 +2920,11 @@ class TreeOptimizer:
     def _build_tree_fit_target(self, gate, logical_where):
         """Build an exact layered operator--state TreeFIT target."""
 
-        from .operators import TreeMPO
+        from .operators import SubTreeMPO
 
         gate = self._as_state_backend(gate)
         where = self._validate_support(logical_where)
-        tree_mpo = TreeMPO.from_gate(
+        tree_mpo = SubTreeMPO.from_gate(
             self.plan,
             gate,
             where,
@@ -5370,7 +5378,7 @@ class TreeOptimizer:
         self, op, where, *, max_bond=None, cutoff=None,
         renormalize=False, track_norm=True,
     ):
-        """Apply a subtree operator and aggregate its edge truncations.
+        """Apply a gate through compact SubTreeMPO in every algorithm mode.
 
         Set ``track_norm=False`` for a known non-unitary/Kraus operator so its
         physical norm change is not reported as compression loss.
@@ -5382,31 +5390,79 @@ class TreeOptimizer:
         with self._update(
             "subtree", _normalize_where(where), track_norm=track_norm
         ):
-            if self.mode in {"dmrg", "zipup"}:
-                from .operators import TreeMPO
+            from .operators import SubTreeMPO
 
-                logical_where = _normalize_where(where)
-                compact_where = self._validate_support(logical_where)
-                self._check_operator_limits(compact_where)
-                if len(set(compact_where)) != len(compact_where):
-                    raise ValueError("apply_subtree_operator needs distinct qubits")
-                operator = TreeMPO.from_gate(
-                    self.plan, op, compact_where,
-                    fermionic=self.tn.fermionic,
-                    symmetry=self.tn.symmetry, dtype=self.backend_dtype,
-                )
-                result = self.apply_sub_mpotree(
-                    operator, compact_where, max_bond=max_bond, cutoff=cutoff,
-                    track_norm=track_norm, _validate_backend=False,
-                )
-                if renormalize:
-                    self.normalize()
-                return result
-            result = self._apply_subtree_operator_impl(
-                op, where, max_bond=max_bond, cutoff=cutoff,
-                renormalize=renormalize,
+            logical_where = _normalize_where(where)
+            compact_where = self._validate_support(logical_where)
+            self._check_operator_limits(compact_where)
+            if not compact_where:
+                raise ValueError("apply_subtree_operator needs at least one qubit")
+            if len(set(compact_where)) != len(compact_where):
+                raise ValueError("apply_subtree_operator needs distinct qubits")
+            operator = SubTreeMPO.from_gate(
+                self.plan, self._as_state_backend(op), compact_where,
+                fermionic=self.tn.fermionic,
+                symmetry=self.tn.symmetry, dtype=self.backend_dtype,
             )
+            result = self.apply_sub_mpotree(
+                operator, compact_where, max_bond=max_bond, cutoff=cutoff,
+                track_norm=track_norm, _validate_backend=False,
+            )
+            if renormalize:
+                self.normalize()
         return result
+
+    def _apply_compact_one_site_unitary(self, operator, application):
+        """Absorb a certified local unitary without changing the state gauge.
+
+        Certification reads the current small physical matrix, so edits to a
+        supplied operator cannot leave a stale unitary flag. No state or
+        multi-site operator is densified. Native odd operators retain their
+        general graded application path.
+        """
+        from .operators import SubTreeMPO
+
+        if not isinstance(operator, SubTreeMPO) or len(application.region) != 1:
+            return False
+        node = next(iter(application.region))
+        site = self.plan.qubit_of_node.get(node)
+        if site is None:
+            return False
+        gate = operator.node_tensor(node).transpose(
+            operator.upper_ind(site), operator.lower_ind(site),
+        ).data
+        if _is_symmray_array(gate):
+            if getattr(gate, "parity", 0):
+                return False
+            matrix = ar.to_numpy(gate.to_dense())
+        else:
+            matrix = ar.to_numpy(gate)
+        # The certification tolerance follows arithmetic precision, not the
+        # user's truncation cutoff (which can be arbitrarily loose).
+        real_dtype = np.result_type(matrix.real.dtype, np.float32)
+        tolerance = 8 * np.finfo(real_dtype).eps
+        if not np.allclose(matrix.conj().T @ matrix, np.eye(matrix.shape[0]),
+                           rtol=0., atol=tolerance):
+            return False
+        region = self.tn.canonical_region
+        left_inds = self.tn.node_tensor(node).left_inds
+        if self.mode == "dmrg" and self._normalize_fit_init_strategy(
+            self.fit_init_strategy
+        ).startswith("guess_"):
+            # Preserve the disposable guess's child-seed draw so subsequent
+            # measurements retain their seeded sequence after this shortcut.
+            self.rng.integers(0, 2**63, dtype=np.uint64)
+        absorb_started = self._profile_phase_start()
+        with self._thread_ctx():
+            self.tn.gate_inds_(gate, [self._phys(site)], contract=True)
+        self._profile_phase_event(
+            "tensor_absorption", absorb_started,
+            support=(site,), route="one_site_unitary",
+        )
+        self.tn.node_tensor(node).modify(left_inds=left_inds)
+        self.tn.canonical_region = region
+        self.tn.exponent += application.exponent
+        return True
 
     def apply_sub_mpotree(
         self,
@@ -5419,9 +5475,9 @@ class TreeOptimizer:
         _validate_backend=True,
         _path_order=None,
     ):
-        """Apply a complete TreeMPO/TTNO on its active subtree.
+        """Apply a compact SubTreeMPO, or a complete general TreeMPO.
 
-        This is the primary ordinary-gate entry point: gate -> TreeMPO ->
+        This is the primary ordinary-gate entry point: gate -> SubTreeMPO ->
         apply_sub_mpotree. Modes share this operator boundary, then dispatch
         to their own tree algorithm:
 
@@ -5442,8 +5498,10 @@ class TreeOptimizer:
         the TreePlan itself. Off-subtree state branches supply canonical
         boundaries; none of these routes converts the state into an MPS.
         The operator's represented exponent is retained without constructing
-        its power of ten. A minimal route requires unchanged builder-proven
-        exterior identities; otherwise all operator nodes participate.
+        its power of ten. SubTreeMPO contains only its active connected region;
+        exterior identity action is implicit, with no exterior operator layer.
+        Only full TreeMPO inputs need builder-proven exterior identities to
+        shorten their route; otherwise all their operator nodes participate.
         """
         self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
@@ -5463,6 +5521,8 @@ class TreeOptimizer:
         with self._update(
             "subtreempo", declared, track_norm=track_norm
         ):
+            if self._apply_compact_one_site_unitary(tree_mpo, application):
+                return self
             if self.mode == "dmrg":
                 # Keep the exact DMRG target in operator--state form. The
                 # TreeMPO is still the source of the complete

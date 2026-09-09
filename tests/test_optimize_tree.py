@@ -323,10 +323,11 @@ def test_tree_optimizer_dmrg_target_keeps_operator_and_state_layers():
         (0, 4),
     )
 
-    assert len(target.tensors) == 2 * len(optimizer.tn.tensors)
+    assert len(target.tensors) == len(optimizer.tn.tensors) + len(_operator.active_nodes)
     fit = TreeFIT(target, optimizer.tn.copy(), max_bond=2, cutoffs=0.0)
     assert fit.target_layout == "layered"
-    assert all(len(group) == 2 for group in fit._target_tensors.values())
+    assert all(len(group) == (2 if node in _operator.active_nodes else 1)
+               for node, group in fit._target_tensors.items())
 
 
 @pytest.mark.parametrize("strategy", ("random", "random_expand"))
@@ -6118,6 +6119,45 @@ def test_shift_center_recovers_from_multinode_region_locally():
     assert ttn.is_canonical_form(target)
     for nid in outside:
         assert np.array_equal(ttn.node_tensor(nid).data, snapshot[nid])
+
+
+@pytest.mark.parametrize("absorb", ["left", "right"])
+def test_region_recovery_preserves_leaf_order_without_repeated_scans(monkeypatch, absorb):
+    ttn = TreeTensorNetwork.from_order(range(64), structure="balanced")
+    region = set(ttn.plan.nodes())
+    target = ttn.plan.node_of_qubit[0]
+    remaining = set(region)
+    expected = []
+    while len(remaining) > 1:
+        node = min(n for n in remaining if n != target
+                   and sum(v in remaining for v in ttn.neighbors(n)) == 1)
+        neighbor = next(v for v in ttn.neighbors(node) if v in remaining)
+        expected.append((node, neighbor) if absorb == "right" else (neighbor, node))
+        remaining.remove(node)
+
+    # Preserve builder-proven isometries while exercising regional recovery.
+    ttn.canonical_region = region
+    neighbors = ttn.neighbors
+    canonize = ttn.canonize_edge_
+    visits = 0
+    actual = []
+
+    def counted(node):
+        nonlocal visits
+        visits += 1
+        return neighbors(node)
+
+    def recorded(a, b, **kwargs):
+        actual.append((a, b))
+        return canonize(a, b, **kwargs)
+
+    monkeypatch.setattr(ttn, "neighbors", counted)
+    monkeypatch.setattr(ttn, "canonize_edge_", recorded)
+    ttn.shift_orthogonality_center(target, absorb=absorb)
+    assert actual == expected
+    assert visits < 20 * len(region)
+    assert ttn.orthogonality_center == target
+    assert ttn.is_canonical_form(target)
 
 
 def test_two_qubit_anchor_uses_nearest_endpoint(monkeypatch):

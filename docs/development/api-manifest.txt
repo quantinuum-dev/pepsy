@@ -114,6 +114,7 @@ TreeBatchSampleResult
 TreeEnergyOptimizer
 TreeLayoutFinder
 TreeMPO
+SubTreeMPO
 TreePEPO
 TreeSubPEPO
 TreeNoisy

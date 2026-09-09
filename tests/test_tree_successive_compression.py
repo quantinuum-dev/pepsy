@@ -32,7 +32,8 @@ def test_environment_plan_is_immutable_bounded_and_directional():
             plan(invalid, 2)
 
 
-def test_src_environment_objects_are_reused_then_released(monkeypatch):
+@pytest.mark.parametrize("method", ["src", "sdc"])
+def test_environment_objects_are_reused_then_released(monkeypatch, method):
     import pepsy.optimizers.tree.compression as tc
 
     local = {i: [qtn.Tensor(np.eye(2, dtype=complex), inds=(f"k{i}", f"b{i}"))]
@@ -48,17 +49,20 @@ def test_src_environment_objects_are_reused_then_released(monkeypatch):
     reads = {}
     projecting = False
 
+    def remember(tensor):
+        identity = id(tensor)
+        references[identity] = weakref.ref(tensor.data)
+        reads[identity] = 0
+        built.append(identity)
+
     def contract(*ts, **kwargs):
         for tensor in ts:
             identity = id(tensor)
             if identity in references and references[identity]() is tensor.data:
                 reads[identity] += 1
         result = original_contract(*ts, **kwargs)
-        if not projecting and kwargs.get("output_inds") is not None:
-            identity = id(result)
-            references[identity] = weakref.ref(result.data)
-            reads[identity] = 0
-            built.append(identity)
+        if method == "src" and not projecting and kwargs.get("output_inds") is not None:
+            remember(result)
         return result
 
     def modify(self, **kwargs):
@@ -71,13 +75,17 @@ def test_src_environment_objects_are_reused_then_released(monkeypatch):
 
     def split(self, *args, **kwargs):
         nonlocal projecting
-        projecting = True
-        return original_split(self, *args, **kwargs)
+        if kwargs.get("method") == "qr":
+            projecting = True
+        result = original_split(self, *args, **kwargs)
+        if method == "sdc" and not projecting:
+            remember(result[1])
+        return result
 
     monkeypatch.setattr(qtn, "tensor_contract", contract)
     monkeypatch.setattr(qtn.Tensor, "split", split)
     monkeypatch.setattr(qtn.Tensor, "modify", modify)
-    tc.successive_tree_compress(local, order, 3, method="src", max_bond=1, seed=51)
+    tc.successive_tree_compress(local, order, 3, method=method, max_bond=1, seed=51)
     # Each directed sketch is contracted once, with the same cached object
     # reused at branching consumers. No numerical environment survives return.
     assert len(built) == len(tc._successive_environment_plan(order, 3)[1]) == 6

@@ -38,6 +38,7 @@ MPS.
 
 from __future__ import annotations
 
+import heapq
 import re
 import time
 from collections.abc import Mapping
@@ -2468,25 +2469,24 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             raise ValueError("absorb must be 'right' or 'left'.")
 
         remaining = set(region)
+        adjacency = {
+            node: tuple(v for v in self.neighbors(node) if v in region)
+            for node in region
+        }
+        degree = {node: len(vs) for node, vs in adjacency.items()}
+        leaves = [node for node in region if node != target and degree[node] == 1]
+        heapq.heapify(leaves)
         while len(remaining) > 1:
-            candidates = [
-                node for node in remaining
-                if node != target
-                and sum(
-                    neighbour in remaining
-                    for neighbour in self.neighbors(node)
-                ) == 1
-            ]
-            if not candidates:
+            if not leaves:
                 raise ValueError(
                     "canonical region is not a connected tree containing target."
                 )
-            # The region is a tree, so any non-target leaf can be peeled.
-            # Sorting keeps the QR sequence deterministic across set order.
-            node = min(candidates)
+            # Preserve the former smallest-leaf order without rescanning the
+            # whole remaining region after every metadata-only or QR move.
+            node = heapq.heappop(leaves)
             neighbour = next(
                 neighbour
-                for neighbour in self.neighbors(node)
+                for neighbour in adjacency[node]
                 if neighbour in remaining
             )
             if absorb == "right":
@@ -2498,6 +2498,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 a, b, absorb=absorb, _isometry_proven=proof,
             )
             remaining.remove(node)
+            degree[neighbour] -= 1
+            if neighbour != target and degree[neighbour] == 1:
+                heapq.heappush(leaves, neighbour)
 
         self._canonical_region = frozenset({target})
         return self

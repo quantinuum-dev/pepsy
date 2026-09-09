@@ -179,6 +179,7 @@ _SYMBOL_MODULES = {
     "TreeEnergyOptimizer": ".optimizers",
     "TreeLayoutFinder": ".optimizers",
     "TreeMPO": ".optimizers",
+    "SubTreeMPO": ".optimizers",
     "TreeOptimizer": ".optimizers",
     "TreePlan": ".optimizers",
     "TreePeps": ".optimizers",

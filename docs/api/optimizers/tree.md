@@ -1,5 +1,18 @@
 # `pepsy.optimizers.tree`
 
+The operator classes have distinct representation contracts:
+
+| Class | Stored region | Labels and physical indices |
+| --- | --- | --- |
+| `TreeMPO` | The whole lattice: every node of the TreePlan, including explicit identity tensors where appropriate. | Full-lattice node tags, site labels, and physical input/output indices. |
+| `SubTreeMPO` | Only a connected active region, normally the gate support's Steiner subtree. No exterior operator tensors. | The same original node IDs, site labels, and configured tag/index formats; never locally renumbered. |
+
+`SubTreeMPO.plan` still refers to the original full-lattice plan.
+`active_nodes` gives the stored region; `sites` gives physical sites present
+there, including any physical routing site. `operator_support` gives the
+gate support. Connecting internal nodes are included without inventing
+physical site legs. Identity action outside the region is implicit.
+
 `TreeOptimizer` simulates a quantum circuit by replaying a canonical bundled
 gate stream `[(gate, where), ...]` on a **rooted tree tensor network**, after
 *Simulating quantum circuits using tree tensor networks* (Seitz, Medina, Cruz,
@@ -300,14 +313,35 @@ lowered to a chain. The same Tree-native factorization is used by the dense
 term path and by the native Hamiltonian builders (with graded Symmray tensors
 on the fermionic path).
 
-For a local gate, use `TreeMPO.from_gate(plan, gate, where)` instead of
-materializing a full-system matrix. `where` always contains logical qubit
-labels, independent of whether the plan was created from row-major, snake,
-folded-snake, or Hilbert order. The constructor factors only the gate over
-the minimal TreePlan Steiner subtree and adds bond-one identity legs elsewhere,
-so the result can be sent directly to `TreeOptimizer.apply_sub_mpotree` or a
-`subtreempo_event`. Dense gate factorization removes only machine-precision
-null operator-Schmidt sectors; configured TreeMPO compression remains explicit.
+For a local gate, use `SubTreeMPO.from_gate(plan, gate, where)`. This compact
+operator stores tensors **only on the connected Steiner subtree**. It retains
+the original logical site labels, node IDs, and configurable tags. Connecting
+internal nodes are included; a physical routing node not acted on by the gate
+has a local identity pair. There are **no exterior operator tensors or dangling
+exterior operator bonds**. Exterior identity action is implicit.
+
+```python
+from pepsy import SubTreeMPO
+
+subop = SubTreeMPO.from_gate(plan, gate, where)
+assert subop.num_tensors == len(subop.active_nodes)
+optimizer.apply_sub_mpotree(subop)
+# Equivalent stream entry:
+event = optimizer.sub_mpotree_event(subop)
+```
+
+`subop.sites` lists physical sites present in the subtree, including any
+physical routing node; `operator_support` names the actual gate support.
+`to_dense()` returns an operator on `subop.sites`, not on every state site.
+Copies, backend conversion, canonicalization, and compression preserve the
+compact region. Ordinary gate replay builds this representation directly;
+it must not construct a full identity-padded operator and strip it afterward.
+Dense factorization removes only machine-precision null operator-Schmidt
+sectors; configured operator compression remains explicit.
+
+`TreeMPO.from_gate` remains the full-tree constructor for callers that need
+a complete operator for general operator algebra. It includes exterior
+bond-one identities and is not the ordinary local gate replay builder.
 `TreeMPO.from_pauli_sum(plan, weighted_terms)` provides the analogous compact
 TTNO for a weighted sum of product-Pauli branches. It uses one virtual branch
 channel per retained term only on the union of the active Steiner subtrees,
@@ -330,7 +364,7 @@ node.
 Gates are absorbed into the tree according to the selected optimizer mode:
 
 - **ordinary `apply_gate` entries** in `auto`, `direct`, `dm`, `sdc`, `src`,
-  and `mpo` are lowered to a true `TreeMPO` with `TreeMPO.from_gate`,
+  and `mpo` are lowered to `SubTreeMPO` with `SubTreeMPO.from_gate`,
   factorized on the minimal TreePlan Steiner subtree, and applied with
   `apply_sub_mpotree`. The compression mode controls the tree-edge state
   compression, and gate width no longer causes a dense-route cliff.
@@ -582,10 +616,12 @@ generalisation of the two-qubit gate: a `k`-qubit gate, a multi-site
 **non-unitary / Kraus** operator, or a whole **Trotter block**. It is the tree
 analogue of a sub-MPO applied over the covering range and then compressed (cf.
 Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
-only). The dense operator is first factorized into an exact tree-MPO on the
+only). Every mode first factorizes the operator into a compact `SubTreeMPO` on the
 **minimal connected subtree** (Steiner subtree) spanning the target physical
-nodes.
-Application then proceeds recursively from subtree leaves to a hub: each local
+nodes, then uses `apply_sub_mpotree`, just like ordinary `apply_gate`.
+SRC/SDC compute complementary environments from the original operator/state
+layers. Zipup streams truncation and DMRG fits that same exact layered target.
+Direct/DM application proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
 for the whole Steiner subtree is formed. Each routed Q tensor, including native
@@ -594,12 +630,18 @@ available, so canonical recovery recognizes that it already points toward the
 hub instead of repeating the same QR. The native predicate additionally
 validates charge-map alignment before skipping. Once all MPO factors have
 arrived, every
-touched edge is compressed once. A bond that remains within its configured
-`max_bond` uses a lossless QR, avoiding repeated cutoff loss of tiny state
-components across successive sub-MPO events; when the MPO expands an edge
-past its cap, the configured Quimb `cutoff` and `cutoff_mode` are applied to
-the truncating SVD. Thus every actual truncation sees the complete operator in
-an isometric environment.
+touched edge is compressed once with the configured cap and cutoff. A
+zero-cutoff bond within its cap uses lossless QR; positive cutoffs are honored
+even below the cap, matching ordinary replay. Each direct/DM truncation sees
+the complete operator in an isometric environment.
+
+A compact one-site unitary is absorbed directly in every mode, preserving
+the incoming canonical center or region and local isometry metadata. The
+current small physical matrix is checked at arithmetic precision, including
+even native operators; nonunitary and odd native operators retain the general
+route. This exact absorption skips FIT and clears its latest diagnostic record.
+Native `compression_mode="dm"` raises before update accounting or state
+changes; use `"direct"` for native graded compression.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
@@ -628,14 +670,15 @@ which must produce an operator on the declared support.
 For a complete operator already represented as a `TreeMPO`, use
 `apply_sub_mpotree(tree_operator, where=None, ...)` or the aliases
 `apply_subtreempo` / `apply_sub_tree_mpo` / `apply_subttno`. All refer to the
-same implementation. Ordinary gates use `gate -> TreeMPO -> apply_sub_mpotree`
-in direct, DM, SRC, SDC, zipup, and DMRG modes. This contracts the operator's internal
-TTNO bonds directly on the TreePlan, routes the resulting messages by the
-TreePlan geometry, and performs one final configured Tree compression sweep.
+same implementation. Ordinary gates use `gate -> SubTreeMPO -> apply_sub_mpotree`
+in direct, DM, SRC, SDC, zipup, and DMRG modes. Operator bonds follow the
+TreePlan geometry; each mode retains its own compression algorithm.
 It never extracts a contiguous chain MPO. The operator must use the same plan,
 contain one primary network, and either declare all physical sites or declare
 exactly its `operator_support` metadata when that known non-identity support is
-available. Bond-one identity factors outside a term's active support are still
+available. Compact operators also accept their `sites` as the declaration.
+They store only their `active_nodes`; exterior identity is implicit. For a
+full `TreeMPO`, bond-one identity factors outside a term's active support are still
 part of the complete TTNO; the shorter declaration only selects the minimal
 Steiner route. Any omitted boundary operator bond must be bond one, otherwise
 the application raises instead of silently discarding operator information.
@@ -763,14 +806,15 @@ On a native fermionic tree, an overly small cap can remove every compatible
 charge path. Zipup raises before installing such an empty state; increase
 `chi` or choose `direct`, whose cuts see the complete operator environment.
 
-The minimal subtree shortcut requires exterior tensors proven to be unit
+For a full `TreeMPO`, the minimal subtree shortcut requires exterior tensors proven to be unit
 identities by `TreeMPO.from_gate` or `from_pauli_sum`. Copies, scalar scaling
 on the active support, conjugation, and internal backend conversion preserve
 that proof. Operator canonicalization, distributed scaling, or exterior
 tensor replacement can move physical scale into those tensors. Such operators
 use the full tree in every mode, which is conservative and can cost more than
-the original local route. Unchanged ordinary gates retain their path/subtree
-optimization; the check compares array references and index metadata without
+the original local route. Compact `SubTreeMPO` operators have no exterior
+layer and never need this proof or fallback. For full operators, the check
+compares array references and index metadata without
 contraction or backend transfer. After editing array entries directly in place,
 call `operator.invalidate_canonical_form()` to invalidate the identity proof
 as well as its gauge metadata. A caller-supplied `operator_support` hint alone
@@ -854,7 +898,19 @@ node's target tensors, fitted bra tensor, and incoming neighbor messages.
 An iterative postorder traversal avoids recursive calls on deep trees.
 Invalidation follows those dependencies outward; there is no table of full
 branch-node sets. Temporary messages carry indices and data without
-accumulating branch-wide tags. `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
+accumulating branch-wide tags. Numerical messages belong to one TreeFIT
+instance and are reused across its sweeps; each TreeOptimizer gate creates
+a new fit for its new target. Initial exterior contractions can visit the
+whole state even when the operator itself is compact. Subsequent local
+updates reuse unaffected messages. The cache holds at most one tensor per
+directed tree edge, with tensor sizes determined by the live bond dimensions.
+
+Standalone callers who directly edit `fit.p` tensor data must invalidate its
+canonical metadata and call `fit.clear_environment_cache()` before resuming.
+Raw external edits are not automatically tracked by the FIT message cache.
+Construct a new TreeFIT when changing target geometry or connectivity.
+
+`dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
 engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
 `dmrg` uses `fit_block_size` (two by default) and its configured adaptive
 warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
@@ -876,9 +932,16 @@ below. `RL`/`INOUT` and `LR`/`OUTIN` remain compatible aliases
 for the two orders. Standalone TreeFIT uses the same names and default;
 diagnostics report the normalized `sweep_sequence`.
 
+Local gates in `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` build a compact
+`SubTreeMPO`; explicit `apply_sub_mpotree(subtree_operator)` uses the same
+FIT route. The exact target has operator tensors only inside that region,
+with original site labels and physical input/output indices preserved.
+
 FIT reuses each traversal order within a run. Before a block update, it moves
 the canonical center only as far as needed to make the exterior isometric;
-an existing center inside the block needs no preparatory QR. Local
+an existing center or canonical region contained inside the block needs no
+preparatory QR. An unknown gauge is canonicalized toward the block without
+collapsing its interior first. Local
 factorization still establishes the requested final center, including explicit
 endpoint centers for three-node `TreeFIT.fit_block` updates.
 
@@ -2104,6 +2167,12 @@ available through `truncation_report()`, `get_infidelities()`, and
   network derives orientation diagnostics from those tensors; the optimizer
   does not keep a duplicate map. Native fermionic trees keep their separate
   explicit graded QR/SVD path.
+- **Regional recovery traversal.** Recovering a single center from a tracked
+  canonical region uses a smallest-leaf priority queue. It preserves the
+  deterministic QR order while avoiding repeated whole-region scans:
+  traversal bookkeeping is O(E + R log R) for R region nodes and E incident
+  adjacency entries, excluding tensor operations. Existing `left_inds`
+  proofs still turn redundant QR operations into metadata-only moves.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

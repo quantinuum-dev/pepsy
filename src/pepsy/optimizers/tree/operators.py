@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import heapq
 from numbers import Integral
+from types import SimpleNamespace
 
 import autoray as ar
 import numpy as np
@@ -33,7 +34,7 @@ from ...operators._structural_compression import _structural_compress_tree
 from .layout import TreeLayoutFinder, TreePlan
 from ._display import ascii_lattice, ascii_tree
 
-__all__ = ["TreeMPO", "build_tree_operator"]
+__all__ = ["TreeMPO", "SubTreeMPO", "build_tree_operator"]
 
 
 def _as_numpy(data, *, dtype=None):
@@ -111,6 +112,12 @@ def _tree_subtree_span(plan, nodes):
 
 class TreeMPO(qtn.TensorNetworkGenOperator):
     """TreePlan-aware operator with dense and native Symmray backends.
+
+    ``TreeMPO`` represents an operator on the whole lattice: one tensor for
+    every structural node of its TreePlan, with physical input/output legs
+    at every lattice site. Local identity action is explicitly represented
+    on otherwise unoperated nodes. For an operator stored only on a connected
+    region, use ``SubTreeMPO`` instead.
 
     ``TreeMPO`` is the operator-level API for measurements on a
     :class:`TreeTensorNetwork`. It subclasses Quimb's generalized operator
@@ -566,10 +573,15 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         the optional operator-side ``max_bond``/``cutoff`` sweep.
         """
         support = _term_support(where)
+        compact = issubclass(cls, SubTreeMPO)
         if any(site not in plan.node_of_qubit for site in support):
             raise ValueError(
                 f"gate support {support!r} is outside the supplied TreePlan."
             )
+        active_nodes = (
+            _tree_subtree_span(plan, tuple(plan.node_of_qubit[q] for q in support))
+            if compact else None
+        )
         if fermionic:
             if symmetry is None:
                 symmetry = getattr(gate, "symmetry", None)
@@ -585,6 +597,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                 symmetry=symmetry,
                 cutoff=0.0,
                 dtype=dtype,
+                active_only=compact,
             )
             backend = "symmray"
         else:
@@ -611,6 +624,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                 data,
                 support,
                 dtype=dtype,
+                active_only=compact,
             )
             backend = "dense"
         _relabel_tree_operator_network(
@@ -620,6 +634,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
+            nodes=active_nodes,
         )
 
         operator = cls(
@@ -630,7 +645,10 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             symmetry=symmetry,
             cutoff=cutoff,
             compressed=False,
-            sites=tuple(sorted(plan.node_of_qubit)),
+            sites=tuple(sorted(
+                plan.qubit_of_node[node] for node in active_nodes
+                if node in plan.qubit_of_node
+            )) if compact else tuple(sorted(plan.node_of_qubit)),
             site_tag_id=site_tag_id,
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
@@ -921,6 +939,10 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             else ()
         )
 
+    def _operator_geometry(self):
+        """Geometry of stored tensors, separate from the owning state plan."""
+        return self.plan
+
     def is_leaf(self, node):
         """Whether ``node`` is a structural leaf."""
         return self.plan.is_leaf(int(node))
@@ -1004,6 +1026,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         additionally checks the tracked ``left_inds`` orientation for every
         stored network.
         """
+        nodes = self.active_nodes if isinstance(self, SubTreeMPO) else frozenset(self.plan.nodes())
         expected_outer = {
             self.upper_ind(site) for site in self.sites
         } | {
@@ -1012,14 +1035,14 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         region = self.canonical_region
         if region is not None:
             region = frozenset(region)
-            if not region.issubset(set(self.plan.nodes())):
+            if not region.issubset(nodes):
                 raise ValueError("TreeMPO canonical region contains unknown nodes.")
             if _tree_subtree_span(self.plan, region) != region:
                 raise ValueError("TreeMPO canonical region is not connected.")
 
         for network in self.tree_networks:
             node_tids = {}
-            for node in self.plan.nodes():
+            for node in nodes:
                 tids = tuple(network.tag_map.get(self.node_tag(node), ()))
                 if len(tids) != 1:
                     raise ValueError(
@@ -1033,8 +1056,10 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                 )
 
             edge_bonds = {}
-            for parent, children in self.plan.children.items():
-                for child in children:
+            for parent in nodes:
+                for child in self.plan.children[parent]:
+                    if child not in nodes:
+                        continue
                     shared = qtn.bonds(
                         network.tensor_map[node_tids[parent]],
                         network.tensor_map[node_tids[child]],
@@ -1114,16 +1139,16 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         """Return operator bond dimensions in deterministic tree-edge order."""
         return tuple(
             self.bond_size(node, child)
-            for node in self.plan.nodes()
-            for child in self.plan.children[node]
+            for node, child in self.edge_nodes()
         )
 
     def edge_nodes(self):
         """Return all directed parent-child tree edges."""
+        geometry = self._operator_geometry()
         return tuple(
             (node, child)
-            for node in self.plan.nodes()
-            for child in self.plan.children[node]
+            for node in geometry.nodes()
+            for child in geometry.children[node]
         )
 
     @property
@@ -1765,11 +1790,11 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         if info_c is not None and not hasattr(info_c, "__setitem__"):
             raise TypeError("info_c must be a mutable mapping when supplied.")
         if center is None:
-            center = self.plan.root
-        center = _tree_node_selector(self.plan, center, self.node_tag_id)
+            center = self._operator_geometry().root
+        center = _tree_node_selector(self._operator_geometry(), center, self.node_tag_id)
         target = self if inplace else self.copy()
         for network in target.tree_networks:
-            _canonicalize_tree_operator(network, target.plan, center)
+            _canonicalize_tree_operator(network, target._operator_geometry(), center)
         target._canonical_region = frozenset({center})
         if info_c is not None:
             info_c["cur_orthog"] = (center, center)
@@ -1783,7 +1808,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                         is None
                         else tuple(tensor.left_inds)
                     )
-                    for node in target.plan.nodes()
+                    for node in target._operator_geometry().nodes()
                 }
                 for network in target.tree_networks
             )
@@ -1825,7 +1850,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         """Return the live QR orientation map for all TreePlan nodes."""
         return {
             node: self.isometry_direction(node)
-            for node in self.plan.nodes()
+            for node in self._operator_geometry().nodes()
         }
 
     def is_subtree_canonical_form(self, nodes=None, *, span=False):
@@ -1845,7 +1870,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             )
             if _tree_subtree_span(self.plan, region) != region:
                 return False
-        for node in self.plan.nodes():
+        for node in self._operator_geometry().nodes():
             if node in region:
                 continue
             path = min(
@@ -1884,7 +1909,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         """MPO-compatible alias for a root-oriented tree QR sweep."""
         del kwargs
         return self.canonicalize(
-            center=self.plan.root if center is None else center,
+            center=center,
             inplace=inplace,
         )
 
@@ -1897,7 +1922,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         """MPO-compatible alias for a root-oriented tree QR sweep."""
         del kwargs
         return self.canonicalize(
-            center=self.plan.root if center is None else center,
+            center=center,
             inplace=inplace,
         )
 
@@ -1957,11 +1982,11 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             if len(tags) != 1:
                 target = self if inplace else self.copy()
                 region = _tree_region_selector(
-                    target.plan, tags, target.node_tag_id,
+                    target._operator_geometry(), tags, target.node_tag_id,
                 )
                 for network in target.tree_networks:
                     _canonicalize_tree_operator_region(
-                        network, target.plan, region,
+                        network, target._operator_geometry(), region,
                     )
                 target._canonical_region = region
                 return target
@@ -1988,7 +2013,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         region = frozenset(self.plan.node_path(node1, node2))
         target = self if inplace else self.copy()
         for network in target.tree_networks:
-            _canonicalize_tree_operator_region(network, target.plan, region)
+            _canonicalize_tree_operator_region(network, target._operator_geometry(), region)
         target._canonical_region = region
         return target
 
@@ -2047,6 +2072,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             cutoff = self.cutoff
         cutoff = float(cutoff)
         reports = []
+        geometry = self._operator_geometry()
         for network in self.tree_networks:
             raw_bond = max(
                 (network.ind_size(index) for index in network.inner_inds()),
@@ -2054,10 +2080,10 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             )
             structural_report = _structural_compress_tree(
                 network,
-                root=self.plan.root,
-                parent=self.plan.parent,
-                children=self.plan.children,
-                nodes=self.plan.nodes(),
+                root=geometry.root,
+                parent=geometry.parent,
+                children=geometry.children,
+                nodes=geometry.nodes(),
                 tensor_getter=lambda node: _tree_operator_tensor(network, node),
                 bond_getter=lambda node, neighbor: _tree_operator_bond(
                     network, self.plan, node, neighbor,
@@ -2066,7 +2092,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             )
             report = _compress_tree_operator(
                 network,
-                self.plan,
+                geometry,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 order=order,
@@ -2227,7 +2253,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                 f"state={getattr(tree, 'symmetry', None)!r}."
             )
 
-        sites = tuple(sorted(tree.plan.node_of_qubit))
+        sites = self.sites if isinstance(self, SubTreeMPO) else tuple(sorted(tree.plan.node_of_qubit))
         numerator = 0.0
         for operator in self._scaled_tree_networks():
             ket = tree.copy()
@@ -2268,6 +2294,97 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             if len(networks) == 1:
                 return getattr(networks[0], name)
         raise AttributeError(name)
+
+
+class SubTreeMPO(TreeMPO):
+    """Operator stored only on its support's connected Steiner subtree.
+
+    This is a compact operator representation, not a full TreeMPO with
+    exterior identity tensors. Original TreePlan node IDs and physical tags
+    are retained. Connecting nodes belong to ``active_nodes``; physical
+    sites there carry an identity pair when they are not in gate support.
+    Outside this region the action is implicitly identity: no tensors or
+    dangling operator bonds are allocated there.
+
+    ``plan`` is the original full-lattice TreePlan, not a relabeled local
+    plan. ``active_nodes`` identifies the stored structural region, ``sites``
+    contains its original physical site labels, and ``operator_support``
+    identifies the gate's support. Node/site tags and upper/lower physical
+    indices use those original IDs with the configured naming formats;
+    region-local renumbering is never performed.
+
+    Use ``SubTreeMPO.from_gate(plan, gate, where)`` for local application.
+    ``to_dense()`` covers only ``sites``, not the complete state Hilbert space.
+    """
+
+    _EXTRA_PROPS = TreeMPO._EXTRA_PROPS + ("_active_nodes",)
+
+    @classmethod
+    def from_gate(cls, plan, gate, where, **kwargs):
+        """Factor a gate directly on its Steiner subtree, with no exterior.
+
+        Keyword options match ``TreeMPO.from_gate``. Physical and structural
+        labels remain those of the original plan; ``sites`` includes any
+        unoperated physical routing node inside the subtree. Identity outside
+        ``active_nodes`` is implicit, never allocated and then stripped.
+        """
+        return super().from_gate(plan, gate, where, **kwargs)
+
+    from_operator = from_gate
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.operator_support is None:
+            raise ValueError("SubTreeMPO requires explicit operator_support.")
+        self._active_nodes = _tree_subtree_span(
+            self.plan, tuple(self.plan.node_of_qubit[q] for q in self.operator_support)
+        )
+        expected_sites = tuple(sorted(
+            self.plan.qubit_of_node[n] for n in self.active_nodes
+            if n in self.plan.qubit_of_node
+        ))
+        self._sites = expected_sites
+        self.validate()
+
+    @property
+    def active_nodes(self):
+        """Immutable connected set of stored structural node IDs."""
+        return self._active_nodes
+
+    def neighbors(self, node):
+        if node not in self.active_nodes:
+            raise ValueError(f"node {node!r} is outside the active operator region")
+        return tuple(v for v in super().neighbors(node) if v in self.active_nodes)
+
+    def _operator_geometry(self):
+        # Structural helpers need the induced tree, but public ``plan`` must
+        # remain the original state plan: never relabel or remount local sites.
+        nodes = tuple(sorted(self.active_nodes))
+        parent = {
+            n: self.plan.parent.get(n) if self.plan.parent.get(n) in self.active_nodes else None
+            for n in nodes
+        }
+        return SimpleNamespace(
+            root=next(n for n in nodes if parent[n] is None),
+            parent=parent,
+            children={n: tuple(c for c in self.plan.children[n] if c in self.active_nodes)
+                      for n in nodes},
+            nodes=lambda: nodes,
+            node_path=self.plan.node_path,
+        )
+
+    def _capture_identity_exterior(self):
+        # There is no exterior operator layer to certify or inspect.
+        return None
+
+    def _identity_exterior_unchanged(self):
+        return False
+
+    def __repr__(self):
+        return (
+            f"SubTreeMPO(sites={self.sites}, nodes={len(self.active_nodes)}, "
+            f"backend={self.backend!r}, max_bond={self.max_bond()})"
+        )
 
 
 def _term_support(where):
@@ -3150,6 +3267,7 @@ def _relabel_tree_operator_network(
     upper_ind_id="k{}",
     lower_ind_id="b{}",
     node_tag_id="N{}",
+    nodes=None,
 ):
     """Relabel a generated default TTNO to the public TreeMPO layout.
 
@@ -3159,7 +3277,7 @@ def _relabel_tree_operator_network(
     """
     index_map = {}
     tag_map = {}
-    for node in plan.nodes():
+    for node in plan.nodes() if nodes is None else nodes:
         tag_map[f"N{node}"] = node_tag_id.format(node)
         qubit = plan.qubit_of_node.get(node)
         if qubit is not None:
@@ -3314,7 +3432,7 @@ def _pauli_sum_tree_operator(
 
 
 def _native_tree_term_network(
-    plan, term, support, *, symmetry, cutoff=1e-12, dtype=None,
+    plan, term, support, *, symmetry, cutoff=1e-12, dtype=None, active_only=False,
 ):
     """Decompose one native term into a graded TTNO on the selected tree.
 
@@ -3411,9 +3529,11 @@ def _native_tree_term_network(
         )
 
     tensors = []
-    for node in plan.nodes():
+    for node in sorted(active_nodes) if active_only else plan.nodes():
         qubit = plan.qubit_of_node.get(node)
         neighbors = _tree_plan_neighbors(plan, node)
+        if active_only:
+            neighbors = tuple(v for v in neighbors if v in active_nodes)
         if node in factors:
             factor = factors[node]
             data = factor.data
@@ -4567,7 +4687,7 @@ def _dense_tree_tensor_network_for_term(plan, operator, support, *, dtype=None):
     return network
 
 
-def _dense_tree_term_tnno(plan, operator, support, *, dtype=None):
+def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=False):
     """Build one exact dense term as a valid TreePlan TTNO.
 
     Unlike ``_dense_tree_tensor_network_for_term`` (the historical hyperedge
@@ -4659,9 +4779,11 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None):
 
     physical_dims = dict(zip(ordered_support, output_dims))
     tensors = []
-    for node in plan.nodes():
+    for node in sorted(active_nodes) if active_only else plan.nodes():
         qubit = plan.qubit_of_node.get(node)
         neighbors = _tree_plan_neighbors(plan, node)
+        if active_only:
+            neighbors = tuple(v for v in neighbors if v in active_nodes)
         if node in factors:
             factor = factors[node]
             tensor_data = np.asarray(ar.to_numpy(factor.data), dtype=dtype)

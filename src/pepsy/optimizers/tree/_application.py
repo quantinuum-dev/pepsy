@@ -29,6 +29,8 @@ class OperatorApplication:
 
 def _same_tree_plan(left, right):
     """Return whether two plans describe the same rooted tree geometry."""
+    if left is right and isinstance(left, TreePlan):
+        return True
     return (
         isinstance(left, TreePlan)
         and isinstance(right, TreePlan)
@@ -42,10 +44,15 @@ def _same_tree_plan(left, right):
 def plan_operator_application(state, tree_mpo, where, *, full_tree):
     """Validate representation and freeze the active geometry before mutation.
 
-    Only unchanged builder-certified exterior identities can shorten a route.
+    Compact SubTreeMPO inputs already store only their connected region.
+    Full TreeMPO inputs need unchanged builder-certified exterior identities
+    to shorten a route.
     FIT retains its Steiner-region convention; full operator routing includes
     every structural node when the complete physical support is active.
     """
+    from .operators import SubTreeMPO
+
+    compact = isinstance(tree_mpo, SubTreeMPO)
     plan = getattr(tree_mpo, "plan", None)
     networks = getattr(tree_mpo, "tree_networks", None)
     if plan is None or networks is None:
@@ -61,7 +68,10 @@ def plan_operator_application(state, tree_mpo, where, *, full_tree):
             "multi-sector TreeMPO expectation remains supported separately."
         )
     sites = tuple(sorted(state.plan.node_of_qubit))
-    declared = sites if where is None else _normalize_where(where)
+    declared = (
+        tuple(tree_mpo.operator_support) if compact and where is None
+        else sites if where is None else _normalize_where(where)
+    )
     if len(set(declared)) != len(declared):
         raise ValueError(
             f"TreeMPO application support repeats a site: {declared!r}."
@@ -74,7 +84,9 @@ def plan_operator_application(state, tree_mpo, where, *, full_tree):
                 "TreeMPO operator_support contains sites outside its "
                 f"TreePlan: {operator_support!r}."
             )
-    if tuple(sorted(declared)) == sites:
+    if compact and set(declared) == set(tree_mpo.sites):
+        active_support = operator_support
+    elif tuple(sorted(declared)) == sites:
         active_support = sites if operator_support is None else operator_support
     elif operator_support is not None and set(declared) == set(operator_support):
         # A complete TreeMPO may be declared by its non-identity support.
@@ -105,6 +117,16 @@ def plan_operator_application(state, tree_mpo, where, *, full_tree):
         )
     if hasattr(tree_mpo, "validate"):
         tree_mpo.validate()
+
+    if compact:
+        # Compact operators define implicit identity outside their stored
+        # region. Never inspect or manufacture exterior identity tensors.
+        exponent = float(tree_mpo.exponent)
+        if not np.isfinite(exponent):
+            raise ValueError("TreeMPO exponent must be finite.")
+        return OperatorApplication(
+            declared, operator_support, tree_mpo.active_nodes, exponent
+        )
 
     # Physical support alone cannot prove that exterior tensors are unit
     # identities after operator canonicalization, scaling, or tensor edits.
@@ -147,6 +169,8 @@ def operator_local_tensors(state, tree_mpo, snodes, *, layered,
         # expose node tensors, not duplicate the neighbor API.
         for neighbor in state.neighbors(nid):
             if neighbor in snodes:
+                continue
+            if getattr(tree_mpo, "active_nodes", None) is not None:
                 continue
             shared = qtn.bonds(
                 op_t, tree_mpo.node_tensor(neighbor),

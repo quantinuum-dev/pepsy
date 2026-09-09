@@ -242,11 +242,8 @@ def test_unknown_center_orientation_is_frozen_before_norm_preparation():
                                atol=1e-11)
 
 
-@pytest.mark.parametrize("mode,gauge", [
-    ("direct", "inside"), ("direct", "outside"),
-    ("direct", "region"), ("direct", "unknown"),
-    ("src", "inside"), ("src", "outside"), ("sdc", "inside"),
-])
+@pytest.mark.parametrize("mode", ["direct", "dm", "src", "sdc"])
+@pytest.mark.parametrize("gauge", ["inside", "outside", "region", "unknown"])
 def test_operator_preparation_only_gauges_the_exterior(mode, gauge, monkeypatch):
     plan, state, path = _problem()
     if gauge == "outside":
@@ -274,7 +271,7 @@ def test_operator_preparation_only_gauges_the_exterior(mode, gauge, monkeypatch)
         full_preparations.append(frozenset(nodes))
         return prepare(nodes, **kwargs)
 
-    method = "_route_subtree_messages" if mode == "direct" else "_successive_subtree_messages"
+    method = "_route_subtree_messages" if mode in {"direct", "dm"} else "_successive_subtree_messages"
     route = getattr(opt, method)
 
     def check_preparation(*args, **kwargs):

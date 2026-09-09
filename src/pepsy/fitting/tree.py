@@ -375,8 +375,14 @@ def _build_layered_operator_state_target(state, operator):
         state_node_tag = lambda node: f"N{node}"
 
     plan = state.plan
+    operator_nodes = getattr(operator, "active_nodes", None)
     for node in _nodes_of(state):
         state_tensor = _tensor_of(state, node).copy()
+        if operator_nodes is not None and node not in operator_nodes:
+            # An absent compact-operator node means implicit identity, so
+            # retain the original state tensor without an operator layer.
+            state_tensors.append(state_tensor)
+            continue
         operator_tensor = operator.node_tensor(node).copy()
         qubit_of_node = getattr(plan, "qubit_of_node", None)
         if qubit_of_node is None:
@@ -1103,16 +1109,16 @@ class TreeFIT:
             self.p.shift_orthogonality_center(changed_path[-1], _skip_validate=True)
             return
 
-        is_canonical = getattr(self.p, "is_subtree_canonical_form", None)
-        if current_region != region or not (
-            callable(is_canonical) and is_canonical(region)
-        ):
-            # With no single tracked centre there is no safe incremental path
-            # to identify. Establish the block gauge once and discard the
-            # basis-dependent messages conservatively.
-            self.clear_environment_cache()
-            self.p.canonize_subtree_(region)
-        self.p.shift_orthogonality_center(center)
+        if current_region and frozenset(current_region).issubset(region):
+            # A contained canonical region proves the same exterior as a
+            # contained single centre. The whole block is replaced below;
+            # neither an isometry scan nor interior QR adds information.
+            return
+        # Establish only the block's exterior gauge when its old canonical
+        # region is unknown or extends outside. The local factorization sets
+        # the requested centre, so do not collapse this region beforehand.
+        self.clear_environment_cache()
+        self.p.canonize_subtree_(region)
 
     def _split_method(self):
         return {

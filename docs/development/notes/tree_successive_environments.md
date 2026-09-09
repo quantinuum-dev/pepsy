@@ -1,5 +1,113 @@
 # Tree SRC, SDC, and zipup algorithm audit
 
+## Compression review follow-up (2026-09-09)
+
+Reviewed ordinary TreeMPO direct/DM routing, canonical path and branching
+compression, SRC/SDC environment construction and release, and the focused
+algorithm tests. No compression implementation was changed in this review.
+
+The active `/Users/rezah/envs/genpy` environment now contains Quimb
+`1.15.1.dev51+g2e99c793e`, Autoray `0.11.1.dev3+g1b476b305`, Cotengra
+`0.8.3.dev7+g1d7fd333f`, and Symmray `0.3.2.dev8+g6c6dd34b5`.
+Rechecked the Quimb changelog, Autoray repository, Cotengra documentation and
+changelog, and Symmray repository; the Symmray Abelian HTML page still failed
+retrieval. Probed installed `Tensor.split`, `tensor_contract`,
+`tensor_compress_bond`, `TensorNetwork.compress_between`,
+`autoray.get_namespace`, and Quimb's SRC/SDC callable signatures, plus NumPy
+dispatch for `svd_truncated`, `qr_stabilized`, and `svd_via_eig_truncated`.
+The historical standalone DM failure described below no longer reproduces:
+3-by-3 identity splits with `svd:eig`, cap 2, complex64/complex128, and
+cutoffs 0 and 1e-7 all pass. No compatibility shim is needed for those probes.
+
+Findings and classifications:
+
+- **Defer / performance opportunity:** direct/DM use layered local inputs
+  on paths, but eagerly fuse local operator/state tensors on branching
+  regions. At internal nodes this forms an outer product before incoming
+  messages can reduce the contraction. Its element count is the product of
+  the two tensor sizes. Extending delayed fusion to branching regions needs
+  dense/native correctness and peak-memory measurements before adoption.
+- **Defer / approximation policy:** SRC sketches use exactly `chi` samples;
+  there is no separate oversampling rank. SDC similarly caps complementary
+  environments at the output rank. Neither guarantees optimal retained
+  subspaces of the complete target. Canonical direct/DM cuts are locally
+  optimal in exact arithmetic, but a sequence of cuts is not a global
+  fixed-rank TTN optimization. DM retains Gram-matrix conditioning concerns.
+- **Defer / intermittent validation failure:** the combined selection of
+  successive, path, hook, TreeMPO, and optimizer tests produced 488 passes,
+  4 skips, and one failure in the immediate weak-reference-release assertion
+  of `test_src_environment_objects_are_reused_then_released`. It passed
+  alone, in 40 direct repetitions (20 with prior garbage collection), and
+  with its preceding cache-plan test under the same five-file collection
+  (2 passed, 491 deselected). Cause remains unresolved; this is not proof
+  of a persistent leak, nor a clean full-suite result.
+
+A small serial NumPy complex128 check used a balanced eight-site tree,
+initial bond 4 (state seed 19), QR-generated complex gates (RNG seed 12),
+output cap 2, zero cutoff, and SRC seed 31. Three warm timings followed one
+warmup per case; operator construction and dense readout were excluded.
+For support `(0, 2, 5, 7)`, direct/DM/SRC/SDC respectively took median
+2.28/2.18/1.77/1.99 ms and yielded normalized squared fidelities to the exact
+target of 0.442375/0.442375/0.149243/0.082012. All returned canonical states
+and respected the active-region cap. The two-site path case also returned
+canonical states; untouched exterior bonds correctly remained at 4.
+These small examples establish neither general speed rankings nor error
+bounds. In particular, deterministic SDC need not beat SRC or direct at the
+same output cap. GPU performance and large-tree peak memory were not tested.
+
+Follow-up source tracing of construction and canonical preparation found two
+additional bookkeeping opportunities. `TreeMPO.from_gate` factorizes only
+the active span but installs bond-one identities on the full plan; the
+optimizer's 64-entry identity-keyed gate cache amortizes that construction
+only for repeated immutable payload objects with matching support.
+`plan_operator_application` still validates the complete operator and checks
+exterior identity references on each application. Thus a local numerical
+update can retain O(N) operator bookkeeping. Any validation cache would need
+reliable mutation tracking; bypassing checks for arbitrary edited operators
+would be unsafe.
+
+Steiner selection correctly unions paths from one support node; TreePlan
+caches the individual directed paths, while the union is rebuilt at its
+call sites. Ordinary direct/DM/SRC/SDC preparation skips gauge work when the
+tracked canonical region is contained in the active span, and otherwise
+moves a known center only to its first entry. Actual edge moves consult live
+`left_inds` (plus native charge alignment) and preserve the TTN-owned
+`_canonical_region`; there is no independent optimizer `info_c` dictionary.
+However, `_recover_center_from_region` rescans every remaining node for each
+peeled leaf. Even when all QR operations are skipped using isometry proofs,
+this traversal has quadratic bookkeeping for bounded-degree regions.
+A leaf queue is a deferred optimization. `TreePlan._path_cache` is also
+unbounded, unlike the bounded optimizer and successive-plan caches; workloads
+with many distinct queried node pairs can retain substantial path storage.
+
+### Implemented follow-up: region leaf queue and environment validation
+
+Replaced the repeated scans in `_recover_center_from_region` with cached
+region adjacency, degree counters, and a minimum heap of non-target leaves.
+The smallest eligible node is still processed first, preserving both absorb
+orientations, tensor operations, native charge checks, and `left_inds` skips.
+Bookkeeping is O(E + R log R) rather than quadratic for a bounded-degree
+region of R nodes; E includes incident adjacency entries read during setup.
+The regression compares the complete edge sequence with the former scan
+order and bounds neighbor queries on a 64-site tree for both orientations.
+
+SRC/SDC compression mathematics and environment scheduling are unchanged.
+Extended the existing weak-reference test to track deterministic SDC factors
+as well as SRC sketches, verifying each directed environment is built once,
+branch consumers reuse the same object, and numerical arrays are released
+after return. The previous intermittent SRC failure did not reproduce in
+100 additional direct repetitions with cyclic GC disabled; its historical
+cause remains unresolved, and no speculative memory-management fix was made.
+
+Validation: 462 tests passed and 4 skipped across optimizer, path execution,
+and successive compression after the queue change. After extending the SDC
+test, all 28 successive-compression tests passed. Repository-wide Ruff and
+whitespace checks passed. These include installed Quimb path parity, dense
+NumPy/Torch/JAX successive algorithms, native canonical movement, stale-cache
+protection, and failed-call recovery. The full repository test suite was not
+run. The upstream versions and API/dispatch probes recorded above remain
+applicable; no upstream API or dependency change was introduced.
+
 Date: 2026-09-08.
 
 ## Implemented algorithms

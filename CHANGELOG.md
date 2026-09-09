@@ -14,6 +14,29 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Explicit `apply_subtree_operator` now shares compact `SubTreeMPO`
+  application with ordinary gates in every mode, including original-layer
+  SRC/SDC and consistent per-call caps/cutoffs. Certified one-site unitaries
+  preserve the canonical center and isometry metadata. Unsupported native
+  DM rejects before update accounting or state changes.
+
+- TreeFIT now reuses a canonical region contained inside its next local
+  block, preserving exterior environments without an isometry rescan or
+  interior QR. Unknown-gauge preparation also leaves the block interior for
+  the local solve. Compact DMRG path and depth-first branch sweeps have
+  explicit end-to-end regression coverage.
+
+- Local tree gate replay now builds `SubTreeMPO` directly on its connected
+  Steiner subtree, with original node/site tags and implicit exterior
+  identity action. No full-tree identity layer is allocated or inspected.
+  Direct/DM, SRC/SDC, zipup, and FIT share this compact application boundary;
+  full `TreeMPO` operators retain their separate validation and semantics.
+
+- Tree canonical-region recovery now uses a smallest-leaf priority queue
+  instead of repeatedly scanning the remaining region. The traversal order,
+  native charge checks, and `left_inds` QR skips are preserved. SRC/SDC
+  environment reuse and release are covered for both algorithms.
+
 - Consolidated TreeOptimizer mode resolution, copy configuration, operator
   preparation, Born-probability kernels, and diagnostic record construction
   into focused private helpers. Updates now share one aggregation lifecycle;
