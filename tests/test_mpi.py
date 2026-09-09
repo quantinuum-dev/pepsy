@@ -1,5 +1,7 @@
 """Focused tests for MPI shot orchestration without requiring mpi4py."""
 
+from copy import deepcopy
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -152,8 +154,13 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
         [(flip, 0)],
         n=1,
         chi=4,
+        mode="dmrg2",
+        fit_n_iter=3,
+        seed=46,
         run=False,
     )
+    before = optimizer.to_dense().copy()
+    rng_state = deepcopy(optimizer.rng.bit_generator.state)
     result = optimizer.run(
         shots=3,
         seed=47,
@@ -161,12 +168,26 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
         workers=1,
         progress=False,
         retain="final",
+        mode="direct",
+        compression_mode="dm",
+        compression_seed=19,
+        track_infidelity=False,
     )
 
     assert isinstance(result, pepsy.MPIShotResult)
     assert result.local_shots == 3
     assert len(result.local_result.optimizers) == 3
     assert len(optimizer.G) == 1
+    assert optimizer._dmrg_mode_alias == "dmrg2"
+    assert optimizer.compression_mode == "direct"
+    assert optimizer.compression_seed is None and optimizer.track_infidelity
+    assert optimizer.rng.bit_generator.state == rng_state
+    np.testing.assert_array_equal(optimizer.to_dense(), before)
+    for child in result.local_result.optimizers:
+        assert child.mode == "direct" and child.compression_mode == "dm"
+        assert child.compression_seed == 19 and not child.track_infidelity
+        assert child.fit_n_iter == 3
+        np.testing.assert_allclose(child.to_dense().reshape(-1), [0., 1.], atol=1e-12)
 
 
 def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():

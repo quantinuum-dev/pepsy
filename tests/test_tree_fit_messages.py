@@ -103,7 +103,8 @@ def test_incremental_fit_matches_full_branch_sweeps(schedule):
     fast.p.validate(check_canonical=True)
 
 
-def test_incremental_fit_preserves_even_native_fermionic_state(monkeypatch):
+@pytest.mark.parametrize("traversal", ["depth", "auto"])
+def test_incremental_fit_preserves_even_native_fermionic_state(monkeypatch, traversal):
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype="complex128")
     plan = TreePlan.from_order(range(4), structure="balanced")
@@ -114,7 +115,8 @@ def test_incremental_fit_preserves_even_native_fermionic_state(monkeypatch):
         fermion.hopping_gate(.1, t=1., imaginary=False), (0, 3),
     )
     optimizer.apply_subtreempo(operator)
-    fit = TreeFIT(target, optimizer.tn, max_bond=16, cutoffs=0., finite_check=True)
+    fit = TreeFIT(target, optimizer.tn, max_bond=16, cutoffs=0., finite_check=True,
+                  traversal=traversal)
     update = fit.fit_block
 
     def checked_update(*args, **kwargs):
@@ -126,12 +128,58 @@ def test_incremental_fit_preserves_even_native_fermionic_state(monkeypatch):
 
     monkeypatch.setattr(fit, "fit_block", checked_update)
     with pytest.warns(RuntimeWarning, match="TreeFIT finite_check"):
-        fit.run_eff(4, block_size=3, adaptive_block_sweeps=2,
-                    two_site_transition_sweeps=1)
+        region = (plan.node_path(plan.node_of_qubit[0], plan.node_of_qubit[3])
+                  if traversal == "auto" else fit.nodes)
+        fit.run_gate(region, n_iter=4, block_size=3, adaptive_block_sweeps=2,
+                     two_site_transition_sweeps=1)
     assert fit.block_size_trace == [3, 3, 2, 1]
     assert float(pepsy.tensors.tn_fidelity(fit.p, optimizer.tn)) > 1 - 1e-10
     assert fit.fit_diagnostics(overlap=True)["target_fidelity"] > 1 - 1e-10
     assert all(ar.infer_backend(t.data) == "symmray" for t in fit.p.tensors)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "jax"])
+def test_auto_path_cached_sweeps_match_full_branches_with_rank_changes(backend):
+    plan = TreePlan.from_order(range(8), structure="balanced", top_arity=2)
+    target = TreeTensorNetwork.rand(plan, D=3, seed=44)
+    guess = TreeTensorNetwork.rand(plan, D=2, seed=45)
+    target.exponent = 4.
+    tolerance = 1e-10
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        convert = torch.as_tensor
+    elif backend == "jax":
+        jax = pytest.importorskip("jax")
+        tolerance = 2e-5
+        convert = lambda x: jax.numpy.asarray(x, dtype="complex64")
+    else:
+        convert = np.asarray
+    for state in (target, guess):
+        state.apply_to_arrays(convert)
+    region = plan.node_path(plan.node_of_qubit[0], plan.node_of_qubit[7])
+    fast = TreeFIT(target, guess, max_bond=3, cutoffs=0., traversal="auto")
+    reference = TreeFIT(target, guess, max_bond=3, cutoffs=0., traversal="auto")
+    reference._message = MethodType(_full_branch_message, reference)
+    options = dict(n_iter=4, block_size=3, adaptive_block_sweeps=2,
+                   two_site_transition_sweeps=1, final_one_site_sweeps=1)
+    fast.run_gate(region, **options)
+    reference.run_gate(region, **options)
+    # Mixed exterior overlaps are nontrivial: independently canonical target
+    # and guess branches must not be replaced by identity messages.
+    scale = 10 ** target.exponent
+    np.testing.assert_allclose(ar.to_numpy(fast.p.to_dense()) / scale,
+                               ar.to_numpy(reference.p.to_dense()) / scale, atol=tolerance,
+                               rtol=1e-4 if backend == "jax" else 1e-10)
+    assert fast.block_size_trace == [3, 3, 2, 1, 1]
+    assert fast.p.exponent == target.exponent
+    assert fast.p.is_canonical_form(fast.final_center_site,
+                                    tol=2e-5 if backend == "jax" else 1e-9)
+    assert fast.p.max_bond() <= 3
+    assert all(ar.infer_backend(t.data) == backend for t in fast.p.tensors)
+    # A subsequent branched run must clear compact path diagnostics.
+    fast.run_eff(1)
+    assert fast.fit_diagnostics()["resolved_traversal"] == "depth-first"
+    assert fast.fit_diagnostics()["path_endpoints"] is None
 
 
 @pytest.mark.parametrize("dtype,cutoff,rtol", [

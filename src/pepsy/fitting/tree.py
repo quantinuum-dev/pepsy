@@ -238,6 +238,47 @@ def _is_connected(state, nodes):
     return reached == nodes
 
 
+def _region_path(state, region):
+    """Return a connected region's endpoint order, or None if it branches.
+
+    Only induced degrees count: exterior legs remain part of each local
+    tensor, but are not sweep directions. Orient once from the endpoint
+    nearest the incoming canonical center, breaking ties by structural id.
+    This geometry-only helper also serves ordinary tree operator routing.
+    """
+    region = frozenset(region)
+    if not region:
+        return None
+    if len(region) == 1:
+        return tuple(region)
+    endpoints = []
+    for node in region:
+        degree = sum(v in region for v in _neighbors_of(state, node))
+        if degree == 1:
+            endpoints.append(node)
+        elif degree != 2:
+            return None
+    if len(endpoints) != 2:
+        return None
+    center = getattr(state, "orthogonality_center", None)
+    endpoints.sort(key=lambda node: (
+        0 if center is None else len(_path_of(state, center, node)), node,
+    ))
+    path = _path_of(state, *endpoints)
+    return path if frozenset(path) == region else None
+
+
+def _validate_region_path(state, region, path):
+    """Validate a frozen internal order before any canonicalization."""
+    path = tuple(path)
+    if (
+        len(path) != len(region) or frozenset(path) != frozenset(region)
+        or any(v not in _neighbors_of(state, u) for u, v in zip(path, path[1:]))
+    ):
+        raise ValueError("path order must visit the connected region exactly once")
+    return path
+
+
 def _component_of(state, start, blocked):
     """Return the component containing ``start`` after cutting an edge."""
 
@@ -451,9 +492,10 @@ class TreeFIT:
         Quimb singular-value cutoff convention.
     contraction_opt : object, default="auto-hq"
         Contraction optimizer forwarded to local environment contractions.
-    traversal : {"depth", "depth-first"}, default="depth"
-        Legacy depth ordering or branch-grouped depth-first local updates.
-        Both visit the same blocks; truncated results can depend on order.
+    traversal : {"auto", "depth", "depth-first"}, default="depth"
+        Auto sweeps path-shaped regions between endpoints and uses depth-first
+        for branching regions. Explicit depth policies retain their medial
+        ordering. All visit the same blocks; truncated results depend on order.
     environment_strategy : {"default", "native-blockwise"}, default="default"
         Optional per-contraction Symmray blockwise implementation for messages
         and effective tensors. Requires native target/state arrays and public
@@ -507,6 +549,8 @@ class TreeFIT:
     ):
         self._validate_geometry(tn, p)
         self.traversal = self._normalize_traversal(traversal)
+        self.resolved_traversal = None
+        self.path_endpoints = None
         self.environment_strategy = self._normalize_environment_strategy(
             environment_strategy
         )
@@ -891,8 +935,8 @@ class TreeFIT:
     @staticmethod
     def _normalize_traversal(value):
         value = str(value).strip().lower().replace("_", "-")
-        if value not in {"depth", "depth-first"}:
-            raise ValueError("traversal must be 'depth' or 'depth-first'")
+        if value not in {"auto", "depth", "depth-first"}:
+            raise ValueError("traversal must be 'auto', 'depth', or 'depth-first'")
         return value
 
     @staticmethod
@@ -1513,7 +1557,13 @@ class TreeFIT:
         """Return one inward or outward sequence of local update blocks."""
 
         region = frozenset(region)
-        if self.traversal == "depth-first":
+        if self.traversal == "auto":
+            path = _region_path(self.p, region)
+            if path is not None:
+                return [block for block, _ in self._path_sweep_updates(
+                    path, block_size, direction,
+                )]
+        if self.traversal in {"auto", "depth-first"}:
             return self._depth_first_sweep_blocks(region, block_size, direction)
         if block_size == 1:
             center = self._block_center(region)
@@ -1545,6 +1595,19 @@ class TreeFIT:
             ),
             reverse=direction == "in",
         )
+
+    @staticmethod
+    def _path_sweep_updates(path, block_size, direction):
+        """Consecutive windows, with the center at the advancing endpoint.
+
+        For auto paths, 'in' traverses the frozen reference order; 'out'
+        reverses it. Reverse both windows and centers, so adjacent multi-node
+        windows contain the previous center and need no preparatory QR.
+        """
+        path = path if direction == "in" else path[::-1]
+        size = min(block_size, len(path))
+        return tuple((path[i:i + size], path[i + size - 1])
+                     for i in range(len(path) - size + 1))
 
     def _depth_first_sweep_blocks(self, region, block_size, direction):
         """Group updates by branch using one iterative walk of the region.
@@ -1665,6 +1728,7 @@ class TreeFIT:
         two_site_transition_sweeps=0,
         final_one_site_sweeps=0,
         single_node_fast_path=True,
+        _path_order=None,
     ):
         """Run cached tree FIT sweeps over a connected active region.
 
@@ -1672,8 +1736,10 @@ class TreeFIT:
         local update. ``sweep_sequence`` selects ``"inward-outward"`` or
         ``"outward-inward"``; legacy ``"RL"``/``"LR"`` remain aliases.
         One iteration includes both directional passes. These directions are
-        measured relative to the active region's medial node, not necessarily
-        the structural root of the whole tree.
+        measured relative to the active region's medial node for explicit
+        depth policies and branched auto regions. Auto paths instead freeze
+        an entry endpoint nearest the incoming center: inward follows that
+        endpoint order and outward reverses it, including block centers.
         The target remains fixed and the fitted state is updated in place.
         ``adaptive_block_sweeps`` enables the MPS-compatible larger-block
         warm-up followed by one-site refinement. ``adaptive_until_rank``
@@ -1721,6 +1787,16 @@ class TreeFIT:
         # update, and a one-node region is necessarily one-site.
         block_size = min(int(block_size), len(region))
         sequence = self._normalize_sweep_sequence(sweep_sequence)
+        # Freeze orientation before any updates. TreeOptimizer supplies the
+        # same order used to align its disposable initial guess; reorienting
+        # from that guess would silently cancel a requested reverse pass.
+        path = None
+        if _path_order is not None:
+            if self.traversal != "auto":
+                raise ValueError("a frozen path order requires traversal='auto'")
+            path = _validate_region_path(self.p, region, _path_order)
+        elif self.traversal == "auto":
+            path = _region_path(self.p, region)
         directions = {
             "inward-outward": ("in", "out"),
             "outward-inward": ("out", "in"),
@@ -1785,6 +1861,11 @@ class TreeFIT:
         self.adaptive_sweeps_run = 0
         self.one_site_sweeps_run = 0
         self.block_size_trace = []
+        self.resolved_traversal = (
+            "path" if path is not None else
+            "depth-first" if self.traversal == "auto" else self.traversal
+        )
+        self.path_endpoints = None if path is None else (path[0], path[-1])
         if single_node_fast_path and len(region) == 1:
             # The exterior is fixed: one canonical local projection solves
             # this region exactly, independent of the initial centre tensor.
@@ -1830,7 +1911,12 @@ class TreeFIT:
             # tree-medial node and pairwise paths on every iteration.
             key = (size, direction)
             if key not in block_orders:
-                block_orders[key] = tuple(self._sweep_blocks(region, size, direction))
+                block_orders[key] = (
+                    self._path_sweep_updates(path, size, direction)
+                    if path is not None else
+                    tuple((block, None) for block in
+                          self._sweep_blocks(region, size, direction))
+                )
             return block_orders[key]
 
         def block_size_for_sweep(sweep_number):
@@ -1864,8 +1950,8 @@ class TreeFIT:
             else:
                 self.adaptive_sweeps_run += 1
             for direction in directions:
-                for block in sweep_blocks(active_block_size, direction):
-                    self.fit_block(block, validate=False)
+                for block, center in sweep_blocks(active_block_size, direction):
+                    self.fit_block(block, center=center, validate=False)
             self.iterations_run = iteration
             self.final_direction = directions[-1]
             self.final_center_site = getattr(self.p, "orthogonality_center", None)
@@ -1962,8 +2048,8 @@ class TreeFIT:
                 self.block_size_trace.append(1)
                 self.one_site_sweeps_run += 1
                 for direction in directions:
-                    for block in sweep_blocks(1, direction):
-                        self.fit_block(block, validate=False)
+                    for block, center in sweep_blocks(1, direction):
+                        self.fit_block(block, center=center, validate=False)
                 self.iterations_run += 1
                 self.final_direction = directions[-1]
                 self.final_center_site = getattr(
@@ -2109,6 +2195,8 @@ class TreeFIT:
             "block_size_trace": tuple(self.block_size_trace),
             "sweep_sequence": self.sweep_sequence,
             "traversal": self.traversal,
+            "resolved_traversal": self.resolved_traversal,
+            "path_endpoints": self.path_endpoints,
             "environment_strategy": self.environment_strategy,
             "target_layout": self.target_layout,
             "cache": self.environment_cache_info(),

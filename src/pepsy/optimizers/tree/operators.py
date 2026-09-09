@@ -172,12 +172,14 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         virtual=True,
         deep=False,
     ):
+        source_identity_exterior = False
         if isinstance(plan, TreeMPO) and tree_networks is None:
             source = plan
+            source_identity_exterior = source._identity_exterior_unchanged()
             plan = source.plan
             networks = tuple(
                 network.copy(virtual=virtual, deep=deep)
-                for network in source.tree_networks
+                for network in source._scaled_tree_networks()
             )
             terms = source.terms
             backend = source.backend
@@ -239,6 +241,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                     "operator_support must contain only TreePlan physical sites."
                 )
             self._operator_support = normalized_support
+        self._identity_exterior = None
         self.pepsy_tree_plan_signature = _tree_plan_signature(plan)
         self.layout_finder = layout_finder
         for network in networks:
@@ -247,6 +250,54 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             # stored network so copies and backend conversions retain the
             # geometry contract without hard-coding ``N{node}``.
             network.pepsy_tree_node_tag_id = node_tag_id
+        if source_identity_exterior:
+            self._capture_identity_exterior()
+
+    def _scaled_tree_networks(self):
+        """Private sector views carrying the public Quimb exponent.
+
+        The primary generalized-operator view and its stored networks share
+        tensors, but Quimb exponents are ordinary numeric attributes. Apply
+        the public exponent offset to each sector without changing the source.
+        Relative sector exponents are preserved; no power of ten is formed.
+        """
+        offset = self.exponent - self.tree_networks[0].exponent
+        if offset == 0:
+            return self.tree_networks
+        networks = tuple(network.copy(virtual=True) for network in self.tree_networks)
+        for network in networks:
+            network.exponent += offset
+        return networks
+
+    def _capture_identity_exterior(self):
+        """Record builder-proven identity tensors outside the active subtree.
+
+        Only identity builders and transformations known to preserve their
+        proof call this. A caller-supplied support hint alone is not a proof.
+        Store array references, not their values: replay needs no contractions
+        or host transfers to notice an exterior gauge or tensor replacement.
+        """
+        if self.operator_support is None or len(self.tree_networks) != 1:
+            return
+        active = _tree_subtree_span(
+            self.plan, tuple(self.plan.node_of_qubit[q] for q in self.operator_support),
+        )
+        self._identity_exterior = tuple(
+            (node, tensor.data, tensor.inds)
+            for node in self.plan.nodes() if node not in active
+            for tensor in (self.node_tensor(node),)
+        )
+
+    def _identity_exterior_unchanged(self):
+        """Whether the builder's identity-only exterior can still be omitted."""
+        if self.__dict__.get("_identity_exterior") is None:
+            return False
+        return all(
+            tensor.data is data and tensor.inds == inds
+            for node, data, inds in self._identity_exterior
+            for tensor in (self.node_tensor(node),)
+        )
+
     @property
     def backend(self):
         """Return the logical Pepsy backend label for this operator."""
@@ -330,9 +381,11 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
     def operator_support(self):
         """Logical sites with known non-identity operator support.
 
-        This is an application optimization hint. The stored TreeMPO remains
-        complete and still carries explicit identity legs outside this set.
+        This is an application optimization hint. Builder-created TreeMPOs
+        are complete, with explicit unit identity tensors outside this set.
         ``None`` means that a conservative full-tree route is required.
+        The optimizer also checks the builder's exterior identity proof;
+        changed or unproven exterior tensors require a full-tree application.
         """
         if self._operator_support is None:
             return None
@@ -503,7 +556,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         layout. The gate is factorized only over the minimal TreePlan Steiner
         subtree joining those sites; bond-one identity tensors are installed
         on the remaining TreePlan nodes. Thus the result can be passed
-        directly to :meth:`TreeOptimizer.apply_subtreempo` without building a
+        directly to :meth:`TreeOptimizer.apply_sub_mpotree` without building a
         ``2**n`` operator or introducing a fictitious contiguous MPS window.
 
         Dense gates may be supplied as a square matrix or as a tensor with
@@ -585,6 +638,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             operator_support=support,
             layout_finder=layout_finder,
         )
+        operator._capture_identity_exterior()
         if compress:
             operator.compress(max_bond=max_bond, cutoff=cutoff)
         return operator
@@ -622,7 +676,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
         )
-        return cls(
+        operator = cls(
             plan,
             network,
             backend="dense",
@@ -635,6 +689,8 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             operator_support=support,
             layout_finder=layout_finder,
         )
+        operator._capture_identity_exterior()
+        return operator
 
     @classmethod
     def from_dense(
@@ -1092,7 +1148,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         if not inds_seq:
             inds_seq = (self.upper_inds_present, self.lower_inds_present)
         values = []
-        for network in self.tree_networks:
+        for network in self._scaled_tree_networks():
             if self.fermionic:
                 # Symmray's block-sparse contraction assumes a neutral scalar
                 # when it closes all internal legs. A charged operator has
@@ -1110,7 +1166,9 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                         inds=tensor.inds,
                         tags=tensor.tags,
                     ))
+                exponent = network.exponent
                 network = qtn.TensorNetwork(dense_tensors)
+                network.exponent = exponent
             view = qtn.TensorNetworkGenOperator(
                 network,
                 virtual=True,
@@ -1230,14 +1288,32 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                     f"cutoff, got {names}."
                 )
 
+        # Direct-sum kernels combine tensor entries, not represented network
+        # scalars. Align every sector to one exponent before adding; choosing
+        # the largest exponent avoids overflow while scaling private tensors.
+        sources = (self._scaled_tree_networks(), other._scaled_tree_networks())
+        common_exponent = max(network.exponent for group in sources for network in group)
+        aligned = []
+        for group in sources:
+            components = []
+            for network in group:
+                if network.exponent != common_exponent:
+                    offset = network.exponent - common_exponent
+                    network = network.copy()
+                    tensor = network[self.node_tag(self.plan.root)]
+                    tensor.modify(data=tensor.data * 10.0 ** offset, left_inds=None)
+                    network.exponent = common_exponent
+                components.append(network)
+            aligned.append(tuple(components))
+
         if self.fermionic:
             # Symmray arrays cannot be padded by Quimb's generic direct-sum
             # helper when an axis contains multiple charge sectors. Group
             # complete TTNO networks by their open operator charge and build
             # each group with the TreePlan-aware native block direct sum.
             grouped = {}
-            for source, sign in ((self, 1), (other, -1 if negate else 1)):
-                for network in source.tree_networks:
+            for source, sign in ((aligned[0], 1), (aligned[1], -1 if negate else 1)):
+                for network in source:
                     charge = _tree_operator_charge(network, self.plan)
                     grouped.setdefault(charge, []).append((network, sign))
             networks = tuple(
@@ -1270,8 +1346,10 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                     # then uses the native tree SVD sweep below when requested.
                     compress=False,
                 )
-                for left, right in zip(self.tree_networks, other.tree_networks)
+                for left, right in zip(*aligned)
             )
+        for network in networks:
+            network.exponent = common_exponent
         terms = None
         if self.terms is not None and other.terms is not None:
             terms = dict(self.terms)
@@ -1348,14 +1426,19 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         if not target.tree_networks:
             raise ValueError("cannot scale a TreeMPO without stored networks.")
         for network in target.tree_networks:
-            tensor = next(iter(network))
+            # Keep builder identities outside the support unchanged, so a
+            # scalar multiple of a local gate retains its minimal route.
+            tensor = (
+                network[target.node_tag(target.plan.node_of_qubit[target.operator_support[0]])]
+                if target.operator_support is not None else next(iter(network))
+            )
             tensor.modify(data=tensor.data * factor, left_inds=tensor.left_inds)
         if target.terms is not None:
             target.terms = {
                 support: value * factor
                 for support, value in target.terms.items()
             }
-        target.invalidate_canonical_form()
+        target._canonical_region = None
         return target
 
     def compose(
@@ -1429,6 +1512,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             if left_support is None or right_support is None
             else frozenset(left_support) | frozenset(right_support)
         )
+        network.exponent = self.exponent + other.exponent
         result = type(self)(
             self.plan,
             network,
@@ -1444,6 +1528,8 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             operator_support=support,
             layout_finder=self.layout_finder,
         )
+        if self._identity_exterior_unchanged() and other._identity_exterior_unchanged():
+            result._capture_identity_exterior()
         if compress:
             result.compress(max_bond=max_bond, cutoff=cutoff, order=order)
         if inplace:
@@ -1492,7 +1578,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             selector[self.upper_ind(site)] = bra_value
             selector[self.lower_ind(site)] = ket_value
         value = 0.0
-        for network in self.tree_networks:
+        for network in self._scaled_tree_networks():
             value = value + network.isel(selector).contract(all)
         return value
 
@@ -1712,8 +1798,13 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
     canonize = canonicalize_
 
     def invalidate_canonical_form(self):
-        """Forget operator gauge metadata after an unmanaged tensor edit."""
+        """Forget gauge and exterior-identity proofs after an unmanaged edit.
+
+        Call this after modifying array entries in place (rather than through
+        ``Tensor.modify``), since array identity alone cannot detect that edit.
+        """
         self._canonical_region = None
+        self._identity_exterior = None
         return self
 
     def isometry_direction(self, node):
@@ -2005,7 +2096,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             self.plan,
             tuple(
                 network.copy(virtual=virtual, deep=deep)
-                for network in self.tree_networks
+                for network in self._scaled_tree_networks()
             ),
             terms=self.terms,
             backend=self.backend,
@@ -2024,6 +2115,8 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         if hasattr(self, "pepsy_compression_report"):
             copied.pepsy_compression_report = self.pepsy_compression_report
         copied._canonical_region = self.canonical_region
+        if self._identity_exterior_unchanged():
+            copied._capture_identity_exterior()
         if transpose:
             copied._transpose_operator_inplace()
         if conj:
@@ -2032,6 +2125,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
 
     def _transpose_operator_inplace(self):
         """Transpose every local upper/lower physical pair in place."""
+        identity_exterior = self._identity_exterior_unchanged()
         for network in self.tree_networks:
             for tensor in network:
                 physical_axes = []
@@ -2057,6 +2151,8 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                     # indices. Preserve the tree canonical gauge metadata.
                     left_inds=tensor.left_inds,
                 )
+        if identity_exterior:
+            self._capture_identity_exterior()
         return self
 
     def conj(
@@ -2068,6 +2164,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
     ):
         """Conjugate every stored tree operator like a Quimb operator view."""
         if inplace:
+            identity_exterior = self._identity_exterior_unchanged()
             for network in self.tree_networks:
                 network.conj(
                     mangle_inner=mangle_inner,
@@ -2075,6 +2172,8 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                     phase_dual=phase_dual,
                     inplace=True,
                 )
+            if identity_exterior:
+                self._capture_identity_exterior()
             return self
 
         networks = tuple(
@@ -2083,7 +2182,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
                 output_inds=output_inds,
                 phase_dual=phase_dual,
             )
-            for network in self.tree_networks
+            for network in self._scaled_tree_networks()
         )
         result = type(self)(
             self.plan,
@@ -2104,6 +2203,8 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         )
         if not mangle_inner and output_inds is None:
             result._canonical_region = self.canonical_region
+            if self._identity_exterior_unchanged():
+                result._capture_identity_exterior()
         return result
 
     def expectation(self, state, *, normalized=True, optimize="auto"):
@@ -2128,7 +2229,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
 
         sites = tuple(sorted(tree.plan.node_of_qubit))
         numerator = 0.0
-        for operator in self.tree_networks:
+        for operator in self._scaled_tree_networks():
             ket = tree.copy()
             operator_work = operator.copy()
             ket_reindex = {}

@@ -26,9 +26,9 @@ Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted TTN (internal
 nodes of **any arity**; binary is the default, see *Non-binary trees* below)
 whose leaves carry physical qubit indices. An optional ``root_qubit`` is instead
 carried by the top tensor; all other physical sites remain leaves. A bundled gate stream
-`[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
-(2q); supports with `len(where) >= 3` route through
-`apply_subtree_operator` (see *Multi-qubit / sub-MPO application*).
+`[(gate, where), ...]` is replayed. `where` is an integer or distinct integer
+support. All ordinary gates lower to TreeMPO and `apply_sub_mpotree`;
+`apply_subtree_operator` remains an explicit lower-level interface.
 
 Preferred public handoff:
 
@@ -225,7 +225,7 @@ one-node case.
 ## Ordinary gate routing and local FIT
 
 Ordinary gate streams in `auto`, `direct`, `dm`, `sdc`, `src`, `zipup`,
-`mpo`, and DMRG modes build a TreeMPO and use `apply_subtreempo`. Explicit
+`mpo`, and DMRG modes build a TreeMPO and use `apply_sub_mpotree`. Explicit
 `submpo` still declares chain-MPO entries. Keep the target and disposable
 FIT guess separate; `guess-zipup` is an opt-in tree warm start.
 TreeFIT rejects odd-parity fermionic tensors because their graded local
@@ -299,10 +299,10 @@ parent blob -- this is exact up to the truncation.
 `apply_subtree_operator(op, where, *, max_bond=None, cutoff=None,
 renormalize=False)` applies a general operator on `k >= 1` qubits in one shot --
 a `k`-qubit gate, a multi-site **non-unitary / Kraus** operator, or a whole
-**Trotter block**. It extends the two-factor path-thread kernel to the whole
-spanning subtree: the tree analogue of a sub-MPO applied over a
-covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductState`
--only; the tree base `TensorNetworkGenVector` has no such method).
+**Trotter block**. DMRG/zipup lower to TreeMPO and `apply_sub_mpotree`.
+The other modes retain this lower-level exact factor-and-route preparation,
+then compress the completed state. The following canonical sweep describes
+direct/DM; SRC/SDC instead use successive environments on the routed state.
 
 1. `snodes = _steiner_nodes(site_nodes)` -- minimal connected subtree spanning
    the target physical nodes.
@@ -321,19 +321,18 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
    Dense trees and charge-aligned native Symmray trees can then recover the
    hub centre through the normal canonical state machine without repeating
    those QRs; missing or malformed native proofs use explicit graded QR.
-   Finally make one depth-first canonical SVD sweep: every affected tree edge
+   Finally compress once along a path, or depth-first on branches: every edge
    is truncated once, after the complete operator has arrived. Dense path and
    subtree sweeps select one-sided ``reduced="left"`` compression only when
    the destination tensor's live ``left_inds`` proves the required isometry;
-   native graded compression keeps its explicit block-SVD semantics.
+   native graded SVD keeps Symmray's multiplet policy (chi may be exceeded).
    `renormalize=True` renormalises afterwards (for Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator
-bonds are private to the temporary tree-MPO. `apply_gate` routes
-`len(where) >= 3` here; `k == 1`/`k == 2` still take the optimised
-leaf-absorb / threading paths (but `k == 1` non-unitary and `k == 2` Kraus
-can be sent here explicitly).
+bonds are private to the temporary tree-MPO. Ordinary `apply_gate` uses the
+primary `apply_sub_mpotree` route at every arity. Explicit one-/two-site
+compatibility methods retain specialized kernels outside DMRG/zipup.
 
 ### Native streamed sub-MPOs
 

@@ -42,26 +42,52 @@ Read this reference before changing `pepsy.fitting.TreeFIT` or its
   fermionic `guess-direct`. Explicit unsupported native methods must still
   raise. `guess-direct` applies/compresses the operator on a private state;
   `direct` alone keeps the current state as the initial guess.
+- Per-call `apply_sub_mpotree` / `apply_subtree_operator` caps and cutoffs must
+  reach both `_tree_fit_initial_guess` and `_run_tree_fit`; never temporarily
+  change parent defaults. Diagnostics record the effective per-call values.
+  Local FIT splits retain `compression_mode="direct"` / `"dm"`; SRC/SDC
+  settings map to direct local SVD. Keep the independently configured guess
+  algorithm separate and report the effective local `split_method`.
+  FIT controls remain constructor options inherited by copies and shots;
+  `run` and child `run_kwargs` reject unsupported `fit_*` keywords.
+  The latest FIT getter returns an independent record, clears after completed
+  non-FIT updates, and returns `None` outside FIT. State replacement clears
+  both the latest record and historical FIT list.
 - TreeOptimizer defaults to automatic cutoff, `rsum2` cutoff mode,
   `fit_rtol="auto"`, and `fit_min_iter=2`. FIT tolerance is `1e-3` for
   16-bit data, `1e-5` for float32/complex64, and `1e-9` otherwise. Explicit
   `None` disables tolerance stopping. Automatic stopping is disabled for
   declared non-unitary replay and `track_norm=False` updates; explicit
   numeric tolerances remain honored. Standalone TreeFIT defaults to no rtol.
-- `inward-outward` and `outward-inward` name the two passes of each iteration,
-  relative to the active region's medial node. Preserve `RL`/`INOUT` and
-  `LR`/`OUTIN` as aliases with unchanged traversal order. The default four
+- `inward-outward` and `outward-inward` name the two passes of each iteration.
+  For explicit depth policies and branched auto regions, these are relative
+  to the region's medial node. Preserve `RL`/`INOUT` and `LR`/`OUTIN` as aliases
+  of those orders, including the endpoint convention below. The default four
   optimizer iterations permit eight directional passes and reach one-site
   refinement. Named `dmrg3` uses `(3, 3, 2, 1)`, with its two-node transition
   controlled by `fit_two_site_transition_sweeps` (one by default). Explicit
   budgets remain authoritative. Standalone TreeFIT keeps its fixed defaults
   and offers `two_site_transition_sweeps=0` on each run entry point.
-- TreeOptimizer defaults to `fit_traversal="depth-first"` for all DMRG modes;
-  standalone TreeFIT retains `traversal="depth"`. Depth-first groups
-  connected blocks by branch of the region's medial hub using iterative DFS.
-  Preserve the block set and reverse the order for the inward pass. Test
-  real center travel and finite-bond fidelity; explicit `"depth"` restores legacy order.
-  The optimizer forwards `fit_traversal` and copies preserve both policies.
+- TreeOptimizer defaults to `fit_traversal="auto"` for all DMRG modes;
+  standalone TreeFIT retains `traversal="depth"`. Auto inspects induced
+  region degrees, using endpoint sweeps on paths and depth-first on branches.
+  Explicit depth/depth-first retain their medial block ordering.
+- Freeze a path before the guess from the endpoint nearest the incoming
+  center (node-id ties, deterministic node-id endpoint if unknown). Inward
+  follows this reference order; outward reverses it. Never reorient after
+  constructing a guess or switching block size. Compressed guesses must end
+  at the actual first FIT endpoint, including reversed sweep sequences.
+  SRC/SDC project toward that endpoint with complementary messages traveling
+  oppositely. Direct prepares the complete operator exactly, gauges to the
+  other endpoint, then compresses toward it. Its exact preparation can peel
+  from both ends to avoid large QR matrices; never truncate that preparation.
+- Path blocks are consecutive windows with their requested center at the
+  advancing endpoint. Reverse centers as well as block order. Adjacent
+  two-/three-node blocks contain the previous center, avoiding interior QR.
+  Off-path mixed target/bra environments are not generally identities even
+  when both branches are isometric. Keep numerical dependency invalidation.
+  Cache only geometry within the run and report compact resolved traversal,
+  endpoints and final center; do not accumulate a per-block history.
 - A one-node active region uses one exact projection by default in
   `run_gate(single_node_fast_path=True)` / TreeOptimizer. Skip guess replay,
   preserve the compressed guess's parent child-seed draw, record one norm

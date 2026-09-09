@@ -12,7 +12,23 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+### Changed
+
+- Consolidated TreeOptimizer mode resolution, copy configuration, operator
+  preparation, Born-probability kernels, and diagnostic record construction
+  into focused private helpers. Updates now share one aggregation lifecycle;
+  direct/DM, SRC/SDC, zipup, and FIT retain their algorithms and defaults.
+  Layout pilot selection belongs to the layout finder, with replay supplied
+  by a callback. Private MPO readout no longer copies accumulated histories
+  or queued gates; public optimizer copies retain them. Installing a selected
+  layout now invalidates gate factors tied to the previous tree.
+
 ### Documentation
+
+- Clarified that native Symmray's existing global SVD policy may retain a
+  degenerate boundary beyond the requested tree bond cap. Native zipup checks
+  now verify any such excess against the singular spectrum and exercise empty
+  charge rejection independently of roundoff-dependent tie choices.
 
 - Clarified TreeOptimizer's automatic cutoff parity with MpsOptimizer and
   added numerical regressions for DM aliases, installed-state precision,
@@ -22,11 +38,58 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
-- TreeOptimizer now defaults to depth-first FIT traversal for `dmrg`,
-  `dmrg1`, `dmrg2`, and `dmrg3`, retaining automatic SRC guesses for dense
-  trees and direct guesses for native fermionic trees. Explicit
-  `fit_traversal="depth"` restores the previous update order; finite-sweep
-  results can change. Standalone TreeFIT keeps its existing default.
+- Preserve TreeMPO represented exponents across direct/DM, SRC/SDC, zipup,
+  copies, exact readout, and operator arithmetic, matching FIT target scaling.
+  Retain relative sector exponents and align them before direct-sum addition.
+  Minimal application routes now require unchanged builder-proven exterior
+  identities; re-gauged or externally modified operators use the full tree
+  so scalar factors outside the nominal support are not silently dropped.
+  Native tree statevector readout now unpacks Symmray blocks into numeric
+  arrays and restores declared physical charge sectors removed by contraction
+  or canonicalization, preserving the local Hilbert-space dimensions.
+
+- Clarified TreeOptimizer's distinct direct/DM, SRC/SDC, zipup, and FIT
+  dispatch at `apply_sub_mpotree`. State replacement and caps now invalidate
+  cached operators bound to the old layout. Approximate MPO readout preserves
+  the sampling RNG and reports private-ket rank cuts even with replay history
+  disabled. FIT readout exposes separate approximation diagnostics and warns
+  for multi-node variational fits without claiming that absent edge cuts mean
+  an exact result. FIT diagnostics identify the effective direct/DM local split,
+  independently of the initial guess algorithm.
+
+- Made `TreeOptimizer.apply_sub_mpotree` the primary ordinary-gate and
+  TreeMPO entry point, retaining existing method aliases and adding matching
+  event helpers. Documented explicit `fit_traversal="depth"` / `"depth-first"`
+  for multi-site DMRG operators and automatic path-versus-branch routing.
+  Tree Pauli measurements and coalesced shots now share independently
+  computed Born weights from projected amplitudes: local one-site projectors
+  or lossless parity QR messages on the active subtree. This preserves rare
+  branches without a dense projector or full optimizer copy. Rejected
+  fractional supports no longer address different qubits, and canonicalization
+  resolves stable logical labels correctly after caps.
+
+- Unified TreeOptimizer constructor/run/legacy mode resolution and validated
+  caps, cutoffs, FIT budgets, and initialization settings consistently. Per-call
+  bond/cutoff overrides now reach both DMRG guesses and refinement. Shot options
+  affect only children; invalid replay options preserve configuration and
+  queues, and MPI-only options no longer silently disappear. Clear stale FIT
+  diagnostics after non-FIT updates and state replacement. Keep root arity
+  synchronized after caps/state replacement so copies and shots remain valid;
+  fix direct measurement's logical labels, positive-branch selection, and
+  projection-versus-compression norm accounting.
+
+- TreeOptimizer now defaults to `fit_traversal="auto"`: endpoint FIT sweeps
+  on path-shaped active regions and depth-first traversal on branches for
+  `dmrg` and `dmrg1/2/3`. Align compressed guesses with the first pass and
+  retain advancing block centers through direction and size changes. Direct
+  and DM prepare path operators exactly then compress in one direction, without
+  return QR sweeps. SRC/SDC and zipup also use endpoint path routes. Explicit
+  depth policies retain their FIT block order; finite-cap and seeded results
+  can change. Standalone TreeFIT keeps its existing default.
+  Reuse exterior canonical proofs before direct/SRC/SDC preparation, schedule
+  QR messages incrementally without rescanning pending edges, and limit
+  SRC/SDC/zipup physical-index maps to the active region. Path profiling now
+  includes planning time and distinguishes deferred message merges.
 
 - Cache up to 128 immutable SRC/SDC tree environment plans across calls.
   Keep numerical messages and consumption counters private to each call;

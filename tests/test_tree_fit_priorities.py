@@ -35,7 +35,7 @@ def test_single_node_gate_exact_without_guess_replay(mode, monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(TreeFIT, "fit_block", counted)
-        patch.setattr(TreeOptimizer, "apply_subtreempo", no_guess)
+        patch.setattr(TreeOptimizer, "apply_sub_mpotree", no_guess)
         fast.apply_gate(gate, (0,), track_norm=False)
     expected = (gate @ state.to_dense().reshape(2, -1)).reshape(-1)
     np.testing.assert_allclose(fast.to_dense().reshape(-1), expected, atol=1e-10)
@@ -160,7 +160,7 @@ def test_native_blockwise_fit_matches_default_without_global_dispatch(backend):
 
 
 @pytest.mark.parametrize("traversal,expected", [
-    ("depth_first", "depth-first"), ("depth", "depth"),
+    ("auto", "auto"), ("depth_first", "depth-first"), ("depth", "depth"),
 ])
 def test_fit_execution_options_validate_and_survive_optimizer_copy(traversal, expected):
     state = pepsy.ps_to_ttn(3)
@@ -180,7 +180,7 @@ def test_fit_execution_options_validate_and_survive_optimizer_copy(traversal, ex
 
 
 @pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
-def test_default_depth_first_src_lossless_gate_replay(mode):
+def test_default_auto_src_lossless_branched_gate_replay(mode):
     plan = TreePlan.from_order(range(1, 6), root_qubit=0, structure="balanced",
                                max_arity=3)
     state = TreeTensorNetwork.rand(plan, D=2, seed=10)
@@ -190,11 +190,13 @@ def test_default_depth_first_src_lossless_gate_replay(mode):
     exact = TreeOptimizer(stream, state=state, chi=64, cutoff=0., mode="direct")
     fitted = TreeOptimizer(stream, state=state, chi=64, cutoff=0., mode=mode)
     np.testing.assert_allclose(fitted.to_dense(), exact.to_dense(), atol=1e-10)
-    assert fitted.get_fit_diagnostics()["traversal"] == "depth-first"
+    assert fitted.get_fit_diagnostics()["traversal"] == "auto"
+    assert fitted.get_fit_diagnostics()["resolved_traversal"] == "depth-first"
+    assert fitted.get_fit_diagnostics()["path_endpoints"] is None
     assert fitted.get_fit_diagnostics()["fit_init_strategy_requested"] == "auto"
     assert fitted.get_fit_diagnostics()["fit_init_strategy"] == "guess_src"
     assert fitted.get_fit_diagnostics()["guess_used"] is True
-    assert fitted.copy().fit_traversal == "depth-first"
+    assert fitted.copy().fit_traversal == "auto"
     fitted.tn.validate(check_canonical=True)
 
 

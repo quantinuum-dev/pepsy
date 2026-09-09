@@ -176,7 +176,7 @@ def test_subtree_operator_uses_lazy_tree_mpo(mode, monkeypatch):
 
 @pytest.mark.parametrize("dtype", ("complex64", "complex128"))
 @pytest.mark.parametrize("chi", (4, None))
-def test_zipup_native_fermionic_matches_direct(dtype, chi):
+def test_zipup_native_fermionic_matches_direct(dtype, chi, monkeypatch):
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype=dtype)
     plan = TreePlan.from_order(range(4), structure="balanced")
@@ -185,18 +185,44 @@ def test_zipup_native_fermionic_matches_direct(dtype, chi):
     gate = fermion.hopping_gate(0.1, t=1., imaginary=False)
     stream = [(gate, (0, 3)), (gate, (0, 1)), (gate, (1, 2))]
     direct = TreeOptimizer(stream, state=state.copy(), chi=None, cutoff=0.)
-    zipup = TreeOptimizer(stream, state=state.copy(), chi=chi, cutoff=0., mode="zipup")
     tolerance = 2e-5 if dtype == "complex64" else 1e-10
+    split = qtn.Tensor.split
+    allowed_ranks = [chi or 0]
+
+    def checked_split(tensor, *args, **kwargs):
+        result = split(tensor, *args, **kwargs)
+        if (chi is not None and tensor.isfermionic()
+                and kwargs.get("method") == "svd" and kwargs.get("max_bond") is not None):
+            assert kwargs.get("max_bond") == chi
+            bond = next(iter(qtn.bonds(*result)))
+            rank = result[0].ind_size(bond)
+            if rank > chi:
+                # Symmray's global mode retains a whole degenerate multiplet.
+                # Prove an over-cap result ends within the boundary multiplet,
+                # rather than permitting arbitrary cap or recovery violations.
+                opts = dict(kwargs, max_bond=None, cutoff=0., absorb=None)
+                _, singular, _ = split(tensor, *args, **opts)
+                spectrum = TreeOptimizer._spectrum_to_numpy(singular.data)
+                np.testing.assert_allclose(
+                    spectrum[chi - 1:rank], spectrum[chi - 1],
+                    rtol=tolerance, atol=tolerance * spectrum[0],
+                )
+                allowed_ranks.append(rank)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(qtn.Tensor, "split", checked_split)
+        zipup = TreeOptimizer(stream, state=state.copy(), chi=chi, cutoff=0., mode="zipup")
     if chi is None:
         assert float(pepsy.tensors.tn_fidelity(zipup.tn, direct.tn)) > 1 - tolerance
         assert zipup.norm() == pytest.approx(direct.norm(), rel=tolerance)
     else:
-        assert zipup.max_bond() <= chi
+        assert zipup.max_bond() <= max(allowed_ranks)
         assert 0 < zipup.norm() <= direct.norm() + tolerance
     assert zipup.tn.is_canonical_form(zipup.center, tol=tolerance)
 
 
-def test_zipup_does_not_install_empty_native_charge_paths():
+def test_zipup_does_not_install_empty_native_charge_paths(monkeypatch):
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype="complex128")
     plan = TreePlan.from_order(range(4), structure="balanced")
@@ -204,11 +230,55 @@ def test_zipup_does_not_install_empty_native_charge_paths():
                             occupations=((1, 0), (0, 1), (1, 0), (0, 1)))
     optimizer = TreeOptimizer(None, state=state.copy(), chi=2, cutoff=0.,
                               mode="zipup", run=False)
-    with pytest.raises(ValueError, match="no compatible charge blocks"):
-        optimizer.apply_gate(fermion.hopping_gate(.1, t=1., imaginary=False), (0, 3))
+    operator = TreeMPO.from_gate(
+        plan, fermion.hopping_gate(.1, t=1., imaginary=False), (0, 3),
+        fermionic=True, symmetry=state.symmetry, dtype="complex128",
+    )
+    # A conservative full support uses branched peeling. Inject the empty
+    # final hub that incompatible early cuts can produce, independent of
+    # roundoff-dependent choices at a degenerate singular-value boundary.
+    operator = TreeMPO(plan, operator.tree_networks, backend=operator.backend, fermionic=True,
+                       symmetry=state.symmetry, operator_support=tuple(range(4)))
+    contract = qtn.tensor_contract
+    injected = []
+
+    def empty_hub(*tensors, **kwargs):
+        result = contract(*tensors, **kwargs)
+        if len(tensors) == 2 + len(plan.children[plan.root]):
+            # State and operator layers plus all three incoming messages.
+            assert result.isfermionic()
+            data = result.data.copy()
+            data.blocks.clear()
+            result.modify(data=data)
+            injected.append(True)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(qtn, "tensor_contract", empty_hub)
+        with pytest.raises(ValueError, match="no compatible charge blocks"):
+            optimizer.apply_subtreempo(operator)
+    assert injected == [True]
     assert float(pepsy.tensors.tn_fidelity(optimizer.tn, state)) > 1 - 1e-10
     assert optimizer._active_update is None
     assert all(t.data.blocks for t in optimizer.tn.tensors)
+
+
+def test_native_global_svd_preserves_degenerate_boundary_policy():
+    sr = pytest.importorskip("symmray")
+    index = sr.BlockIndex({0: 3, 1: 2})
+    data = sr.U1FermionicArray(
+        indices=(index, index.conj()), charge=0, label=0,
+        blocks={(0, 0): np.eye(3, dtype=complex), (1, 1): np.eye(2, dtype=complex)},
+    )
+    tensor = qtn.Tensor(data, inds=("left", "right"))
+    left, right = tensor.split(
+        left_inds=("left",), method="svd", max_bond=4, cutoff=0.,
+        cutoff_mode="rsum2", absorb="right", get="tensors", bond_ind="kept",
+    )
+    # This is the installed public driver used by native tree local splits.
+    # Its global cap preserves all five equal values, even with max_bond=4.
+    assert left.ind_size("kept") == 5
+    np.testing.assert_allclose((left @ right).data.to_dense(), data.to_dense(), atol=1e-12)
 
 
 def test_tree_fit_rejects_unsupported_odd_parity_without_installing_state():

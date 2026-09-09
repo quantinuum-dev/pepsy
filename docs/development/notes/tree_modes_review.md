@@ -1,5 +1,12 @@
 # TreeOptimizer mode review and bottlenecks — 2026-09-08
 
+Historical record: the algorithm descriptions and timings below predate the
+complementary-environment SDC implementation and later path execution changes.
+Use the [current API](../../api/optimizers/tree.md) and
+[implementation map](../modules/optimizers.md) for current behavior; the
+[consolidation record](../plans/tree_optimizer_consolidation.md) explains the
+current ownership boundaries.
+
 Reviewed the current working tree, including the preceding MPS-parity work.
 The review covers ordinary gate modes, explicit chain-MPO replay, shared
 TreeFIT, and dense/native numerical paths. Performance measurements below

@@ -4360,11 +4360,14 @@ def _coalesced_leakage_event(
 
 
 def _coalesced_measurement_probabilities(optimizer, pauli, where):
-    """Keep small MPS Born branches without subtractive cancellation."""
+    """Use both backend Born weights without subtractive cancellation."""
     if isinstance(optimizer, MpsOptimizer):
         return optimizer._measurement_probabilities(
             pauli, optimizer._logical_to_physical_where(where),
         )
+    probabilities = getattr(optimizer, "_measurement_probabilities", None)
+    if callable(probabilities):
+        return probabilities(pauli, where)
     p_plus = _coalesced_measurement_probability(optimizer, pauli, where)
     return p_plus, 1.0 - p_plus
 

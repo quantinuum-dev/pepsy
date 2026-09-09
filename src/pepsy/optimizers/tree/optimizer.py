@@ -37,9 +37,11 @@ canonicalisation, bond compression, tensor splitting, tree path finding) uses
 from __future__ import annotations
 
 import contextlib
-from copy import deepcopy
-from collections.abc import Mapping
+import functools
 import heapq
+from copy import deepcopy
+from collections import Counter
+from collections.abc import Mapping
 import inspect
 from numbers import Integral
 import time
@@ -55,6 +57,8 @@ from ...fitting.tree import (
     _build_layered_operator_state_target,
     _layered_target_bond_sizes,
     _randomize_tree_guess,
+    _region_path,
+    _validate_region_path,
 )
 from ...backends import (
     backend_infer,
@@ -67,7 +71,6 @@ from ...operators.gates import _normalize_gate_entries
 from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
-    log_fidelity_from_norms,
 )
 from ..mps.optimizer import (
     _control_event_parts as _mps_control_event_parts,
@@ -82,6 +85,20 @@ from .layout import (
     _normalize_time_decay,
     _normalize_time_window,
     _submpo_schmidt_rank_bound,
+)
+from ._application import (
+    _same_tree_plan, operator_local_tensors, peel_order, plan_operator_application,
+)
+from ._diagnostics import norm_event, summarize_update, truncation_event
+from ._readout import product_pauli_probabilities, single_pauli_probabilities
+from ._policy import (
+    COPY_SETTINGS,
+    _normalize_where,
+    compression_for_mode,
+    normalize_mode,
+    replay_mode_name,
+    resolve_replay_mode,
+    resolve_replay_override,
 )
 from .ttn import (
     TreeTensorNetwork,
@@ -101,14 +118,9 @@ except Exception:  # pragma: no cover - threadpoolctl missing
     _THREAD_CONTROLLER = None
 
 
-def _normalize_where(where):
-    """Return a tuple of int qubit labels for a gate support."""
-    if isinstance(where, Integral):
-        return (int(where),)
-    return tuple(int(site) for site in where)
-
 
 _TREE_MPO_EVENT_NAMES = frozenset({
+    "sub_mpotree",
     "subtreempo",
     "sub_treempo",
     "sub_tree_mpo",
@@ -185,17 +197,6 @@ def _submpo_to_dense(submpo, where):
         )
     return ar.do("reshape", dense, (2 ** len(where), 2 ** len(where)))
 
-
-def _same_tree_plan(left, right):
-    """Return whether two plans describe the same rooted tree geometry."""
-    return (
-        isinstance(left, TreePlan)
-        and isinstance(right, TreePlan)
-        and left.root == right.root
-        and left.children == right.children
-        and left.qubit_of_leaf == right.qubit_of_leaf
-        and left.root_qubit == right.root_qubit
-    )
 
 
 def _is_product_tensor_network(state):
@@ -383,7 +384,7 @@ class TreeOptimizer:
     """Replay a bundled gate stream on a rooted tree tensor network.
 
     The constructor defaults are performance-oriented: ordinary gate entries
-    are converted to a TreeMPO and routed through ``apply_subtreempo`` on
+    are converted to a TreeMPO and routed through ``apply_sub_mpotree`` on
     their active canonical Steiner region, small tree contractions are capped
     to one BLAS/OpenMP thread (``threads=1``), and full singular-spectrum
     diagnostics are disabled
@@ -399,7 +400,9 @@ class TreeOptimizer:
     n : int, optional
         Number of qubits.  Inferred from ``gates`` / ``tree`` when omitted.
     chi : int | None
-        Maximum virtual bond dimension enforced during two-qubit threading.
+        Requested maximum virtual bond dimension during compression. Dense
+        splits enforce the cap; native Symmray global SVD can exceed it to
+        retain equal singular values together. Exact QR routing is lossless.
         ``None`` leaves the bond uncapped; the singular-value ``cutoff`` still
         applies.
     cutoff : float | {"auto"}
@@ -407,6 +410,8 @@ class TreeOptimizer:
         ``cutoff_mode``. ``"auto"`` selects the shared MPS dtype-aware value:
         ``1e-3`` for 16-bit data, ``1e-6`` for 32-bit data, and ``1e-12``
         for 64-bit data, resolved from the installed state at construction.
+        SRC ignores this threshold with a warning and uses ``chi`` samples;
+        SDC uses it when truncating deterministic environment factors.
     cutoff_mode : str | None | {"auto"}
         Quimb singular-value cutoff mode. ``"auto"`` (and the compatibility
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
@@ -419,7 +424,7 @@ class TreeOptimizer:
         Gate/operator route and state-compression method. Ordinary gate
         entries in ``"auto"``, ``"direct"``, ``"dm"``, ``"sdc"``,
         ``"src"``, and ``"mpo"`` are converted to a true :class:`TreeMPO`
-        and applied with :meth:`apply_subtreempo` on the active Steiner
+        and applied with :meth:`apply_sub_mpotree` on the active Steiner
         subtree; the compression spelling selects the configured tree
         decomposition. ``"tree_mpo_direct"`` and ``"tree_mpo_dm"`` retain
         explicit route names and select direct SVD or density-matrix
@@ -432,14 +437,17 @@ class TreeOptimizer:
         messages, then immediately truncates its outgoing message by SVD.
         Its intermediate cuts do not have a canonical right environment.
         ``"dmrg"`` and ``"dmrg1"``/``"dmrg2"``/``"dmrg3"`` select the
-        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` and
-        ``dmrg2`` use two-node warm-up blocks, ``dmrg3`` uses three-node
-        warm-up blocks, and all named modes refine with one-node sweeps.
+        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` can use
+        two-node warm-up blocks to grow missing ranks; ``dmrg2`` starts with
+        two-node blocks and ``dmrg3`` with three-node blocks. Their schedules
+        transition to one-node refinement within the iteration budget.
         Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
         ``"tree_mpo_dem"`` and ``"tree_mpo"`` compatibility spellings.
     compression_mode : {"direct", "dm", "sdc", "src"}
-        Decomposition used by ordinary tree compression and TreeFIT local
-        splits. ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
+        Decomposition used by ordinary tree compression and FIT local splits.
+        FIT retains direct/DM but maps SRC/SDC to direct local SVD;
+        ``fit_init_strategy`` independently selects its guess algorithm.
+        ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
         density-matrix-equivalent ``svd:eig`` decomposition on the local
         canonical compression core; ``"sdc"`` uses the deterministic
         low-rank complementary environments and ``"src"`` uses contracted
@@ -538,10 +546,11 @@ class TreeOptimizer:
         Order of the two passes: ``"inward-outward"`` or ``"outward-inward"``.
         The legacy ``"RL"``/``"LR"`` and ``"INOUT"``/``"OUTIN"`` aliases
         remain accepted with identical traversal order.
-    fit_traversal : {"depth", "depth-first"}, default="depth-first"
-        Group FIT updates by branch to reduce center travel. Explicit
-        ``"depth"`` restores legacy ordering. Update order can affect
-        finite-bond accuracy and convergence.
+    fit_traversal : {"auto", "depth", "depth-first"}, default="auto"
+        Sweep path-shaped active regions between endpoints; use depth-first
+        traversal when the region branches. Explicit depth policies retain
+        medial ordering. Update order can affect finite-bond accuracy and
+        convergence. Auto guesses finish at the first path endpoint.
     fit_environment_strategy : {"default", "native-blockwise"}, default="default"
         Per-FIT native Symmray blockwise environment contractions. The opt-in
         path requires supported upstream APIs and native target/state arrays.
@@ -614,36 +623,7 @@ class TreeOptimizer:
         The tree structure.
     """
 
-    @staticmethod
-    def _normalize_mode(mode):
-        """Validate and normalize the gate or sub-MPO replay mode."""
-        mode = str(mode).strip().lower().replace("-", "_")
-        aliases = {
-            "dem": "dm",
-            "tree_mpo": "tree_mpo_direct",
-            "treempo": "tree_mpo_direct",
-            "treempo_direct": "tree_mpo_direct",
-            "treempo_dm": "tree_mpo_dm",
-            "treempo_dem": "tree_mpo_dm",
-            "tree_mpo_dem": "tree_mpo_dm",
-            "tree_mpo_svd": "tree_mpo_direct",
-            "tree_mpo_eig": "tree_mpo_dm",
-        }
-        mode = aliases.get(mode, mode)
-        if mode == "fit":
-            mode = "dmrg"
-        if mode in {"dmrg", "dmrg1", "dmrg2", "dmrg3"}:
-            return mode
-        if mode not in {
-            "auto", "direct", "dm", "sdc", "src", "zipup", "mpo", "submpo",
-            "tree_mpo_direct", "tree_mpo_dm",
-        }:
-            raise ValueError(
-                "mode must be one of 'auto', 'direct', 'dm', 'sdc', 'src', 'zipup', 'mpo', "
-                "'submpo', 'dmrg', 'dmrg1', 'dmrg2', 'dmrg3', "
-                "'tree_mpo_direct', or 'tree_mpo_dm'."
-            )
-        return mode
+    _normalize_mode = staticmethod(normalize_mode)
 
     _PROGBAR_COLORS = {
         # Keep the two primary colors aligned with MpsOptimizer. The tree
@@ -654,49 +634,12 @@ class TreeOptimizer:
     }
 
     def _progress_mode_name(self):
-        """Return the active short mode name shown by a replay bar."""
+        """Return the resolved short name shown by a replay bar."""
+        return replay_mode_name(self.mode, self.compression_mode, self._dmrg_mode_alias)
 
-        mode = str(self.mode).strip().lower().replace("-", "_")
-        if mode == "dmrg":
-            return self._dmrg_mode_alias or "dmrg"
-        if mode in {"dmrg1", "dmrg2", "dmrg3"}:
-            return mode
-        if mode == "tree_mpo_dm":
-            return "dm"
-        if mode in {"auto", "direct", "mpo", "submpo", "tree_mpo_direct"}:
-            compression_mode = str(self.compression_mode).strip().lower()
-            if compression_mode in {"direct", "dm", "sdc", "src"}:
-                return compression_mode
-            return "direct"
-        return mode
+    _compression_for_mode = staticmethod(compression_for_mode)
 
-    def _gate_route(self, width):
-        """Return the implementation route for an ordinary dense gate.
-
-        Ordinary TreeOptimizer gates use the geometry-aware TreeMPO kernel.
-        Keeping this decision here means construction-time and run-time mode
-        overrides share one gate-to-TreeMPO path. Explicit ``submpo`` remains
-        reserved for chain-MPO stream events.
-        """
-        if self.mode == "submpo":
-            return "submpo"
-        return "treempo"
-
-    def _compression_for_mode(self, mode, compression_mode):
-        """Resolve a mode's optional compression suffix.
-
-        The combined TreeMPO names own their compression method. A conflicting
-        explicit ``compression_mode`` is rejected rather than silently
-        changing the meaning of a mode name.
-        """
-        if mode not in {"zipup", "tree_mpo_direct", "tree_mpo_dm"}:
-            return compression_mode
-        expected = "dm" if mode == "tree_mpo_dm" else "direct"
-        if compression_mode not in {expected, "direct"}:
-            raise ValueError(
-                f"mode={mode!r} requires compression_mode={expected!r}."
-            )
-        return expected
+    _resolve_replay_mode = staticmethod(resolve_replay_mode)
 
     @staticmethod
     def _normalize_compression_mode(mode):
@@ -709,7 +652,7 @@ class TreeOptimizer:
         """Validate an optional per-update bond cap."""
         if max_bond is None:
             return None
-        if isinstance(max_bond, bool):
+        if isinstance(max_bond, bool) or not isinstance(max_bond, Integral):
             raise TypeError("max_bond must be a positive integer or None.")
         max_bond = int(max_bond)
         if max_bond < 1:
@@ -718,7 +661,7 @@ class TreeOptimizer:
 
     def _resolve_cutoff(self, value):
         """Return a validated truncation cutoff, including ``"auto"``."""
-        if value == "auto":
+        if isinstance(value, str) and value.strip().lower() == "auto":
             return dtype_auto_cutoff(self.backend_dtype)
         try:
             value = float(value)
@@ -745,7 +688,16 @@ class TreeOptimizer:
             isinstance(value, str) and value.strip().lower() == "auto"
         ):
             return "rsum2"
-        return value
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value in {"abs", "rel", "sum1", "sum2", "rsum1", "rsum2"}:
+                return value
+        elif isinstance(value, Integral) and not isinstance(value, bool) and 1 <= value <= 6:
+            return int(value)
+        raise ValueError(
+            "cutoff_mode must be 'auto', 'abs', 'rel', 'sum1', 'sum2', "
+            "'rsum1', 'rsum2', or a Quimb integer code 1..6."
+        )
 
     def _resolve_fit_rtol(self, value):
         """Resolve the same dtype-aware stopping tolerance as MpsOptimizer."""
@@ -781,7 +733,7 @@ class TreeOptimizer:
                  fit_init_strategy="auto",
                  fit_init_rand_strength=0.0, fit_init_seed=0,
                  fit_sweep_sequence="inward-outward", fit_overlap_diagnostics=False,
-                 fit_traversal="depth-first", fit_environment_strategy="default",
+                 fit_traversal="auto", fit_environment_strategy="default",
                  fit_single_node_fast_path=True,
                  fit_finite_check=False,
                  two_site_mode=None,
@@ -952,44 +904,43 @@ class TreeOptimizer:
         self._logical_qubits = list(range(self.n))
         self._logical_positions = {q: q for q in self._logical_qubits}
 
-        compression_mode = self._normalize_compression_mode(compression_mode)
         raw_mode = self._normalize_mode(mode)
-        if raw_mode in {"dm", "sdc", "src"}:
-            if compression_mode not in {"direct", raw_mode}:
+        if two_site_mode is not None:
+            legacy_mode = self._normalize_mode(two_site_mode)
+            if raw_mode != "auto" and raw_mode != legacy_mode:
                 raise ValueError(
-                    f"mode={raw_mode!r} cannot be combined with a "
-                    "different compression_mode."
+                    "pass either mode= or two_site_mode=, or give them the same value."
                 )
-            compression_mode = raw_mode
-            raw_mode = "auto"
-        compression_mode = self._compression_for_mode(
+            warnings.warn(
+                "two_site_mode= is deprecated; use mode= instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+            raw_mode = legacy_mode
+        self.mode, self.compression_mode, self._dmrg_mode_alias = self._resolve_replay_mode(
             raw_mode, compression_mode
         )
 
         self.chi = self._normalize_max_bond(chi)
         self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
-        self.mode = self._normalize_mode(raw_mode)
-        self._dmrg_mode_alias = (
-            self.mode if self.mode in {"dmrg1", "dmrg2", "dmrg3"} else None
-        )
-        if self.mode in {"dmrg1", "dmrg2", "dmrg3"}:
-            self.mode = "dmrg"
-        self.compression_mode = compression_mode
-        if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {1, 2, 3}:
+        if (isinstance(fit_block_size, bool) or not isinstance(fit_block_size, Integral)
+                or int(fit_block_size) not in {1, 2, 3}):
             raise ValueError("fit_block_size must be 1, 2, or 3.")
         self.fit_block_size = int(fit_block_size)
-        if not isinstance(fit_n_iter, Integral) or int(fit_n_iter) < 1:
+        if (isinstance(fit_n_iter, bool) or not isinstance(fit_n_iter, Integral)
+                or int(fit_n_iter) < 1):
             raise ValueError("fit_n_iter must be a positive integer.")
         self.fit_n_iter = int(fit_n_iter)
         if (
-            not isinstance(fit_adaptive_sweeps, Integral)
+            isinstance(fit_adaptive_sweeps, bool)
+            or not isinstance(fit_adaptive_sweeps, Integral)
             or int(fit_adaptive_sweeps) < 1
         ):
             raise ValueError("fit_adaptive_sweeps must be a positive integer.")
         self.fit_adaptive_sweeps = int(fit_adaptive_sweeps)
         if (
-            not isinstance(fit_two_site_transition_sweeps, Integral)
+            isinstance(fit_two_site_transition_sweeps, bool)
+            or not isinstance(fit_two_site_transition_sweeps, Integral)
             or int(fit_two_site_transition_sweeps) < 0
         ):
             raise ValueError("fit_two_site_transition_sweeps must be a non-negative integer.")
@@ -1000,11 +951,15 @@ class TreeOptimizer:
         ):
             raise ValueError("fit_min_iter must be a positive integer or None.")
         self.fit_min_iter = fit_min_iter
-        self._fit_rtol_requested = fit_rtol
-        if not isinstance(fit_patience, Integral) or int(fit_patience) < 1:
+        self._fit_rtol_requested = (
+            fit_rtol.strip().lower() if isinstance(fit_rtol, str) else fit_rtol
+        )
+        if (isinstance(fit_patience, bool) or not isinstance(fit_patience, Integral)
+                or int(fit_patience) < 1):
             raise ValueError("fit_patience must be a positive integer.")
         self.fit_patience = int(fit_patience)
         self.fit_init_strategy = str(fit_init_strategy).strip().lower().replace("-", "_")
+        self._normalize_fit_init_strategy(self.fit_init_strategy)
         self.fit_init_rand_strength = float(fit_init_rand_strength)
         if (
             not np.isfinite(self.fit_init_rand_strength)
@@ -1016,6 +971,8 @@ class TreeOptimizer:
         if isinstance(fit_init_seed, bool) or not isinstance(fit_init_seed, Integral):
             raise TypeError("fit_init_seed must be an integer.")
         self.fit_init_seed = int(fit_init_seed)
+        if self.fit_init_seed < 0:
+            raise ValueError("fit_init_seed must be non-negative.")
         self.fit_sweep_sequence = TreeFIT._normalize_sweep_sequence(fit_sweep_sequence)
         self.fit_traversal = TreeFIT._normalize_traversal(fit_traversal)
         self.fit_environment_strategy = TreeFIT._normalize_environment_strategy(
@@ -1037,19 +994,6 @@ class TreeOptimizer:
             if compression_seed < 0:
                 raise ValueError("compression_seed must be non-negative.")
         self.compression_seed = compression_seed
-        if two_site_mode is not None:
-            legacy_mode = self._normalize_mode(two_site_mode)
-            if self.mode != "auto" and self.mode != legacy_mode:
-                raise ValueError(
-                    "pass either mode= or two_site_mode=, or give them "
-                    "the same value."
-                )
-            warnings.warn(
-                "two_site_mode= is deprecated; use mode= instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            self.mode = legacy_mode
         self.structure = structure
         # ``max_arity`` may be a scalar (fixed tree), ``None`` (unbounded), or an
         # iterable of candidate arities to search; forward it to the finder,
@@ -1063,12 +1007,12 @@ class TreeOptimizer:
         self.layout_time_decay = _normalize_time_decay(layout_time_decay)
         self.layout_time_window = _normalize_time_window(layout_time_window)
         self.dtype = dtype
-        self.threads = None if threads is None else int(threads)
-        if self.threads is not None and self.threads < 1:
-            raise ValueError("threads must be positive or None.")
+        self.threads = self._positive_limit(threads, "threads")
         self.subtree_workers = self._positive_limit(
             subtree_workers, "subtree_workers"
         )
+        if self.subtree_workers is None:
+            raise ValueError("subtree_workers must be a positive integer.")
         self.rng = np.random.default_rng(seed)
         self.track_truncation = bool(track_truncation)
         self._track_warning_emitted = False
@@ -1174,7 +1118,7 @@ class TreeOptimizer:
         )
         self.cutoff = self._resolve_cutoff(cutoff)
         self.cutoff_mode = self._resolve_cutoff_mode(cutoff_mode)
-        self.fit_rtol = self._resolve_fit_rtol(fit_rtol)
+        self.fit_rtol = self._resolve_fit_rtol(self._fit_rtol_requested)
 
         if run and self.G:
             if (
@@ -1350,11 +1294,13 @@ class TreeOptimizer:
                     ]
         return stream
 
-    def _validate_event_stream_for_run(self):
+    def _validate_event_stream_for_run(self, queue=None):
         """Validate stream labels, including optional stable-label caps."""
         active = list(self._logical_qubits)
+        if queue is None:
+            queue = self.G, self.where, self.event_types
         for step, (payload, where, event_type) in enumerate(
-            zip(self.G, self.where, self.event_types), start=1
+            zip(*queue), start=1
         ):
             support = _normalize_where(where)
             if event_type == "cap":
@@ -1383,31 +1329,35 @@ class TreeOptimizer:
                     f"current active labels {active!r}: {out_of_range!r}."
                 )
 
-    def _validate_mode_for_stream(self):
+    def _validate_mode_for_stream(self, *, mode=None, queue=None):
         """Validate mode-specific stream declarations before replay."""
-        if not self.G:
+        mode = self.mode if mode is None else mode
+        gates, supports, event_types = (
+            (self.G, self.where, self.event_types) if queue is None else queue
+        )
+        if not gates:
             return
-        if self.mode in {"tree_mpo_direct", "tree_mpo_dm"}:
+        if mode in {"tree_mpo_direct", "tree_mpo_dm"}:
             chain_events = [
-                step for step, event_type in enumerate(self.event_types, 1)
+                step for step, event_type in enumerate(event_types, 1)
                 if event_type == "submpo"
             ]
             if chain_events:
                 raise ValueError(
-                    f"mode={self.mode!r} requires TreeMPO/TTNO events; "
+                    f"mode={mode!r} requires TreeMPO/TTNO events; "
                     "chain sub-MPO event(s) found at step(s) "
                     f"{chain_events!r}. Use mode='submpo' for chain MPOs or "
                     "TreeOptimizer.subtreempo_event(...) for TreeMPOs."
                 )
             return
-        if self.mode != "submpo":
+        if mode != "submpo":
             return
         # ``output_replay='submpo'`` still represents singleton supports as
         # ordinary one-site gates. They do not introduce a competing
         # multi-site lowering path and are therefore valid in this mode.
         ordinary = []
         for step, (where, event_type) in enumerate(
-            zip(self.where, self.event_types), start=1
+            zip(supports, event_types), start=1
         ):
             if event_type != "gate":
                 continue
@@ -1422,7 +1372,7 @@ class TreeOptimizer:
                 "Use mode='direct', mode='dm', or a tree_mpo_* mode for "
                 "dense gate streams."
             )
-        if "submpo" not in self.event_types:
+        if "submpo" not in event_types:
             raise ValueError(
                 "mode='submpo' requires at least one explicit sub-MPO event."
             )
@@ -1434,10 +1384,9 @@ class TreeOptimizer:
         """Validate an optional positive integer resource limit."""
         if value is None:
             return None
-        try:
-            value = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a positive integer or None.") from exc
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise TypeError(f"{name} must be a positive integer or None.")
+        value = int(value)
         if value < 1:
             raise ValueError(f"{name} must be a positive integer or None.")
         return value
@@ -1687,6 +1636,8 @@ class TreeOptimizer:
         ):
             return tree_mpo
         copied = tree_mpo.copy()
+        check_exterior = getattr(copied, "_identity_exterior_unchanged", None)
+        identity_exterior = check_exterior is not None and check_exterior()
         converter = self._backend_converter(self._state_like())
         for network in copied.tree_networks:
             apply_to_arrays = getattr(network, "apply_to_arrays", None)
@@ -1695,6 +1646,9 @@ class TreeOptimizer:
             else:
                 for tensor in network.tensor_map.values():
                     tensor.modify(data=self._as_state_backend(tensor.data, warn=False))
+        if identity_exterior:
+            # Backend conversion preserves the known exterior identities.
+            copied._capture_identity_exterior()
         return copied
 
     def _tag(self, nid):
@@ -1820,7 +1774,11 @@ class TreeOptimizer:
         tn.validate()
         self.tn = tn.copy()
         self.plan = self.tn.plan
+        self.top_arity = self.plan.top_arity if self.plan.top_arity >= 2 else None
         self._two_site_path_cache.clear()
+        # Gate factors include TreeMPOs mounted on the previous TreePlan.
+        # Even a same-size replacement can change geometry or site order.
+        self._gate_factor_cache.clear()
         self.tn.validate()
         self.n = self.tn.nqubits
         self._logical_qubits = list(range(self.n))
@@ -1887,6 +1845,8 @@ class TreeOptimizer:
         self.norm_events.clear()
         self.normalizations.clear()
         self.projection_diagnostics.clear()
+        self.fit_diagnostics.clear()
+        self._last_fit_diagnostics = None
         self._truncation_log_survival = 0.0
         self._norm_log_survival = 0.0
         self._update_counter = 0
@@ -1903,7 +1863,7 @@ class TreeOptimizer:
 
     def _validate_qubit(self, q):
         """Return the compact TTN position for a logical qubit label."""
-        if not isinstance(q, Integral):
+        if isinstance(q, bool) or not isinstance(q, Integral):
             raise ValueError(f"qubit label must be an integer; got {q!r}.")
         q = int(q)
         try:
@@ -1913,7 +1873,7 @@ class TreeOptimizer:
 
     def _validate_support(self, where, *, min_size=1, resolve=True):
         """Validate a logical support and optionally return TTN positions."""
-        where = tuple(int(q) for q in where)
+        where = _normalize_where(where)
         if len(where) < min_size:
             raise ValueError(
                 f"gate support must contain at least {min_size} qubit(s); "
@@ -2205,17 +2165,6 @@ class TreeOptimizer:
             }
         return self.layout_finder.report(self.plan)
 
-    def _layout_candidate_record(self, finder, plan, *, source=None):
-        """Build the common static record for a pilot candidate."""
-        return {
-            "plan": plan,
-            "objective_key": finder._selection_key(plan, self.chi),
-            "path_score": finder.score(plan),
-            "tensor_cost": finder._tensor_cost_key(plan),
-            "edge_loads": finder.edge_loads(plan),
-            **({"source": source} if source is not None else {}),
-        }
-
     @staticmethod
     def _pilot_edge_diagnostics(events):
         """Aggregate replay losses by the immutable planned tree edge."""
@@ -2256,49 +2205,12 @@ class TreeOptimizer:
     ):
         """Replay one candidate and return state-aware diagnostics."""
         started = time.perf_counter()
-        trial = type(self)(
-            None,
-            n=self.n,
-            chi=self.chi,
-            cutoff=self.cutoff,
-            cutoff_mode=self.cutoff_mode,
-            mode=self.mode,
-            compression_mode=self.compression_mode,
-            compression_seed=self.compression_seed,
-            fit_block_size=self.fit_block_size,
-            fit_n_iter=self.fit_n_iter,
-            fit_adaptive_sweeps=self.fit_adaptive_sweeps,
-            fit_two_site_transition_sweeps=self.fit_two_site_transition_sweeps,
-            fit_min_iter=self.fit_min_iter,
-            fit_rtol=("auto" if self._fit_rtol_requested == "auto" else self.fit_rtol),
-            fit_patience=self.fit_patience,
-            fit_init_strategy=self.fit_init_strategy,
-            fit_init_rand_strength=self.fit_init_rand_strength,
-            fit_init_seed=self.fit_init_seed,
-            fit_sweep_sequence=self.fit_sweep_sequence,
-            fit_traversal=self.fit_traversal,
-            fit_environment_strategy=self.fit_environment_strategy,
-            fit_single_node_fast_path=self.fit_single_node_fast_path,
-            fit_overlap_diagnostics=self.fit_overlap_diagnostics,
-            fit_finite_check=self.fit_finite_check,
-            structure=self.structure,
-            max_arity=self.max_arity,
-            top_arity=self.top_arity,
-            community_frac=self.community_frac,
-            star_frac=self.star_frac,
-            layout_objective=objective,
-            tree=plan,
-            dtype=self.dtype,
-            threads=self.threads,
-            subtree_workers=self.subtree_workers,
-            track_truncation=True,
-            track_infidelity=True,
-            max_intermediate_bond=self.max_intermediate_bond,
-            max_operator_qubits=self.max_operator_qubits,
-            max_subtree_nodes=self.max_subtree_nodes,
-            record_history=True,
-            run=False,
-            tn=self.tn,
+        trial = self._new_state_optimizer(
+            seed=None, tree=plan,
+            layout_objective=objective, layout_weight_mode="count",
+            layout_time_decay=None, layout_time_window=None,
+            track_truncation=True, track_infidelity=True, record_history=True,
+            profile=False, profile_sync=False, track_bond_diagnostics=False,
         )
         trial.G = list(self.G)
         trial.where = list(self.where)
@@ -2429,184 +2341,32 @@ class TreeOptimizer:
             raise ValueError("seed must be an integer.") from exc
 
         objective = self.layout_objective if objective is None else objective
-        previous_plan = None
-        previous_edge_diagnostics = None
-        round_reports = []
-        final_finder = None
-        final_candidates = None
-        final_ranked = None
-        final_selected_name = None
-
-        for round_index in range(rounds):
-            finder = TreeLayoutFinder(
-                gates=self._layout_gate_stream(),
-                n=self.n,
-                structure=self.structure,
-                max_arity=self.max_arity,
-                community_frac=self.community_frac,
-                star_frac=self.star_frac,
-                objective=objective,
-                weight_mode=self.layout_weight_mode,
-                time_decay=self.layout_time_decay,
-                time_window=self.layout_time_window,
-                chi=self.chi,
-                max_operator_qubits=self.max_operator_qubits,
-                root_qubit=self.plan.root_qubit,
-                top_arity=self.top_arity,
-                seed=seed + round_index,
-            )
-            quality_kwargs = {
-                "chi": self.chi,
-                "include_quality": bool(include_quality),
-            }
-            if topology_budget is not None:
-                quality_kwargs["quality_topology_budget"] = topology_budget
-            if refine_budget is not None:
-                quality_kwargs["quality_refine_budget"] = refine_budget
-            if search_budget is not None:
-                quality_kwargs["quality_search_budget"] = search_budget
-            quality_kwargs["quality_seed"] = seed + round_index
-            candidates = finder.candidate_plans(**quality_kwargs)
-
-            if (
-                previous_plan is not None
-                and previous_edge_diagnostics
-                and rounds > 1
-            ):
-                targeted = finder.targeted_candidates(
-                    previous_plan,
-                    previous_edge_diagnostics,
-                    chi=self.chi,
-                    budget=max(2 * pilot_candidates, 8),
-                    seed=seed + round_index,
-                )
-                for proposal_index, plan in enumerate(targeted):
-                    candidates[
-                        f"pilot:round={round_index}:proposal={proposal_index}"
-                    ] = self._layout_candidate_record(
-                        finder,
-                        plan,
-                        source="pilot_feedback",
-                    )
-
-            ranked_static = sorted(
-                candidates,
-                key=lambda name: candidates[name]["objective_key"],
-            )
-            quality_names = [
-                name for name in ranked_static if name.startswith("quality:")
-            ]
-            feedback_names = [
-                name for name in ranked_static
-                if name.startswith("pilot:")
-            ]
-            ordinary_names = [
-                name for name in ranked_static
-                if not name.startswith(("quality:", "pilot:"))
-            ]
-            if include_quality:
-                ranked = quality_names[:1]
-                remaining = pilot_candidates - len(ranked)
-                ranked.extend(feedback_names[:remaining])
-                remaining = pilot_candidates - len(ranked)
-                ranked.extend(ordinary_names[:remaining])
-                remaining = pilot_candidates - len(ranked)
-                ranked.extend(
-                    name for name in ranked_static
-                    if name not in ranked
-                )
-                ranked = ranked[:pilot_candidates]
-            else:
-                ranked = ranked_static[:pilot_candidates]
-
-            pilot_jobs = [
-                (name, candidates[name]["plan"])
-                for name in ranked
-            ]
-
-            def run_pilot(job):
-                name, plan = job
-                return name, self._pilot_layout_candidate(
-                    plan,
-                    objective=finder.objective,
-                    pilot_steps=pilot_steps,
-                    progbar=progbar,
-                )
-
-            if pilot_workers > 1 and len(pilot_jobs) > 1:
-                from concurrent.futures import ThreadPoolExecutor
-
-                with ThreadPoolExecutor(
-                    max_workers=min(pilot_workers, len(pilot_jobs)),
-                    thread_name_prefix="pepsy-tree-pilot",
-                ) as pool:
-                    pilot_results = list(pool.map(run_pilot, pilot_jobs))
-            else:
-                pilot_results = [run_pilot(job) for job in pilot_jobs]
-
-            reports = {}
-            successful = []
-            for name, report in pilot_results:
-                reports[name] = report
-                if report["status"] != "ok":
-                    continue
-                successful.append((
-                    float(report["infidelity"]),
-                    float(report["total_discarded_weight"]),
-                    float(report["max_discarded_fraction"]),
-                    int(report["truncated_edges"]),
-                    float(report["elapsed_seconds"]),
-                    int(report["final_bond"]),
-                    name,
-                ))
-            if not successful:
-                raise RuntimeError(
-                    "All Tree layout pilot candidates failed. "
-                    f"Diagnostics: {reports!r}"
-                )
-            selected_name = min(successful)[-1]
-            selected_plan = candidates[selected_name]["plan"]
-            selected_report = reports[selected_name]
-            round_reports.append({
-                "round": round_index,
-                "objective": finder.objective,
-                "pilot_candidates": tuple(ranked),
-                "selected_candidate": selected_name,
-                "reports": reports,
-            })
-            previous_plan = selected_plan
-            previous_edge_diagnostics = selected_report.get(
-                "edge_diagnostics", {}
-            )
-            final_finder = finder
-            final_candidates = candidates
-            final_ranked = ranked
-            final_selected_name = selected_name
-
-        selected_plan = final_candidates[final_selected_name]["plan"]
+        result, finder = TreeLayoutFinder._search_with_pilots(
+            {
+                "gates": self._layout_gate_stream(), "n": self.n,
+                "structure": self.structure, "max_arity": self.max_arity,
+                "community_frac": self.community_frac, "star_frac": self.star_frac,
+                "objective": objective, "weight_mode": self.layout_weight_mode,
+                "time_decay": self.layout_time_decay, "time_window": self.layout_time_window,
+                "chi": self.chi, "max_operator_qubits": self.max_operator_qubits,
+                "root_qubit": self.plan.root_qubit, "top_arity": self.top_arity,
+            },
+            self._pilot_layout_candidate, pilot_candidates=pilot_candidates,
+            pilot_steps=pilot_steps, pilot_workers=pilot_workers,
+            include_quality=include_quality, rounds=rounds,
+            topology_budget=topology_budget, refine_budget=refine_budget,
+            search_budget=search_budget, seed=seed, progbar=progbar,
+        )
         if install:
-            self.plan = selected_plan
+            self.plan = result["plan"]
             self._two_site_path_cache.clear()
+            self._gate_factor_cache.clear()
             self.tn = self._remount_product_state(self.tn)
             self.center = self.plan.root
-            self.layout_finder = final_finder
-            self.layout_objective = final_finder.objective
-        final_round = round_reports[-1]
-        return {
-            "plan": selected_plan,
-            "selected_candidate": final_selected_name,
-            "candidates": final_candidates,
-            "pilot": {
-                "objective": final_finder.objective,
-                "include_quality": bool(include_quality),
-                "pilot_candidates": tuple(final_ranked),
-                "selected_candidate": final_selected_name,
-                "reports": final_round["reports"],
-                "rounds": round_reports,
-                "n_rounds": rounds,
-                "installed": bool(install),
-            },
-        }
+            self.layout_finder = finder
+            self.layout_objective = finder.objective
+        result["pilot"]["installed"] = bool(install)
+        return result
 
     def select_layout_for_compression(
         self,
@@ -2756,6 +2516,7 @@ class TreeOptimizer:
         subtree.  Delegates to :meth:`TreeTensorNetwork.canonize_around_qubits_`.
         Returns ``self``.
         """
+        qubits = self._validate_support(_normalize_where(qubits))
         self.tn.canonize_around_qubits_(qubits)
         return self
 
@@ -2804,6 +2565,24 @@ class TreeOptimizer:
         return target
 
     # -- gate application -----------------------------------------------------
+
+    @contextlib.contextmanager
+    def _update(self, kind, where, *, track_norm=True):
+        """Own diagnostics for one update, including nested compatibility calls.
+
+        The outermost caller finishes or discards aggregation exactly once.
+        This is not tensor rollback: engines retain their existing in-place
+        or private-result installation semantics.
+        """
+        started = self._begin_update(kind, where, track_norm=track_norm)
+        try:
+            yield started
+            if started:
+                self._finish_update()
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
 
     def _begin_update(self, kind, where, *, track_norm=True):
         """Start aggregating diagnostics for one state update.
@@ -2871,51 +2650,13 @@ class TreeOptimizer:
         self._active_update = None
 
     def _finish_norm_update(self, active):
-        """Record one path-level canonical norm-survival event.
-
-        The resulting metric is a retained-norm compression proxy. It is not
-        a target-state overlap and it is intentionally independent of the
-        optional edge-spectrum records collected by ``track_truncation``.
-        """
-        if not active.get("track_norm", True):
+        """Record path-level norm survival independently of edge spectra."""
+        if not active.get("track_norm", True) or active.get("norm_before") is None:
             return
-        expected = active.get("norm_before")
-        if expected is None:
-            return
-        observed = float(self.norm())
-        log_local = log_fidelity_from_norms(observed, expected)
-        raw_local = (
-            None
-            if (
-                expected <= 0.0
-                or not np.isfinite(expected)
-                or not np.isfinite(observed)
-            )
-            else float((observed / expected) ** 2)
+        self._norm_log_survival, event = norm_event(
+            active, float(self.norm()), self._norm_log_survival,
         )
-        local_fidelity = fidelity_from_log(log_local)
-        local_infidelity = infidelity_from_log(log_local)
-        if self._norm_log_survival == -np.inf or log_local == -np.inf:
-            self._norm_log_survival = -np.inf
-        else:
-            self._norm_log_survival += float(log_local)
-        cumulative_fidelity = fidelity_from_log(self._norm_log_survival)
-        cumulative_infidelity = infidelity_from_log(self._norm_log_survival)
-        self.norm_events.append({
-            "step": int(active["update"]),
-            "kind": active["kind"],
-            "where": tuple(active["support"]),
-            "valid": True,
-            "expected_norm": float(abs(expected)),
-            "observed_norm": float(abs(observed)),
-            "fidelity_raw": raw_local,
-            "local_fidelity": local_fidelity,
-            "local_infidelity": local_infidelity,
-            "cumulative_fidelity": cumulative_fidelity,
-            "cumulative_infidelity": cumulative_infidelity,
-            "cumulative_compression_fidelity": cumulative_fidelity,
-            "cumulative_compression_infidelity": cumulative_infidelity,
-        })
+        self.norm_events.append(event)
 
     def _finish_update(self):
         """Commit one gate-level truncation aggregation."""
@@ -2952,6 +2693,8 @@ class TreeOptimizer:
             "bond_trace": deepcopy(active.get("bond_trace", [])),
         }
         self._finish_norm_update(active)
+        if "fit_diagnostics" not in active:
+            self._last_fit_diagnostics = None
         if self.track_bond_diagnostics:
             self.bond_history.append(deepcopy(bond_record))
         if not self.record_history:
@@ -2969,111 +2712,32 @@ class TreeOptimizer:
             return
         start = active["edge_start"]
         edge_events = self.truncation_history[start:]
-        tracked = [
-            event for event in edge_events
-            if event["discarded_fraction"] is not None
-        ]
-        if tracked:
-            edge_log_survival = 0.0
-            for event in tracked:
-                edge_survival = min(
-                    1.0,
-                    max(0.0, 1.0 - float(event["discarded_fraction"])),
-                )
-                if edge_survival <= 0.0:
-                    edge_log_survival = -np.inf
-                    break
-                edge_log_survival += float(np.log(edge_survival))
-            relative_loss = infidelity_from_log(edge_log_survival)
-            absolute_loss = float(
-                sum(event["discarded_weight"] for event in tracked)
-            )
-            max_edge_loss = float(
-                max(event["discarded_weight"] for event in tracked)
-            )
-            max_edge_fraction = float(
-                max(event["discarded_fraction"] for event in tracked)
-            )
-            if (
-                np.isneginf(self._truncation_log_survival)
-                or np.isneginf(edge_log_survival)
-            ):
-                self._truncation_log_survival = -np.inf
-            else:
-                self._truncation_log_survival += edge_log_survival
-            cumulative_loss = infidelity_from_log(
-                self._truncation_log_survival,
-            )
-        else:
-            if self.track_truncation and self.mode != "zipup":
-                relative_loss = 0.0
-                absolute_loss = 0.0
-                max_edge_loss = 0.0
-                max_edge_fraction = 0.0
-                cumulative_loss = infidelity_from_log(
-                    self._truncation_log_survival,
-                )
-            else:
-                relative_loss = None
-                absolute_loss = None
-                max_edge_loss = None
-                max_edge_fraction = None
-                cumulative_loss = None
-
-        self.update_history.append({
-            "update": update_index,
-            "kind": active["kind"],
-            "support": active["support"],
-            "elapsed_seconds": float(elapsed),
-            "edge_event_indices": list(range(start, len(self.truncation_history))),
-            "edge_count": len(edge_events),
-            "truncated_edges": sum(event["truncated"] for event in edge_events),
-            "absolute_discarded_weight": absolute_loss,
-            "relative_discarded_weight": relative_loss,
-            "cumulative_relative_discarded_weight": cumulative_loss,
-            "max_edge_discarded_weight": max_edge_loss,
-            "max_edge_discarded_fraction": max_edge_fraction,
-            "fit_diagnostics": deepcopy(active.get("fit_diagnostics")),
-            **bond_record,
-        })
+        self._truncation_log_survival, update, sample = summarize_update(
+            active, edge_events, bond_record, elapsed=elapsed, mode=self.mode,
+            track_truncation=self.track_truncation,
+            log_survival=self._truncation_log_survival,
+            sample_step=len(self.infidelity_samples) + 1,
+        )
+        self.update_history.append(update)
         if self.profile:
             self.profile_events.append({
-                "kind": "update",
-                "update": update_index,
-                "support": active["support"],
-                "seconds": elapsed,
+                "kind": "update", "update": update_index,
+                "support": active["support"], "seconds": elapsed,
             })
-        if tracked:
-            local_infidelity = float(relative_loss)
-            self.infidelities.append(float(cumulative_loss))
-            self.infidelity_samples.append({
-                "step": len(self.infidelity_samples) + 1,
-                "where": active["support"],
-                "edge_count": len(edge_events),
-                "local_fidelity": fidelity_from_log(edge_log_survival),
-                "local_infidelity": local_infidelity,
-                "infidelity": float(cumulative_loss),
-                "cumulative_infidelity": float(cumulative_loss),
-                "method": "tree_edge_spectrum",
-            })
+        if sample is not None:
+            self.infidelities.append(sample["cumulative_infidelity"])
+            self.infidelity_samples.append(sample)
         self._active_update = None
 
     def apply_gate(self, gate, where, *, renormalize=False, track_norm=True):
         """Apply a gate and aggregate its edge truncation diagnostics."""
         self._warn_track_truncation_slow()
-        started = self._begin_update(
+        with self._update(
             "gate", _normalize_where(where), track_norm=track_norm
-        )
-        try:
+        ):
             result = self._apply_gate_impl(
                 gate, where, renormalize=renormalize, track_norm=track_norm
             )
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
         return result
 
     def _apply_gate_tree_mpo_impl(
@@ -3085,6 +2749,16 @@ class TreeOptimizer:
         logical_where = _normalize_where(logical_where)
         where = self._validate_support(logical_where)
         self._check_operator_limits(where)
+        if len(logical_where) == 2 and logical_where[0] == logical_where[1]:
+            raise ValueError(
+                "A two-qubit gate needs two distinct qubits; "
+                f"got where={logical_where}."
+            )
+        if len(logical_where) > 2 and len(set(logical_where)) != len(logical_where):
+            raise ValueError(
+                "A multi-qubit gate needs distinct qubits; "
+                f"got where={logical_where}."
+            )
         gate = self._as_state_backend(gate)
         factor_started = (
             self._profile_phase_start() if len(logical_where) > 1 else None
@@ -3121,7 +2795,7 @@ class TreeOptimizer:
             support=tuple(logical_where),
             operator_bond=tree_mpo.max_bond(),
         )
-        self.apply_subtreempo(
+        self.apply_sub_mpotree(
             tree_mpo,
             tree_mpo.operator_support,
             max_bond=self.chi,
@@ -3161,7 +2835,8 @@ class TreeOptimizer:
             "'random_expand', or 'guess-<method>'."
         )
 
-    def _tree_fit_initial_guess(self, target, region, *, operator=None):
+    def _tree_fit_initial_guess(self, target, region, *, operator=None, path_order=None,
+                                max_bond=None, cutoff=None):
         """Build a disposable TreeFIT guess without replacing the target.
 
         For a TreeMPO-backed gate, ``guess-src`` follows the requested
@@ -3171,6 +2846,8 @@ class TreeOptimizer:
         the FIT initial state.
         """
 
+        max_bond = self.chi if max_bond is None else max_bond
+        cutoff = self.cutoff if cutoff is None else cutoff
         strategy = self._normalize_fit_init_strategy(self.fit_init_strategy)
         if self.fit_init_strategy == "auto" and self.tn.fermionic:
             # Native SRC is not charge-safe. The exact target stays separate
@@ -3187,7 +2864,7 @@ class TreeOptimizer:
                 self.tn,
                 region,
                 target=target,
-                max_bond=self.chi,
+                max_bond=max_bond,
                 strength=self.fit_init_rand_strength,
                 expand=strategy == "random_expand",
                 seed=self.fit_init_seed,
@@ -3202,32 +2879,30 @@ class TreeOptimizer:
             # Preserve copy()'s one child-seed draw so later measurements
             # retain their existing seeded sequence.
             child_seed = int(self.rng.integers(0, 2**63, dtype=np.uint64))
-            guess_optimizer = type(self)(
-                None, state=self.tn, tree=self.plan,
-                chi=self.chi, cutoff=self.cutoff, cutoff_mode=self.cutoff_mode,
+            guess_optimizer = self._new_state_optimizer(
+                chi=max_bond, cutoff=cutoff,
                 mode="zipup" if method == "zipup" else "auto",
                 compression_mode="direct" if method == "zipup" else method,
                 compression_seed=self.fit_init_seed, seed=child_seed,
-                threads=self.threads, subtree_workers=self.subtree_workers,
-                max_operator_qubits=self.max_operator_qubits,
-                max_subtree_nodes=self.max_subtree_nodes,
                 track_infidelity=False, track_truncation=False,
-                record_history=False, run=False,
+                record_history=False, profile=False, profile_sync=False,
+                track_bond_diagnostics=False, max_intermediate_bond=None,
             )
             guess_optimizer._norm_tracking_enabled = False
-            guess_optimizer.apply_subtreempo(
+            guess_optimizer.apply_sub_mpotree(
                 operator,
                 getattr(operator, "operator_support", None),
-                max_bond=self.chi,
-                cutoff=self.cutoff,
+                max_bond=max_bond,
+                cutoff=cutoff,
                 track_norm=False,
                 _validate_backend=False,
+                _path_order=path_order,
             )
             return guess_optimizer.tn, strategy, None, "tree_mpo"
         guess = target.copy()
         guess.compress(
-            max_bond=self.chi,
-            cutoff=self.cutoff,
+            max_bond=max_bond,
+            cutoff=cutoff,
             cutoff_mode=self.cutoff_mode,
             compression_mode=method,
             compression_seed=self.fit_init_seed,
@@ -3252,13 +2927,25 @@ class TreeOptimizer:
 
         return _build_layered_operator_state_target(self.tn, tree_mpo), tree_mpo
 
-    def _run_tree_fit(self, target, region, support, *, operator=None, target_norm=None):
+    def _run_tree_fit(self, target, region, support, *, operator=None, target_norm=None,
+                      path_order=None, max_bond=None, cutoff=None):
         """Fit one exact tree target and install it atomically."""
 
+        max_bond = self.chi if max_bond is None else max_bond
+        cutoff = self.cutoff if cutoff is None else cutoff
+        path = path_order
+        if path is None and self.fit_traversal == "auto":
+            path = _region_path(self.tn, region)
+        first_path = path
+        if path is not None and self.fit_sweep_sequence == "outward-inward":
+            first_path = path[::-1]
         guess_result = self._tree_fit_initial_guess(
             target,
             region,
             operator=operator,
+            path_order=first_path,
+            max_bond=max_bond,
+            cutoff=cutoff,
         )
         if len(guess_result) == 3:
             guess, strategy, random_info = guess_result
@@ -3266,6 +2953,7 @@ class TreeOptimizer:
         else:
             guess, strategy, random_info, guess_backend = guess_result
         # SRC/SDC are complete environment algorithms, not local SVD drivers.
+        # Keep an explicit DM local split; the guess strategy is independent.
         split_method = (
             "direct" if self.compression_mode in {"src", "sdc"}
             else self.compression_mode
@@ -3274,8 +2962,8 @@ class TreeOptimizer:
         fit = TreeFIT(
             target,
             guess,
-            max_bond=self.chi,
-            cutoffs=self.cutoff,
+            max_bond=max_bond,
+            cutoffs=cutoff,
             cutoff_mode=self.cutoff_mode,
             split_method=split_method,
             split_seed=(
@@ -3326,6 +3014,7 @@ class TreeOptimizer:
             rtol=fit_rtol,
             patience=self.fit_patience,
             single_node_fast_path=self.fit_single_node_fast_path,
+            _path_order=path,
             adaptive_block_sweeps=adaptive_sweeps,
             two_site_transition_sweeps=(
                 self.fit_two_site_transition_sweeps
@@ -3343,12 +3032,15 @@ class TreeOptimizer:
         diagnostics.update(
             {
                 "backend": "tree_fit",
+                "split_method": fit.split_method,
                 "support": tuple(support),
                 "region": tuple(sorted(region)),
                 "fit_init_strategy": strategy,
                 "fit_init_strategy_requested": self.fit_init_strategy,
                 "fit_rtol": fit_rtol,
                 "fit_rtol_requested": self._fit_rtol_requested,
+                "max_bond": max_bond,
+                "cutoff": cutoff,
                 "guess_used": strategy != "direct" and guess_backend != "single_node",
                 "guess_method": (
                     strategy[6:] if strategy.startswith("guess_") else strategy
@@ -3389,90 +3081,27 @@ class TreeOptimizer:
             )
         return self
 
-    def _apply_gate_dmrg_impl(
-        self, gate, logical_where, *, renormalize=False, track_norm=True
-    ):
-        """Apply a gate through the shared TreeMPO-to-TreeFIT path."""
-
-        return self._apply_gate_tree_mpo_impl(
-            gate,
-            logical_where,
-            renormalize=renormalize,
-            track_norm=track_norm,
-        )
-
     def _apply_gate_impl(
         self, gate, where, *, renormalize=False, track_norm=True
     ):
-        """Apply a gate without opening a nested diagnostic update."""
-        logical_where = _normalize_where(where)
-        if self.mode == "dmrg":
-            return self._apply_gate_dmrg_impl(
-                gate,
-                logical_where,
-                renormalize=renormalize,
-                track_norm=track_norm,
-            )
-        where = self._validate_support(logical_where)
-        self._check_operator_limits(where)
-        if len(logical_where) == 2 and logical_where[0] == logical_where[1]:
-            raise ValueError(
-                "A two-qubit gate needs two distinct qubits; "
-                f"got where={logical_where}."
-            )
-        if len(logical_where) > 2 and len(set(logical_where)) != len(logical_where):
-            raise ValueError(
-                "A multi-qubit gate needs distinct qubits; "
-                f"got where={logical_where}."
-            )
-        route = self._gate_route(len(logical_where))
-        if route == "treempo":
+        """Ordinary gates share the TreeMPO boundary; sub-MPO events stay explicit."""
+        if self.mode != "submpo":
             return self._apply_gate_tree_mpo_impl(
-                gate,
-                logical_where,
-                renormalize=renormalize,
-                track_norm=track_norm,
+                gate, where, renormalize=renormalize, track_norm=track_norm,
             )
-        if route == "submpo" and len(logical_where) > 1:
+        logical_where = _normalize_where(where)
+        compact_where = self._validate_support(logical_where)
+        self._check_operator_limits(compact_where)
+        if len(logical_where) > 1:
             raise ValueError(
                 "mode='submpo' accepts explicit sub-MPO stream events, not "
                 "ordinary dense gates; use mode='direct', mode='dm', or a "
                 "tree_mpo_* mode."
             )
         with self._thread_ctx():
-            if len(where) == 1:
-                self.apply_1q(
-                    gate,
-                    logical_where[0],
-                    renormalize=renormalize,
-                    track_norm=track_norm,
-                )
-            elif len(where) == 2:
-                if where[0] == where[1]:
-                    raise ValueError(
-                        "A two-qubit gate needs two distinct qubits; "
-                        f"got where={where}."
-                    )
-                self.apply_2q(
-                    gate,
-                    logical_where[0],
-                    logical_where[1],
-                    track_norm=track_norm,
-                )
-                if renormalize:
-                    self.normalize()
-            else:
-                if len(set(where)) != len(where):
-                    raise ValueError(
-                        "A multi-qubit gate needs distinct qubits; "
-                        f"got where={where}."
-                    )
-                self.apply_subtree_operator(
-                    gate,
-                    logical_where,
-                    renormalize=renormalize,
-                    track_norm=track_norm,
-                )
+            self.apply_1q(
+                gate, logical_where[0], renormalize=renormalize, track_norm=track_norm,
+            )
         return self
 
     def _trajectory_gate_stream(self):
@@ -3568,10 +3197,10 @@ class TreeOptimizer:
             raise ValueError("shots must be a nonnegative integer.")
         mpi_enabled = mpi is not None and mpi is not False
         if not mpi_enabled and any(
-            value is not None for value in (observable, checkpoint_path)
+            value is not None for value in (observable, checkpoint_path, chunk_size)
         ):
             raise ValueError(
-                "observable and checkpoint options require mpi=True or an "
+                "observable, chunk_size and checkpoint options require mpi=True or an "
                 "MPI communicator."
             )
         if not mpi_enabled and (
@@ -3593,8 +3222,10 @@ class TreeOptimizer:
             if progress not in {False, "never"}:
                 child_kwargs["progbar"] = False
             parent_rng_state = deepcopy(self.rng.bit_generator.state)
-            template = self.copy()
-            self.rng.bit_generator.state = parent_rng_state
+            try:
+                template = self.copy()
+            finally:
+                self.rng.bit_generator.state = parent_rng_state
             communicator = None if mpi is True else mpi
             runner = MPIShotRunner(
                 lambda: template.copy(),
@@ -3661,8 +3292,10 @@ class TreeOptimizer:
         if workers > 1 and progress_mode != "never":
             child_kwargs["progbar"] = False
         parent_rng_state = deepcopy(self.rng.bit_generator.state)
-        template = self.copy()
-        self.rng.bit_generator.state = parent_rng_state
+        try:
+            template = self.copy()
+        finally:
+            self.rng.bit_generator.state = parent_rng_state
         factory = lambda: template.copy()
         common = {
             "seed": seed,
@@ -3773,10 +3406,12 @@ class TreeOptimizer:
             warm-up blocks followed by its configured two-node transition;
             each named schedule then performs one-node refinement.
         compression_mode : {"direct", "dm", "sdc", "src"} | None, default=None
-            Persistent TreeMPO compression algorithm. SRC/SDC use environment
-            sweeps for guesses; TreeFIT refinement retains direct local SVD.
+            Persistent TreeMPO compression algorithm. FIT local splits retain
+            direct/DM; SRC/SDC settings use direct local SVD. The separate
+            fit_init_strategy controls the guess algorithm.
         compression_seed : int | None, default=None
-            Override the configured randomized-compression seed for this run.
+            Persistently replace the randomized-compression seed for ordinary
+            replay. Shot replay applies this override only to its children.
         finite_check : bool, default=False
             Optional finite-value scans after each FIT iteration and at the
             end of replay in every mode, including empty streams. Warns once
@@ -3797,7 +3432,8 @@ class TreeOptimizer:
         seed : int | None, default=None
             Reseed measurement/reset sampling before replay.
         track_infidelity : bool | None, default=None
-            Override :attr:`track_infidelity` for this replay. When disabled,
+            Persistently replace :attr:`track_infidelity` for ordinary replay;
+            shot replay changes only its children. When disabled,
             the progress bar omits the norm-based infidelity field and avoids
             the per-event norm readout. Truncation-spectrum diagnostics remain
             controlled independently by :attr:`track_truncation`.
@@ -3812,8 +3448,10 @@ class TreeOptimizer:
         keeping the parent optimizer unchanged.  The shot factory starts from
         the current tree state, so an already prepared tree can be sampled
         without replaying or consuming the caller's optimizer.
+        Explicit ``run_kwargs`` take precedence over top-level child options.
+        Configure ``fit_*`` controls at construction: copies and shot children
+        inherit them, and ``run`` rejects them as unsupported keywords.
         """
-        self._warn_track_truncation_slow()
         if mode is not None:
             requested_mode_raw = str(mode).strip().lower().replace("-", "_")
             if requested_mode_raw in {"tree", "ttn", "tree_tensor_network"}:
@@ -3825,73 +3463,12 @@ class TreeOptimizer:
                     DeprecationWarning,
                     stacklevel=2,
                 )
-            else:
-                requested_mode = self._normalize_mode(requested_mode_raw)
-                if requested_mode in {"dm", "sdc", "src"}:
-                    self._dmrg_mode_alias = None
-                    if compression_mode is not None:
-                        requested_compression = self._normalize_compression_mode(
-                            compression_mode
-                        )
-                        if requested_compression not in {"direct", requested_mode}:
-                            raise ValueError(
-                                f"mode={requested_mode!r} cannot be combined "
-                                "with a different compression_mode."
-                            )
-                    self.mode = "auto"
-                    self.compression_mode = requested_mode
-                    # The shorthand owns the compression choice. The
-                    # explicit ``direct`` value is only the neutral default
-                    # accepted alongside it and must not overwrite it below.
-                    compression_mode = None
-                else:
-                    requested_compression = (
-                        None if compression_mode is None
-                        else self._normalize_compression_mode(compression_mode)
-                    )
-                    if requested_mode in {
-                        "zipup", "tree_mpo_direct", "tree_mpo_dm"
-                    }:
-                        self._dmrg_mode_alias = None
-                        expected = (
-                            "dm" if requested_mode == "tree_mpo_dm"
-                            else "direct"
-                        )
-                        if (
-                            requested_compression is not None
-                            and requested_compression != expected
-                        ):
-                            raise ValueError(
-                                f"mode={requested_mode!r} requires "
-                                f"compression_mode={expected!r}."
-                            )
-                        self.mode = requested_mode
-                        self.compression_mode = expected
-                    else:
-                        if requested_mode in {"dmrg1", "dmrg2", "dmrg3"}:
-                            self._dmrg_mode_alias = requested_mode
-                            self.mode = "dmrg"
-                        else:
-                            self._dmrg_mode_alias = None
-                            self.mode = requested_mode
-        if compression_mode is not None:
-            if self.mode in {"zipup", "tree_mpo_direct", "tree_mpo_dm"}:
-                normalized_compression = self._normalize_compression_mode(
-                    compression_mode
-                )
-                expected = (
-                    "dm" if self.mode == "tree_mpo_dm" else "direct"
-                )
-                if normalized_compression not in {expected, "direct"}:
-                    raise ValueError(
-                        f"mode={self.mode!r} requires "
-                        f"compression_mode={expected!r}."
-                    )
-                self.compression_mode = expected
-            else:
-                self.compression_mode = self._normalize_compression_mode(
-                    compression_mode
-                )
+                mode = None
+        next_mode, next_compression, next_alias = resolve_replay_override(
+            mode, compression_mode, current_mode=self.mode,
+            current_compression=self.compression_mode,
+            current_alias=self._dmrg_mode_alias,
+        )
         if compression_seed is not None:
             if isinstance(compression_seed, bool) or not isinstance(
                 compression_seed, Integral
@@ -3900,18 +3477,15 @@ class TreeOptimizer:
             compression_seed = int(compression_seed)
             if compression_seed < 0:
                 raise ValueError("compression_seed must be non-negative.")
-            self.compression_seed = compression_seed
         non_unitary = bool(non_unitary)
-        if track_infidelity is not None:
-            self.track_infidelity = bool(track_infidelity)
         if not non_unitary and normalize_every not in (False, None):
             raise ValueError("normalize_every requires non_unitary=True.")
         if not non_unitary and normalize_final:
             raise ValueError("normalize_final requires non_unitary=True.")
         normalize_every = bool(normalize_every)
         normalize_eps = float(normalize_eps)
-        if normalize_eps < 0.0:
-            raise ValueError("normalize_eps must be non-negative.")
+        if not np.isfinite(normalize_eps) or normalize_eps < 0.0:
+            raise ValueError("normalize_eps must be finite and non-negative.")
 
         shot_requested = bool(
             error_model is not None
@@ -3931,6 +3505,13 @@ class TreeOptimizer:
             or (workers is not None and workers != "auto")
             or observable is not None
             or checkpoint_path is not None
+            or chunk_size is not None
+            or resume
+            or checkpoint_keep != 2
+            or checkpoint_sync is not True
+            or collect_diagnostics is not True
+            or checkpoint_id is not None
+            or progress != "auto"
         )
         if shot_requested:
             if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
@@ -3979,15 +3560,29 @@ class TreeOptimizer:
                 collect_diagnostics=collect_diagnostics,
                 checkpoint_id=checkpoint_id,
             )
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
+        next_rng = self.rng if seed is None else np.random.default_rng(seed)
+        normalized = None
         if gates is not None:
             normalized = self._normalize_gate_queue(gates)
             self._validate_gate_stream_backend(normalized[0], normalized[2])
+        self._validate_event_stream_for_run(normalized)
+        self._validate_mode_for_stream(mode=next_mode, queue=normalized)
+        # Install persistent options only after validation and after the shot
+        # branch. Shot workers receive overrides; their parent stays unchanged.
+        self.mode, self.compression_mode, self._dmrg_mode_alias = (
+            next_mode, next_compression, next_alias
+        )
+        if self.mode != "dmrg":
+            self._last_fit_diagnostics = None
+        if compression_seed is not None:
+            self.compression_seed = compression_seed
+        if track_infidelity is not None:
+            self.track_infidelity = bool(track_infidelity)
+        self.rng = next_rng
+        if normalized is not None:
             self.G, self.where, self.event_types = normalized
             self._gate_factor_cache.clear()
-        self._validate_event_stream_for_run()
-        self._validate_mode_for_stream()
+        self._warn_track_truncation_slow()
         # The complete stream was validated at installation. Replay therefore
         # uses the caller's payload objects without a second scan or cast.
         payloads = self.G
@@ -4048,7 +3643,7 @@ class TreeOptimizer:
                         multi_qubit_count += 1
                     self.apply_gate(payload, support)
                 elif event_type == "subtreempo":
-                    self.apply_subtreempo(
+                    self.apply_sub_mpotree(
                         payload,
                         support,
                         max_bond=self.chi,
@@ -4074,15 +3669,8 @@ class TreeOptimizer:
                     submpo_count += 1
                 else:
                     control_count += 1
-                    started = self._begin_update(event_type, support)
-                    try:
+                    with self._update(event_type, support):
                         self._apply_control_event(event_type, payload, support)
-                    except Exception:
-                        if started:
-                            self._abort_update()
-                        raise
-                    if started:
-                        self._finish_update()
 
                 if normalize_every:
                     self._normalize_and_record_working_scale(
@@ -4242,6 +3830,9 @@ class TreeOptimizer:
     subttno_event = subtreempo_event
     sub_treempo_event = subtreempo_event
     sub_tree_mpo_event = subtreempo_event
+    # Keep the established wire marker so shared stream consumers remain
+    # compatible; the public name follows apply_sub_mpotree.
+    sub_mpotree_event = subtreempo_event
 
     @staticmethod
     def subtreempo_event_parts(entry):
@@ -4250,6 +3841,7 @@ class TreeOptimizer:
 
     subttno_event_parts = subtreempo_event_parts
     sub_treempo_event_parts = subtreempo_event_parts
+    sub_mpotree_event_parts = subtreempo_event_parts
 
     @staticmethod
     def is_subtreempo_event(entry):
@@ -4258,6 +3850,7 @@ class TreeOptimizer:
 
     is_subttno_event = is_subtreempo_event
     is_sub_treempo_event = is_subtreempo_event
+    is_sub_mpotree_event = is_subtreempo_event
 
     @staticmethod
     def submpo_event_parts(entry):
@@ -4272,13 +3865,12 @@ class TreeOptimizer:
     def apply_1q(self, gate, q, *, renormalize=False, track_norm=True):
         """Absorb a one-qubit gate into the site tensor of qubit ``q``."""
         self._invalidate_state_norm_cache()
-        started = self._begin_update(
+        with self._update(
             "gate", _normalize_where(q), track_norm=track_norm
-        )
-        try:
+        ):
             with self._thread_ctx():
                 if self.mode == "dmrg":
-                    result = self._apply_gate_dmrg_impl(
+                    result = self._apply_gate_tree_mpo_impl(
                         gate,
                         (q,),
                         renormalize=renormalize,
@@ -4291,12 +3883,6 @@ class TreeOptimizer:
                     )
                 else:
                     result = self._apply_1q_impl(gate, q, renormalize=renormalize)
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
         return result
 
     def _apply_1q_impl(self, gate, q, *, renormalize=False):
@@ -4358,7 +3944,7 @@ class TreeOptimizer:
         This low-level method retains the specialized two-factor path kernel
         for compatibility with callers that explicitly use ``apply_2q``.
         Ordinary ``apply_gate`` calls and bundled gate streams use the shared
-        ``TreeMPO -> apply_subtreempo`` route, which factorizes on the active
+        ``TreeMPO -> apply_sub_mpotree`` route, which factorizes on the active
         canonical Steiner region. ``tree_mpo_direct`` and ``tree_mpo_dm`` also
         select that route here; ``submpo`` remains reserved for explicit chain
         MPO events.
@@ -4368,13 +3954,12 @@ class TreeOptimizer:
         self._validate_support(logical_where)
         if logical_where[0] == logical_where[1]:
             raise ValueError("A two-qubit gate needs two distinct qubits.")
-        started = self._begin_update(
+        with self._update(
             "gate", logical_where, track_norm=track_norm
-        )
-        try:
+        ):
             with self._thread_ctx():
                 if self.mode == "dmrg":
-                    result = self._apply_gate_dmrg_impl(
+                    result = self._apply_gate_tree_mpo_impl(
                         gate,
                         logical_where,
                         track_norm=track_norm,
@@ -4385,12 +3970,6 @@ class TreeOptimizer:
                     )
                 else:
                     result = self._apply_2q_impl(gate, *logical_where)
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
         return result
 
     @staticmethod
@@ -4423,7 +4002,7 @@ class TreeOptimizer:
         two-factor attach/QR-thread/compress kernel. ``'auto'`` and ``'dm'``
         select local direct factorization. Ordinary ``apply_gate`` calls do not
         use this compatibility helper: they are lowered to a true TreeMPO and
-        passed to :meth:`apply_subtreempo`. ``'submpo'`` is reserved for
+        passed to :meth:`apply_sub_mpotree`. ``'submpo'`` is reserved for
         explicit sub-MPO stream events and cannot be used with a dense gate.
         """
         if self.mode == "submpo":
@@ -5131,50 +4710,12 @@ class TreeOptimizer:
         )
         if not self.record_history:
             return
-        discarded_weight = None
-        discarded_fraction = None
-        spectrum_norm_sq = None
-        spectrum_rank = None
-        if full_spectrum is not None:
-            if isinstance(full_spectrum, dict):
-                spectrum = np.asarray(
-                    full_spectrum["values"], dtype=float,
-                ).ravel()
-                kept = full_spectrum.get("kept_values")
-            else:
-                spectrum = np.asarray(full_spectrum, dtype=float).ravel()
-                kept = None
-            spectrum_rank = int(spectrum.size)
-            spectrum_norm_sq = float(np.sum(spectrum * spectrum))
-            if kept is not None:
-                kept = np.asarray(kept, dtype=float).ravel()
-                kept_norm_sq = float(np.sum(kept * kept))
-                discarded_weight = max(0.0, spectrum_norm_sq - kept_norm_sq)
-            else:
-                discarded = spectrum[int(after_bond):]
-                discarded_weight = float(np.sum(discarded * discarded))
-            if spectrum_norm_sq > 0.0:
-                discarded_fraction = float(discarded_weight / spectrum_norm_sq)
-            else:
-                discarded_fraction = 0.0
-
-        self.truncation_history.append({
-            "kind": str(kind),
-            "edge": tuple(int(x) for x in edge),
-            "bond": bond_ind,
-            "before_bond": int(before_bond),
-            "after_bond": int(after_bond),
-            "truncated": bool(after_bond < before_bond),
-            "spectrum_rank": spectrum_rank,
-            "spectrum_norm_sq": spectrum_norm_sq,
-            "discarded_weight": discarded_weight,
-            "discarded_fraction": discarded_fraction,
-            # ``None`` is meaningful: native MPO routing uses an uncapped,
-            # lossless split before the final ``chi``-limited path sweep.
-            "max_bond": None if max_bond is None else int(max_bond),
-            "cutoff": float(self.cutoff if cutoff is None else cutoff),
-            "cutoff_mode": self.cutoff_mode,
-        })
+        self.truncation_history.append(truncation_event(
+            kind=kind, edge=edge, before_bond=before_bond, after_bond=after_bond,
+            bond_ind=bond_ind, full_spectrum=full_spectrum, max_bond=max_bond,
+            cutoff=self.cutoff if cutoff is None else cutoff,
+            cutoff_mode=self.cutoff_mode,
+        ))
 
     def _split_with_diagnostics(
         self, tensor, left_inds, *, edge, bond_ind, max_bond, cutoff,
@@ -5456,15 +4997,16 @@ class TreeOptimizer:
 
     def _compress_subtree(
         self, snodes, hub, *, max_bond=None, cutoff=None,
-        preserve_subcap=True,
+        preserve_subcap=True, _path_order=None,
     ):
-        """Canonically compress every edge of a connected updated subtree.
+        """Compress a connected updated subtree using the selected method.
 
-        Starting at ``hub``, descend each branch. Compressing ``node -> child``
-        moves the centre onto the child; a lossless QR move returns it before
-        the next branch. Thus every actual SVD sees the completed operator
-        update with an isometric environment, while every affected edge is
-        compressed exactly once.
+        SRC/SDC dispatch to successive environments on the supplied state;
+        ordinary TreeMPO replay enters that kernel earlier with target layers.
+        Direct/DM prepare a path endpoint and compress once to the other end.
+        On branches, start at ``hub`` and descend. Compressing ``node -> child``
+        advances the center; a lossless QR returns it before the next branch.
+        Each direct/DM cut sees the completed update with canonical boundaries.
         """
         snodes = frozenset(snodes)
         if self.compression_mode in {"src", "sdc"}:
@@ -5481,6 +5023,20 @@ class TreeOptimizer:
             )
             return
         self._move_center(hub)
+
+        path = (_region_path(self.tn, snodes) if _path_order is None else
+                _validate_region_path(self.tn, snodes, _path_order))
+        if path is not None:
+            # Exact preparation can peel from both ends to limit QR sizes.
+            # Move its hub to the endpoint once, then truncate directionally.
+            # Keep the frozen requested terminal endpoint for FIT guesses.
+            if _path_order is None and path[0] == hub:
+                path = path[::-1]
+            self._move_center(path[-1])
+            return self._compress_path(
+                path, max_bond=max_bond, cutoff=cutoff,
+                preserve_subcap=preserve_subcap,
+            )
 
         def edge_cutoff(node, child):
             """Keep existing sub-cap bonds lossless during subtree replay.
@@ -5565,9 +5121,57 @@ class TreeOptimizer:
         if self.tn.fermionic:
             workers = 1
 
-        pending = list(order)
+        layered_route = isinstance(next(iter(local.values())), list)
+        physical_map = {
+            self._phys(q) + "*": self._phys(q)
+            for node in local for q in (self.plan.qubit_of_node.get(node),)
+            if q is not None
+        }
+        # Track readiness once, including paths peeled from both ends. The
+        # original edge index preserves serial order and parallel wave order
+        # without rescanning and copying the remaining edges at every hop.
+        outgoing = {u: i for i, (u, _) in enumerate(order)}
+        if len(outgoing) != len(order):
+            raise RuntimeError("subtree peel order repeats an outgoing node")
+        pending_inputs = Counter(v for _, v in order)
+        available = [i for i, (u, _) in enumerate(order) if not pending_inputs[u]]
+        remaining = len(order)
+
+        def fuse_layered_node(node):
+            started = self._profile_phase_start()
+            try:
+                local[node] = qtn.tensor_contract(*local[node]).reindex_(physical_map)
+            finally:
+                self._profile_phase_event(
+                    "tensor_absorption", started, node=node, route="subtreempo_layered",
+                )
+            operator_inds[node] = set(local[node].inds) - state_inds[node]
+
+        def split_message(index):
+            u, v = order[index]
+            if layered_route:
+                # Fuse a node only after all its incoming messages arrive.
+                # Avoid state/operator outer products on unvisited nodes.
+                fuse_layered_node(u)
+            state_bond = self.tn.bond(u, v)
+            left_inds = [
+                ix for ix in local[u].inds
+                if ix != state_bond and ix not in operator_inds[u]
+            ]
+            new_bond = f"_ttn_mpo_route_{token}_{u}_{v}"
+            hop_started = self._profile_phase_start()
+            try:
+                kept, message = self._qr_route_message(
+                    local[u], left_inds, bond_ind=new_bond,
+                )
+            finally:
+                self._profile_phase_event(
+                    "thread_hop", hop_started, edge=(u, v), route="subtreempo",
+                )
+            return index, u, v, state_bond, new_bond, kept, message
+
         pool = None
-        if workers > 1 and not self.tn.fermionic and len(order) > 1:
+        if workers > 1 and len(available) > 1:
             from concurrent.futures import ThreadPoolExecutor
 
             pool = ThreadPoolExecutor(
@@ -5576,41 +5180,13 @@ class TreeOptimizer:
             )
 
         try:
-            while pending:
-                pending_destinations = {v for _, v in pending}
-                ready = [
-                    (index, u, v)
-                    for index, (u, v) in enumerate(pending)
-                    if u not in pending_destinations
-                ]
-                if not ready:
+            while remaining:
+                if not available:
                     raise RuntimeError(
                         "subtree peel order contains a cyclic message dependency."
                     )
-                if workers == 1:
-                    ready = ready[:1]
-
-                def split_message(item):
-                    index, u, v = item
-                    state_bond = self.tn.bond(u, v)
-                    left_inds = [
-                        ix for ix in local[u].inds
-                        if ix != state_bond and ix not in operator_inds[u]
-                    ]
-                    new_bond = f"_ttn_mpo_route_{token}_{u}_{v}"
-                    hop_started = self._profile_phase_start()
-                    try:
-                        kept, message = self._qr_route_message(
-                            local[u], left_inds, bond_ind=new_bond,
-                        )
-                    finally:
-                        self._profile_phase_event(
-                            "thread_hop",
-                            hop_started,
-                            edge=(u, v),
-                            route="subtreempo",
-                        )
-                    return index, u, v, state_bond, new_bond, kept, message
+                ready = [heapq.heappop(available) for _ in
+                         range(1 if workers == 1 else len(available))]
 
                 if pool is not None and len(ready) > 1:
                     results = list(pool.map(split_message, ready))
@@ -5624,7 +5200,7 @@ class TreeOptimizer:
                 # contraction dispatch/reindex bookkeeping for every message.
                 # Messages in one ready wave have disjoint source edges and
                 # are therefore independent until this grouped merge.
-                results = sorted(results)
+                # map() and the serial comprehension retain ready's order.
                 by_destination = {}
                 for result in results:
                     by_destination.setdefault(result[2], []).append(result)
@@ -5633,7 +5209,9 @@ class TreeOptimizer:
                     messages = [result[-1] for result in destination_results]
                     merge_started = self._profile_phase_start()
                     try:
-                        if len(messages) == 1:
+                        if layered_route:
+                            local[destination].extend(messages)
+                        elif len(messages) == 1:
                             local[destination] = qtn.tensor_contract(
                                 local[destination], messages[0]
                             )
@@ -5647,6 +5225,7 @@ class TreeOptimizer:
                             merge_started,
                             destination=destination,
                             message_count=len(messages),
+                            deferred=layered_route,
                         )
                     for (
                         _, source, _, state_bond, new_bond, kept, _
@@ -5657,18 +5236,21 @@ class TreeOptimizer:
                         local[source] = kept
                         state_inds[destination].discard(state_bond)
                         state_inds[destination].add(new_bond)
-                    operator_inds[destination] = (
-                        set(local[destination].inds)
-                        - state_inds[destination]
-                    )
-                removed = {index for index, *_ in results}
-                pending = [
-                    edge for index, edge in enumerate(pending)
-                    if index not in removed
-                ]
+                        pending_inputs[destination] -= 1
+                    if not layered_route:
+                        operator_inds[destination] = (
+                            set(local[destination].inds)
+                            - state_inds[destination]
+                        )
+                    if not pending_inputs[destination] and destination in outgoing:
+                        heapq.heappush(available, outgoing[destination])
+                remaining -= len(results)
         finally:
             if pool is not None:
                 pool.shutdown()
+        if layered_route:
+            hub = order[-1][1] if order else next(iter(local))
+            fuse_layered_node(hub)
 
     def _successive_subtree_messages(self, local, order, hub, *, max_bond, cutoff):
         """Compress layered targets using actual complementary environments."""
@@ -5679,7 +5261,11 @@ class TreeOptimizer:
             max_bond=max_bond, cutoff=cutoff, cutoff_mode=self.cutoff_mode,
             seed=self.compression_seed,
         )
-        physical_map = {self._phys(q) + "*": self._phys(q) for q in range(self.n)}
+        physical_map = {
+            self._phys(q) + "*": self._phys(q)
+            for node in local for q in (self.plan.qubit_of_node.get(node),)
+            if q is not None
+        }
         for tensor in result.values():
             tensor.reindex_(physical_map)
         self._install_routed_subtree(result, frozenset(local), hub)
@@ -5693,13 +5279,19 @@ class TreeOptimizer:
     def _zipup_subtree_messages(self, local, state_inds, order, hub, *, max_bond, cutoff):
         """Contract and truncate one layered tree node at a time toward a hub.
 
-        Each outgoing message has one retained state leg capped by max_bond
+        Each outgoing message has one retained state leg truncated by max_bond
         and the original state/operator legs toward its unvisited parent.
         Unlike direct compression, this truncation precedes contraction of
         the complete operator. Its right environment is not canonical, so
         local discarded weights are not global fidelity errors.
+        Native SVD retains Symmray's global multiplet policy, which can keep
+        a degenerate boundary beyond the requested max_bond.
         """
-        physical_map = {self._phys(q) + "*": self._phys(q) for q in range(self.n)}
+        physical_map = {
+            self._phys(q) + "*": self._phys(q)
+            for node in local for q in (self.plan.qubit_of_node.get(node),)
+            if q is not None
+        }
         for u, v in order:
             tensor = qtn.tensor_contract(*local[u]).reindex(physical_map)
             state_bond = self.tn.bond(u, v)
@@ -5739,8 +5331,9 @@ class TreeOptimizer:
     def _install_routed_subtree(self, local, snodes, hub):
         """Install routed tensors and recover their proven hub centre.
 
-        Dense routing already QR-isometrizes every peeled non-hub tensor toward
-        ``hub``. Retaining each Q factor's ``left_inds`` lets Quimb's canonical
+        Each peeled non-hub tensor is isometric toward ``hub``: direct routing
+        and SRC/SDC retain QR factors, while zipup retains QR or left SVD factors.
+        Retaining their ``left_inds`` lets Quimb's canonical
         recovery walk short-circuit those decompositions while still advancing
         the canonical-region state machine honestly. Native graded routing
         retains the same metadata when Symmray supplied it; the
@@ -5782,12 +5375,13 @@ class TreeOptimizer:
         Set ``track_norm=False`` for a known non-unitary/Kraus operator so its
         physical norm change is not reported as compression loss.
         """
+        max_bond = self.chi if max_bond is None else self._normalize_max_bond(max_bond)
+        cutoff = self.cutoff if cutoff is None else self._resolve_cutoff(cutoff)
         self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
-        started = self._begin_update(
+        with self._update(
             "subtree", _normalize_where(where), track_norm=track_norm
-        )
-        try:
+        ):
             if self.mode in {"dmrg", "zipup"}:
                 from .operators import TreeMPO
 
@@ -5801,28 +5395,20 @@ class TreeOptimizer:
                     fermionic=self.tn.fermionic,
                     symmetry=self.tn.symmetry, dtype=self.backend_dtype,
                 )
-                result = self.apply_subtreempo(
+                result = self.apply_sub_mpotree(
                     operator, compact_where, max_bond=max_bond, cutoff=cutoff,
                     track_norm=track_norm, _validate_backend=False,
                 )
                 if renormalize:
                     self.normalize()
-                if started:
-                    self._finish_update()
                 return result
             result = self._apply_subtree_operator_impl(
                 op, where, max_bond=max_bond, cutoff=cutoff,
                 renormalize=renormalize,
             )
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
         return result
 
-    def apply_subtreempo(
+    def apply_sub_mpotree(
         self,
         tree_mpo,
         where=None,
@@ -5831,16 +5417,33 @@ class TreeOptimizer:
         cutoff=None,
         track_norm=True,
         _validate_backend=True,
+        _path_order=None,
     ):
-        """Apply a complete TreeMPO/TTNO without lowering it to a chain MPO.
+        """Apply a complete TreeMPO/TTNO on its active subtree.
+
+        This is the primary ordinary-gate entry point: gate -> TreeMPO ->
+        apply_sub_mpotree. Modes share this operator boundary, then dispatch
+        to their own tree algorithm:
+
+        * Direct/DM route the complete action losslessly with QR, then make
+          one canonical compression sweep (SVD / density-matrix factorization).
+        * SRC/SDC project the layered target successively using complementary
+          randomized / deterministic environments, without building its full
+          enlarged state. Numerical environments live only for this update.
+        * Zipup contracts and caps each outgoing message immediately; its
+          intermediate cuts do not see a canonical complementary environment.
+        * DMRG refines a separate guess against the exact layered target.
+          ``fit_traversal="auto"`` uses endpoint sweeps on paths and
+          depth-first on branches. Explicit ``"depth"`` and ``"depth-first"``
+          remain available for FIT on any support, including multi-site gates.
 
         ``tree_mpo`` must use the same :class:`TreePlan` as this state and
-        contain one primary TTNO network.  The operator's virtual bonds are
-        contracted on the Tree geometry itself: each state/operator site is
-        absorbed locally, open operator bonds are QR-routed from the leaves to
-        a common hub, and the affected state bonds are compressed once after
-        the complete TreeMPO has arrived.  This is the Tree-native analogue of
-        applying a sub-MPO, not a call into an MPS backend.
+        contain one primary TTNO network. Operator bonds are contracted on
+        the TreePlan itself. Off-subtree state branches supply canonical
+        boundaries; none of these routes converts the state into an MPS.
+        The operator's represented exponent is retained without constructing
+        its power of ten. A minimal route requires unchanged builder-proven
+        exterior identities; otherwise all operator nodes participate.
         """
         self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
@@ -5851,86 +5454,28 @@ class TreeOptimizer:
             self._validate_gate_stream_backend([tree_mpo], ["subtreempo"])
         else:
             tree_mpo = self._coerce_tree_mpo_backend(tree_mpo)
-        plan = getattr(tree_mpo, "plan", None)
-        networks = getattr(tree_mpo, "tree_networks", None)
-        if plan is None or networks is None:
-            raise TypeError(
-                "apply_subtreempo requires a TreeMPO/TTNO payload with a TreePlan."
-            )
-        if not _same_tree_plan(self.plan, plan):
-            raise ValueError("TreeMPO and state use different TreePlans.")
-        networks = tuple(networks)
-        if len(networks) != 1:
-            raise NotImplementedError(
-                "apply_subtreempo currently requires one TreeMPO network; "
-                "multi-sector TreeMPO expectation remains supported separately."
-            )
-        sites = tuple(sorted(self.plan.node_of_qubit))
-        declared = sites if where is None else _normalize_where(where)
-        if len(set(declared)) != len(declared):
-            raise ValueError(
-                f"TreeMPO application support repeats a site: {declared!r}."
-            )
-        operator_support = getattr(tree_mpo, "operator_support", None)
-        if operator_support is not None:
-            operator_support = tuple(sorted(_normalize_where(operator_support)))
-            if any(site not in sites for site in operator_support):
-                raise ValueError(
-                    "TreeMPO operator_support contains sites outside its "
-                    f"TreePlan: {operator_support!r}."
-                )
-        if tuple(sorted(declared)) == sites:
-            active_support = sites if operator_support is None else operator_support
-        elif operator_support is not None and set(declared) == set(operator_support):
-            # A complete TreeMPO may be declared by its non-identity support.
-            # Identity legs outside that support are validated and stripped
-            # below before the minimal Steiner route is constructed.
-            active_support = operator_support
-        else:
-            raise ValueError(
-                "a TreeMPO application must declare every physical site of its "
-                "TreePlan, or exactly its known operator_support; got "
-                f"{declared!r} for sites {sites!r}."
-            )
-        if bool(getattr(tree_mpo, "fermionic", False)) != bool(
-            getattr(self.tn, "fermionic", False)
-        ):
-            raise TypeError(
-                "TreeMPO and TreeTensorNetwork must agree on the fermionic "
-                "backend when applying a TreeMPO."
-            )
-        if bool(getattr(self.tn, "fermionic", False)) and (
-            getattr(tree_mpo, "symmetry", None)
-            != getattr(self.tn, "symmetry", None)
-        ):
-            raise TypeError(
-                "native TreeMPO and TreeTensorNetwork must use the same "
-                f"symmetry, got operator={getattr(tree_mpo, 'symmetry', None)!r} "
-                f"and state={getattr(self.tn, 'symmetry', None)!r}."
-            )
-        if hasattr(tree_mpo, "validate"):
-            tree_mpo.validate()
-
-        max_bond = self.chi if max_bond is None else self._normalize_max_bond(max_bond)
-        cutoff = self.cutoff if cutoff is None else float(cutoff)
-        if cutoff < 0.0:
-            raise ValueError("cutoff must be non-negative.")
-        started = self._begin_update(
-            "subtreempo", declared, track_norm=track_norm
+        application = plan_operator_application(
+            self.tn, tree_mpo, where, full_tree=self.mode != "dmrg",
         )
-        try:
+        declared, active_support = application.declared, application.support
+        max_bond = self.chi if max_bond is None else self._normalize_max_bond(max_bond)
+        cutoff = self.cutoff if cutoff is None else self._resolve_cutoff(cutoff)
+        with self._update(
+            "subtreempo", declared, track_norm=track_norm
+        ):
             if self.mode == "dmrg":
                 # Keep the exact DMRG target in operator--state form. The
                 # TreeMPO is still the source of the complete
                 # ``sub_treempo @ tree_state`` action, but its virtual layer
                 # is not fused into the fitted target.
-                active_nodes = tuple(
-                    self.plan.node_of_qubit[site] for site in active_support
-                )
                 target = _build_layered_operator_state_target(
                     self.tn, tree_mpo
                 )
-                region = frozenset(self.tn.steiner_nodes(active_nodes))
+                region = application.region
+                # Norm preparation may recover an unknown center. Preserve
+                # the orientation selected from the state on entry to replay.
+                fit_path = (_region_path(self.tn, region)
+                            if self.fit_traversal == "auto" else None)
                 target_norm = None
                 if track_norm and self._norm_tracking_enabled:
                     if self.center is None:
@@ -5942,22 +5487,37 @@ class TreeOptimizer:
                     active_support,
                     operator=tree_mpo,
                     target_norm=target_norm,
+                    path_order=fit_path,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
                 )
-                if started:
-                    self._finish_update()
                 return self
             with self._thread_ctx():
-                active_nodes = tuple(
-                    self.plan.node_of_qubit[site] for site in active_support
+                path_started = self._profile_phase_start()
+                snodes = application.region
+                path = (
+                    _region_path(self.tn, snodes) if _path_order is None else
+                    _validate_region_path(self.tn, snodes, _path_order)
                 )
-                snodes = (
-                    frozenset(self.plan.nodes())
-                    if tuple(sorted(active_support)) == sites
-                    else self._steiner_nodes(active_nodes)
+                route_path = path
+                if path is not None and (
+                    self.compression_mode in {"src", "sdc"}
+                    or (self.mode == "zipup" and _path_order is not None)
+                ):
+                    # Complementary environments travel opposite to the
+                    # projection sweep. Finish at the incoming endpoint (or
+                    # the frozen first FIT endpoint for a disposable guess).
+                    route_path = path[::-1]
+                successive = self.mode == "zipup" or self.compression_mode in {"src", "sdc"}
+                # Exact QR preparation may consume both path endpoints. This
+                # bounds intermediate ranks by both sides before the final
+                # single-direction SVD sweep. Strictly one-ended preparation
+                # can create much larger, unnecessary QR matrices.
+                order, hub = self._peel_order(
+                    snodes, path_order=route_path if successive else None,
+                    path_routing=successive,
                 )
-                order, hub = self._peel_order(snodes)
                 if order:
-                    path_started = self._profile_phase_start()
                     self._profile_phase_event(
                         "metadata_path",
                         path_started,
@@ -5966,134 +5526,80 @@ class TreeOptimizer:
                         subtree_nodes=len(snodes),
                         message_edges=len(order),
                         hub=hub,
+                        traversal="path" if path is not None else "tree",
                     )
-                if self.compression_mode in {"src", "sdc"}:
-                    # Only exterior isometries are needed: the environment
-                    # algorithm replaces the entire active region. Moving
-                    # a center through that region would perform dead QRs.
-                    self.tn.canonize_subtree_(snodes)
+                if self.mode == "zipup":
+                    self._move_center(route_path[0] if route_path is not None else hub)
                 else:
-                    self._move_center(hub)
-                local = {}
-                state_inds = {}
-                operator_inds = {}
-                for nid in snodes:
-                    state_t = self.tn.tensor_map[self._tid(nid)].copy()
-                    state_inds[nid] = set(state_t.inds)
-                    op_t = tree_mpo.node_tensor(nid).copy()
-                    # The state plan is the validated routing authority. Use
-                    # its adjacency here so compatible TreeMPO views need only
-                    # expose node tensors, not duplicate the neighbor API.
-                    for neighbor in self._neighbors(nid):
-                        if neighbor in snodes:
-                            continue
-                        shared = qtn.bonds(
-                            op_t, tree_mpo.node_tensor(neighbor),
-                        )
-                        if len(shared) != 1:
-                            raise ValueError(
-                                "TreeMPO boundary must have one virtual bond "
-                                f"on edge {(nid, neighbor)!r}."
+                    # Direct routing and SRC/SDC replace the active region.
+                    # Only its exterior must be isometric: stop at the first
+                    # entry instead of QR-moving through tensors about to be
+                    # refactored. Reuse an already-contained canonical region.
+                    canonical = self.tn.canonical_region
+                    if not canonical or not canonical.issubset(snodes):
+                        if self.center is not None:
+                            entry = next(
+                                node for node in self.plan.node_path(self.center, hub)
+                                if node in snodes
                             )
-                        edge = next(iter(shared))
-                        if int(op_t.ind_size(edge)) != 1:
-                            raise ValueError(
-                                "TreeMPO operator_support omits a nontrivial "
-                                f"boundary bond on edge {(nid, neighbor)!r}."
-                            )
-                        op_t = op_t.isel({edge: 0})
-                    qubit = self.plan.qubit_of_node.get(nid)
-                    absorb_started = self._profile_phase_start()
-                    if qubit is not None:
-                        upper = tree_mpo.upper_ind(qubit)
-                        lower = tree_mpo.lower_ind(qubit)
-                        physical = self._phys(qubit)
-                        if upper not in op_t.inds or lower not in op_t.inds:
-                            raise ValueError(
-                                f"TreeMPO is missing physical site {qubit!r}."
-                            )
-                        op_t.reindex_({
-                            lower: physical,
-                            upper: physical + "*",
-                        })
-                        if self.mode == "zipup" or self.compression_mode in {"src", "sdc"}:
-                            local[nid] = [state_t, op_t]
-                            continue
-                        try:
-                            local[nid] = _contract_two_tensors(
-                                state_t, op_t, shared_ind=physical,
-                            ).reindex_({physical + "*": physical})
-                        finally:
-                            self._profile_phase_event(
-                                "tensor_absorption",
-                                absorb_started,
-                                support=(qubit,),
-                                route="subtreempo",
-                            )
-                    else:
-                        if self.mode == "zipup" or self.compression_mode in {"src", "sdc"}:
-                            local[nid] = [state_t, op_t]
-                            continue
-                        try:
-                            local[nid] = qtn.tensor_contract(state_t, op_t)
-                        finally:
-                            self._profile_phase_event(
-                                "tensor_absorption",
-                                absorb_started,
-                                support=(),
-                                route="subtreempo",
-                            )
-                    operator_inds[nid] = (
-                        set(local[nid].inds) - state_inds[nid]
-                    )
+                            self._move_center(entry)
+                        else:
+                            self.tn.canonize_subtree_(snodes)
+                local, state_inds, operator_inds = operator_local_tensors(
+                    self.tn, tree_mpo, snodes, layered=successive or path is not None,
+                    phase_start=self._profile_phase_start,
+                    phase_event=self._profile_phase_event,
+                )
 
                 if self.compression_mode in {"src", "sdc"}:
+                    # Project the original layers using complementary branch
+                    # environments, not local randomized SVD of routed edges.
                     self._successive_subtree_messages(
                         local, order, hub, max_bond=max_bond, cutoff=cutoff,
                     )
-                    if started:
-                        self._finish_update()
-                    return self
-                if self.mode == "zipup":
+                elif self.mode == "zipup":
+                    # Truncate during absorption, before the complete target
+                    # arrives. Recover a canonical hub after the last message.
                     self._zipup_subtree_messages(
                         local, state_inds, order, hub,
                         max_bond=max_bond, cutoff=cutoff,
                     )
                     self._install_routed_subtree(local, snodes, hub)
-                    if started:
-                        self._finish_update()
-                    return self
-                self._route_subtree_messages(
-                    local,
-                    state_inds,
-                    operator_inds,
-                    order,
-                    token=qtn.rand_uuid(),
-                    workers=self.subtree_workers,
-                )
-                if operator_inds[hub]:
-                    raise ValueError(
-                        "TreeMPO application left open operator bonds at its hub."
+                else:
+                    # Direct/DM alone complete exact QR routing before applying
+                    # their canonical edge compression to the enlarged state.
+                    self._route_subtree_messages(
+                        local,
+                        state_inds,
+                        operator_inds,
+                        order,
+                        token=qtn.rand_uuid(),
+                        workers=self.subtree_workers,
                     )
-                self._install_routed_subtree(local, snodes, hub)
-                self._compress_subtree(
-                    snodes,
-                    hub,
-                    max_bond=max_bond,
-                    cutoff=cutoff,
-                    preserve_subcap=False,
-                )
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
+                    if operator_inds[hub]:
+                        raise ValueError(
+                            "TreeMPO application left open operator bonds at its hub."
+                        )
+                    self._install_routed_subtree(local, snodes, hub)
+                    self._compress_subtree(
+                        snodes,
+                        hub,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        preserve_subcap=False,
+                        _path_order=path,
+                    )
+                # Tensor-local routing does not carry Quimb network scalars.
+                # Install the operator scale once, after successful reduction;
+                # DMRG above already inherits it from its exact layered target.
+                self.tn.exponent += application.exponent
         return self
 
-    apply_sub_tree_mpo = apply_subtreempo
-    apply_sub_treempo = apply_subtreempo
-    apply_subttno = apply_subtreempo
+    # Existing method names remain zero-overhead aliases of the primary route.
+    apply_subtreempo = apply_sub_mpotree
+    apply_sub_tree_mpo = apply_sub_mpotree
+    apply_sub_treempo = apply_sub_mpotree
+    apply_subttno = apply_sub_mpotree
 
     def apply_submpo(
         self, submpo, where, *, max_bond=None, cutoff=None, track_norm=True
@@ -6140,7 +5646,7 @@ class TreeOptimizer:
 
         The live state is not modified.  A private branch routes an ordinary
         chain MPO with :meth:`apply_submpo`, while a complete :class:`TreeMPO`
-        is routed with :meth:`apply_subtreempo` so its internal TTNO bonds are
+        is routed with :meth:`apply_sub_mpotree` so its internal TTNO bonds are
         contracted through the TreePlan rather than left open.  In both cases
         no ``to_dense`` conversion is needed.  ``max_bond``
         defaults to this optimizer's ``chi``; pass a larger cap when the
@@ -6151,7 +5657,13 @@ class TreeOptimizer:
         ``UserWarning`` by default; set ``warn_on_truncation=False`` only when
         that approximation is intentional. Set ``return_diagnostics=True`` to
         receive ``(value, diagnostics)`` with the compression events from this
-        expectation only.
+        expectation only, independently of ``record_history``. The configured
+        numerical mode is retained. Multi-node TreeMPO FIT can be approximate
+        without recording edge cuts, so it also warns by default and exposes
+        ``fit_diagnostics`` and ``approximation_possible``. ``truncated=False``
+        only means no recorded rank reduction; it does not certify exact FIT.
+        Use :meth:`expectation_mpo_exact` for readout without compression or FIT.
+        Sampling RNG state is preserved, including on failure.
         """
         if not isinstance(warn_on_truncation, bool):
             raise TypeError("warn_on_truncation must be a bool.")
@@ -6164,12 +5676,19 @@ class TreeOptimizer:
             else self._normalize_max_bond(max_bond)
         )
         effective_cutoff = (
-            self.cutoff if cutoff is None else float(cutoff)
+            self.cutoff if cutoff is None else self._resolve_cutoff(cutoff)
         )
-        if effective_cutoff < 0.0:
-            raise ValueError("cutoff must be non-negative.")
-        event_start = len(self.profile_events)
-        work = self.copy()
+        # State forks draw the same child seed as public copy(). Readout uses
+        # fresh histories and must not consume the live sampling stream.
+        rng_state = deepcopy(self.rng.bit_generator.state)
+        try:
+            work = self._copy_state()
+        finally:
+            self.rng.bit_generator.state = rng_state
+        event_start = len(work.profile_events)
+        # Measurement-local reports must not disappear when callers disable
+        # growing replay histories. This enables records, not spectral probes.
+        work.record_history = warn_on_truncation or return_diagnostics
         history_start = len(work.truncation_history)
         # A TreeMPO is already a complete tree operator.  It cannot be
         # treated as an ordinary site-labelled MPO: doing so extracts only
@@ -6181,7 +5700,7 @@ class TreeOptimizer:
             and hasattr(submpo, "tree_networks")
         )
         if is_tree_mpo:
-            work.apply_subtreempo(
+            work.apply_sub_mpotree(
                 submpo,
                 logical_where,
                 max_bond=max_bond,
@@ -6201,13 +5720,28 @@ class TreeOptimizer:
             event for event in compression_events
             if event.get("truncated", False)
         ]
+        fit_diagnostics = work.get_fit_diagnostics()
+        fit_approximation_possible = (
+            fit_diagnostics is not None
+            and fit_diagnostics.get("convergence_reason") != "single_node_exact"
+        )
         if truncated_events and warn_on_truncation:
             warnings.warn(
                 "expectation_mpo compressed its private transformed ket on "
                 f"{len(truncated_events)} edge(s) with max_bond="
-                f"{effective_max_bond!r}; the expectation is approximate. "
+                f"{effective_max_bond!r}; the expectation may be approximate. "
                 "Increase max_bond or inspect return_diagnostics=True if "
                 "an untruncated measurement is required.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif fit_approximation_possible and warn_on_truncation:
+            warnings.warn(
+                "expectation_mpo used variational FIT for its private "
+                "transformed ket; the expectation may be approximate even "
+                "without recorded edge truncations. Inspect "
+                "return_diagnostics=True or use expectation_mpo_exact for "
+                "readout without compression or FIT.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -6246,6 +5780,10 @@ class TreeOptimizer:
             "n_events": len(compression_events),
             "n_truncated": len(truncated_events),
             "truncated": bool(truncated_events),
+            "approximation_possible": bool(
+                truncated_events or fit_approximation_possible
+            ),
+            "fit_diagnostics": fit_diagnostics,
             "events": deepcopy(compression_events),
         }
         return result, diagnostics
@@ -6287,15 +5825,10 @@ class TreeOptimizer:
         max_bond = (
             self.chi if max_bond is None else self._normalize_max_bond(max_bond)
         )
-        cutoff = self.cutoff if cutoff is None else float(cutoff)
-        if cutoff < 0.0:
-            raise ValueError(
-                "max_bond must be positive or None and cutoff non-negative."
-            )
-        started = self._begin_update(
+        cutoff = self.cutoff if cutoff is None else self._resolve_cutoff(cutoff)
+        with self._update(
             "submpo", where, track_norm=track_norm
-        )
-        try:
+        ):
             with self._thread_ctx():
                 applied = None
                 if len(where) == 2:
@@ -6332,12 +5865,6 @@ class TreeOptimizer:
                         _submpo_to_dense(submpo, logical_where), logical_where,
                         max_bond=max_bond, cutoff=cutoff,
                     )
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
         return self
 
     def apply_pauli_rotation(
@@ -6378,7 +5905,7 @@ class TreeOptimizer:
             [(c, {}), (coef, terms)],
             dtype=self.dtype,
         )
-        return self.apply_subtreempo(
+        return self.apply_sub_mpotree(
             tree_mpo,
             tree_mpo.operator_support,
             track_norm=True,
@@ -6435,7 +5962,7 @@ class TreeOptimizer:
             resolved_terms,
             dtype=self.dtype,
         )
-        return self.apply_subtreempo(
+        return self.apply_sub_mpotree(
             tree_mpo,
             tree_mpo.operator_support,
             max_bond=max_bond,
@@ -6530,9 +6057,7 @@ class TreeOptimizer:
         max_bond = (
             self.chi if max_bond is None else self._normalize_max_bond(max_bond)
         )
-        cutoff = self.cutoff if cutoff is None else float(cutoff)
-        if cutoff < 0.0:
-            raise ValueError("cutoff must be non-negative.")
+        cutoff = self.cutoff if cutoff is None else self._resolve_cutoff(cutoff)
 
         if _is_symmray_array(op):
             op_shape = tuple(int(dim) for dim in ar.shape(op))
@@ -6883,95 +6408,6 @@ class TreeOptimizer:
         factors[hub] = blob
         return factors, op_bonds
 
-    def _apply_product_pauli_projector_impl(
-        self, axes, where, snodes, order, hub, outcome, *, max_bond, cutoff,
-    ):
-        """Apply ``(I + outcome P) / 2`` with a dimension-two branch index."""
-        target_axes = dict(zip(where, axes))
-        local = {}
-        branch_index = {}
-        for nid in snodes:
-            state_t = self.tn.tensor_map[self._tid(nid)].copy()
-            q = self.plan.qubit_of_node.get(nid)
-            if q in target_axes:
-                p = self._phys(q)
-                branch = f"_ttn_pauli_branch_{qtn.rand_uuid()}"
-                operators = np.stack(
-                    (
-                        np.eye(2, dtype=complex),
-                        outcome * _PAULI_1Q[target_axes[q]],
-                    ),
-                    axis=-1,
-                )
-                op_t = qtn.Tensor(
-                    self._as_state_backend(operators, warn=False),
-                    inds=(p + "*", p, branch),
-                )
-                local[nid] = _contract_two_tensors(
-                    state_t, op_t, shared_ind=p,
-                ).reindex_(
-                    {p + "*": p}
-                )
-                branch_index[nid] = branch
-            else:
-                local[nid] = state_t
-
-        # Carry one dimension-two branch through the tree. When multiple child
-        # messages meet, a three-leg copy tensor enforces the same branch while
-        # keeping the representation linear in the node degree (rather than
-        # forming a high-rank 2**degree copy tensor at a wide hub).
-        update_token = qtn.rand_uuid()
-        for u, v in order:
-            state_bond = self.tn.bond(u, v)
-            branch = branch_index[u]
-            left_inds = [
-                ix for ix in local[u].inds
-                if ix not in {state_bond, branch}
-            ]
-            new_bond = f"_ttn_pauli_apply_{update_token}_{u}_{v}"
-            tu, message = self._split_with_diagnostics(
-                local[u], left_inds, edge=(u, v), bond_ind=new_bond,
-                max_bond=max_bond, cutoff=cutoff,
-            )
-            local[u] = tu
-
-            parent_branch = branch_index.get(v)
-            if parent_branch is None:
-                local[v] = qtn.tensor_contract(local[v], message)
-                branch_index[v] = branch
-            else:
-                branch_out = f"_ttn_pauli_branch_{qtn.rand_uuid()}"
-                copy_tensor = np.zeros((2, 2, 2), dtype=complex)
-                copy_tensor[0, 0, 0] = 1.0
-                copy_tensor[1, 1, 1] = 1.0
-                copy_tensor = qtn.Tensor(
-                    self._as_state_backend(copy_tensor, warn=False),
-                    inds=(parent_branch, branch, branch_out),
-                )
-                local[v] = qtn.tensor_contract(
-                    local[v], message, copy_tensor
-                )
-                branch_index[v] = branch_out
-
-        root_branch = branch_index[hub]
-        local[hub] = qtn.tensor_contract(
-            local[hub],
-            qtn.Tensor(
-                self._as_state_backend(
-                    np.array([0.5, 0.5], dtype=complex), warn=False
-                ),
-                inds=(root_branch,),
-            ),
-        )
-        for nid in snodes:
-            node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(
-                data=local[nid].data,
-                inds=local[nid].inds,
-                left_inds=None if nid == hub else local[nid].left_inds,
-            )
-        self.center = hub
-
     def _apply_product_pauli_projector(
         self, axes, where, outcome, *, renormalize=True,
         return_diagnostics=False, logical_support=None, probability=None,
@@ -6988,8 +6424,7 @@ class TreeOptimizer:
             )
         before_norm = self.norm()
         before = self._projection_snapshot(where)
-        started = self._begin_update("measure", where)
-        try:
+        with self._update("measure", where) as started:
             # Build every projector, including the one-site case, as the
             # same two-branch TreeMPO. ``where`` is in compact Tree positions;
             # map it back to logical qubit labels before constructing the
@@ -7006,13 +6441,7 @@ class TreeOptimizer:
                 _force_tree_mpo=_force_tree_mpo,
             )
             if renormalize:
-                self.normalize()
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
+                self.normalize(eps=0.0)
         after_norm = self.norm()
         after = self._projection_snapshot(where)
         diagnostics = {
@@ -7072,6 +6501,41 @@ class TreeOptimizer:
             den = (ket.H.reindex(internal_map) & ket).contract(output_inds=[])
         return num / den
 
+    def _measurement_probabilities(self, pauli, where):
+        """Return both Born weights from amplitudes on the active subtree.
+
+        Rotate measured physical legs to the Z basis and carry their XOR on
+        one dimension-two index. Lossless QR messages retain orthonormal
+        subtree bases, so the final tensor carries both parity norms. Squaring
+        amplitudes only after collecting parity avoids subtracting an
+        expectation from one. No dense projector, state copy, truncation, or
+        optimizer history is needed; the live state only changes gauge.
+        """
+        self._require_dense_qubit_state("measure_pauli")
+        logical_where = _normalize_control_where(where)
+        where = self._validate_support(logical_where)
+        axes = _normalize_measure_axes(pauli, logical_where)
+        if len(set(where)) != len(where):
+            raise ValueError("product-Pauli measurement needs distinct qubits.")
+        self._check_operator_limits(where, dense=False)
+        snodes = self._steiner_nodes([self.plan.node_of_qubit[q] for q in where])
+        order, hub = self._peel_order(snodes)
+        self._move_center(hub)
+        scale = self._working_norm()
+        if scale <= 0.0 or not np.isfinite(scale):
+            raise ValueError("Measurement requires a finite nonzero working norm.")
+        to_backend = functools.partial(self._as_state_backend, warn=False)
+        if len(where) == 1:
+            return single_pauli_probabilities(
+                self.tn.node_tensor(hub) / scale, self._phys(where[0]),
+                _PAULI_1Q[axes[0]], to_backend=to_backend,
+            )
+        with self._thread_ctx():
+            return product_pauli_probabilities(
+                self.tn, axes, where, snodes, order, hub, scale,
+                to_backend=to_backend,
+            )
+
     @staticmethod
     def _expand_tree_operator_leaf(op_tensor, packed_ind, physical_ind):
         """Unpack one dimension-four tree-MPO leg into output and input legs."""
@@ -7084,41 +6548,9 @@ class TreeOptimizer:
             inds=[f"{physical_ind}*", physical_ind] + rest_inds,
         )
 
-    def _peel_order(self, snodes):
-        """Return ``(peels, hub)`` for recursive leaf-to-hub application.
-
-        ``peels`` is a list of ``(u, v)`` edges: repeatedly a current
-        subtree-leaf ``u`` (with a single remaining subtree neighbour ``v``) is
-        peeled off toward ``v`` until a single ``hub`` node remains -- the node
-        the orthogonality centre ends on. Deterministic (smallest id first).
-        """
-        remaining = set(snodes)
-        adj = {
-            u: tuple(w for w in self._neighbors(u) if w in remaining)
-            for u in remaining
-        }
-        degree = {
-            u: sum(w in remaining for w in neighbours)
-            for u, neighbours in adj.items()
-        }
-        leaves = [u for u, degree_u in degree.items() if degree_u == 1]
-        heapq.heapify(leaves)
-        peels = []
-        while len(remaining) > 1:
-            while leaves and leaves[0] not in remaining:
-                heapq.heappop(leaves)
-            if not leaves:
-                raise ValueError("subtree peel order requires a connected tree")
-            leaf = heapq.heappop(leaves)
-            v = next(w for w in adj[leaf] if w in remaining)
-            peels.append((leaf, v))
-            remaining.discard(leaf)
-            degree[leaf] = 0
-            degree[v] -= 1
-            if degree[v] == 1:
-                heapq.heappush(leaves, v)
-        hub = min(remaining)
-        return peels, hub
+    def _peel_order(self, snodes, *, path_order=None, path_routing=True):
+        """Return the shared geometry-only peel schedule and final hub."""
+        return peel_order(self.tn, snodes, path_order=path_order, path_routing=path_routing)
 
     # -- readout --------------------------------------------------------------
 
@@ -7468,6 +6900,8 @@ class TreeOptimizer:
 
     def logical_site(self, position):
         """Return the logical qubit at compact tree position ``position``."""
+        if isinstance(position, bool) or not isinstance(position, Integral):
+            raise ValueError("tree position must be an integer.")
         position = int(position)
         if not 0 <= position < self.n:
             raise IndexError(
@@ -7616,8 +7050,8 @@ class TreeOptimizer:
         Quimb ``tn.exponent`` is cleared so the represented state has unit norm.
         """
         eps = float(eps)
-        if eps < 0.0:
-            raise ValueError("eps must be non-negative.")
+        if not np.isfinite(eps) or eps < 0.0:
+            raise ValueError("eps must be finite and non-negative.")
         nrm = self.norm()
         working_norm = self._working_norm()
         if working_norm > eps and np.isfinite(working_norm):
@@ -7636,18 +7070,19 @@ class TreeOptimizer:
         logical_where = _normalize_control_where(where)
         where = self._validate_support(logical_where)
         axes = _normalize_measure_axes(pauli, logical_where)
-        expectation = to_float(
-            self._product_pauli_expectation(axes, where), real=True
-        )
-        p_plus = min(max(0.5 * (1.0 + expectation), 0.0), 1.0)
+        if outcome is not None and (
+            not isinstance(outcome, Integral) or int(outcome) not in (-1, 1)
+        ):
+            raise ValueError("measure event outcome must be +1 or -1.")
+        p_plus, p_minus = self._measurement_probabilities(pauli, logical_where)
         if outcome is None:
             outcome = 1 if self.rng.random() < p_plus else -1
         elif not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
             raise ValueError("measure event outcome must be +1 or -1.")
         else:
             outcome = int(outcome)
-        probability = p_plus if outcome > 0 else 1.0 - p_plus
-        if probability <= 1e-12:
+        probability = p_plus if outcome > 0 else p_minus
+        if probability <= 0.0:
             raise ValueError(
                 f"forced measure outcome {outcome} has ~0 probability "
                 f"({probability:.2e})."
@@ -7778,8 +7213,13 @@ class TreeOptimizer:
         probabilities are exact regardless of the global state norm.
         """
         self._require_dense_qubit_state("measure")
+        logical_q = q
+        q = self._validate_qubit(q)
+        if outcome is not None:
+            if not isinstance(outcome, Integral) or int(outcome) not in (0, 1):
+                raise ValueError("measurement outcome must be 0 or 1.")
+            outcome = int(outcome)
         with self._thread_ctx():
-            q = self._validate_qubit(q)
             site_node = self.plan.node_of_qubit[q]
             self._move_center(site_node)
             t = self.tn.tensor_map[self._tid(site_node)]
@@ -7796,17 +7236,19 @@ class TreeOptimizer:
             if outcome is None:
                 outcome = int(self.rng.choice(2, p=probs))
             else:
-                if not isinstance(outcome, Integral) or int(outcome) not in (0, 1):
-                    raise ValueError("measurement outcome must be 0 or 1.")
-                outcome = int(outcome)
-                if probs[outcome] <= 1e-12:
+                if probs[outcome] <= 0.0:
                     raise ValueError(
-                        f"forced measure outcome {outcome} has ~0 probability."
+                        f"forced measure outcome {outcome} has zero probability."
                     )
             proj = np.zeros((2, 2), dtype=complex)
             proj[outcome, outcome] = 1.0
-            self.apply_1q(self._as_state_backend(proj, warn=False), q)
-            self.normalize()
+            # Public updates resolve logical labels themselves. Passing the
+            # compact position would resolve it twice after a stable-label cap.
+            # Projection probability is physical loss, not compression error.
+            self.apply_1q(
+                self._as_state_backend(proj, warn=False), logical_q, track_norm=False
+            )
+            self.normalize(eps=0.0)
         return outcome
 
     def reset(self, q):
@@ -7828,19 +7270,22 @@ class TreeOptimizer:
         original logical labels while the internal TTN stays compact.
         """
         if stable_labels is not None:
+            if not isinstance(stable_labels, (bool, np.bool_)):
+                raise ValueError("stable_labels must be boolean.")
             compact_labels = not bool(stable_labels)
         if not isinstance(compact_labels, (bool, np.bool_)):
             raise ValueError("compact_labels must be boolean.")
         self._invalidate_state_norm_cache()
-        logical_q = int(q)
-        q = self._validate_qubit(logical_q)
+        position = self._validate_qubit(q)
+        logical_q, q = int(q), position
         if absorb not in {"left", "right"}:
             raise ValueError("cap absorb direction must be 'left' or 'right'.")
-        started = self._begin_update("cap", (q,))
-        try:
+        with self._update("cap", (q,)):
             self.tn.cap_qubit_(q, self._as_state_backend(vec))
             self.plan = self.tn.plan
+            self.top_arity = self.plan.top_arity if self.plan.top_arity >= 2 else None
             self._two_site_path_cache.clear()
+            self._gate_factor_cache.clear()
             self.n = self.tn.nqubits
             remaining = [label for label in self._logical_qubits if label != logical_q]
             if compact_labels:
@@ -7853,13 +7298,53 @@ class TreeOptimizer:
                 label: position for position, label in enumerate(remaining)
             }
             self.layout_finder = None
-        except Exception:
-            if started:
-                self._abort_update()
-            raise
-        if started:
-            self._finish_update()
         return self
+
+    def _configuration_snapshot(self):
+        """Return current constructor settings without retaining mutable state.
+
+        Read live attributes, so post-construction edits and replay overrides
+        propagate to copies and shot templates. Keep automatic FIT tolerance
+        automatic; explicit tolerances retain their current public value.
+        """
+        settings = {name: getattr(self, name) for name in COPY_SETTINGS}
+        settings["fit_rtol"] = (
+            "auto" if self._fit_rtol_requested == "auto" else self.fit_rtol
+        )
+        return settings
+
+    def _new_state_optimizer(self, *, seed, tree=None, **overrides):
+        """Construct private work from one live configuration snapshot.
+
+        State validation and canonical recovery remain centralized in the
+        constructor. No queue or accumulated diagnostic history is copied.
+        Guess and layout callers supply their deliberate policy overrides.
+        """
+        settings = self._configuration_snapshot()
+        settings.update(overrides)
+        return type(self)(
+            None, **settings, tn=self.tn,
+            tree=self.plan if tree is None else tree, seed=seed, run=False,
+        )
+
+    def _copy_state(self):
+        """Fork the live state/policy with fresh histories and a derived RNG.
+
+        Scalar ledgers and logical labels retain the current replay position.
+        Public copy() additionally retains independent histories and the queue;
+        private readout does not pay for either. Callers requiring a pure
+        readout restore the parent RNG around this boundary, even on failure.
+        """
+        child_seed = int(self.rng.integers(0, 2**63, dtype=np.uint64))
+        other = self._new_state_optimizer(seed=child_seed)
+        other._logical_qubits = list(self._logical_qubits)
+        other._logical_positions = dict(self._logical_positions)
+        other._dmrg_mode_alias = self._dmrg_mode_alias
+        other._norm_tracking_enabled = self._norm_tracking_enabled
+        other._update_counter = self._update_counter
+        other._truncation_log_survival = self._truncation_log_survival
+        other._norm_log_survival = self._norm_log_survival
+        return other
 
     def copy(self):
         """Return an independent optimizer at the current tree state.
@@ -7870,58 +7355,7 @@ class TreeOptimizer:
         sequences.  The immutable :class:`TreePlan` is shared; the gate queue is
         retained (gate payloads are not copied) but not replayed.
         """
-        child_seed = int(self.rng.integers(0, 2**63, dtype=np.uint64))
-        other = type(self)(
-            None,
-            n=self.n,
-            chi=self.chi,
-            cutoff=self.cutoff,
-            cutoff_mode=self.cutoff_mode,
-            mode=self.mode,
-            compression_mode=self.compression_mode,
-            compression_seed=self.compression_seed,
-            fit_block_size=self.fit_block_size,
-            fit_n_iter=self.fit_n_iter,
-            fit_adaptive_sweeps=self.fit_adaptive_sweeps,
-            fit_two_site_transition_sweeps=self.fit_two_site_transition_sweeps,
-            fit_min_iter=self.fit_min_iter,
-            fit_rtol=("auto" if self._fit_rtol_requested == "auto" else self.fit_rtol),
-            fit_patience=self.fit_patience,
-            fit_init_strategy=self.fit_init_strategy,
-            fit_init_rand_strength=self.fit_init_rand_strength,
-            fit_init_seed=self.fit_init_seed,
-            fit_sweep_sequence=self.fit_sweep_sequence,
-            fit_traversal=self.fit_traversal,
-            fit_environment_strategy=self.fit_environment_strategy,
-            fit_single_node_fast_path=self.fit_single_node_fast_path,
-            fit_overlap_diagnostics=self.fit_overlap_diagnostics,
-            fit_finite_check=self.fit_finite_check,
-            structure=self.structure,
-            max_arity=self.max_arity,
-            top_arity=self.top_arity,
-            community_frac=self.community_frac,
-            star_frac=self.star_frac,
-            tree=self.plan,
-            dtype=self.dtype,
-            threads=self.threads,
-            subtree_workers=self.subtree_workers,
-            layout_objective=self.layout_objective,
-            layout_weight_mode=self.layout_weight_mode,
-            layout_time_decay=self.layout_time_decay,
-            layout_time_window=self.layout_time_window,
-            track_truncation=self.track_truncation,
-            track_infidelity=self.track_infidelity,
-            max_intermediate_bond=self.max_intermediate_bond,
-            max_operator_qubits=self.max_operator_qubits,
-            max_subtree_nodes=self.max_subtree_nodes,
-            record_history=self.record_history,
-            profile=self.profile,
-            profile_sync=self.profile_sync,
-            track_bond_diagnostics=self.track_bond_diagnostics,
-            seed=child_seed,
-            run=False,
-            tn=self.tn,
-        )
+        other = self._copy_state()
         other.G = list(self.G)
         other.where = list(self.where)
         other.event_types = list(self.event_types)
@@ -7939,14 +7373,7 @@ class TreeOptimizer:
             self._backend_conversion_warnings
         )
         other._track_warning_emitted = self._track_warning_emitted
-        other._logical_qubits = list(self._logical_qubits)
-        other._logical_positions = dict(self._logical_positions)
-        other._update_counter = self._update_counter
-        other._truncation_log_survival = self._truncation_log_survival
-        other._norm_log_survival = self._norm_log_survival
-        other._norm_tracking_enabled = self._norm_tracking_enabled
         other.profile_events = deepcopy(self.profile_events)
-        other._dmrg_mode_alias = self._dmrg_mode_alias
         other.fit_diagnostics = deepcopy(self.fit_diagnostics)
         other._last_fit_diagnostics = deepcopy(self._last_fit_diagnostics)
         other._attach_profile_sink()
@@ -8165,9 +7592,9 @@ class TreeOptimizer:
         return self.projection_diagnostics
 
     def get_fit_diagnostics(self):
-        """Return the latest TreeFIT diagnostic record, if available."""
+        """Return diagnostics for the latest completed update, or None outside FIT."""
 
-        return None if self._last_fit_diagnostics is None else deepcopy(
+        return None if self.mode != "dmrg" or self._last_fit_diagnostics is None else deepcopy(
             self._last_fit_diagnostics
         )
 

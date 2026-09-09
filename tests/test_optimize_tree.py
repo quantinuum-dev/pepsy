@@ -294,7 +294,7 @@ def test_tree_optimizer_guess_src_uses_fit_init_seed(monkeypatch):
         observed.append(self.compression_seed)
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(TreeOptimizer, "apply_subtreempo", capture_seed)
+    monkeypatch.setattr(TreeOptimizer, "apply_sub_mpotree", capture_seed)
     optimizer._tree_fit_initial_guess(target, region, operator=operator)
 
     assert observed == [37]
@@ -988,7 +988,7 @@ def test_tree_mpo_gate_modes_use_tree_mpo_not_chain_submpo(monkeypatch):
     def no_chain_mpo(*args, **kwargs):
         raise AssertionError("TreeMPO gate route used a chain sub-MPO")
 
-    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    monkeypatch.setattr(opt, "apply_sub_mpotree", traced_apply_subtreempo)
     monkeypatch.setattr(qtn.MatrixProductOperator, "from_dense", no_chain_mpo)
     opt.apply_gate(gate, support)
 
@@ -1035,7 +1035,7 @@ def test_tree_ordinary_gate_modes_all_lower_to_subtreempo(monkeypatch, mode):
         routed.append(tree_mpo)
         return apply_subtreempo(tree_mpo, *args, **kwargs)
 
-    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    monkeypatch.setattr(opt, "apply_sub_mpotree", traced_apply_subtreempo)
     opt.apply_gate(cnot, (0, 3))
 
     assert routed
@@ -1055,7 +1055,7 @@ def test_tree_gate_mode_uses_subtreempo_for_four_qubits(monkeypatch):
         routed.append(tree_mpo)
         return apply_subtreempo(tree_mpo, *args, **kwargs)
 
-    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    monkeypatch.setattr(opt, "apply_sub_mpotree", traced_apply_subtreempo)
     opt.apply_gate(_rand_unitary(4, rng), (0, 2, 4, 5))
 
     assert routed
@@ -1073,7 +1073,7 @@ def test_tree_gate_mode_routes_wider_dense_gate_through_tree_mpo(monkeypatch):
         routed.append(tree_mpo)
         return apply_subtreempo(tree_mpo, *args, **kwargs)
 
-    monkeypatch.setattr(opt, "apply_subtreempo", traced_apply_subtreempo)
+    monkeypatch.setattr(opt, "apply_sub_mpotree", traced_apply_subtreempo)
     opt.apply_gate(np.eye(32, dtype=complex), tuple(range(5)))
 
     assert routed
@@ -6364,7 +6364,7 @@ def test_forced_measurement_validates_outcome_probability():
     opt = TreeOptimizer(None, n=2)
     with pytest.raises(ValueError, match="outcome must be 0 or 1"):
         opt.measure(0, outcome=2)
-    with pytest.raises(ValueError, match="~0 probability"):
+    with pytest.raises(ValueError, match="zero probability"):
         opt.measure(0, outcome=1)
     assert np.isclose(opt.norm(), 1.0)
 

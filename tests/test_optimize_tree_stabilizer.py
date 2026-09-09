@@ -146,14 +146,14 @@ def test_tree_stab_c_basis_updates_use_tree_mpo_active_span(monkeypatch):
 
     opt = pepsy.TreeStabOptimizer(3, mode="tree-mpo-dm")
     calls = []
-    apply_subtreempo = opt.tree_optimizer.apply_subtreempo
+    apply_sub_mpotree = opt.tree_optimizer.apply_sub_mpotree
 
-    def traced_apply_subtreempo(tree_mpo, where=None, **kwargs):
+    def traced_apply_sub_mpotree(tree_mpo, where=None, **kwargs):
         calls.append((tree_mpo, tuple(where)))
-        return apply_subtreempo(tree_mpo, where, **kwargs)
+        return apply_sub_mpotree(tree_mpo, where, **kwargs)
 
     monkeypatch.setattr(
-        opt.tree_optimizer, "apply_subtreempo", traced_apply_subtreempo
+        opt.tree_optimizer, "apply_sub_mpotree", traced_apply_sub_mpotree
     )
     opt.apply([
         ("h", 0),

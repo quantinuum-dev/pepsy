@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Mapping
 
 import autoray as ar
 import numpy as np
@@ -2795,7 +2796,28 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         if order is None:
             order = range(self._plan.n)
         out_inds = [self.site_ind(q) for q in order]
-        return ar.to_numpy(self.to_dense(out_inds)).reshape(-1)
+        if self.fermionic:
+            # Keep physical legs separate through graded contraction. Fusing
+            # them first can discard unavailable total-charge sectors and
+            # packs the remaining entries by charge, not by physical site.
+            physical_indices = []
+            for ind in out_inds:
+                tensor = self.tensor_map[next(iter(self.ind_map[ind]))]
+                index = tensor.data.indices[tensor.inds.index(ind)]
+                if isinstance(self.physical_sectors, Mapping):
+                    # Gauge moves can already have removed empty physical
+                    # sectors. The declared local Hilbert space is unchanged.
+                    index = index.copy_with(chargemap=dict(self.physical_sectors))
+                physical_indices.append(index)
+            # Native contraction can remove empty charge sectors even on
+            # outer legs. Restore each live site's original basis explicitly.
+            contracted = self.contract(
+                all, output_inds=out_inds, preserve_tensor=True,
+            ).data
+            data = contracted.copy_with(indices=tuple(physical_indices)).to_dense()
+        else:
+            data = self.to_dense(out_inds)
+        return ar.to_numpy(data).reshape(-1)
 
     # -- ascii drawing --------------------------------------------------------
 

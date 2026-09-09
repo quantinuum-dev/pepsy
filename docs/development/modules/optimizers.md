@@ -16,6 +16,16 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `optimizer.py`: `MpoOptimizer`.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.
   - `compression.py`: extraction target for compression backends.
+- `tree/`: `TreeOptimizer` gate replay and controls, `TreeTensorNetwork` state
+  and canonical metadata, `TreePlan` / `TreeLayoutFinder` geometry and search,
+  and `TreeMPO` operators. Private helpers have explicit state/value inputs:
+  `_policy.py` resolves modes and lists retained configuration settings;
+  `_application.py` validates operator regions and prepares local targets;
+  `_readout.py` computes projected-amplitude Born weights; `_diagnostics.py`
+  constructs records without contracting tensors. `compression.py` owns
+  SRC/SDC environments; variational sweeps use the shared `pepsy.fitting.TreeFIT`.
+  See the [consolidation record](../plans/tree_optimizer_consolidation.md) for
+  ownership, compatibility boundaries, and validation.
 - `peps/`: PEPS/PEPO gate-stream optimization.
   - `optimizer.py`: `PepsOptimizer`.
   - `gates.py`: extraction target for gate routing and target application.

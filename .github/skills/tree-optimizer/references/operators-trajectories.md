@@ -6,6 +6,32 @@ replay backed by `TreeOptimizer`.
 
 ## Tree-native MPO API
 
+`TreeOptimizer.apply_sub_mpotree` is the primary gate-to-TreeMPO entry point.
+Ordinary gate replay and explicit TreeMPO application share it across modes.
+Keep `apply_subtreempo` / `apply_sub_tree_mpo` / `apply_subttno` as aliases;
+`sub_mpotree_event` retains the established stream marker. The FIT traversal
+choices `auto`, `depth`, and `depth-first` are independent of compression
+mode: auto uses path windows on geodesics and depth-first on branches, while
+explicit policies retain their requested FIT order on multi-site operators.
+
+The TreeMPO public exponent and its primary network exponent are separate
+Quimb attributes. Use `_scaled_tree_networks` for sector readout/copies so
+the public offset is applied once and relative sector scales survive. Local
+operator routing must add the operator exponent only after successful
+reduction; FIT already carries it in its exact layered target. Never form a
+large power of ten merely to apply an operator.
+Native statevector readout must retain separate physical legs, restore their
+declared sector maps after sparse contraction, and explicitly unpack Symmray
+blocks before Autoray host conversion. Fused or trimmed charge bases are not
+the full physical output basis. Keep this expansion confined to dense readout.
+
+Only builder-proven unchanged exterior identities permit support-based
+elision. Keep this proof through copies, identity-preserving conjugation and
+internal backend conversion; drop to full-tree application after exterior
+tensor changes or for unproven external operators. After unmanaged in-place
+array edits, `invalidate_canonical_form` clears both proofs. Do not recertify
+an arbitrary copied or canonicalized exterior merely from `operator_support`.
+
 When the consumer is a `TreeTensorNetwork`, `TreeMPO` is the primary operator
 API. Use `TreePlan.build_tree_operator(...)` or
 `Fermion.build_tree_operator(..., tree=plan)`:
@@ -28,6 +54,14 @@ not change the tree contraction route. `to_tree_mpo(...)` remains a
 compatibility alias for `build_tree_operator(...)`.
 The chain MPO must not be moved into the tree, densified, or compressed as a
 state update for exact tree measurement.
+
+Optimizer `expectation_mpo` deliberately retains its numerical update mode.
+Preserve the parent RNG around private copies, including failed copies. Its
+measurement-local edge records and warnings must work with replay history
+disabled, without enabling spectral probes. Multi-node FIT has no edge-cut
+records: expose its FIT diagnostics and approximation risk separately rather
+than treating `truncated=False` as an exactness certificate. Single-node exact
+FIT needs no approximation warning. Exact readout stays a separate contraction.
 
 `TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, analogous to
 `TreeTensorNetwork` subclassing `TensorNetworkGenVector`. It is the tree twin
@@ -58,6 +92,21 @@ truncation. Native operator QR uses the same centralized
 
 ## Noisy trajectory replay
 
+Constructor, legacy `two_site_mode`, and replay selectors use one resolver.
+Validate prospective replay settings and streams before installing them.
+Ordinary mode/compression/seed/tracking overrides persist; shot overrides are
+child-only, with explicit `run_kwargs` taking precedence. Restore the parent
+RNG even when the shot template copy fails. MPI-only options must raise
+without MPI rather than disappear into the single-replay default.
+Caps and state replacement must update the stored root arity to the live
+plan so a subsequent copy or shot does not reject its own topology.
+Clear geometry-bound gate-factor caches on both operations. Same-size state
+replacement can change the TreePlan or site order while reusing a gate object.
+Direct computational measurement uses compact positions only for tensor
+access and logical labels for public gate calls. Its local projected weights
+accept positive branches without a fixed probability floor; projection uses
+`track_norm=False` so Born loss does not enter compression diagnostics.
+
 `run_trajectory_shots` and `run_coalesced_trajectory_shots` support
 `TreeOptimizer` factories as well as MPS and stabilizer-TN factories. Use them
 for trajectory simulation without forming a density matrix:
@@ -69,8 +118,15 @@ for trajectory simulation without forming a density matrix:
   the live TTN.
 - Coalesced replay shares deterministic prefixes and branches exact
   mid-circuit `measure`, `reset`, and `measure_reset` events. Tree measurement
-  probabilities come from `TreeOptimizer.expectation_pauli`; each resulting
-  leaf remains normalized.
+  probabilities come from the paired `_measurement_probabilities` protocol,
+  also used by direct and queued Pauli measurements. Never reconstruct the
+  negative branch as `1 - p_plus`. One-site readout uses projected canonical
+  amplitudes; multi-site readout carries one XOR parity index through
+  lossless active-subtree QR messages before taking the two norms. Preserve
+  each parity sector's coherence, backend, logical-label mapping, and global
+  exponent independence. Probability queries must not truncate, form dense
+  multi-site operators, or copy optimizer histories. Normalize positive
+  selected branches with `eps=0`; each resulting leaf remains normalized.
 - The runner converts generated dense matrices through the live state backend.
   When constructing a direct Tree stream, use matrix-valued gate payloads such
   as `pepsy.h()`; textual MPS gate aliases are not normalized by the Tree gate

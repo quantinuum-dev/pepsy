@@ -5,8 +5,21 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
 
 ## Performance and stability
 
-- TreeOptimizer defaults to `fit_traversal="depth-first"` for branch-grouped
-  FIT updates. Native `fit_environment_strategy="native-blockwise"` remains
+- Native Symmray SVD uses its existing global truncation policy: equal values
+  at a cut can be retained together beyond the requested `chi`. Report actual
+  bond dimensions; do not silently switch to eager per-sector allocation or
+  split a multiplet to make a hard-cap assertion pass. Dense caps remain hard.
+
+- TreeOptimizer defaults to `fit_traversal="auto"` for endpoint FIT sweeps on
+  paths and depth-first updates on branches. Direct/DM use lossless path
+  preparation (peeling from both ends can reduce QR sizes), followed by one
+  endpoint-to-endpoint compression pass; keep the terminal
+  center without return QR. SRC/SDC and zipup also use endpoint path orders.
+  Direct/DM and SRC/SDC need only exterior canonicalization before routing:
+  reuse a contained canonical region, move a known exterior center only to
+  the first entry, and recover an unknown gauge conservatively. Zipup retains
+  its initial center because its intermediate truncations depend on that gauge.
+  Native `fit_environment_strategy="native-blockwise"` remains
   opt-in for local contractions without charge-block fusion.
   The traversal can change truncated results and blockwise speed depends on
   sector structure. A truly one-node FIT region automatically uses one exact
@@ -74,7 +87,11 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   messages landing at one hub use one multi-tensor contraction instead of
   rebuilding that hub once per child. Dense message waves reuse one worker
   pool; native fermionic waves remain serial, but use the same grouped merge
-  without changing graded block semantics.
+  without changing graded block semantics. Track incoming message counts and
+  ready edge indices once, preserving serial order and grouped parallel waves;
+  do not repeatedly scan/copy the remaining edges. Construct physical-index
+  maps only for active nodes. Layered merge profiling marks message queuing
+  as deferred; actual fusion is a later tensor-absorption event.
 - **Two-site routing prefactors.** The immutable geodesic for a repeated
   qubit support is cached and reversed when the current centre chooses the
   opposite endpoint as the source, so the cache never assumes a gauge

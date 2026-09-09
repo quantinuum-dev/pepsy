@@ -1,8 +1,8 @@
 # Tree FIT execution improvements — 2026-09-08
 
 The initial implementation and audits below retain their historical defaults.
-See [the adoption follow-up](#default-adoption-follow-up) for the current
-TreeOptimizer default.
+See the subsequent [path execution update](tree_path_execution.md) for the
+current TreeOptimizer default, which builds on the depth-first adoption below.
 
 Implements the first three priorities from the [mode review](tree_modes_review.md):
 less tree travel, faster native environments, and an exact one-node local solve.

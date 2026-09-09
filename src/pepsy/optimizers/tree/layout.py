@@ -3724,6 +3724,185 @@ class TreeLayoutFinder:
         self._selected_candidate = selected
         return candidates[selected]
 
+    def _pilot_candidate_record(self, plan, *, source=None):
+        """Build the common static record for a pilot candidate."""
+        return {
+            "plan": plan,
+            "objective_key": self._selection_key(plan, self.chi),
+            "path_score": self.score(plan),
+            "tensor_cost": self._tensor_cost_key(plan),
+            "edge_loads": self.edge_loads(plan),
+            **({"source": source} if source is not None else {}),
+        }
+
+    @classmethod
+    def _search_with_pilots(
+        cls, finder_settings, evaluate, *, pilot_candidates, pilot_steps,
+        pilot_workers, include_quality, rounds, topology_budget, refine_budget,
+        search_budget, seed, progbar,
+    ):
+        """Rank static plans with reports supplied by an independent evaluator.
+
+        This owns candidate selection and feedback only. The callback receives
+        a plan and returns a report; the finder never constructs a state or
+        imports an optimizer. Budgets are validated by the calling facade.
+        """
+        previous_plan = None
+        previous_edge_diagnostics = None
+        round_reports = []
+        final_finder = None
+        final_candidates = None
+        final_ranked = None
+        final_selected_name = None
+
+        for round_index in range(rounds):
+            finder = cls(**finder_settings, seed=seed + round_index)
+            quality_kwargs = {
+                "chi": finder_settings["chi"],
+                "include_quality": bool(include_quality),
+            }
+            if topology_budget is not None:
+                quality_kwargs["quality_topology_budget"] = topology_budget
+            if refine_budget is not None:
+                quality_kwargs["quality_refine_budget"] = refine_budget
+            if search_budget is not None:
+                quality_kwargs["quality_search_budget"] = search_budget
+            quality_kwargs["quality_seed"] = seed + round_index
+            candidates = finder.candidate_plans(**quality_kwargs)
+
+            if (
+                previous_plan is not None
+                and previous_edge_diagnostics
+                and rounds > 1
+            ):
+                targeted = finder.targeted_candidates(
+                    previous_plan,
+                    previous_edge_diagnostics,
+                    chi=finder_settings["chi"],
+                    budget=max(2 * pilot_candidates, 8),
+                    seed=seed + round_index,
+                )
+                for proposal_index, plan in enumerate(targeted):
+                    candidates[
+                        f"pilot:round={round_index}:proposal={proposal_index}"
+                    ] = finder._pilot_candidate_record(
+                        plan,
+                        source="pilot_feedback",
+                    )
+
+            ranked_static = sorted(
+                candidates,
+                key=lambda name: candidates[name]["objective_key"],
+            )
+            quality_names = [
+                name for name in ranked_static if name.startswith("quality:")
+            ]
+            feedback_names = [
+                name for name in ranked_static
+                if name.startswith("pilot:")
+            ]
+            ordinary_names = [
+                name for name in ranked_static
+                if not name.startswith(("quality:", "pilot:"))
+            ]
+            if include_quality:
+                ranked = quality_names[:1]
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(feedback_names[:remaining])
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(ordinary_names[:remaining])
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(
+                    name for name in ranked_static
+                    if name not in ranked
+                )
+                ranked = ranked[:pilot_candidates]
+            else:
+                ranked = ranked_static[:pilot_candidates]
+
+            pilot_jobs = [
+                (name, candidates[name]["plan"])
+                for name in ranked
+            ]
+
+            def run_pilot(job):
+                name, plan = job
+                return name, evaluate(
+                    plan,
+                    objective=finder.objective,
+                    pilot_steps=pilot_steps,
+                    progbar=progbar,
+                )
+
+            if pilot_workers > 1 and len(pilot_jobs) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(
+                    max_workers=min(pilot_workers, len(pilot_jobs)),
+                    thread_name_prefix="pepsy-tree-pilot",
+                ) as pool:
+                    pilot_results = list(pool.map(run_pilot, pilot_jobs))
+            else:
+                pilot_results = [run_pilot(job) for job in pilot_jobs]
+
+            reports = {}
+            successful = []
+            for name, report in pilot_results:
+                reports[name] = report
+                if report["status"] != "ok":
+                    continue
+                successful.append((
+                    float(report["infidelity"]),
+                    float(report["total_discarded_weight"]),
+                    float(report["max_discarded_fraction"]),
+                    int(report["truncated_edges"]),
+                    float(report["elapsed_seconds"]),
+                    int(report["final_bond"]),
+                    name,
+                ))
+            if not successful:
+                raise RuntimeError(
+                    "All Tree layout pilot candidates failed. "
+                    f"Diagnostics: {reports!r}"
+                )
+            selected_name = min(successful)[-1]
+            selected_plan = candidates[selected_name]["plan"]
+            selected_report = reports[selected_name]
+            round_reports.append({
+                "round": round_index,
+                "objective": finder.objective,
+                "pilot_candidates": tuple(ranked),
+                "selected_candidate": selected_name,
+                "reports": reports,
+            })
+            previous_plan = selected_plan
+            previous_edge_diagnostics = selected_report.get(
+                "edge_diagnostics", {}
+            )
+            final_finder = finder
+            final_candidates = candidates
+            final_ranked = ranked
+            final_selected_name = selected_name
+
+        selected_plan = final_candidates[final_selected_name]["plan"]
+        final_round = round_reports[-1]
+        result = {
+            "plan": selected_plan,
+            "selected_candidate": final_selected_name,
+            "candidates": final_candidates,
+            "pilot": {
+                "objective": final_finder.objective,
+                "include_quality": bool(include_quality),
+                "pilot_candidates": tuple(final_ranked),
+                "selected_candidate": final_selected_name,
+                "reports": final_round["reports"],
+                "rounds": round_reports,
+                "n_rounds": rounds,
+                "installed": False,
+            },
+        }
+        return result, final_finder
+
     def candidate_plans(
         self,
         *,
