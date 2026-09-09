@@ -583,6 +583,11 @@ Changes for the next release should be added here before the version is bumped.
   explicit opt-in MPO auto-swap wrapper. These integrations preserve existing
   defaults and fail locally when an optional Quimb capability is unavailable.
 
+### Removed
+
+- Removed `MpsOptimizer(mode="su")` and its optimizer-owned simple-update gauge
+  state. Use the dedicated simple-update gate or PEPS APIs instead.
+
 ### Fixed
 
 - Optional MPS FIT overlap diagnostics now report non-finite contraction
@@ -613,6 +618,11 @@ Changes for the next release should be added here before the version is bumped.
   charge maps needed for computational-basis output.
 
 ### Changed
+
+- Non-unitary MPS DMRG now keeps the adaptive `fit_rtol="auto"` policy even
+  when the exact FIT target has a non-unit norm. `stabilize_unitary=True` is
+  rejected for non-unitary replay, and exact-mode normalization requests fail
+  explicitly.
 
 - Fixed the higher-order MPO convenience API so `extension_budget` is
   available consistently on batched and compatibility evolution entry points,

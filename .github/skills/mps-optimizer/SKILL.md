@@ -14,10 +14,10 @@ tests before editing.
 
 Make decisions in this order; each choice owns a different invariant:
 
-1. **State contract.** Use `exact` for a dense reference or cyclic input,
-   `su` for gate-only simple-update evolution, and a canonical open-boundary
-   MPS mode for local norms, controls, and DMRG. Do not make a cyclic MPS look
-   canonical by scanning it—the missing loop environment makes a one-center
+1. **State contract.** Use `exact` for a dense reference or cyclic input, and
+   a canonical open-boundary MPS mode for local norms, controls, and DMRG. Do
+   not make a cyclic MPS look canonical by scanning it—the missing loop
+   environment makes a one-center
    norm invalid.
 2. **Compression route.** `direct` is the constructor default and preferred
    public name for Quimb direct compression. `mpo` is a silent compatibility
@@ -83,6 +83,14 @@ than hiding policy in a mode-specific helper.
   with per-step MPO fallback. Explicit `fit_block_size=2` or `3` opts into
   mixed block-FIT transactions.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
+  Exact replay preserves operator scale directly; `non_unitary=True` is only
+  needed for compressed MPS scale bookkeeping and is accepted in exact
+  trajectory paths for compatibility. Automatic normalization remains an MPS
+  canonicalization feature.
+
+Simple-update evolution is not an `MpsOptimizer` mode. Use the dedicated
+`pepsy.gate_simple` or PEPS simple-update APIs when that gauge-based algorithm
+is required.
 
 Keep `exact` separate from MPS code. When switching from exact to an MPS mode,
 rebuild an MPS from the explicit physical indices and canonicalize it. Do not
@@ -139,6 +147,8 @@ before rebuilding an open MPS.
 - Local non-unitary scale control reuses an authoritative singleton center
   inside the active span, collapsing only a genuinely broad center, and adds
   the removed base-10 scale to `p.exponent`.
+- Keep `stabilize_unitary=True` and `non_unitary=True` mutually exclusive;
+  unitary working-norm restoration must never cancel physical norm change.
 - Every rebuilt/replaced live MPS needs its known canonical span recorded.
 - `set_p()` starts a new fidelity interval. Manual normalization and layout
   changes preserve cumulative fidelity but must invalidate/rebase raw unitary

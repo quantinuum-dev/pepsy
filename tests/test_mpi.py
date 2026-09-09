@@ -106,7 +106,7 @@ def test_run_mpi_shots_convenience_entry_point():
 
 @pytest.mark.parametrize(
     "mode",
-    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "fit", "mix", "mpo", "svd", "swap", "perm", "exact", "su"),
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "fit", "mix", "mpo", "svd", "swap", "perm", "exact"),
 )
 def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
     initial = qtn.MPS_computational_state("0", dtype="complex128")

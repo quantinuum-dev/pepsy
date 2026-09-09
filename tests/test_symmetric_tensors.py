@@ -2730,37 +2730,6 @@ def test_symmps_heisenberg_builds_energy_and_imaginary_step():
     assert state.norm() == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("model", ["heisenberg", "fermi_hubbard"])
-def test_symmps_mps_optimizer_simple_update_preserves_symmray_data(model):
-    """Simple update should preserve Symmray tensor data under default settings."""
-    state = SymMPS.for_model(
-        model,
-        3,
-        bond_dim=2,
-        seed=18,
-        dtype="complex128",
-    )
-    if model == "fermi_hubbard":
-        hamiltonian = state.build_hamiltonian(t=1.0, U=2.0, mu=0.1)
-    else:
-        hamiltonian = state.build_hamiltonian()
-    gates = hamiltonian.gate_stream(0.001, imaginary=True)
-
-    optimizer = pepsy.MpsOptimizer(
-        state.tn.copy(),
-        gates,
-        chi=4,
-        mode="su",
-    )
-    out = optimizer.run(progbar=False, cutoff=1.0e-10)
-
-    assert _all_tensor_data_symmray(out)
-    assert out.max_bond() <= 4
-    assert len(optimizer.gauges) == out.L - 1
-    assert optimizer.p_ungauged is not None
-    assert np.isfinite(np.real(optimizer.p_ungauged.norm()))
-
-
 def test_symmps_measures_dense_generic_observables():
     """SymMPS.measure should convert dense local operators to Symmray arrays."""
     state = SymMPS.for_model(

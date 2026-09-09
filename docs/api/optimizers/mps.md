@@ -141,7 +141,7 @@ Quimb compression family these events are applied with `gate_with_submpo_` and
 compressed to `chi`. DMRG also accepts multi-site sub-MPO events: it
 canonicalizes the active region, aligns the MPO site tags, and keeps the
 operator as a layered FIT target while using the DMRG SRC warm-up guess.
-`svd`, `swap`, `perm`, `su`, and `exact` reject sub-MPO stream events; `mix`
+`svd`, `swap`, `perm`, and `exact` reject sub-MPO stream events; `mix`
 retains its existing gate-oriented unitary path.
 
 Modes that use canonical MPS metadata require an open-boundary MPS. A cyclic
@@ -260,8 +260,8 @@ observables afterward. `dmrg2` is the normal variational production backend;
 `direct` is the default compression path for explicit sub-MPO events, while
 DMRG schedules retain multi-site sub-MPOs as layered FIT targets. `svd`, `swap`,
 and the other DMRG schedules use the same
-trajectory contract and should be benchmarked for the workload. `mix` and `su`
-remain gate-oriented/unitary modes, while `exact` also supports state-dependent
+trajectory contract and should be benchmarked for the workload. `mix` remains a
+gate-oriented/unitary mode, while `exact` also supports state-dependent
 Kraus branches by evaluating copied dense TensorNetwork leaves. Shot
 replay uses a frozen persistent-layout template when one is installed, but
 still requires a fresh identity-order optimizer for an already-permuted `perm`
@@ -299,7 +299,6 @@ The practical shot-mode matrix is:
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
 | `dmrg`, `dmrg1/2/3` | opt-in variational compressed replay with the selected FIT schedule |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
-| `su` | gate-only simple-update; selected Kraus gates are normalized after replay |
 | `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
@@ -781,25 +780,10 @@ The accelerator backend is detected once per timing session, so CPU timing
 does not repeatedly scan the MPS. JAX barriers wait on each newly returned
 stage result rather than an unrelated previously ready MPS leaf.
 
-`mode="su"` uses simple-update evolution for imaginary-time or other
-non-unitary gate streams. It keeps `opt.p` as the simple-update core and
-stores the external bond factors in `opt.gauges`. After every run,
-`opt.p_ungauged` is refreshed as a physical copy with those gauges inserted.
-If the supplied dictionary
-does not contain the current bond gauges, the optimizer initializes it with
-`opt.p.gauge_all_simple_(gauges=opt.gauges, progbar=False)`, then applies each
-gate through `pepsy.gate_simple(..., renorm=True)`. This mode does not
-canonicalize the MPS or expose canonical diagnostics. Use
-`opt.p_ungauged` for the physical state and `opt.p` for continued SU updates.
-If an independent physical copy is needed, use:
-
-```python
-physical = opt.p_ungauged.copy()
-```
-
-For Symmray block-sparse MPS data, `gate_simple` automatically uses Quimb's
-full two-site `split` path so symmetry and fermionic fusion metadata are
-preserved. Dense MPS data keeps the faster `reduce-split` path by default.
+`MpsOptimizer` no longer accepts `mode="su"`; simple-update gauge/core
+bookkeeping is not part of the MPS optimizer. For direct simple-update
+evolution, use the dedicated `pepsy.gate_simple` API (or the PEPS
+simple-update APIs) instead.
 
 `mode="swap"` applies non-local two-site gates through a swap-and-split path
 and swaps the sites back after each gate. `mode="perm"` uses the same
@@ -826,7 +810,10 @@ observable support, and records the new range. A concrete tracked range avoids
 an orthogonality-center scan. Older Quimb versions without the local evaluator
 use a compatibility overlap contraction instead.
 
-Normalization uses the same canonical-center contract as gate application. For a non-unitary run with `normalize_every` enabled, the optimizer reuses an authoritative one-site center inside the active span, normalizes that tensor, and stores the removed scale in `p.exponent`. Only a genuinely broad tracked center is collapsed to one site. Thus `p.norm()` restores the represented norm, while a copy with `exponent=0` exposes the normalized working data. For DMRG, a multi-gate batch is one replay step for this purpose.\n\nUse `get_normalizations()` for scale events, `get_quality_checks()` for optional finite/canonical health records, and `get_fit_diagnostics()` for the latest DMRG/FIT convergence record. `mode="exact"` and `mode="su"` deliberately skip canonical metadata; switching back to an MPS mode rebuilds and canonicalizes the contracted state.\n\n
+Normalization uses the same canonical-center contract as gate application. For a non-unitary run with `normalize_every` enabled, the optimizer reuses an authoritative one-site center inside the active span, normalizes that tensor, and stores the removed scale in `p.exponent`. Only a genuinely broad tracked center is collapsed to one site. Thus `p.norm()` restores the represented norm, while a copy with `exponent=0` exposes the normalized working data. For DMRG, a multi-gate batch is one replay step for this purpose. Non-unitary DMRG keeps the adaptive `fit_rtol="auto"` policy; the exact target norm need not be one because convergence is measured relatively.
+
+Use `get_normalizations()` for scale events, `get_quality_checks()` for optional finite/canonical health records, and `get_fit_diagnostics()` for the latest DMRG/FIT convergence record. `mode="exact"` deliberately skips canonical metadata; switching back to an MPS mode rebuilds and canonicalizes the contracted state. Exact replay preserves operator scale directly, while automatic normalization options remain unavailable in exact mode.
+
 For a logical gate stream whose site order has not been chosen yet,
 `MpsOptimizer.LayoutFinder(gates, L=...)` or
 `MpsOptimizer.gate_stream_layout(gates, L=...)` returns a 1D layout plan with

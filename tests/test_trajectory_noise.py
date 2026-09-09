@@ -350,7 +350,7 @@ def test_mps_kraus_bell_branches_match_dense_trajectory_states():
     assert result.diagnostics.used_kraus_copy_fallback is False
 
 
-@pytest.mark.parametrize("mode", ("mix", "su"))
+@pytest.mark.parametrize("mode", ("mix",))
 def test_gate_oriented_modes_reject_control_shots(mode):
     initial = qtn.MPS_computational_state("0", dtype="complex128")
     simulator = pepsy.MpsOptimizer(
@@ -366,7 +366,7 @@ def test_gate_oriented_modes_reject_control_shots(mode):
 
 @pytest.mark.parametrize(
     "mode",
-    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "su", "exact"),
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "exact"),
 )
 def test_unitary_shot_replay_has_a_valid_path_for_each_mps_mode(mode):
     simulator = pepsy.MpsOptimizer(
@@ -414,7 +414,7 @@ def test_shot_replay_reuses_a_frozen_persistent_layout():
 
 
 @pytest.mark.parametrize(
-    "mode", ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "svd", "perm", "su", "exact")
+    "mode", ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "svd", "perm", "exact")
 )
 def test_canonical_mps_modes_replay_kraus_shots(mode):
     simulator = pepsy.MpsOptimizer(

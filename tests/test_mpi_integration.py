@@ -327,7 +327,6 @@ def test_real_mpi_tree_stabilizer_run_keyword():
         "swap",
         "perm",
         "exact",
-        "su",
     ),
 )
 def test_real_mpi_mps_optimizer_modes(mode):

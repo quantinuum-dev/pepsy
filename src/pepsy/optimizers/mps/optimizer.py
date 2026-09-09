@@ -23,12 +23,6 @@ Quimb compression modes apply sub-MPO events with ``gate_with_submpo_``;
 DMRG keeps multi-site sub-MPOs as tagged lazy FIT target layers and uses the
 same SRC warm-up policy as ordinary DMRG targets.  The stream may also carry:
 
-``mode="su"`` is the simple-update backend. It keeps the MPS core and its
-bond gauges separate, initializes missing gauges with
-``p.gauge_all_simple_(gauges=..., progbar=False)``, and applies each gate with
-``pepsy.gate_simple(..., renorm=True)``. The simple-update core is not
-canonicalized.
-
 * ``("measure", pauli, where[, outcome])`` — projectively measure a Pauli
   observable, collapse the MPS onto a sampled (or forced ``outcome``)
   eigenvalue, and append ``(pauli, where, outcome, prob)`` to
@@ -95,7 +89,6 @@ from ...tensors.core import tn_fidelity
 from ...operators.gates import (
     _normalize_gate_entries,
     gate as apply_gate,
-    gate_simple as apply_gate_simple,
 )
 from ...operators import primitives as _gate_primitives
 from .layout import (
@@ -1459,11 +1452,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     The input state and gate stream are snapshotted at construction. Repeated
     ``run(shots=...)`` calls therefore restart every trajectory from the same
     initial state rather than continuing from an earlier ensemble.
-    gauges : dict | None, default=None
-        Simple-update bond gauges used only by ``mode="su"``. The dictionary
-        is mutated in place and is exposed as :attr:`gauges`. If omitted, the
-        optimizer initializes it with ``p.gauge_all_simple_(...)`` before the
-        first simple-update gate.
     to_backend : callable | None, default=None
         Optional converter for named gate entries. For example,
         ``to_backend=pepsy.backend_torch(dtype=torch.complex64)`` converts
@@ -1497,13 +1485,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         The record contains total replay time, inclusive stage totals, and,
         for mixed mode, the final ``last_mix_summary``. Use
         :meth:`get_run_timing` for a copy.
-    gauges : dict
-        Simple-update bond gauges. In ``mode="su"``, ``p`` is the gauged core
-        and the physical state is recovered with ``p.gauge_simple_insert(gauges)``.
-    p_ungauged : qtn.MatrixProductState | None
-        In ``mode="su"``, an automatically refreshed physical-state copy with
-        the current simple-update gauges inserted. ``p`` remains the core used
-        for continued simple-update evolution.
     logical_order : list[int]
         Persistent-layout mapping from physical MPS position to logical site.
         The list is identity until :meth:`apply_layout` is called.
@@ -1522,7 +1503,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "swap",
             "perm",
             "svd",
-            "su",
             "exact",
         }
         | _MPO_COMPRESSION_METHODS
@@ -1538,7 +1518,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         "swap": "#ff7f0e",
         "perm": "#8c564b",
         "svd": "#d62728",
-        "su": "#e377c2",
         "exact": "#9467bd",
     }
 
@@ -2108,7 +2087,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         ind_id="k{}",
         inplace=False,
-        gauges=None,
         _capture_initial=True,
         to_backend=None,
     ):
@@ -2169,14 +2147,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._validate_canonical_boundary(self.p, self.mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.ind_id = str(ind_id)
-        if gauges is not None and not isinstance(gauges, dict):
-            raise TypeError("gauges must be a mutable dictionary or None.")
-        self.gauges = {} if gauges is None else gauges
-        self.p_ungauged = None
-        self._su_gauges_supplied = gauges is not None
-        self._su_gauges_ready = False
-        self._su_gauges_state = None
-        self._su_force_regauge = False
 
         self.info_c = {}
         # Physical MPS position -> logical site. ``perm`` mode updates this
@@ -3047,8 +3017,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _init_canonicalization(self):
         """Initialize canonical form and orthogonality center."""
-        if self.mode in {"exact", "su"}:
-            # Exact and simple-update evolution do not use canonical metadata.
+        if self.mode == "exact":
+            # Exact evolution does not use canonical metadata.
             self.info_c = {}
             return
         self._validate_canonical_boundary(self.p, self.mode)
@@ -3065,38 +3035,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         canonical center: the omitted loop environment is not an identity.
         FIT already requires an open guess, and every optimizer mode that uses
         ``info_c`` and one-center norms must enforce the same boundary contract.
-        Exact and simple-update modes do not consume canonical metadata.
+        Exact mode does not consume canonical metadata.
         """
-        if mode not in {"exact", "su"} and bool(getattr(p, "cyclic", False)):
+        if mode != "exact" and bool(getattr(p, "cyclic", False)):
             raise ValueError(
                 "MpsOptimizer canonical modes require an open-boundary MPS; "
                 "cyclic MPS data do not have an exact one-tensor canonical norm."
             )
-
-    def _prepare_su_state(self):
-        """Prepare the MPS core and bond gauges for simple-update replay."""
-        if self._su_gauges_ready and self._su_gauges_state is self.p:
-            return
-
-        inner_inds = tuple(self.p.inner_inds())
-        missing_gauges = any(index not in self.gauges for index in inner_inds)
-        if (
-            self._su_force_regauge
-            or not self._su_gauges_supplied
-            or missing_gauges
-        ):
-            self.p.gauge_all_simple_(gauges=self.gauges, progbar=False)
-
-        self._su_gauges_ready = True
-        self._su_gauges_state = self.p
-        self._su_force_regauge = False
-
-    def _refresh_su_physical_state(self):
-        """Store a physical copy of the SU core with its gauges inserted."""
-        physical = self.p.copy()
-        physical.gauge_simple_insert(self.gauges)
-        self.p_ungauged = physical
-        return physical
 
     def _prepare_dmrg_state(self):
         """Prepare DMRG without globally padding every MPS bond.
@@ -3280,11 +3225,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._persistent_layout_plan = None
         self.layout_plan = None
         self.last_layout_plan = None
-        self._su_gauges_supplied = False
-        self._su_gauges_ready = False
-        self._su_gauges_state = None
-        self._su_force_regauge = self.mode == "su"
-        self.p_ungauged = None
         self.backend_info()
         self._init_canonicalization()
 
@@ -3315,7 +3255,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         tuple[int, int]
             The synchronized one-site canonical span.
         """
-        if self.mode in {"exact", "su"}:
+        if self.mode == "exact":
             raise ValueError(
                 "sync_canonicalization requires a canonical MPS mode; "
                 f"mode={self.mode!r} does not track info_c."
@@ -3347,8 +3287,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Parameters
         ----------
         eps : float, default=1e-15
-            Precision used by Quimb's general normalization path in exact and
-            simple-update modes. Canonical open-MPS modes use their tracked
+            Precision used by Quimb's general normalization path in exact
+            mode. Canonical open-MPS modes use their tracked
             one-site center directly.
         insert : int | None, default=None
             Optional site where the normalization factor is inserted.
@@ -3357,13 +3297,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         -------
         float | complex
             Previous raw ``self.p.H @ self.p`` value. Canonical open-MPS modes
-            derive it from the tracked center; exact and simple-update modes
+            derive it from the tracked center; exact mode
             use Quimb's general normalization implementation. The removed norm
             factor is accumulated into ``self.p.exponent`` when present, so
             ``self.p.norm()`` continues to report the represented norm while
             the raw data norm becomes one.
         """
-        track_canonical_center = self.mode not in {"exact", "su"}
+        track_canonical_center = self.mode != "exact"
         if track_canonical_center:
             previous_span = self._current_orthog(self.p)
             if insert is None:
@@ -3395,7 +3335,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._accumulate_exponent(self.p, scale)
             self._record_orthog_span(self.p, (insert_site, insert_site))
         else:
-            # Exact/SU states do not have a tracked one-site center. Preserve
+            # Exact states do not have a tracked one-site center. Preserve
             # Quimb's general and cyclic normalization implementation there.
             normalize = getattr(self.p, "normalize", None)
             if callable(normalize):
@@ -3424,7 +3364,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _copy_impl(self, *, capture_initial):
         """Copy optimizer state, optionally retaining a shot-replay template."""
         history_copy = deepcopy if capture_initial else list
-        trusted = not capture_initial and self.mode not in {"exact", "su"} and self._fit_window_copy_supported(self.p)
+        trusted = not capture_initial and self.mode != "exact" and self._fit_window_copy_supported(self.p)
         if trusted:
             # Owned arrays preserve the existing isometries; no constructor,
             # recanonicalization, or discovery scan is required for this clone.
@@ -3432,14 +3372,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             copied.__dict__ = self.__dict__.copy()
             copied.p = self._copy_fit_window_state(self.p, (0, self.p.L - 1))
             copied.info_c = deepcopy(self.info_c)
-            copied.gauges = deepcopy(self.gauges)
             copied._rng = np.random.default_rng()
             copied._timing_state = None
         else:
             copied = type(self)(
                 self.p.copy(), gates=[], chi=self.chi, mode=self.mode,
                 contraction_opt=self.contraction_opt, ind_id=self.ind_id,
-                inplace=True, gauges=deepcopy(self.gauges),
+                inplace=True,
                 _capture_initial=False, to_backend=self._symbolic_gate_to_backend,
             )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
@@ -3453,7 +3392,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # here. Overwriting it with the source cache can claim that site 0 is
         # canonical while the copied tensors are centered at site ``L // 2``;
         # a subsequent projective replay can then lose the branch norm.
-        if not trusted and copied.mode not in {"exact", "su"}:
+        if not trusted and copied.mode != "exact":
             copied.info_c["cur_orthog"] = tuple(
                 int(site) for site in copied.p.calc_current_orthog_center()
             )
@@ -3510,13 +3449,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._trajectory_diagnostics = deepcopy(
             getattr(self, "_trajectory_diagnostics", None)
         )
-        copied._su_gauges_supplied = True
-        copied._su_gauges_ready = self._su_gauges_ready
-        copied._su_gauges_state = copied.p if self._su_gauges_ready else None
-        copied._su_force_regauge = self._su_force_regauge
-        copied.p_ungauged = (
-            self.p_ungauged.copy() if self.p_ungauged is not None else None
-        )
         copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         if not capture_initial:
             # Internal replay only appends committed records. Isolate their
@@ -3567,14 +3499,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         self._validate_canonical_boundary(self.p, new_mode)
         self._invalidate_replay_metadata()
-        if old_mode == "su" and new_mode != "su":
-            if self._su_gauges_ready:
-                self.p.gauge_simple_insert(self.gauges)
-                self.p_ungauged = self.p.copy()
-            self._su_gauges_supplied = False
-            self._su_gauges_ready = False
-            self._su_gauges_state = None
-            self._su_force_regauge = True
         if old_mode == "perm" and new_mode != "perm":
             # Other modes interpret integer ``where`` values as physical MPS
             # positions, so restore the logical ordering before switching.
@@ -3603,15 +3527,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
             self._dmrg1_one_site_locked = False
-        if self.mode == "su":
-            self.info_c = {}
-            self.p_ungauged = None
-            if old_mode != "su":
-                self._su_gauges_ready = False
-                self._su_gauges_state = None
-                self._su_force_regauge = True
-        elif old_mode == "su":
-            self._init_canonicalization()
         if old_mode == "exact" and self.mode != "exact":
             # Exact mode stores a fully contracted TensorNetwork, so rebuild an
             # MPS before recreating canonical metadata for an MPS mode.
@@ -3908,7 +3823,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         def make_optimizer():
             options = dict(constructor)
-            options["gauges"] = deepcopy(self.gauges)
             options["inplace"] = True
             options["_capture_initial"] = False
             optimizer = type(self)(template.copy(), [], **options)
@@ -4010,11 +3924,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self.mode == "mix" and (controls or has_leakage):
             raise ValueError(
                 "mode='mix' is unitary-only and cannot replay controls or leakage."
-            )
-        if self.mode == "su" and (controls or has_leakage):
-            raise ValueError(
-                "mode='su' supports gate-only shot replay; controls and leakage "
-                "require a canonical MPS mode."
             )
         if error_model is not None and _has_unforced_branching_control(entries):
             raise ValueError(
@@ -4942,7 +4851,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             orthogonality center to one site and normalizes it after every
             replay step. In DMRG, a step containing a multi-gate batch is
             normalized once after that batch. The removed scale is accumulated
-            in ``p.exponent``.
+            in ``p.exponent``. Exact replay preserves the physical operator
+            scale directly and does not require this flag; it accepts the flag
+            for trajectory compatibility but does not apply MPS scale control.
         normalize_every : int | bool | None, default=False
             Enable one-site normalization after every replay step for a
             non-unitary stream. Use ``True`` (or any positive integer); use
@@ -5140,8 +5051,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             mixed/MPO/swap/permutation/SVD compression so norm loss remains
             observable. Set this to ``True`` to restore the working norm for
             numerical scale control; the discarded scale is not stored in
-            ``p.exponent``. Pass ``non_unitary=True`` for norm-changing
-            streams.
+            ``p.exponent``. This option cannot be combined with
+            ``non_unitary=True``.
         fit_stabilize_unitary : optional
             Deprecated compatibility alias for ``stabilize_unitary``.
         finite_check : bool, default=False
@@ -5334,9 +5245,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._mix_dmrg_failed_sweep = None
         if not G_seq:
             def run_empty():
-                if self.mode == "su":
-                    self._prepare_su_state()
-                    self._refresh_su_physical_state()
                 return self.p
 
             return self._run_with_fit_copy_policy(
@@ -5351,21 +5259,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         has_control = any(
             event_type in _CONTROL_EVENT_NAMES for event_type in event_seq
         )
-        if self.mode == "su" and has_control:
-            raise ValueError(
-                "mode='su' supports gate-only streams; control events require "
-                "a canonical MPS mode."
-            )
         has_cap = any(event_type == "cap" for event_type in event_seq)
         layout_request = self._coalesce_layout_request(use_layout_finder, layout)
         persistent_layout_active = self._persistent_layout_plan is not None
-        if self.mode == "su" and (
-            persistent_layout_active or self._layout_request_enabled(layout_request)
-        ):
-            raise ValueError(
-                "mode='su' does not support layout replay because its gauges "
-                "belong to the current MPS site order."
-            )
         if self.mode == "perm" and (
             persistent_layout_active or self._layout_request_enabled(layout_request)
         ):
@@ -5470,6 +5366,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             legacy_value=fit_stabilize_unitary,
         )
         fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        if stabilize_unitary and non_unitary:
+            raise ValueError(
+                "stabilize_unitary=True cannot be combined with "
+                "non_unitary=True; unitary norm restoration is not valid for "
+                "a norm-changing stream."
+            )
         if stabilize_unitary and not non_unitary:
             # Each stabilized unitary stream needs a fresh raw-norm reference.
             # Mixed mode then carries this working value across its trials.
@@ -5590,14 +5492,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 or int(fit_patience) < 1
             ):
                 raise ValueError("fit_patience must be a positive integer.")
-            if self.mode == "dmrg" and non_unitary and fit_rtol == "auto":
-                # Preserve the historical fixed-sweep behavior for
-                # non-unitary DMRG unless the caller supplies an explicit
-                # tolerance. Mixed mode is unitary-only and keeps adaptive
-                # stopping by default.
-                fit_rtol = None
-            else:
-                fit_rtol = self._resolve_fit_rtol(fit_rtol)
+            # The FIT convergence test is relative to the current target and
+            # remains meaningful when that target has a non-unit norm. Do not
+            # disable adaptive stopping merely because the physical stream
+            # changes norm.
+            fit_rtol = self._resolve_fit_rtol(fit_rtol)
             current_max_bond = self.p.max_bond() if self.mode == "mix" else None
             if (
                 self.mode == "mix"
@@ -5608,7 +5507,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "mode='mix' requires the initial MPS max bond to be <= chi; "
                     "compress the state first or increase chi."
                 )
-        if normalize_every is not None and self.mode == "exact":
+        if self.mode == "exact" and (
+            normalize_every is not None or normalize_final
+        ):
             raise ValueError(
                 "automatic normalization uses MPS canonicalization and is not "
                 "available in exact mode."
@@ -6158,19 +6059,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
                 stabilize_unitary=stabilize_unitary,
-            )
-            return self.p
-
-        if self.mode == "su":
-            self._timed_call(
-                "su.replay",
-                self._run_su,
-                G_seq,
-                where_seq,
-                event_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
             )
             return self.p
 
@@ -6939,7 +6827,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _control_state_norm(self, *, include_exponent=True):
         """Read the represented control-state norm from its tracked center."""
-        if self.mode in {"exact", "su"}:
+        if self.mode == "exact":
             raw_state = self.p.copy()
             raw_state.exponent = 0.0
             norm = self._real_float(ar.do("abs", raw_state.norm()))
@@ -11103,80 +10991,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             last_normalized_step = idx
 
         self.p = self._install_represented_norm(p)
-
-    def _run_su(
-        self,
-        G_seq,
-        where_seq,
-        event_seq,
-        *,
-        progbar=False,
-        cutoff=1e-12,
-        cutoff_mode="rsum2",
-    ):
-        """Apply a gate stream with simple-update bond gauges.
-
-        ``self.p`` remains the simple-update core and ``self.gauges`` stores
-        the external bond factors. This path intentionally does not
-        canonicalize the MPS.
-        """
-        self._prepare_su_state()
-        p = self.p
-
-        pbar = None
-        if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
-            pbar = tqdm(
-                total=len(G_seq),
-                desc="su",
-                leave=True,
-                position=0,
-                ascii=True,
-                colour=self._PROGBAR_COLORS["su"],
-            )
-
-        try:
-            for step, (gate, where, event_type) in enumerate(
-                zip(G_seq, where_seq, event_seq),
-                start=1,
-            ):
-                if event_type != "gate":
-                    raise ValueError(
-                        "mode='su' supports gate-only streams; subMPO events "
-                        "are not supported."
-                    )
-                if len(where) not in {1, 2}:
-                    raise ValueError(
-                        "Each simple-update gate location must have one or two sites."
-                    )
-
-                p = apply_gate_simple(
-                    p,
-                    gate,
-                    where,
-                    gauges=self.gauges,
-                    ind_id=self.ind_id,
-                    renorm=True,
-                    max_bond=self.chi,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    inplace=True,
-                )
-                if pbar is not None:
-                    pbar.set_postfix(
-                        {"bnd": p.max_bond(), "gauges": len(self.gauges)}
-                    )
-                    pbar.update(1)
-        finally:
-            if pbar is not None:
-                pbar.close()
-
-        self.p = p
-        self.info_c = {}
-        self._su_gauges_ready = True
-        self._su_gauges_state = self.p
-        self._refresh_su_physical_state()
 
     def _run_mpo(  # pylint: disable=too-many-locals
         self,

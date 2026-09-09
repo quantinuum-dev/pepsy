@@ -179,45 +179,8 @@ def test_mps_optimizer_accepts_svd_mode():
     assert opt.mode == "svd"
 
 
-def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
-    """SU routed SWAPs should stay on the live Torch Symmray backend."""
-    torch = pytest.importorskip("torch")
-
-    backend = py.backend_torch(dtype=torch.float64, device="cpu")
-    fermion = py.Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        dtype="float64",
-    )
-    state = py.hrs_to_mps(
-        4,
-        fermion=fermion,
-        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
-        chi=4,
-        seed=1,
-        dtype="float64",
-        cyclic=False,
-    )
-    state.apply_to_arrays(backend)
-    fermion.to_backend = backend
-    hopping = fermion.hopping_gate(0.001, t=1.0, imaginary=True)
-
-    optimizer = py.MpsOptimizer(
-        state,
-        gates=[(hopping, (0, 3))],
-        chi=4,
-        mode="su",
-        inplace=True,
-    )
-    out = optimizer.run(progbar=False, cutoff=1.0e-10, non_unitary=True)
-
-    assert type(out[0].data).__name__ == "U1U1FermionicArray"
-    assert out.max_bond() <= 4
-    assert len(optimizer.gauges) == out.L - 1
-
-
 @pytest.mark.parametrize(
-    "mode", ["dmrg", "mpo", "svd", "swap", "perm", "mix", "su", "exact"]
+    "mode", ["dmrg", "mpo", "svd", "swap", "perm", "mix", "exact"]
 )
 def test_mps_optimizer_rejects_mismatched_gate_stream_backend(mode):
     """Mismatched user gates must be prepared before optimizer construction."""
@@ -379,62 +342,16 @@ def test_mps_optimizer_accepts_perm_mode():
     assert opt.qubits == [0, 1, 2, 3]
 
 
-def test_mps_optimizer_simple_update_initializes_and_keeps_gauges_separate():
-    """Simple-update mode keeps its core and external bond gauges separate."""
+def test_mps_optimizer_rejects_removed_simple_update_mode():
+    """Simple-update mode is no longer part of MpsOptimizer."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
-    gauges = {}
-    opt = py.MpsOptimizer(
-        p0.copy(),
-        gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))],
-        chi=2,
-        mode="su",
-        gauges=gauges,
-    )
 
-    out = opt.run(progbar=False, cutoff=1e-12)
+    with pytest.raises(ValueError, match="Unknown mode: su"):
+        py.MpsOptimizer(p0, gates=[], chi=2, mode="su")
 
-    assert out is opt.p
-    assert opt.gauges is gauges
-    assert len(gauges) == out.L - 1
-    assert opt.info_c == {}
-    assert opt.p_ungauged is not None
-
-    physical = out.copy()
-    physical.gauge_simple_insert(gauges)
-    assert physical.norm() == pytest.approx(1.0, rel=1e-10, abs=1e-10)
-    assert opt.p_ungauged.norm() == pytest.approx(physical.norm())
-    assert np.allclose(opt.p_ungauged.to_dense(), physical.to_dense())
-
-
-def test_mps_optimizer_simple_update_forwards_gate_simple_options(monkeypatch):
-    """SU mode should use ``gate_simple`` with fixed renormalization."""
-    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
-    gauges = {}
-    p0.gauge_all_simple_(gauges=gauges, progbar=False)
-    calls = []
-
-    def fake_gate_simple(tn, gate, where, **kwargs):
-        calls.append((tn, gate, where, kwargs))
-        return tn
-
-    monkeypatch.setattr(mps_optimizer_module, "apply_gate_simple", fake_gate_simple)
-    opt = py.MpsOptimizer(
-        p0,
-        gates=[(qu.CNOT(), (0, 3))],
-        chi=3,
-        mode="su",
-        gauges=gauges,
-    )
-    opt.run(progbar=False, cutoff=1e-9, cutoff_mode="rel")
-
-    assert len(calls) == 1
-    _, _, where, kwargs = calls[0]
-    assert where == (0, 3)
-    assert kwargs["gauges"] is gauges
-    assert kwargs["renorm"] is True
-    assert kwargs["max_bond"] == 3
-    assert kwargs["cutoff"] == pytest.approx(1e-9)
-    assert kwargs["cutoff_mode"] == "rel"
+    optimizer = py.MpsOptimizer(p0, gates=[], chi=2, mode="direct")
+    with pytest.raises(ValueError, match="Unknown mode: su"):
+        optimizer.set_mode("su")
 
 
 def test_mps_optimizer_perm_tracks_lazy_order_and_logical_state():
@@ -554,6 +471,46 @@ def test_mps_optimizer_diagnostic_accessors_are_copy_safe():
     assert opt.quality_checks[0]["step"] != -1
     assert opt.normalizations[0]["step"] != -1
     assert opt._last_dmrg_fit_diagnostics["iterations"] != -1
+
+
+def test_mps_optimizer_non_unitary_rejects_unitary_stabilization():
+    """Unitary working-norm restoration is invalid for non-unitary replay."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="direct",
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        opt.run(
+            progbar=False,
+            non_unitary=True,
+            stabilize_unitary=True,
+        )
+
+
+def test_mps_optimizer_non_unitary_dmrg_keeps_adaptive_fit_default():
+    """Non-unitary target scale should not disable adaptive DMRG stopping."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(_non_unitary_entangling_gate(), (0, 1))],
+        chi=2,
+        mode="dmrg",
+    )
+    captured = {}
+
+    def capture_execute(*args, **kwargs):
+        captured.update(kwargs)
+        return opt.p
+
+    opt._execute_mode = capture_execute
+    opt.run(progbar=False, non_unitary=True, n_iter=2)
+
+    assert captured["fit_rtol"] == pytest.approx(
+        opt._resolve_fit_rtol("auto")
+    )
+    assert captured["fit_rtol"] is not None
 
 
 def test_mps_optimizer_fit_diagnostics_is_none_before_fit():
@@ -4939,7 +4896,6 @@ def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
         "swap",
         "perm",
         "mix",
-        "su",
         "exact",
     ],
 )
@@ -4994,11 +4950,6 @@ def test_mps_optimizer_spinful_fermion_symmetry_mode_matrix_matches_mpo(
     if mode == "perm":
         optimizer.restore_qubit_order()
         compared = optimizer.p
-    elif mode == "su":
-        # SU evolves an ungauged core and exposes the physical state through
-        # the separately stored bond gauges.
-        compared = optimizer.p_ungauged
-        assert compared is not None
     else:
         compared = out
 
@@ -5035,7 +4986,6 @@ def test_mps_optimizer_spinful_fermion_symmetry_mode_matrix_matches_mpo(
         "swap",
         "perm",
         "mix",
-        "su",
         "exact",
     ],
 )
@@ -5113,9 +5063,6 @@ def test_mps_optimizer_fermion_gate_stream_ps_to_mps_all_modes_native(
     if mode == "perm":
         optimizer.restore_qubit_order()
         compared = optimizer.p
-    elif mode == "su":
-        compared = optimizer.p_ungauged
-        assert compared is not None
     else:
         compared = out
 
@@ -5227,7 +5174,6 @@ def test_mps_optimizer_complex64_native_fit_short_sector_edges(
         "swap",
         "perm",
         "mix",
-        "su",
         "exact",
     ],
 )
@@ -5310,9 +5256,6 @@ def test_mps_optimizer_3x4_pbc_hubbard_long_range_modes_native(
     if mode == "perm":
         optimizer.restore_qubit_order()
         compared = optimizer.p
-    elif mode == "su":
-        compared = optimizer.p_ungauged
-        assert compared is not None
 
     assert all(
         type(tensor.data).__module__.split(".", 1)[0] == "symmray"
@@ -7599,6 +7542,8 @@ def test_mps_optimizer_automatic_normalization_rejects_exact_mode():
 
     with pytest.raises(ValueError, match="not available in exact mode"):
         opt.run(progbar=False, non_unitary=True, normalize_every=True)
+    with pytest.raises(ValueError, match="not available in exact mode"):
+        opt.run(progbar=False, non_unitary=True, normalize_final=True)
 
 
 def test_mps_optimizer_exact_mode_keeps_canonical_metadata_separate():
