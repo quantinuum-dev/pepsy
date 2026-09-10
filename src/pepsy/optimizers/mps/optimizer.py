@@ -831,6 +831,19 @@ def _is_control_event(entry):
     return _control_event_parts(entry) is not None
 
 
+def _control_event_contains_cap(name, payload):
+    """Return whether a control event contains a selected nested cap action."""
+    if name == "cap":
+        return True
+    if name != "conditional":
+        return False
+    nested = _control_event_parts(payload["action"])
+    if nested is None:
+        return False
+    nested_name, nested_payload, _ = nested
+    return _control_event_contains_cap(nested_name, nested_payload)
+
+
 def _normalize_gate_where(where):
     """Return canonical one-/two-site gate locations for MPS replay."""
     if isinstance(where, Integral):
@@ -4433,7 +4446,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "persistent layouts cannot be combined with mode='perm'; choose one."
             )
-        if any(event_type == "cap" for event_type in self.event_types):
+        if any(
+            _control_event_contains_cap(event_type, payload)
+            for payload, event_type in zip(self.G, self.event_types)
+        ):
             raise ValueError(
                 "persistent layouts are not supported with cap control events "
                 "because cap changes the MPS length."
@@ -5259,7 +5275,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         has_control = any(
             event_type in _CONTROL_EVENT_NAMES for event_type in event_seq
         )
-        has_cap = any(event_type == "cap" for event_type in event_seq)
+        has_cap = any(
+            _control_event_contains_cap(event_type, payload)
+            for payload, event_type in zip(G_seq, event_seq)
+        )
         layout_request = self._coalesce_layout_request(use_layout_finder, layout)
         persistent_layout_active = self._persistent_layout_plan is not None
         if self.mode == "perm" and (
@@ -6210,27 +6229,40 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             action_where = action_wheres[0]
             action_type = action_types[0]
+            # The parent conditional's ``where`` is the same logical support
+            # as ``action_where``, but has already passed through any transient
+            # or persistent layout mapping. Resolve it only after a true
+            # predicate so removed sites on false branches remain harmless.
+            action_execution_where = (
+                tuple(int(site) for site in where)
+                if where_is_physical
+                else self._logical_to_physical_where(where)
+            )
             if action_type in _CONTROL_EVENT_NAMES:
                 self._apply_control_event(
                     action_type,
                     action_payloads[0],
-                    action_where,
+                    action_execution_where,
                     record_where=action_where,
-                    where_is_physical=where_is_physical,
+                    where_is_physical=True,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     measure_renormalize=measure_renormalize,
                     mode_kwargs=mode_kwargs,
                 )
             else:
-                physical_where = (
-                    tuple(int(site) for site in action_where)
-                    if where_is_physical
-                    else self._logical_to_physical_where(action_where)
-                )
+                action_payload = action_payloads[0]
+                if action_type == "submpo" and tuple(
+                    map(int, action_where)
+                ) != action_execution_where:
+                    action_payload = self._copy_submpo_for_layout(
+                        action_payload,
+                        dict(zip(action_where, action_execution_where)),
+                        action_where,
+                    )
                 self._execute_mode(
-                    [action_payloads[0]],
-                    [physical_where],
+                    [action_payload],
+                    [action_execution_where],
                     [action_type],
                     logical_where_seq=[action_where],
                     progbar=False,
@@ -6259,7 +6291,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 mode_kwargs=mode_kwargs,
             )
         elif name == "cap":
-            logical_site = int(where[0])
+            logical_site = int(record_where[0])
             physical_site = int(execution_where[0])
             self._apply_cap_event(
                 execution_where,
@@ -7236,7 +7268,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "subMPO stream events require an MPO or DMRG mode."
             )
 
-        has_cap = any(event_type == "cap" for event_type in event_seq)
+        has_cap = any(
+            _control_event_contains_cap(event_type, payload)
+            for payload, event_type in zip(G_seq, event_seq)
+        )
         if not has_submpo:
             return
 

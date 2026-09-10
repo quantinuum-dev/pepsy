@@ -6640,6 +6640,29 @@ def test_mps_optimizer_current_gate_stream_layout_uses_state_length():
     assert plan["mapped_where"] == ((0, 2),)
 
 
+def test_mps_optimizer_layout_finder_includes_conditional_action_support():
+    """A possible conditional gate contributes its operator and support."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[
+            ("measure", "Z", 0, +1),
+            ("if", -1, 0, (qu.CNOT(), (0, 3))),
+        ],
+        chi=8,
+        mode="svd",
+    )
+
+    plan = opt.current_gate_stream_layout(
+        objective="compression",
+        nevergrad_budget=0,
+    )
+
+    assert plan["event_types"] == ("conditional",)
+    assert plan["where"] == ((0, 3),)
+    assert plan["stats"]["max_span"] == 1
+    assert plan["rank_exact_events"] == 1
+
+
 def test_mps_optimizer_gate_stream_layout_preserves_submpo_events():
     """Layout planning should not rewrite explicit sub-MPO stream events."""
     mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
@@ -6688,6 +6711,92 @@ def test_mps_optimizer_layout_run_restores_original_mps_order_and_stream():
         for actual, (expected, _where) in zip(opt.G, gates)
     )
     assert opt.last_layout_plan is not None
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_mps_optimizer_layout_remaps_conditional_gate_action(persistent):
+    """Conditional actions execute on their mapped physical layout sites."""
+    stream = [
+        ("measure", "Z", 0, +1),
+        ("if", -1, 0, (qu.pauli("X"), 3)),
+        (qu.CNOT(), (0, 3)),
+    ]
+    initial = qtn.MPS_computational_state("0000", dtype="complex128")
+    reference = py.MpsOptimizer(
+        initial.copy(),
+        gates=stream,
+        chi=8,
+        mode="svd",
+    )
+    reference.run(progbar=False, cutoff=0.0)
+
+    opt = py.MpsOptimizer(
+        initial.copy(),
+        gates=stream,
+        chi=8,
+        mode="svd",
+    )
+    order = (0, 3, 1, 2)
+    if persistent:
+        opt.apply_layout(order, layout_report=False)
+        opt.run(progbar=False, cutoff=0.0)
+        assert opt.logical_order == list(order)
+    else:
+        with pytest.warns(DeprecationWarning, match="temporary reorder"):
+            opt.run(
+                progbar=False,
+                cutoff=0.0,
+                use_layout_finder=opt._explicit_layout_plan(order),
+                layout_report=False,
+            )
+        assert opt.logical_order == list(range(4))
+
+    actual = np.asarray(opt.to_dense()).reshape(-1)
+    expected = np.asarray(reference.to_dense()).reshape(-1)
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+    assert np.flatnonzero(np.abs(actual) > 1e-12).tolist() == [1]
+    assert opt.measurements == [("Z", (0,), 1, 1.0)]
+
+
+def test_mps_optimizer_layout_remaps_conditional_submpo_action():
+    """Nested sub-MPO labels follow the conditional's mapped support."""
+    mpo = _two_branch_flip_submpo(
+        L=4,
+        sites=(0, 3),
+        targets=(0, 3),
+        w0=0.0,
+        w1=1.0,
+    )
+    stream = [
+        ("measure", "Z", 1, +1),
+        ("if", -1, 0, py.MpsOptimizer.submpo_event(mpo, (0, 3))),
+    ]
+    initial = qtn.MPS_computational_state("0000", dtype="complex128")
+    reference = py.MpsOptimizer(
+        initial.copy(),
+        gates=stream,
+        chi=8,
+        mode="direct",
+    )
+    reference.run(progbar=False, cutoff=0.0)
+
+    opt = py.MpsOptimizer(
+        initial.copy(),
+        gates=stream,
+        chi=8,
+        mode="direct",
+    )
+    plan = opt._explicit_layout_plan((0, 3, 1, 2))
+    with pytest.warns(DeprecationWarning, match="temporary reorder"):
+        opt.run(
+            progbar=False,
+            cutoff=0.0,
+            use_layout_finder=plan,
+            layout_report=False,
+        )
+
+    np.testing.assert_allclose(opt.to_dense(), reference.to_dense(), atol=1e-12)
+    assert stream[1][3][1] is mpo
 
 
 def test_mps_optimizer_apply_layout_relabels_product_state_without_swaps(monkeypatch):
@@ -8486,6 +8595,27 @@ def test_mps_optimizer_cap_events_reject_layout_finder():
     )
     with pytest.raises(ValueError, match="cap control"):
         opt.run(progbar=False, use_layout_finder=True)
+
+
+def test_mps_optimizer_conditional_cap_rejects_layouts():
+    """A nested cap is still incompatible with a fixed-length layout."""
+    stream = [
+        ("measure", "Z", 0, +1),
+        ("if", -1, 0, ("cap", 1, [1.0, 1.0])),
+    ]
+    initial = qtn.MPS_computational_state("0000", dtype="complex128")
+
+    persistent = py.MpsOptimizer(initial.copy(), stream, chi=8, mode="direct")
+    with pytest.raises(ValueError, match="cap control events"):
+        persistent.apply_layout((0, 2, 3, 1), layout_report=False)
+
+    transient = py.MpsOptimizer(initial.copy(), stream, chi=8, mode="direct")
+    with pytest.raises(ValueError, match="cap control events"):
+        transient.run(
+            progbar=False,
+            use_layout_finder=True,
+            layout_report=False,
+        )
 
 
 def test_mps_optimizer_control_events_track_canonical_center(monkeypatch):

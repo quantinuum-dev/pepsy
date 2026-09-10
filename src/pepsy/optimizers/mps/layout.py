@@ -136,6 +136,29 @@ def _normalize_layout_gate_queue(gates):
     )
 
 
+def _conditional_layout_payload(action):
+    """Extract an operator payload from one normalized conditional action.
+
+    ``MpsOptimizer`` has already resolved symbolic gates before constructing a
+    finder. Keep control actions opaque, but expose ordinary gate and sub-MPO
+    payloads so their normal weight/rank probes remain available.
+    """
+    submpo_parts = _submpo_event_parts(action)
+    if submpo_parts is not None:
+        return submpo_parts[0]
+    try:
+        entries = _normalize_gate_entries(
+            (action,),
+            where=None,
+            allow_empty=False,
+        )
+    except (TypeError, ValueError):
+        return action
+    if len(entries) != 1:  # pragma: no cover - guarded by optimizer parsing
+        return action
+    return entries[0][0]
+
+
 def _freeze_site_label(site):
     """Return a hashable, stable representation of a site label."""
     if isinstance(site, Integral):
@@ -1734,13 +1757,17 @@ class MpsGateStreamLayoutFinder:
     ):
         """Construct from an optimizer's queued stream without mutating it.
 
-        Control events (measure/cap/reset) do not constrain gate locality, so
-        they are omitted from the layout search; every site is still covered
-        through ``L``/``sites`` so the resulting plan is a full permutation.
+        Pure state-control events (measure/cap/reset) do not constrain gate
+        locality, so they are omitted from the layout search. Conditional
+        actions are retained because an executed gate or sub-MPO still creates
+        the same routing/compression pressure as an unconditional action. Every
+        site is covered through ``L``/``sites`` so the plan is a full
+        permutation.
         """
         if sites is None and L is None:
             L = getattr(optimizer.p, "L", None)
         stream = []
+        layout_event_types = []
         for payload, where, event_type in zip(
             optimizer.G,
             optimizer.where,
@@ -1748,17 +1775,29 @@ class MpsGateStreamLayoutFinder:
         ):
             if event_type == "submpo":
                 stream.append(("submpo", payload, where))
+                layout_event_types.append("submpo")
             elif event_type == "gate":
                 stream.append((payload, where))
-            # measure/cap/reset control events are skipped: they do not change
-            # the optimal gate layout.
-        return cls(
+                layout_event_types.append("gate")
+            elif event_type == "conditional":
+                stream.append(
+                    (_conditional_layout_payload(payload["action"]), where)
+                )
+                layout_event_types.append("conditional")
+            # Pure measure/cap/reset controls are skipped: they do not add an
+            # operator-routing edge to the layout objective.
+        finder = cls(
             stream,
             sites=sites,
             L=L,
             lattice_shape=lattice_shape,
             lattice_site=lattice_site,
         )
+        # The generic bundled-stream parser labels the synthetic conditional
+        # entry as a gate. Restore its semantic type for diagnostics and custom
+        # weight functions; supports and payloads are already canonical.
+        finder.event_types = tuple(layout_event_types)
+        return finder
 
     @classmethod
     def lattice_order(cls, Lx, Ly, mode="row-major", *, site=None):
