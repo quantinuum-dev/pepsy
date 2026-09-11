@@ -170,17 +170,37 @@ def _freeze_site_label(site):
     return site
 
 
+def _normalize_layout_length(L):
+    """Validate and normalize a layout register length."""
+    if L is None:
+        return None
+    if isinstance(L, (bool, np.bool_)) or not isinstance(L, Integral):
+        raise TypeError("L must be a non-negative integer or None.")
+    L = int(L)
+    if L < 0:
+        raise ValueError("L must be a non-negative integer or None.")
+    return L
+
+
 def _normalize_layout_support(where):
     """Return canonical support labels for layout-only gate-stream analysis."""
     if isinstance(where, Integral):
-        return (int(where),)
-    if isinstance(where, list):
+        support = (int(where),)
+    elif isinstance(where, list):
         where = tuple(where)
     if not isinstance(where, tuple):
-        return (_freeze_site_label(where),)
-    if len(where) == 0:
-        raise ValueError("gate-stream layout entries must touch at least one site.")
-    return tuple(_freeze_site_label(site) for site in where)
+        support = (_freeze_site_label(where),)
+    else:
+        if len(where) == 0:
+            raise ValueError(
+                "gate-stream layout entries must touch at least one site."
+            )
+        support = tuple(_freeze_site_label(site) for site in where)
+    if len(set(support)) != len(support):
+        raise ValueError(
+            "gate-stream layout entries must reference each site at most once."
+        )
+    return support
 
 
 def _unique_ordered(items):
@@ -204,10 +224,11 @@ def _normalize_layout_sites(supports, *, sites=None, L=None):
     if sites is not None and L is not None:
         raise ValueError("Specify at most one of sites=... or L=....")
 
+    L = _normalize_layout_length(L)
     if sites is None:
         if L is None:
             return list(_unique_ordered(touched))
-        site_list = list(range(int(L)))
+        site_list = list(range(L))
     else:
         site_list = [_freeze_site_label(site) for site in sites]
 
@@ -1710,11 +1731,12 @@ class MpsGateStreamLayoutFinder:
         lattice_site=None,
     ):
         self.lattice_shape = _normalize_lattice_shape(lattice_shape)
+        L = _normalize_layout_length(L)
         if self.lattice_shape is not None:
             lattice_size = self.lattice_shape[0] * self.lattice_shape[1]
             if sites is None and L is None:
                 L = lattice_size
-            elif L is not None and int(L) != lattice_size:
+            elif L is not None and L != lattice_size:
                 raise ValueError(
                     "lattice_shape product must equal L; got "
                     f"{lattice_size} != {L}."

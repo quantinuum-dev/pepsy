@@ -100,7 +100,8 @@ compatibility alias for `direct`. For repeated evolution on a graph
 with a useful one-dimensional layout, call `opt.apply_layout("quality")` once.
 The MPS then stays in the selected physical order across `run()` calls and
 logical readout goes through `opt.logical_order`, `opt.remap_sample(...)`, or
-`opt.to_dense()`.
+`opt.to_dense()`. During `mode="perm"`, `opt.qubits` is the synchronized
+Quimb-compatible view of that same physical-position mapping.
 
 The persistent reorder is free only for a product MPS (`p.max_bond() == 1`).
 For an entangled initial state, the default is to raise; an explicit

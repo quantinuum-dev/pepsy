@@ -145,8 +145,8 @@ The deeper review reproduced and corrected these additional cases:
 
 Canonical MPS control norms now reuse the tracked center and represented
 exponent. Kraus Gram expectations pass the live `info_c` through Quimb's
-canonical local expectation API. Exact/SU modes retain their general norm
-paths; noncanonical/custom probability evaluation retains the prior fallback.
+canonical local expectation API. Exact replay retains its general norm path;
+noncanonical/custom probability evaluation retains the prior fallback.
 No finite-check defaults, FIT schedules, or truncation settings changed.
 
 ### Compatibility audit

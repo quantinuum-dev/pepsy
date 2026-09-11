@@ -589,7 +589,7 @@ class GibbsMps:
         if mode is None:
             mode = "direct"
         mode_name = str(mode).strip().lower().replace("_", "-")
-        if mode_name in {"exact", "perm", "su", "mix"}:
+        if mode_name in {"exact", "perm", "mix"}:
             raise ValueError(
                 "GibbsMps requires an ordinary open MPS replay mode; "
                 f"mode={mode!r} cannot preserve the physical/ancilla layout."

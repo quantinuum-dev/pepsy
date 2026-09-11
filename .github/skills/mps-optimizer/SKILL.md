@@ -78,7 +78,11 @@ than hiding policy in a mode-specific helper.
   oversampling variants, `fit`, `fit-zipup`, `fit-projector`, and
   `fit-oversample`.
 - `svd`: local SVD compression; `swap`: swap-and-split with swap-back.
-- `perm`: swap-and-split with lazy logical-to-physical tracking.
+- `perm`: one Quimb-style swap-and-split path with lazy logical-to-physical
+  tracking. It calls the in-place `gate_with_auto_swap_(..., swap_back=False)`
+  surface (or the native Symmray equivalent), so routing and the final local
+  SVD are one compressed update. It is not a routing modifier: do not add a
+  `routing=` keyword or revive `perm-*` / `*-perm` compositions.
 - `mix`: transactional direct/MPO warm-up followed by one-site FIT by default,
   with per-step MPO fallback. Explicit `fit_block_size=2` or `3` opts into
   mixed block-FIT transactions.
@@ -108,8 +112,27 @@ opt.run()  # reuses the same physical order
 ```
 
 `logical_order[position]` is the logical site stored at a physical MPS
-position. Use `logical_site(position)`, `position(site)`, `remap_sample`, and
-`to_dense()` for readout. A persistent layout never swaps the MPS back.
+position. In `mode="perm"`, `qubits[position]` exposes the same live mapping
+using Quimb's permutation-MPS name; both views must remain synchronized after
+every successful gate and control-length change. Outside `perm`, `qubits` is
+the identity or the same fixed mapping installed by `apply_layout`. Use
+`logical_site(position)`, `position(site)`, `remap_sample`, and `to_dense()`
+for readout. A persistent layout never swaps the MPS back.
+
+### Permutation API contract
+
+The permutation update has three coupled steps: map logical gate sites to the
+current physical positions, let Quimb route and compress with
+`swap_back=False`, then publish the new position-to-logical mapping. Publish
+the mapping only after the gate succeeds. The right routed endpoint is left
+immediately to the right of the left endpoint, matching Quimb's
+`CircuitPermMPS` convention. `restore_qubit_order()` may then perform one
+explicit reorder and reset both mapping views to identity.
+
+`mode="swap"` uses the same routing/compression kernel with
+`swap_back=True`; it does not update a persistent logical layout. Sub-MPO
+events remain unsupported in `perm`, because that mode is deliberately the
+single gate-with-swap-and-split API rather than a general MPO compressor.
 
 The reorder is free exactly when `p.max_bond() == 1`: rebuild the product MPS
 with tensors in the new order and do not call an SVD swap. If the initial MPS

@@ -369,10 +369,12 @@ def test_mps_optimizer_perm_tracks_lazy_order_and_logical_state():
     reference.run(progbar=False, cutoff=1e-12)
 
     assert perm.qubits == [0, 2, 3, 1]
+    assert perm.logical_order == perm.qubits
     assert np.allclose(_perm_mps_to_logical_dense(perm), reference.p.to_dense().reshape(-1))
 
     perm.restore_qubit_order()
     assert perm.qubits == [0, 1, 2, 3]
+    assert perm.logical_order == perm.qubits
     assert np.allclose(perm.p.to_dense().reshape(-1), reference.p.to_dense().reshape(-1))
 
 
@@ -418,17 +420,8 @@ def test_mps_optimizer_perm_conditional_gate_maps_logical_site_once():
     np.testing.assert_allclose(opt.to_dense().reshape(-1), expected, atol=1e-12)
 
 
-@pytest.mark.parametrize(
-    ("mode", "routing"),
-    [
-        ("perm-direct", None),
-        ("perm-src", None),
-        ("perm-dmrg2", None),
-        ("dmrg2", "perm"),
-    ],
-)
-def test_mps_optimizer_perm_composes_routing_and_compression(mode, routing):
-    """Lazy permutation routing should compose with the selected compressor."""
+def test_mps_optimizer_perm_is_single_svd_swap_path():
+    """Perm mode should retain Quimb's no-swap-back local SVD semantics."""
     p0 = qtn.MPS_computational_state("00000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -443,42 +436,47 @@ def test_mps_optimizer_perm_composes_routing_and_compression(mode, routing):
         p0,
         gates=gates,
         chi=32,
-        mode=mode,
-        **({} if routing is None else {"routing": routing}),
+        mode="perm",
     )
-    opt.run(progbar=False, cutoff=0.0, n_iter=4)
+    opt.run(progbar=False, cutoff=0.0)
 
     np.testing.assert_allclose(
         np.asarray(opt.to_dense()).reshape(-1),
         np.asarray(reference.to_dense()).reshape(-1),
         atol=1e-10,
     )
-    assert opt.routing == "perm"
     assert opt.qubits != list(range(5))
 
 
-def test_mps_optimizer_perm_routing_rejects_layout_and_duplicate_alias_options():
-    """Routing and persistent layouts remain mutually exclusive."""
+@pytest.mark.parametrize("mode", ["perm-src", "perm-dmrg2", "dmrg2-perm"])
+def test_mps_optimizer_rejects_composed_perm_mode_aliases(mode):
+    """Permutation mode is not a routing prefix/suffix for another solver."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
-    opt = py.MpsOptimizer(p0, gates=[], chi=8, mode="dmrg2", routing="perm")
+
+    with pytest.raises(ValueError, match=f"Unknown mode: {mode}"):
+        py.MpsOptimizer(p0, gates=[], chi=8, mode=mode)
+
+
+def test_mps_optimizer_perm_rejects_routing_keyword_and_layout():
+    """Perm mode owns routing and cannot be combined with another layout."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(p0, gates=[], chi=8, mode="perm")
 
     with pytest.raises(ValueError, match="persistent layouts cannot be combined"):
         opt.apply_layout((0, 2, 3, 1), layout_report=False)
-    with pytest.raises(ValueError, match="specify either"):
-        py.MpsOptimizer(p0, gates=[], chi=8, mode="perm-dmrg2", routing="perm")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'routing'"):
+        py.MpsOptimizer(p0, gates=[], chi=8, mode="perm", routing="perm")
 
 
-@pytest.mark.parametrize("mode", ["perm-direct", "perm-src", "perm-dmrg2"])
-def test_mps_optimizer_exact_to_perm_mode_switch_rebuilds_mps(mode):
-    """Switching a contracted exact state must seed routed MPS bookkeeping."""
+def test_mps_optimizer_exact_to_perm_mode_switch_rebuilds_mps():
+    """Switching a contracted exact state must seed perm bookkeeping."""
     gates = [("h", 0), ("cnot", 0, 3), ("h", 1)]
     opt = py.MpsOptimizer(
         qtn.MPS_computational_state("0000"), gates, chi=16, mode="exact"
     )
     opt.run(progbar=False)
-    opt.set_mode(mode)
+    opt.set_mode("perm")
 
-    assert opt.routing == "perm"
     assert opt.qubits == list(range(4))
     opt.run(progbar=False, cutoff=0.0, fit_init_strategy="guess-direct")
 
@@ -493,16 +491,15 @@ def test_mps_optimizer_exact_to_perm_mode_switch_rebuilds_mps(mode):
     )
 
 
-@pytest.mark.parametrize("mode", ["perm-direct", "perm-src", "perm-dmrg2"])
-def test_mps_optimizer_perm_stabilization_includes_route_compression(mode):
-    """Routed swap truncation belongs to the selected unitary compression step."""
+def test_mps_optimizer_perm_stabilization_includes_route_compression():
+    """Perm route truncation belongs to its unitary compression step."""
     vector = np.zeros(32, dtype=complex)
     vector[0] = vector[18] = 1.0 / np.sqrt(2.0)
     opt = py.MpsOptimizer(
         qtn.MatrixProductState.from_dense(vector, [2] * 5),
         gates=[("cnot", 0, 4)],
         chi=1,
-        mode=mode,
+        mode="perm",
     )
 
     opt.run(progbar=False, cutoff=1.0e-12, stabilize_unitary=True)
@@ -6630,6 +6627,74 @@ def test_mps_compression_layout_pilot_is_non_mutating():
     assert selected["pilot"]["reports"]
     assert opt._persistent_layout_plan is None
     assert np.allclose(opt.to_dense(), before)
+
+
+@pytest.mark.parametrize("bad_length", [-1, 1.5, True])
+def test_mps_layout_finder_rejects_invalid_register_lengths(bad_length):
+    """Layout register lengths must be explicit non-negative integers."""
+    error = ValueError if bad_length == -1 else TypeError
+    with pytest.raises(error, match="non-negative integer"):
+        py.MpsOptimizer.LayoutFinder([], L=bad_length)
+
+
+def test_mps_layout_finder_rejects_duplicate_support_sites():
+    """Static plans must not silently accept repeated gate support labels."""
+    with pytest.raises(ValueError, match="at most once"):
+        py.MpsOptimizer.LayoutFinder(
+            [(np.eye(4, dtype=complex), (1, 1))],
+            L=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"mode": "perm"}, "fixed-layout"),
+        ({"layout": False}, "must not contain layout"),
+    ],
+)
+def test_mps_compression_layout_pilot_rejects_conflicting_modes(kwargs, match):
+    """Pilot selection should reject layouts it cannot execute up front."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=4,
+        mode="direct",
+    )
+    with pytest.raises(ValueError, match=match):
+        opt.select_layout_for_compression(
+            pilot_candidates=1,
+            pilot_steps=1,
+            run_kwargs=kwargs,
+        )
+
+
+def test_mps_compression_layout_pilot_rejects_cap_stream():
+    """Pilot selection should reject length-changing streams early."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        gates=[("cap", 1, [1.0, 1.0])],
+        chi=4,
+        mode="direct",
+    )
+    with pytest.raises(ValueError, match="cap control events"):
+        opt.select_layout_for_compression(pilot_candidates=1, pilot_steps=1)
+
+
+def test_mps_compression_layout_pilot_accepts_none_mode_override():
+    """A ``mode=None`` run override keeps the optimizer's current mode."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=4,
+        mode="direct",
+    )
+    plan = opt.select_layout_for_compression(
+        pilot_candidates=1,
+        pilot_steps=1,
+        run_kwargs={"mode": None},
+    )
+    assert plan["pilot"]["reports"]
 
 
 def test_mps_layout_finder_plot_draws_lattice_and_gate_order():

@@ -14,6 +14,14 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Simplified `MpsOptimizer(mode="perm")` to one Quimb-style lazy
+  swap-and-split SVD path using `swap_back=False`. Removed the separate
+  `routing="perm"` axis and the misleading `perm-*` / `*-perm` compositions
+  with DMRG, SRC, or other compressors.
+
+- Removed the obsolete MPS simple-update mode from mode dispatch. Simple
+  update remains available through its dedicated gate and PEPS APIs.
+
 - Explicit `apply_subtree_operator` now shares compact `SubTreeMPO`
   application with ordinary gates in every mode, including original-layer
   SRC/SDC and consistent per-call caps/cutoffs. Certified one-site unitaries

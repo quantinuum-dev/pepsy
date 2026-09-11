@@ -65,6 +65,21 @@ Before changing a specialized subsystem, read its skill:
 Keep domain-specific invariants in those skills or their direct references;
 do not duplicate them here.
 
+## MpsOptimizer permutation API
+
+- `mode="perm"` is one standalone Quimb-style swap-and-split path. It uses
+  `gate_with_auto_swap_(..., swap_back=False)` and is not a routing modifier;
+  do not reintroduce a `routing=` keyword or `perm-*` / `*-perm` mode aliases.
+- `mode="swap"` shares the same kernel with `swap_back=True`. Keep the
+  swap-back choice explicit at that boundary rather than creating separate
+  route-then-compress dispatchers.
+- `qubits[position]` and `logical_order[position]` are synchronized
+  physical-position → logical-site views. `perm` updates both only after a
+  successful gate; persistent layouts freeze the mapping for readout.
+- Preserve Quimb's in-place gate helper and the native Symmray equivalent.
+  Keep detailed permutation, readout, and layout invariants in
+  `.github/skills/mps-optimizer/SKILL.md`.
+
 ## Native fermionic tree QR policy
 
 The native `TreeTensorNetwork` QR policy is centralized in

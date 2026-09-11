@@ -128,27 +128,29 @@ successive deterministic compressors are available explicitly as
 build provides them. These modes are opt-in and do not change existing
 defaults.
 
-## Lazy permutation routing with a selected compressor
+## Lazy permutation swap-and-split
 
-Routing and compression can be selected independently. Use the explicit
-two-axis form for new code:
+`mode="perm"` mirrors Quimb's `gate_with_auto_swap(..., swap_back=False)`:
+each non-local two-site gate is routed to an adjacent physical pair, applied
+and locally SVD-compressed, and the resulting physical ordering is retained.
+The physical-position-to-logical-site ordering is exposed consistently through
+both `opt.qubits` (Quimb's name) and `opt.logical_order` (Pepsy's readout and
+layout name).
 
 ```python
-opt = pepsy.MpsOptimizer(state, gates, chi=64, mode="dmrg2", routing="perm")
+opt = pepsy.MpsOptimizer(state, gates, chi=64, mode="perm")
 opt.run()
 ```
 
-The historical `mode="perm"` remains the local swap-and-split path. For
-convenience, `mode="perm-dmrg2"`, `mode="perm-direct"`, and
-`mode="perm-src"` are aliases for `routing="perm"` with the corresponding
-compressor. During a routed replay, each non-local gate is moved to an
-adjacent physical pair and then passed to the selected DMRG, Quimb, or SVD
-backend. Internal route swaps use the stable adjacent MPS split path. This
-feature currently accepts ordinary gate events; use a normal compression mode
-for explicit sub-MPO stream events.
+This is a single compression path, not a routing option that composes with
+DMRG, SRC, or another Quimb compressor. The mapping views are updated only
+after a successful gate. `mode="swap"` uses the same swap-and-split operation
+but restores the ordering after each gate. The `perm` path currently accepts
+ordinary gate events; use a normal compression mode for explicit sub-MPO stream
+events.
 
-For a compression-aware static layout, combine the layout pilot with the same
-compression mode:
+For a compression-aware static layout, use a fixed compression mode with the
+layout pilot:
 
 ```python
 opt = pepsy.MpsOptimizer(state, gates, chi=64, mode="dmrg2")
@@ -157,8 +159,8 @@ opt.apply_layout(plan, layout_report=False)
 opt.run(n_iter=8)
 ```
 
-Persistent layouts and `routing="perm"` are mutually exclusive: a layout is a
-fixed physical order, while permutation routing changes the order after each
+Persistent layouts and `mode="perm"` are mutually exclusive: a layout is a
+fixed physical order, while permutation mode changes the order after each
 non-local gate.
 
 These events represent already-factorized nonlocal operators:
@@ -505,7 +507,7 @@ scalar results on the device, and transfer one Boolean to the host.
 
 `run(finite_check=False)` disables runtime non-finite detection by default
 in every MpsOptimizer mode, including DMRG1/2/3, mixed, MPO/direct/SRC/SDC,
-swap/permutation/SVD, SU, and exact replay. This is an optional diagnostic
+swap/permutation/SVD, and exact replay. This is an optional diagnostic
 feature, not a requirement for normal optimization. Leave it off to avoid
 extra validation work and possible accelerator synchronization.
 FIT array scans, scalar non-finite
@@ -814,19 +816,17 @@ The accelerator backend is detected once per timing session, so CPU timing
 does not repeatedly scan the MPS. JAX barriers wait on each newly returned
 stage result rather than an unrelated previously ready MPS leaf.
 
-`MpsOptimizer` no longer accepts `mode="su"`; simple-update gauge/core
-bookkeeping is not part of the MPS optimizer. For direct simple-update
-evolution, use the dedicated `pepsy.gate_simple` API (or the PEPS
-simple-update APIs) instead.
+Simple-update gauge/core bookkeeping is not an `MpsOptimizer` mode. For
+direct simple-update evolution, use the dedicated `pepsy.gate_simple` API (or
+the PEPS simple-update APIs) instead.
 
 `mode="swap"` applies non-local two-site gates through a swap-and-split path
 and swaps the sites back after each gate. `mode="perm"` uses the same
 swap-and-split path but leaves the swaps in place, tracking the current
-physical-site-to-logical-site ordering in `opt.qubits`. This is useful for
-streams with little expected locality. The returned `opt.p` remains an MPS in
-physical order; call `opt.restore_qubit_order()` when a conventional logical
-site order is needed. The `perm-*` aliases and the explicit
-`mode=<compressor>, routing="perm"` form retain this logical readout contract.
+physical-site-to-logical-site ordering in both `opt.qubits` and
+`opt.logical_order`. This is useful for streams with little expected locality.
+The returned `opt.p` remains an MPS in physical order; call
+`opt.restore_qubit_order()` when a conventional logical site order is needed.
 
 For repeated evolution, use `opt.apply_layout("quality")` once. This installs
 the selected position-to-logical mapping in `opt.logical_order` and keeps the
@@ -955,7 +955,10 @@ dimension and elapsed time, and returns per-candidate records under
 `plan["pilot"]`. The original state, queue, and
 layout are unchanged. Perform this before installing a persistent layout;
 reordering an already-entangled MPS remains explicitly guarded because the
-reorder itself can be lossy or expensive.
+reorder itself can be lossy or expensive. Compression pilots reject
+`mode="perm"`, cap events, and caller-supplied `layout`/
+`use_layout_finder` options because the pilot must control one fixed layout
+per trial.
 
 The layout can be inspected graphically without changing the optimizer. The
 finder returns a Matplotlib `(fig, ax)` pair. The original lattice and gate

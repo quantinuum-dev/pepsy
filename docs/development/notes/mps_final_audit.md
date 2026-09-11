@@ -5,6 +5,24 @@ The original review findings below refer to that commit. The subsequent
 authorized fixes are recorded in "Implementation follow-up" at the end;
 the original reproductions are retained as historical evidence.
 
+## 2026-09-11 permutation API compatibility audit
+
+The installed Quimb development build is `1.15.1.dev55+gd0591eb70`.
+Runtime inspection reports
+`MatrixProductState.gate_with_auto_swap(G, where, info=None,
+swap_back=True, inplace=False, **compress_opts)` and an in-place
+`gate_with_auto_swap_` helper. The permutation path therefore uses the public
+Quimb swap-and-split API with `swap_back=False`; no separate route-then-SVD
+dispatcher or routing keyword is needed.
+
+Pepsy now exposes one standalone `mode="perm"` contract. `qubits` and
+`logical_order` are synchronized physical-position → logical-site views and
+are updated only after successful permutation gates or length-changing control
+events. `mode="swap"` reuses the same kernel with `swap_back=True`. Focused
+permutation, layout, native, lint, and whitespace checks pass after this
+change; the broader native Symmray FIT suite remains subject to the installed
+upstream cumulative-cutoff/max-bond incompatibility recorded in the handoff.
+
 ## Original assessment
 
 The existing regression suite passes, including the earlier reset/leakage,

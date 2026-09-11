@@ -6,11 +6,9 @@ backends. The default ``mode="direct"`` selects Quimb's direct compressor;
 ``mode="mpo"`` is only a compatibility alias for that algorithm.
 ``mode="perm"`` uses a lazy permutation swap network: non-local
 two-site gates swap the right endpoint next to the left endpoint, apply the
-gate, and leave the resulting physical ordering in place. The current
-physical-site-to-logical-site ordering is available as ``optimizer.qubits``.
-The same routing can be combined with another compressor using
-``routing="perm"`` and, for example, ``mode="dmrg2"`` or ``mode="src"``;
-``mode="perm-dmrg2"`` is a convenience alias.
+gate with a local SVD split, and leave the resulting physical ordering in
+place. The current physical-site-to-logical-site ordering is available as the
+synchronized ``optimizer.qubits`` and ``optimizer.logical_order`` views.
 For repeated layout-aware evolution, :meth:`MpsOptimizer.apply_layout`
 installs a persistent position-to-logical mapping and never performs a
 swap-back; logical readout is available through ``logical_order``,
@@ -1457,16 +1455,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         a direct-compression warm-up on under-capacity active bonds, followed by
         transactional one-site DMRG/FIT; explicit ``fit_block_size=2`` or
         ``3`` opts into mixed block-FIT transactions.
-        Prefixing a supported compression mode with ``"perm-"`` is a
-        convenience alias for ``routing="perm"``, for example
-        ``"perm-dmrg2"`` or ``"perm-src"``. The explicit two-axis spelling
-        ``mode="dmrg2", routing="perm"`` is preferred for new code.
-    routing : {None, "perm"}, optional
-        Optional logical-to-physical routing policy. ``"perm"`` keeps the
-        lazy permutation behavior of the historical ``mode="perm"`` while
-        allowing the compression algorithm to be selected independently by
-        ``mode``. A ``"perm-*"`` mode alias and ``routing`` cannot both be
-        supplied.
+        ``mode="perm"`` routes non-local two-site gates with Quimb's
+        swap-and-split SVD path and keeps the resulting physical ordering.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -1511,13 +1501,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         The record contains total replay time, inclusive stage totals, and,
         for mixed mode, the final ``last_mix_summary``. Use
         :meth:`get_run_timing` for a copy.
+    qubits : list[int]
+        Physical-position to logical-site mapping. In ``mode="perm"`` this is
+        updated after each successful no-swap-back gate, matching Quimb's
+        ``CircuitPermMPS`` convention.
     logical_order : list[int]
-        Persistent-layout mapping from physical MPS position to logical site.
-        The list is identity until :meth:`apply_layout` is called.
+        The shared readout/layout view of the physical-position mapping. It
+        mirrors :attr:`qubits` during ``mode="perm"`` and stores the fixed
+        mapping installed by :meth:`apply_layout` otherwise.
     """
 
     _DMRG_MODE_ALIASES = {"dmrg1": 1, "dmrg2": 2, "dmrg3": 3}
-    _ALLOWED_ROUTINGS = frozenset({"none", "perm"})
     _ALLOWED_MODES = frozenset(
         {
             "dmrg",
@@ -1549,39 +1543,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     }
 
     @classmethod
-    def _split_mode_routing(cls, mode):
-        """Split a convenience ``perm-*`` mode into two execution axes."""
-        mode_norm = str(mode).strip().lower()
-        if mode_norm == "perm":
-            return mode_norm, "perm"
-        if mode_norm.startswith("perm-"):
-            compression = mode_norm[len("perm-") :]
-            if not compression:
-                raise ValueError("mode='perm-' must name a compression mode.")
-            return compression, "perm"
-        return mode_norm, None
-
-    @classmethod
-    def _normalize_routing(cls, routing):
-        """Validate and normalize the optional logical-site routing policy."""
-        if routing is None:
-            return "none"
-        routing_norm = str(routing).strip().lower()
-        if routing_norm not in cls._ALLOWED_ROUTINGS:
-            raise ValueError(
-                f"Unknown routing: {routing}. Expected one of "
-                f"{sorted(cls._ALLOWED_ROUTINGS)!r}."
-            )
-        return routing_norm
-
-    def _perm_routing_active(self):
-        """Return whether logical locations need lazy permutation mapping."""
-        return self.routing == "perm"
-
-    @classmethod
     def _normalize_mode(cls, mode):
         """Validate and normalize execution mode."""
-        mode_norm, _embedded_routing = cls._split_mode_routing(mode)
+        mode_norm = str(mode).strip().lower()
         # Public ``direct`` names the compression algorithm. Historical
         # ``mpo``/``quimb`` spellings select exactly that same path; retain
         # them as silent aliases, not distinct replay modes.
@@ -2022,6 +1986,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "compression layout pilots require an optimizer without a "
                 "persistent layout; create the pilot before apply_layout()."
             )
+        if self.mode == "perm":
+            raise ValueError(
+                "compression layout pilots require a fixed-layout compression "
+                "mode; mode='perm' changes the order during replay."
+            )
+        if any(
+            _control_event_contains_cap(event_type, payload)
+            for payload, event_type in zip(self.G, self.event_types)
+        ):
+            raise ValueError(
+                "compression layout pilots are not supported with cap control "
+                "events because caps change the MPS length."
+            )
         try:
             pilot_candidates = int(pilot_candidates)
         except (TypeError, ValueError) as exc:
@@ -2035,6 +2012,29 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("pilot_steps must be a positive integer or None.") from exc
             if pilot_steps < 1:
                 raise ValueError("pilot_steps must be a positive integer or None.")
+
+        base_run_kwargs = dict(run_kwargs or {})
+        conflicting = sorted(
+            {"layout", "use_layout_finder"}.intersection(base_run_kwargs)
+        )
+        if conflicting:
+            raise ValueError(
+                "run_kwargs for compression layout pilots must not contain "
+                f"{', '.join(conflicting)}; the pilot supplies its own layout."
+            )
+        pilot_mode = base_run_kwargs.get("mode", self.mode)
+        if pilot_mode is None:
+            pilot_mode = self.mode
+        if self._normalize_mode(pilot_mode) == "perm":
+            raise ValueError(
+                "compression layout pilots require a fixed-layout compression "
+                "mode; mode='perm' changes the order during replay."
+            )
+        if self._normalize_mode(pilot_mode) == "exact":
+            raise ValueError(
+                "compression layout pilots require an MPS compression mode, "
+                "not mode='exact'."
+            )
 
         kwargs = dict(layout_kwargs or {})
         finder_kwargs, kwargs = self._split_layout_finder_kwargs(kwargs)
@@ -2055,7 +2055,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ),
         )[:pilot_candidates]
 
-        base_run_kwargs = dict(run_kwargs or {})
         base_run_kwargs.setdefault("progbar", False)
         base_run_kwargs.setdefault("layout_report", False)
         base_run_kwargs.setdefault("cutoff", cutoff)
@@ -2146,7 +2145,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         inplace=False,
         _capture_initial=True,
         to_backend=None,
-        routing=None,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -2196,28 +2194,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._validate_normalized_gate_queue(normalized_queue)
         self._install_stream_plan(plan, normalized_queue=normalized_queue)
         self.chi = int(chi)
-        mode_name, embedded_routing = self._split_mode_routing(mode)
-        if embedded_routing is not None and routing is not None:
-            explicit_routing = self._normalize_routing(routing)
-            if not (mode_name == "perm" and explicit_routing == "perm"):
-                raise ValueError(
-                    "specify either a 'perm-*' mode alias or routing='perm', "
-                    "not both."
-                )
-        self.routing = self._normalize_routing(
-            embedded_routing if embedded_routing is not None else routing
-        )
-        if mode_name == "perm":
-            if self.routing != "perm":
-                raise ValueError(
-                    "mode='perm' requires routing='perm'; use mode='direct' "
-                    "or another compression mode for ordinary replay."
-                )
-            self.routing = "perm"
-        if self.routing == "perm" and mode_name in {"mix", "swap", "exact"}:
-            raise ValueError(
-                f"routing='perm' cannot be combined with mode={mode_name!r}."
-            )
+        mode_name = str(mode).strip().lower()
         self._dmrg_mode_alias = (
             mode_name if mode_name in self._DMRG_MODE_ALIASES else None
         )
@@ -2228,12 +2205,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.ind_id = str(ind_id)
 
         self.info_c = {}
-        # Physical MPS position -> logical site. ``perm`` mode updates this
-        # lazily as non-local gates leave their swap network in place.
-        self.qubits = list(range(int(getattr(self.p, "L", 0))))
-        # Persistent layout position -> logical site. Unlike ``qubits`` this
-        # mapping is installed once by ``apply_layout`` and is never restored.
-        self.logical_order = list(self.qubits)
+        # Keep the Quimb-compatible dynamic view and the shared readout/layout
+        # view synchronized. ``perm`` changes both after each gate; a
+        # persistent layout freezes the same position -> logical-site map.
+        self._set_site_order(range(int(getattr(self.p, "L", 0))))
         self._persistent_layout_plan = None
         self.layout_plan = None
         self.normalizations = []
@@ -3299,8 +3274,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._dmrg_mode_alias == "dmrg1"
             and self._is_native_fermionic_product_state(self.p)
         )
-        self.qubits = list(range(int(getattr(self.p, "L", 0))))
-        self.logical_order = list(self.qubits)
+        self._set_site_order(range(int(getattr(self.p, "L", 0))))
         self._persistent_layout_plan = None
         self.layout_plan = None
         self.last_layout_plan = None
@@ -3458,7 +3432,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.p.copy(), gates=[], chi=self.chi, mode=self.mode,
                 contraction_opt=self.contraction_opt, ind_id=self.ind_id,
                 inplace=True,
-                routing=None if self.mode == "perm" else self.routing,
                 _capture_initial=False, to_backend=self._symbolic_gate_to_backend,
             )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
@@ -3499,8 +3472,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.G = list(self.G)
         copied.where = list(self.where)
         copied.event_types = list(self.event_types)
-        copied.qubits = list(self.qubits)
-        copied.logical_order = list(self.logical_order)
+        copied._set_site_order(self.qubits)
         copied._persistent_layout_plan = deepcopy(self._persistent_layout_plan)
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
@@ -3565,27 +3537,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def set_mode(self, mode):
         """Switch optimization mode while preserving the represented state."""
         old_mode = self.mode
-        old_routing = self.routing
         old_dmrg_alias = self._dmrg_mode_alias
-        mode_name, embedded_routing = self._split_mode_routing(mode)
-        if embedded_routing is not None:
-            new_routing = embedded_routing
-        elif old_routing == "perm" and mode_name != "perm":
-            # Preserve the historical ``set_mode`` behavior: switching away
-            # from a lazy permutation restores the ordinary physical order.
-            new_routing = "none"
-        else:
-            new_routing = old_routing
+        mode_name = str(mode).strip().lower()
         new_dmrg_alias = (
             mode_name if mode_name in self._DMRG_MODE_ALIASES else None
         )
         new_dmrg_block_size = self._dmrg_alias_block_size(mode_name)
-        if mode_name == "perm":
-            new_routing = "perm"
-        if new_routing == "perm" and mode_name in {"mix", "swap", "exact"}:
-            raise ValueError(
-                f"routing='perm' cannot be combined with mode={mode_name!r}."
-            )
         new_mode = self._normalize_mode(mode_name)
         if new_mode == "exact" and self._persistent_layout_plan is not None:
             raise ValueError(
@@ -3594,38 +3551,32 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         self._validate_canonical_boundary(self.p, new_mode)
         self._invalidate_replay_metadata()
-        old_perm_routing = old_routing == "perm"
-        new_perm_routing = new_routing == "perm"
-        if old_perm_routing and not new_perm_routing:
+        old_perm_mode = old_mode == "perm"
+        new_perm_mode = new_mode == "perm"
+        if old_perm_mode and not new_perm_mode:
             # Other modes interpret integer ``where`` values as physical MPS
             # positions, so restore the logical ordering before switching.
             self._restore_permutation()
-        elif not old_perm_routing and new_perm_routing:
+        elif not old_perm_mode and new_perm_mode:
             if self._persistent_layout_plan is not None:
                 raise ValueError(
-                    "cannot switch a persistent layout into routing='perm'; "
+                    "cannot switch a persistent layout into mode='perm'; "
                     "use the persistent layout mapping for replay instead."
                 )
             if old_mode == "exact":
                 # Exact replay stores a contracted TensorNetwork rather than
                 # an MPS, so it has no physical length from which to seed the
                 # logical-to-physical permutation. Rebuild it before creating
-                # the routed bookkeeping below.
+                # the permutation bookkeeping below.
                 self._ensure_mps_state()
-            self.qubits = list(range(int(getattr(self.p, "L", 0))))
-            self.logical_order = list(self.qubits)
+            self._set_site_order(range(int(getattr(self.p, "L", 0))))
         if new_mode == "exact":
             # Exact contractions do not consume canonical metadata. Discard
             # the MPS-only cache so it cannot be mistaken for the contracted
             # TensorNetwork's state.
             self.info_c = {}
         self.mode = new_mode
-        self.routing = new_routing
-        if (
-            old_mode != new_mode
-            or old_routing != new_routing
-            or old_dmrg_alias != new_dmrg_alias
-        ):
+        if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
             self._last_dmrg_fit_diagnostics = None
         self._dmrg_mode_alias = new_dmrg_alias
         self._dmrg_mode_block_size = new_dmrg_block_size
@@ -3633,11 +3584,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._dmrg_mode_alias == "dmrg1"
             and self._is_native_fermionic_product_state(self.p)
         )
-        if (
-            old_mode != new_mode
-            or old_routing != new_routing
-            or old_dmrg_alias != new_dmrg_alias
-        ):
+        if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
             self._dmrg1_one_site_locked = False
         if old_mode == "exact" and self.mode != "exact":
             # Exact mode stores a fully contracted TensorNetwork, so rebuild an
@@ -3657,17 +3604,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         current = tuple(self.qubits)
         if current != target:
             self._reorder_mps_to_logical_order(target, current_order=current)
-        self.qubits = list(target)
-        self.logical_order = list(target)
+        self._set_site_order(target)
 
     def restore_qubit_order(self):
         """Restore ``p`` to logical site order and return the managed state."""
         self._restore_permutation()
         return self.p
 
+    def _set_site_order(self, order):
+        """Set the physical-position to logical-site mapping consistently.
+
+        ``qubits`` is the name used by Quimb's permutation MPS helpers,
+        whereas ``logical_order`` is Pepsy's public readout/layout name. They
+        intentionally expose the same mapping while a lazy permutation is
+        active, so all state transitions go through this helper.
+        """
+        order = [int(site) for site in order]
+        self.qubits = list(order)
+        self.logical_order = list(order)
+
     def _logical_to_physical_where(self, where):
         """Map logical site locations to current physical MPS positions."""
-        if self._persistent_layout_plan is None and not self._perm_routing_active():
+        if self._persistent_layout_plan is None and self.mode != "perm":
             return tuple(int(site) for site in where)
         order = self.logical_order if self._persistent_layout_plan is not None else self.qubits
         try:
@@ -3681,9 +3639,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _record_permutation_move(self, where):
         """Record the no-swap-back movement made by a two-site gate."""
         i, j = sorted(map(int, where))
-        moved = self.qubits.pop(j)
-        self.qubits.insert(i + 1, moved)
-        self.logical_order = list(self.qubits)
+        # The routed right endpoint is left immediately to the right of the
+        # left endpoint, exactly as in Quimb's no-swap-back permutation MPS.
+        order = list(self.qubits)
+        moved = order.pop(j)
+        order.insert(i + 1, moved)
+        self._set_site_order(order)
 
     def _update_permutation_after_cap(self, logical_site, physical_site):
         """Remove a capped logical site and renumber the shortened chain."""
@@ -3698,11 +3659,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             for physical, logical in enumerate(self.qubits)
             if physical != physical_site
         ]
-        self.qubits = [
+        self._set_site_order(
             logical if logical < logical_site else logical - 1
             for logical in remaining
-        ]
-        self.logical_order = list(self.qubits)
+        )
 
     def logical_site(self, position):
         """Return the logical site currently stored at physical ``position``."""
@@ -3928,7 +3888,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         constructor = {
             "chi": self.chi,
             "mode": mode,
-            "routing": None if mode == "perm" else self.routing,
             "contraction_opt": self.contraction_opt,
             "ind_id": self.ind_id,
             "to_backend": self._symbolic_gate_to_backend,
@@ -3959,8 +3918,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 optimizer.layout_plan = deepcopy(self.layout_plan)
                 optimizer.last_layout_plan = deepcopy(self.last_layout_plan)
-                optimizer.logical_order = list(self.logical_order)
-                optimizer.qubits = list(self.qubits)
+                # The child starts from the same frozen physical order; keep
+                # both public mapping views consistent without reordering it.
+                optimizer._set_site_order(self.qubits)
             optimizer.scheduled_layout_plan = deepcopy(self.scheduled_layout_plan)
             optimizer.scheduled_site_order = deepcopy(self.scheduled_site_order)
             return optimizer
@@ -4028,11 +3988,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         has_leakage = any(_leakage_event_parts(entry) is not None for entry in entries)
         has_submpo = any(_is_submpo_event(entry) for entry in entries)
-        if has_submpo and self._perm_routing_active():
-            raise ValueError(
-                "shot replay with routing='perm' does not support sub-MPO "
-                "stream events."
-            )
         if has_submpo and not self._is_mpo_mode(self.mode):
             raise ValueError(
                 "shot replay of sub-MPO events requires mode='direct' "
@@ -4080,7 +4035,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._validate_shot_compatibility(error_model=error_model)
         if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
             raise ValueError("shots must be a nonnegative integer.")
-        if self._perm_routing_active() and self.logical_order != list(
+        if self.mode == "perm" and self.logical_order != list(
             range(int(getattr(self.p, "L", 0)))
         ):
             raise ValueError(
@@ -4280,10 +4235,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         supply the state in ``schedule.site_order`` or use an explicitly
         controlled lossy reorder.
         """
-        if self._perm_routing_active():
+        if self.mode == "perm":
             raise ValueError(
                 "scheduled streams use fixed physical positions after caps; "
-                "routing='perm' cannot apply its own lazy permutation on top."
+                "mode='perm' cannot apply its own lazy permutation on top."
             )
         if self._persistent_layout_plan is not None:
             raise ValueError(
@@ -4547,9 +4502,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         if self.mode == "exact":
             raise ValueError("persistent layouts require an MPS execution mode, not exact.")
-        if self._perm_routing_active():
+        if self.mode == "perm":
             raise ValueError(
-                "persistent layouts cannot be combined with routing='perm'; choose one."
+                "persistent layouts cannot be combined with mode='perm'; choose one."
             )
         if any(
             _control_event_contains_cap(event_type, payload)
@@ -4602,8 +4557,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=cutoff_mode,
                 )
 
-        self.logical_order = list(target_order)
-        self.qubits = list(target_order)
+        self._set_site_order(target_order)
         self._persistent_layout_plan = plan
         self.layout_plan = plan
         self.last_layout_plan = plan
@@ -4957,8 +4911,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Optional compression-algorithm override for this run. If omitted,
             use the constructor's mode (``"direct"`` by default). If supplied,
             update ``self.mode`` before execution. ``"mpo"`` remains a
-            compatibility alias for ``"direct"``. The ``"perm-*"`` spellings
-            also select lazy permutation routing for that run.
+            compatibility alias for ``"direct"``. ``mode="perm"`` is the
+            standalone lazy permutation swap-and-split path.
         k_2q_batch : int, default=1
             DMRG and mixed modes: number of contiguous two-qubit gates to batch
             into one local FIT update. In mixed mode, a failed batch is replayed
@@ -5387,11 +5341,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         layout_request = self._coalesce_layout_request(use_layout_finder, layout)
         persistent_layout_active = self._persistent_layout_plan is not None
-        if self._perm_routing_active() and (
+        if self.mode == "perm" and (
             persistent_layout_active or self._layout_request_enabled(layout_request)
         ):
             raise ValueError(
-                "routing='perm' keeps a lazy logical-to-physical permutation; "
+                "mode='perm' keeps a lazy logical-to-physical permutation; "
                 "use either the perm mode or a persistent/transient layout, "
                 "not both."
             )
@@ -5842,7 +5796,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "status": status,
                 "mode": self.mode,
                 "mode_alias": self._dmrg_mode_alias,
-                "routing": self.routing,
                 "event_count": int(event_count),
                 "elapsed_seconds": float(time.perf_counter() - started),
                 "final_bond": final_bond,
@@ -6031,50 +5984,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # Dispatch directly to the mode implementations, which share the same
         # validated stream but have different state contracts:
         # DMRG owns local variational targets, MPO owns Quimb compression,
-        # swap/perm own endpoint movement, and exact/SU deliberately bypass
+        # swap/perm own endpoint movement, and exact deliberately bypasses
         # canonical-center bookkeeping. Keeping the branches here prevents a
         # control-event caller from accidentally selecting a gate-only kernel.
-        if self._perm_routing_active() and self.mode != "perm":
-            self._timed_call(
-                "perm.replay",
-                self._run_perm_composed,
-                G_seq,
-                where_seq,
-                event_seq,
-                progbar=progbar,
-                n_iter=n_iter,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                mpo_cutoff_mode=mpo_cutoff_mode,
-                k_2q_batch=k_2q_batch,
-                normalize_every=normalize_every,
-                normalize_final=normalize_final,
-                normalize_eps=normalize_eps,
-                non_unitary=non_unitary,
-                submpo_method=submpo_method,
-                compression_seed=compression_seed,
-                fit_min_iter=fit_min_iter,
-                fit_rtol=fit_rtol,
-                fit_patience=fit_patience,
-                fit_block_size=fit_block_size,
-                fit_adaptive_sweeps=fit_adaptive_sweeps,
-                fit_sweep_sequence=fit_sweep_sequence,
-                fit_max_span=fit_max_span,
-                target_cutoff=target_cutoff,
-                fit_target_strategy=fit_target_strategy,
-                fit_mpo_guess=fit_mpo_guess,
-                fit_init_strategy=fit_init_strategy,
-                fit_init_rand_strength=fit_init_rand_strength,
-                fit_init_seed=fit_init_seed,
-                fit_single_pair_fast_path=fit_single_pair_fast_path,
-                finite_check=finite_check,
-                fit_overlap_diagnostics=fit_overlap_diagnostics,
-                stabilize_unitary=stabilize_unitary,
-                quality_check_every=quality_check_every,
-                quality_check_repair=quality_check_repair,
-            )
-            return self.p
-
         if self.mode == "dmrg":
             self._timed_call("dmrg.prepare", self._prepare_dmrg_state)
             self._timed_call(
@@ -6409,13 +6321,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         action_where,
                     )
                 # Ordinary mode backends receive physical execution
-                # locations, but routed replay owns the logical-to-physical
+                # locations, but perm replay owns the logical-to-physical
                 # translation inside its gate kernel. Passing the already
                 # mapped location there would translate a conditional action
                 # a second time after an earlier lazy swap.
                 mode_where = (
                     action_where
-                    if self._perm_routing_active() and not where_is_physical
+                    if self.mode == "perm" and not where_is_physical
                     else action_execution_where
                 )
                 self._execute_mode(
@@ -7419,11 +7331,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"Unknown MPS stream event type(s): {unknown!r}.")
 
         has_submpo = any(event_type == "submpo" for event_type in event_seq)
-        if has_submpo and self._perm_routing_active():
-            raise ValueError(
-                "routing='perm' does not currently support sub-MPO stream "
-                "events; use a normal Quimb or DMRG compression mode."
-            )
         if has_submpo and not (
             self._is_mpo_mode(self.mode) or self.mode == "dmrg"
         ):
@@ -11439,262 +11346,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Apply gates with lazy swap-network compression."""
         return self._run_swap_network(*args, swap_back=False, mode_name="perm", **kwargs)
 
-    def _perm_route_to_adjacent(self, where, *, cutoff, cutoff_mode):
-        """Route a physical endpoint pair together without changing mapping."""
-        first, second = map(int, where)
-        if first > second:
-            left, right = second, first
-            final_where = (left + 1, left)
-        else:
-            left, right = first, second
-            final_where = (left, left + 1)
-
-        if left + 1 == right:
-            return final_where
-
-        compress_opts = {
-            "max_bond": self.chi,
-            "cutoff": cutoff,
-            "cutoff_mode": cutoff_mode,
-        }
-        if (
-            self._replay_has_symmray_data(self.p)
-            and self._native_needs_safe_qr(self.p)
-        ):
-            self._native_swap_site_to(
-                self.p,
-                right,
-                left + 1,
-                info=self.info_c,
-                compress_opts=compress_opts,
-            )
-        else:
-            self.p.swap_site_to_(
-                right,
-                left + 1,
-                info=self.info_c,
-                **compress_opts,
-            )
-        return final_where
-
-    def _run_perm_composed(  # pylint: disable=too-many-locals,too-many-arguments
-        self,
-        G_seq,
-        where_seq,
-        event_seq,
-        *,
-        progbar=False,
-        **mode_kwargs,
-    ):
-        """Replay lazy permutation routing with a selected inner compressor.
-
-        Routing is deliberately kept outside the compressor. Each non-local
-        gate first moves its right physical endpoint next to its left endpoint,
-        then the selected DMRG, Quimb, or local-SVD backend compresses the
-        logical gate on that adjacent pair. The route swaps use Quimb's stable
-        adjacent MPS split path and are not exposed as user gate events.
-        """
-        if any(event_type != "gate" for event_type in event_seq):
-            raise ValueError(
-                "routing='perm' currently supports ordinary gate events only; "
-                "sub-MPO events cannot be lazily permuted."
-            )
-
-        inner_mode = self.mode
-        if inner_mode not in {"dmrg", "svd"} and not self._is_mpo_mode(inner_mode):
-            raise ValueError(
-                f"routing='perm' does not support compression mode {inner_mode!r}."
-            )
-        if inner_mode == "dmrg" and int(mode_kwargs["k_2q_batch"]) != 1:
-            raise ValueError(
-                "routing='perm' with DMRG requires k_2q_batch=1 because the "
-                "physical routing can change after every logical gate."
-            )
-
-        if inner_mode == "dmrg":
-            self._timed_call("dmrg.prepare", self._prepare_dmrg_state)
-
-        cutoff = mode_kwargs["cutoff"]
-        cutoff_mode = mode_kwargs["cutoff_mode"]
-        normalize_every = mode_kwargs["normalize_every"]
-        normalize_final = mode_kwargs["normalize_final"]
-        normalize_eps = mode_kwargs["normalize_eps"]
-        non_unitary = mode_kwargs["non_unitary"]
-        stabilize_unitary = mode_kwargs["stabilize_unitary"]
-        if not non_unitary and self._unitary_previous_norm is None:
-            # Establish the baseline before routing swaps. Their truncation
-            # is part of the routed compressed operation and must therefore
-            # be included in norm-survival/stabilization diagnostics.
-            self._start_unitary_norm_tracking(self.p)
-        last_where = self._current_orthog(self.p)
-        last_normalized_step = None
-        two_qubit_count = 0
-
-        pbar = None
-        if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
-            progress_name = self._progress_mode_name(inner_mode)
-            pbar = tqdm(
-                total=len(G_seq),
-                desc=f"perm-{progress_name}",
-                leave=True,
-                position=0,
-                ascii=True,
-                colour=self._PROGBAR_COLORS.get(
-                    progress_name,
-                    self._PROGBAR_COLORS["perm"],
-                ),
-            )
-
-        idx = 0
-        while idx < len(G_seq):
-            logical_where = where_seq[idx]
-            where = self._logical_to_physical_where(logical_where)
-            gate = G_seq[idx]
-            compressed = False
-
-            if len(where) == 1:
-                self._apply_gate(
-                    self.p,
-                    gate,
-                    where,
-                    contract=True,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    inplace=True,
-                )
-                if non_unitary:
-                    self.canonize_mps(self.p, where)
-                last_where = where
-                self._record_effective_event(where, event_type="gate")
-            else:
-                if len(where) != 2:
-                    raise ValueError("Each gate location must have one or two sites.")
-                two_qubit_count += 1
-                final_where = self._perm_route_to_adjacent(
-                    where,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                )
-                if inner_mode == "dmrg":
-                    self._run_dmrg(
-                        [gate],
-                        [final_where],
-                        event_seq=["gate"],
-                        n_iter=mode_kwargs["n_iter"],
-                        progbar=False,
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                        k_2q_batch=1,
-                        normalize_every=None,
-                        normalize_final=False,
-                        normalize_eps=normalize_eps,
-                        non_unitary=non_unitary,
-                        fit_min_iter=mode_kwargs["fit_min_iter"],
-                        fit_rtol=mode_kwargs["fit_rtol"],
-                        fit_patience=mode_kwargs["fit_patience"],
-                        fit_finite_check=mode_kwargs["finite_check"],
-                        fit_block_size=mode_kwargs["fit_block_size"],
-                        fit_adaptive_sweeps=mode_kwargs["fit_adaptive_sweeps"],
-                        fit_sweep_sequence=mode_kwargs["fit_sweep_sequence"],
-                        fit_max_span=mode_kwargs["fit_max_span"],
-                        target_cutoff=mode_kwargs["target_cutoff"],
-                        fit_target_strategy=mode_kwargs["fit_target_strategy"],
-                        fit_mpo_guess=mode_kwargs["fit_mpo_guess"],
-                        fit_init_strategy=mode_kwargs["fit_init_strategy"],
-                        fit_init_rand_strength=mode_kwargs["fit_init_rand_strength"],
-                        fit_init_seed=mode_kwargs["fit_init_seed"],
-                        fit_single_pair_fast_path=mode_kwargs[
-                            "fit_single_pair_fast_path"
-                        ],
-                        finite_check=mode_kwargs["finite_check"],
-                        fit_overlap_diagnostics=mode_kwargs[
-                            "fit_overlap_diagnostics"
-                        ],
-                        stabilize_unitary=stabilize_unitary,
-                        quality_check_every=None,
-                        quality_check_repair=mode_kwargs["quality_check_repair"],
-                    )
-                elif self._is_mpo_mode(inner_mode):
-                    self._run_mpo(
-                        [gate],
-                        [final_where],
-                        ["gate"],
-                        progbar=False,
-                        cutoff=cutoff,
-                        cutoff_mode=mode_kwargs["mpo_cutoff_mode"],
-                        normalize_every=None,
-                        normalize_final=False,
-                        normalize_eps=normalize_eps,
-                        non_unitary=non_unitary,
-                        submpo_method=mode_kwargs["submpo_method"],
-                        compression_seed=mode_kwargs["compression_seed"],
-                        stabilize_unitary=stabilize_unitary,
-                    )
-                else:
-                    self._run_svd(
-                        [gate],
-                        [final_where],
-                        progbar=False,
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                        normalize_every=None,
-                        normalize_final=False,
-                        normalize_eps=normalize_eps,
-                        non_unitary=non_unitary,
-                        stabilize_unitary=stabilize_unitary,
-                    )
-
-                self._record_permutation_move(where)
-                last_where = tuple(sorted(final_where))
-                compressed = True
-
-            idx += 1
-            event = self._maybe_normalize_after_step(
-                self.p,
-                step=idx,
-                where=last_where,
-                normalize_every=normalize_every,
-                reason="compression" if compressed else "step",
-            )
-            if event is not None:
-                last_normalized_step = idx
-            self._maybe_run_quality_check(
-                idx,
-                last_where,
-                mode_kwargs["quality_check_every"],
-                repair=mode_kwargs["quality_check_repair"],
-            )
-
-            if pbar is not None:
-                pbar.set_postfix(
-                    {
-                        "2q": two_qubit_count,
-                        "~F": self._format_progress_scalar(
-                            self._cumulative_fidelity()
-                        ),
-                        "bnd": self.p.max_bond(),
-                    }
-                )
-                pbar.update(1)
-
-        if pbar is not None:
-            pbar.close()
-
-        event = self._maybe_normalize_final(
-            self.p,
-            step=idx,
-            last_normalized_step=last_normalized_step,
-            where=last_where,
-            normalize_every=normalize_every,
-            normalize_final=normalize_final,
-            normalize_eps=normalize_eps,
-        )
-        if event is not None:
-            last_normalized_step = idx
-        self.p = self._install_represented_norm(self.p)
-
     def _run_swap_network(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         G_seq,
@@ -11720,8 +11371,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         # ``swap_back`` is the semantic switch: ``swap`` restores the input
         # logical order after each nonlocal gate, while ``perm`` leaves the
-        # physical order changed and updates ``self.qubits`` for later gates
-        # and logical readout.
+        # physical order changed and updates both public mapping views for
+        # later gates and logical readout.
         p = self.p
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
         if not non_unitary and self._unitary_previous_norm is None:
