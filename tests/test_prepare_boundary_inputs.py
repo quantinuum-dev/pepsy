@@ -954,8 +954,8 @@ def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
     )
 
 
-def test_contract_flat_supports_sequential_three_layer_compression():
-    """A tagged BRA--PEPO--KET target is compressed one layer at a time."""
+def test_contract_layered_supports_sequential_three_layer_compression():
+    """A tagged BRA--PEPO--KET target uses the multilayer boundary façade."""
 
     def add_unit_layer(tn, layer, *, lx=2, ly=2):
         for x in range(lx):
@@ -987,11 +987,9 @@ def test_contract_flat_supports_sequential_three_layer_compression():
     add_unit_layer(sandwich, "BRA")
     add_unit_layer(sandwich, "PEPO")
     add_unit_layer(sandwich, "KET")
-
-    value = pepsy.contract_flat(
+    result = pepsy.contract_layered(
         sandwich,
         chi=2,
-        method="dmrg",
         fit_mode="sdc",
         fit_layer_mode="sequential",
         layer_tags=("BRA", "PEPO", "KET"),
@@ -999,9 +997,139 @@ def test_contract_flat_supports_sequential_three_layer_compression():
         max_separation=0,
         contraction_opt="greedy",
         progress=False,
+        return_info=True,
+    )
+
+    assert result.cost == pytest.approx(1.0)
+
+
+def _make_unit_flat_layer(*, lx=3, ly=3):
+    """Build one effective flat layer with unit-valued lattice bonds."""
+    flat_layer = qtn.TensorNetwork()
+    for x in range(lx):
+        for y in range(ly):
+            inds = []
+            if x > 0:
+                inds.append(f"h-{x - 1}-{y}")
+            if x < lx - 1:
+                inds.append(f"h-{x}-{y}")
+            if y > 0:
+                inds.append(f"v-{x}-{y - 1}")
+            if y < ly - 1:
+                inds.append(f"v-{x}-{y}")
+            flat_layer.add_tensor(
+                qtn.Tensor(
+                    data=np.ones((1,) * len(inds)),
+                    inds=inds,
+                    tags={f"X{x}", f"Y{y}"},
+                )
+            )
+    return flat_layer
+
+
+def test_contract_layered_requires_explicit_distinct_present_tags():
+    """The layered façade should reject ambiguous or absent layer metadata."""
+    flat_layer = _make_unit_flat_layer(lx=2, ly=2)
+
+    with pytest.raises(ValueError, match="at least two distinct"):
+        pepsy.contract_layered(flat_layer, layer_tags=("KET",), chi=2)
+
+    with pytest.raises(ValueError, match="could not find layer tag"):
+        pepsy.contract_layered(
+            flat_layer,
+            layer_tags=("BRA", "KET"),
+            chi=2,
+        )
+
+
+def test_bdymps_lazy_builds_only_requested_boundary_chain():
+    """Lazy BdyMPS materializes one direction and predecessor steps on demand."""
+    flat_layer = _make_unit_flat_layer()
+    bdy = pepsy.BdyMPS(
+        tn_double=flat_layer,
+        chi=2,
+        flat=False,
+        lazy=True,
+    )
+
+    assert len(bdy.mps_b) == 0
+    assert bdy.available_boundary_keys(direction="y") == [
+        "Y0_l",
+        "Y0_r",
+        "Y1_l",
+        "Y1_r",
+    ]
+
+    _ = bdy.mps_b["Y1_l"]
+    assert set(bdy.mps_b) == {"Y0_l", "Y1_l"}
+
+    _ = bdy.mps_b["X0_r"]
+    assert set(bdy.mps_b) == {"Y0_l", "Y1_l", "X0_r"}
+
+
+def test_contract_boundary_rejects_sequential_flat_mode():
+    """The lower-level flat path must enforce the same layer-policy guard."""
+    flat_layer = _make_unit_flat_layer(lx=2, ly=2)
+    bdy = pepsy.BdyMPS(tn_flat=flat_layer, chi=2, flat=True)
+
+    with pytest.raises(ValueError, match="already-flattened effective layer"):
+        pepsy.contract_boundary(
+            norm=flat_layer,
+            bdy=bdy,
+            flat=True,
+            fit_layer_mode="sequential",
+            layer_tags=("BRA", "PEPO", "KET"),
+            progress=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "fit_mode",
+    (
+        "direct",
+        "src",
+        "zipup",
+        "sdc",
+        "dm",
+        "eff",
+        "two-site",
+        "dmrg2",
+        "global",
+    ),
+)
+def test_contract_flat_supports_all_fit_modes_for_one_effective_layer(fit_mode):
+    """All FIT and direct modes work on the intended flat single-layer path."""
+    flat_layer = _make_unit_flat_layer()
+    n_iter = 2 if fit_mode == "dmrg2" else 1
+
+    value = pepsy.contract_flat(
+        flat_layer,
+        chi=2,
+        method="dmrg",
+        fit_mode=fit_mode,
+        n_iter=n_iter,
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
     )
 
     assert value == pytest.approx(1.0)
+
+
+def test_contract_flat_rejects_sequential_layer_mode():
+    """The single-layer API must not be used as a multilayer façade."""
+    flat_layer = _make_unit_flat_layer(lx=2, ly=2)
+
+    with pytest.raises(ValueError, match="one already-flattened effective layer"):
+        pepsy.contract_flat(
+            flat_layer,
+            chi=2,
+            method="dmrg",
+            fit_mode="sdc",
+            fit_layer_mode="sequential",
+            layer_tags=("BRA", "PEPO", "KET"),
+            progress=False,
+        )
 
 
 def test_compbdy_sequential_layer_mode_is_restricted_to_direct_modes():
@@ -2129,6 +2257,7 @@ def test_contract_flat_dmrg_uses_flat_boundary_path(monkeypatch):
     assert out == 7.0
     assert captured["bdymps_kwargs"]["tn_flat"] is tn
     assert captured["bdymps_kwargs"]["flat"] is True
+    assert captured["bdymps_kwargs"]["lazy"] is True
     assert captured["bdymps_kwargs"]["chi"] == 4
     assert captured["contract_kwargs"]["norm"] is tn
     assert captured["contract_kwargs"]["flat"] is True

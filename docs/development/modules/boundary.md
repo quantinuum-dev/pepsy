@@ -24,6 +24,12 @@ build_bra_ket(ket, bra?) -> BdyMPS(...) -> contract_boundary(...)
 tagged in place with `KET`; the bra layer is tagged with `BRA`; shared internal
 bra indices are reindexed with an `_*` suffix.
 
+The word `flat` has a specific meaning in this package. `tn_flat` and
+`flat=True` refer to one already-flattened effective lattice layer whose local
+bra/ket or operator contractions are complete. They do not mean an arbitrary
+stack of separately tagged layers. `tn_double` and `flat=False` are the
+multi-layer boundary path, normally used for the tagged BRA--KET network.
+
 `BdyMPS` initializes reusable row and column boundary MPS environments. Its
 `mps_b` dictionary uses keys like:
 
@@ -46,10 +52,12 @@ The local boundary solver is selected with `fit_mode`:
 - `"dmrg"` is an alias for `"eff"`.
 
 Direct Quimb modes support `fit_layer_mode="joint"` (default) or
-`"sequential"`. Sequential mode applies the selected direct compressor to
-each tagged layer in `layer_tags` order, which can be useful for a
-BRA--PEPO--KET boundary. It is intentionally unavailable for variational FIT
-modes, whose target remains the complete local layered network.
+`"sequential"` on the multilayer, non-flat boundary path. Sequential mode
+applies the selected direct compressor to each tagged layer in `layer_tags`
+order, which can be useful for a BRA--PEPO--KET boundary. It is intentionally
+unavailable for variational FIT modes, whose target remains the complete local
+layered network. `contract_flat(...)` is separate: it uses `flat=True` for one
+effective layer and requires the joint policy.
 
 Each boundary FIT can optionally use `fit_init_strategy="guess-direct"`,
 `"guess-src"`, or `"guess-sdc"`. These compress a copy of the exact
@@ -93,7 +101,13 @@ Reusing a boundary at a larger `chi` does not globally pad it first; lowering
   remains as a deprecated compatibility alias.
 - `peps_fidelity(...)`: return only fidelity by default, or preserve all three
   contraction results and their FIT diagnostics with `return_info=True`.
-- `contract_flat(...)`: contract an already-flat PEPS-like tensor network.
+- `contract_flat(...)`: contract one already-flattened effective PEPS-like
+  layer with the `flat=True` first-slice shortcut. It is not a multilayer
+  PEPS--PEPO--PEPS façade.
+- `contract_layered(...)`: contract a preassembled multilayer network with
+  explicit `layer_tags`, using the shared `CompBdy` engine and `flat=False`.
+  This is the high-level façade for sequential BRA--PEPO--KET-style
+  absorption without flattening the stack into one giant tensor network.
 
 Use `result.cost`, `result.fidel`, and `result.fit_diagnostics` from
 `BoundaryContractResult`; do not rely on tuple unpacking. Each typed boundary

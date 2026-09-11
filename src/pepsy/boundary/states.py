@@ -7,8 +7,15 @@ import warnings
 import numpy as np
 import quimb.tensor as qtn
 
+from ._lattice import infer_lattice_shape
 from ..tensors.core import backend_numpy, get_default_array_backend
-from .._internal.formatting import ansi_wrap, colorize_symbols, resolve_color_mode, style_show_line, style_show_lines
+from .._internal.formatting import (
+    ansi_wrap,
+    colorize_symbols,
+    resolve_color_mode,
+    style_show_line,
+    style_show_lines,
+)
 from ..backends.convert import (
     dispatch_backend_converter,
     infer_backend_and_dtype,
@@ -16,6 +23,34 @@ from ..backends.convert import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyBoundaryMap(dict):
+    """Dictionary that builds valid boundary keys on first access."""
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+
+    def __missing__(self, key):
+        self._owner._ensure_boundary_key(key)
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError as exc:  # pragma: no cover - defensive owner contract
+            raise KeyError(key) from exc
+
+    def get(self, key, default=None):
+        """Return a boundary, constructing a valid missing key on demand."""
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or self._owner._is_valid_boundary_key(key)
+
+    def __bool__(self):
+        return bool(dict.__len__(self)) or self._owner.ly > 1 or self._owner.lx > 1
 
 
 def make_numpy_array_caster(dtype=np.float64):
@@ -41,14 +76,25 @@ class BdyMPS:
     Parameters
     ----------
     tn_flat : qtn.TensorNetwork | None
-        Flattened tensor network used when ``flat=True``.
+        One already-flattened effective lattice layer used when ``flat=True``.
+        Local bra/ket or operator contractions should already have been done;
+        this is not a stack of separately tagged ``BRA``/``PEPO``/``KET``
+        layers. When ``flat=False`` and ``tn_double`` is also supplied, it is
+        optional and is used only as a shape/backend reference.
     tn_double : qtn.TensorNetwork | None
-        Double-layer tensor network used when ``flat=False``.
+        Preassembled multi-layer tensor network used when ``flat=False``,
+        typically a tagged ``BRA``--``KET`` double layer.
     chi : int
         Maximum bond dimension for generated boundary MPS tensors.
     flat : bool
-        If ``True``, initialize the first boundary slice directly from a
-        flattened tensor network.
+        If ``True``, initialize the first boundary slice directly from the
+        single effective layer in ``tn_flat``. This is an initialization
+        shortcut, not automatic handling of an arbitrary layer stack.
+    lazy : bool, default=False
+        If ``True``, defer boundary construction until a key is accessed. The
+        high-level contraction helpers enable this mode so they can build only
+        the requested sweep direction; eager construction remains the default
+        for callers that want the complete boundary map immediately.
     seed : int
         Random seed used during boundary randomization.
     single_layer : bool
@@ -75,6 +121,7 @@ class BdyMPS:
         flat=False,
         seed=1,
         single_layer=False,
+        lazy=False,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         if chi < 1:
             raise ValueError("chi must be >= 1")
@@ -95,6 +142,7 @@ class BdyMPS:
         self.seed = seed
         self._chi_target = int(chi)
         self.flat = flat
+        self.lazy = bool(lazy)
         # Lattice shape is immutable after construction; cache on first access.
         self._lx = None
         self._ly = None
@@ -114,7 +162,7 @@ class BdyMPS:
         self.numpy_backend = make_numpy_array_caster(dtype=dtype_name)
 
         # Validate that lattice dimensions can be resolved early.
-        self._infer_lattice_shape(tn_ref, self._tn_norm)
+        self._lx, self._ly = self._infer_lattice_shape(tn_ref, self._tn_norm)
 
         if self.flat and single_layer:
             warnings.warn(
@@ -125,7 +173,13 @@ class BdyMPS:
             )
             single_layer = False
 
-        self.mps_b = self._initialize_all_boundaries(single_layer=single_layer)
+        self._single_layer = bool(single_layer)
+
+        self.mps_b = (
+            _LazyBoundaryMap(self)
+            if self.lazy
+            else self._initialize_all_boundaries(single_layer=single_layer)
+        )
 
     @staticmethod
     def _build_to_numpy(sample_data, dtype_name):
@@ -202,6 +256,108 @@ class BdyMPS:
             boundaries |= update
         return boundaries
 
+    def _all_boundary_keys(self):
+        """Return every valid boundary key without constructing its MPS."""
+        return [
+            f"{prefix}{step}_{suffix}"
+            for prefix, length in (("Y", self.ly), ("X", self.lx))
+            for step in range(max(length - 1, 0))
+            for suffix in ("l", "r")
+        ]
+
+    def _is_valid_boundary_key(self, key):
+        """Return whether ``key`` names a boundary in the current lattice."""
+        if not isinstance(key, str):
+            return False
+        meta = self._boundary_key_metadata(key)
+        if meta["prefix"] is None:
+            return False
+        axis_length = self.ly if meta["prefix"] == "Y" else self.lx
+        return 0 <= meta["step"] < axis_length - 1
+
+    def _ensure_boundary_key(self, key):
+        """Build one requested boundary and its missing predecessor chain."""
+        if dict.__contains__(self.mps_b, key):
+            return
+        if not self.lazy or not self._is_valid_boundary_key(key):
+            raise KeyError(key)
+
+        meta = self._boundary_key_metadata(key)
+        site_tag_id, cut_tag_id = (
+            ("X{}", "Y{}") if meta["prefix"] == "Y" else ("Y{}", "X{}")
+        )
+        side = "left" if meta["suffix"] == "l" else "right"
+        prefix = meta["prefix"]
+
+        # Continue from the longest contiguous prefix already present. This
+        # avoids rebuilding the same environment chain after an earlier key
+        # has been requested from the lazy map.
+        start_step = 0
+        while dict.__contains__(
+            self.mps_b,
+            f"{prefix}{start_step}_{meta['suffix']}",
+        ):
+            start_step += 1
+
+        initializer = (
+            self._initialize_single_layer_boundaries
+            if self._single_layer
+            else self._initialize_multi_layer_boundaries
+        )
+        update = initializer(
+            side=side,
+            site_tag_id=site_tag_id,
+            cut_tag_id=cut_tag_id,
+            upto_step=meta["step"],
+            start_step=start_step,
+        )
+        self.mps_b.update(update)
+
+    def _ensure_boundaries(self, direction=None, side=None, upto_step=None):
+        """Build selected lazy boundaries, or all directions when unspecified."""
+        if not self.lazy:
+            return
+
+        prefixes = (
+            [self._normalize_boundary_direction(direction)]
+            if direction is not None
+            else ["Y", "X"]
+        )
+        suffixes = (
+            [self._normalize_boundary_side(side)]
+            if side is not None
+            else ["l", "r"]
+        )
+        if upto_step is not None:
+            if not isinstance(upto_step, (int, np.integer)):
+                raise TypeError("upto_step must be an integer or None")
+            upto_step = int(upto_step)
+            if upto_step < 0:
+                raise ValueError("upto_step must be >= 0")
+
+        for prefix in prefixes:
+            max_step = (self.ly if prefix == "Y" else self.lx) - 2
+            if upto_step is not None:
+                max_step = min(max_step, upto_step)
+            if max_step < 0:
+                continue
+            for suffix in suffixes:
+                self._ensure_boundary_key(f"{prefix}{max_step}_{suffix}")
+
+    def ensure_boundaries(self, direction=None, side=None, upto_step=None):
+        """Materialize selected lazy boundaries and return ``self``.
+
+        This is primarily useful for high-level contraction helpers that know
+        the requested sweep direction. Direct key access through ``mps_b``
+        remains lazy as well.
+        """
+        self._ensure_boundaries(
+            direction=direction,
+            side=side,
+            upto_step=upto_step,
+        )
+        return self
+
     @property
     def ly(self):
         """Lattice size along the vertical axis."""
@@ -224,7 +380,7 @@ class BdyMPS:
     @property
     def chi(self):
         """Return the current largest bond dimension across all boundary MPS."""
-        if not getattr(self, "mps_b", None):
+        if len(getattr(self, "mps_b", {})) == 0:
             return int(self._chi_target)
         return max(int(mps.max_bond()) for mps in self.mps_b.values())
 
@@ -240,7 +396,9 @@ class BdyMPS:
     @property
     def norm(self):
         """Return the mean of ``mps.norm()`` across all stored boundaries."""
-        if not self.mps_b:
+        if self.lazy:
+            self._ensure_boundaries()
+        if len(self.mps_b) == 0:
             raise ValueError("No boundary MPS available to compute norm.")
 
         norms = [mps.norm() for mps in self.mps_b.values()]
@@ -282,7 +440,9 @@ class BdyMPS:
         chi = int(chi)
         if chi < 1:
             raise ValueError("chi must be >= 1")
-        if not self.mps_b:
+        if self.lazy:
+            self._ensure_boundaries()
+        if len(self.mps_b) == 0:
             raise ValueError("No boundary MPS available to retune.")
 
         target = self.mps_b if inplace else {key: mps.copy() for key, mps in self.mps_b.items()}
@@ -316,7 +476,9 @@ class BdyMPS:
         BdyMPS
             ``self`` for chaining.
         """
-        if not self.mps_b:
+        if self.lazy:
+            self._ensure_boundaries()
+        if len(self.mps_b) == 0:
             raise ValueError("No boundary MPS available to normalize.")
 
         for mps in self.mps_b.values():
@@ -362,7 +524,11 @@ class BdyMPS:
 
     def available_boundary_keys(self, direction=None, side=None):
         """Return sorted boundary keys, optionally filtered by direction/side."""
-        keys = sorted(self.mps_b)
+        keys = (
+            sorted(self._all_boundary_keys())
+            if self.lazy
+            else sorted(self.mps_b)
+        )
         if direction is not None:
             prefix = self._normalize_boundary_direction(direction)
             keys = [entry for entry in keys if entry.startswith(prefix)]
@@ -382,7 +548,7 @@ class BdyMPS:
         prefix = self._normalize_boundary_direction(direction)
         suffix = self._normalize_boundary_side(side)
         key = f"{prefix}{step}_{suffix}"
-        if key not in self.mps_b:
+        if not self._is_valid_boundary_key(key):
             candidates = self.available_boundary_keys(direction=direction, side=side)
             available = ", ".join(candidates) if candidates else ", ".join(sorted(self.mps_b))
             raise KeyError(
@@ -734,41 +900,22 @@ class BdyMPS:
         return keys
 
 
-    @staticmethod
-    def _max_tag_number(tags, prefix):
-        pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
-        nums = [int(match.group(1)) for tag in tags if (match := pattern.match(tag))]
-        return max(nums) if nums else None
-
     def _infer_lattice_shape(self, tn_ref, tn_fallback):
         """Infer ``(lx, ly)`` from explicit attributes or X/Y tags."""
-        for tn in (tn_ref, tn_fallback):
-            if tn is None:
-                continue
-            lx = getattr(tn, "Lx", None)
-            ly = getattr(tn, "Ly", None)
-            if lx is not None and ly is not None:
-                return int(lx), int(ly)
-
+        fallback_has_shape = (
+            tn_fallback is not None
+            and getattr(tn_fallback, "Lx", None) is not None
+            and getattr(tn_fallback, "Ly", None) is not None
+        )
         if tn_ref is not None and (
             getattr(tn_ref, "Lx", None) is None
             or getattr(tn_ref, "Ly", None) is None
-        ):
+        ) and not fallback_has_shape:
             logger.warning(
                 "Lx/Ly not found on reference TN; inferring lattice shape "
                 "from X*/Y* tags."
             )
-
-        tags = getattr(tn_fallback, "tags", ())
-        max_x = self._max_tag_number(tags, "X")
-        max_y = self._max_tag_number(tags, "Y")
-        if max_x is not None and max_y is not None:
-            return max_x + 1, max_y + 1
-
-        raise ValueError(
-            "Could not infer lattice shape. Provide a network with Lx/Ly "
-            "or X*/Y* tags."
-        )
+        return infer_lattice_shape(tn_ref, tn_fallback)
 
     def _get_axis_length_for_site_tag(self, site_tag_id):
         if site_tag_id == "X{}":
@@ -913,12 +1060,15 @@ class BdyMPS:
         side,
         site_tag_id="X{}",
         cut_tag_id="Y{}",
+        upto_step=None,
+        start_step=0,
     ):
         length = self._get_axis_length_for_site_tag(site_tag_id)
         suffix = "l" if side == "left" else "r"
         boundaries = {}
 
-        for step in range(length - 1):
+        stop = length - 1 if upto_step is None else min(int(upto_step) + 1, length - 1)
+        for step in range(start_step, stop):
             cut_pos = step if side == "left" else (length - 1 - step)
             key = f"{cut_tag_id.format(step)}_{suffix}"
             tn = self._tn_norm.select(cut_tag_id.format(cut_pos), "any").copy()
@@ -930,7 +1080,10 @@ class BdyMPS:
             if step == 0:
                 mps_net = tn
             else:
-                prev = boundaries[self._previous_boundary_key(cut_tag_id, step, suffix)]
+                previous_key = self._previous_boundary_key(cut_tag_id, step, suffix)
+                prev = boundaries.get(previous_key)
+                if prev is None and hasattr(self, "mps_b"):
+                    prev = self.mps_b.get(previous_key)
                 mps_net = tn | prev
 
             boundaries[key] = self._build_single_layer_boundary_mps(
@@ -945,13 +1098,16 @@ class BdyMPS:
         side,
         site_tag_id="X{}",
         cut_tag_id="Y{}",
+        upto_step=None,
+        start_step=0,
     ):
         length = self._get_axis_length_for_site_tag(site_tag_id)
         suffix = "l" if side == "left" else "r"
         default_count = self._get_default_site_count(site_tag_id)
         boundaries = {}
 
-        for step in range(length - 1):
+        stop = length - 1 if upto_step is None else min(int(upto_step) + 1, length - 1)
+        for step in range(start_step, stop):
             cut_pos = step if side == "left" else (length - 1 - step)
             key = f"{cut_tag_id.format(step)}_{suffix}"
             tn = self._tn_norm.select(cut_tag_id.format(cut_pos), "any").copy()
@@ -963,7 +1119,10 @@ class BdyMPS:
             if step == 0:
                 mps_net = tn
             else:
-                prev = boundaries[self._previous_boundary_key(cut_tag_id, step, suffix)]
+                previous_key = self._previous_boundary_key(cut_tag_id, step, suffix)
+                prev = boundaries.get(previous_key)
+                if prev is None and hasattr(self, "mps_b"):
+                    prev = self.mps_b.get(previous_key)
                 mps_net = tn | prev
 
             boundaries[key] = self._build_multi_layer_boundary_mps(

@@ -1,7 +1,6 @@
 """Boundary-MPS sweep utilities for approximate 2D tensor-network contraction."""
 
 from copy import deepcopy
-import re
 from dataclasses import dataclass
 from numbers import Integral
 import time
@@ -14,6 +13,7 @@ from tqdm.auto import tqdm
 from .._internal.cutoff import dtype_auto_cutoff
 from ..tensors.core import tn_fidelity
 from ..fitting.local import FIT
+from ._lattice import has_numbered_axis_tag, infer_lattice_shape
 
 __all__ = ["BoundaryFitDiagnostic", "CompBdy"]
 
@@ -154,27 +154,16 @@ class BoundaryFitDiagnostic:
     one_site_refinement_sweeps: int = 0
 
 
-def max_tag_number(tags, tag_format):
-    """Return the maximum numeric suffix matching tag pattern ``tag_format``."""
-    prefix = tag_format[:-2]
-    pattern = re.compile(rf"^{prefix}(\d+)$")
-
-    nums = []
-    for tag in tags:
-        match = pattern.match(tag)
-        if match:
-            nums.append(int(match.group(1)))
-
-    return max(nums) if nums else None
-
-
 class CompBdy:  # pylint: disable=too-many-instance-attributes
-    """Approximate double-layer contraction via boundary-MPS sweeps.
+    """Approximate 2D tensor-network contraction via boundary-MPS sweeps.
 
     The class fits boundary MPS tensors slice-by-slice on a tagged 2D
-    double-layer tensor network (``norm``), then contracts the resulting
-    boundary pair to a scalar. It also supports boundary-only updates
-    (full side or single-step) without final contraction.
+    tensor network (``norm``), then contracts the resulting boundary pair to
+    a scalar. ``flat=True`` is a shortcut for a single already-flattened
+    effective layer: it uses the first slice directly and skips fitting that
+    initial slice. It does not mean that a ``BRA``/``PEPO``/``KET`` stack has
+    been automatically flattened. The class also supports boundary-only
+    updates (full side or single-step) without final contraction.
 
     Parameters
     ----------
@@ -202,7 +191,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         For direct Quimb compression modes, combine all tagged layers in one
         local boundary target (``"joint"``), or compress them one at a time
         in the order given by ``layer_tags`` (``"sequential"``). Sequential
-        compression is intentionally unavailable for variational FIT modes.
+        compression is intended for explicitly layered non-flat targets and
+        is unavailable for variational FIT modes.
     layer_tags : sequence[str] | None, default=None
         Layer tags and, for ``fit_layer_mode="sequential"``, their absorption
         order. The standard two-layer order is ``("KET", "BRA")``. Supply
@@ -390,15 +380,17 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.x_left = 0
         self.x_right = 0
 
-        # Extract lattice sizes from tags.
-        max_y = max_tag_number(list(norm.tags), "Y{}")
-        max_x = max_tag_number(list(norm.tags), "X{}")
-        if max_y is None or max_x is None:
+        # Use the same Lx/Ly-or-tag inference as BdyMPS, while still requiring
+        # numbered axis tags because sweep slices are selected by those tags.
+        self.Lx, self.Ly = infer_lattice_shape(norm)
+        if not (
+            has_numbered_axis_tag(norm, "X")
+            and has_numbered_axis_tag(norm, "Y")
+        ):
             raise ValueError(
-                "norm must include X*/Y* tags so lattice shape can be inferred."
+                "norm must include numbered X*/Y* tags so boundary slices "
+                "can be selected."
             )
-        self.Ly = 1 + max_y
-        self.Lx = 1 + max_x
         self._update_separation()
 
     def _reset_fidelity_history(self):
@@ -476,6 +468,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             if not isinstance(mps_boundaries, dict):
                 raise TypeError("mps_boundaries must be a dictionary of boundary states.")
             self.mps_boundaries = mps_boundaries
+
+        if flat and self.fit_layer_mode != "joint":
+            raise ValueError(
+                "flat=True handles one already-flattened effective layer and "
+                "requires fit_layer_mode='joint'; use an explicitly layered "
+                "non-flat target for sequential compression."
+            )
 
         self.retag = retag
         self.visualize = visualize

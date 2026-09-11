@@ -8,8 +8,8 @@ ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
 ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
 
 bdy = pepsy.BdyMPS(
-    tn_flat=ket_tagged,
-    tn_double=norm,
+    tn_flat=ket_tagged,  # optional single-layer shape/backend reference
+    tn_double=norm,      # BRA--KET target used because flat=False
     chi=32,
     single_layer=False,
 )

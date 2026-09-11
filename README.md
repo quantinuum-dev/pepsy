@@ -64,6 +64,8 @@ import quimb.tensor as qtn
 ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
 ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
 
+# ``tn_double`` drives the BRA--KET boundary path. ``tn_flat`` is an optional
+# single-layer reference here; it is the contraction target only with flat=True.
 bdy = pepsy.BdyMPS(tn_flat=ket_tagged, tn_double=norm, chi=32, single_layer=False)
 res = pepsy.contract_boundary(norm=norm, bdy=bdy, direction="y", n_iter=2)
 
