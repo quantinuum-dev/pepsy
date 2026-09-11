@@ -31,6 +31,11 @@ default. `run()` accepts the ordinary MPS FIT controls, including `n_iter`,
 `fit_adaptive_sweeps`, `fit_sweep_sequence`, `finite_check`, and optional
 `fit_overlap_diagnostics`. `fit_rtol="auto"` is dtype-aware; `None` requests
 fixed sweeps. The default FIT warm start is `fit_init_strategy="guess-src"`.
+Optional performance diagnostics are disabled by default: `finite_check=False`,
+`fit_overlap_diagnostics=False`, and `timing=False`. Untimed replay performs no
+profiling clock reads and leaves `get_run_timing()` unset. Per-update STN
+norm-survival tracking remains part of the simulator's fidelity contract and
+is independent of these optional diagnostics.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
 native-compressed FIT guess before active bonds reach their `chi` ceilings;

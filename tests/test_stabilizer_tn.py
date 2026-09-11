@@ -8,6 +8,7 @@ Covers Phase 1 (state container + statevector reconstruction) and Phase 2
 import math
 import sys
 import types
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -829,6 +830,86 @@ def test_stn_fidelity_tracking_is_automatic_without_legacy_flag():
         StabilizerMpsSimulator(2, chi=1, track_infidelity=True)
 
 
+@pytest.mark.parametrize("mode", ("direct", "src", "dmrg2"))
+def test_stn_modes_skip_clocks_when_timing_disabled(monkeypatch, mode):
+    """Normal replay must not touch the profiling clock in any mode family."""
+    import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
+
+    sim = StabilizerMpsSimulator(
+        3,
+        gates=[("rxx", 0.37, 0, 2)],
+        chi=2,
+        mode=mode,
+        exact_cooling=False,
+    )
+
+    def fail_clock():
+        raise AssertionError("timing=False must not read the profiling clock")
+
+    monkeypatch.setattr(
+        optimizer_module,
+        "time",
+        types.SimpleNamespace(perf_counter=fail_clock),
+    )
+    if mode == "dmrg2":
+        monkeypatch.setattr(optimizer_module.FIT, "_timing_mark", fail_clock)
+
+    sim.run(timing=False)
+
+    assert sim.get_run_timing() is None
+
+
+def test_stn_shot_replay_skips_clock_when_timing_disabled(monkeypatch):
+    """Untimed trajectory replay must not allocate a parent timing record."""
+    import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
+
+    sim = StabilizerMpsSimulator(
+        1,
+        gates=[("x_error", 0.5, 0)],
+    )
+
+    def fail_clock():
+        raise AssertionError("timing=False must not read the profiling clock")
+
+    monkeypatch.setattr(
+        optimizer_module,
+        "time",
+        types.SimpleNamespace(perf_counter=fail_clock),
+    )
+
+    result = sim.run(shots=2, seed=3, timing=False)
+
+    assert result.shots == 2
+    assert sim.get_run_timing() is None
+
+
+def test_stn_timing_and_expensive_fit_diagnostics_are_opt_in(monkeypatch):
+    """Only an explicit request enables replay timing or FIT target overlap."""
+    sim = StabilizerMpsSimulator(
+        3,
+        gates=[("rxx", 0.37, 0, 2)],
+        chi=2,
+        mode="dmrg2",
+        exact_cooling=False,
+    )
+
+    def fail_overlap(*_args, **_kwargs):
+        raise AssertionError("FIT overlap diagnostics must remain opt-in")
+
+    monkeypatch.setattr(sim, "_fit_overlap_diagnostics_for_target", fail_overlap)
+
+    sim.run(timing=True)
+
+    timing = sim.get_run_timing()
+    diagnostics = sim.get_fit_diagnostics()
+    assert timing["enabled"] is True
+    assert timing["elapsed_seconds"] >= 0.0
+    assert diagnostics["fit_overlap_diagnostics"] is False
+    assert diagnostics["fit_overlap_fidelity"] is None
+    assert diagnostics["fit_overlap_infidelity"] is None
+    assert sim._fit_finite_check is False
+
+
 def test_stn_stabilize_unitary_preserves_norm_but_not_fidelity_ledger():
     stream = [("rxx", 0.73, 0, 2), ("rxx", 0.51, 0, 2)]
     raw = StabilizerMpsSimulator(
@@ -1292,6 +1373,44 @@ def test_operator_tolerance_must_be_finite_and_nonnegative(operator_tol):
 def test_pauli_decomposition_budget_validation(value, error):
     with pytest.raises(error, match="max_pauli_decomposition_qubits"):
         StabilizerMpsSimulator(1, max_pauli_decomposition_qubits=value)
+
+
+@pytest.mark.parametrize("chi", [0, -2, True, np.bool_(False), 1.5, "4"])
+def test_stabilizer_mps_chi_must_be_a_positive_integer_or_none(chi):
+    with pytest.raises(ValueError, match="chi must be a positive integer"):
+        StabilizerMpsSimulator(2, chi=chi)
+
+
+def test_stabilizer_mps_chi_accepts_numpy_integer_and_exact_discards_cap():
+    assert StabilizerMpsSimulator(2, chi=np.int64(3)).chi == 3
+    assert StabilizerMpsSimulator(2, chi=3, mode="exact").chi is None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit-oversample",
+    ),
+)
+def test_stabilizer_mps_finite_chi_modes_fail_before_replay(mode):
+    with pytest.raises(ValueError, match="requires a finite chi"):
+        StabilizerMpsSimulator(2, chi=None, mode=mode)
+
+
+def test_set_mode_rejects_missing_required_chi_without_mutation():
+    sim = StabilizerMpsSimulator(2, chi=None, mode="direct")
+
+    with pytest.raises(ValueError, match="requires a finite chi"):
+        sim.set_mode("src")
+
+    assert sim.mode == "direct"
+    assert sim.chi is None
 
 
 def test_copy_preserves_pauli_decomposition_budget():
@@ -2928,6 +3047,70 @@ def test_measure_rejects_invalid_forced_outcome_without_mutation(outcome):
     with pytest.raises(ValueError, match=r"exactly \+1 or -1"):
         sim.measure("Z", 0, outcome=outcome)
     assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("outcome", [(+1, 0), (+1, True), (+1, 0.5)])
+def test_measure_reset_validates_all_forced_outcomes_before_mutation(outcome):
+    sim = StabilizerMpsSimulator(2).apply([("h", 0), ("h", 1)])
+    before_state = sim.to_statevector()
+    before_tableau = sim.state._sim.current_inverse_tableau()
+    before_history = (
+        list(sim.measurements),
+        deepcopy(sim.norm_events),
+        list(sim.bond_history),
+    )
+
+    with pytest.raises(ValueError, match=r"exactly \+1 or -1"):
+        sim.measure_reset("Z", (0, 1), outcome=outcome, order="input")
+
+    np.testing.assert_allclose(sim.to_statevector(), before_state, atol=1e-12)
+    assert sim.state._sim.current_inverse_tableau() == before_tableau
+    assert (
+        list(sim.measurements),
+        sim.norm_events,
+        list(sim.bond_history),
+    ) == before_history
+
+
+def test_measure_reset_impossible_late_outcome_rolls_back_whole_batch():
+    sim = StabilizerMpsSimulator(2, seed=2).apply(
+        [("h", 0), ("cnot", 0, 1)]
+    )
+    before_state = sim.to_statevector()
+    before_tableau = sim.state._sim.current_inverse_tableau()
+    before_rng = deepcopy(sim._rng.bit_generator.state)
+    before_history = (
+        list(sim.measurements),
+        deepcopy(sim.norm_events),
+        list(sim.bond_history),
+        list(sim.infidelities),
+    )
+
+    with pytest.raises(ValueError, match="0 probability"):
+        sim.measure_reset(
+            "Z",
+            (0, 1),
+            outcome=(None, -1),
+            order="input",
+        )
+
+    np.testing.assert_allclose(sim.to_statevector(), before_state, atol=1e-12)
+    assert sim.state._sim.current_inverse_tableau() == before_tableau
+    assert sim._rng.bit_generator.state == before_rng
+    assert (
+        list(sim.measurements),
+        sim.norm_events,
+        list(sim.bond_history),
+        list(sim.infidelities),
+    ) == before_history
+
+
+@pytest.mark.parametrize("outcome", [0, True, 0.5])
+def test_measurement_event_builders_reject_invalid_forced_outcomes(outcome):
+    with pytest.raises(ValueError, match=r"exactly \+1 or -1"):
+        StabilizerMpsSimulator.measure_event("Z", 0, outcome)
+    with pytest.raises(ValueError, match=r"exactly \+1 or -1"):
+        StabilizerMpsSimulator.measure_reset_event("Z", 0, outcome)
 
 
 # --------------------------------------------------------------------------- #

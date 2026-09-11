@@ -21,6 +21,11 @@ def _configuration(opt):
             opt.compression_seed, opt.track_infidelity, opt.chi, opt.cutoff)
 
 
+def test_constructor_propagates_map_mode_to_automatic_layout():
+    opt = TreeOptimizer(None, n=8, map_mode="coarse-alternate-x", run=False)
+    assert opt.plan.map_mode == "coarse-alternate-x"
+
+
 @pytest.mark.parametrize("mode", [
     "direct", "dm", "src", "sdc", "zipup", "dmrg1", "dmrg2", "dmrg3",
 ])

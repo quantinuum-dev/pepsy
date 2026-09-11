@@ -380,18 +380,31 @@ def _normalize_outcomes(outcome, where, *, event):
     """Return one optional forced outcome per site."""
     if outcome is None:
         return (None,) * len(where)
-    if isinstance(outcome, Integral):
-        return (int(outcome),) * len(where)
     if isinstance(outcome, (tuple, list)):
         if len(outcome) != len(where):
             raise ValueError(
                 f"{event} outcome sequence has length {len(outcome)} but where "
                 f"{where!r} has {len(where)} site(s)."
             )
-        return tuple(None if value is None else int(value) for value in outcome)
-    raise ValueError(
-        f"{event} outcome must be an int, None, or a sequence matching where."
-    )
+        return tuple(_validate_forced_outcome(value) for value in outcome)
+    value = _validate_forced_outcome(outcome)
+    return (value,) * len(where)
+
+
+def _validate_forced_outcome(outcome):
+    """Return one forced Pauli outcome, requiring exactly integer +/-1."""
+    if outcome is None:
+        return None
+    if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
+        raise ValueError(
+            f"outcome must be exactly +1 or -1, got {outcome!r}."
+        )
+    value = int(outcome)
+    if value not in (-1, 1):
+        raise ValueError(
+            f"outcome must be exactly +1 or -1, got {outcome!r}."
+        )
+    return value
 
 
 def _parse_reset_args(params, *, default_axis=None):
@@ -787,9 +800,7 @@ class StabilizerMpsSimulator:
             )
 
         self.mode = self._normalize_mode(mode)
-        self.chi = None if chi is None else int(chi)
-        if self.mode == "exact":
-            self.chi = None
+        self.chi = self._normalize_chi(chi, mode=self.mode)
         self.fit_init_strategy = self._normalize_fit_init_strategy(
             fit_init_strategy
         )
@@ -973,6 +984,15 @@ class StabilizerMpsSimulator:
     # ------------------------------------------------------------------ #
     _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
     _CANONICAL_MPO_MODES = frozenset(_MPO_COMPRESSION_METHODS)
+    _FINITE_CHI_MPO_METHODS = frozenset({
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit-oversample",
+    })
     _LEGACY_MODE_NAMES = frozenset({"quimb", "mpo"})
     _LEGACY_MODE_PREFIXES = ("quimb-", "mpo-")
     _ALLOWED_MODES = frozenset(
@@ -1094,9 +1114,30 @@ class StabilizerMpsSimulator:
 
     @staticmethod
     def _validate_positive_int(value, name):
-        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Integral)
+            or value < 1
+        ):
             raise ValueError(f"{name} must be a positive integer.")
         return int(value)
+
+    @classmethod
+    def _normalize_chi(cls, chi, *, mode):
+        """Validate a bond cap and its compression-mode requirements."""
+        if chi is not None:
+            chi = cls._validate_positive_int(chi, "chi")
+        if mode == "exact":
+            return None
+        if (
+            chi is None
+            and cls._is_quimb_mode(mode)
+            and cls._mode_quimb_method(mode) in cls._FINITE_CHI_MPO_METHODS
+        ):
+            raise ValueError(
+                f"StabilizerMpsSimulator mode {mode!r} requires a finite chi."
+            )
+        return chi
 
     @classmethod
     def _normalize_fit_init_strategy(cls, strategy):
@@ -1125,13 +1166,16 @@ class StabilizerMpsSimulator:
         """Switch compression mode while preserving the represented state."""
         new_mode = self._normalize_mode(mode)
         if new_mode == "exact":
-            self.chi = None
+            new_chi = None
         elif self.mode == "exact" and self.chi is None:
             raise ValueError(
                 "cannot leave mode='exact' after its finite chi was discarded; "
                 "create a new optimizer with chi first."
             )
+        else:
+            new_chi = self._normalize_chi(self.chi, mode=new_mode)
         self.mode = new_mode
+        self.chi = new_chi
         requested_cutoff_mode = self._requested_cutoff_mode
         if requested_cutoff_mode is None or (
             isinstance(requested_cutoff_mode, str)
@@ -1405,6 +1449,7 @@ class StabilizerMpsSimulator:
     ):
         """Build a canonical Pauli-measurement event shared with MPS."""
         where = _normalize_sites(where)
+        outcome = _validate_forced_outcome(outcome)
         if absorb_basis is not None or disentangle is not None:
             absorb_basis = _resolve_measurement_disentangle(
                 absorb_basis,
@@ -1414,9 +1459,9 @@ class StabilizerMpsSimulator:
         entry = ("measure", str(pauli), where)
         if absorb_basis is None:
             if outcome is not None:
-                entry += (int(outcome),)
+                entry += (outcome,)
         else:
-            entry += (None if outcome is None else int(outcome), bool(absorb_basis))
+            entry += (outcome, bool(absorb_basis))
         return entry
 
     @staticmethod
@@ -3348,14 +3393,19 @@ class StabilizerMpsSimulator:
         if mode is not None:
             # ``mode`` is retained after the replay; the other run controls are
             # restored in ``_restore_run_configuration`` when the queue ends.
-            self.mode = self._normalize_mode(mode)
-            if self.mode == "exact":
-                self.chi = None
-            elif original["mode"] == "exact" and original["chi"] is None:
+            new_mode = self._normalize_mode(mode)
+            if (
+                new_mode != "exact"
+                and original["mode"] == "exact"
+                and original["chi"] is None
+            ):
                 raise ValueError(
                     "run(mode=...) cannot recover a finite chi after an exact "
                     "optimizer was constructed; create it with chi first."
                 )
+            new_chi = self._normalize_chi(self.chi, mode=new_mode)
+            self.mode = new_mode
+            self.chi = new_chi
             self._dmrg1_one_site_locked = False
 
         requested_cutoff = self.cutoff if cutoff is None else cutoff
@@ -3563,7 +3613,8 @@ class StabilizerMpsSimulator:
             Show one aggregate rank-zero progress bar for MPI runs.
         timing : bool
             Record a lightweight wall-clock replay record available through
-            :meth:`get_run_timing`.
+            :meth:`get_run_timing`. The default ``False`` performs no replay
+            profiling clock reads and allocates no timing record.
         transactional : bool
             If true, restore the STN state and diagnostics when an entry fails;
             the failed entry and suffix remain queued for retry. This is opt-in
@@ -3646,7 +3697,7 @@ class StabilizerMpsSimulator:
             or checkpoint_path is not None
         )
         if shot_requested:
-            started = time.perf_counter()
+            started = time.perf_counter() if timing else None
             result = self._run_shots(
                 shots,
                 error_model=error_model,
@@ -3672,12 +3723,13 @@ class StabilizerMpsSimulator:
                 collect_diagnostics=collect_diagnostics,
                 checkpoint_id=checkpoint_id,
             )
-            self._last_run_timing = {
-                "enabled": bool(timing),
-                "mode": "trajectory" if error_model is None else "noisy",
-                "entries": len(self._gate_stream),
-                "elapsed_seconds": float(time.perf_counter() - started),
-            }
+            if timing:
+                self._last_run_timing = {
+                    "enabled": True,
+                    "mode": "trajectory" if error_model is None else "noisy",
+                    "entries": len(self._gate_stream),
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                }
             return result
 
         run_configuration = self._prepare_run_configuration(
@@ -3707,7 +3759,7 @@ class StabilizerMpsSimulator:
         pbar = None
         snapshot = self._execution_snapshot() if transactional else None
         rolled_back = False
-        started = time.perf_counter()
+        started = time.perf_counter() if timing else None
         if progbar and queue:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
@@ -3738,13 +3790,14 @@ class StabilizerMpsSimulator:
                 pbar.close()
             if completed and not rolled_back:
                 del self._queue[:completed]
-            self._last_run_timing = {
-                "enabled": bool(timing),
-                "mode": "direct",
-                "entries": len(queue),
-                "completed": completed,
-                "elapsed_seconds": float(time.perf_counter() - started),
-            }
+            if timing:
+                self._last_run_timing = {
+                    "enabled": True,
+                    "mode": "direct",
+                    "entries": len(queue),
+                    "completed": completed,
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                }
             self._restore_run_configuration(
                 run_configuration,
                 keep_mode=mode is not None,
@@ -6035,16 +6088,7 @@ class StabilizerMpsSimulator:
     def _apply_quimb_submpo(self, p, mpo, where, *, method, max_bond, info):
         """Apply one coefficient-frame sub-MPO with the selected Quimb method."""
         method = self._normalize_quimb_method(method)
-        requires_chi = {
-            "src",
-            "src-first",
-            "src-oversample",
-            "srcmps",
-            "srcmps-first",
-            "srcmps-oversample",
-            "fit-oversample",
-        }
-        if max_bond is None and method in requires_chi:
+        if max_bond is None and method in self._FINITE_CHI_MPO_METHODS:
             raise ValueError(
                 f"StabilizerMpsSimulator mode {method!r} requires a finite chi."
             )
@@ -6701,14 +6745,7 @@ class StabilizerMpsSimulator:
     @staticmethod
     def _validate_outcome(outcome):
         """Return a forced Pauli outcome, requiring exactly integer +/-1."""
-        if outcome is None:
-            return None
-        if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
-            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
-        value = int(outcome)
-        if value not in (-1, 1):
-            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
-        return value
+        return _validate_forced_outcome(outcome)
 
     @staticmethod
     def _outcome_probability(expectation, outcome):
@@ -6905,72 +6942,87 @@ class StabilizerMpsSimulator:
         remaining = list(range(len(operations)))
         result = [None] * len(operations)
         schedule = []
+        # A later impossible forced outcome must not leave an earlier collapse,
+        # reset, diagnostic, or RNG draw committed. Only forced multi-operation
+        # batches need this snapshot; sampled-only batches cannot fail due to
+        # impossible postselection.
+        snapshot = (
+            self._execution_snapshot()
+            if len(operations) > 1
+            and any(operation[2] is not None for operation in operations)
+            else None
+        )
 
-        for step in range(len(operations)):
-            if normalized_order == "input":
-                input_index = remaining.pop(0)
-            elif normalized_order == "min_span":
-                candidate_info = {
-                    index: self._measurement_span_info(
-                        operations[index][0],
-                        operations[index][1],
+        try:
+            for step in range(len(operations)):
+                if normalized_order == "input":
+                    input_index = remaining.pop(0)
+                elif normalized_order == "min_span":
+                    candidate_info = {
+                        index: self._measurement_span_info(
+                            operations[index][0],
+                            operations[index][1],
+                            absorb_basis=absorb_basis,
+                        )
+                        for index in remaining
+                    }
+                    input_index = min(
+                        remaining,
+                        key=lambda index: (
+                            candidate_info[index]["span"],
+                            candidate_info[index]["localizer_distance"],
+                            len(candidate_info[index]["frame_support"]),
+                            index,
+                        ),
+                    )
+                    remaining.remove(input_index)
+                else:
+                    rank = {
+                        index: position
+                        for position, index in enumerate(normalized_order)
+                    }
+                    input_index = min(remaining, key=rank.__getitem__)
+                    remaining.remove(input_index)
+
+                axis, qubit, forced = operations[input_index]
+                info = (
+                    candidate_info[input_index]
+                    if normalized_order == "min_span"
+                    else self._measurement_span_info(
+                        axis,
+                        qubit,
                         absorb_basis=absorb_basis,
                     )
-                    for index in remaining
-                }
-                input_index = min(
-                    remaining,
-                    key=lambda index: (
-                        candidate_info[index]["span"],
-                        candidate_info[index]["localizer_distance"],
-                        len(candidate_info[index]["frame_support"]),
-                        index,
-                    ),
                 )
-                remaining.remove(input_index)
-            else:
-                rank = {
-                    index: position
-                    for position, index in enumerate(normalized_order)
-                }
-                input_index = min(remaining, key=rank.__getitem__)
-                remaining.remove(input_index)
-
-            axis, qubit, forced = operations[input_index]
-            info = (
-                candidate_info[input_index]
-                if normalized_order == "min_span"
-                else self._measurement_span_info(
-                    axis,
-                    qubit,
-                    absorb_basis=absorb_basis,
-                )
-            )
-            if reset:
-                m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
-                outcome = self._absorb_measure(
-                    m_pauli,
-                    None,
-                    norm_event_kind="reset",
-                )
-            else:
-                outcome = self.measure(
-                    axis,
-                    qubit,
-                    outcome=forced,
-                    absorb_basis=absorb_basis,
-                )
-            if (reset or reset_after) and outcome < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
-                self._record()
-            result[input_index] = int(outcome)
-            schedule.append({
-                "order": int(step),
-                "input_index": int(input_index),
-                "pauli": str(axis),
-                "qubit": int(qubit),
-                **info,
-            })
+                if reset:
+                    m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
+                    outcome = self._absorb_measure(
+                        m_pauli,
+                        None,
+                        norm_event_kind="reset",
+                    )
+                else:
+                    outcome = self.measure(
+                        axis,
+                        qubit,
+                        outcome=forced,
+                        absorb_basis=absorb_basis,
+                    )
+                if (reset or reset_after) and outcome < 0:
+                    self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+                    self._record()
+                result[input_index] = int(outcome)
+                schedule.append({
+                    "order": int(step),
+                    "input_index": int(input_index),
+                    "pauli": str(axis),
+                    "qubit": int(qubit),
+                    **info,
+                })
+        except BaseException:
+            if snapshot is not None:
+                self._restore_execution_snapshot(snapshot)
+            raise
 
         self.last_measurement_schedule = tuple(schedule)
         return tuple(result)

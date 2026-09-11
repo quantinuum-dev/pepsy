@@ -1075,6 +1075,7 @@ class TreeOptimizer:
                 time_window=self.layout_time_window,
                 chi=self.chi,
                 max_operator_qubits=self.max_operator_qubits,
+                map_mode=map_mode,
                 root_qubit=root_qubit,
             )
             tree = self.layout_finder.run()
@@ -2934,6 +2935,93 @@ class TreeOptimizer:
         )
 
         return _build_layered_operator_state_target(self.tn, tree_mpo), tree_mpo
+
+    def _record_exact_one_site_fit_diagnostics(self, application, *, cutoff=None,
+                                               max_bond=None, track_norm=True):
+        """Record TreeFIT-compatible diagnostics for an exact local update."""
+
+        node = next(iter(application.region))
+        strategy = self._normalize_fit_init_strategy(self.fit_init_strategy)
+        active = self._active_update
+        represented_norm = (
+            None if active is None else active.get("norm_before")
+        )
+        target_norm_available = bool(track_norm and self._norm_tracking_enabled)
+        norm_pair = (
+            None if represented_norm is None
+            else (float(represented_norm), 0.0)
+        )
+        fit_rtol = (
+            None
+            if self._fit_rtol_requested == "auto" and not target_norm_available
+            else self.fit_rtol
+        )
+        diagnostics = {
+            "iterations": 1,
+            "converged": True,
+            "convergence_reason": "single_node_exact",
+            "relative_change": None,
+            "final_norm": represented_norm,
+            "final_norm_mantissa": (
+                None if norm_pair is None else norm_pair[0]
+            ),
+            "final_norm_exponent": (
+                None if norm_pair is None else norm_pair[1]
+            ),
+            "local_norm": represented_norm,
+            "local_norm_trace": (
+                () if represented_norm is None else (represented_norm,)
+            ),
+            "local_norm_stripped_trace": (
+                () if norm_pair is None else (norm_pair,)
+            ),
+            "sweep_norm_trace": (
+                () if represented_norm is None else (represented_norm,)
+            ),
+            "local_fidelity": 1.0 if target_norm_available else None,
+            "local_infidelity": 0.0 if target_norm_available else None,
+            "adaptive_sweeps": 0,
+            "one_site_refinement_sweeps": 1,
+            "block_size_trace": (1,),
+            "sweep_sequence": self.fit_sweep_sequence,
+            "traversal": self.fit_traversal,
+            "resolved_traversal": "path",
+            "path_endpoints": (node, node),
+            "environment_strategy": self.fit_environment_strategy,
+            "target_layout": "layered",
+            "cache": {
+                "messages": 0,
+                "effective_blocks": 0,
+                "hits": 0,
+                "misses": 0,
+            },
+            "backend": "tree_fit",
+            "split_method": (
+                "direct" if self.compression_mode in {"src", "sdc"}
+                else self.compression_mode
+            ),
+            "support": tuple(application.support),
+            "region": tuple(sorted(application.region)),
+            "fit_init_strategy": strategy,
+            "fit_init_strategy_requested": self.fit_init_strategy,
+            "fit_rtol": fit_rtol,
+            "fit_rtol_requested": self._fit_rtol_requested,
+            "max_bond": self.chi if max_bond is None else max_bond,
+            "cutoff": self.cutoff if cutoff is None else cutoff,
+            "guess_used": False,
+            "guess_method": (
+                strategy[6:] if strategy.startswith("guess_") else strategy
+            ),
+            "random_initialization": False,
+            "random_initialization_info": None,
+            "block_size": 1,
+            "requested_block_size": self._fit_block_size(),
+            "guess_backend": "single_node",
+        }
+        self._last_fit_diagnostics = diagnostics
+        self.fit_diagnostics.append(deepcopy(diagnostics))
+        if active is not None:
+            active["fit_diagnostics"] = deepcopy(diagnostics)
 
     def _run_tree_fit(self, target, region, support, *, operator=None, target_norm=None,
                       path_order=None, max_bond=None, cutoff=None):
@@ -5412,7 +5500,8 @@ class TreeOptimizer:
                 self.normalize()
         return result
 
-    def _apply_compact_one_site_unitary(self, operator, application):
+    def _apply_compact_one_site_unitary(self, operator, application, *, cutoff=None,
+                                        max_bond=None, track_norm=True):
         """Absorb a certified local unitary without changing the state gauge.
 
         Certification reads the current small physical matrix, so edits to a
@@ -5462,6 +5551,11 @@ class TreeOptimizer:
         self.tn.node_tensor(node).modify(left_inds=left_inds)
         self.tn.canonical_region = region
         self.tn.exponent += application.exponent
+        if self.mode == "dmrg":
+            self._record_exact_one_site_fit_diagnostics(
+                application, cutoff=cutoff, max_bond=max_bond,
+                track_norm=track_norm,
+            )
         return True
 
     def apply_sub_mpotree(
@@ -5521,7 +5615,10 @@ class TreeOptimizer:
         with self._update(
             "subtreempo", declared, track_norm=track_norm
         ):
-            if self._apply_compact_one_site_unitary(tree_mpo, application):
+            if self._apply_compact_one_site_unitary(
+                tree_mpo, application, cutoff=cutoff, max_bond=max_bond,
+                track_norm=track_norm,
+            ):
                 return self
             if self.mode == "dmrg":
                 # Keep the exact DMRG target in operator--state form. The
