@@ -14,6 +14,13 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Changed `MpsOptimizer(mode="mix")` to use the same transactional algorithm
+  in both bond-growth and fixed-`chi` phases: each eligible multi-site gate
+  builds a disposable chi-capped `guess-direct` state, then runs one-site FIT
+  against a separate exact target. Mixed mode now fixes `fit_block_size=1` and
+  `fit_init_strategy="guess-direct"`; one-site gates and failed FIT fallbacks
+  retain the direct compression path.
+
 - Renamed the stabilizer tensor-network front ends to the descriptive
   `StabilizerMpsSimulator`, `StabilizerTreeSimulator`, and
   `StabilizerMpsSampler` names. The former `MpsStabOptimizer`,
@@ -732,7 +739,7 @@ backend, and documentation improvements developed on `develop`.
   tensors, including the Algorithm 3 and 4 policies.
 - MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
   `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
-  and `stabilize_unitary` now covers DMRG, mixed MPO warm-up/fallback, and the
+  and `stabilize_unitary` now covers DMRG, mixed direct/fallback, and the
   standalone MPO/swap/permutation/SVD compression modes.
 - PEPS boundary contractions expose typed per-fit convergence diagnostics,
   opt-in detailed timing, `return_info=True` on scalar norm helpers, and an

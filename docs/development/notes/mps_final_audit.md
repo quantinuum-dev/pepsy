@@ -23,6 +23,36 @@ permutation, layout, native, lint, and whitespace checks pass after this
 change; the broader native Symmray FIT suite remains subject to the installed
 upstream cumulative-cutoff/max-bond incompatibility recorded in the handoff.
 
+## 2026-09-11 mixed guess-direct compatibility audit
+
+The active Python 3.12 environment reports Quimb
+`1.15.1.dev51+g2e99c793e`, Autoray `0.11.1.dev3+g1b476b305`, Cotengra
+`0.8.3.dev7+g1d7fd333f`, and Symmray `0.3.2.dev8+g6c6dd34b5`. Reviewed the
+[Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray repository](https://github.com/jcmgray/autoray),
+[Cotengra documentation](https://cotengra.readthedocs.io/en/latest/) and
+[changelog](https://cotengra.readthedocs.io/en/latest/changelog.html), plus
+the Symmray [Abelian-array documentation](https://symmray.readthedocs.io/en/latest/abelian_arrays.html)
+and [repository](https://github.com/jcmgray/symmray).
+
+Runtime inspection confirmed the public in-place signatures for
+`MatrixProductState.gate_nonlocal_`, `gate_with_auto_swap_`, `gate_split_`,
+and `swap_sites_with_compress_`, including their compression-option forwarding.
+It also confirmed `tensor_network_1d_compress(..., max_bond, cutoff,
+method, ...)`, Cotengra's `HyperOptimizer` constructor, and Autoray NumPy and
+Symmray SVD/QR dispatch. Symmray dispatch resolves to `symmray.linalg.svd` and
+`symmray.linalg.qr`; the installed truncated-SVD and stabilized-QR callables
+remain available.
+
+- **Adopt:** the existing public Quimb direct compressor for dense disposable
+  guesses and Pepsy's existing Quimb auto-swap/SVD boundary for native
+  Symmray guesses. Both are chi-capped and preserve the target/guess split.
+- **Compatibility shim/prototype:** none. The mixed-policy change does not
+  patch dispatch, edit installed packages, or add a version gate.
+- **Defer:** new upstream compressors and unrelated Cotengra/Autoray/Symmray
+  behavior. Mixed mode fixes its guess to direct rather than selecting a new
+  algorithm based on dependency versions.
+
 ## Original assessment
 
 The existing regression suite passes, including the earlier reset/leakage,

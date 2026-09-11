@@ -395,9 +395,13 @@ schedule for local windows. For a long-range window that is wider than the
 selected FIT block, it uses the corresponding fixed block handoff so the
 terminal canonical center remains authoritative for unitary norm tracking;
 the randomized FIT initialization is unchanged. `mode="mix"` is the
-transactional unitary variant and defaults to one-site DMRG/FIT after a
-direct/MPO warm-up of under-capacity active bonds.
-With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
+transactional unitary variant: every eligible multi-site gate first builds a
+disposable, chi-capped `guess-direct` state and then runs one-site DMRG/FIT
+against a separately constructed exact target. This path is unchanged between
+the bond-growing and fixed-`chi` phases; the direct guess is never committed
+without the FIT refinement.
+For ordinary DMRG, `fit_block_size=2` grows only bonds visited by the gate
+interval, up
 to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
 not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
 wavefunction and two direction-aware native SVD splits, and is useful when a
@@ -416,16 +420,16 @@ Quimb-specific guess methods retain their native direct fallback. The available 
 require a Quimb build containing the corresponding successive deterministic
 compressor. They are also valid FIT warm-start policies as
 `fit_init_strategy="guess-sdc"` and `fit_init_strategy="guess-sdc-oversample"`.
-`auto` selects `guess-src` in both phases;
+For ordinary DMRG, `auto` selects `guess-src` in both phases;
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).
 Native Symmray and fermionic paths use their graded sector-growth route without
 dense random padding. `fit_block_size=1` selects the fixed-rank compatibility
-algorithm. In mixed mode, it first applies eligible gates through the
-direct/MPO path while active bonds are under capacity, then hands later
-eligible gates to one-site DMRG/FIT through a transactional commit. Mixed
-two-site and three-site FIT transactions remain available explicitly with
-`fit_block_size=2` and `3`, respectively.
+algorithm in ordinary DMRG. Mixed mode fixes `fit_block_size=1` and
+`fit_init_strategy="guess-direct"`; pass another block size or initialization
+only with `mode="dmrg"`. On native Symmray states, the mixed direct guess uses
+Pepsy's native chi-capped auto-swap/SVD route and does not densify charge
+sectors.
 Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
 the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive
@@ -497,9 +501,10 @@ the complete variational problem. The default
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
 when `fit_rtol="auto"`, while an explicit numeric tolerance enables
-adaptive stopping there too. With `finite_check=True`, mixed DMRG and
-direct/MPO warm-up transactions validate the retained canonical-center norm
-and represented exponent before commit. Default replay skips that validation; enable
+adaptive stopping there too. With `finite_check=True`, mixed DMRG and its
+direct/MPO exact or fallback transactions validate the retained
+canonical-center norm and represented exponent before commit. Default replay
+skips that validation; enable
 `quality_check_every=N` when periodic full finite-data and canonical-gauge
 checks are needed. Transactional MPO fallbacks are norm-checked only when
 `finite_check=True`. Torch and CuPy quality checks process one tensor at a time, combine
@@ -723,7 +728,9 @@ default; when enabled,
 `quality_check_repair=True` re-canonicalizes if canonical coverage is lost.
 
 Mixed-mode DMRG trials isolate only the active FIT window and the canonicalization
-path leading to it. Untouched MPS tensors are shared until a successful trial is
+path leading to it. The exact target and direct-compressed initial guess are
+separate disposable objects; neither replaces the committed state before FIT
+succeeds. Untouched MPS tensors are shared until a successful trial is
 committed, avoiding a full deep copy for every transaction while preserving
 rollback safety for the active update. After a non-finite DMRG result,
 `mix_sticky_nonfinite=True` (default `False`) keeps the remainder

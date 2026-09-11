@@ -83,9 +83,13 @@ than hiding policy in a mode-specific helper.
   surface (or the native Symmray equivalent), so routing and the final local
   SVD are one compressed update. It is not a routing modifier: do not add a
   `routing=` keyword or revive `perm-*` / `*-perm` compositions.
-- `mix`: transactional direct/MPO warm-up followed by one-site FIT by default,
-  with per-step MPO fallback. Explicit `fit_block_size=2` or `3` opts into
-  mixed block-FIT transactions.
+- `mix`: phase-independent transactional one-site FIT. Every eligible
+  multi-site gate builds a disposable chi-capped `guess-direct` state while
+  retaining a separate exact target; this is the same during rank growth and
+  after reaching `chi`. One-site gates remain exact/direct, and failed FIT
+  transactions restore the committed state before direct/MPO fallback.
+  `fit_block_size` is fixed at `1` and `fit_init_strategy` at `guess-direct`;
+  use ordinary `dmrg` for other block sizes or initialization policies.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
   Exact replay preserves operator scale directly; `non_unitary=True` is only
   needed for compressed MPS scale bookkeeping and is accepted in exact
@@ -273,7 +277,9 @@ or isolated `guess-<method>` replay (default `guess-src`). The underscore
 spelling remains accepted for compatibility. In `auto`, only active bonds below their attainable
 physical/`chi` rank are expanded, and the exact gate target remains separate as
 `p_g`. Native Symmray/fermionic paths keep their graded sector-growth route and
-do not use dense random padding. If `run()` omits `cutoff_mode`, ordinary paths
+do not use dense random padding. Mixed `guess-direct` uses the native
+chi-capped auto-swap/SVD route on a disposable copy rather than densifying the
+state. If `run()` omits `cutoff_mode`, ordinary paths
 use `rsum2` while MPO `dm` preserves Quimb's native `rsum1` default; an
 explicit mode overrides it. Interior oversampled zipup and `fit-*` replay keep
 the local sub-MPO partition and disable nested full-chain array permutation.
