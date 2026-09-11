@@ -1451,10 +1451,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         directly with one-site sweeps. ``"dmrg2"`` uses two-site updates
         for the required warm-up (two sweeps by default), then one-site
         refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
-        three-site updates before one-site refinement. ``"mix"`` defaults to
-        a direct-compression warm-up on under-capacity active bonds, followed by
-        transactional one-site DMRG/FIT; explicit ``fit_block_size=2`` or
-        ``3`` opts into mixed block-FIT transactions.
+        three-site updates before one-site refinement. ``"mix"`` uses a
+        disposable, chi-capped ``guess-direct`` state followed by
+        transactional one-site DMRG/FIT for every eligible multi-site gate,
+        both while bonds are growing and after they reach ``chi``.
         ``mode="perm"`` routes non-local two-site gates with Quimb's
         swap-and-split SVD path and keeps the resulting physical ordering.
     contraction_opt : object | None, default="auto-hq"
@@ -3107,14 +3107,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         self._ensure_tracked_center()
 
-    def _prepare_mix_dmrg_state(self, where):
-        """Ensure the active bonds can support a mixed-mode DMRG update.
+    def _prepare_one_site_dmrg_state(self, where):
+        """Prepare active bond support for ordinary one-site DMRG.
 
         FIT only optimizes the interval spanned by the gate. Expanding every
         bond in a long MPS would waste ``O(L * chi**2)`` memory, so only the
-        active internal indices are padded. Native Symmray callers are routed
-        through MPO while an active bond is still short, avoiding Quimb's
-        dense-style expansion path.
+        active internal indices are padded. Mixed mode deliberately bypasses
+        this helper because its disposable direct-compressed guess owns rank
+        growth. Native Symmray callers use two- or three-site FIT instead of
+        this dense-style expansion path.
         """
         if self.chi <= 1 or getattr(self.p, "L", 0) <= 1:
             return
@@ -3156,11 +3157,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         Native two- and three-site FIT updates receive the current MPS bond
         dimensions unchanged. Their direction-aware SVD splits grow only the
-        visited bonds, up to ``chi``. The one-site compatibility path is the
-        sole FIT path that may pre-size active bonds before fitting.
+        visited bonds, up to ``chi``. Ordinary one-site compatibility FIT may
+        pre-size active bonds. Mixed one-site FIT instead receives its bond
+        support from the disposable ``guess-direct`` state.
         """
-        if int(block_size) == 1:
-            self._prepare_mix_dmrg_state(where)
+        if int(block_size) == 1 and self.mode != "mix":
+            self._prepare_one_site_dmrg_state(where)
 
     def _dmrg_fit_block_size(self, p, where, requested_block_size):
         """Resolve the live DMRG block size for an active window.
@@ -4844,7 +4846,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_mpo_guess=True,
-        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_strategy=None,
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
@@ -5014,9 +5016,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_block_size : {1, 2, 3} | None, default=None
             Number of neighboring MPS tensors optimized by each FIT update.
             ``None`` selects two-site FIT for ordinary DMRG and one-site FIT
-            for ``mode="mix"``. In mixed mode, the one-site default first
-            uses direct/MPO updates to warm under-capacity active bonds, then
-            hands later eligible gates to transactional DMRG1.
+            for ``mode="mix"``. Mixed mode fixes this value at one: a
+            chi-capped direct-compressed guess opens the active bond support
+            before every eligible multi-site gate is refined with one-site
+            FIT. Use ordinary ``mode="dmrg"`` to select block sizes two or
+            three.
             Two-site FIT is recommended: it forms both physical legs and the
             two outer virtual legs, then uses a native SVD on the middle bond,
             allowing active bonds to grow up to ``chi``. One-site FIT is kept
@@ -5080,7 +5084,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Native Symmray and fermionic routes use a disposable
             sector-preserving randomized guess for the ``guess-src`` policy;
             this does not replace the exact FIT target or live MPS.
-        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"}, default="guess-src"
+        fit_init_strategy : {"auto", "direct", "random", "random_expand", "guess-<method>"} | None, default=None
             Select the disposable FIT initial guess. ``"direct"`` uses the
             current MPS, ``"random"`` perturbs existing tensors without
             changing bond dimensions, ``"random_expand"`` adds seeded
@@ -5089,21 +5093,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             method on an isolated copy. For native Symmray/fermionic states,
             ``"guess-src"`` instead uses Symmray's sector-preserving
             randomized SVD on an isolated copy; other Quimb guess methods
-            retain the native direct fallback. ``"auto"`` and the default
-            select ``"guess-src"`` in both expansion and reached-chi phases.
+            retain the native direct fallback. ``None`` selects
+            ``"guess-src"`` for DMRG and the fixed ``"guess-direct"`` policy
+            for mixed mode. ``"auto"`` selects ``"guess-src"`` in both
+            expansion and reached-chi phases for ordinary DMRG.
             On native Symmray/fermionic states this is the sector-preserving
-            randomized guess. The underscore spelling ``"guess_<method>"``
-            remains accepted as a compatibility alias.
+            randomized guess. Mixed mode requires ``"guess-direct"`` and
+            uses the native auto-swap/SVD equivalent for Symmray arrays. The
+            underscore spelling ``"guess_<method>"`` remains accepted as a
+            compatibility alias.
         fit_init_rand_strength : float, default=0.0
             For dense two- and three-site FIT growth windows that are below
             their attainable physical/``chi`` bond ceilings, seed a
             disposable copy of the current MPS with random entries on only
             those active bonds. The exact FIT target is still built from the
-            unmodified current MPS. The default ``fit_init_strategy`` is
-            ``"guess-src"``, so this strength is unused unless a random
-            strategy is selected explicitly. Set it to a positive value to
-            enable random initialization. Native Symmray and fermionic
-            routes ignore it.
+            unmodified current MPS. Ordinary DMRG defaults to ``"guess-src"``
+            and mixed mode fixes ``"guess-direct"``, so this strength is
+            unused unless a random strategy is selected explicitly in DMRG.
+            Set it to a positive value to enable random initialization. Native
+            Symmray and fermionic routes ignore it.
         fit_init_seed : int, default=0
             Deterministic seed for ``"random"`` and ``"random_expand"`` FIT
             guesses and randomized Quimb methods selected through
@@ -5291,12 +5299,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         quality_check_repair = bool(quality_check_repair)
         self.quality_checks = []
-        # Mixed mode is intentionally a direct/MPO warm-up followed by
-        # one-site DMRG. Keep the ordinary DMRG default at two-site FIT, while
-        # allowing callers to opt into mixed two- or three-site transactions
-        # explicitly with ``fit_block_size=2`` or ``3``.
+        # Mixed mode is a fixed one-site FIT algorithm initialized from a
+        # disposable direct-compressed guess. Ordinary DMRG retains its
+        # two-site and ``guess-src`` defaults.
         if fit_block_size is None:
             fit_block_size = 1 if self.mode == "mix" else 2
+        if fit_init_strategy is None:
+            fit_init_strategy = (
+                "guess_direct"
+                if self.mode == "mix"
+                else _DEFAULT_FIT_INIT_STRATEGY
+            )
 
         # ``auto`` (and the legacy ``None``) uses Pepsy's relative squared
         # weight policy for ordinary paths. MPO paths retain Quimb's native
@@ -5510,6 +5523,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ):
                 raise ValueError("fit_block_size must be 1, 2, or 3.")
             fit_block_size = int(fit_block_size)
+            if self.mode == "mix" and fit_block_size != 1:
+                raise ValueError(
+                    "mode='mix' fixes fit_block_size=1; use mode='dmrg' "
+                    "for two- or three-site FIT."
+                )
             fit_adaptive_sweeps = self._resolve_legacy_fit_option(
                 canonical_name="fit_adaptive_sweeps",
                 canonical_value=fit_adaptive_sweeps,
@@ -5537,6 +5555,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_strategy = self._validate_fit_init_strategy(
                 fit_init_strategy
             )
+            if self.mode == "mix" and fit_init_strategy != "guess_direct":
+                raise ValueError(
+                    "mode='mix' fixes fit_init_strategy='guess-direct'; "
+                    "use mode='dmrg' for another FIT initialization."
+                )
             try:
                 fit_init_rand_strength = float(fit_init_rand_strength)
             except (TypeError, ValueError) as exc:
@@ -8173,6 +8196,52 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "gate_count": len(gates),
         }
 
+    def _build_native_direct_fit_guess(
+        self,
+        p,
+        gates,
+        wheres,
+        *,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Build a chi-capped native direct guess without densification."""
+        guess_mps = p.copy(deep=True)
+        guess_info = {}
+        for gate, where in zip(gates, wheres):
+            where = tuple(int(site) for site in where)
+            if len(where) == 1:
+                self._apply_gate(
+                    guess_mps,
+                    gate,
+                    where,
+                    contract=True,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    inplace=True,
+                )
+            elif len(where) == 2:
+                self._apply_symmray_auto_swap_gate(
+                    guess_mps,
+                    gate,
+                    where,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    max_bond=self.chi,
+                    info=guess_info,
+                )
+            else:
+                raise ValueError(
+                    "Native direct FIT guesses support one- or two-site "
+                    "gates only."
+                )
+
+        return guess_mps, {
+            "backend": "symmray-auto-swap",
+            "method": "direct",
+            "gate_count": len(gates),
+        }
+
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
         """Generate deterministic random data on ``data``'s backend."""
@@ -8382,6 +8451,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 result["svd_guess_used"] = True
                 result["guess_backend"] = "symmray-svd:rand"
                 result["native_randomized_guess_used"] = True
+                return result
+            if not submpo and requested_strategy in {
+                "guess_direct",
+                "svd_guess",
+            }:
+                fit_guess, native_info = self._build_native_direct_fit_guess(
+                    p if native_source is None else native_source,
+                    gates,
+                    wheres,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
+                info.update(native_info)
+                info["reason"] = "native_direct"
+                result["fit_guess"] = fit_guess
+                result["strategy"] = requested_strategy
+                result["guess_method"] = "direct"
+                result["guess_used"] = True
+                result["svd_guess_used"] = True
+                result["guess_backend"] = "symmray-auto-swap"
                 return result
             info["reason"] = (
                 "native_sector_growth"
@@ -8865,26 +8954,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._validate_mix_norm(active_where, operation="MPO batch")
 
     def _run_mix_dmrg(self, *args, fit_block_size, **kwargs):
-        """Run mixed DMRG with a stable named FIT schedule when available.
-
-        Mixed mode may enter DMRG after an MPO warm-up with a two- or
-        three-site FIT window.  Keep that transaction on the corresponding
-        fixed schedule: the generic rank-adaptive schedule can leave a
-        long-range window with a stale represented norm after a short sweep
-        budget, which the unitary invariant must (correctly) reject.
-        """
-        requested_block_size = int(fit_block_size)
-        schedule_alias = {
-            1: ("dmrg1", 1),
-            2: ("dmrg2", 2),
-            3: ("dmrg3", 3),
-        }.get(requested_block_size)
+        """Run the fixed mixed one-site DMRG schedule."""
+        if int(fit_block_size) != 1:
+            raise ValueError("mixed DMRG requires fit_block_size=1.")
         old_dmrg_alias = self._dmrg_mode_alias
         old_dmrg_block_size = self._dmrg_mode_block_size
-        if schedule_alias is not None:
-            self._dmrg_mode_alias, fit_block_size = schedule_alias
-            self._dmrg_mode_block_size = fit_block_size
-        kwargs["fit_block_size"] = fit_block_size
+        self._dmrg_mode_alias = "dmrg1"
+        self._dmrg_mode_block_size = 1
+        kwargs["fit_block_size"] = 1
         try:
             return self._run_dmrg(*args, **kwargs)
         finally:
@@ -8903,12 +8980,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_patience,
         cutoff,
         cutoff_mode,
-        fit_block_size=2,
+        fit_block_size=1,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
-        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_strategy="guess_direct",
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
@@ -8958,12 +9035,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_patience,
         cutoff,
         cutoff_mode,
-        fit_block_size=2,
+        fit_block_size=1,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
-        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_strategy="guess_direct",
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
@@ -9508,12 +9585,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode="rsum2",
         submpo_method="direct",
         compression_seed=None,
-        fit_block_size=2,
+        fit_block_size=1,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
-        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_init_strategy="guess_direct",
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
@@ -9524,14 +9601,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         quality_check_every=None,
         quality_check_repair=True,
     ):
-        """Apply transactional FIT with an MPO fallback.
+        """Apply phase-independent guess-direct/DMRG1 with an MPO fallback.
 
-        Block FIT grows active bonds directly. Mixed mode's one-site default
-        uses direct/MPO updates as a rank warm-up, then hands later eligible
-        gates to one-site DMRG/FIT. Explicit block sizes 2 and 3 retain their
-        corresponding mixed block-FIT schedules. Non-unitary trajectory
-        branches use the explicit MPO fallback because mixed FIT is defined
-        only for unitary working-norm updates.
+        Every eligible multi-site gate builds a disposable chi-capped direct
+        guess, then runs one-site FIT against a separately constructed exact
+        target. This is the same while bonds are growing and after they reach
+        ``chi``. Non-unitary trajectory branches use the explicit MPO fallback
+        because mixed FIT is defined only for unitary working-norm updates.
         """
         mix_started = (
             time.perf_counter() if self._timing_state is not None else None
@@ -9607,13 +9683,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mpo_state_check_where = None
 
         def check_pending_mpo_state():
-            """Validate one completed contiguous MPO warm-up block."""
+            """Validate one completed contiguous direct/MPO block."""
             nonlocal mpo_state_needs_check, mpo_state_check_where
             if not mpo_state_needs_check:
                 return
             self._validate_mix_norm(
                 mpo_state_check_where,
-                operation="MPO warm-up",
+                operation="MPO step",
             )
             mpo_state_needs_check = False
             mpo_state_check_where = None
@@ -9637,19 +9713,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self._effective_max_bond(self.p)
                     if current_bond is None else current_bond
                 )
-                active_bond_is_short = self._mix_active_bond_is_short(
-                    where, target_sizes=target_sizes
-                )
-                # Block FIT can grow the active bonds itself. The mixed
-                # one-site path uses direct/MPO warm-up first so that the
-                # subsequent one-site FIT has the required bond support.
-                needs_rank_warmup = fit_block_size == 1 and (
-                    start_bond < target_bond or active_bond_is_short
-                )
                 use_mpo = (
                     len(where) == 1
                     or self._mix_dmrg_disabled_reason is not None
-                    or needs_rank_warmup
                 )
                 if use_mpo:
                     self._run_mix_mpo_step(
@@ -9668,12 +9734,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     mpo_state_check_where = where
                     if len(where) == 1:
                         reason = "one_site_exact"
-                    elif self._mix_dmrg_disabled_reason is not None:
-                        reason = "dmrg_disabled_nonfinite"
-                    elif start_bond < target_bond:
-                        reason = "bond_below_target"
                     else:
-                        reason = "active_bond_below_target"
+                        reason = "dmrg_disabled_nonfinite"
                     current_bond = self._effective_max_bond(self.p)
                     entry = {
                         "step": int(step),
@@ -9708,7 +9770,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     idx,
                     k_2q_batch,
                     target_sizes=target_sizes,
-                    allow_short=fit_block_size in {2, 3},
+                    allow_short=True,
                     max_span=fit_max_span,
                 )
                 batch_steps = [
@@ -9890,8 +9952,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "target_bond": int(target_bond),
                             "backend": "dmrg",
                             "reason": (
-                                "bond_at_target"
-                                if offset == 0 and start_bond >= target_bond
+                                "guess_direct_dmrg1"
+                                if offset == 0
                                 else "dmrg_batch"
                             ),
                             "fit_iterations": fit_diagnostics.get("iterations"),
@@ -10446,9 +10508,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     if (
                         not is_submpo
                         and self._replay_has_symmray_data(p)
-                        and self._native_src_fit_guess_enabled(
-                            fit_init_strategy,
-                            fit_mpo_guess,
+                        and (
+                            self._native_src_fit_guess_enabled(
+                                fit_init_strategy,
+                                fit_mpo_guess,
+                            )
+                            or fit_init_strategy in {
+                                "guess_direct",
+                                "svd_guess",
+                            }
                         )
                     ):
                         native_fit_guess_source = (
@@ -10488,15 +10556,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff_mode,
                             target_strategy=fit_target_strategy,
                         )
-                        native_fermionic_warm_start = self._timed_call(
-                            "dmrg.native_warm_start",
-                            self._warm_start_native_fermionic_fit,
-                            p,
-                            (gate,),
-                            (where,),
-                            cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                        )
+                        if fit_init_strategy in {
+                            "guess_direct",
+                            "svd_guess",
+                        }:
+                            # The native direct guess already applies the gate
+                            # and opens compatible sectors on its private copy.
+                            # Replaying a second warm start on ``p`` would add
+                            # work without changing the FIT initialization.
+                            native_fermionic_warm_start = False
+                        else:
+                            native_fermionic_warm_start = self._timed_call(
+                                "dmrg.native_warm_start",
+                                self._warm_start_native_fermionic_fit,
+                                p,
+                                (gate,),
+                                (where,),
+                                cutoff=cutoff,
+                                cutoff_mode=cutoff_mode,
+                            )
                     active_fit_block_size = self._dmrg_fit_block_size(
                         p,
                         (xmin, xmax),
@@ -10792,9 +10870,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     native_fit_guess_source = None
                     if (
                         self._replay_has_symmray_data(p)
-                        and self._native_src_fit_guess_enabled(
-                            fit_init_strategy,
-                            fit_mpo_guess,
+                        and (
+                            self._native_src_fit_guess_enabled(
+                                fit_init_strategy,
+                                fit_mpo_guess,
+                            )
+                            or fit_init_strategy in {
+                                "guess_direct",
+                                "svd_guess",
+                            }
                         )
                     ):
                         native_fit_guess_source = (
@@ -10812,15 +10896,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode,
                         target_strategy=fit_target_strategy,
                     )
-                    native_fermionic_warm_start = self._timed_call(
-                        "dmrg.native_warm_start",
-                        self._warm_start_native_fermionic_fit,
-                        p,
-                        batch_G,
-                        batch_where,
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                    )
+                    if fit_init_strategy in {
+                        "guess_direct",
+                        "svd_guess",
+                    }:
+                        native_fermionic_warm_start = False
+                    else:
+                        native_fermionic_warm_start = self._timed_call(
+                            "dmrg.native_warm_start",
+                            self._warm_start_native_fermionic_fit,
+                            p,
+                            batch_G,
+                            batch_where,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
                     active_fit_block_size = self._dmrg_fit_block_size(
                         p,
                         (xmin, xmax),

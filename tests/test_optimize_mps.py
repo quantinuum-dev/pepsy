@@ -1779,8 +1779,20 @@ def test_mps_optimizer_mix_timing_includes_mix_summary():
     assert timing["mix_summary"]["elapsed_seconds"] >= 0.0
 
 
-def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
-    """Mix mode should use MPO until the active bonds reach their targets."""
+def test_mps_optimizer_mix_uses_dmrg_during_growth_and_fixed_chi(monkeypatch):
+    """Mixed multi-site gates use one-site FIT in both rank phases."""
+    guess_start_bonds = []
+    original_guess = py.MpsOptimizer._build_compression_fit_guess
+
+    def record_direct_guess(self, p, *args, **kwargs):
+        guess_start_bonds.append(int(p.max_bond()))
+        return original_guess(self, p, *args, **kwargs)
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_build_compression_fit_guess",
+        record_direct_guess,
+    )
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1794,24 +1806,31 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
         progbar=False,
         cutoff=1e-12,
         n_iter=3,
-        fit_block_size=1,
     )
 
     assert out.max_bond() <= 2
-    assert [event["backend"] for event in opt.mix_history][:3] == [
+    assert [event["backend"] for event in opt.mix_history] == [
         "mpo",
-        "mpo",
-        "mpo",
+        "dmrg",
+        "dmrg",
+        "dmrg",
     ]
-    assert opt.mix_history[-1]["backend"] == "dmrg"
-    assert opt.mix_history[-1]["reason"] == "bond_at_target"
-    assert opt.last_mix_summary["mpo_steps"] == 3
-    assert opt.last_mix_summary["dmrg_steps"] == 1
+    assert [event["reason"] for event in opt.mix_history[1:]] == [
+        "guess_direct_dmrg1",
+        "guess_direct_dmrg1",
+        "guess_direct_dmrg1",
+    ]
+    assert opt.mix_history[1]["start_bond"] == 1
+    assert opt.mix_history[1]["end_bond"] == 2
+    assert opt.mix_history[-1]["start_bond"] == 2
+    assert guess_start_bonds == [1, 2, 2]
+    assert opt.last_mix_summary["mpo_steps"] == 1
+    assert opt.last_mix_summary["dmrg_steps"] == 3
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
-def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg1():
-    """Direct warm-up should feed the default mixed one-site DMRG schedule."""
+def test_mps_optimizer_mix_defaults_to_guess_direct_dmrg1():
+    """Mixed multi-site gates use the fixed guess-direct/DMRG1 contract."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1832,17 +1851,21 @@ def test_mps_optimizer_mix_mpo_warmup_hands_off_to_dmrg1():
     assert out.max_bond() <= 2
     assert [event["backend"] for event in opt.mix_history] == [
         "mpo",
-        "mpo",
-        "mpo",
+        "dmrg",
+        "dmrg",
         "dmrg",
     ]
     fit_steps = opt.get_run_timing()["fit_steps"]
-    assert [record["block_size"] for record in fit_steps] == [1, 1, 1]
+    assert [record["block_size"] for record in fit_steps] == [1] * 9
     diagnostics = opt.get_fit_diagnostics()
     assert diagnostics["block_size"] == 1
     assert diagnostics["one_site_refinement_sweeps"] == 3
-    assert opt.last_mix_summary["mpo_steps"] == 3
-    assert opt.last_mix_summary["dmrg_steps"] == 1
+    assert diagnostics["fit_init_strategy_requested"] == "guess_direct"
+    assert diagnostics["fit_init_strategy"] == "guess_direct"
+    assert diagnostics["guess_method"] == "direct"
+    assert diagnostics["guess_used"] is True
+    assert opt.last_mix_summary["mpo_steps"] == 1
+    assert opt.last_mix_summary["dmrg_steps"] == 3
 
 
 def test_mps_optimizer_mix_one_site_fast_path_keeps_input_identity():
@@ -1865,7 +1888,7 @@ def test_mps_optimizer_mix_one_site_fast_path_keeps_input_identity():
 
 
 def test_mps_optimizer_mix_targets_attainable_edge_bonds():
-    """Mixed warm-up should cap edge targets by their physical ranks."""
+    """Mixed diagnostics should cap edge targets by their physical ranks."""
     opt = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         gates=[],
@@ -1876,8 +1899,8 @@ def test_mps_optimizer_mix_targets_attainable_edge_bonds():
     assert opt._mix_target_bond_dimensions() == [2, 4, 2]
 
 
-def test_mps_optimizer_mix_keeps_short_active_bonds_on_mpo():
-    """Mixed mode must not pad a previously short active bond for DMRG."""
+def test_mps_optimizer_mix_guess_direct_opens_short_active_bonds():
+    """The disposable direct guess, not live pre-padding, grows short bonds."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1891,16 +1914,21 @@ def test_mps_optimizer_mix_keeps_short_active_bonds_on_mpo():
         progbar=False,
         cutoff=1e-12,
         n_iter=8,
-        fit_block_size=1,
     )
 
     expected = np.zeros(16, dtype=complex)
     expected[[0, 15]] = 1.0 / np.sqrt(2.0)
     assert np.allclose(out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1), expected)
-    assert opt.mix_history[2]["backend"] == "mpo"
-    assert opt.mix_history[2]["reason"] == "active_bond_below_target"
-    assert opt.mix_history[3]["backend"] == "mpo"
-    assert opt.mix_history[3]["reason"] == "active_bond_below_target"
+    assert [entry["backend"] for entry in opt.mix_history] == [
+        "mpo",
+        "dmrg",
+        "dmrg",
+        "dmrg",
+    ]
+    assert all(
+        entry["reason"] == "guess_direct_dmrg1"
+        for entry in opt.mix_history[1:]
+    )
 
 
 def test_mps_optimizer_mix_history_accumulates_control_segments():
@@ -1919,9 +1947,9 @@ def test_mps_optimizer_mix_history_accumulates_control_segments():
     opt.run(progbar=False, seed=7)
 
     assert [event["step"] for event in opt.mix_history] == [1, 2]
-    assert [event["backend"] for event in opt.mix_history] == ["mpo", "mpo"]
-    assert opt.last_mix_summary["mpo_steps"] == 2
-    assert opt.last_mix_summary["dmrg_steps"] == 0
+    assert [event["backend"] for event in opt.mix_history] == ["mpo", "dmrg"]
+    assert opt.last_mix_summary["mpo_steps"] == 1
+    assert opt.last_mix_summary["dmrg_steps"] == 1
 
 
 def test_mps_optimizer_mix_one_site_is_exact_at_target_bond():
@@ -4769,6 +4797,59 @@ def test_mps_optimizer_native_guess_src_uses_sector_preserving_randomized_guess(
     )
 
 
+def test_mps_optimizer_mix_native_guess_direct_uses_auto_swap(monkeypatch):
+    """Mixed native direct guesses stay block-sparse and disposable."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1",
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        4,
+        fermion=fermion,
+        occupations=fermion.half_filled_occupations(4),
+        seed=17,
+        dtype="complex128",
+    )
+
+    def fail_dense_guess(*args, **kwargs):
+        raise AssertionError("mixed native guess-direct must not use dense compression")
+
+    monkeypatch.setattr(
+        mps_optimizer_module,
+        "_apply_dense_gate_with_method",
+        fail_dense_guess,
+    )
+    optimizer = py.MpsOptimizer(
+        state,
+        [(fermion.hopping_gate(0.2, t=1.0), (0, 3))],
+        chi=8,
+        mode="mix",
+    )
+    out = optimizer.run(
+        progbar=False,
+        n_iter=2,
+        fit_rtol=None,
+        cutoff=1.0e-12,
+        stabilize_unitary=False,
+    )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert optimizer.mix_history[0]["reason"] == "guess_direct_dmrg1"
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["fit_init_strategy"] == "guess_direct"
+    assert diagnostics["guess_method"] == "direct"
+    assert diagnostics["guess_backend"] == "symmray-auto-swap"
+    assert diagnostics["guess_used"] is True
+    assert diagnostics["native_fermionic_warm_start"] is False
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+        and type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in out.tensors
+    )
+
+
 def test_fit_run_eff_fermionic_keeps_current_state_as_initial_guess():
     """Native block run_eff does not replace its current state."""
     pytest.importorskip("symmray")
@@ -5641,10 +5722,8 @@ def test_mps_optimizer_batched_boundary_long_range_uses_fixed_handoff(
     assert adaptive_rank_flags == [False]
 
 
-@pytest.mark.parametrize("mode", ("dmrg", "mix"))
 @pytest.mark.parametrize("block_size", (2, 3))
 def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
-    mode,
     block_size,
     monkeypatch,
 ):
@@ -5654,7 +5733,7 @@ def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
         qtn.MPS_computational_state("0" * length, dtype="complex128"),
         gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 4))],
         chi=2,
-        mode=mode,
+        mode="dmrg",
     )
 
     def fail_rank_warmup(*args, **kwargs):
@@ -5664,7 +5743,7 @@ def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
 
     monkeypatch.setattr(
         optimizer,
-        "_prepare_mix_dmrg_state",
+        "_prepare_one_site_dmrg_state",
         fail_rank_warmup,
     )
     optimizer.run(
@@ -5682,8 +5761,64 @@ def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
         optimizer.p.bond_size(site, site + 1) for site in range(length - 1)
     ] == [2, 2, 2, 2, 1, 1, 1]
     assert optimizer._last_dmrg_fit_diagnostics["block_size"] == block_size
-    if mode == "mix":
-        assert optimizer.mix_history[-1]["backend"] == "dmrg"
+
+
+def test_mps_optimizer_mix_guess_direct_does_not_preexpand_bonds(monkeypatch):
+    """Mixed rank growth belongs to the disposable direct guess."""
+    length = 8
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * length, dtype="complex128"),
+        gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 4))],
+        chi=2,
+        mode="mix",
+    )
+
+    def fail_rank_padding(*args, **kwargs):
+        raise AssertionError("mixed guess-direct must not pre-expand live bonds")
+
+    monkeypatch.setattr(
+        optimizer,
+        "_prepare_one_site_dmrg_state",
+        fail_rank_padding,
+    )
+    optimizer.run(
+        progbar=False,
+        n_iter=3,
+        fit_rtol=None,
+        cutoff=0.0,
+        target_cutoff=0.0,
+        timing=True,
+    )
+
+    assert [
+        optimizer.p.bond_size(site, site + 1) for site in range(length - 1)
+    ] == [2, 2, 2, 2, 1, 1, 1]
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["block_size"] == 1
+    assert diagnostics["fit_init_strategy"] == "guess_direct"
+    assert diagnostics["guess_method"] == "direct"
+    assert optimizer.mix_history[-1]["backend"] == "dmrg"
+
+
+@pytest.mark.parametrize(
+    "run_kwargs",
+    [
+        {"fit_block_size": 2},
+        {"fit_block_size": 3},
+        {"fit_init_strategy": "guess-src"},
+    ],
+)
+def test_mps_optimizer_mix_rejects_nonfixed_fit_policy(run_kwargs):
+    """Mixed mode exposes one algorithm, not block/guess submodes."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="mix",
+    )
+
+    with pytest.raises(ValueError, match="mode='mix' fixes"):
+        optimizer.run(progbar=False, **run_kwargs)
 
 
 def test_unitary_fit_stabilization_preserves_working_norm():
@@ -5838,8 +5973,8 @@ def test_mps_optimizer_mix_uses_norm_guard_without_full_scan(monkeypatch):
     assert checks == 0
 
 
-def test_mps_optimizer_mix_uses_norm_guard_after_mpo_warmup(monkeypatch):
-    """MPO warm-up should avoid a full post-update data scan."""
+def test_mps_optimizer_mix_guess_direct_avoids_full_data_scan(monkeypatch):
+    """Mixed guess-direct/FIT should avoid a full post-update data scan."""
     original_check = py.MpsOptimizer._mps_data_is_finite
     checks = 0
 
@@ -5864,9 +5999,13 @@ def test_mps_optimizer_mix_uses_norm_guard_after_mpo_warmup(monkeypatch):
         mode="mix",
     )
 
-    opt.run(progbar=False, fit_block_size=1)
+    opt.run(progbar=False)
 
-    assert [entry["backend"] for entry in opt.mix_history] == ["mpo"] * 3
+    assert [entry["backend"] for entry in opt.mix_history] == [
+        "mpo",
+        "dmrg",
+        "dmrg",
+    ]
     assert checks == 0
 
 
@@ -5982,8 +6121,8 @@ def test_mps_optimizer_rejects_conflicting_legacy_fit_controls():
             )
 
 
-def test_mix_unitary_stabilization_covers_mpo_rank_warmup():
-    """One-site mixed MPO warm-up should retain the unitary working norm."""
+def test_mix_unitary_stabilization_covers_guess_direct_dmrg1():
+    """Mixed guess-direct/DMRG1 should retain the unitary working norm."""
     gates = []
     for depth in range(4):
         start = depth % 2
@@ -5999,7 +6138,6 @@ def test_mix_unitary_stabilization_covers_mpo_rank_warmup():
     stabilized.run(
         progbar=False,
         n_iter=1,
-        fit_block_size=1,
         fit_rtol=None,
         stabilize_unitary=True,
     )
@@ -6013,7 +6151,6 @@ def test_mix_unitary_stabilization_covers_mpo_rank_warmup():
     unstabilized.run(
         progbar=False,
         n_iter=1,
-        fit_block_size=1,
         fit_rtol=None,
         stabilize_unitary=False,
     )
@@ -6078,8 +6215,8 @@ def test_mps_optimizer_mix_inplace_success_two_site_keeps_input_identity():
     assert not np.allclose(p0.to_dense(), before)
 
 
-def test_mps_optimizer_mix_inplace_short_active_bond_uses_mpo():
-    """In-place mixed replay should warm a short active bond through MPO."""
+def test_mps_optimizer_mix_inplace_guess_direct_opens_short_bond():
+    """In-place mixed replay commits one-site FIT from its direct guess."""
     dense = np.zeros((2, 2, 2, 2), dtype=complex)
     dense[0, 0, 0, 0] = 1.0 / np.sqrt(2.0)
     dense[1, 1, 0, 0] = 1.0 / np.sqrt(2.0)
@@ -6096,13 +6233,12 @@ def test_mps_optimizer_mix_inplace_short_active_bond_uses_mpo():
         progbar=False,
         cutoff=1e-12,
         n_iter=4,
-        fit_block_size=1,
     )
 
     assert out is p0
     assert opt.p is p0
-    assert opt.mix_history[1]["backend"] == "mpo"
-    assert opt.mix_history[1]["reason"] == "active_bond_below_target"
+    assert opt.mix_history[1]["backend"] == "dmrg"
+    assert opt.mix_history[1]["reason"] == "guess_direct_dmrg1"
     assert p0.bond_size(2, 3) == 2
 
 
@@ -6237,7 +6373,7 @@ def test_mps_optimizer_mix_batches_two_site_transactions():
 
     assert out.max_bond() <= 2
     assert [entry["backend"] for entry in opt.mix_history] == ["dmrg", "dmrg"]
-    assert opt.mix_history[0]["reason"] == "bond_at_target"
+    assert opt.mix_history[0]["reason"] == "guess_direct_dmrg1"
     assert opt.mix_history[1]["reason"] == "dmrg_batch"
 
 
