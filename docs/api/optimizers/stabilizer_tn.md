@@ -16,11 +16,21 @@ remains exact up to the configured cutoff, while a finite `chi` compresses the
 mapped operator with the normal diagnostics. The coefficient-MPS compression
 backend uses the same bare method names as `MpsOptimizer`: `mode="direct"`
 (the default), `"dm"`, `"zipup"`, `"src"`, their `*-first` and
-`*-oversample` variants, and the `fit-*` variants. `"dmrg"`/`"dmrg1"`/
+`*-oversample` variants, `"sdc"` / `"sdc-oversample"`, and the `fit-*`
+variants. `"dmrg"`/`"dmrg1"`/
 `"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`, `"perm"`, and `"exact"` remain
 available. Historical `"quimb-*"` and `"mpo-*"` spellings are accepted only
 as deprecated aliases. `mode="exact"` forces `chi=None`; Clifford tableau
 updates remain free in every mode.
+
+`cutoff="auto"` follows the ordinary MPS dtype-aware policy (`1e-12` for
+64-bit, `1e-6` for 32-bit, and `1e-3` for 16-bit data). `cutoff_mode="auto"`
+uses `"rsum2"` for FIT while leaving native MPO methods on Quimb's method
+default. `run()` accepts the ordinary MPS FIT controls, including `n_iter`,
+`fit_min_iter`, `fit_rtol`, `fit_patience`, `fit_block_size`,
+`fit_adaptive_sweeps`, `fit_sweep_sequence`, `finite_check`, and optional
+`fit_overlap_diagnostics`. `fit_rtol="auto"` is dtype-aware; `None` requests
+fixed sweeps. The default FIT warm start is `fit_init_strategy="guess-src"`.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
 native-compressed FIT guess before active bonds reach their `chi` ceilings;
@@ -39,7 +49,8 @@ the exact target construction. On dense backends, the exact coefficient
 sub-MPO is retained as a tagged lazy FIT target layer: the active MPS window
 is canonicalized first, then FIT contracts the MPS and sub-MPO tensors without
 absorbing the operator into an intermediate target MPS. Symmray and fermionic
-routes retain the materialized backend-safe target fallback.
+routes retain the materialized backend-safe target fallback. The resulting
+`get_fit_diagnostics()` record includes the selected convergence controls.
 `get_fit_diagnostics()` reports the selected block size, growth/refinement
 sweeps, SRC guess method, target representation, and the DMRG1 one-site latch.
 

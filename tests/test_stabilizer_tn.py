@@ -5,6 +5,7 @@ Covers Phase 1 (state container + statevector reconstruction) and Phase 2
 (arXiv:2403.08724).
 """
 
+import math
 import sys
 import types
 
@@ -1353,6 +1354,8 @@ def test_coefficient_compression_modes_preserve_stn_state(mode):
         "srcmps",
         "srcmps-first",
         "srcmps-oversample",
+        "sdc",
+        "sdc-oversample",
         "fit-zipup",
         "fit-projector",
         "fit-oversample",
@@ -1414,6 +1417,45 @@ def test_stn_defaults_use_bare_native_mode_and_src_warmup():
 
     assert optimizer.mode == "direct"
     assert optimizer.fit_init_strategy == "guess_src"
+    assert optimizer.cutoff == pytest.approx(1e-12)
+    assert optimizer.contraction_opt == "auto-hq"
+
+
+def test_stn_auto_cutoff_follows_dtype_policy():
+    assert MpsStabOptimizer(2, dtype="complex64").cutoff == pytest.approx(1e-6)
+    assert MpsStabOptimizer(2, dtype="complex128").cutoff == pytest.approx(1e-12)
+
+
+def test_stn_dmrg_run_controls_match_mps_optimizer_contract():
+    sim = MpsStabOptimizer(
+        3,
+        chi=2,
+        mode="dmrg2",
+        exact_cooling=False,
+    )
+    sim.set_gates([("rxx", 0.37, 0, 2)]).run(
+        n_iter=5,
+        cutoff="auto",
+        cutoff_mode="rsum2",
+        fit_min_iter=1,
+        fit_rtol=None,
+        fit_patience=1,
+        fit_adaptive_sweeps=1,
+        fit_init_strategy="guess-src",
+        fit_overlap_diagnostics=True,
+    )
+
+    diagnostics = sim.get_fit_diagnostics()
+    assert diagnostics["fit_n_iter"] == 5
+    assert diagnostics["fit_min_iter"] == 1
+    assert diagnostics["fit_rtol"] is None
+    assert diagnostics["fit_patience"] == 1
+    assert diagnostics["fit_adaptive_sweeps"] == 1
+    assert diagnostics["cutoff"] == pytest.approx(1e-12)
+    assert diagnostics["cutoff_mode"] == "rsum2"
+    assert diagnostics["fit_overlap_diagnostics"] is True
+    assert diagnostics["fit_overlap_error"] is None
+    assert diagnostics["fit_overlap_fidelity"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -1508,11 +1550,15 @@ def test_stn_dmrg_keeps_submpo_as_layered_fit_target():
 
 
 @pytest.mark.parametrize(
-    ("mode", "block_size"),
-    (("dmrg1", 2), ("dmrg2", 2), ("dmrg3", 3)),
+    ("mode", "block_size", "growth_sweeps", "one_site_sweeps", "iterations"),
+    (
+        ("dmrg1", 2, 2, 2, 4),
+        ("dmrg2", 2, 2, 2, 4),
+        ("dmrg3", 3, 3, 2, 5),
+    ),
 )
 def test_stn_named_dmrg_modes_use_growth_refinement_and_src_guess(
-    mode, block_size
+    mode, block_size, growth_sweeps, one_site_sweeps, iterations
 ):
     sim = MpsStabOptimizer(
         3,
@@ -1523,9 +1569,9 @@ def test_stn_named_dmrg_modes_use_growth_refinement_and_src_guess(
 
     diagnostics = sim.get_fit_diagnostics()
     assert diagnostics["block_size"] == block_size
-    assert diagnostics["growth_sweeps"] == 2
-    assert diagnostics["one_site_refinement_sweeps"] == 1
-    assert diagnostics["iterations"] == 3
+    assert diagnostics["growth_sweeps"] == growth_sweeps
+    assert diagnostics["one_site_refinement_sweeps"] == one_site_sweeps
+    assert diagnostics["iterations"] == iterations
     assert diagnostics["fit_init_strategy"] == "guess_src"
     assert diagnostics["guess_method"] == "src"
     assert diagnostics["guess_used"] is True
@@ -1978,6 +2024,96 @@ def test_norm_expectation_and_measurement_respect_mps_exponent():
     assert sim.norm() == pytest.approx(1.0)
     assert sim.state.p.exponent == pytest.approx(0.0)
     assert np.linalg.norm(sim.to_statevector()) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("exponent", [155.0, -155.0])
+def test_norm_scaling_handles_extreme_mps_exponents_without_power_overflow(exponent):
+    sim = MpsStabOptimizer(2)
+    sim.state.info["cur_orthog"] = (0, 0)
+    sim.state.p.exponent = exponent
+
+    norm = sim.norm()
+    norm_squared = sim._norm_squared()
+
+    if exponent > 0.0:
+        assert norm == pytest.approx(10.0**exponent)
+        assert norm_squared == math.inf
+    else:
+        assert norm == pytest.approx(10.0**exponent)
+        assert norm_squared == pytest.approx(10.0 ** (2.0 * exponent))
+
+
+@pytest.mark.parametrize("exponent", [155.0, -155.0])
+def test_local_compression_fidelity_uses_norm_ratio_at_extreme_scale(exponent):
+    sim = MpsStabOptimizer(1)
+    sim.state.info["cur_orthog"] = (0, 0)
+    sim.state.p.exponent = exponent
+    before_log_norm = sim._norm_log10()
+    before_norm_sq = sim._norm_squared()
+
+    center = sim.state.p[sim.state.p.site_tag(0)]
+    center.modify(data=center.data * 0.5)
+    sim._record_compression_norm_event(
+        before_norm_sq,
+        after_infidelity=0.0,
+        before_log_norm=before_log_norm,
+    )
+
+    event = sim.get_compression_norm_events()[-1]
+    assert event["local_fidelity"] == pytest.approx(0.25)
+    assert event["local_infidelity"] == pytest.approx(0.75)
+
+
+def test_local_compression_fidelity_cancels_representation_rescaling():
+    sim = MpsStabOptimizer(1)
+    sim.state.info["cur_orthog"] = (0, 0)
+    before_norm_sq = sim._norm_squared()
+    before_log_norm = sim._norm_log10()
+
+    center = sim.state.p[sim.state.p.site_tag(0)]
+    center.modify(data=center.data * 0.5)
+    sim.state.p.exponent = math.log10(2.0)
+    sim._record_compression_norm_event(
+        before_norm_sq,
+        after_infidelity=0.0,
+        before_log_norm=before_log_norm,
+    )
+
+    event = sim.get_compression_norm_events()[-1]
+    assert event["local_fidelity"] == pytest.approx(1.0)
+    assert event["local_infidelity"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("exponent", [155.0, -155.0])
+def test_unitary_norm_stabilization_uses_log_scale_at_extreme_exponent(exponent):
+    sim = MpsStabOptimizer(1, stabilize_unitary=True)
+    sim.state.info["cur_orthog"] = (0, 0)
+    sim.state.p.exponent = exponent
+    _before_norm, before_norm_sq, before_log_norm = sim._norm_snapshot()
+
+    center = sim.state.p[sim.state.p.site_tag(0)]
+    center.modify(data=center.data * 0.5)
+    observed_infidelity = sim._unitary_infidelity()
+    sim._stabilize_unitary_norm(
+        before_norm_sq,
+        observed_infidelity,
+        target_log_norm=before_log_norm,
+    )
+
+    assert sim._norm_log10() == pytest.approx(before_log_norm)
+
+
+@pytest.mark.parametrize("exponent", [2.0, 155.0, -155.0])
+def test_norm_scaling_full_contraction_keeps_quimb_exponent_separate(exponent):
+    sim = MpsStabOptimizer(2)
+    sim.state.p.exponent = exponent
+    sim.state.info["cur_orthog"] = None
+
+    assert sim.norm() == pytest.approx(10.0**exponent)
+    if exponent > 154.0:
+        assert sim._norm_squared() == math.inf
+    else:
+        assert sim._norm_squared() == pytest.approx(10.0 ** (2.0 * exponent))
 
 
 def test_mps_stab_sync_canonicalization_repairs_external_readout():

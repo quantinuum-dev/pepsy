@@ -68,7 +68,11 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
+from ..._internal.cutoff import dtype_auto_cutoff
 from ..._internal.random import backend_random_array
+from ..._internal.quimb import (
+    require_quimb_1d_compression_method as _require_quimb_compression_method,
+)
 from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
@@ -77,6 +81,7 @@ from .._fidelity import (
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
     _MPO_COMPRESSION_METHODS,
+    _MPO_METHODS_IGNORE_CUTOFF_MODE,
     _MPO_METHODS_IGNORE_CUTOFF,
     _MPO_METHODS_NEED_INTERIOR_WORKAROUND,
     _MPO_METHODS_USE_SEED,
@@ -117,6 +122,12 @@ from .settings import (
     DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS,
 )
 from .stn_state import STNState, _tableau_gate_stream, _validate_bits
+
+
+_LN10 = math.log(10.0)
+_LOG10_FLOAT_MAX = math.log10(np.finfo(float).max)
+_LOG10_FLOAT_MIN_SUBNORMAL = math.log10(np.nextafter(0.0, 1.0))
+
 
 __all__ = [
     "DeferredInjectionRecord",
@@ -645,7 +656,7 @@ class MpsStabOptimizer:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
-    mode : {"direct", "dm", "zipup", "src", "fit-*", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "swap", "perm", "exact"}
+    mode : {"direct", "dm", "zipup", "src", "sdc", "fit-*", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "swap", "perm", "exact"}
         Compression backend for coefficient-MPS updates. Native compression
         names are used directly, for example ``"direct"``, ``"zipup"``, or
         ``"src"``; the ``"*-first"`` and ``"*-oversample"`` variants are
@@ -676,6 +687,17 @@ class MpsStabOptimizer:
     compression_seed : int | None
         Seed forwarded to randomized native compression methods. This is kept
         separate from ``seed``, which controls STN measurement sampling.
+    cutoff : float | {"auto"}, default="auto"
+        Dtype-aware truncation cutoff. ``"auto"`` matches
+        :class:`MpsOptimizer` and resolves to ``1e-12`` for 64-bit data,
+        ``1e-6`` for 32-bit data, and ``1e-3`` for 16-bit data.
+    cutoff_mode : str | None | {"auto"}, default="auto"
+        Singular-value cutoff convention. ``"auto"`` uses Pepsy's ``"rsum2"``
+        policy for FIT and preserves Quimb's native method default for native
+        MPO compressors.
+    contraction_opt : object | None, default="auto-hq"
+        Contraction optimizer passed to FIT and explicit native compression
+        paths, matching :class:`MpsOptimizer`.
 
     Attributes
     ----------
@@ -723,7 +745,9 @@ class MpsStabOptimizer:
         gates=None,
         *,
         chi: Optional[int] = None,
-        cutoff: float = 1e-12,
+        cutoff: float | str = "auto",
+        cutoff_mode: str | None = "auto",
+        contraction_opt="auto-hq",
         operator_tol: Optional[float] = None,
         max_pauli_decomposition_qubits: Optional[int] = (
             DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS
@@ -798,7 +822,11 @@ class MpsStabOptimizer:
                     "compression_seed must be a non-negative integer or None."
                 )
         self.compression_seed = compression_seed
-        self.cutoff = float(cutoff)
+        self._requested_cutoff = cutoff
+        self._requested_cutoff_mode = cutoff_mode
+        self.contraction_opt = (
+            "auto-hq" if contraction_opt is None else contraction_opt
+        )
         if operator_tol is not None:
             operator_tol = float(operator_tol)
             if not np.isfinite(operator_tol) or operator_tol < 0.0:
@@ -878,6 +906,25 @@ class MpsStabOptimizer:
             self.state.p.apply_to_arrays(to_backend)
         if self._backend_signature is None:
             self.backend_info()
+        self.cutoff = self._resolve_cutoff(cutoff, dtype=self.backend_dtype)
+        self.cutoff_mode = self._resolve_cutoff_mode(
+            cutoff_mode,
+            preserve_mpo_default=self._is_quimb_mode(self.mode),
+        )
+        # These are per-replay FIT controls, mirroring ``MpsOptimizer.run``.
+        # The constructor keeps them initialized as well so direct helper use
+        # and copied/shot-replayed optimizers have a complete configuration.
+        self._fit_n_iter = 8
+        self._fit_min_iter = 2
+        self._fit_rtol = "auto"
+        self._fit_patience = 2
+        self._fit_block_size = None
+        self._fit_adaptive_sweeps = 2
+        self._fit_sweep_sequence = "RL"
+        self._fit_two_site_transition_sweeps = None
+        self._fit_single_pair_fast_path = False
+        self._fit_finite_check = False
+        self._fit_overlap_diagnostics = False
 
         self._queue: List[object] = []
         self._gate_stream = ()
@@ -993,7 +1040,63 @@ class MpsStabOptimizer:
         if method not in _MPO_COMPRESSION_METHODS:
             allowed = ", ".join(sorted(_MPO_COMPRESSION_METHODS))
             raise ValueError(f"Unknown Quimb compression method {method!r}; choose one of {allowed}.")
+        _require_quimb_compression_method(method)
         return method
+
+    @staticmethod
+    def _resolve_cutoff(value, *, dtype=None):
+        """Resolve and validate a dtype-aware truncation cutoff."""
+        if value == "auto":
+            if dtype is None:
+                dtype = "complex128"
+            return float(dtype_auto_cutoff(dtype))
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cutoff must be 'auto' or a non-negative number."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        return value
+
+    @staticmethod
+    def _resolve_cutoff_mode(value, *, preserve_mpo_default=False):
+        """Resolve ``cutoff_mode='auto'`` like the ordinary MPS optimizer."""
+        if value is None or (
+            isinstance(value, str) and value.strip().lower() == "auto"
+        ):
+            return None if preserve_mpo_default else "rsum2"
+        return value
+
+    def _resolve_fit_rtol(self, value):
+        """Resolve the ordinary MPS dtype-aware FIT relative tolerance."""
+        if value == "auto":
+            dtype = str(self.backend_dtype).lower()
+            if "16" in dtype:
+                return 1e-3
+            if "32" in dtype or "complex64" in dtype:
+                return 1e-5
+            return 1e-9
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fit_rtol must be 'auto', a non-negative number, or None."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "fit_rtol must be 'auto', a non-negative number, or None."
+            )
+        return value
+
+    @staticmethod
+    def _validate_positive_int(value, name):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+            raise ValueError(f"{name} must be a positive integer.")
+        return int(value)
 
     @classmethod
     def _normalize_fit_init_strategy(cls, strategy):
@@ -1017,6 +1120,33 @@ class MpsStabOptimizer:
         if strategy == "svd_guess":
             return "guess_direct"
         return strategy
+
+    def set_mode(self, mode):
+        """Switch compression mode while preserving the represented state."""
+        new_mode = self._normalize_mode(mode)
+        if new_mode == "exact":
+            self.chi = None
+        elif self.mode == "exact" and self.chi is None:
+            raise ValueError(
+                "cannot leave mode='exact' after its finite chi was discarded; "
+                "create a new optimizer with chi first."
+            )
+        self.mode = new_mode
+        requested_cutoff_mode = self._requested_cutoff_mode
+        if requested_cutoff_mode is None or (
+            isinstance(requested_cutoff_mode, str)
+            and requested_cutoff_mode.strip().lower() == "auto"
+        ):
+            requested_cutoff_mode = "auto"
+        else:
+            requested_cutoff_mode = self.cutoff_mode
+        self.cutoff_mode = self._resolve_cutoff_mode(
+            requested_cutoff_mode,
+            preserve_mpo_default=self._is_quimb_mode(new_mode),
+        )
+        self._dmrg1_one_site_locked = False
+        self._last_fit_diagnostics = None
+        return self
 
     @classmethod
     def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
@@ -2873,6 +3003,8 @@ class MpsStabOptimizer:
                 chi=self.chi,
                 mode=self.mode,
                 cutoff=self.cutoff,
+                cutoff_mode=self.cutoff_mode,
+                contraction_opt=self.contraction_opt,
                 operator_tol=self.operator_tol,
                 max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
                 max_pauli_terms=self.max_pauli_terms,
@@ -3158,6 +3290,206 @@ class MpsStabOptimizer:
         self._rng.bit_generator.state = deepcopy(snapshot["rng_state"])
         self.backend_info()
 
+    def _prepare_run_configuration(
+        self,
+        *,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        mode,
+        contraction_opt,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
+        fit_block_size,
+        fit_adaptive_sweeps,
+        fit_sweep_sequence,
+        fit_two_site_transition_sweeps,
+        fit_single_pair_fast_path,
+        finite_check,
+        fit_overlap_diagnostics,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+    ):
+        """Resolve one MPS-compatible replay configuration.
+
+        ``run`` accepts per-replay overrides without making every FIT control
+        part of the constructor state. Snapshot all mutable settings before
+        resolving them so the caller's configuration can be restored after a
+        successful replay or an exception. An explicitly supplied ``mode`` is
+        the one intentional persistent state transition.
+        """
+        # Keep these overrides isolated from queue execution: FIT and native
+        # Quimb paths read the optimizer attributes directly while replaying.
+        original = {
+            "mode": self.mode,
+            "chi": self.chi,
+            "cutoff": self.cutoff,
+            "cutoff_mode": self.cutoff_mode,
+            "contraction_opt": self.contraction_opt,
+            "fit_n_iter": self._fit_n_iter,
+            "fit_min_iter": self._fit_min_iter,
+            "fit_rtol": self._fit_rtol,
+            "fit_patience": self._fit_patience,
+            "fit_block_size": self._fit_block_size,
+            "fit_adaptive_sweeps": self._fit_adaptive_sweeps,
+            "fit_sweep_sequence": self._fit_sweep_sequence,
+            "fit_two_site_transition_sweeps": self._fit_two_site_transition_sweeps,
+            "fit_single_pair_fast_path": self._fit_single_pair_fast_path,
+            "fit_finite_check": self._fit_finite_check,
+            "fit_overlap_diagnostics": self._fit_overlap_diagnostics,
+            "fit_init_strategy": self.fit_init_strategy,
+            "fit_init_rand_strength": self.fit_init_rand_strength,
+            "fit_init_seed": self.fit_init_seed,
+            "dmrg1_one_site_locked": self._dmrg1_one_site_locked,
+        }
+
+        if mode is not None:
+            # ``mode`` is retained after the replay; the other run controls are
+            # restored in ``_restore_run_configuration`` when the queue ends.
+            self.mode = self._normalize_mode(mode)
+            if self.mode == "exact":
+                self.chi = None
+            elif original["mode"] == "exact" and original["chi"] is None:
+                raise ValueError(
+                    "run(mode=...) cannot recover a finite chi after an exact "
+                    "optimizer was constructed; create it with chi first."
+                )
+            self._dmrg1_one_site_locked = False
+
+        requested_cutoff = self.cutoff if cutoff is None else cutoff
+        self.cutoff = self._resolve_cutoff(
+            requested_cutoff,
+            dtype=self.backend_dtype,
+        )
+        requested_cutoff_mode = (
+            self.cutoff_mode if cutoff_mode is None else cutoff_mode
+        )
+        self.cutoff_mode = self._resolve_cutoff_mode(
+            requested_cutoff_mode,
+            preserve_mpo_default=self._is_quimb_mode(self.mode),
+        )
+        self.contraction_opt = (
+            original["contraction_opt"]
+            if contraction_opt is None
+            else contraction_opt
+        )
+
+        self._fit_n_iter = self._validate_positive_int(n_iter, "n_iter")
+        self._fit_min_iter = self._validate_positive_int(
+            fit_min_iter,
+            "fit_min_iter",
+        )
+        self._fit_patience = self._validate_positive_int(
+            fit_patience,
+            "fit_patience",
+        )
+        self._fit_rtol = self._resolve_fit_rtol(fit_rtol)
+        if fit_block_size is None:
+            fit_block_size = 3 if self.mode == "dmrg3" else 2
+        if (
+            isinstance(fit_block_size, bool)
+            or not isinstance(fit_block_size, Integral)
+            or int(fit_block_size) not in {1, 2, 3}
+        ):
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        fit_block_size = int(fit_block_size)
+        if self.mode == "dmrg3" and fit_block_size not in {1, 3}:
+            raise ValueError("mode='dmrg3' fixes fit_block_size to 3 or its one-site phase.")
+        if self.mode in {"dmrg1", "dmrg2"} and fit_block_size not in {1, 2}:
+            raise ValueError(
+                f"mode={self.mode!r} fixes fit_block_size to 2 or its one-site phase."
+            )
+        self._fit_block_size = fit_block_size
+        self._fit_adaptive_sweeps = self._validate_positive_int(
+            fit_adaptive_sweeps,
+            "fit_adaptive_sweeps",
+        )
+        self._fit_adaptive_sweeps = min(
+            self._fit_adaptive_sweeps,
+            self._fit_n_iter,
+        )
+        self._fit_sweep_sequence = FIT._validate_sweep_sequence(
+            fit_sweep_sequence
+        )
+        if fit_two_site_transition_sweeps is None:
+            fit_two_site_transition_sweeps = 1 if self.mode == "dmrg3" else 0
+        if (
+            isinstance(fit_two_site_transition_sweeps, bool)
+            or not isinstance(fit_two_site_transition_sweeps, Integral)
+            or int(fit_two_site_transition_sweeps) < 0
+        ):
+            raise ValueError(
+                "fit_two_site_transition_sweeps must be a non-negative integer."
+            )
+        self._fit_two_site_transition_sweeps = min(
+            int(fit_two_site_transition_sweeps),
+            self._fit_n_iter,
+        )
+        self._fit_single_pair_fast_path = bool(fit_single_pair_fast_path)
+        self._fit_finite_check = finite_check
+        self._fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        if fit_init_strategy is not None:
+            self.fit_init_strategy = self._normalize_fit_init_strategy(
+                fit_init_strategy
+            )
+        if fit_init_rand_strength is not None:
+            try:
+                fit_init_rand_strength = float(fit_init_rand_strength)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "fit_init_rand_strength must be finite and non-negative."
+                ) from exc
+            if (
+                not np.isfinite(fit_init_rand_strength)
+                or fit_init_rand_strength < 0.0
+            ):
+                raise ValueError(
+                    "fit_init_rand_strength must be finite and non-negative."
+                )
+            self.fit_init_rand_strength = fit_init_rand_strength
+        if fit_init_seed is not None:
+            if isinstance(fit_init_seed, bool) or not isinstance(
+                fit_init_seed, Integral
+            ) or int(fit_init_seed) < 0:
+                raise ValueError("fit_init_seed must be a non-negative integer.")
+            self.fit_init_seed = int(fit_init_seed)
+        return original
+
+    def _restore_run_configuration(self, original, *, keep_mode=False):
+        """Restore constructor configuration after a replay override.
+
+        ``keep_mode`` is used only when the caller explicitly requested a
+        mode transition in ``run``. Keeping that transition while restoring
+        cutoff/FIT controls makes mode changes persistent without allowing
+        one-off numerical settings to leak into later replays.
+        """
+        if not keep_mode:
+            self.mode = original["mode"]
+            self.chi = original["chi"]
+        self.cutoff = original["cutoff"]
+        self.cutoff_mode = original["cutoff_mode"]
+        self.contraction_opt = original["contraction_opt"]
+        self._fit_n_iter = original["fit_n_iter"]
+        self._fit_min_iter = original["fit_min_iter"]
+        self._fit_rtol = original["fit_rtol"]
+        self._fit_patience = original["fit_patience"]
+        self._fit_block_size = original["fit_block_size"]
+        self._fit_adaptive_sweeps = original["fit_adaptive_sweeps"]
+        self._fit_sweep_sequence = original["fit_sweep_sequence"]
+        self._fit_two_site_transition_sweeps = original[
+            "fit_two_site_transition_sweeps"
+        ]
+        self._fit_single_pair_fast_path = original["fit_single_pair_fast_path"]
+        self._fit_finite_check = original["fit_finite_check"]
+        self._fit_overlap_diagnostics = original["fit_overlap_diagnostics"]
+        self.fit_init_strategy = original["fit_init_strategy"]
+        self.fit_init_rand_strength = original["fit_init_rand_strength"]
+        self.fit_init_seed = original["fit_init_seed"]
+        if not keep_mode:
+            self._dmrg1_one_site_locked = original["dmrg1_one_site_locked"]
+
     def run(
         self,
         *,
@@ -3188,6 +3520,24 @@ class MpsStabOptimizer:
         timing: bool = False,
         transactional: bool = False,
         atomic=None,
+        n_iter=8,
+        cutoff=None,
+        cutoff_mode=None,
+        mode=None,
+        contraction_opt=None,
+        fit_min_iter=2,
+        fit_rtol="auto",
+        fit_patience=2,
+        fit_block_size=None,
+        fit_adaptive_sweeps=2,
+        fit_sweep_sequence="RL",
+        fit_two_site_transition_sweeps=None,
+        fit_single_pair_fast_path=False,
+        finite_check=False,
+        fit_overlap_diagnostics=False,
+        fit_init_strategy=None,
+        fit_init_rand_strength=None,
+        fit_init_seed=None,
     ):
         """Apply all queued gates in order, consuming successful entries.
 
@@ -3220,6 +3570,28 @@ class MpsStabOptimizer:
             because a full STN snapshot is intentionally expensive.
         atomic : bool | None
             Alias for ``transactional``.
+        n_iter, cutoff, cutoff_mode, mode, contraction_opt : optional
+            Replay controls matching :meth:`MpsOptimizer.run`. ``cutoff=None``
+            and ``contraction_opt=None`` retain the constructor values;
+            ``cutoff="auto"`` uses the dtype-aware Pepsy policy.
+        fit_min_iter, fit_rtol, fit_patience, fit_block_size, fit_adaptive_sweeps : optional
+            Local FIT/DMRG controls matching the ordinary MPS optimizer.
+            ``fit_rtol="auto"`` selects the dtype-aware stopping tolerance;
+            pass ``None`` to use the fixed iteration budget. The default FIT
+            guess remains ``fit_init_strategy="guess-src"``.
+        fit_sweep_sequence, fit_two_site_transition_sweeps : optional
+            Sweep direction and three-site-to-two-site transition controls for
+            FIT-backed DMRG modes.
+        fit_single_pair_fast_path, finite_check : optional
+            Enable the structural adjacent-pair shortcut or FIT validation
+            checks. Validation is opt-in because it adds tensor-scan cost.
+        fit_overlap_diagnostics : bool, optional
+            If true, compute a diagnostic overlap between the exact FIT target
+            and fitted MPS after each FIT update. This is separate from the
+            norm-based STN compression-loss diagnostic.
+        fit_init_strategy, fit_init_rand_strength, fit_init_seed : optional
+            Select and configure the disposable FIT warm start. The exact
+            target remains independent of this initial guess.
         """
         if atomic is not None:
             transactional = bool(atomic)
@@ -3227,6 +3599,35 @@ class MpsStabOptimizer:
             raise ValueError("shots must be a nonnegative integer.")
         if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
             raise TypeError("run_kwargs must be a mapping or None.")
+        replay_kwargs = dict(run_kwargs or {})
+        for key, value in {
+            "n_iter": n_iter,
+            "fit_min_iter": fit_min_iter,
+            "fit_rtol": fit_rtol,
+            "fit_patience": fit_patience,
+            "fit_block_size": fit_block_size,
+            "fit_adaptive_sweeps": fit_adaptive_sweeps,
+            "fit_sweep_sequence": fit_sweep_sequence,
+            "fit_two_site_transition_sweeps": fit_two_site_transition_sweeps,
+            "fit_single_pair_fast_path": fit_single_pair_fast_path,
+            "finite_check": finite_check,
+            "fit_overlap_diagnostics": fit_overlap_diagnostics,
+        }.items():
+            replay_kwargs.setdefault(key, value)
+        if cutoff is not None:
+            replay_kwargs["cutoff"] = cutoff
+        if cutoff_mode is not None:
+            replay_kwargs["cutoff_mode"] = cutoff_mode
+        if mode is not None:
+            replay_kwargs["mode"] = mode
+        if contraction_opt is not None:
+            replay_kwargs["contraction_opt"] = contraction_opt
+        if fit_init_strategy is not None:
+            replay_kwargs["fit_init_strategy"] = fit_init_strategy
+        if fit_init_rand_strength is not None:
+            replay_kwargs["fit_init_rand_strength"] = fit_init_rand_strength
+        if fit_init_seed is not None:
+            replay_kwargs["fit_init_seed"] = fit_init_seed
         shot_requested = bool(
             self._has_trajectory_events
             or error_model is not None
@@ -3250,7 +3651,7 @@ class MpsStabOptimizer:
                 shots,
                 error_model=error_model,
                 seed=seed,
-                run_kwargs=run_kwargs,
+                run_kwargs=replay_kwargs,
                 strategy=strategy,
                 max_branches=max_branches,
                 importance_sampling=importance_sampling,
@@ -3279,6 +3680,26 @@ class MpsStabOptimizer:
             }
             return result
 
+        run_configuration = self._prepare_run_configuration(
+            n_iter=n_iter,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            mode=mode,
+            contraction_opt=contraction_opt,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
+            fit_block_size=fit_block_size,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
+            fit_sweep_sequence=fit_sweep_sequence,
+            fit_two_site_transition_sweeps=fit_two_site_transition_sweeps,
+            fit_single_pair_fast_path=fit_single_pair_fast_path,
+            finite_check=finite_check,
+            fit_overlap_diagnostics=fit_overlap_diagnostics,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_rand_strength=fit_init_rand_strength,
+            fit_init_seed=fit_init_seed,
+        )
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         queue = tuple(self._queue)
@@ -3324,6 +3745,10 @@ class MpsStabOptimizer:
                 "completed": completed,
                 "elapsed_seconds": float(time.perf_counter() - started),
             }
+            self._restore_run_configuration(
+                run_configuration,
+                keep_mode=mode is not None,
+            )
         return self
 
     def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
@@ -3705,11 +4130,115 @@ class MpsStabOptimizer:
     def norm(self) -> float:
         """Norm of the coefficient state ``|nu>`` (represented state norm; ~1).
 
-        Computed from :meth:`_norm_squared`, which uses the tracked orthogonality
-        centre when available (no full ``<nu|nu>`` contraction) and never mutates
-        the state.
+        Computed from a log-scaled norm read, using the tracked orthogonality
+        centre when available (no full ``<nu|nu>`` contraction) and never
+        materializing an extreme exponent.
         """
-        return float(self._norm_squared() ** 0.5)
+        return self._float_from_log10(self._norm_log10())
+
+    @staticmethod
+    def _float_from_log10(log10_value: float) -> float:
+        """Materialize a base-10 log value without raising on overflow.
+
+        Norm diagnostics can legitimately span beyond the representable float
+        range. Check the logarithm before exponentiating so reporting an
+        extreme norm produces ``0.0`` or ``inf`` rather than an exception.
+        """
+        log10_value = float(log10_value)
+        if math.isnan(log10_value):
+            return math.nan
+        if log10_value <= _LOG10_FLOAT_MIN_SUBNORMAL:
+            return 0.0
+        if log10_value >= _LOG10_FLOAT_MAX:
+            return math.inf
+        return float(10.0 ** log10_value)
+
+    @staticmethod
+    def _log10_fidelity_from_norms(approx_log10, expected_log10):
+        """Return log fidelity from log-norms, clipped to unit fidelity.
+
+        Fidelity is the squared retained-norm ratio, so the calculation stays
+        stable when either norm carries a very large Quimb exponent.
+        """
+        approx_log10 = float(approx_log10)
+        expected_log10 = float(expected_log10)
+        if math.isnan(approx_log10) or math.isnan(expected_log10):
+            return -math.inf
+        if expected_log10 == -math.inf:
+            return 0.0 if approx_log10 == -math.inf else -math.inf
+        if approx_log10 == -math.inf:
+            return -math.inf
+        if approx_log10 == math.inf and expected_log10 == math.inf:
+            return 0.0
+        if expected_log10 == math.inf:
+            return -math.inf
+        return min(0.0, 2.0 * (approx_log10 - expected_log10) * _LN10)
+
+    def _coefficient_norm_parts(self):
+        """Return ``(norm_mantissa, log10_scale)`` for ``state.p``.
+
+        The tracked canonical centre gives a cheap norm mantissa while keeping
+        Quimb's network exponent separate. For an unknown centre, use Quimb's
+        public ``strip_exponent`` norm API so the full contraction does not
+        materialize an extreme scale.
+        """
+        p = self.state.p
+        cur = self.state.info.get("cur_orthog")
+        if isinstance(cur, tuple) and len(cur) == 2 and cur[0] == cur[1]:
+            center = p[p.site_tag(int(cur[0]))]
+            norm_mantissa = float(abs(self._to_scalar(center.norm())))
+            return norm_mantissa, float(getattr(p, "exponent", 0.0))
+
+        try:
+            result = p.norm(strip_exponent=True)
+            if isinstance(result, tuple) and len(result) == 2:
+                norm_mantissa, exponent = result
+                return (
+                    float(abs(self._to_scalar(norm_mantissa))),
+                    float(exponent),
+                )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            FloatingPointError,
+            OverflowError,
+        ):
+            pass
+
+        # Compatibility fallback for older Quimb releases without the public
+        # ``strip_exponent`` norm option. Keep the explicit scale separate so
+        # the fallback cannot double-count it.
+        raw = p.copy()
+        exponent = float(getattr(raw, "exponent", 0.0))
+        raw.exponent = 0.0
+        return float(abs(self._to_scalar(raw.norm()))), exponent
+
+    def _norm_log10(self) -> float:
+        """Return ``log10(||p||)`` without materializing the represented norm."""
+        norm_mantissa, exponent = self._coefficient_norm_parts()
+        if math.isnan(norm_mantissa) or math.isnan(exponent):
+            return math.nan
+        if norm_mantissa == 0.0:
+            return -math.inf
+        if norm_mantissa == math.inf or exponent == math.inf:
+            return math.inf
+        if exponent == -math.inf:
+            return -math.inf
+        return math.log10(norm_mantissa) + exponent
+
+    def _norm_snapshot(self):
+        """Return ``(norm, norm_squared, log10_norm)`` from one norm read.
+
+        The materialized values serve compatibility diagnostics; the log value
+        is the authoritative form for ratios and norm restoration.
+        """
+        log10_norm = self._norm_log10()
+        return (
+            self._float_from_log10(log10_norm),
+            self._float_from_log10(2.0 * log10_norm),
+            log10_norm,
+        )
 
     def _norm_squared(self) -> float:
         """Return ``<nu|nu>`` (real) without mutating the state.
@@ -3718,13 +4247,7 @@ class MpsStabOptimizer:
         squared Frobenius norm of that centre tensor; otherwise the full closed
         ``<nu|nu>`` network is contracted.
         """
-        cur = self.state.info.get("cur_orthog")
-        if isinstance(cur, tuple) and len(cur) == 2 and cur[0] == cur[1]:
-            center = self.state.p[self.state.p.site_tag(int(cur[0]))]
-            nrm = float(abs(self._to_scalar(center.norm())))
-            exponent = float(getattr(self.state.p, "exponent", 0.0))
-            return nrm * nrm * (10.0 ** (2.0 * exponent))
-        return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
+        return self._norm_snapshot()[1]
 
     def _unitary_infidelity(self) -> Optional[float]:
         """Return cumulative unitary norm loss from the canonical centre."""
@@ -3732,7 +4255,10 @@ class MpsStabOptimizer:
             return None
 
         self._canonize_p_single()
-        infidelity = min(1.0, max(0.0, 1.0 - self._norm_squared()))
+        log_fidelity = self._log10_fidelity_from_norms(
+            self._norm_log10(), 0.0
+        )
+        infidelity = float(infidelity_from_log(log_fidelity))
         if not self._norm_segment_open:
             self._current_infidelity = infidelity
         return infidelity
@@ -3743,22 +4269,39 @@ class MpsStabOptimizer:
         after_infidelity: Optional[float],
         *,
         kind: str = "unitary_compression",
+        before_log_norm: Optional[float] = None,
     ) -> None:
         """Record one local retained-norm ratio for a compressed update."""
+        if after_infidelity is None:
+            return
+        if before_log_norm is None:
+            if (
+                before_norm_sq is None
+                or before_norm_sq <= 0.0
+                or math.isnan(float(before_norm_sq))
+            ):
+                return
+            before_log_norm = 0.5 * math.log10(float(before_norm_sq))
+        after_log_norm = self._norm_log10()
         if (
-            before_norm_sq is None
-            or after_infidelity is None
-            or not np.isfinite(before_norm_sq)
-            or before_norm_sq <= 0.0
+            math.isnan(float(before_log_norm))
+            or math.isnan(after_log_norm)
+            or before_log_norm == -math.inf
         ):
             return
-        observed_norm_sq = min(1.0, max(0.0, 1.0 - float(after_infidelity)))
-        raw = float(np.divide(observed_norm_sq, float(before_norm_sq)))
-        local_log_fidelity = log_fidelity_from_norms(
-            observed_norm_sq ** 0.5,
-            float(before_norm_sq) ** 0.5,
-        )
-        local_fidelity = min(1.0, max(0.0, fidelity_from_log(local_log_fidelity)))
+
+        # Measure retention from the pre/post represented norms, not from the
+        # optional ``after_infidelity`` estimate. The latter is only the local
+        # observation used to decide whether this unitary segment is valid;
+        # the log ratio remains finite even when squared norms overflow.
+        raw_log_fidelity = 2.0 * (
+            after_log_norm - float(before_log_norm)
+        ) * _LN10
+        if math.isnan(raw_log_fidelity):
+            return
+        local_log_fidelity = min(0.0, raw_log_fidelity)
+        raw = self._float_from_log10(raw_log_fidelity / _LN10)
+        local_fidelity = float(fidelity_from_log(local_log_fidelity))
         local_infidelity = float(1.0 - local_fidelity)
         if local_fidelity == 0.0 or self._compression_segment_log_survival == -math.inf:
             self._compression_segment_log_survival = -math.inf
@@ -3779,8 +4322,8 @@ class MpsStabOptimizer:
             "step": len(self._compression_norm_events) + 1,
             "kind": str(kind),
             "valid": True,
-            "expected_norm": float(max(0.0, before_norm_sq) ** 0.5),
-            "observed_norm": float(observed_norm_sq ** 0.5),
+            "expected_norm": self._float_from_log10(float(before_log_norm)),
+            "observed_norm": self._float_from_log10(after_log_norm),
             "fidelity_raw": float(raw),
             "local_fidelity": local_fidelity,
             "local_infidelity": local_infidelity,
@@ -3797,6 +4340,8 @@ class MpsStabOptimizer:
         self,
         target_norm_sq: Optional[float],
         observed_infidelity: Optional[float],
+        *,
+        target_log_norm: Optional[float] = None,
     ) -> None:
         """Restore the pre-compression working norm without changing fidelity data."""
         if (
@@ -3806,22 +4351,38 @@ class MpsStabOptimizer:
             or not self._infidelity_valid
         ):
             return
-        target_norm = float(max(0.0, target_norm_sq) ** 0.5)
-        observed_norm = float(self._norm_squared() ** 0.5)
+        if target_log_norm is None:
+            if target_norm_sq is None or target_norm_sq <= 0.0:
+                raise FloatingPointError(
+                    "Cannot stabilize a unitary compression with a zero or "
+                    "invalid target norm."
+                )
+            target_log_norm = 0.5 * math.log10(float(target_norm_sq))
+        observed_log_norm = self._norm_log10()
         if (
-            target_norm <= 0.0
-            or observed_norm <= 0.0
-            or not np.isfinite(target_norm)
-            or not np.isfinite(observed_norm)
+            math.isnan(float(target_log_norm))
+            or math.isnan(observed_log_norm)
+            or target_log_norm == -math.inf
+            or observed_log_norm == -math.inf
         ):
             raise FloatingPointError(
                 "Cannot stabilize a unitary compression with a zero or "
                 "non-finite retained norm."
             )
-        if not np.isclose(target_norm, observed_norm, rtol=1e-14, atol=1e-15):
+        # Restore only the working representation's scale. The compression
+        # loss has already been recorded above and must remain visible in the
+        # segment diagnostics after this normalization.
+        log10_scale = float(target_log_norm) - observed_log_norm
+        if abs(log10_scale) > 1.0e-14:
+            scale = self._float_from_log10(log10_scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise FloatingPointError(
+                    "Cannot stabilize a unitary compression with an invalid "
+                    "represented-norm scale."
+                )
             center_site = self._canonize_p_single()
             center = self.state.p[self.state.p.site_tag(int(center_site))]
-            center.modify(data=center.data * (target_norm / observed_norm))
+            center.modify(data=center.data * scale)
         self.state.info["cur_orthog"] = (
             int(self.state.info["cur_orthog"][0]),
             int(self.state.info["cur_orthog"][1]),
@@ -3883,9 +4444,10 @@ class MpsStabOptimizer:
             )
             self._norm_segment_open = True
         segment_fidelity = max(0.0, min(1.0, 1.0 - segment_infidelity))
-        norm_sq = self._norm_squared()
+        norm_log10 = self._norm_log10()
+        norm_sq = self._float_from_log10(2.0 * norm_log10)
         event.update(
-            pre_norm=float(norm_sq ** 0.5),
+            pre_norm=self._float_from_log10(norm_log10),
             pre_norm_sq=float(norm_sq),
             segment_infidelity=segment_infidelity,
             segment_fidelity=segment_fidelity,
@@ -4244,7 +4806,7 @@ class MpsStabOptimizer:
                 f"measured/forced outcome has ~0 probability (centre norm={nrm:.2e})."
             )
         exponent = float(getattr(self.state.p, "exponent", 0.0))
-        represented_norm = float(nrm * (10.0 ** exponent))
+        represented_norm = self._float_from_log10(math.log10(nrm) + exponent)
         center.modify(data=center.data / nrm)
         # Quimb stores an additional base-10 network scale separately from the
         # tensors. The centre is now normalized, so that scale must be cleared.
@@ -4300,6 +4862,8 @@ class MpsStabOptimizer:
             chi=self.chi,
             mode=self.mode,
             cutoff=self.cutoff,
+            cutoff_mode=self.cutoff_mode,
+            contraction_opt=self.contraction_opt,
             operator_tol=self.operator_tol,
             max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
             max_pauli_terms=self.max_pauli_terms,
@@ -5442,9 +6006,26 @@ class MpsStabOptimizer:
 
     def _quimb_compress_opts(self, method):
         """Return the Quimb options shared by coefficient-MPO updates."""
+        # Some Quimb methods deliberately choose rank from ``max_bond`` and
+        # therefore ignore singular-value cutoffs. Keep that exception aligned
+        # with MpsOptimizer instead of passing an option the method will reject
+        # or silently interpret differently.
         opts = {
             "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else self.cutoff,
         }
+        if (
+            self.cutoff_mode is not None
+            and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
+        ):
+            opts["cutoff_mode"] = self.cutoff_mode
+        optimize = self.contraction_opt
+        if optimize is not None and not (
+            isinstance(optimize, str)
+            and optimize.strip().lower() in {"auto", "auto-hq"}
+        ):
+            # ``auto``/``auto-hq`` are Pepsy policy names. Only explicit
+            # contraction choices belong in Quimb's low-level kwargs.
+            opts["optimize"] = optimize
         if method == "fit-projector":
             # Match the ordinary MPS path: projector fitting does not need the
             # optional pre-gauge and is safer on exact product-state bonds.
@@ -5483,9 +6064,10 @@ class MpsStabOptimizer:
                 chi=max_bond,
                 method=method,
                 cutoff=self.cutoff,
-                cutoff_mode=None,
+                cutoff_mode=self.cutoff_mode,
                 info=info,
                 inplace_mpo=False,
+                optimize=self._native_contraction_opt(),
                 seed=self.compression_seed,
             )
 
@@ -5506,6 +6088,18 @@ class MpsStabOptimizer:
             **opts,
         )
         return p
+
+    def _native_contraction_opt(self):
+        """Return only explicit contraction options for native Quimb calls."""
+        optimize = self.contraction_opt
+        if optimize is None:
+            return None
+        if isinstance(optimize, str) and optimize.strip().lower() in {
+            "auto",
+            "auto-hq",
+        }:
+            return None
+        return optimize
 
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
@@ -5557,11 +6151,11 @@ class MpsStabOptimizer:
         compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
-        before_norm_sq = (
-            self._norm_squared()
-            if unitary and self._infidelity_valid
-            else None
-        )
+        if unitary and self._infidelity_valid:
+            _before_norm, before_norm_sq, before_log_norm = self._norm_snapshot()
+        else:
+            before_norm_sq = None
+            before_log_norm = None
         if self.mode in self._DMRG_MODES:
             self._evolve_p_dmrg(mpo, where)
         else:
@@ -5585,6 +6179,7 @@ class MpsStabOptimizer:
             before_norm_sq,
             observed_infidelity,
             kind=norm_event_kind,
+            before_log_norm=before_log_norm,
         )
         infidelity = (
             None
@@ -5592,7 +6187,11 @@ class MpsStabOptimizer:
             else self._current_infidelity
         )
         if unitary:
-            self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
+            self._stabilize_unitary_norm(
+                before_norm_sq,
+                observed_infidelity,
+                target_log_norm=before_log_norm,
+            )
         if renormalize:
             site = self._canonize_p_single()
             projected_norm = self._renorm_p_at(site)
@@ -5893,7 +6492,9 @@ class MpsStabOptimizer:
             target_strategy = (
                 "layered" if self._fit_target_is_layered(target) else "mps"
             )
-        requested_block_size = 3 if self.mode == "dmrg3" else 2
+        requested_block_size = self._fit_block_size or (
+            3 if self.mode == "dmrg3" else 2
+        )
         block_size = min(requested_block_size, span)
         self._maybe_lock_dmrg1_one_site_phase(p)
         if (
@@ -5921,22 +6522,34 @@ class MpsStabOptimizer:
             where,
             block_size=block_size,
         )
+        # The exact operator-applied target and the disposable FIT starting
+        # point have different jobs: ``target`` defines the variational
+        # problem, while ``fit_guess`` only improves convergence.
         fit = FIT(
             target,
             p=fit_guess,
             cutoffs=self.cutoff,
+            contraction_opt=self.contraction_opt,
             retag=False,
             range_int=[start, stop],
             inplace=True,
             copy_target=False,
         )
         adjacent_two_site = span == 2 and block_size == 2
-        growth_sweeps = (
-            0 if block_size == 1 else (1 if adjacent_two_site else 2)
+        single_pair_fast_path = bool(
+            self._fit_single_pair_fast_path
+            or (self.mode == "dmrg2" and adjacent_two_site)
+        )
+        growth_sweeps = 0 if block_size == 1 else min(
+            self._fit_adaptive_sweeps,
+            self._fit_n_iter,
         )
         resolved_fit_init_strategy = self._resolved_fit_init_strategy(
             self.fit_init_strategy
         )
+        transition_sweeps = self._fit_two_site_transition_sweeps
+        if transition_sweeps is None:
+            transition_sweeps = 1 if self.mode == "dmrg3" else 0
         guess_method = (
             resolved_fit_init_strategy[len("guess_") :]
             if resolved_fit_init_strategy.startswith("guess_")
@@ -5954,14 +6567,20 @@ class MpsStabOptimizer:
             # A two-site gate is already the complete local problem. Match
             # MpsOptimizer's structural fast path and spend one FIT update on
             # it; longer windows use two growth sweeps and one-site handoff.
-            n_iter=1 if adjacent_two_site else 3,
+            n_iter=(
+                1
+                if single_pair_fast_path and adjacent_two_site
+                else self._fit_n_iter
+            ),
             block_size=block_size,
-            sweep_sequence="RL",
+            sweep_sequence=self._fit_sweep_sequence,
             max_bond=self.chi,
             cutoff=self.cutoff,
-            min_iter=1,
-            rtol=None,
-            patience=1,
+            cutoff_mode=self.cutoff_mode or "rsum2",
+            min_iter=self._fit_min_iter,
+            rtol=self._fit_rtol,
+            patience=self._fit_patience,
+            finite_check=self._fit_finite_check,
             adaptive_block_sweeps=(
                 None if block_size == 1 else growth_sweeps
             ),
@@ -5970,7 +6589,12 @@ class MpsStabOptimizer:
             # FIT's one-site handoff. Do not add a second explicit refinement
             # sweep on top of that canonical MpsOptimizer schedule.
             final_one_site_sweeps=0,
-            single_pair_fast_path=True,
+            two_site_transition_sweeps=(
+                0
+                if block_size != 3
+                else transition_sweeps
+            ),
+            single_pair_fast_path=single_pair_fast_path,
             collect_split_diagnostics=False,
         )
         self.state.p = fit.p
@@ -5984,17 +6608,74 @@ class MpsStabOptimizer:
                 getattr(fit, "one_site_sweeps_run", 0)
             ),
             "iterations": int(getattr(fit, "iterations_run", 0)),
+            "converged": bool(getattr(fit, "converged", False)),
+            "convergence_reason": getattr(fit, "convergence_reason", None),
+            "relative_change": getattr(fit, "last_relative_change", None),
             "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
             "fit_init_strategy": resolved_fit_init_strategy,
             "fit_init_strategy_requested": self.fit_init_strategy,
             "guess_method": guess_method,
             "guess_used": guess_used,
             "target_strategy": target_strategy,
+            "cutoff": float(self.cutoff),
+            "cutoff_mode": self.cutoff_mode or "rsum2",
+            "contraction_opt": self.contraction_opt,
+            "fit_n_iter": int(self._fit_n_iter),
+            "fit_min_iter": int(self._fit_min_iter),
+            "fit_rtol": self._fit_rtol,
+            "fit_patience": int(self._fit_patience),
+            "fit_adaptive_sweeps": int(self._fit_adaptive_sweeps),
+            "fit_sweep_sequence": self._fit_sweep_sequence,
+            "fit_two_site_transition_sweeps": int(
+                transition_sweeps
+            ),
+            "fit_single_pair_fast_path": bool(single_pair_fast_path),
+            "fit_overlap_diagnostics": bool(self._fit_overlap_diagnostics),
+            "fit_overlap_fidelity": None,
+            "fit_overlap_infidelity": None,
+            "fit_overlap_error": None,
         }
+        if self._fit_overlap_diagnostics:
+            overlap = self._fit_overlap_diagnostics_for_target(target, fit.p)
+            self._last_fit_diagnostics.update(overlap)
         center = fit.final_center_site
         if center is None:
             center = stop
         self.state.info["cur_orthog"] = (int(center), int(center))
+
+    def _fit_overlap_diagnostics_for_target(self, target, fitted):
+        """Return the optional target-overlap diagnostic for a FIT update."""
+        from ...tensors.core import tn_fidelity
+
+        # Contract copies so this optional diagnostic cannot alter the live
+        # target or FIT center metadata used by the next replay step.
+        contraction_opt = self.contraction_opt
+        if contraction_opt is None or (
+            isinstance(contraction_opt, str)
+            and contraction_opt.strip().lower() in {"auto", "auto-hq"}
+        ):
+            contraction_opt = "greedy"
+        try:
+            overlap = tn_fidelity(
+                target.copy(),
+                fitted.copy(),
+                contraction_opt=contraction_opt,
+            )
+            overlap = float(np.real(self._to_scalar(overlap)))
+            if not np.isfinite(overlap):
+                raise ValueError("FIT target overlap is non-finite")
+        except Exception as exc:  # diagnostic only
+            return {
+                "fit_overlap_fidelity": None,
+                "fit_overlap_infidelity": None,
+                "fit_overlap_error": f"{type(exc).__name__}: {exc}",
+            }
+        overlap = min(1.0, max(0.0, overlap))
+        return {
+            "fit_overlap_fidelity": overlap,
+            "fit_overlap_infidelity": float(1.0 - overlap),
+            "fit_overlap_error": None,
+        }
 
     def _evolve_p_dmrg(self, mpo, where):
         """Build a layered target and compress it with coefficient FIT."""
@@ -7916,11 +8597,11 @@ class MpsStabOptimizer:
         """
         p = self.state.p
         branches = tuple(branches)
-        before_norm_sq = (
-            self._norm_squared()
-            if unitary and self._infidelity_valid
-            else None
-        )
+        if unitary and self._infidelity_valid:
+            _before_norm, before_norm_sq, before_log_norm = self._norm_snapshot()
+        else:
+            before_norm_sq = None
+            before_log_norm = None
         if not branches or self._norm_squared() <= 0.0:
             self._set_zero_coefficient_state()
             if unitary:
@@ -7928,9 +8609,14 @@ class MpsStabOptimizer:
                 self._record_compression_norm_event(
                     before_norm_sq,
                     observed_infidelity,
+                    before_log_norm=before_log_norm,
                 )
                 infidelity = self._current_infidelity
-                self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
+                self._stabilize_unitary_norm(
+                    before_norm_sq,
+                    observed_infidelity,
+                    target_log_norm=before_log_norm,
+                )
                 return infidelity
             if target_norm is not None:
                 return self._nonunitary_compression_infidelity(target_norm)
@@ -7944,7 +8630,11 @@ class MpsStabOptimizer:
                 and (max_bond is None or max_bond >= len(branches))
             )
             if not preserve_zero:
-                result.compress(max_bond=max_bond, cutoff=self.cutoff)
+                result.compress(
+                    max_bond=max_bond,
+                    cutoff=self.cutoff,
+                    cutoff_mode=self.cutoff_mode or "rsum2",
+                )
             return result
 
         def build(max_bond):
@@ -7990,7 +8680,11 @@ class MpsStabOptimizer:
                     else combine(result, partial, max_bond)
                 )
             if not preserve_zero:
-                result.compress(max_bond=max_bond, cutoff=self.cutoff)
+                result.compress(
+                    max_bond=max_bond,
+                    cutoff=self.cutoff,
+                    cutoff_mode=self.cutoff_mode or "rsum2",
+                )
             return result
 
         if self.mode in self._DMRG_MODES:
@@ -8018,9 +8712,14 @@ class MpsStabOptimizer:
             self._record_compression_norm_event(
                 before_norm_sq,
                 observed_infidelity,
+                before_log_norm=before_log_norm,
             )
             infidelity = self._current_infidelity
-            self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
+            self._stabilize_unitary_norm(
+                before_norm_sq,
+                observed_infidelity,
+                target_log_norm=before_log_norm,
+            )
             return infidelity
         if target_norm is not None:
             return self._nonunitary_compression_infidelity(target_norm)
