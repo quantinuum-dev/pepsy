@@ -396,6 +396,123 @@ def test_mps_optimizer_perm_maps_control_events_to_logical_sites():
     assert opt.measurements[0][2] == 1
 
 
+def test_mps_optimizer_perm_conditional_gate_maps_logical_site_once():
+    """A feed-forward gate after a lazy swap must not be mapped twice."""
+    flip = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        [
+            (qu.hadamard(), 0),
+            (qu.CNOT(), (0, 3)),
+            ("measure", "Z", 0, -1),
+            ("if", -1, 1, (flip, 2)),
+        ],
+        chi=8,
+        mode="perm",
+    )
+
+    opt.run(progbar=False, cutoff=0.0)
+
+    expected = np.zeros(16, dtype=complex)
+    expected[11] = 1.0  # logical |1011>
+    np.testing.assert_allclose(opt.to_dense().reshape(-1), expected, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("mode", "routing"),
+    [
+        ("perm-direct", None),
+        ("perm-src", None),
+        ("perm-dmrg2", None),
+        ("dmrg2", "perm"),
+    ],
+)
+def test_mps_optimizer_perm_composes_routing_and_compression(mode, routing):
+    """Lazy permutation routing should compose with the selected compressor."""
+    p0 = qtn.MPS_computational_state("00000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (3, 0)),
+        (qu.CNOT(), (1, 4)),
+        (qu.hadamard(), (2,)),
+        (qu.CNOT(), (4, 1)),
+    ]
+    reference = py.MpsOptimizer(p0.copy(), gates=gates, chi=32, mode="exact")
+    reference.run(progbar=False)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=gates,
+        chi=32,
+        mode=mode,
+        **({} if routing is None else {"routing": routing}),
+    )
+    opt.run(progbar=False, cutoff=0.0, n_iter=4)
+
+    np.testing.assert_allclose(
+        np.asarray(opt.to_dense()).reshape(-1),
+        np.asarray(reference.to_dense()).reshape(-1),
+        atol=1e-10,
+    )
+    assert opt.routing == "perm"
+    assert opt.qubits != list(range(5))
+
+
+def test_mps_optimizer_perm_routing_rejects_layout_and_duplicate_alias_options():
+    """Routing and persistent layouts remain mutually exclusive."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(p0, gates=[], chi=8, mode="dmrg2", routing="perm")
+
+    with pytest.raises(ValueError, match="persistent layouts cannot be combined"):
+        opt.apply_layout((0, 2, 3, 1), layout_report=False)
+    with pytest.raises(ValueError, match="specify either"):
+        py.MpsOptimizer(p0, gates=[], chi=8, mode="perm-dmrg2", routing="perm")
+
+
+@pytest.mark.parametrize("mode", ["perm-direct", "perm-src", "perm-dmrg2"])
+def test_mps_optimizer_exact_to_perm_mode_switch_rebuilds_mps(mode):
+    """Switching a contracted exact state must seed routed MPS bookkeeping."""
+    gates = [("h", 0), ("cnot", 0, 3), ("h", 1)]
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"), gates, chi=16, mode="exact"
+    )
+    opt.run(progbar=False)
+    opt.set_mode(mode)
+
+    assert opt.routing == "perm"
+    assert opt.qubits == list(range(4))
+    opt.run(progbar=False, cutoff=0.0, fit_init_strategy="guess-direct")
+
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"), gates + gates, chi=16, mode="exact"
+    )
+    reference.run(progbar=False)
+    np.testing.assert_allclose(
+        np.asarray(opt.to_dense()).reshape(-1),
+        np.asarray(reference.to_dense()).reshape(-1),
+        atol=1e-10,
+    )
+
+
+@pytest.mark.parametrize("mode", ["perm-direct", "perm-src", "perm-dmrg2"])
+def test_mps_optimizer_perm_stabilization_includes_route_compression(mode):
+    """Routed swap truncation belongs to the selected unitary compression step."""
+    vector = np.zeros(32, dtype=complex)
+    vector[0] = vector[18] = 1.0 / np.sqrt(2.0)
+    opt = py.MpsOptimizer(
+        qtn.MatrixProductState.from_dense(vector, [2] * 5),
+        gates=[("cnot", 0, 4)],
+        chi=1,
+        mode=mode,
+    )
+
+    opt.run(progbar=False, cutoff=1.0e-12, stabilize_unitary=True)
+
+    event = opt.get_norm_events()[0]
+    assert event["kind"] == "unitary_compression"
+    assert event["observed_norm"] < 0.9 * event["expected_norm"]
+    assert opt.p.norm() == pytest.approx(1.0)
+
+
 def test_mps_optimizer_svd_smoke():
     """SVD mode should apply mixed 1q/2q gates without errors."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")

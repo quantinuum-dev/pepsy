@@ -127,6 +127,40 @@ successive deterministic compressors are available explicitly as
 `mode="quimb-sdc"` and `mode="quimb-sdc-oversample"` when the installed Quimb
 build provides them. These modes are opt-in and do not change existing
 defaults.
+
+## Lazy permutation routing with a selected compressor
+
+Routing and compression can be selected independently. Use the explicit
+two-axis form for new code:
+
+```python
+opt = pepsy.MpsOptimizer(state, gates, chi=64, mode="dmrg2", routing="perm")
+opt.run()
+```
+
+The historical `mode="perm"` remains the local swap-and-split path. For
+convenience, `mode="perm-dmrg2"`, `mode="perm-direct"`, and
+`mode="perm-src"` are aliases for `routing="perm"` with the corresponding
+compressor. During a routed replay, each non-local gate is moved to an
+adjacent physical pair and then passed to the selected DMRG, Quimb, or SVD
+backend. Internal route swaps use the stable adjacent MPS split path. This
+feature currently accepts ordinary gate events; use a normal compression mode
+for explicit sub-MPO stream events.
+
+For a compression-aware static layout, combine the layout pilot with the same
+compression mode:
+
+```python
+opt = pepsy.MpsOptimizer(state, gates, chi=64, mode="dmrg2")
+plan = opt.select_layout_for_compression(run_kwargs={"n_iter": 8})
+opt.apply_layout(plan, layout_report=False)
+opt.run(n_iter=8)
+```
+
+Persistent layouts and `routing="perm"` are mutually exclusive: a layout is a
+fixed physical order, while permutation routing changes the order after each
+non-local gate.
+
 These events represent already-factorized nonlocal operators:
 
 ```python
@@ -791,7 +825,8 @@ swap-and-split path but leaves the swaps in place, tracking the current
 physical-site-to-logical-site ordering in `opt.qubits`. This is useful for
 streams with little expected locality. The returned `opt.p` remains an MPS in
 physical order; call `opt.restore_qubit_order()` when a conventional logical
-site order is needed.
+site order is needed. The `perm-*` aliases and the explicit
+`mode=<compressor>, routing="perm"` form retain this logical readout contract.
 
 For repeated evolution, use `opt.apply_layout("quality")` once. This installs
 the selected position-to-logical mapping in `opt.logical_order` and keeps the
