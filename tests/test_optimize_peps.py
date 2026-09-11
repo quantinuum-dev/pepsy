@@ -137,7 +137,9 @@ def test_peps_optimizer_routes_two_site_boundary_policy(monkeypatch):
 
     monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
     policy = {
-        "fit_mode": "two-site",
+        "fit_mode": "dmrg2",
+        "fit_init_strategy": "guess-src",
+        "fit_init_seed": 13,
         "fit_max_bond": 7,
         "fit_sweep_sequence": "RL",
         "fit_cutoff_mode": "rsum2",
@@ -1553,6 +1555,83 @@ def test_peps_optimizer_explicit_quimb_boundary_engine_forwards_options(monkeypa
     assert captured["kwargs"]["normalize_kwargs"]["method"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["mode_"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["balance_bonds"] is False
+
+
+def test_quimb_boundary_store_resolves_auto_cutoffs_and_preserves_sweep_state():
+    """Quimb options should use the shared dtype policy without leaking API keywords."""
+    from pepsy.boundary.metrics import build_bra_ket
+    from pepsy.optimizers.sweep.environments import QuimbMpsBoundaryStore
+
+    ket = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        seed=304,
+        dtype="float32",
+    )
+    _, norm = build_bra_ket(ket=ket)
+    store = QuimbMpsBoundaryStore(
+        chi=4,
+        cutoff="auto",
+        cutoff_mode="auto",
+    )
+    envs_ref = store.envs
+    mps_b_ref = store.mps_b
+
+    store.update_axis(norm, "Y")
+
+    assert store.envs is envs_ref
+    assert store.mps_b is mps_b_ref
+    assert store._resolved_cutoff == pytest.approx(1.0e-6)
+    opts = store._compute_kwargs(tn=norm)
+    assert opts["cutoff"] == pytest.approx(1.0e-6)
+    assert opts["compress_opts"]["cutoff_mode"] == "rsum2"
+    assert "cutoff_mode" not in opts
+
+    store.start_sweep(norm, "Y", "left", reuse_static=True)
+    assert store.envs is envs_ref
+    assert store.mps_b is mps_b_ref
+    assert store._compute_kwargs()["cutoff"] == pytest.approx(1.0e-6)
+    copied = store.copy()
+    assert copied._sweep_axis == "y"
+    assert copied._sweep_update_side == "left"
+    assert copied.cutoff_mode == "rsum2"
+
+    store.clear("Y")
+    assert store.envs is envs_ref
+    assert store.mps_b is mps_b_ref
+    assert not store.envs
+    assert not store.mps_b
+
+
+def test_quimb_boundary_store_reuses_complete_static_side_without_recompute():
+    """Alternating half-sweeps should reuse the side built by the prior sweep."""
+    from pepsy.optimizers.sweep.environments import QuimbMpsBoundaryStore
+
+    class _FakeTN:
+        Lx = 2
+        Ly = 3
+
+        def compute_y_environments(self, **_kwargs):
+            return {
+                (side, index): object()
+                for side in ("ymin", "ymax")
+                for index in range(self.Ly)
+            }
+
+        def compute_ymax_environments(self, **_kwargs):
+            raise AssertionError("complete static side should have been reused")
+
+    tn = _FakeTN()
+    store = QuimbMpsBoundaryStore(chi=4)
+    store.update_axis(tn, "y")
+    store.start_sweep(tn, "y", "left", reuse_static=True)
+
+    assert set(store.envs) == {
+        ("ymax", 0),
+        ("ymax", 1),
+        ("ymax", 2),
+    }
 
 
 def test_peps_optimizer_explicit_dmrg_boundary_engine_overrides_symmray_auto(monkeypatch):

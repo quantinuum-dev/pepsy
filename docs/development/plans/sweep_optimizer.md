@@ -7,7 +7,8 @@ Implemented:
 - `boundary_engine="dmrg"` for the historical Pepsy boundary path.
 - `boundary_engine="quimb-mps"` for Quimb MPS environment stores.
 - `boundary_engine="auto"` for Symmray-aware routing.
-- Conservative full-axis Quimb environment refreshes after local updates.
+- Alternating Quimb half-sweeps with one initial static-side build and cached
+  static-side reuse after each complete half-sweep.
 
 ## Next steps
 
@@ -15,8 +16,8 @@ Implemented:
   environment around an `axis/index` pair.
 - Move local objective construction into `local_objective.py`.
 - Move trace and progress summarization into `traces.py`.
-- Tighten Quimb reupdates from full-axis refreshes to narrower ranges once the
-  provider API is stable.
+- Benchmark narrower-range invalidation once the provider API supports it;
+  static-side reuse is the current safe optimization for complete half-sweeps.
 - Add numerical comparisons between dense Pepsy and Quimb MPS environment
   paths.
 

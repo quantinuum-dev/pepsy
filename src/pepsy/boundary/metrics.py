@@ -833,11 +833,13 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -867,7 +869,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     if method == "dmrg":
         fit_mode = _canonical_fit_mode_selector(fit_mode)
         bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
-        block_fit = fit_mode == "two-site" or (
+        block_fit = fit_mode in {"two-site", "dmrg2"} or (
             fit_mode == "eff" and fit_block_size in {2, 3}
         )
         _retune_bdy_to_chi(
@@ -904,6 +906,8 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             bdy=bdy_obj,
             contraction_opt=contraction_opt,
             fit_mode=fit_mode,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_seed=fit_init_seed,
             fit_block_size=fit_block_size,
             fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_max_bond=chi if fit_max_bond is None else fit_max_bond,
@@ -965,11 +969,13 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1008,6 +1014,15 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         Contraction backend. ``"dmrg"`` is only supported for 2D flat
         PEPS-like networks; quimb methods are used for 2D and 3D when the
         input network exposes the corresponding method.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. The Quimb modes directly compress each
+        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
+        uses two-site warm-up followed by one-site refinement.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     strip_exponent : bool, default=False
         If ``True``, return ``(mantissa, exponent)``.
     return_info : bool, default=False
@@ -1049,6 +1064,8 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -1154,10 +1171,12 @@ def contract_boundary(
     contraction_opt="auto-hq",
     flat=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff=1.0e-12,
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1192,9 +1211,15 @@ def contract_boundary(
         Contraction optimizer passed through to :class:`pepsy.boundary.sweeps.CompBdy`.
     flat : bool, default=False
         Forwarded to sweep backend.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Fit backend mode. ``"two-site"`` performs native-SVD pair updates
-        while preserving the cached left/right environment sweep.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. The Quimb modes directly compress each
+        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
+        uses two-site warm-up followed by one-site refinement.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
     fit_adaptive_sweeps : int | None, default=None
@@ -1207,10 +1232,12 @@ def contract_boundary(
     fit_sweep_sequence : str, default="RL"
         Repeating local-fit sweep directions. ``"RL"`` runs left-to-right
         and then right-to-left.
-    fit_cutoff : float, default=1e-12
-        Two-site SVD truncation cutoff.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used by the two-site split.
+    fit_cutoff : float | {"auto"}, default=1e-12
+        Boundary compression cutoff. ``"auto"`` selects the shared
+        dtype-aware cutoff policy.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum completed sweeps before adaptive stopping. ``FIT.run_eff``
         requires at least two when ``fit_rtol`` is enabled.
@@ -1281,6 +1308,8 @@ def contract_boundary(
         mps_boundaries,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -1331,6 +1360,8 @@ def _contract_state_norm(
     progress,
     track_boundary_fidelity,
     fit_mode,
+    fit_init_strategy,
+    fit_init_seed,
     fit_block_size,
     fit_adaptive_sweeps,
     fit_max_bond,
@@ -1375,6 +1406,8 @@ def _contract_state_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -1411,11 +1444,13 @@ def peps_normalize(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1472,9 +1507,15 @@ def peps_normalize(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Boundary fitting backend mode. ``"two-site"`` can grow useful bond
-        subspaces up to ``fit_max_bond`` through native SVD pair updates.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. The Quimb modes directly compress each
+        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
+        uses two-site warm-up followed by one-site refinement.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
         Sizes 2 and 3 enable native block-SVD growth.
@@ -1486,8 +1527,9 @@ def peps_normalize(
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum two-site sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -1537,6 +1579,8 @@ def peps_normalize(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -1602,11 +1646,13 @@ def boundary_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1651,9 +1697,15 @@ def boundary_norm(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Boundary fitting backend mode. ``"two-site"`` uses cached pair
-        environments and native SVD truncation.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. The Quimb modes directly compress each
+        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
+        uses two-site warm-up followed by one-site refinement.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
         Sizes 2 and 3 enable native block-SVD growth.
@@ -1665,8 +1717,9 @@ def boundary_norm(
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum two-site sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -1708,6 +1761,8 @@ def boundary_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -1746,11 +1801,13 @@ def peps_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1794,6 +1851,8 @@ def peps_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -1834,11 +1893,13 @@ def peps_infidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1918,8 +1979,15 @@ def peps_infidelity(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track per-step fidelity during boundary contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Boundary fitting backend mode.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. The Quimb modes directly compress each
+        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
+        uses two-site warm-up followed by one-site refinement.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
     fit_adaptive_sweeps : int | None, default=None
@@ -1929,8 +1997,9 @@ def peps_infidelity(
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum two-site sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -1979,6 +2048,8 @@ def peps_infidelity(
         chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
@@ -2089,11 +2160,13 @@ def peps_fidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2141,6 +2214,8 @@ def peps_fidelity(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,

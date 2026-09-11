@@ -5,10 +5,13 @@ import re
 from dataclasses import dataclass
 from numbers import Integral
 import time
+import warnings
 
 import numpy as np
+import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
+from .._internal.cutoff import dtype_auto_cutoff
 from ..tensors.core import tn_fidelity
 from ..fitting.local import FIT
 
@@ -16,11 +19,32 @@ __all__ = ["BoundaryFitDiagnostic", "CompBdy"]
 
 
 _FIT_MODE_ALIASES = {
+    "direct": "direct",
+    "src": "src",
+    "zipup": "zipup",
+    "sdc": "sdc",
+    "dm": "dm",
     "eff": "eff",
     "one-site": "eff",
+    "dmrg": "eff",
+    "dmrg1": "eff",
     "two-site": "two-site",
+    "dmrg2": "dmrg2",
     "global": "global",
 }
+
+_FIT_INIT_STRATEGY_ALIASES = {
+    "auto": "direct",
+    "direct": "direct",
+    "guess-direct": "guess-direct",
+    "guess-src": "guess-src",
+    "guess-sdc": "guess-sdc",
+}
+
+_FIT_QUIMB_MODES = frozenset({"direct", "src", "zipup", "sdc", "dm"})
+_FIT_CUTOFF_MODES = frozenset(
+    {"rel", "rsum2", "rsum1", "abs", "sum2", "sum1"}
+)
 
 
 def _canonical_fit_mode_selector(fit_mode):
@@ -35,10 +59,39 @@ def _canonical_fit_mode_selector(fit_mode):
     key = str(fit_mode).strip().lower().replace("_", "-")
     if key not in _FIT_MODE_ALIASES:
         raise ValueError(
-            f"Unknown fit_mode={fit_mode!r}. Expected 'eff', 'two-site', "
+            f"Unknown fit_mode={fit_mode!r}. Expected 'direct', 'src', "
+            "'zipup', 'sdc', 'dm', 'eff', 'two-site', 'dmrg', 'dmrg2', "
             "or 'global'."
         )
     return _FIT_MODE_ALIASES[key]
+
+
+def _canonical_fit_init_strategy(strategy):
+    """Return the supported disposable boundary-guess strategy."""
+    key = str(strategy).strip().lower().replace("_", "-")
+    try:
+        return _FIT_INIT_STRATEGY_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown fit_init_strategy={strategy!r}. Expected 'direct', "
+            "'auto', 'guess-direct', 'guess-src', or 'guess-sdc'."
+        ) from exc
+
+
+def _canonical_fit_cutoff_mode(mode):
+    """Resolve the boundary cutoff-mode policy before calling Quimb."""
+    if mode is None:
+        return "rsum2"
+    key = str(mode).strip().lower()
+    if key == "auto":
+        return "rsum2"
+    if key not in _FIT_CUTOFF_MODES:
+        allowed = ", ".join(sorted(_FIT_CUTOFF_MODES))
+        raise ValueError(
+            f"Unknown fit_cutoff_mode={mode!r}. Expected 'auto' or one of "
+            f"{allowed}."
+        )
+    return key
 
 
 @dataclass(frozen=True)
@@ -71,10 +124,13 @@ class BoundaryFitDiagnostic:
     relative_change: float | None
     center_site: int | None
     direction: str | None
-    max_bond: int
+    max_bond: int | None
     elapsed_seconds: float | None = None
     sweep_timings: tuple[dict[str, object], ...] = ()
     error: str | None = None
+    fit_init_strategy: str = "direct"
+    adaptive_sweeps: int = 0
+    one_site_refinement_sweeps: int = 0
 
 
 def max_tag_number(tags, tag_format):
@@ -112,12 +168,23 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Contraction optimizer used by the local :class:`~pepsy.fitting.local.FIT`
         boundary fits. Kept separate from ``contraction_opt`` so the local
         fitting path can be tuned independently of the final contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Local fit backend used by :class:`pepsy.fitting.local.FIT`:
-        ``"eff"`` uses ``FIT.run_eff`` for multi-site boundaries;
-        ``"two-site"`` uses cached full-boundary two-site sweeps with a
-        native SVD after every pair update;
-        ``"global"`` uses ``FIT.run``.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "one-site", "dmrg", "dmrg1", "two-site", "dmrg2", "global"}, default="eff"
+        Boundary compression backend. The Quimb modes ``"direct"``,
+        ``"src"``, ``"zipup"``, ``"sdc"``, and ``"dm"`` directly compress
+        each boundary target. ``"dmrg"`` (also ``"eff"``/``"one-site"``)
+        uses one-site FIT. ``"dmrg2"`` uses two-site FIT for the configured
+        warm-up sweeps, then one-site refinement. ``"two-site"`` remains the
+        legacy all-two-site FIT mode and ``"global"`` uses ``FIT.run``.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial guess for each boundary FIT solve. ``"direct"``
+        reuses the existing boundary guess. ``"guess-src"`` first applies
+        Quimb's successive randomized compression to a copy of the exact
+        boundary target, then starts FIT from that copy. ``"guess-direct"``
+        and ``"guess-sdc"`` use the corresponding Quimb compressors.
+        ``"auto"`` is an alias for the compatibility-preserving direct
+        strategy. This option is ignored by direct Quimb compression modes.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to randomized disposable boundary guesses.
     fit_block_size : {1, 2, 3}, default=1
         Block size passed to ``FIT.run_eff`` when ``fit_mode="eff"``.
         Block sizes 2 and 3 enable native SVD growth for full-boundary fits.
@@ -133,10 +200,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Repeating local-fit sweep directions. ``"RL"`` runs each boundary
         left-to-right and then right-to-left; alternating directions normally
         converges more evenly than repeatedly sweeping from one side.
-    fit_cutoff : float, default=1e-12
-        Two-site SVD truncation cutoff.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used by the native two-site split.
+    fit_cutoff : float | {"auto"}, default="auto"
+        Boundary compression cutoff. ``"auto"`` selects the shared
+        dtype-aware cutoff policy.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"`` before compression or native FIT splits.
     fit_min_iter : int | None, default=None
         Minimum completed sweeps before adaptive convergence can stop. For
         ``FIT.run_eff``, adaptive stopping requires at least two sweeps.
@@ -170,12 +239,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         fit_contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_init_strategy="direct",
+        fit_init_seed=0,
         fit_block_size=1,
         fit_adaptive_sweeps=None,
         fit_max_bond=None,
         fit_sweep_sequence="RL",
-        fit_cutoff=1.0e-12,
-        fit_cutoff_mode="rsum2",
+        fit_cutoff="auto",
+        fit_cutoff_mode="auto",
         fit_min_iter=None,
         fit_rtol=None,
         fit_patience=1,
@@ -192,6 +263,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # Validate at construction time rather than after an expensive PEPS
         # boundary has already reached its first local fit.
         self.fit_mode = _canonical_fit_mode_selector(fit_mode)
+        self.fit_init_strategy = _canonical_fit_init_strategy(fit_init_strategy)
+        self.fit_init_seed = fit_init_seed
         if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
             1,
             2,
@@ -199,12 +272,19 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         }:
             raise ValueError("fit_block_size must be 1, 2, or 3.")
         fit_block_size = int(fit_block_size)
-        if self.fit_mode != "eff" and fit_block_size != 1:
+        if self.fit_mode not in {"eff"} and fit_block_size != 1:
             raise ValueError(
-                "fit_block_size is only configurable with fit_mode='eff'."
+                "fit_block_size is only configurable with fit_mode='dmrg'/'eff'."
             )
         if fit_adaptive_sweeps is not None:
-            if fit_block_size not in {2, 3}:
+            if self.fit_mode == "dmrg2":
+                if not isinstance(fit_adaptive_sweeps, Integral) or int(
+                    fit_adaptive_sweeps
+                ) < 1:
+                    raise ValueError(
+                        "fit_adaptive_sweeps must be a positive integer or None."
+                    )
+            elif fit_block_size not in {2, 3}:
                 raise ValueError(
                     "fit_adaptive_sweeps requires fit_block_size=2 or 3."
                 )
@@ -221,7 +301,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.fit_max_bond = fit_max_bond
         self.fit_sweep_sequence = fit_sweep_sequence
         self.fit_cutoff = fit_cutoff
-        self.fit_cutoff_mode = fit_cutoff_mode
+        self.fit_cutoff_mode = _canonical_fit_cutoff_mode(fit_cutoff_mode)
         self.fit_min_iter = fit_min_iter
         self.fit_rtol = fit_rtol
         self.fit_patience = fit_patience
@@ -240,6 +320,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.track_boundary_fidelity = False
         self.fidel = []
         self.fit_diagnostics = []
+        self._fit_init_strategy_used = "direct"
+        self._fit_init_warned = False
         self.progress = False
         self.max_separation = 0
         self.direction = "y"
@@ -409,9 +491,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 and self.fit_min_iter is None
                 and self.fit_rtol is None
                 and self.fit_sweep_sequence == "RL"
+                and not (
+                    isinstance(self.fit_cutoff, str)
+                    and self.fit_cutoff.strip().lower() == "auto"
+                )
             ):
                 # Keep the historical call shape for lightweight compatible
-                # FIT doubles and the default boundary path.
+                # FIT doubles when the caller supplied an explicit numeric
+                # cutoff. Automatic cutoffs need the expanded call below.
                 fit.run_eff(n_iter=self.n_iter, verbose=verbose)
                 return
             max_bond = self.fit_max_bond
@@ -424,13 +511,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 sweep_sequence=self.fit_sweep_sequence,
                 max_bond=max_bond,
                 cutoff=self.fit_cutoff,
+                cutoff_mode=self.fit_cutoff_mode,
                 adaptive_block_sweeps=self.fit_adaptive_sweeps,
                 min_iter=self.fit_min_iter,
                 rtol=self.fit_rtol,
                 patience=self.fit_patience,
             )
             return
-        if self.fit_mode == "two-site":
+        if self.fit_mode in {"two-site", "dmrg2"}:
             # The complete boundary is the active DMRG interval. ``run_gate``
             # builds one fixed environment per sweep and updates the opposite
             # environment incrementally, so pair updates remain O(L) rather
@@ -450,9 +538,19 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 max_bond=max_bond,
                 cutoff=self.fit_cutoff,
                 cutoff_mode=self.fit_cutoff_mode,
-                # Boundary two-site FIT owns its fixed block schedule. Do
-                # not inherit the circuit solver's block-to-one-site warm-up.
-                adaptive_block_sweeps=None,
+                # Legacy ``two-site`` owns a fixed pair-update schedule.
+                # ``dmrg2`` follows MpsOptimizer: two-site warm-up followed
+                # by one-site refinement for the remaining sweeps.
+                adaptive_block_sweeps=(
+                    None
+                    if self.fit_mode == "two-site"
+                    or self.n_iter < 2
+                    else (
+                        2
+                        if self.fit_adaptive_sweeps is None
+                        else self.fit_adaptive_sweeps
+                    )
+                ),
                 min_iter=self.fit_min_iter,
                 rtol=self.fit_rtol,
                 patience=self.fit_patience,
@@ -472,6 +570,136 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # normal user-input path.
         raise RuntimeError(f"Unhandled canonical fit_mode: {self.fit_mode}")
 
+    def _resolve_fit_cutoff(self, tn):
+        """Resolve the boundary cutoff for direct Quimb compression modes."""
+        if isinstance(self.fit_cutoff, str) and self.fit_cutoff.strip().lower() == "auto":
+            for tensor in tn.tensors:
+                dtype = getattr(tensor.data, "dtype", None)
+                if dtype is not None:
+                    return dtype_auto_cutoff(dtype)
+            return 1.0e-12
+        try:
+            cutoff = float(self.fit_cutoff)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fit_cutoff must be 'auto' or a non-negative number."
+            ) from exc
+        if not np.isfinite(cutoff) or cutoff < 0.0:
+            raise ValueError("fit_cutoff must be 'auto' or a non-negative number.")
+        return cutoff
+
+    def _record_compression_diagnostic(
+        self,
+        boundary_mps,
+        boundary_key,
+        *,
+        elapsed_seconds,
+        fit_mode,
+    ):
+        """Record one completed non-variational boundary compression."""
+        current_bond = boundary_mps.max_bond()
+        self.fit_diagnostics.append(
+            BoundaryFitDiagnostic(
+                boundary_key=str(boundary_key),
+                fit_mode=str(fit_mode),
+                status="complete",
+                iterations=1,
+                converged=False,
+                convergence_reason="fixed_compression",
+                relative_change=None,
+                center_site=None,
+                direction=None,
+                max_bond=(
+                    None if current_bond is None else int(current_bond)
+                ),
+                elapsed_seconds=elapsed_seconds,
+                sweep_timings=(),
+                error=None,
+                fit_init_strategy="not-applicable",
+                adaptive_sweeps=0,
+                one_site_refinement_sweeps=0,
+            )
+        )
+
+    def _compress_boundary(self, tn, boundary_mps, boundary_key, site_tag_id):
+        """Compress one boundary target with a direct Quimb method."""
+        started = time.perf_counter() if self.fit_timing else None
+        if self._uses_symmray_arrays(tn):
+            raise NotImplementedError(
+                f"fit_mode={self.fit_mode!r} is currently dense-only for "
+                "native Symmray boundary targets; use fit_mode='dmrg'."
+            )
+
+        if int(boundary_mps.L) <= 1:
+            compressed = tn.copy()
+            compressed.view_as_(
+                qtn.MatrixProductState,
+                L=boundary_mps.L,
+                site_tag_id=site_tag_id,
+                site_ind_id=None,
+                cyclic=False,
+            )
+        else:
+            max_bond = self.fit_max_bond
+            if max_bond is None:
+                max_bond = int(boundary_mps.max_bond())
+            method = self.fit_mode
+            cutoff = self._resolve_fit_cutoff(tn)
+            if method == "src":
+                # SRC is rank-controlled; keep the explicit zero cutoff to
+                # avoid Quimb's advisory warning and match MPS semantics.
+                cutoff = 0.0
+            site_tags = tuple(
+                site_tag_id.format(site) for site in range(int(boundary_mps.L))
+            )
+            compress_kwargs = {
+                "max_bond": int(max_bond),
+                "cutoff": cutoff,
+                "method": method,
+                "site_tags": site_tags,
+                "permute_arrays": False,
+                "inplace": False,
+            }
+            if method == "src":
+                compress_kwargs["seed"] = self.fit_init_seed
+            else:
+                compress_kwargs["cutoff_mode"] = self.fit_cutoff_mode
+            compressed = qtn.tensor_network_1d_compress(
+                tn.copy(),
+                **compress_kwargs,
+            )
+            compressed.view_as_(
+                qtn.MatrixProductState,
+                L=boundary_mps.L,
+                site_tag_id=site_tag_id,
+                site_ind_id=None,
+                cyclic=False,
+            )
+
+        if self.equalize_norms:
+            compressed.equalize_norms_(value=self.equalize_norms)
+        if self.fit_timing_sync_device:
+            FIT.synchronize_backend(compressed)
+        elapsed = (
+            None if started is None else float(time.perf_counter() - started)
+        )
+        self._record_compression_diagnostic(
+            compressed,
+            boundary_key,
+            elapsed_seconds=elapsed,
+            fit_mode=self.fit_mode,
+        )
+        if self.track_boundary_fidelity:
+            fidelity = tn_fidelity(
+                tn,
+                compressed,
+                contraction_opt=self.contraction_opt,
+            )
+            self.fidel.append(fidelity)
+        if self.write_back:
+            self.mps_boundaries[boundary_key] = compressed
+        return compressed
+
     def _record_fit_diagnostic(
         self,
         fit,
@@ -483,7 +711,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         error=None,
     ):
         """Append one typed, copy-safe boundary FIT diagnostic."""
-        gate_solver_ran = self.fit_mode == "two-site" and boundary_mps.L > 1
+        gate_solver_ran = (
+            self.fit_mode in {"two-site", "dmrg2"}
+            and boundary_mps.L > 1
+        )
         adaptive_eff_ran = self.fit_mode == "eff" and self.fit_rtol is not None
         if status == "failed":
             # Failure reporting must not assume run_gate reached its normal
@@ -514,6 +745,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             direction = None
         if relative_change is not None:
             relative_change = float(relative_change)
+        adaptive_sweeps = int(getattr(fit, "adaptive_sweeps_run", 0) or 0)
+        one_site_refinement_sweeps = int(
+            getattr(fit, "one_site_sweeps_run", 0) or 0
+        )
         sweep_timings = (
             tuple(deepcopy(fit.get_timing())) if self.fit_timing else ()
         )
@@ -530,10 +765,17 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                     None if center_site is None else int(center_site)
                 ),
                 direction=None if direction is None else str(direction),
-                max_bond=int(fit.p.max_bond()),
+                max_bond=(
+                    None
+                    if fit.p.max_bond() is None
+                    else int(fit.p.max_bond())
+                ),
                 elapsed_seconds=elapsed_seconds,
                 sweep_timings=sweep_timings,
                 error=error,
+                fit_init_strategy=str(self._fit_init_strategy_used),
+                adaptive_sweeps=adaptive_sweeps,
+                one_site_refinement_sweeps=one_site_refinement_sweeps,
             )
         )
 
@@ -578,6 +820,80 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         return boundary_mps
 
+    @staticmethod
+    def _uses_symmray_arrays(network):
+        """Return whether *network* contains native Symmray arrays."""
+        return any(
+            type(tensor.data).__module__.split(".", maxsplit=1)[0] == "symmray"
+            for tensor in network.tensors
+        )
+
+    def _build_fit_initial_guess(self, tn, boundary_mps, site_tag_id):
+        """Build the disposable initial guess for one boundary FIT solve."""
+        self._fit_init_strategy_used = "direct"
+        if self.fit_init_strategy == "direct":
+            return boundary_mps
+
+        # There is no compression problem for a one-site MPS. Quimb's SRC
+        # implementation assumes at least one internal bond, so preserve the
+        # direct guess for this valid degenerate boundary shape.
+        if int(boundary_mps.L) <= 1:
+            return boundary_mps
+
+        guess_method = self.fit_init_strategy.removeprefix("guess-")
+
+        # Quimb's dense compressors cannot preserve Symmray block sectors or
+        # fermionic metadata. Keep the exact native path safe and visible
+        # rather than coercing the boundary to dense arrays.
+        if self._uses_symmray_arrays(tn) or self._uses_symmray_arrays(boundary_mps):
+            if not self._fit_init_warned:
+                warnings.warn(
+                    f"fit_init_strategy={self.fit_init_strategy!r} is not "
+                    "available for native Symmray PEPS boundaries; falling "
+                    "back to 'direct'.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self._fit_init_warned = True
+            return boundary_mps
+
+        site_tags = tuple(
+            site_tag_id.format(site) for site in range(int(boundary_mps.L))
+        )
+        max_bond = self.fit_max_bond
+        if max_bond is None:
+            max_bond = int(boundary_mps.max_bond())
+        cutoff = self._resolve_fit_cutoff(tn)
+        if guess_method == "src":
+            # SRC is rank-controlled; keep the explicit zero cutoff to avoid
+            # Quimb's advisory warning and match MPS initialization semantics.
+            cutoff = 0.0
+        guess_kwargs = {
+            "max_bond": int(max_bond),
+            "cutoff": cutoff,
+            "method": guess_method,
+            "site_tags": site_tags,
+            "permute_arrays": False,
+            "inplace": False,
+        }
+        if guess_method == "src":
+            guess_kwargs["seed"] = self.fit_init_seed
+        else:
+            guess_kwargs["cutoff_mode"] = self.fit_cutoff_mode
+        guess = qtn.tensor_network_1d_compress(tn.copy(), **guess_kwargs)
+        guess.view_as_(
+            qtn.MatrixProductState,
+            L=boundary_mps.L,
+            site_tag_id=site_tag_id,
+            site_ind_id=None,
+            cyclic=False,
+        )
+        # Preserve the boundary's scale convention. The source target is a
+        # disposable guess only; FIT still owns the exact target ``tn``.
+        guess.exponent = complex(getattr(boundary_mps, "exponent", 0.0)).real
+        self._fit_init_strategy_used = self.fit_init_strategy
+        return guess
+
     def _fit_boundary(
         self,
         tn,
@@ -589,9 +905,23 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         """Fit one boundary MPS against ``tn`` and return the owned result."""
         boundary_mps = self._initial_boundary_mps(boundary_key, previous)
 
+        if self.fit_mode in _FIT_QUIMB_MODES:
+            return self._compress_boundary(
+                tn,
+                boundary_mps,
+                boundary_key,
+                site_tag_id,
+            )
+
+        fit_guess = self._build_fit_initial_guess(
+            tn,
+            boundary_mps,
+            site_tag_id,
+        )
+
         fit = FIT(
             tn,
-            p=boundary_mps,
+            p=fit_guess,
             inplace=True,
             site_tag_id=site_tag_id,
             contraction_opt=self.fit_contraction_opt,
@@ -687,7 +1017,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             )
 
             if progress_bar is not None:
-                postfix = {"chi": int(previous.max_bond())}
+                current_bond = previous.max_bond()
+                postfix = {
+                    "chi": None if current_bond is None else int(current_bond)
+                }
                 if self.track_boundary_fidelity:
                     prod_fidelity = np.prod(self.fidel)
                     postfix["F"] = complex(prod_fidelity).real
@@ -1003,7 +1336,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 if progress_bar is not None and step_does_fit:
                     postfix = {"pos": int(pos)}
                     if hasattr(updated, "max_bond"):
-                        postfix["chi"] = int(updated.max_bond())
+                        current_bond = updated.max_bond()
+                        postfix["chi"] = (
+                            None if current_bond is None else int(current_bond)
+                        )
                     if self.track_boundary_fidelity and self.fidel:
                         postfix["F"] = complex(self.fidel[-1]).real
                     if postfix:

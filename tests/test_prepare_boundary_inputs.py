@@ -344,8 +344,8 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
 
     run_eff_verbose_args = []
 
-    def fake_run_eff(self, n_iter=6, verbose=False):
-        run_eff_verbose_args.append(verbose)
+    def fake_run_eff(self, n_iter=6, verbose=False, **kwargs):
+        run_eff_verbose_args.append((verbose, kwargs))
 
     monkeypatch.setattr(pepsy.boundary.sweeps.FIT, "run_eff", fake_run_eff)
     monkeypatch.setattr(pepsy.boundary.sweeps, "tn_fidelity", lambda _tn, _p, **kwargs: 0.5)
@@ -353,7 +353,8 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
     comp.run(direction="y", track_boundary_fidelity=True, progress=False, n_iter=1, max_separation=0)
 
     assert run_eff_verbose_args
-    assert all(arg is False for arg in run_eff_verbose_args)
+    assert all(arg[0] is False for arg in run_eff_verbose_args)
+    assert all(arg[1]["cutoff"] == "auto" for arg in run_eff_verbose_args)
     assert comp.fidel == [0.5, 0.5]
 
 
@@ -446,9 +447,127 @@ def test_compbdy_fit_mode_is_canonicalized_and_validated_early():
 
     assert pepsy.CompBdy(norm, {}, fit_mode="two_site").fit_mode == "two-site"
     assert pepsy.CompBdy(norm, {}, fit_mode="one-site").fit_mode == "eff"
+    assert pepsy.CompBdy(norm, {}, fit_mode="dmrg").fit_mode == "eff"
+    assert pepsy.CompBdy(norm, {}, fit_mode="dmrg2").fit_mode == "dmrg2"
+    for mode in ("direct", "src", "zipup", "sdc", "dm"):
+        assert pepsy.CompBdy(norm, {}, fit_mode=mode).fit_mode == mode
+
+    assert (
+        pepsy.CompBdy(norm, {}, fit_init_strategy="guess_direct").fit_init_strategy
+        == "guess-direct"
+    )
+    assert (
+        pepsy.CompBdy(norm, {}, fit_init_strategy="guess-sdc").fit_init_strategy
+        == "guess-sdc"
+    )
+    assert pepsy.CompBdy(norm, {}, fit_cutoff_mode="auto").fit_cutoff_mode == "rsum2"
 
     with pytest.raises(ValueError, match="Unknown fit_mode"):
         pepsy.CompBdy(norm, {}, fit_mode="two-sites")
+
+    with pytest.raises(ValueError, match="Unknown fit_init_strategy"):
+        pepsy.CompBdy(norm, {}, fit_init_strategy="guess-random")
+
+
+def test_compbdy_dmrg2_uses_mps_style_two_to_one_site_schedule():
+    """DMRG2 should warm up with pairs and refine with one-site FIT."""
+    captured = []
+
+    class _Fit:
+        range_int = None
+
+        def run_gate(self, **kwargs):
+            captured.append(kwargs)
+
+    class _Boundary:
+        L = 4
+
+        @staticmethod
+        def max_bond():
+            return 3
+
+    comp = object.__new__(pepsy.CompBdy)
+    comp.fit_mode = "dmrg2"
+    comp.fit_max_bond = 7
+    comp.fit_sweep_sequence = "LR"
+    comp.fit_cutoff = "auto"
+    comp.fit_cutoff_mode = "rsum2"
+    comp.fit_min_iter = None
+    comp.fit_rtol = None
+    comp.fit_patience = 1
+    comp.fit_adaptive_sweeps = None
+    comp.fit_timing = False
+    comp.fit_timing_sync_device = False
+    comp.n_iter = 5
+
+    fit = _Fit()
+    comp._run_fit_solver(fit, _Boundary())
+
+    assert fit.range_int == (0, 3)
+    assert captured[-1]["block_size"] == 2
+    assert captured[-1]["adaptive_block_sweeps"] == 2
+    assert captured[-1]["sweep_sequence"] == "LR"
+
+    comp.n_iter = 1
+    comp._run_fit_solver(fit, _Boundary())
+    assert captured[-1]["adaptive_block_sweeps"] is None
+
+
+def test_compbdy_guess_src_uses_direct_for_one_site_boundary():
+    """SRC warm starts should skip compression when no internal bond exists."""
+    ket = qtn.PEPS.rand(Lx=1, Ly=2, bond_dim=2, seed=47, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=4,
+        single_layer=False,
+    )
+    comp = pepsy.CompBdy(
+        norm_tagged,
+        bdy.mps_b,
+        fit_mode="dmrg2",
+        fit_init_strategy="guess-src",
+        fit_max_bond=4,
+    )
+
+    boundary = bdy.mps_b["Y0_r"]
+    guess = comp._build_fit_initial_guess(
+        norm_tagged.select("Y1", "any"),
+        boundary,
+        "X{}",
+    )
+
+    assert guess is boundary
+    assert comp._fit_init_strategy_used == "direct"
+
+
+def test_compbdy_diagnostic_allows_one_site_boundary_bond():
+    """One-site boundary diagnostics should represent the absent bond as None."""
+    ket = qtn.PEPS.rand(Lx=1, Ly=2, bond_dim=2, seed=53, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=4,
+        single_layer=False,
+    )
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b, fit_mode="dmrg2")
+
+    fit = pepsy.boundary.sweeps.FIT(
+        norm_tagged.select("Y1", "any"),
+        p=bdy.mps_b["Y0_r"],
+        inplace=False,
+    )
+    comp._record_fit_diagnostic(
+        fit,
+        bdy.mps_b["Y0_r"],
+        "Y0_r",
+        status="complete",
+        elapsed_seconds=None,
+    )
+
+    assert comp.fit_diagnostics[-1].max_bond is None
 
 
 def test_compbdy_run_reuses_equalized_boundaries_without_stale_exponent():
@@ -723,6 +842,144 @@ def test_peps_norm_eff_can_use_adaptive_run_eff_blocks():
         diagnostic.fit_mode == "eff"
         and diagnostic.iterations == 4
         and diagnostic.convergence_reason == "fixed_sweeps"
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+def test_peps_norm_and_infidelity_support_dmrg2_src_boundary_guesses():
+    """DMRG2 aliases and SRC guesses should cover norm and overlap paths."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=481, dtype="complex128")
+    norm_result = pepsy.peps_norm(
+        ket.copy(),
+        chi=4,
+        fit_mode="dmrg2",
+        fit_init_strategy="guess-src",
+        fit_init_seed=7,
+        fit_sweep_sequence="LR",
+        n_iter=1,
+        max_separation=0,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert norm_result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == "dmrg2"
+        and diagnostic.fit_init_strategy == "guess-src"
+        for diagnostic in norm_result.fit_diagnostics
+    )
+
+    infidelity = pepsy.peps_infidelity(
+        ket.copy(),
+        ket.copy(),
+        chi=4,
+        fit_mode="dmrg2",
+        fit_init_strategy="guess_src",
+        fit_init_seed=7,
+        fit_sweep_sequence="LR",
+        n_iter=1,
+        max_separation=0,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert infidelity["infidelity"] == pytest.approx(0.0)
+    for result in (
+        infidelity["norm_result"],
+        infidelity["norm_target_result"],
+        infidelity["overlap_result"],
+    ):
+        assert result.fit_diagnostics
+        assert all(
+            diagnostic.fit_mode == "dmrg2"
+            and diagnostic.fit_init_strategy == "guess-src"
+            for diagnostic in result.fit_diagnostics
+        )
+
+
+@pytest.mark.parametrize("fit_mode", ["direct", "src", "zipup", "sdc", "dm"])
+def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
+    """Non-variational Quimb boundary compressors should share the API."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=483, dtype="complex128")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=4,
+        fit_mode=fit_mode,
+        fit_max_bond=4,
+        fit_cutoff_mode="auto",
+        cutoff="auto",
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == fit_mode
+        and diagnostic.convergence_reason == "fixed_compression"
+        and diagnostic.fit_init_strategy == "not-applicable"
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+def test_peps_norm_dmrg2_reports_two_site_warmup_and_one_site_refinement():
+    """DMRG2 diagnostics should expose both phases of the FIT schedule."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=484, dtype="complex128")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=4,
+        fit_mode="dmrg2",
+        fit_init_strategy="guess-src",
+        fit_max_bond=4,
+        n_iter=4,
+        cutoff="auto",
+        fit_cutoff_mode="auto",
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == "dmrg2"
+        and diagnostic.adaptive_sweeps == 2
+        and diagnostic.one_site_refinement_sweeps == 2
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+@pytest.mark.parametrize("fit_init_strategy", ["guess-direct", "guess-sdc"])
+def test_peps_norm_supports_additional_dmrg2_guess_strategies(fit_init_strategy):
+    """Direct and SDC disposable guesses should feed the same DMRG2 path."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=485, dtype="complex128")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=4,
+        fit_mode="dmrg2",
+        fit_init_strategy=fit_init_strategy,
+        fit_max_bond=4,
+        fit_sweep_sequence="LR",
+        n_iter=2,
+        cutoff="auto",
+        fit_cutoff_mode="auto",
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == "dmrg2"
+        and diagnostic.fit_init_strategy == fit_init_strategy
         for diagnostic in result.fit_diagnostics
     )
 

@@ -17,7 +17,12 @@ from tqdm.auto import tqdm
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import build_bra_ket, peps_normalize
 from ...boundary.states import BdyMPS
-from ...boundary.sweeps import CompBdy, _canonical_fit_mode_selector
+from ...boundary.sweeps import (
+    CompBdy,
+    _canonical_fit_cutoff_mode,
+    _canonical_fit_init_strategy,
+    _canonical_fit_mode_selector,
+)
 from ...tensors.core import tn_fidelity
 from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
 from ...tensors.validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
@@ -83,8 +88,18 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         place.
     contraction_opt : object | str, default="auto-hq"
         Contraction optimizer.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary.sweeps.CompBdy`.
+        Quimb modes directly compress boundary targets. ``"dmrg"`` aliases
+        ``"eff"`` and ``"dmrg2"`` uses two-site warm-up followed by
+        one-site refinement. ``"two-site"`` remains the legacy fixed
+        two-site mode.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess for DMRG/FIT modes. The guess
+        compressors are applied to a copy of each exact boundary target;
+        ``"auto"`` aliases the compatibility-preserving direct guess.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC boundary guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
     fit_adaptive_sweeps : int | None, default=None
@@ -95,11 +110,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site boundary sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used by two-site boundary splits.
-    cutoff : float, default=1e-12
-        Boundary compression cutoff. In ``fit_mode="two-site"`` this is the
-        native SVD truncation cutoff.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
+    cutoff : float | {"auto"}, default="auto"
+        Boundary compression cutoff. ``"auto"`` selects the shared
+        dtype-aware cutoff policy.
     fit_min_iter : int | None, default=None
         Minimum two-site boundary sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -114,8 +130,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         networks to ``"quimb-mps"``.
     boundary_options : mapping | None, optional
         Extra options for the Quimb MPS environment engine, such as
-        ``cutoff``, ``canonize``, ``mode``, ``layer_tags``,
-        ``compress_opts``, and ``equalize_norms``.
+        ``cutoff`` (including ``"auto"``), ``cutoff_mode``, ``canonize``,
+        ``mode``, ``layer_tags``, ``compress_opts``, and ``equalize_norms``.
+        ``cutoff_mode`` is translated into Quimb's ``compress_opts`` so it
+        reaches the boundary SVD rather than the boundary-contraction API.
     """
 
     _NORMALIZE_KEYS = frozenset({
@@ -126,6 +144,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "fit_init_strategy",
+        "fit_init_seed",
         "fit_block_size",
         "fit_adaptive_sweeps",
         "fit_max_bond",
@@ -153,6 +173,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "fit_init_strategy",
+        "fit_init_seed",
         "fit_block_size",
         "fit_adaptive_sweeps",
         "fit_max_bond",
@@ -431,12 +453,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         bdy_overlap=None,
         contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_init_strategy="direct",
+        fit_init_seed=0,
         fit_block_size=1,
         fit_adaptive_sweeps=None,
         fit_max_bond=None,
         fit_sweep_sequence="RL",
-        fit_cutoff_mode="rsum2",
-        cutoff=1.0e-12,
+        fit_cutoff_mode="auto",
+        cutoff="auto",
         fit_min_iter=None,
         fit_rtol=None,
         fit_patience=1,
@@ -466,12 +490,20 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         }:
             raise ValueError("fit_block_size must be 1, 2, or 3.")
         fit_block_size = int(fit_block_size)
-        if fit_mode != "eff" and fit_block_size != 1:
+        fit_init_strategy = _canonical_fit_init_strategy(fit_init_strategy)
+        if fit_mode not in {"eff"} and fit_block_size != 1:
             raise ValueError(
-                "fit_block_size is only configurable with fit_mode='eff'."
+                "fit_block_size is only configurable with fit_mode='dmrg'/'eff'."
             )
         if fit_adaptive_sweeps is not None:
-            if fit_block_size not in {2, 3}:
+            if fit_mode == "dmrg2":
+                if not isinstance(fit_adaptive_sweeps, Integral) or int(
+                    fit_adaptive_sweeps
+                ) < 1:
+                    raise ValueError(
+                        "fit_adaptive_sweeps must be a positive integer or None."
+                    )
+            elif fit_block_size not in {2, 3}:
                 raise ValueError(
                     "fit_adaptive_sweeps requires fit_block_size=2 or 3."
                 )
@@ -483,7 +515,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     "fit_adaptive_sweeps must be a positive integer or None."
                 )
             fit_adaptive_sweeps = int(fit_adaptive_sweeps)
-        block_fit = fit_mode == "two-site" or (
+        block_fit = fit_mode in {"two-site", "dmrg2"} or (
             fit_mode == "eff" and fit_block_size in {2, 3}
         )
 
@@ -535,11 +567,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._set_boundary_pair(bdy_obj, bdy_overlap_obj)
         self.contraction_opt = contraction_opt
         self.fit_mode = fit_mode
+        self.fit_init_strategy = fit_init_strategy
+        self.fit_init_seed = fit_init_seed
         self.fit_block_size = int(fit_block_size)
         self.fit_adaptive_sweeps = fit_adaptive_sweeps
         self.fit_max_bond = fit_max_bond
         self.fit_sweep_sequence = fit_sweep_sequence
-        self.fit_cutoff_mode = fit_cutoff_mode
+        self.fit_cutoff_mode = _canonical_fit_cutoff_mode(fit_cutoff_mode)
         self.fit_cutoff = cutoff
         self.fit_min_iter = fit_min_iter
         self.fit_rtol = fit_rtol
@@ -792,7 +826,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         two_site_fit = (
             (
-                self.fit_mode == "two-site"
+                self.fit_mode in {"two-site", "dmrg2"}
                 or (
                     self.fit_mode == "eff"
                     and getattr(self, "fit_block_size", 1) in {2, 3}
@@ -923,7 +957,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 1
                 if (
                     (
-                        self.fit_mode == "two-site"
+                        self.fit_mode in {"two-site", "dmrg2"}
                         or (
                             self.fit_mode == "eff"
                             and getattr(self, "fit_block_size", 1) in {2, 3}
@@ -1001,7 +1035,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 chi=(
                     1
                     if (
-                        self.fit_mode == "two-site"
+                        self.fit_mode in {"two-site", "dmrg2"}
                         or (
                             self.fit_mode == "eff"
                             and getattr(self, "fit_block_size", 1) in {2, 3}
@@ -1065,6 +1099,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 progress=progress,
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=self.fit_mode,
+                fit_init_strategy=opts.get(
+                    "fit_init_strategy", self.fit_init_strategy
+                ),
+                fit_init_seed=opts.get("fit_init_seed", self.fit_init_seed),
                 fit_block_size=opts.get("fit_block_size", self.fit_block_size),
                 fit_adaptive_sweeps=opts.get(
                     "fit_adaptive_sweeps", self.fit_adaptive_sweeps
@@ -1099,6 +1137,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            fit_init_strategy=opts.get(
+                "fit_init_strategy", self.fit_init_strategy
+            ),
+            fit_init_seed=opts.get("fit_init_seed", self.fit_init_seed),
             fit_block_size=opts.get("fit_block_size", self.fit_block_size),
             fit_adaptive_sweeps=opts.get(
                 "fit_adaptive_sweeps", self.fit_adaptive_sweeps
@@ -1148,6 +1190,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         max_separation=1,
         progress=False,
         track_boundary_fidelity=False,
+        fit_init_strategy=_INHERIT_FIT_OPTION,
+        fit_init_seed=_INHERIT_FIT_OPTION,
         fit_block_size=_INHERIT_FIT_OPTION,
         fit_adaptive_sweeps=_INHERIT_FIT_OPTION,
         fit_max_bond=_INHERIT_FIT_OPTION,
@@ -1234,6 +1278,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            fit_init_strategy=_resolve_fit_option(
+                fit_init_strategy,
+                self.fit_init_strategy,
+            ),
+            fit_init_seed=_resolve_fit_option(
+                fit_init_seed,
+                self.fit_init_seed,
+            ),
             fit_block_size=_resolve_fit_option(
                 fit_block_size, self.fit_block_size
             ),
@@ -2146,6 +2198,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         common = {
             "contraction_opt": self.contraction_opt,
             "fit_mode": self.fit_mode,
+            "fit_init_strategy": self.fit_init_strategy,
+            "fit_init_seed": self.fit_init_seed,
             "fit_block_size": self.fit_block_size,
             "fit_adaptive_sweeps": self.fit_adaptive_sweeps,
             "fit_sweep_sequence": self.fit_sweep_sequence,
@@ -2207,17 +2261,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     def _update_quimb_double_layer_slice(self, norm_tn, overlap_tn, index, axis):
         """Update the cached double layers after one local slice optimization."""
         for site_tag in self._site_tensor_tags(axis, index):
-            source = next(iter(self.state.select(site_tag).tensor_map.values()))
-            data = source.data
+            # A PEPS coordinate/layer pair contains exactly one tensor. Direct
+            # tag lookup avoids allocating a temporary TensorNetwork through
+            # ``select`` for every site in every half-sweep.
+            data = self.state[site_tag].data
 
             for tn, layer, layer_data in (
                 (norm_tn, "KET", data),
                 (norm_tn, "BRA", data.conj()),
                 (overlap_tn, "BRA", data.conj()),
             ):
-                selected = tn.select([site_tag, layer], "all")
-                for tensor in selected.tensor_map.values():
-                    tensor.modify(data=layer_data)
+                tn[site_tag, layer].modify(data=layer_data)
 
     def _advance_boundary_one_step(
         self,
@@ -2266,6 +2320,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         env_n_iter=4,
         run_callback=None,
         track_boundary_fidelity=False,
+        reuse_static=False,
         debug=False,
         debug_loss_mode="exact",
         debug_loss_kwargs=None,
@@ -2279,12 +2334,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if uses_quimb:
             norm_tn, overlap_tn = self._prepare_current_double_layers()
-            self.bdy.start_sweep(norm_tn, axis, update_side, progress=False)
+            self.bdy.start_sweep(
+                norm_tn,
+                axis,
+                update_side,
+                progress=False,
+                reuse_static=reuse_static,
+            )
             self.bdy_overlap.start_sweep(
                 overlap_tn,
                 axis,
                 update_side,
                 progress=False,
+                reuse_static=reuse_static,
             )
             # A return-forward pass starts at ``1`` because site ``0`` was
             # just optimized by the preceding backward pass. Seed the
@@ -2491,6 +2553,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 range(0, n),
                 update_side="left",
                 sweep_name="forward",
+                reuse_static=False,
                 **sweep_kwargs,
             )
         )
@@ -2501,6 +2564,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     range(n - 2, -1, -1),
                     update_side="right",
                     sweep_name="backward",
+                    reuse_static=True,
                     **sweep_kwargs,
                 )
             )
@@ -2510,6 +2574,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     range(forward_start, n),
                     update_side="left",
                     sweep_name="forward",
+                    reuse_static=True,
                     **sweep_kwargs,
                 )
             )

@@ -15,15 +15,20 @@ quality check without making every optimization environment more expensive.
 delegates to `SweepOptimizer`. The default, `"auto"`, keeps dense inputs on the
 Pepsy `BdyMPS`/`CompBdy` path and routes Symmray-looking inputs to Quimb MPS
 boundaries. Use `boundary_engine="quimb-mps"` to force that path, and pass
-Quimb environment controls with `boundary_options`.
+Quimb environment controls with `boundary_options`. In particular,
+`cutoff="auto"` uses the shared dtype-aware policy and `cutoff_mode` is
+forwarded to Quimb's boundary SVD via `compress_opts`.
 
 Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
 gates, plus intervening one-site gates, into one PEPS target before truncating
 to `chi` and optionally running the sweep/global cleanup.
 
-## Two-site boundary FIT
+## Boundary DMRG modes and SRC guesses
 
-Dense DMRG boundaries can opt into native-SVD two-site updates through
+Dense PEPS boundaries can select the one-site/effective DMRG path with
+`fit_mode="dmrg"`, mixed two-site/one-site DMRG with `fit_mode="dmrg2"`,
+fixed two-site FIT with `fit_mode="two-site"`, or Quimb compression with
+`fit_mode="direct"`, `"src"`, `"zipup"`, `"sdc"`, or `"dm"`, through
 `boundary_kwargs`:
 
 ```python
@@ -34,8 +39,10 @@ optimizer = pepsy.PepsOptimizer(
     boundary_chi=(64, 96),
     boundary_engine="dmrg",
     boundary_kwargs={
-        "fit_mode": "two-site",
-        "fit_sweep_sequence": "RL",
+        "fit_mode": "dmrg2",
+        "fit_init_strategy": "guess-src",
+        "fit_init_seed": 7,
+        "fit_sweep_sequence": "LR",
         "fit_rtol": 1e-8,
         "fit_min_iter": 2,
         "fit_patience": 2,
@@ -44,11 +51,20 @@ optimizer = pepsy.PepsOptimizer(
 )
 ```
 
+`fit_init_strategy` selects only the disposable FIT initial guess:
+`"guess-direct"`, `"guess-src"`, and `"guess-sdc"` are available in
+addition to the default `"direct"`. The exact boundary target, live state,
+and reusable boundary handles remain authoritative. Symmray boundaries safely
+fall back to direct initialization with a warning for dense Quimb guesses.
+
 For sweep cleanup, tuple `boundary_chi` values cap the norm and overlap
 boundaries independently. Normalization and diagnostic contractions receive
 the corresponding scalar `chi`. DMRG two-site boundaries start at bond 1 and
 grow through local SVDs instead of global padding. `fit_mode="eff"` remains
-the default while two-site accuracy and wall time are workload-dependent.
+the compatibility default while two-site accuracy and wall time are
+workload-dependent. Use `cutoff="auto"` and
+`fit_cutoff_mode="auto"` for dtype-aware cutoff selection; the latter
+resolves to the standard `"rsum2"` policy.
 
 For the full-chain `eff` solver, `boundary_kwargs` can instead select native
 block growth followed by one-site refinement:

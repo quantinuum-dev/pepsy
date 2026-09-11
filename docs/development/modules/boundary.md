@@ -35,10 +35,23 @@ bra indices are reindexed with an `_*` suffix.
 
 The local boundary solver is selected with `fit_mode`:
 
+- `"direct"`, `"src"`, `"zipup"`, `"sdc"`, and `"dm"` use Quimb
+  boundary compression directly, without FIT.
 - `"eff"` is the compatibility default and performs cached one-site sweeps.
 - `"two-site"` forms neighboring boundary wavefunctions, splits them with a
   backend-native SVD, and can discover bond subspaces up to `fit_max_bond`.
+- `"dmrg2"` performs two-site FIT warm-up sweeps followed by one-site
+  refinement; it is distinct from the fixed two-site `"two-site"` mode.
 - `"global"` uses the reference global FIT solve.
+- `"dmrg"` is an alias for `"eff"`.
+
+Each boundary FIT can optionally use `fit_init_strategy="guess-direct"`,
+`"guess-src"`, or `"guess-sdc"`. These compress a copy of the exact
+boundary target and give that disposable result to FIT as its initial guess.
+The exact target and live/reusable boundary remain unchanged; the default
+`"direct"` strategy preserves the historical behavior. Native Symmray
+boundaries fall back to `"direct"` with a diagnostic warning because dense
+Quimb guesses cannot preserve their charge sectors.
 
 The `"eff"` path accepts `fit_block_size=2` or `3` for native block-SVD
 growth. With `fit_adaptive_sweeps=N`, it uses that block size for the first
@@ -47,8 +60,9 @@ Optional `fit_rtol`, `fit_min_iter`, and `fit_patience` controls are forwarded
 to `FIT.run_eff`; with `fit_rtol=None`, no convergence scalar is transferred
 from the backend. When enabled, stopping begins only after two completed
 sweeps, using the relative retained-norm change between consecutive sweeps.
-The default `RL` sequence runs each boundary left-to-right and then
-right-to-left.
+The default `RL` sequence runs each local boundary FIT left-to-right and then
+right-to-left. Use `fit_sweep_sequence="LR"` when the requested local
+compression should begin left-to-right.
 
 Two-site sweeps do not rebuild a complete environment for every pair. One
 side is cached once per sweep and the moving side is updated incrementally, so

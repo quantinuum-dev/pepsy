@@ -1,15 +1,30 @@
 # `pepsy.boundary.metrics`
 
 `peps_norm`, `peps_normalize`, `peps_infidelity`, and `contract_flat` accept
-three DMRG/FIT boundary modes:
+the following boundary-compression modes:
 
-- `fit_mode="eff"`: cached one-site sweeps and the compatibility default.
-- `fit_mode="two-site"`: cached pair updates followed by native SVD splits.
+- `fit_mode="direct"`, `"src"`, `"zipup"`, `"sdc"`, or `"dm"`:
+  direct Quimb boundary compression.
+- `fit_mode="eff"` (also `"dmrg"`): cached one-site FIT sweeps and the
+  compatibility default.
+- `fit_mode="two-site"`: fixed two-site FIT updates.
+- `fit_mode="dmrg2"`: two-site FIT warm-up followed by one-site refinement,
+  in the same spirit as a two-site-to-one-site MPS optimizer.
 - `fit_mode="global"`: the full-contraction reference fit.
 
 Selectors are normalized early: `"two_site"` is accepted as an alias for
-`"two-site"`, and `"one-site"` is a descriptive alias for the historical
-`"eff"` spelling. Unknown values fail before boundary work starts.
+`"two-site"`, `"one-site"` aliases `"eff"`, and `"dmrg"` aliases the
+historical `"eff"` spelling. Unknown values fail before boundary work starts.
+
+`fit_init_strategy="direct"` (or the compatibility alias `"auto"`) preserves
+the existing boundary guess. `"guess-direct"`, `"guess-src"`, and
+`"guess-sdc"` create disposable Quimb-compressed guesses from each exact
+boundary target before FIT; they do not replace the target or mutate reusable
+boundaries. These strategies are initialization choices only: the selected
+`fit_mode` still controls the final compressor. Native Symmray boundaries
+fall back to `direct` with a warning for dense Quimb guesses.
+The direct Quimb `fit_mode` values are currently dense-only; use
+`fit_mode="dmrg"` or `"dmrg2"` for native Symmray boundaries.
 
 For `fit_mode="eff"`, set `fit_block_size=2` or `3` to use native block-SVD
 growth through `FIT.run_eff`. Add `fit_adaptive_sweeps=2` to perform two
@@ -26,10 +41,12 @@ result = pepsy.peps_norm(
     state,
     chi=64,
     method="dmrg",
-    fit_mode="two-site",
+    fit_mode="dmrg2",
+    fit_init_strategy="guess-src",
+    fit_init_seed=7,
     fit_sweep_sequence="RL",
-    cutoff=1e-12,
-    fit_cutoff_mode="rsum2",
+    cutoff="auto",
+    fit_cutoff_mode="auto",
     n_iter=8,
     fit_min_iter=2,
     fit_rtol=1e-8,
