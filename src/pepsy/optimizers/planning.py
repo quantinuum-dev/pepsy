@@ -12,11 +12,12 @@ from collections.abc import MutableMapping
 from dataclasses import dataclass, fields
 from numbers import Integral
 from typing import Optional
+import warnings
 
 import numpy as np
 
 from .mps import MpsGateStreamLayoutFinder
-from .stabilizer_tn import MpsStabOptimizer, StreamAnalysisRecord
+from .stabilizer_tn import StabilizerMpsSimulator, StreamAnalysisRecord
 from .tree import TreeLayoutFinder, TreePlan
 
 __all__ = [
@@ -33,8 +34,12 @@ _ROTATION_NAMES = frozenset(
 _CANDIDATE_ORDER = {
     "MpsOptimizer": 0,
     "TreeOptimizer": 1,
-    "MpsStabOptimizer": 2,
-    "TreeStabOptimizer": 3,
+    "StabilizerMpsSimulator": 2,
+    "StabilizerTreeSimulator": 3,
+}
+_CANDIDATE_NAME_ALIASES = {
+    "MpsStabOptimizer": "StabilizerMpsSimulator",
+    "TreeStabOptimizer": "StabilizerTreeSimulator",
 }
 
 
@@ -115,6 +120,15 @@ class SimulatorPlan(_PlannerRecord):
 
     def candidate(self, optimizer: str) -> SimulatorCandidate:
         """Return advice for ``optimizer`` by public class name."""
+        canonical = _CANDIDATE_NAME_ALIASES.get(optimizer)
+        if canonical is not None:
+            warnings.warn(
+                f"simulator candidate name {optimizer!r} is deprecated; use "
+                f"{canonical!r} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            optimizer = canonical
         for candidate in self.candidates:
             if candidate.optimizer == optimizer:
                 return candidate
@@ -255,7 +269,7 @@ class SimulatorPlanner:
     ----------
     gates
         A Pepsy-native gate stream accepted by
-        :meth:`MpsStabOptimizer.analyze_stream`.
+        :meth:`StabilizerMpsSimulator.analyze_stream`.
     n_qubits
         Circuit width. It is inferred from known supports when omitted.
     chi
@@ -309,8 +323,8 @@ class SimulatorPlanner:
         ):
             self.entries = ()
         else:
-            self.entries = tuple(MpsStabOptimizer._as_entries(gates))
-        self.analysis = MpsStabOptimizer.analyze_stream(
+            self.entries = tuple(StabilizerMpsSimulator._as_entries(gates))
+        self.analysis = StabilizerMpsSimulator.analyze_stream(
             None if not self.entries else self.entries,
             n_qubits=n_qubits,
         )
@@ -348,11 +362,11 @@ class SimulatorPlanner:
         records = []
         warnings = []
         for index, entry in enumerate(self.entries):
-            kind = MpsStabOptimizer._analysis_entry_kind(entry)
+            kind = StabilizerMpsSimulator._analysis_entry_kind(entry)
             if kind == "control":
                 continue
             try:
-                sites = MpsStabOptimizer._analysis_entry_sites(
+                sites = StabilizerMpsSimulator._analysis_entry_sites(
                     entry,
                     self.n_qubits,
                 )
@@ -385,7 +399,7 @@ class SimulatorPlanner:
     def _frame_records(self):
         if not self.entries:
             return ()
-        simulator = MpsStabOptimizer(
+        simulator = StabilizerMpsSimulator(
             self.n_qubits,
             gates=self.entries,
             chi=self.chi,
@@ -559,7 +573,7 @@ class SimulatorPlanner:
             candidates.extend(
                 [
                     self._candidate(
-                        optimizer="MpsStabOptimizer",
+                        optimizer="StabilizerMpsSimulator",
                         geometry_name="mps",
                         stabilizer_frame=True,
                         records=frame_records,
@@ -570,7 +584,7 @@ class SimulatorPlanner:
                         tableau_work=tableau_work,
                     ),
                     self._candidate(
-                        optimizer="TreeStabOptimizer",
+                        optimizer="StabilizerTreeSimulator",
                         geometry_name="tree",
                         stabilizer_frame=True,
                         records=frame_records,
@@ -586,12 +600,12 @@ class SimulatorPlanner:
             candidates.extend(
                 [
                     self._unavailable_stabilizer_candidate(
-                        "MpsStabOptimizer",
+                        "StabilizerMpsSimulator",
                         "mps",
                         frame_failure,
                     ),
                     self._unavailable_stabilizer_candidate(
-                        "TreeStabOptimizer",
+                        "StabilizerTreeSimulator",
                         "tree",
                         frame_failure,
                     ),

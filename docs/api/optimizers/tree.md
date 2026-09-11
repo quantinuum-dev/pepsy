@@ -683,7 +683,7 @@ part of the complete TTNO; the shorter declaration only selects the minimal
 Steiner route. Any omitted boundary operator bond must be bond one, otherwise
 the application raises instead of silently discarding operator information.
 The stream constructor `TreeOptimizer.sub_mpotree_event(tree_operator)` and
-the matching `TreeStabOptimizer.subtreempo_event(...)` provide the same
+the matching `StabilizerTreeSimulator.subtreempo_event(...)` provide the same
 native route; `subtreempo_event` and `subttno_event` remain spelling aliases.
 The new helper preserves the established `"subtreempo"` wire marker for shared
 stream consumers; TreeOptimizer also accepts raw `"sub_mpotree"` markers. Set
@@ -1257,11 +1257,11 @@ chain algorithms and are intentionally not copied into `TreeOptimizer`.
 The accepted legacy `mpo` name uses the tree-native route described above.
 Tree-native `dmrg`/`dmrg1`/`dmrg2`/`dmrg3` are provided by `TreeFIT` instead.
 Tree layout is part of the TTN geometry and is selected with
-`tree=`/`layout=` at construction. `TreeStabOptimizer` uses
+`tree=`/`layout=` at construction. `StabilizerTreeSimulator` uses
 `tree_mpo_direct` or `tree_mpo_dm` for its numerical coefficient updates,
 delegating the active-span TreeMPO contraction to this class while keeping
 tableau state and stabilizer-specific bookkeeping above it. See the
-[TreeStabOptimizer API](tree_stabilizer.md) for the supported fixed-basis,
+[StabilizerTreeSimulator API](tree_stabilizer.md) for the supported fixed-basis,
 basis-updating, immediate, and deferred magic-injection
 Clifford/rotation/measurement paths, bounded dense matrix dispatch, and the
 safe MPS naming-compatibility surface.
@@ -1282,7 +1282,7 @@ result = optimizer.run(
 ```
 
 The `strategy="independent"` and `strategy="coalesced"` options follow the
-shared runner semantics. `TreeStabOptimizer.run` provides the corresponding
+shared runner semantics. `StabilizerTreeSimulator.run` provides the corresponding
 API and intentionally supports independent shot distribution only.
 `observable`, `chunk_size`, and checkpoint/resume settings require MPI;
 supplying them without MPI raises instead of silently using ordinary replay.

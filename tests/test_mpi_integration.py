@@ -115,13 +115,13 @@ def test_real_mpi_gathers_trajectory_records_in_global_order():
         (("I", 0.5, identity), ("X", 0.5, flip))
     )
     runner = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [pepsy.TrajectoryEvent(channel, 0)],
         comm=comm,
     )
     result = runner.run(9, seed=53, retain="all")
     serial = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [pepsy.TrajectoryEvent(channel, 0)],
         comm=MPI.COMM_SELF,
     ).run(9, seed=53, retain="all")
@@ -146,7 +146,7 @@ def test_real_mpi_importance_reduction_matches_shot_estimator(strategy):
     )
     policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
     result = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [pepsy.TrajectoryEvent(channel, 0)],
         comm=comm,
     ).run(
@@ -244,7 +244,7 @@ def test_real_mpi_mps_optimizer_run_keyword():
     if comm.Get_size() < 2:
         pytest.skip("run this test under mpiexec -n 2 or more")
 
-    optimizer = pepsy.MpsStabOptimizer(1, gates=[("x", 0)])
+    optimizer = pepsy.StabilizerMpsSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=9,
         seed=63,
@@ -295,7 +295,7 @@ def test_real_mpi_tree_stabilizer_run_keyword():
     if comm.Get_size() < 2:
         pytest.skip("run this test under mpiexec -n 2 or more")
 
-    optimizer = pepsy.TreeStabOptimizer(1, gates=[("x", 0)])
+    optimizer = pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=9,
         seed=65,
@@ -509,7 +509,7 @@ def test_real_mpi_coalesces_within_each_rank():
 
     gate = np.asarray([[0.0, 1.0], [1.0, 0.0]])
     result = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [(gate, 0)],
         comm=comm,
     ).run(
@@ -524,7 +524,7 @@ def test_real_mpi_coalesces_within_each_rank():
     assert result.reduce_sum(result.local_result.shots) == 8
 
     streamed = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [(gate, 0)],
         comm=comm,
     ).run(

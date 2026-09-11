@@ -5,8 +5,8 @@ execution:
 
 - `MpsOptimizer`
 - `TreeOptimizer`
-- `MpsStabOptimizer`
-- `TreeStabOptimizer`
+- `StabilizerMpsSimulator`
+- `StabilizerTreeSimulator`
 
 The result is typed, ranked advice. It includes the selected MPS order or tree
 plan, the physical and stabilizer-frame supports used for pricing, and every
@@ -41,12 +41,12 @@ for candidate in advice.candidates:
 `SimulatorPlanner(...).plan()` and `.recommend()` are equivalent. The
 convenience function above returns a `SimulatorPlan`; its `best` property is
 the first applicable `SimulatorCandidate`, and
-`candidate("TreeStabOptimizer")` selects one record by class name. Both record
+`candidate("StabilizerTreeSimulator")` selects one record by class name. Both record
 types also support mapping-style access and `as_dict()`.
 
 ## What is priced
 
-The planner first uses `MpsStabOptimizer.analyze_stream` to count Clifford,
+The planner first uses `StabilizerMpsSimulator.analyze_stream` to count Clifford,
 injectable, other non-Clifford, structural, and opaque entries. It then builds
 two circuit descriptions:
 

@@ -2,7 +2,7 @@
 
 ## 2026-09-10
 
-This audit covers the `MpsStabOptimizer` native compression and local FIT
+This audit covers the `StabilizerMpsSimulator` native compression and local FIT
 paths. The ordinary `MpsOptimizer` remains the behavioral reference.
 
 Installed versions in the active `py312` environment:

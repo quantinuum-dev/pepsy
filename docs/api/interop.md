@@ -9,7 +9,7 @@ they contain a straight-line sequence of standard quantum operations:
 from guppylang import guppy
 from guppylang.std.quantum import cx, h, qubit
 from pepsy.interop import guppy_gate_stream
-from pepsy.optimizers import MpsStabOptimizer
+from pepsy.optimizers import StabilizerMpsSimulator
 
 @guppy
 def circuit() -> None:
@@ -21,7 +21,7 @@ def circuit() -> None:
     q1.discard()
 
 stream = guppy_gate_stream(circuit)
-sim = MpsStabOptimizer(stream.n_qubits, stream).run()
+sim = StabilizerMpsSimulator(stream.n_qubits, stream).run()
 ```
 
 The default `format="matrix"` is accepted by dense MPS, MPO, PEPS, and

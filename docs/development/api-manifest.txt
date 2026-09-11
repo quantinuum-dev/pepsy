@@ -84,6 +84,7 @@ StabilizerMpsSettingsAdvice
 StabilizerMpsSimulator
 StabilizerMpsSampler
 StabilizerTreeRunResult
+StabilizerTreeSimulator
 StimCircuitPlan
 StimDetector
 StimHerald

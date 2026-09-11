@@ -16,7 +16,7 @@ stream = [
 ]
 
 result = pepsy.run_coalesced_trajectory_shots(
-    lambda: pepsy.MpsStabOptimizer(2, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(2, chi=64),
     stream,
     shots=10_000,
     seed=7,
@@ -27,7 +27,7 @@ Equivalently, select the sampling strategy on the trajectory runner:
 
 ```python
 result = pepsy.run_trajectory_shots(
-    lambda: pepsy.MpsStabOptimizer(2, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(2, chi=64),
     stream,
     shots=10_000,
     seed=7,
@@ -78,7 +78,7 @@ reject caps, while `perm` maintains its shortened logical mapping.
 It samples independent **physical Pauli trajectories**, not a density matrix.
 Each non-identity X/Y/Z fault is inserted into a concrete gate stream after every
 target of an ordinary gate. The resulting stream can be replayed by either
-`MpsOptimizer` or `MpsStabOptimizer`; for STN, every sampled fault is a Clifford
+`MpsOptimizer` or `StabilizerMpsSimulator`; for STN, every sampled fault is a Clifford
 that is absorbed by the Stim tableau. Do not mix this macro with stream-local
 stochastic entries; use `run_trajectory_shots(...)` or
 `run_coalesced_trajectory_shots(...)` when the stream already contains noise.
@@ -88,7 +88,7 @@ import pepsy
 
 noise = pepsy.PauliErrorModel.depolarizing(1e-3)
 result = pepsy.run_noisy_shots(
-    lambda: pepsy.MpsStabOptimizer(6, chi=32),
+    lambda: pepsy.StabilizerMpsSimulator(6, chi=32),
     gates,
     noise,
     shots=1_000,
@@ -192,7 +192,7 @@ and copies an MPS only when two nonempty branches genuinely diverge:
 
 ```python
 result = pepsy.run_coalesced_noisy_shots(
-    lambda: pepsy.MpsStabOptimizer(6, chi=32),
+    lambda: pepsy.StabilizerMpsSimulator(6, chi=32),
     gates,
     pepsy.PauliErrorModel.depolarizing(1e-3),
     shots=100_000,
@@ -372,14 +372,14 @@ expect an explicit `"independent"` or `"coalesced"` strategy.
 
 Use `MPIShotRunner` when the shot ensemble should be distributed across MPI
 processes. It is an orchestration layer rather than another optimizer, so the
-same factory works for `MpsOptimizer`, `MpsStabOptimizer`, `TreeOptimizer`,
-and `TreeStabOptimizer`:
+same factory works for `MpsOptimizer`, `StabilizerMpsSimulator`, `TreeOptimizer`,
+and `StabilizerTreeSimulator`:
 
 ```python
 import pepsy
 
 runner = pepsy.MPIShotRunner(
-    lambda: pepsy.MpsStabOptimizer(32, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(32, chi=64),
     noisy_stream,
 )
 result = runner.run(
@@ -393,7 +393,7 @@ For a single ensemble, `run_mpi_shots` is the concise equivalent:
 
 ```python
 result = pepsy.run_mpi_shots(
-    lambda: pepsy.MpsStabOptimizer(32, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(32, chi=64),
     noisy_stream,
     shots=1_000_000,
     seed=7,
@@ -420,11 +420,11 @@ an observable:
 
 Independent MPI execution supports all four optimizer families. Coalesced
 execution additionally requires the backend's trajectory-copy contract; the
-current coalesced backends are `MpsOptimizer`, `MpsStabOptimizer`, and
-`TreeOptimizer`. Use independent MPI execution for `TreeStabOptimizer`.
+current coalesced backends are `MpsOptimizer`, `StabilizerMpsSimulator`, and
+`TreeOptimizer`. Use independent MPI execution for `StabilizerTreeSimulator`.
 
 The same orchestration is available directly from `MpsOptimizer.run`,
-`MpsStabOptimizer.run`, `TreeOptimizer.run`, and `TreeStabOptimizer.run` by
+`StabilizerMpsSimulator.run`, `TreeOptimizer.run`, and `StabilizerTreeSimulator.run` by
 passing `shots=...` and `mpi=...`. Direct calls create fresh per-shot copies
 from the current optimizer state and leave the caller's state and queued
 stream unchanged. Use `MPIShotRunner` when the factory/stream needs to be
@@ -572,7 +572,7 @@ all ranks when the files are no longer needed.
 
 `TrajectoryEvent` is the general independent noise-simulation interface. Put
 one directly inside an ordinary gate stream and run independently sampled shots
-with `MpsOptimizer`, `TreeOptimizer`, or `MpsStabOptimizer`. It does not require
+with `MpsOptimizer`, `TreeOptimizer`, or `StabilizerMpsSimulator`. It does not require
 Stim or a density matrix.
 
 Use a `mixture` for a user-defined random-unitary channel. Its outcomes have
@@ -606,7 +606,7 @@ stream = [
     (pepsy.h(), 0),
 ]
 result = pepsy.run_trajectory_shots(
-    lambda: pepsy.MpsStabOptimizer(1, chi=32),
+    lambda: pepsy.StabilizerMpsSimulator(1, chi=32),
     stream,
     shots=10_000,
     seed=7,
@@ -628,9 +628,9 @@ Born `branch_probability` and is marked as a `physical_boundary`; the expected
 norm includes that probability, so physical renormalization is not reported as
 compression infidelity. Inspect `optimizer.norm_diagnostics()` and
 `optimizer.get_norm_events()` after independent or coalesced replay. Fidelity
-tracking is automatic for `MpsStabOptimizer`; no tracking flag is needed.
+tracking is automatic for `StabilizerMpsSimulator`; no tracking flag is needed.
 
-For `MpsStabOptimizer`, a selected Kraus outcome is a
+For `StabilizerMpsSimulator`, a selected Kraus outcome is a
 normalized trajectory boundary, just like a measurement/reset: its Born weight
 is retained in the trajectory record but is not treated as compression loss.
 `sim.norm_diagnostics()["norm"]` is the square root of the product of all
@@ -654,7 +654,7 @@ HERALDED_PAULI_CHANNEL_1(0, 0, 0, 0.02) 0
 """
 
 result = pepsy.run_stim_shots(
-    lambda: pepsy.MpsStabOptimizer(2), circuit, shots=10_000, seed=7,
+    lambda: pepsy.StabilizerMpsSimulator(2), circuit, shots=10_000, seed=7,
 )
 print(result.faults[0])
 print(result.heralds[0])
@@ -712,8 +712,8 @@ noisy_stream = model.transform(gates, seed=7)
 ```
 
 For coherent-noise and QEC studies, both STN frontends provide
-`MpsStabOptimizer.truncation_convergence(...)` and
-`TreeStabOptimizer.truncation_convergence(...)`. They replay the same stream
+`StabilizerMpsSimulator.truncation_convergence(...)` and
+`StabilizerTreeSimulator.truncation_convergence(...)`. They replay the same stream
 at several `chi` values and report peak bond, norm diagnostics, and an
 optional observable. `chi=None` is the lossless reference up to the configured
 cutoff.

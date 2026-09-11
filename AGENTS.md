@@ -50,6 +50,27 @@ Keep public re-exports in the owning package `__init__.py`. Preserve the
 top-level convenience API only when it is already documented and useful;
 advanced implementation details should remain behind their domain namespace.
 
+## Stabilizer simulator API naming
+
+- The canonical public names are `StabilizerMpsSimulator`,
+  `StabilizerTreeSimulator`, and `StabilizerMpsSampler`.
+- `MpsStabOptimizer`, `TreeStabOptimizer`, and `MpsStabSampler` are retained as
+  compatibility aliases and emit `DeprecationWarning` when resolved through
+  their public package namespaces. New implementation, tests, examples, and
+  documentation should use the canonical names; migration tests and the API
+  migration guide should continue to cover the aliases.
+- Do not rename `MpsOptimizer` or `TreeOptimizer` to simulator names. They are
+  ordinary tensor-network optimization engines, while the stabilizer classes
+  are gate-stream simulators that own a tableau plus an MPS or tree
+  coefficient state.
+- Simulator planning returns the canonical stabilizer class names. Its
+  `SimulatorPlan.candidate(...)` lookup continues to accept the legacy names
+  with a deprecation warning.
+- Keep the implementation behavior unchanged when making naming-only edits:
+  the `|psi> = C|nu>` / `|psi> = C|p>` representations, Stim stream contract,
+  compression defaults, backend rules, and trajectory semantics are not
+  changed by this API regularization.
+
 Before changing a specialized subsystem, read its skill:
 
 - `pepsy.optimizers.mps` → `.github/skills/mps-optimizer/SKILL.md`

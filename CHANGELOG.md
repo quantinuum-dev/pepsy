@@ -14,6 +14,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Renamed the stabilizer tensor-network front ends to the descriptive
+  `StabilizerMpsSimulator`, `StabilizerTreeSimulator`, and
+  `StabilizerMpsSampler` names. The former `MpsStabOptimizer`,
+  `TreeStabOptimizer`, and `MpsStabSampler` names remain available as
+  deprecation-warning compatibility aliases.
+
 - Simplified `MpsOptimizer(mode="perm")` to one Quimb-style lazy
   swap-and-split SVD path using `swap_back=False`. Removed the separate
   `routing="perm"` axis and the misleading `perm-*` / `*-perm` compositions

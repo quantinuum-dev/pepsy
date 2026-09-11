@@ -107,12 +107,12 @@ The public simulator types are exported at top level (`import pepsy`); see
   for this stateful leakage layer is future work, so `strategy="auto"` remains
   independent and explicit coalescing raises for leakage streams.
 - **Stream and settings advice**:
-  `MpsStabOptimizer.analyze_stream(gates, n_qubits=None)` is the Pepsy-native
+  `StabilizerMpsSimulator.analyze_stream(gates, n_qubits=None)` is the Pepsy-native
   front door. It returns a typed, mapping-compatible `StreamAnalysisRecord`
   with counts for Clifford entries, injectable T-family rotations, other
   non-Clifford work, dense matrices, non-unitary matrices, coefficient-frame
   sub-MPOs, measurements/resets/caps, touched qubits, and warnings.
-  `MpsStabOptimizer.recommend_settings(gates, n_qubits=None,
+  `StabilizerMpsSimulator.recommend_settings(gates, n_qubits=None,
   ancilla_budget=None, prioritize_peak_bond=False, goal="run")` returns a
   typed `StabilizerMpsSettingsAdvice` with constructor settings, execution
   method, ancilla requirements, warnings, and a message. It calls the narrower
@@ -134,7 +134,7 @@ The public simulator types are exported at top level (`import pepsy`); see
   queue length. `sim.run_queued_stream(...)` applies the same runner to an
   unrun converted queue (for example after `from_stim`) without mutating the
   source simulator.
-- **Magic-only strategy advice**: `MpsStabOptimizer.recommend_magic_strategy(gates,
+- **Magic-only strategy advice**: `StabilizerMpsSimulator.recommend_magic_strategy(gates,
   ancilla_budget=None, prioritize_peak_bond=False)` classifies a Pepsy stream and returns
   an explicit direct/immediate/deferred recommendation, counts, ancilla requirements, and a
   plain-English `message`. It recognizes the small physical Clifford matrices emitted by
@@ -185,14 +185,14 @@ The public simulator types are exported at top level (`import pepsy`); see
   apply `S`/`Z`/`S_DAG` for `k mod 4`, and uncompute. Compile that linear-size
   circuit with `stim.Tableau.from_circuit`; do not build a dense unitary.
 - **STN measurement**: do not call stim measurement as an independent second simulation.
-  `MpsStabOptimizer.measure` computes the Born rule from the coefficient frame. The default
+  `StabilizerMpsSimulator.measure` computes the Born rule from the coefficient frame. The default
   fixed-basis path leaves the tableau unchanged; `absorb_basis=True` applies a localizing
   Clifford to `p`, absorbs its inverse into the basis, and projects one coefficient site.
 
 ## Actual module layout (`src/pepsy/optimizers/stabilizer_tn/`)
 ```
 src/pepsy/optimizers/stabilizer_tn/
-  __init__.py        # public API: STNState, MpsStabOptimizer, MPO builders
+  __init__.py        # public API: STNState, StabilizerMpsSimulator, MPO builders
   stn_state.py       # STNState: stim tableau + MPS |p>, frame_pauli, dense reconstruction
   mps_stab_optimizer.py  # routing, rotations, measurement, injection, sampling, backends
   operators.py       # Pauli decomposition and full/windowed two-branch MPO builders
@@ -251,7 +251,7 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   a **quimb MPS** coefficient vector; `gen_clifford.compose(U)` accepts non-Clifford `U` and
   decomposes it with their methods. Example: `stabilizers_example.ipynb`.
 - Our mapping: Qiskit `Clifford` → **stim tableau**; their MPS + `.compose` decomposition →
-  **`MpsStabOptimizer`** frame mapping plus direct quimb local/sub-MPO/branch-sum updates.
+  **`StabilizerMpsSimulator`** frame mapping plus direct quimb local/sub-MPO/branch-sum updates.
   Use their notebook to cross-check Pauli decomposition and signs; do not vendor their code.
 - Disentangling (their extra feature, optional for us): exact method arXiv:2412.17209 +
   sweeping disentangling arXiv:2407.01692 — candidates if you later want to actively reduce

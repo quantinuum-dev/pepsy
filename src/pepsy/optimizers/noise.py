@@ -4,7 +4,7 @@ Pepsy's native design is stream-local: users can place stochastic instructions
 such as ``("depolarize1", p, q)`` or ``("amplitude_damping", gamma, q)`` exactly
 where the hardware schedule says the channel acts. The trajectory runners
 sample a *concrete* branch for each shot and replay the resulting ordinary gate
-stream with either :class:`MpsOptimizer` or :class:`MpsStabOptimizer`. The older
+stream with either :class:`MpsOptimizer` or :class:`StabilizerMpsSimulator`. The older
 ``PauliErrorModel`` helpers remain convenience macros for inserting uniform
 post-gate Pauli faults into a clean deterministic stream.
 """
@@ -2401,10 +2401,10 @@ def run_noisy_shots(
     """Build and replay independent noisy trajectories with either MPS optimizer.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
-    :class:`MpsStabOptimizer` for each trajectory. For example::
+    :class:`StabilizerMpsSimulator` for each trajectory. For example::
 
         result = run_noisy_shots(
-            lambda: pepsy.MpsStabOptimizer(8, chi=32), gates,
+            lambda: pepsy.StabilizerMpsSimulator(8, chi=32), gates,
             PauliErrorModel.depolarizing(1e-3), shots=1_000, seed=7,
         )
 
@@ -2994,7 +2994,7 @@ def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
-    """Recognize TreeStabOptimizer through its lightweight protocol marker."""
+    """Recognize StabilizerTreeSimulator through its lightweight protocol marker."""
     return bool(getattr(optimizer, "_is_tree_stabilizer_trajectory_optimizer", False))
 
 
@@ -3117,7 +3117,7 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
     remap = getattr(optimizer, "_logical_to_physical_where", None)
     if p is None or not callable(apply_gate) or not callable(remap):
         raise TypeError(
-            "State-dependent trajectory channels require MpsOptimizer or MpsStabOptimizer."
+            "State-dependent trajectory channels require MpsOptimizer or StabilizerMpsSimulator."
         )
     matrix = _to_trajectory_backend(matrix, optimizer)
     physical_where = tuple(remap(where))
@@ -3366,7 +3366,7 @@ def _new_magic_context(optimizer, ancillas, *, recycle=True, reset_ancillas=True
     validate = getattr(optimizer, "_validate_magic_ancilla_pool", None)
     if not callable(validate):
         raise TypeError(
-            "magic injection requires MpsStabOptimizer or TreeStabOptimizer "
+            "magic injection requires StabilizerMpsSimulator or StabilizerTreeSimulator "
             "with a validated ancilla pool."
         )
     try:
@@ -3859,7 +3859,7 @@ def _check_coalesced_optimizer(optimizer):
     if not callable(getattr(optimizer, "copy", None)):
         raise TypeError(
             "coalesced trajectory replay requires an optimizer with copy(); "
-            "use MpsOptimizer, TreeOptimizer, or MpsStabOptimizer."
+            "use MpsOptimizer, TreeOptimizer, or StabilizerMpsSimulator."
         )
 
 
@@ -4390,7 +4390,7 @@ def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
         if not callable(mapped) or not callable(state_expectation):
             raise TypeError(
                 "coalesced measurement branching requires MpsOptimizer, "
-                "MpsStabOptimizer, or TreeOptimizer expectation support."
+                "StabilizerMpsSimulator, or TreeOptimizer expectation support."
             )
         value = state_expectation(pauli, mapped(where))
     return min(max(0.5 * (1.0 + float(value)), 0.0), 1.0)
@@ -4769,7 +4769,7 @@ def sample_coalesced_bits(
 
     Ordinary MPS leaves use :class:`pepsy.sampling.MpsSampler`'s batched native
     path, preserving device-local sampling until the final compact NumPy
-    result. STN leaves use :meth:`MpsStabOptimizer.sample_bits`, which is
+    result. STN leaves use :meth:`StabilizerMpsSimulator.sample_bits`, which is
     already a count-coalesced measurement tree. The function never materializes
     one optimizer per trajectory.
 
@@ -4905,8 +4905,8 @@ def run_trajectory_shots(
     ``("amplitude_damping", gamma, q)`` without forming a density matrix.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer`,
-    :class:`TreeOptimizer`, :class:`MpsStabOptimizer`, or
-    :class:`TreeStabOptimizer` per shot. Gate segments
+    :class:`TreeOptimizer`, :class:`StabilizerMpsSimulator`, or
+    :class:`StabilizerTreeSimulator` per shot. Gate segments
     between channel events are batched, so a trajectory does not rebuild an
     optimizer for every gate.
     Set ``strategy="coalesced"`` to share deterministic prefixes and retain one

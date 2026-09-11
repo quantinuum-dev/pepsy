@@ -78,9 +78,9 @@ def test_bell_state_ground_truth():
 
 def test_mps_stab_statevector_readout_does_not_build_dense_tableau(monkeypatch):
     """Physical readout applies the tableau circuit, not its huge matrix."""
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
-    sim = MpsStabOptimizer(17).apply([("h", 0), ("cnot", 0, 16)])
+    sim = StabilizerMpsSimulator(17).apply([("h", 0), ("cnot", 0, 16)])
     monkeypatch.setattr(
         sim.state,
         "clifford_unitary",
@@ -101,9 +101,9 @@ def test_mps_stab_statevector_readout_does_not_build_dense_tableau(monkeypatch):
 @pytest.mark.parametrize("mode", ["exact", "mpo", "quimb-src", "dmrg"])
 def test_mps_stab_physical_mps_replay_matches_matrix_free_readout(mode, monkeypatch):
     """Physical-MPS conversion replays the tableau circuit without a dense C."""
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
-    sim = MpsStabOptimizer(5).apply(
+    sim = StabilizerMpsSimulator(5).apply(
         [("h", 0), ("cnot", 0, 4), ("s", 2), ("cnot", 4, 1)]
     )
     basis_before = sim.to_basis_statevector()
@@ -127,7 +127,7 @@ def test_mps_stab_physical_mps_replay_matches_matrix_free_readout(mode, monkeypa
 
 def test_stabilizer_statevector_readout_cleans_clifford_roundoff():
     """Tableau replay does not expose cancellation noise as amplitudes."""
-    sim = MpsStabOptimizer(2).apply([("x", 0)])
+    sim = StabilizerMpsSimulator(2).apply([("x", 0)])
 
     np.testing.assert_allclose(
         sim.to_statevector(), [0.0, 0.0, 1.0, 0.0], atol=0.0
@@ -135,9 +135,9 @@ def test_stabilizer_statevector_readout_cleans_clifford_roundoff():
 
 
 def test_mps_stab_physical_mps_restores_logical_order_from_static_layout():
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         4,
         layout=[3, 1, 2, 0],
         layout_report=False,
@@ -151,9 +151,9 @@ def test_mps_stab_physical_mps_restores_logical_order_from_static_layout():
 
 
 def test_mps_stab_dense_physical_order_matches_physical_mps_order():
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         4,
         layout=[3, 1, 2, 0],
         layout_report=False,
@@ -169,9 +169,9 @@ def test_mps_stab_dense_physical_order_matches_physical_mps_order():
 
 
 def test_mps_stab_to_physical_mps_is_to_mps_compatibility_alias():
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 2)])
     np.testing.assert_allclose(
         np.asarray(sim.to_mps().to_dense()).reshape(-1),
         np.asarray(sim.to_physical_mps().to_dense()).reshape(-1),
@@ -224,7 +224,7 @@ def test_zero_qubit_rejected():
 
 
 # --------------------------------------------------------------------------- #
-# MpsStabOptimizer simulator (Clifford + non-Clifford rotations, matrices, sub-MPO)
+# StabilizerMpsSimulator (Clifford + non-Clifford rotations, matrices, sub-MPO)
 # --------------------------------------------------------------------------- #
 from pepsy.optimizers.stabilizer_tn import (  # noqa: E402
     DeferredInjectionReport,
@@ -232,11 +232,10 @@ from pepsy.optimizers.stabilizer_tn import (  # noqa: E402
     ImmediateInjectionReport,
     ImmediateProjectionRecord,
     MeasurementRecord,
-    MpsStabOptimizer,
+    StabilizerMpsSimulator,
     NormEventRecord,
     StabilizerMpsSettingsAdvice,
     StabilizerMpsRunResult,
-    StabilizerMpsSimulator,
     StreamAnalysisRecord,
     pauli_rotation_mpo,
     run_stabilizer_mps_stream,
@@ -251,7 +250,7 @@ _T = np.diag([1, np.exp(1j * np.pi / 4)]).astype(complex)
 
 
 def test_stn_tableau_ascii_show_and_draw_are_read_only(capsys):
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1)])
     before = sim.to_statevector().copy()
 
     tableau = sim.tableau()
@@ -343,7 +342,7 @@ def _coefficient_bell_optimizer():
     )
     tableau = stim.TableauSimulator()
     tableau.set_num_qubits(2)
-    return MpsStabOptimizer.from_tableau_and_state(tableau, p, chi=2)
+    return StabilizerMpsSimulator.from_tableau_and_state(tableau, p, chi=2)
 
 
 def test_clifford_disentangling_moves_bell_entanglement_into_tableau():
@@ -378,7 +377,7 @@ def test_disentangle_stream_event_preserves_following_physical_gate_order():
 
 
 def test_static_frame_layout_uses_dynamic_tableau_support():
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     sim.set_gates([("cnot", 0, 2), ("rz", 0.4, 2)])
 
     plan = sim.current_frame_layout(order="auto")
@@ -393,7 +392,7 @@ def test_static_frame_layout_uses_dynamic_tableau_support():
 
 def test_static_frame_layout_defaults_to_operator_schmidt_weights():
     theta = np.pi / 2.0 + 0.07
-    sim = MpsStabOptimizer(2).set_gates([("rzz", theta, 0, 1)])
+    sim = StabilizerMpsSimulator(2).set_gates([("rzz", theta, 0, 1)])
 
     default_plan = sim.current_frame_layout(order="input")
     count_plan = sim.current_frame_layout(order="input", weight_mode="count")
@@ -411,8 +410,8 @@ def test_static_frame_layout_defaults_to_operator_schmidt_weights():
 
 
 def test_static_frame_layout_operator_weight_tracks_rotation_entanglement():
-    weak = MpsStabOptimizer(2).set_gates([("rzz", 0.1, 0, 1)])
-    strong = MpsStabOptimizer(2).set_gates(
+    weak = StabilizerMpsSimulator(2).set_gates([("rzz", 0.1, 0, 1)])
+    strong = StabilizerMpsSimulator(2).set_gates(
         [("rzz", np.pi / 2.0 + 0.01, 0, 1)]
     )
 
@@ -442,7 +441,7 @@ def test_static_frame_layout_operator_weight_covers_pepsy_two_qubit_families(
 ):
     import pepsy as py
 
-    plan = MpsStabOptimizer(2, [(gate(py), (0, 1))]).current_frame_layout(
+    plan = StabilizerMpsSimulator(2, [(gate(py), (0, 1))]).current_frame_layout(
         order="input"
     )
 
@@ -459,8 +458,8 @@ def test_static_frame_layout_run_matches_unlaid_reference():
         ("rx", -0.22, 1),
         ("rzz", 0.19, 0, 1),
     ]
-    ref = MpsStabOptimizer(3).apply(stream)
-    laid = MpsStabOptimizer(3, stream, layout="auto", layout_report=False).run()
+    ref = StabilizerMpsSimulator(3).apply(stream)
+    laid = StabilizerMpsSimulator(3, stream, layout="auto", layout_report=False).run()
 
     assert laid.logical_order != [0, 1, 2]
     assert _fidelity(laid.to_statevector(), ref.to_statevector()) == pytest.approx(
@@ -470,9 +469,9 @@ def test_static_frame_layout_run_matches_unlaid_reference():
 
 def test_static_frame_layout_absorb_measure_matches_reference():
     stream = [("h", 0), ("cnot", 0, 2), ("rz", 0.37, 2), ("ry", 0.41, 1)]
-    ref = MpsStabOptimizer(3).apply(stream)
+    ref = StabilizerMpsSimulator(3).apply(stream)
     laid = (
-        MpsStabOptimizer(3)
+        StabilizerMpsSimulator(3)
         .set_gates(stream)
         .apply_layout([2, 0, 1], layout_report=False)
         .run()
@@ -500,7 +499,7 @@ def test_simulator_single_nonclifford_rotations_match_dense():
         for theta in (0.3, 1.1, -0.7):
             for prep in ([], [("h", 0)], [("h", 0), ("cnot", 0, 1)]):
                 stream = prep + [(axis, theta, 0)]
-                sim = MpsStabOptimizer(2).apply(stream)
+                sim = StabilizerMpsSimulator(2).apply(stream)
                 ref = _dense_reference(2, stream)
                 assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -510,7 +509,7 @@ def test_simulator_full_circuit_matches_dense():
         ("h", 0), ("cnot", 0, 1), ("rz", 0.6, 1), ("ry", -0.4, 2),
         ("cz", 1, 2), ("rzz", 0.9, 0, 2), ("s", 0), ("rx", 0.5, 1), ("t", 2),
     ]
-    sim = MpsStabOptimizer(3).apply(stream)
+    sim = StabilizerMpsSimulator(3).apply(stream)
     ref = _dense_reference(3, stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -532,7 +531,7 @@ def test_trainable_one_qubit_dense_gate_keeps_torch_autodiff():
         ("cnot", 0, 1),
     ]
 
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         2,
         stream,
         to_backend=backend_torch(dtype=torch.complex128),
@@ -558,7 +557,7 @@ def test_identity_frame_cap_keeps_torch_autodiff():
     d_gate = torch.diag(
         torch.stack((torch.tensor(1.0, dtype=torch.float64), 1.0 - 2.0 * p))
     ).to(torch.complex128)
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         2,
         [("h", 0), (d_gate, (0,)), ("h", 0)],
         to_backend=backend_torch(dtype=torch.complex128),
@@ -607,8 +606,8 @@ def test_exact_cooling_moves_controlled_pauli_into_tableau(pivot, frame):
     p = qtn.MPS_product_state([pivot, magic])
     stream = [*frame, ("rz", theta, 1)]
 
-    cooled = MpsStabOptimizer.from_mps(p.copy(), chi=None).apply(stream)
-    plain = MpsStabOptimizer.from_mps(
+    cooled = StabilizerMpsSimulator.from_mps(p.copy(), chi=None).apply(stream)
+    plain = StabilizerMpsSimulator.from_mps(
         p.copy(), chi=None, exact_cooling=False
     ).apply(stream)
 
@@ -627,8 +626,8 @@ def test_exact_cooling_falls_back_when_no_stabilizer_pivot_exists():
     p = qtn.MPS_product_state([magic_a, magic_b])
     stream = [("h", 0), ("cnot", 0, 1), ("rz", theta, 1)]
 
-    cooled = MpsStabOptimizer.from_mps(p.copy(), chi=None).apply(stream)
-    plain = MpsStabOptimizer.from_mps(
+    cooled = StabilizerMpsSimulator.from_mps(p.copy(), chi=None).apply(stream)
+    plain = StabilizerMpsSimulator.from_mps(
         p.copy(), chi=None, exact_cooling=False
     ).apply(stream)
 
@@ -642,7 +641,7 @@ def test_exact_cooling_falls_back_when_no_stabilizer_pivot_exists():
 def test_simulator_t_layer_stays_chi_one():
     n = 5
     stream = [("h", q) for q in range(n)] + [("t", q) for q in range(n)]
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = StabilizerMpsSimulator(n).apply(stream)
     assert sim.state.max_bond() == 1  # Corollary 2.1: free non-Clifford ops
 
 
@@ -656,7 +655,7 @@ def test_simulator_clifford_angle_rotations_are_free():
         ("rz", math.pi / 2, 1), ("rx", math.pi, 0), ("ry", -math.pi / 2, 2),
         ("rzz", math.pi, 0, 2), ("rz", math.pi / 2, 2),
     ]
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = StabilizerMpsSimulator(n).apply(stream)
     assert sim.state.max_bond() == 1  # all Clifford -> free
     psi = np.zeros(2 ** n, dtype=complex)
     psi[0] = 1.0
@@ -687,7 +686,7 @@ def test_simulator_clifford_angle_rotations_are_free():
 )
 def test_clifford_pauli_rotation_tableau_matches_dense(axes, theta):
     n = len(axes)
-    sim = MpsStabOptimizer(n).apply(
+    sim = StabilizerMpsSimulator(n).apply(
         [("rot", theta, axes, tuple(range(n)))]
     )
 
@@ -711,7 +710,7 @@ def test_large_clifford_pauli_rotation_avoids_dense_construction(monkeypatch):
     import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
 
     n = 128
-    sim = MpsStabOptimizer(n)
+    sim = StabilizerMpsSimulator(n)
 
     def forbid_dense_path(*args, **kwargs):
         raise AssertionError("Clifford Pauli rotation used a dense conversion")
@@ -729,7 +728,7 @@ def test_large_clifford_pauli_rotation_avoids_dense_construction(monkeypatch):
 def test_simulator_matrix_entries_clifford_and_nonclifford():
     # Clifford matrix (H) -> tableau; non-Clifford matrix (T) -> |nu> ZYZ path.
     stream = [(_H, 0), (_T, 0), (_H, 1), (_T, 1)]
-    sim = MpsStabOptimizer(2).apply(stream)
+    sim = StabilizerMpsSimulator(2).apply(stream)
     ref_stream = [("h", 0), ("t", 0), ("h", 1), ("t", 1)]
     ref = _dense_reference(2, ref_stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
@@ -741,7 +740,7 @@ def test_simulator_random_1q_matrix_matches_dense():
     q, r = np.linalg.qr(a)
     u = q @ np.diag(np.exp(1j * np.angle(np.diag(r))))  # Haar-ish U(2)
     prep = [("h", 0), ("cnot", 0, 1)]
-    sim = MpsStabOptimizer(2).apply(prep + [(u, 1)])
+    sim = StabilizerMpsSimulator(2).apply(prep + [(u, 1)])
     psi = _dense_reference(2, prep)
     psi = _apply_gate_dense(psi, u, (1,), 2)
     assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
@@ -749,14 +748,14 @@ def test_simulator_random_1q_matrix_matches_dense():
 
 def test_stabilizer_mps_matches_shared_stream_and_diagnostic_api():
     """The STN facade exposes the same stream/ledger surface as ordinary MPS."""
-    sim = MpsStabOptimizer(1)
+    sim = StabilizerMpsSimulator(1)
 
     assert sim.norm_diagnostics()["tracking"] is True
     assert sim.gate_stream() == ()
     assert sim.has_trajectory_events is False
-    assert MpsStabOptimizer.measure_event("Z", 0) == ("measure", "Z", (0,))
-    assert MpsStabOptimizer.reset_event(0) == ("reset", (0,))
-    assert MpsStabOptimizer.measure_reset_event("Z", 0) == (
+    assert StabilizerMpsSimulator.measure_event("Z", 0) == ("measure", "Z", (0,))
+    assert StabilizerMpsSimulator.reset_event(0) == ("reset", (0,))
+    assert StabilizerMpsSimulator.measure_reset_event("Z", 0) == (
         "measure_reset", "Z", (0,)
     )
     assert sim.get_fit_diagnostics() is None
@@ -764,7 +763,7 @@ def test_stabilizer_mps_matches_shared_stream_and_diagnostic_api():
 
 
 def test_stabilizer_mps_run_replays_noisy_stream_through_shared_runner():
-    sim = MpsStabOptimizer(1, gates=[("x_error", 0.5, 0)])
+    sim = StabilizerMpsSimulator(1, gates=[("x_error", 0.5, 0)])
 
     result = sim.run(shots=8, seed=3)
 
@@ -778,7 +777,7 @@ def test_stabilizer_mps_run_replays_noisy_stream_through_shared_runner():
 
 
 def test_stabilizer_mps_transactional_run_restores_state_and_queue():
-    sim = MpsStabOptimizer(1, gates=[("h", 0), ("not-a-gate", 0)])
+    sim = StabilizerMpsSimulator(1, gates=[("h", 0), ("not-a-gate", 0)])
 
     with pytest.raises(ValueError, match="Unknown gate"):
         sim.run(transactional=True)
@@ -791,7 +790,7 @@ def test_stabilizer_mps_transactional_run_restores_state_and_queue():
 def test_simulator_submpo_event_in_nu_frame():
     # A sub-MPO event acts directly on the coefficient MPS p; from |0...0> the
     # basis is identity so it also equals the physical operator.
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     mpo = pauli_rotation_mpo(0.8, ["X", "I", "Z"], sign=1.0)
     exact = mpo.apply(sim.state.p).to_dense().reshape(-1)
     sim.apply([("submpo", mpo, (0, 1, 2))])
@@ -811,7 +810,7 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
         a, b = rng.choice(n, size=2, replace=False)
         stream.append(("cnot", int(a), int(b)))
         stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
-    sim = MpsStabOptimizer(n, chi=4).apply(stream)
+    sim = StabilizerMpsSimulator(n, chi=4).apply(stream)
     assert sim.state.max_bond() <= 4
     assert all(0.0 <= inf <= 1.0 for inf in sim.infidelities)
     assert np.all(np.diff(sim.infidelities) >= -1e-10)
@@ -822,20 +821,20 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
 
 
 def test_stn_fidelity_tracking_is_automatic_without_legacy_flag():
-    sim = MpsStabOptimizer(2, chi=1)
+    sim = StabilizerMpsSimulator(2, chi=1)
 
     assert sim.norm_diagnostics()["tracking"] is True
     assert not hasattr(sim, "track_infidelity")
     with pytest.raises(TypeError, match="track_infidelity"):
-        MpsStabOptimizer(2, chi=1, track_infidelity=True)
+        StabilizerMpsSimulator(2, chi=1, track_infidelity=True)
 
 
 def test_stn_stabilize_unitary_preserves_norm_but_not_fidelity_ledger():
     stream = [("rxx", 0.73, 0, 2), ("rxx", 0.51, 0, 2)]
-    raw = MpsStabOptimizer(
+    raw = StabilizerMpsSimulator(
         3, chi=1, exact_cooling=False, stabilize_unitary=False
     ).apply(stream)
-    stabilized = MpsStabOptimizer(
+    stabilized = StabilizerMpsSimulator(
         3, chi=1, exact_cooling=False, stabilize_unitary=True
     ).apply(stream)
 
@@ -873,7 +872,7 @@ def test_stabilizer_mps_exposes_per_update_norm_ratios():
             ("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))),
         ])
 
-    sim = MpsStabOptimizer(n, chi=2).apply(stream)
+    sim = StabilizerMpsSimulator(n, chi=2).apply(stream)
     events = sim.get_compression_norm_events()
     diagnostics = sim.norm_diagnostics()
 
@@ -903,7 +902,7 @@ def test_stabilizer_mps_exposes_per_update_norm_ratios():
 def test_nonunitary_dense_gate_reports_gdagger_g_infidelity():
     """Non-unitary compression is normalized by the exact G-dagger-G norm."""
     gate = np.diag([1.0, 1.0, 1.0, 0.2]).astype(complex)
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         2, chi=1, exact_cooling=False
     )
     sim.apply([("h", 0), ("h", 1)])
@@ -937,7 +936,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
         stream.append(("cnot", int(a), int(b)))
         stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
 
-    sim = MpsStabOptimizer(n, chi=4).apply(stream)
+    sim = StabilizerMpsSimulator(n, chi=4).apply(stream)
     pre_loss = sim.infidelities[-1]
     pre_norm = sim.norm()
 
@@ -1002,7 +1001,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
 
 
 def test_norm_events_mark_reset_boundaries():
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         2, chi=1, exact_cooling=False
     ).apply([("rxx", 0.8, 0, 1)])
     pre_loss = sim.infidelities[-1]
@@ -1020,7 +1019,7 @@ def test_norm_events_mark_reset_boundaries():
 
 
 def test_norm_events_track_projector_compression_loss_separately():
-    sim = MpsStabOptimizer(2, chi=1)
+    sim = StabilizerMpsSimulator(2, chi=1)
 
     sim.measure("XX", (0, 1), outcome=+1)
 
@@ -1072,7 +1071,7 @@ def test_norm_progress_reports_entry_part_and_infidelity(monkeypatch):
             pass
 
     monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
-    sim = MpsStabOptimizer(1, chi=1, seed=7)
+    sim = StabilizerMpsSimulator(1, chi=1, seed=7)
     sim.apply([("h", 0), ("t", 0), ("measure", "Z", 0)], progbar=True)
 
     progress = progress_instances[-1]
@@ -1092,7 +1091,7 @@ def test_norm_progress_reports_entry_part_and_infidelity(monkeypatch):
 
 def test_simulator_two_qubit_nonclifford_matrix_supported():
     # A dense non-Clifford 2q matrix is now applied via Pauli decomposition.
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("t", 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("t", 2)])
     psi = sim.to_statevector()
     u = _rzz(0.5)  # non-Clifford 2q matrix
     sim.apply([(u, (0, 1))])
@@ -1112,7 +1111,7 @@ def test_sparse_dense_matrix_uses_submpo_instead_of_branch_sum(monkeypatch):
         + 0.17 * yy
         + 0.11j * zz
     )
-    sim = MpsStabOptimizer(4).apply([("h", 0), ("cnot", 0, 2), ("t", 3)])
+    sim = StabilizerMpsSimulator(4).apply([("h", 0), ("cnot", 0, 2), ("t", 3)])
     before = sim.to_statevector()
     calls = []
     original = optimizer_module.pauli_sum_submpo
@@ -1126,7 +1125,7 @@ def test_sparse_dense_matrix_uses_submpo_instead_of_branch_sum(monkeypatch):
 
     monkeypatch.setattr(optimizer_module, "pauli_sum_submpo", spy_pauli_sum_submpo)
     monkeypatch.setattr(
-        optimizer_module.MpsStabOptimizer,
+        optimizer_module.StabilizerMpsSimulator,
         "_apply_operator_sum",
         forbid_branch_sum,
     )
@@ -1161,7 +1160,7 @@ def test_three_qubit_dense_matrix_default_balanced_sum_matches_dense():
             pmat = np.kron(pmat, matrices[label])
         gate += weight * pmat
 
-    sim = MpsStabOptimizer(3).apply(
+    sim = StabilizerMpsSimulator(3).apply(
         [("h", 0), ("cnot", 0, 1), ("t", 2)]
     )
     before = sim.to_statevector()
@@ -1181,7 +1180,7 @@ def test_dense_gate_budget_rejects_before_decomposition_or_state_mutation(
 ):
     import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
 
-    sim = MpsStabOptimizer(3, max_pauli_decomposition_qubits=2)
+    sim = StabilizerMpsSimulator(3, max_pauli_decomposition_qubits=2)
     gate = np.eye(8, dtype=complex)
     gate[0, 0] = 0.5
     before = sim.to_statevector()
@@ -1210,14 +1209,14 @@ def test_four_qubit_dense_gate_warns_and_requires_explicit_opt_in():
     gate = np.eye(16, dtype=complex)
     gate[0, 0] = 0.5
 
-    guarded = MpsStabOptimizer(4)
+    guarded = StabilizerMpsSimulator(4)
     with pytest.warns(UserWarning, match="4-qubit dense physical gate"):
         with pytest.raises(
             ValueError, match="max_pauli_decomposition_qubits=3"
         ):
             guarded.apply([(gate, tuple(range(4)))])
 
-    allowed = MpsStabOptimizer(4, max_pauli_decomposition_qubits=4)
+    allowed = StabilizerMpsSimulator(4, max_pauli_decomposition_qubits=4)
     with pytest.warns(UserWarning, match="4-qubit dense physical gate"):
         allowed.apply([(gate, tuple(range(4)))])
     assert allowed.norm() == pytest.approx(0.5)
@@ -1227,7 +1226,7 @@ def test_dense_gate_budget_does_not_limit_clifford_matrix_dispatch(monkeypatch):
     import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
 
     gate = np.kron(np.kron(_H, _X), _Z)
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
 
     def forbid_decomposition(*args, **kwargs):
         raise AssertionError("Clifford matrix reached Pauli decomposition")
@@ -1250,7 +1249,7 @@ def test_near_clifford_nonunitary_matrix_not_misrouted_to_tableau():
     p = 0.1
     coin = (1 - p) * _I + p * _X
     for n, q in [(1, 0), (3, 1)]:
-        sim = MpsStabOptimizer(n).apply([(coin, q)])
+        sim = StabilizerMpsSimulator(n).apply([(coin, q)])
         psi = sim.to_statevector()
         zero = np.zeros(2 ** n, dtype=complex); zero[0] = 1.0
         ref = _apply_gate_dense(zero, coin, (q,), n)
@@ -1266,7 +1265,7 @@ def test_operator_tolerance_is_independent_of_svd_cutoff(
     gate_dtype, small_coeff, atol
 ):
     gate = np.eye(2, dtype=gate_dtype) + small_coeff * _X.astype(gate_dtype)
-    sim = MpsStabOptimizer(1, cutoff=1e-2).apply([(gate, 0)])
+    sim = StabilizerMpsSimulator(1, cutoff=1e-2).apply([(gate, 0)])
 
     np.testing.assert_allclose(
         sim.to_statevector(), np.array([1.0, small_coeff]), atol=atol
@@ -1275,7 +1274,7 @@ def test_operator_tolerance_is_independent_of_svd_cutoff(
 
 def test_explicit_operator_tolerance_can_prune_small_pauli_terms():
     gate = _I + 1e-3 * _X
-    sim = MpsStabOptimizer(1, cutoff=0.0, operator_tol=1e-2).apply([(gate, 0)])
+    sim = StabilizerMpsSimulator(1, cutoff=0.0, operator_tol=1e-2).apply([(gate, 0)])
 
     np.testing.assert_allclose(sim.to_statevector(), np.array([1.0, 0.0]))
 
@@ -1283,7 +1282,7 @@ def test_explicit_operator_tolerance_can_prune_small_pauli_terms():
 @pytest.mark.parametrize("operator_tol", [-1.0, np.nan, np.inf])
 def test_operator_tolerance_must_be_finite_and_nonnegative(operator_tol):
     with pytest.raises(ValueError, match="operator_tol"):
-        MpsStabOptimizer(1, operator_tol=operator_tol)
+        StabilizerMpsSimulator(1, operator_tol=operator_tol)
 
 
 @pytest.mark.parametrize(
@@ -1292,11 +1291,11 @@ def test_operator_tolerance_must_be_finite_and_nonnegative(operator_tol):
 )
 def test_pauli_decomposition_budget_validation(value, error):
     with pytest.raises(error, match="max_pauli_decomposition_qubits"):
-        MpsStabOptimizer(1, max_pauli_decomposition_qubits=value)
+        StabilizerMpsSimulator(1, max_pauli_decomposition_qubits=value)
 
 
 def test_copy_preserves_pauli_decomposition_budget():
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         2,
         max_pauli_decomposition_qubits=None,
         max_dense_cap_qubits=None,
@@ -1320,10 +1319,10 @@ def test_coefficient_compression_modes_preserve_stn_state(mode):
         ("t", 2),
         ("rxx", 0.37, 0, 2),
     ]
-    reference = MpsStabOptimizer(
+    reference = StabilizerMpsSimulator(
         3, mode="exact", exact_cooling=False
     ).apply(stream)
-    optimizer = MpsStabOptimizer(
+    optimizer = StabilizerMpsSimulator(
         3,
         chi=4,
         mode=mode,
@@ -1369,10 +1368,10 @@ def test_stn_quimb_compression_methods_preserve_state(method):
         ("t", 2),
         ("rxx", 0.37, 0, 2),
     ]
-    reference = MpsStabOptimizer(
+    reference = StabilizerMpsSimulator(
         3, mode="exact", exact_cooling=False
     ).apply(stream)
-    optimizer = MpsStabOptimizer(
+    optimizer = StabilizerMpsSimulator(
         3,
         chi=4,
         mode=method,
@@ -1400,7 +1399,7 @@ def test_stn_quimb_compression_methods_preserve_state(method):
 )
 def test_stn_quimb_mode_aliases(mode, method):
     """Legacy Quimb/MPO spellings share dispatch with the bare API."""
-    optimizer = MpsStabOptimizer(
+    optimizer = StabilizerMpsSimulator(
         3,
         chi=4,
         mode=mode,
@@ -1413,7 +1412,7 @@ def test_stn_quimb_mode_aliases(mode, method):
 
 
 def test_stn_defaults_use_bare_native_mode_and_src_warmup():
-    optimizer = MpsStabOptimizer(2)
+    optimizer = StabilizerMpsSimulator(2)
 
     assert optimizer.mode == "direct"
     assert optimizer.fit_init_strategy == "guess_src"
@@ -1422,12 +1421,12 @@ def test_stn_defaults_use_bare_native_mode_and_src_warmup():
 
 
 def test_stn_auto_cutoff_follows_dtype_policy():
-    assert MpsStabOptimizer(2, dtype="complex64").cutoff == pytest.approx(1e-6)
-    assert MpsStabOptimizer(2, dtype="complex128").cutoff == pytest.approx(1e-12)
+    assert StabilizerMpsSimulator(2, dtype="complex64").cutoff == pytest.approx(1e-6)
+    assert StabilizerMpsSimulator(2, dtype="complex128").cutoff == pytest.approx(1e-12)
 
 
 def test_stn_dmrg_run_controls_match_mps_optimizer_contract():
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         3,
         chi=2,
         mode="dmrg2",
@@ -1464,7 +1463,7 @@ def test_stn_dmrg_run_controls_match_mps_optimizer_contract():
 )
 def test_stn_dmrg_fit_initial_guess_strategies(strategy):
     """STN DMRG keeps the exact target separate from each disposable guess."""
-    optimizer = MpsStabOptimizer(
+    optimizer = StabilizerMpsSimulator(
         3,
         chi=4,
         mode="dmrg2",
@@ -1478,10 +1477,10 @@ def test_stn_dmrg_fit_initial_guess_strategies(strategy):
 
 
 def test_stn_mode_validation_and_copy_preservation():
-    with pytest.raises(ValueError, match="Unknown MpsStabOptimizer mode"):
-        MpsStabOptimizer(2, mode="not-a-mode")
+    with pytest.raises(ValueError, match="Unknown StabilizerMpsSimulator mode"):
+        StabilizerMpsSimulator(2, mode="not-a-mode")
 
-    copied = MpsStabOptimizer(
+    copied = StabilizerMpsSimulator(
         2,
         mode="dmrg3",
         chi=2,
@@ -1501,10 +1500,10 @@ def test_stn_mode_validation_and_copy_preservation():
 def test_stn_dmrg3_falls_back_for_two_site_window():
     """dmrg3 remains usable for the common two-qubit mapped-gate case."""
     stream = [("rx", 0.31, 0), ("cnot", 0, 1), ("rz", 0.71, 1)]
-    reference = MpsStabOptimizer(
+    reference = StabilizerMpsSimulator(
         2, mode="exact", exact_cooling=False
     ).apply(stream)
-    optimizer = MpsStabOptimizer(
+    optimizer = StabilizerMpsSimulator(
         2,
         chi=4,
         mode="dmrg3",
@@ -1519,10 +1518,10 @@ def test_stn_dmrg3_falls_back_for_two_site_window():
 
 def test_stn_dmrg_keeps_submpo_as_layered_fit_target():
     """DMRG retains the exact coefficient sub-MPO as a tagged FIT layer."""
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
     from pepsy.optimizers.stabilizer_tn.operators import pauli_combo_submpo
 
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         4,
         chi=2,
         mode="dmrg2",
@@ -1560,7 +1559,7 @@ def test_stn_dmrg_keeps_submpo_as_layered_fit_target():
 def test_stn_named_dmrg_modes_use_growth_refinement_and_src_guess(
     mode, block_size, growth_sweeps, one_site_sweeps, iterations
 ):
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         3,
         chi=2,
         mode=mode,
@@ -1580,7 +1579,7 @@ def test_stn_named_dmrg_modes_use_growth_refinement_and_src_guess(
 
 
 def test_stn_dmrg_auto_resolves_to_src_warmup():
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         3,
         chi=2,
         mode="dmrg2",
@@ -1596,7 +1595,7 @@ def test_stn_dmrg_auto_resolves_to_src_warmup():
 
 
 def test_stn_dmrg1_latches_one_site_phase_after_full_chain_growth():
-    sim = MpsStabOptimizer(
+    sim = StabilizerMpsSimulator(
         3,
         chi=2,
         mode="dmrg1",
@@ -1622,11 +1621,11 @@ def test_stn_dmrg1_latches_one_site_phase_after_full_chain_growth():
 )
 def test_dense_cap_budget_validation(value, error):
     with pytest.raises(error, match="max_dense_cap_qubits"):
-        MpsStabOptimizer(1, max_dense_cap_qubits=value)
+        StabilizerMpsSimulator(1, max_dense_cap_qubits=value)
 
 
 def test_zero_operator_produces_valid_zero_mps():
-    sim = MpsStabOptimizer(2, chi=1).apply(
+    sim = StabilizerMpsSimulator(2, chi=1).apply(
         [(np.zeros((2, 2), dtype=complex), 0)]
     )
 
@@ -1644,7 +1643,7 @@ def test_zero_operator_produces_valid_zero_mps():
 
 
 def test_normalized_observables_reject_zero_norm_state_without_mutation():
-    sim = MpsStabOptimizer(2).apply([(np.zeros((2, 2), dtype=complex), 0)])
+    sim = StabilizerMpsSimulator(2).apply([(np.zeros((2, 2), dtype=complex), 0)])
     before = sim.to_statevector()
     before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
 
@@ -1671,7 +1670,7 @@ def test_weighted_xor_matrix_matches_dense():
     p = 0.2
     xx = np.kron(_X, _X)
     wxor = (1 - p) * np.eye(4, dtype=complex) + p * xx
-    prep = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1)])
+    prep = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1)])
     psi0 = prep.to_statevector()
     prep.apply([(wxor, (0, 2))])
     ref = _apply_gate_dense(psi0, wxor, (0, 2), 3)
@@ -1690,7 +1689,7 @@ def test_measure_expectation_matches_dense():
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2),
               ("rx", 0.5, 0)]
     n = 3
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = StabilizerMpsSimulator(n).apply(stream)
     psi = sim.to_statevector()
     for axis in ("X", "Y", "Z"):
         for q in range(n):
@@ -1705,7 +1704,7 @@ def test_measure_forced_outcome_collapses_to_dense():
     for axis in ("X", "Y", "Z"):
         for q in range(n):
             for m in (+1, -1):
-                sim = MpsStabOptimizer(n).apply(stream)
+                sim = StabilizerMpsSimulator(n).apply(stream)
                 psi = sim.to_statevector()
                 # skip impossible outcomes (probability ~0)
                 p = 0.5 * (1 + m * _expectation_dense(psi, axis, q, n))
@@ -1720,7 +1719,7 @@ def test_measure_forced_outcome_collapses_to_dense():
 
 def test_measure_is_repeatable():
     # Measuring the same observable twice returns the same outcome deterministically.
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.6, 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.6, 2)])
     first = sim.measure("Z", 0)
     for _ in range(5):
         assert sim.measure("Z", 0) == first
@@ -1735,7 +1734,7 @@ def test_measure_born_statistics():
     plus = 0
     shots = 400
     for s in range(shots):
-        sim = MpsStabOptimizer(1, seed=s).apply([("rx", theta, 0)])
+        sim = StabilizerMpsSimulator(1, seed=s).apply([("rx", theta, 0)])
         if sim.measure("Z", 0) == 1:
             plus += 1
     freq_exp = (2 * plus / shots) - 1  # <Z> = p+ - p-
@@ -1745,7 +1744,7 @@ def test_measure_born_statistics():
 def test_measure_multiqubit_pauli_and_stream_entry():
     n = 3
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2)]
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = StabilizerMpsSimulator(n).apply(stream)
     psi = sim.to_statevector()
     zz = np.kron(_Z, _Z)
     ref = float(np.real(np.vdot(psi, _apply_gate_dense(psi.copy(), zz, (0, 1), n))))
@@ -1816,7 +1815,7 @@ def test_simulator_tdg_rot_rxx_ryy_match_dense():
         ("h", 0), ("cnot", 0, 1), ("tdg", 1), ("rxx", 0.8, 0, 2),
         ("ryy", -0.6, 1, 2), ("rot", 1.1, "XZ", (0, 2)), ("rot", 0.4, "Y", 1),
     ]
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = StabilizerMpsSimulator(n).apply(stream)
     ref = _dense_stream(n, stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -1841,14 +1840,14 @@ def test_simulator_random_exact_circuit_matches_dense(seed):
         else:
             a, b = rng.choice(n, size=2, replace=False)
             stream.append((rng.choice(["rxx", "rzz"]), float(rng.uniform(0.1, 1.3)), int(a), int(b)))
-    sim = MpsStabOptimizer(n).apply(stream)  # exact (chi=None)
+    sim = StabilizerMpsSimulator(n).apply(stream)  # exact (chi=None)
     ref = _dense_stream(n, stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_simulator_inplace_false_preserves_original():
     base = STNState(3)
-    sim = MpsStabOptimizer(base, inplace=False).apply([("h", 0), ("rz", 0.7, 0), ("cnot", 0, 1)])
+    sim = StabilizerMpsSimulator(base, inplace=False).apply([("h", 0), ("rz", 0.7, 0), ("cnot", 0, 1)])
     # original untouched
     np.testing.assert_allclose(base.p_dense(), np.eye(8)[0])
     assert base.max_bond() == 1
@@ -1858,15 +1857,15 @@ def test_simulator_inplace_false_preserves_original():
 
 def test_simulator_incremental_add_gates_equivalent_to_single_run():
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.6, 1), ("ry", -0.4, 2), ("t", 2)]
-    full = MpsStabOptimizer(3).apply(stream)
-    inc = MpsStabOptimizer(3)
+    full = StabilizerMpsSimulator(3).apply(stream)
+    inc = StabilizerMpsSimulator(3)
     inc.add_gates(stream[:2]).run()
     inc.add_gates(stream[2:]).run()
     assert _fidelity(inc.to_statevector(), full.to_statevector()) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_run_failure_consumes_only_successful_queue_prefix():
-    sim = MpsStabOptimizer(1)
+    sim = StabilizerMpsSimulator(1)
     sim.add_gates([("x", 0), ("not-a-gate", 0)])
 
     with pytest.raises(ValueError, match="Unknown gate"):
@@ -1892,12 +1891,12 @@ def test_run_failure_consumes_only_successful_queue_prefix():
 )
 def test_general_rotation_validates_pauli_support(entry, message):
     with pytest.raises(ValueError, match=message):
-        MpsStabOptimizer(2).apply([entry])
+        StabilizerMpsSimulator(2).apply([entry])
 
 
 def test_expectation_of_stabilizer_is_deterministic():
     # After a Clifford circuit, Z-basis stabilizers have expectation +-1.
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])
     # Z0 Z1 and Z1 Z2 are stabilizers of the GHZ state -> expectation +1.
     assert sim.expectation("ZZ", (0, 1)) == pytest.approx(1.0, abs=1e-9)
     assert sim.expectation("ZZ", (1, 2)) == pytest.approx(1.0, abs=1e-9)
@@ -1907,7 +1906,7 @@ def test_pseudo_stabilizer_rank_t_state_is_maximal():
     # |T>^n = prod T prod H |0> has maximal pseudo-stabilizer rank 2^n (paper Eq. 11-12).
     for n in (2, 3):
         stream = [("h", q) for q in range(n)] + [("t", q) for q in range(n)]
-        sim = MpsStabOptimizer(n).apply(stream)
+        sim = StabilizerMpsSimulator(n).apply(stream)
         assert sim.state.max_bond() == 1
         assert sim.pseudo_stabilizer_rank() == 2 ** n
 
@@ -1915,7 +1914,7 @@ def test_pseudo_stabilizer_rank_t_state_is_maximal():
 def test_submpo_truncation_caps_bond():
     # Apply a spread rotation MPO as a sub-MPO event with a chi cap.
     n = 6
-    sim = MpsStabOptimizer(n, chi=4)
+    sim = StabilizerMpsSimulator(n, chi=4)
     sim.apply([("h", q) for q in range(n)])
     for a in range(n - 1):
         sim.apply([("cnot", a, a + 1)])
@@ -1929,7 +1928,7 @@ def test_submpo_truncation_caps_bond():
 # --------------------------------------------------------------------------- #
 def test_initial_state_ghz_is_stabilizer():
     n = 4
-    sim = MpsStabOptimizer.ghz(n)
+    sim = StabilizerMpsSimulator.ghz(n)
     assert sim.state.max_bond() == 1  # GHZ is a stabilizer state -> chi=1
     exp = np.zeros(2 ** n, dtype=complex)
     exp[0] = exp[-1] = 1 / np.sqrt(2)
@@ -1938,7 +1937,7 @@ def test_initial_state_ghz_is_stabilizer():
 
 
 def test_initial_state_from_bits():
-    sim = MpsStabOptimizer.from_bits("1010")
+    sim = StabilizerMpsSimulator.from_bits("1010")
     exp = np.zeros(16, dtype=complex)
     exp[int("1010", 2)] = 1.0
     assert _fidelity(sim.to_statevector(), exp) == pytest.approx(1.0, abs=1e-6)
@@ -1951,7 +1950,7 @@ def test_constructor_accepts_computational_basis_mps_directly():
     psi = psi / np.linalg.norm(psi)
     p = qtn.MatrixProductState.from_dense(psi, dims=[2, 2, 2])
 
-    sim = MpsStabOptimizer(p, chi=None, inplace=False)
+    sim = StabilizerMpsSimulator(p, chi=None, inplace=False)
 
     assert sim.state.p is not p
     assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-12)
@@ -1964,7 +1963,7 @@ def test_direct_mps_constructor_uses_identity_tableau_for_later_cliffords():
     p = qtn.MatrixProductState.from_dense(psi, dims=[2, 2])
     expected = _apply_gate_dense(psi, _H, (0,), 2)
 
-    sim = MpsStabOptimizer.from_mps(p, chi=None).apply([("h", 0)])
+    sim = StabilizerMpsSimulator.from_mps(p, chi=None).apply([("h", 0)])
 
     assert _fidelity(sim.to_statevector(), expected) == pytest.approx(1.0, abs=1e-6)
     assert sim.state.p is p
@@ -1974,21 +1973,21 @@ def test_direct_mps_constructor_rejects_non_qubit_physical_dim():
     p = qtn.MatrixProductState.from_dense(np.ones(3, dtype=complex), dims=[3])
 
     with pytest.raises(ValueError, match="physical dimension 2"):
-        MpsStabOptimizer(p)
+        StabilizerMpsSimulator(p)
 
 
 @pytest.mark.parametrize("bits", ["102", [0, 2], [0.0, 1.0]])
 def test_bit_inputs_must_be_binary_integers(bits):
     with pytest.raises(ValueError, match="0 or 1"):
-        MpsStabOptimizer.from_bits(bits)
+        StabilizerMpsSimulator.from_bits(bits)
 
 
 def test_from_tableau_and_nu_roundtrip():
-    src = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.6, 2), ("t", 1)])
+    src = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.6, 2), ("t", 1)])
     # Primary API is from_tableau_and_state / .p; the *_nu names remain aliases.
-    rebuilt = MpsStabOptimizer.from_tableau_and_state(src.state._sim.copy(), src.state.p.copy())
+    rebuilt = StabilizerMpsSimulator.from_tableau_and_state(src.state._sim.copy(), src.state.p.copy())
     assert _fidelity(rebuilt.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
-    alias = MpsStabOptimizer.from_tableau_and_nu(src.state._sim.copy(), src.state.nu.copy())
+    alias = StabilizerMpsSimulator.from_tableau_and_nu(src.state._sim.copy(), src.state.nu.copy())
     assert _fidelity(alias.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
 
 
@@ -2003,7 +2002,7 @@ def test_from_tableau_and_state_rejects_size_mismatch_without_mutation():
 
 
 def test_norm_preserved_after_circuit():
-    sim = MpsStabOptimizer(3).apply(
+    sim = StabilizerMpsSimulator(3).apply(
         [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2), ("t", 0)]
     )
     assert sim.norm() == pytest.approx(1.0, abs=1e-9)
@@ -2013,7 +2012,7 @@ def test_norm_preserved_after_circuit():
 
 
 def test_norm_expectation_and_measurement_respect_mps_exponent():
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.p.exponent = 2.0
     sim.state.info["cur_orthog"] = (0, 0)
 
@@ -2028,7 +2027,7 @@ def test_norm_expectation_and_measurement_respect_mps_exponent():
 
 @pytest.mark.parametrize("exponent", [155.0, -155.0])
 def test_norm_scaling_handles_extreme_mps_exponents_without_power_overflow(exponent):
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.info["cur_orthog"] = (0, 0)
     sim.state.p.exponent = exponent
 
@@ -2045,7 +2044,7 @@ def test_norm_scaling_handles_extreme_mps_exponents_without_power_overflow(expon
 
 @pytest.mark.parametrize("exponent", [155.0, -155.0])
 def test_local_compression_fidelity_uses_norm_ratio_at_extreme_scale(exponent):
-    sim = MpsStabOptimizer(1)
+    sim = StabilizerMpsSimulator(1)
     sim.state.info["cur_orthog"] = (0, 0)
     sim.state.p.exponent = exponent
     before_log_norm = sim._norm_log10()
@@ -2065,7 +2064,7 @@ def test_local_compression_fidelity_uses_norm_ratio_at_extreme_scale(exponent):
 
 
 def test_local_compression_fidelity_cancels_representation_rescaling():
-    sim = MpsStabOptimizer(1)
+    sim = StabilizerMpsSimulator(1)
     sim.state.info["cur_orthog"] = (0, 0)
     before_norm_sq = sim._norm_squared()
     before_log_norm = sim._norm_log10()
@@ -2086,7 +2085,7 @@ def test_local_compression_fidelity_cancels_representation_rescaling():
 
 @pytest.mark.parametrize("exponent", [155.0, -155.0])
 def test_unitary_norm_stabilization_uses_log_scale_at_extreme_exponent(exponent):
-    sim = MpsStabOptimizer(1, stabilize_unitary=True)
+    sim = StabilizerMpsSimulator(1, stabilize_unitary=True)
     sim.state.info["cur_orthog"] = (0, 0)
     sim.state.p.exponent = exponent
     _before_norm, before_norm_sq, before_log_norm = sim._norm_snapshot()
@@ -2105,7 +2104,7 @@ def test_unitary_norm_stabilization_uses_log_scale_at_extreme_exponent(exponent)
 
 @pytest.mark.parametrize("exponent", [2.0, 155.0, -155.0])
 def test_norm_scaling_full_contraction_keeps_quimb_exponent_separate(exponent):
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.p.exponent = exponent
     sim.state.info["cur_orthog"] = None
 
@@ -2118,10 +2117,10 @@ def test_norm_scaling_full_contraction_keeps_quimb_exponent_separate(exponent):
 
 def test_mps_stab_sync_canonicalization_repairs_external_readout():
     """Coefficient-MPS readout can be explicitly rebound to ``state.info``."""
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
     z = np.diag([1.0, -1.0]).astype(complex)
-    sim = MpsStabOptimizer(6)
+    sim = StabilizerMpsSimulator(6)
     sim.state.p.local_expectation_canonical(z, (5,), normalized=True)
 
     assert sim.sync_canonicalization() == sim.state.info["cur_orthog"]
@@ -2132,10 +2131,10 @@ def test_mps_stab_sync_canonicalization_repairs_external_readout():
 
 def test_mps_stab_basis_measurement_tracks_entangled_coefficient_center():
     """Basis-updating measurement leaves the coefficient centre synchronized."""
-    from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer
+    from pepsy.optimizers.stabilizer_tn import StabilizerMpsSimulator
 
     coefficient = qtn.MPS_rand_state(5, bond_dim=2, seed=31, dtype="complex128")
-    sim = MpsStabOptimizer.from_mps(coefficient, chi=8).apply([("rz", 0.31, 2)])
+    sim = StabilizerMpsSimulator.from_mps(coefficient, chi=8).apply([("rz", 0.31, 2)])
     sim.measure("X", 2, absorb_basis=True)
 
     assert sim.state.info["cur_orthog"] == tuple(
@@ -2145,32 +2144,37 @@ def test_mps_stab_basis_measurement_tracks_entangled_coefficient_center():
 
 def test_run_progbar_smoke():
     pytest.importorskip("tqdm")
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     sim.set_gates([("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2), ("t", 1)]).run(progbar=True)
     assert sim.state.max_bond() >= 1
 
 
 def test_stabilizermps_backward_alias():
+    import pepsy.optimizers.stabilizer_tn as stabilizer_tn
+
     from pepsy.optimizers.stabilizer_tn import StabilizerMps
-    assert StabilizerMps is MpsStabOptimizer
-    assert StabilizerMpsSimulator is MpsStabOptimizer
+    with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
+        old_name = stabilizer_tn.MpsStabOptimizer
+
+    assert StabilizerMps is StabilizerMpsSimulator
+    assert old_name is StabilizerMpsSimulator
 
 
 def test_optimizers_namespace_exports():
     from pepsy.optimizers import (
-        MpsStabOptimizer as M,
+        StabilizerMpsSimulator as M,
+        MpsStabOptimizer as OldM,
         STNState as S,
-        StabilizerMpsSimulator as SMS,
     )
-    assert M is MpsStabOptimizer
+    assert M is StabilizerMpsSimulator
+    assert OldM is StabilizerMpsSimulator
     assert S is STNState
-    assert SMS is MpsStabOptimizer
 
 
 def test_clean_class_api_runner_aliases():
     stream = [("h", 0), ("cnot", 0, 1), ("t", 0)]
 
-    result = MpsStabOptimizer.run_stream(stream, n_qubits=2, mode="direct")
+    result = StabilizerMpsSimulator.run_stream(stream, n_qubits=2, mode="direct")
     alias = StabilizerMpsSimulator.simulate(stream, n_qubits=2, mode="direct")
 
     assert isinstance(result, StabilizerMpsRunResult)
@@ -2204,7 +2208,7 @@ def _pauli_op(pauli, where, n):
 
 def test_amplitude_and_probability_match_dense():
     n = 3
-    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1)])
+    sim = StabilizerMpsSimulator(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1)])
     psi = sim.to_statevector()
     total = 0.0
     for k in range(2 ** n):
@@ -2216,7 +2220,7 @@ def test_amplitude_and_probability_match_dense():
 
 
 def test_amplitude_ghz_ground_truth():
-    sim = MpsStabOptimizer.ghz(3)
+    sim = StabilizerMpsSimulator.ghz(3)
     assert sim.probability("000") == pytest.approx(0.5, abs=1e-6)
     assert sim.probability("111") == pytest.approx(0.5, abs=1e-6)
     assert sim.probability("010") == pytest.approx(0.0, abs=1e-9)
@@ -2224,7 +2228,7 @@ def test_amplitude_ghz_ground_truth():
 
 def test_expectation_full_register_string():
     n = 3
-    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2)])
+    sim = StabilizerMpsSimulator(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2)])
     psi = sim.to_statevector()
     ref = float(np.real(np.vdot(psi, _pauli_op("ZIZ", None, n) @ psi)))
     assert sim.expectation("ZIZ") == pytest.approx(ref, abs=1e-6)
@@ -2234,7 +2238,7 @@ def test_expectation_full_register_string():
 
 def test_expectation_pauli_sum_matches_dense():
     n = 3
-    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.4, 2)])
+    sim = StabilizerMpsSimulator(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.4, 2)])
     psi = sim.to_statevector()
     terms = [(0.5, "Z", 0), (1.0, "ZZ", (0, 1)), (-0.3, "XIX")]
     ref = 0.0
@@ -2246,7 +2250,7 @@ def test_expectation_pauli_sum_matches_dense():
 
 def test_sample_statistics_no_collapse():
     theta = 0.9
-    sim = MpsStabOptimizer(1, seed=0).apply([("rx", theta, 0)])
+    sim = StabilizerMpsSimulator(1, seed=0).apply([("rx", theta, 0)])
     outs = sim.sample("Z", 0, shots=2000)
     assert set(np.unique(outs)).issubset({-1, 1})
     assert outs.mean() == pytest.approx(np.cos(theta), abs=0.08)
@@ -2284,13 +2288,13 @@ def _absorb_stream(n, seed, depth=6):
 def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
     n = 4
     stream = _absorb_stream(n, seed)
-    ref = MpsStabOptimizer(n).apply(stream)
+    ref = StabilizerMpsSimulator(n).apply(stream)
     # skip (near) impossible forced outcomes
     p_plus = 0.5 * (1 + ref.expectation(pauli, where))
     if (outcome > 0 and p_plus < 1e-6) or (outcome < 0 and (1 - p_plus) < 1e-6):
         pytest.skip("outcome has ~0 probability")
     m_ref = ref.measure(pauli, where, outcome=outcome)          # fixed-basis
-    a = MpsStabOptimizer(n).apply(stream)
+    a = StabilizerMpsSimulator(n).apply(stream)
     m_abs = a.measure(pauli, where, outcome=outcome, absorb_basis=True)  # basis-updating
     assert m_abs == m_ref
     assert _fidelity(a.to_statevector(), ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
@@ -2298,8 +2302,8 @@ def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
 
 def test_measure_disentangle_alias_matches_absorb_basis():
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.37, 1)]
-    legacy = MpsStabOptimizer(2).apply(stream)
-    alias = MpsStabOptimizer(2).apply(stream)
+    legacy = StabilizerMpsSimulator(2).apply(stream)
+    alias = StabilizerMpsSimulator(2).apply(stream)
 
     assert legacy.measure("X", 1, outcome=+1, absorb_basis=True) == alias.measure(
         "X", 1, outcome=+1, disentangle=True
@@ -2307,13 +2311,13 @@ def test_measure_disentangle_alias_matches_absorb_basis():
     assert _fidelity(alias.to_statevector(), legacy.to_statevector()) == pytest.approx(
         1.0, abs=1e-9
     )
-    assert MpsStabOptimizer.measure_event("Z", 0, disentangle=True) == (
+    assert StabilizerMpsSimulator.measure_event("Z", 0, disentangle=True) == (
         "measure", "Z", (0,), None, True
     )
 
 
 def test_measure_disentangle_alias_validates_conflicts():
-    sim = MpsStabOptimizer(1)
+    sim = StabilizerMpsSimulator(1)
 
     with pytest.raises(ValueError, match="different measurement modes"):
         sim.measure("Z", 0, absorb_basis=True, disentangle=False)
@@ -2322,7 +2326,7 @@ def test_measure_disentangle_alias_validates_conflicts():
 
 
 def test_measure_many_uses_adaptive_span_order_and_preserves_result_order():
-    sim = MpsStabOptimizer(4).apply([("cnot", 0, 3)])
+    sim = StabilizerMpsSimulator(4).apply([("cnot", 0, 3)])
 
     outcomes = sim.measure_many(
         [("Z", 3, +1), ("Z", 1, +1)],
@@ -2337,7 +2341,7 @@ def test_measure_many_uses_adaptive_span_order_and_preserves_result_order():
 
 
 def test_measure_many_accepts_input_order_override():
-    sim = MpsStabOptimizer(4).apply([("cnot", 0, 3)])
+    sim = StabilizerMpsSimulator(4).apply([("cnot", 0, 3)])
 
     sim.measure_many(
         [("Z", 3, +1), ("Z", 1, +1)],
@@ -2354,7 +2358,7 @@ def test_measure_absorb_tracks_localizer_compression_and_pre_probability():
     # probability to isolate its own compression loss.
     p = qtn.MPS_rand_state(5, bond_dim=2, seed=0, dtype="complex128")
     p /= (p.H @ p) ** 0.5
-    sim = MpsStabOptimizer.from_mps(p, chi=2, exact_cooling=False)
+    sim = StabilizerMpsSimulator.from_mps(p, chi=2, exact_cooling=False)
     sim.apply([
         ("rxx", 0.3, 0, 2),
         ("ryy", 0.4, 1, 3),
@@ -2396,7 +2400,7 @@ def test_measure_absorb_tracks_localizer_compression_and_pre_probability():
 def test_measure_absorb_localizer_uses_selected_dmrg_backend(mode):
     p = qtn.MPS_rand_state(5, bond_dim=2, seed=0, dtype="complex128")
     p /= (p.H @ p) ** 0.5
-    sim = MpsStabOptimizer.from_mps(
+    sim = StabilizerMpsSimulator.from_mps(
         p,
         chi=2,
         mode=mode,
@@ -2427,7 +2431,7 @@ def test_measure_absorb_localizer_uses_selected_dmrg_backend(mode):
 
 
 def test_measure_absorb_rejects_impossible_forced_identity_outcome():
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
 
     with pytest.raises(ValueError, match="zero probability"):
         sim.measure("II", (0, 1), outcome=-1, absorb_basis=True)
@@ -2441,7 +2445,7 @@ def test_measure_absorb_forced_outcome_matches_dense_projector():
     for axis in ("X", "Y", "Z"):
         for q in range(n):
             for m in (+1, -1):
-                sim = MpsStabOptimizer(n).apply(stream)
+                sim = StabilizerMpsSimulator(n).apply(stream)
                 psi = sim.to_statevector()
                 o = {"X": _X, "Y": _Y, "Z": _Z}[axis]
                 p = 0.5 * (1 + m * float(np.real(np.vdot(psi, _apply_gate_dense(psi.copy(), o, (q,), n)))))
@@ -2456,7 +2460,7 @@ def test_measure_absorb_forced_outcome_matches_dense_projector():
 def test_measure_absorb_disentangles_product_ancilla():
     # Entangled data (GHZ chain) tensor a lone rotated ancilla; measuring the
     # ancilla out with absorb_basis must not blow up the bond.
-    sim = MpsStabOptimizer(4, chi=None)
+    sim = StabilizerMpsSimulator(4, chi=None)
     sim.apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2), ("rz", 0.7, 3)])
     sim.measure("Z", 3, absorb_basis=True, outcome=+1)
     assert sim.state.max_bond() == 1  # GHZ stays in the basis, ancilla removed
@@ -2465,7 +2469,7 @@ def test_measure_absorb_disentangles_product_ancilla():
 
 def test_prepare_magic_is_product_state():
     n = 3
-    sim = MpsStabOptimizer(n)
+    sim = StabilizerMpsSimulator(n)
     for q in range(n):
         sim.prepare_magic(q)
     assert sim.state.max_bond() == 1  # |A>^n is a product state
@@ -2478,7 +2482,7 @@ def test_prepare_magic_is_product_state():
 @pytest.mark.parametrize("outcome", [+1, -1])
 def test_inject_t_reproduces_t_gate(outcome):
     # data = |+> on qubit 0, magic ancilla on qubit 1; inject_t must realize T.
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.h(0)          # data -> |+>
     sim.prepare_magic(1)    # ancilla -> |A>
     m = sim.inject_t(0, 1, outcome=outcome)
@@ -2503,7 +2507,7 @@ def test_inject_t_reproduces_t_gate(outcome):
 def test_inject_t_on_entangled_data_matches_direct_t(outcome):
     # T injected on one qubit of a Clifford-entangled register equals a direct T,
     # and the coefficient MPS bond stays tiny (magic confined to the ancilla).
-    sim = MpsStabOptimizer(4, chi=None)
+    sim = StabilizerMpsSimulator(4, chi=None)
     sim.apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])  # GHZ on data 0,1,2
     sim.prepare_magic(3)
     m = sim.inject_t(0, 3, outcome=outcome)
@@ -2524,7 +2528,7 @@ def test_inject_t_on_entangled_data_matches_direct_t(outcome):
 def test_reset_stream_entry_resets_to_zero():
     n = 3
     # entangle + rotate, then reset qubit 2 to |0> via the stream entry.
-    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.8, 2)])
+    sim = StabilizerMpsSimulator(n).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.8, 2)])
     sim.apply([("reset", 2)])
     assert sim.expectation("Z", 2) == pytest.approx(1.0, abs=1e-9)  # |0> -> <Z> = +1
     assert sim.probability("000") + sim.probability("110") == pytest.approx(1.0, abs=1e-6)
@@ -2534,7 +2538,7 @@ def test_reset_stream_entry_resets_to_zero():
 
 @pytest.mark.parametrize("axis", ["X", "Y", "Z"])
 def test_reset_stream_entry_supports_pauli_bases(axis):
-    sim = MpsStabOptimizer(1).apply([("h", 0), ("reset", 0, axis)])
+    sim = StabilizerMpsSimulator(1).apply([("h", 0), ("reset", 0, axis)])
 
     assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
     assert sim.measurements == []
@@ -2545,7 +2549,7 @@ def test_reset_stream_entry_supports_pauli_bases(axis):
     [("Z", "1", -1), ("X", "0", -1), ("Y", "0", -1)],
 )
 def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
-    sim = MpsStabOptimizer.from_bits(bits).apply(
+    sim = StabilizerMpsSimulator.from_bits(bits).apply(
         [("measure_reset", axis, 0, outcome)]
     )
 
@@ -2556,7 +2560,7 @@ def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
 
 
 def test_measure_reset_defaults_to_fixed_basis():
-    sim = MpsStabOptimizer.from_bits("0")
+    sim = StabilizerMpsSimulator.from_bits("0")
 
     sim.measure_reset("Z", 0, outcome=+1)
 
@@ -2566,7 +2570,7 @@ def test_measure_reset_defaults_to_fixed_basis():
 
 
 def test_measure_reset_defaults_to_span_order_and_keeps_input_result_order():
-    sim = MpsStabOptimizer(4).apply([("cnot", 0, 3)])
+    sim = StabilizerMpsSimulator(4).apply([("cnot", 0, 3)])
 
     outcomes = sim.measure_reset(
         "Z",
@@ -2581,7 +2585,7 @@ def test_measure_reset_defaults_to_span_order_and_keeps_input_result_order():
 
 def test_cap_stream_entry_contracts_physical_qubit_and_shortens():
     n = 3
-    sim = MpsStabOptimizer(n, chi=None).apply(
+    sim = StabilizerMpsSimulator(n, chi=None).apply(
         [("h", 0), ("cnot", 0, 1), ("ry", 0.4, 2)]
     )
     before = sim.to_statevector()
@@ -2596,7 +2600,7 @@ def test_cap_stream_entry_contracts_physical_qubit_and_shortens():
 
 
 def test_cap_stream_entry_obeys_dense_qubit_guard():
-    sim = MpsStabOptimizer(3, max_dense_cap_qubits=2)
+    sim = StabilizerMpsSimulator(3, max_dense_cap_qubits=2)
 
     with pytest.raises(ValueError, match="max_dense_cap_qubits"):
         sim.apply([("cap", 0, [1.0, 1.0])])
@@ -2605,7 +2609,7 @@ def test_cap_stream_entry_obeys_dense_qubit_guard():
 def test_reset_multiqubit_and_disentangles():
     # GHZ chain; reset the whole register back to |000..0>.
     n = 4
-    sim = MpsStabOptimizer(n, chi=None).apply(
+    sim = StabilizerMpsSimulator(n, chi=None).apply(
         [("h", 0), ("cnot", 0, 1), ("cnot", 1, 2), ("cnot", 2, 3), ("rz", 0.5, 3)]
     )
     sim.reset(range(n))
@@ -2616,7 +2620,7 @@ def test_reset_multiqubit_and_disentangles():
 
 def test_reset_then_reuse_ancilla_for_injection():
     # Reset a used qubit, then re-prepare magic and inject again (ancilla reuse).
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.h(0)
     sim.prepare_magic(1)
     sim.inject_t(0, 1, outcome=+1)   # data qubit -> T|+>, ancilla consumed
@@ -2633,7 +2637,7 @@ def test_reset_then_reuse_ancilla_for_injection():
 def test_measure_absorb_via_stream_entry():
     n = 3
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2)]
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = StabilizerMpsSimulator(n).apply(stream)
     # ("measure", pauli, where, outcome, absorb_basis)
     sim.apply([("measure", "Z", 0, +1, True)])
     assert len(sim.measurements) == 1 and sim.measurements[0][2] == +1
@@ -2641,7 +2645,7 @@ def test_measure_absorb_via_stream_entry():
 
 
 def test_measurement_localizer_cache_keys_on_layout_and_terms():
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     terms = {0: "X", 2: "Z"}
 
     first = sim._localizing_clifford_cached(terms)
@@ -2658,7 +2662,7 @@ def test_measurement_localizer_cache_keys_on_layout_and_terms():
 # --------------------------------------------------------------------------- #
 def test_probability_bits_matches_dense():
     n = 4
-    sim = MpsStabOptimizer(n, seed=0).apply(
+    sim = StabilizerMpsSimulator(n, seed=0).apply(
         [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1), ("ry", 0.5, 3)]
     )
     psi = sim.to_statevector()
@@ -2672,7 +2676,7 @@ def test_probability_bits_matches_dense():
 
 def test_probability_bits_accepts_mps_order_with_layout():
     n = 4
-    sim = MpsStabOptimizer(n, seed=0, layout=[2, 0, 3, 1], layout_report=False).apply(
+    sim = StabilizerMpsSimulator(n, seed=0, layout=[2, 0, 3, 1], layout_report=False).apply(
         [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1), ("ry", 0.5, 3)]
     )
     psi = sim.to_statevector()
@@ -2686,7 +2690,7 @@ def test_probability_bits_accepts_mps_order_with_layout():
 
 def test_probability_bits_many_matches_scalar_and_dense():
     n = 4
-    sim = MpsStabOptimizer(n, seed=1).apply(
+    sim = StabilizerMpsSimulator(n, seed=1).apply(
         [("h", 0), ("cnot", 0, 1), ("rz", 0.4, 2), ("t", 3), ("ry", 0.6, 1)]
     )
     bitstrings = ["0000", "0011", "0011", "1010", "1111"]
@@ -2699,7 +2703,7 @@ def test_probability_bits_many_matches_scalar_and_dense():
 
 
 def test_probability_bits_many_empty_and_single_bitstring():
-    sim = MpsStabOptimizer(2).apply([("h", 0)])
+    sim = StabilizerMpsSimulator(2).apply([("h", 0)])
     assert sim.probability_bits_many([]).shape == (0,)
     got = sim.probability_bits_many("00")
     assert got.shape == (1,)
@@ -2707,7 +2711,7 @@ def test_probability_bits_many_empty_and_single_bitstring():
 
 
 def test_probability_bits_does_not_mutate_state():
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
     before = sim.to_statevector()
     sim.probability_bits("010")
     sim.probability_bits_many(["010", "111"])
@@ -2716,14 +2720,14 @@ def test_probability_bits_does_not_mutate_state():
 
 def test_probability_bits_rejects_non_binary_values():
     with pytest.raises(ValueError, match="0 or 1"):
-        MpsStabOptimizer(2).probability_bits([0, 2])
+        StabilizerMpsSimulator(2).probability_bits([0, 2])
     with pytest.raises(ValueError, match="0 or 1"):
-        MpsStabOptimizer(2).probability_bits_many([[0, 1], [0, 2]])
+        StabilizerMpsSimulator(2).probability_bits_many([[0, 1], [0, 2]])
 
 
 def test_sample_bits_frequencies_match_dense():
     n = 3
-    sim = MpsStabOptimizer(n, seed=3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2)])
+    sim = StabilizerMpsSimulator(n, seed=3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2)])
     probs = np.abs(sim.to_statevector()) ** 2
     shots = 4000
     s = sim.sample_bits(shots, seed=7)
@@ -2735,7 +2739,7 @@ def test_sample_bits_frequencies_match_dense():
 
 def test_sample_bits_accepts_mps_order_with_layout():
     n = 3
-    sim = MpsStabOptimizer(n, seed=3, layout=[2, 0, 1], layout_report=False).apply(
+    sim = StabilizerMpsSimulator(n, seed=3, layout=[2, 0, 1], layout_report=False).apply(
         [("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2)]
     )
     probs = np.abs(sim.to_statevector()) ** 2
@@ -2749,7 +2753,7 @@ def test_sample_bits_accepts_mps_order_with_layout():
 
 def test_sample_bits_packed_matches_unpacked_samples():
     n = 5
-    sim = MpsStabOptimizer(n, seed=3).apply(
+    sim = StabilizerMpsSimulator(n, seed=3).apply(
         [("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2), ("t", 4)]
     )
     raw = sim.sample_bits(64, seed=7, shuffle=False)
@@ -2762,7 +2766,7 @@ def test_sample_bits_packed_matches_unpacked_samples():
 
 def test_iter_sample_bits_chunks_and_packed_output():
     n = 3
-    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.4, 2)])
+    sim = StabilizerMpsSimulator(n).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.4, 2)])
     chunks = list(sim.iter_sample_bits(17, chunk_size=6, seed=11, packed=True))
     assert [chunk.shape for chunk in chunks] == [(6, 1), (6, 1), (5, 1)]
     unpacked = np.vstack([
@@ -2774,7 +2778,7 @@ def test_iter_sample_bits_chunks_and_packed_output():
 
 
 def test_bitstring_api_aliases_match_existing_methods():
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
 
     np.testing.assert_array_equal(
         sim.sample_bitstrings(16, seed=5, shuffle=False),
@@ -2797,13 +2801,13 @@ def test_bitstring_api_aliases_match_existing_methods():
 
 
 def test_sample_bits_shuffle_false_keeps_prefix_grouping():
-    sim = MpsStabOptimizer(1).apply([("h", 0)])
+    sim = StabilizerMpsSimulator(1).apply([("h", 0)])
     s = sim.sample_bits(40, seed=5, shuffle=False)[:, 0]
     assert np.array_equal(s, np.sort(s))
 
 
 def test_sample_bits_rows_are_exchangeable():
-    sim = MpsStabOptimizer(1).apply([("h", 0)])
+    sim = StabilizerMpsSimulator(1).apply([("h", 0)])
     draws = np.array([
         sim.sample_bits(2, seed=seed)[:, 0]
         for seed in range(300)
@@ -2815,7 +2819,7 @@ def test_sample_bits_rows_are_exchangeable():
 
 def test_sample_bits_stabilizer_ghz_support():
     # GHZ only has support on 000 and 111.
-    sim = MpsStabOptimizer.ghz(3)
+    sim = StabilizerMpsSimulator.ghz(3)
     s = sim.sample_bits(500, seed=1)
     rows = {tuple(r) for r in s.tolist()}
     assert rows.issubset({(0, 0, 0), (1, 1, 1)})
@@ -2823,18 +2827,18 @@ def test_sample_bits_stabilizer_ghz_support():
 
 def test_sample_bits_deterministic_product_state():
     # A computational-basis product state samples that bitstring with certainty.
-    sim = MpsStabOptimizer.from_bits("1011")
+    sim = StabilizerMpsSimulator.from_bits("1011")
     s = sim.sample_bits(64, seed=0)
     assert np.all(s == np.array([1, 0, 1, 1], dtype=np.int8))
 
 
 def test_copy_is_independent():
-    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+    sim = StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
     clone = sim.copy()
     clone.apply([("x", 0), ("rz", 0.5, 2)])
     # mutating the clone leaves the original untouched
     assert _fidelity(sim.to_statevector(),
-                     MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)]).to_statevector()) == pytest.approx(1.0, abs=1e-6)
+                     StabilizerMpsSimulator(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)]).to_statevector()) == pytest.approx(1.0, abs=1e-6)
     assert clone.state is not sim.state
 
 
@@ -2848,7 +2852,7 @@ def _rz(theta):
 @pytest.mark.parametrize("phi", [np.pi / 4, -np.pi / 4, np.pi / 2, 3 * np.pi / 4])
 @pytest.mark.parametrize("outcome", [+1, -1])
 def test_inject_rz_matches_dense(phi, outcome):
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.h(0)                       # data -> |+>
     sim.prepare_magic(1, angle=phi)      # ancilla -> Rz(phi)|+>
     m = sim.inject_rz(0, 1, phi, outcome=outcome)
@@ -2871,7 +2875,7 @@ def test_inject_rz_matches_dense(phi, outcome):
 
 @pytest.mark.parametrize("outcome", [+1, -1])
 def test_inject_tdg_matches_tdg(outcome):
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.h(0)
     sim.prepare_magic(1, angle=-np.pi / 4)
     sim.inject_tdg(0, 1, outcome=outcome)
@@ -2883,7 +2887,7 @@ def test_inject_tdg_matches_tdg(outcome):
 
 
 def test_inject_rz_rejects_non_pi4_angle():
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.h(0)
     sim.prepare_magic(1, angle=0.3)
     with pytest.raises(ValueError, match="multiple of pi/4"):
@@ -2892,7 +2896,7 @@ def test_inject_rz_rejects_non_pi4_angle():
 
 def test_absorb_measure_forced_impossible_raises():
     # GHZ: forcing Z0 = -1 while Z1 = +1 is impossible (they are perfectly correlated).
-    sim = MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
+    sim = StabilizerMpsSimulator(2).apply([("h", 0), ("cnot", 0, 1)])
     sim.measure("Z", 0, outcome=+1, absorb_basis=True)   # collapse to |00>
     before_p = sim.state.p_dense()
     before_tableau = sim.state._sim.current_inverse_tableau()
@@ -2907,7 +2911,7 @@ def test_absorb_measure_forced_impossible_raises():
 def test_fixed_basis_forced_impossible_raises():
     # Same impossible post-selection via the default fixed-basis path: it must
     # raise on the ~0-norm collapse rather than silently keep a garbage state.
-    sim = MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
+    sim = StabilizerMpsSimulator(2).apply([("h", 0), ("cnot", 0, 1)])
     sim.measure("Z", 0, outcome=+1)   # collapse to |00>
     before = sim.to_statevector()
     before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
@@ -2919,7 +2923,7 @@ def test_fixed_basis_forced_impossible_raises():
 
 @pytest.mark.parametrize("outcome", [0, 2, -2, 0.5])
 def test_measure_rejects_invalid_forced_outcome_without_mutation(outcome):
-    sim = MpsStabOptimizer(1).apply([("h", 0)])
+    sim = StabilizerMpsSimulator(1).apply([("h", 0)])
     before = sim.to_statevector()
     with pytest.raises(ValueError, match=r"exactly \+1 or -1"):
         sim.measure("Z", 0, outcome=outcome)
@@ -2940,8 +2944,8 @@ def test_run_with_injection_matches_direct(n_ancilla):
     nd = 3
     stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("tdg", 0),
               ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1), ("rz", np.pi / 2, 0)]
-    direct = MpsStabOptimizer(nd).apply(stream)
-    inj = MpsStabOptimizer.with_injection(nd, stream, n_ancilla=n_ancilla)
+    direct = StabilizerMpsSimulator(nd).apply(stream)
+    inj = StabilizerMpsSimulator.with_injection(nd, stream, n_ancilla=n_ancilla)
     assert inj.n == nd + n_ancilla
     ref = _data_marginal_ref(direct, n_ancilla)
     assert _fidelity(inj.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
@@ -2951,8 +2955,8 @@ def test_with_injection_auto_layout_matches_direct():
     nd = 3
     stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("tdg", 0),
               ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1)]
-    direct = MpsStabOptimizer(nd).apply(stream)
-    inj = MpsStabOptimizer.with_injection(
+    direct = StabilizerMpsSimulator(nd).apply(stream)
+    inj = StabilizerMpsSimulator.with_injection(
         nd,
         stream,
         n_ancilla=1,
@@ -2972,8 +2976,8 @@ def test_with_injection_pool_one_recycles_many_t():
     stream = ([("h", i) for i in range(n)]
               + [("cnot", i, i + 1) for i in range(n - 1)]
               + [("t", i) for i in range(n)] * 2)  # 10 T-gates
-    direct = MpsStabOptimizer(n).apply(stream)
-    inj = MpsStabOptimizer.with_injection(n, stream, n_ancilla=1)  # single recycled ancilla
+    direct = StabilizerMpsSimulator(n).apply(stream)
+    inj = StabilizerMpsSimulator.with_injection(n, stream, n_ancilla=1)  # single recycled ancilla
     ref = _data_marginal_ref(direct, 1)
     assert _fidelity(inj.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -2982,8 +2986,8 @@ def test_run_with_injection_non_pi4_rz_applied_normally():
     # rz(0.3) is not a pi/4 multiple -> must fall through to the normal path (still correct).
     nd = 2
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.3, 1), ("t", 0)]
-    direct = MpsStabOptimizer(nd).apply(stream)
-    inj = MpsStabOptimizer.with_injection(nd, stream, n_ancilla=1)
+    direct = StabilizerMpsSimulator(nd).apply(stream)
+    inj = StabilizerMpsSimulator.with_injection(nd, stream, n_ancilla=1)
     assert _fidelity(inj.to_statevector(), _data_marginal_ref(direct, 1)) == pytest.approx(1.0, abs=1e-6)
 
 
@@ -2994,9 +2998,9 @@ def test_matrix_t_gate_streams_are_injectable(gate_factory):
 
     gate = getattr(py, gate_factory)()
     stream = [(py.h(), 0), (gate, 0)]
-    direct = MpsStabOptimizer(1).apply(stream)
-    immediate = MpsStabOptimizer.with_injection(1, stream, n_ancilla=1)
-    deferred = MpsStabOptimizer.with_deferred_injection(1, stream)
+    direct = StabilizerMpsSimulator(1).apply(stream)
+    immediate = StabilizerMpsSimulator.with_injection(1, stream, n_ancilla=1)
+    deferred = StabilizerMpsSimulator.with_deferred_injection(1, stream)
 
     assert immediate.last_immediate_injection_report["n_injections"] == 1
     assert deferred.last_deferred_injection_report["n_injections"] == 1
@@ -3009,20 +3013,20 @@ def test_matrix_t_gate_streams_are_injectable(gate_factory):
 
 
 def test_run_with_injection_rejects_target_in_pool():
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     with pytest.raises(ValueError, match="ancilla pool"):
         sim.run_with_injection([("t", 2)], ancillas=[2])
 
 
 @pytest.mark.parametrize("ancillas", [[2, 2], [3], [-1]])
 def test_run_with_injection_rejects_invalid_ancilla_pool(ancillas):
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     with pytest.raises(ValueError, match="ancilla"):
         sim.run_with_injection([("t", 0)], ancillas=ancillas)
 
 
 def test_run_with_injection_rejects_dirty_ancilla_before_mutation():
-    sim = MpsStabOptimizer(2).apply([("x", 1)])
+    sim = StabilizerMpsSimulator(2).apply([("x", 1)])
     before = sim.to_statevector()
 
     with pytest.raises(ValueError, match="must start clean"):
@@ -3032,7 +3036,7 @@ def test_run_with_injection_rejects_dirty_ancilla_before_mutation():
 
 
 def test_run_with_injection_rejects_ordinary_entry_touching_pool_before_mutation():
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     before = sim.to_statevector()
 
     with pytest.raises(ValueError, match="ordinary stream entry"):
@@ -3043,7 +3047,7 @@ def test_run_with_injection_rejects_ordinary_entry_touching_pool_before_mutation
 
 def test_run_with_injection_no_recycle_exhausts():
     # two T-gates, single ancilla, recycle disabled -> exhaustion error.
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     with pytest.raises(RuntimeError, match="exhausted"):
         sim.run_with_injection([("t", 0), ("t", 1)], ancillas=[2], recycle=False)
 
@@ -3055,8 +3059,8 @@ def test_run_with_injection_spread_pool_matches_direct():
     pool = [1, 3]
     stream = [("h", 0), ("cnot", 0, 2), ("t", 4), ("rz", np.pi / 4, 0),
               ("cnot", 2, 4), ("t", 2), ("tdg", 0)]
-    direct = MpsStabOptimizer(n).apply(stream)   # T applied directly; qubits 1,3 stay |0>
-    inj = MpsStabOptimizer(n)
+    direct = StabilizerMpsSimulator(n).apply(stream)   # T applied directly; qubits 1,3 stay |0>
+    inj = StabilizerMpsSimulator(n)
     inj.run_with_injection(stream, ancillas=pool)  # teleport via spread ancillas, reset at end
     assert _fidelity(inj.to_statevector(), direct.to_statevector()) == pytest.approx(1.0, abs=1e-6)
     for a in pool:  # ancillas returned to |0>
@@ -3064,7 +3068,7 @@ def test_run_with_injection_spread_pool_matches_direct():
 
 
 def test_run_with_injection_reset_ancillas_leaves_zero():
-    sim = MpsStabOptimizer(2)
+    sim = StabilizerMpsSimulator(2)
     sim.state.h(0)
     sim.run_with_injection([("t", 0)], ancillas=[1], reset_ancillas=True)
     # ancilla qubit 1 is back to |0> -> <Z_1> = +1
@@ -3077,7 +3081,7 @@ def test_magic_strategy_recommends_explicit_clifford_t_execution_modes():
         ("tdg", 1), ("rz", np.pi / 4, 0),
     ]
 
-    default = MpsStabOptimizer.recommend_magic_strategy(stream)
+    default = StabilizerMpsSimulator.recommend_magic_strategy(stream)
     assert default["recommended_mode"] == "immediate"
     assert default["is_clifford_t_like"]
     assert default["injectable_entries"] == 3
@@ -3085,33 +3089,33 @@ def test_magic_strategy_recommends_explicit_clifford_t_execution_modes():
     assert default["deferred_feasible"] is None
     assert "with_injection" in default["message"]
 
-    deferred = MpsStabOptimizer.recommend_magic_strategy(
+    deferred = StabilizerMpsSimulator.recommend_magic_strategy(
         stream, ancilla_budget=3, prioritize_peak_bond=True
     )
     assert deferred["recommended_mode"] == "deferred"
     assert deferred["deferred_feasible"]
     assert "with_deferred_injection" in deferred["message"]
 
-    constrained = MpsStabOptimizer.recommend_magic_strategy(
+    constrained = StabilizerMpsSimulator.recommend_magic_strategy(
         stream, ancilla_budget=1, prioritize_peak_bond=True
     )
     assert constrained["recommended_mode"] == "immediate"
     assert not constrained["deferred_feasible"]
 
-    queued = MpsStabOptimizer(2, gates=stream)
+    queued = StabilizerMpsSimulator(2, gates=stream)
     assert queued.queued_magic_strategy()["message"] == default["message"]
     assert len(queued._queue) == len(stream)
 
 
 def test_magic_strategy_identifies_direct_and_mixed_streams():
-    direct = MpsStabOptimizer.recommend_magic_strategy(
+    direct = StabilizerMpsSimulator.recommend_magic_strategy(
         [("h", 0), ("rxx", 0.31, 0, 1)]
     )
     assert direct["recommended_mode"] == "direct"
     assert direct["other_nonclifford_entries"] == 1
     assert "exact_cooling=True" in direct["message"]
 
-    mixed = MpsStabOptimizer.recommend_magic_strategy(
+    mixed = StabilizerMpsSimulator.recommend_magic_strategy(
         [("t", 0), ("rx", 0.31, 1)]
     )
     assert mixed["recommended_mode"] == "immediate"
@@ -3122,7 +3126,7 @@ def test_magic_strategy_identifies_direct_and_mixed_streams():
 
 def test_magic_strategy_recognizes_stim_style_clifford_matrices():
     stim_h = np.asarray(_H, dtype=np.complex64)
-    report = MpsStabOptimizer.recommend_magic_strategy([(stim_h, 0), ("t", 0)])
+    report = StabilizerMpsSimulator.recommend_magic_strategy([(stim_h, 0), ("t", 0)])
 
     assert report["recommended_mode"] == "immediate"
     assert report["clifford_entries"] == 1
@@ -3132,13 +3136,13 @@ def test_magic_strategy_recognizes_stim_style_clifford_matrices():
 
 def test_stream_advisors_use_exact_clifford_matrix_classification():
     near_identity_rotation = np.diag([1.0, np.exp(1j * 1e-6)])
-    analysis = MpsStabOptimizer.analyze_stream(
+    analysis = StabilizerMpsSimulator.analyze_stream(
         [(near_identity_rotation, 0)], n_qubits=1
     )
     assert analysis.other_nonclifford_entries == 1
     assert analysis.clifford_entries == 0
 
-    report = MpsStabOptimizer.recommend_magic_strategy(
+    report = StabilizerMpsSimulator.recommend_magic_strategy(
         [(near_identity_rotation, 0)]
     )
     assert report["other_nonclifford_entries"] == 1
@@ -3146,7 +3150,7 @@ def test_stream_advisors_use_exact_clifford_matrix_classification():
 
 
 def test_magic_strategy_recognizes_matrix_form_t_as_injectable():
-    report = MpsStabOptimizer.recommend_magic_strategy([(np.asarray(_T), 0)])
+    report = StabilizerMpsSimulator.recommend_magic_strategy([(np.asarray(_T), 0)])
 
     assert report["recommended_mode"] == "immediate"
     assert report["injectable_entries"] == 1
@@ -3166,7 +3170,7 @@ def test_stream_analysis_summarizes_pepsy_native_design():
         ("measure_reset", "X", 2),
     ]
 
-    analysis = MpsStabOptimizer.analyze_stream(stream, n_qubits=3)
+    analysis = StabilizerMpsSimulator.analyze_stream(stream, n_qubits=3)
 
     assert isinstance(analysis, StreamAnalysisRecord)
     assert analysis.total_entries == 9
@@ -3184,7 +3188,7 @@ def test_stream_analysis_identifies_dense_matrices_as_cost_drivers():
     nonunitary = np.array([[1.0, 0.0], [0.25, 0.0]], dtype=complex)
     stream = [(np.asarray(_H, dtype=np.complex64), 0), (nonunitary, 1)]
 
-    analysis = MpsStabOptimizer.analyze_stream(stream, n_qubits=2)
+    analysis = StabilizerMpsSimulator.analyze_stream(stream, n_qubits=2)
 
     assert analysis.clifford_entries == 1
     assert analysis.dense_matrix_entries == 2
@@ -3197,7 +3201,7 @@ def test_stream_analysis_identifies_dense_matrices_as_cost_drivers():
 def test_recommend_settings_wraps_magic_strategy_and_settings():
     stream = [("h", 0), ("cnot", 0, 1), ("t", 0), ("tdg", 1)]
 
-    advice = MpsStabOptimizer.recommend_settings(
+    advice = StabilizerMpsSimulator.recommend_settings(
         stream,
         n_qubits=2,
         ancilla_budget=2,
@@ -3219,7 +3223,7 @@ def test_recommend_settings_wraps_magic_strategy_and_settings():
 
 
 def test_recommend_settings_validate_goal_prefers_exact_reference():
-    advice = MpsStabOptimizer.recommend_settings(
+    advice = StabilizerMpsSimulator.recommend_settings(
         [("t", 0), ("rx", 0.31, 1)],
         n_qubits=2,
         goal="validate",
@@ -3233,7 +3237,7 @@ def test_recommend_settings_validate_goal_prefers_exact_reference():
 
 def test_queued_recommend_settings_does_not_consume_queue():
     stream = [("h", 0), ("t", 0), ("rx", 0.31, 1)]
-    sim = MpsStabOptimizer(2, gates=stream)
+    sim = StabilizerMpsSimulator(2, gates=stream)
 
     analysis = sim.queued_stream_analysis()
     advice = sim.queued_recommend_settings(ancilla_budget=1)
@@ -3335,7 +3339,7 @@ def test_from_stim_queue_can_use_settings_advice_and_runner():
     def add_t_after_stim_prefix(stream):
         return [*stream[:-1], ("t", 0)]
 
-    sim = MpsStabOptimizer.from_stim(
+    sim = StabilizerMpsSimulator.from_stim(
         "H 0\nM 0",
         seed=7,
         stream_transform=add_t_after_stim_prefix,
@@ -3344,7 +3348,7 @@ def test_from_stim_queue_can_use_settings_advice_and_runner():
     advice = sim.queued_recommend_settings(goal="validate")
 
     result = sim.run_queued_stream(mode="direct", goal="validate")
-    expected = MpsStabOptimizer(1).apply([("h", 0), ("t", 0)])
+    expected = StabilizerMpsSimulator(1).apply([("h", 0), ("t", 0)])
 
     assert analysis.total_entries == 2
     assert advice.recommended_mode == "immediate"
@@ -3358,7 +3362,7 @@ def test_from_stim_queue_can_use_settings_advice_and_runner():
 
 
 def test_run_with_injection_records_projection_costs():
-    sim = MpsStabOptimizer(3)
+    sim = StabilizerMpsSimulator(3)
     sim.run_with_injection([("t", 0), ("tdg", 1)], ancillas=[2])
 
     report = sim.last_immediate_injection_report
@@ -3382,8 +3386,8 @@ def test_deferred_injection_matches_direct_circuit(projection_order):
         ("rz", np.pi / 2, 0),
     ]
     outcomes = [+1, -1, +1, -1]
-    direct = MpsStabOptimizer(n_data).apply(stream)
-    deferred = MpsStabOptimizer.with_deferred_injection(
+    direct = StabilizerMpsSimulator(n_data).apply(stream)
+    deferred = StabilizerMpsSimulator.with_deferred_injection(
         n_data,
         stream,
         outcomes=outcomes,
@@ -3412,8 +3416,8 @@ def test_deferred_injection_auto_layout_matches_direct_circuit():
         ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1),
     ]
     outcomes = [+1, -1, +1, -1]
-    direct = MpsStabOptimizer(n_data).apply(stream)
-    deferred = MpsStabOptimizer.with_deferred_injection(
+    direct = StabilizerMpsSimulator(n_data).apply(stream)
+    deferred = StabilizerMpsSimulator.with_deferred_injection(
         n_data,
         stream,
         outcomes=outcomes,
@@ -3433,9 +3437,9 @@ def test_deferred_injection_auto_layout_matches_direct_circuit():
 def test_deferred_injection_accepts_an_explicit_projection_order():
     n_data = 2
     stream = [("h", 0), ("t", 0), ("tdg", 1), ("t", 1)]
-    direct = MpsStabOptimizer(n_data).apply(stream)
+    direct = StabilizerMpsSimulator(n_data).apply(stream)
     ancillas = [2, 3, 4]
-    deferred = MpsStabOptimizer(n_data + len(ancillas))
+    deferred = StabilizerMpsSimulator(n_data + len(ancillas))
     deferred.run_with_deferred_injection(
         stream,
         ancillas=ancillas,
@@ -3453,7 +3457,7 @@ def test_deferred_injection_accepts_an_explicit_projection_order():
 
 def test_deferred_injection_middle_out_projects_each_odd_register_ancilla_once():
     stream = [("h", 0), ("t", 0), ("tdg", 1), ("t", 1)]
-    deferred = MpsStabOptimizer.with_deferred_injection(
+    deferred = StabilizerMpsSimulator.with_deferred_injection(
         2,
         stream,
         outcomes=[+1, -1, +1],
@@ -3466,14 +3470,14 @@ def test_deferred_injection_middle_out_projects_each_odd_register_ancilla_once()
 
 def test_deferred_injection_requires_a_fresh_ancilla_per_gate():
     with pytest.raises(ValueError, match="ancilla per injectable gate"):
-        MpsStabOptimizer.with_deferred_injection(
+        StabilizerMpsSimulator.with_deferred_injection(
             2, [("t", 0), ("t", 1)], n_ancilla=1
         )
 
 
 def test_deferred_injection_rejects_ordinary_entry_touching_reserved_pool():
     with pytest.raises(ValueError, match="ordinary stream entry"):
-        MpsStabOptimizer.with_deferred_injection(
+        StabilizerMpsSimulator.with_deferred_injection(
             2, [("h", 2), ("t", 0)], n_ancilla=1
         )
 
@@ -3491,8 +3495,8 @@ def test_torch_backend_matches_numpy():
     tb = _torch_backend()
     stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("rz", np.pi / 4, 1),
               ("ry", 0.7, 3), ("cnot", 2, 3), ("tdg", 0)]
-    cpu = MpsStabOptimizer(4, seed=0).apply(stream)
-    gpu = MpsStabOptimizer(4, seed=0, to_backend=tb).apply(stream)
+    cpu = StabilizerMpsSimulator(4, seed=0).apply(stream)
+    gpu = StabilizerMpsSimulator(4, seed=0, to_backend=tb).apply(stream)
     # |nu> tensors live on the torch backend
     assert type(gpu.state.p[0].data).__module__.split(".")[0] == "torch"
     assert _fidelity(cpu.to_statevector(), gpu.to_statevector()) == pytest.approx(1.0, abs=1e-6)
@@ -3506,9 +3510,9 @@ def test_torch_backend_absorb_measure_matches_numpy():
     tb = _torch_backend()
     circ = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2)]
     for m in (+1, -1):
-        cpu = MpsStabOptimizer(3).apply(circ)
+        cpu = StabilizerMpsSimulator(3).apply(circ)
         cpu.measure("Z", 1, outcome=m, absorb_basis=True)
-        gpu = MpsStabOptimizer(3, to_backend=tb).apply(circ)
+        gpu = StabilizerMpsSimulator(3, to_backend=tb).apply(circ)
         gpu.measure("Z", 1, outcome=m, absorb_basis=True)
         assert _fidelity(cpu.to_statevector(), gpu.to_statevector()) == pytest.approx(1.0, abs=1e-6)
 
@@ -3519,7 +3523,7 @@ def test_torch_backend_matrix_gate_input():
     # A torch-native (non-unitary) gate matrix passed as an explicit
     # (matrix, where) entry is materialized on the CPU for classification.
     coin = torch.tensor([[0.9, 0.1], [0.1, 0.9]], dtype=torch.complex128)
-    sim = MpsStabOptimizer(2, to_backend=tb).apply([(coin, 0)])
+    sim = StabilizerMpsSimulator(2, to_backend=tb).apply([(coin, 0)])
     ref = _apply_gate_dense(
         np.array([1, 0, 0, 0], complex),
         np.array([[0.9, 0.1], [0.1, 0.9]], complex), (0,), 2,
@@ -3535,7 +3539,7 @@ def test_native_mps_backend_is_inferred_and_foreign_payloads_are_rejected():
     )
     p.apply_to_arrays(backend)
 
-    sim = MpsStabOptimizer.from_mps(p)
+    sim = StabilizerMpsSimulator.from_mps(p)
     assert sim.backend_info() == {
         "backend": "torch",
         "dtype": "complex128",
@@ -3568,7 +3572,7 @@ def test_native_mps_submpo_requires_explicit_backend_preparation(monkeypatch):
         np.array([1, 0, 0, 0], dtype=complex), dims=[2, 2]
     )
     p.apply_to_arrays(backend)
-    sim = MpsStabOptimizer.from_mps(p)
+    sim = StabilizerMpsSimulator.from_mps(p)
     mpo = pauli_rotation_mpo(0.2, ["X", "Z"])
     source_types = tuple(type(tensor.data) for tensor in mpo.tensors)
 
@@ -3592,18 +3596,18 @@ def test_native_mps_submpo_requires_explicit_backend_preparation(monkeypatch):
 def test_torch_backend_injection_and_sampling():
     tb = _torch_backend()
     # injection on the torch backend reproduces T
-    sim = MpsStabOptimizer(2, to_backend=tb)
+    sim = StabilizerMpsSimulator(2, to_backend=tb)
     sim.state.h(0)
     sim.prepare_magic(1)
     sim.inject_t(0, 1, outcome=+1)
-    ref = MpsStabOptimizer(1).apply([("h", 0), ("t", 0)])
+    ref = StabilizerMpsSimulator(1).apply([("h", 0), ("t", 0)])
     full = sim.to_statevector().reshape(2, 2)
     dv = full[:, 0] if np.linalg.norm(full[:, 0]) > np.linalg.norm(full[:, 1]) else full[:, 1]
     assert _fidelity(dv, ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
     # probability_bits and sampling work off the backend state
     circ = [("h", 0), ("cnot", 0, 1), ("t", 1)]
-    gpu = MpsStabOptimizer(2, to_backend=tb).apply(circ)
-    cpu = MpsStabOptimizer(2).apply(circ)
+    gpu = StabilizerMpsSimulator(2, to_backend=tb).apply(circ)
+    cpu = StabilizerMpsSimulator(2).apply(circ)
     for k in range(4):
         b = format(k, "02b")
         assert gpu.probability_bits(b) == pytest.approx(cpu.probability_bits(b), abs=1e-6)
@@ -3653,27 +3657,27 @@ def test_optional_array_backends_match_numpy_for_stn_paths(
         ("ry", 0.4, 2),
         ("t", 0),
     ]
-    cpu = MpsStabOptimizer(3, seed=0).apply(stream)
-    other = MpsStabOptimizer(3, seed=0, to_backend=backend).apply(stream)
+    cpu = StabilizerMpsSimulator(3, seed=0).apply(stream)
+    other = StabilizerMpsSimulator(3, seed=0, to_backend=backend).apply(stream)
     assert module_token in type(other.state.p[0].data).__module__
     assert _fidelity(cpu.to_statevector(), other.to_statevector()) == pytest.approx(
         1.0, abs=1e-6
     )
 
     for outcome in (+1, -1):
-        cpu_m = MpsStabOptimizer(3).apply(stream)
-        other_m = MpsStabOptimizer(3, to_backend=backend).apply(stream)
+        cpu_m = StabilizerMpsSimulator(3).apply(stream)
+        other_m = StabilizerMpsSimulator(3, to_backend=backend).apply(stream)
         cpu_m.measure("Z", 1, outcome=outcome, absorb_basis=True)
         other_m.measure("Z", 1, outcome=outcome, absorb_basis=True)
         assert _fidelity(
             cpu_m.to_statevector(), other_m.to_statevector()
         ) == pytest.approx(1.0, abs=1e-6)
 
-    inj = MpsStabOptimizer(2, to_backend=backend)
+    inj = StabilizerMpsSimulator(2, to_backend=backend)
     inj.state.h(0)
     inj.prepare_magic(1)
     inj.inject_t(0, 1, outcome=+1)
-    ref = MpsStabOptimizer(1).apply([("h", 0), ("t", 0)])
+    ref = StabilizerMpsSimulator(1).apply([("h", 0), ("t", 0)])
     full = inj.to_statevector().reshape(2, 2)
     data_vec = (
         full[:, 0]

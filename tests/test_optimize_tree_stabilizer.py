@@ -1,4 +1,4 @@
-"""Dense correctness tests for the first TreeStabOptimizer milestone."""
+"""Dense correctness tests for the first StabilizerTreeSimulator milestone."""
 
 import numpy as np
 import pytest
@@ -31,11 +31,11 @@ def _rzz(theta):
 
 def test_tree_stab_uses_binary_tree_with_ternary_root_by_default():
     """The stabilizer facade propagates the shared tree geometry default."""
-    optimizer = pepsy.TreeStabOptimizer(5)
+    optimizer = pepsy.StabilizerTreeSimulator(5)
     assert optimizer.tree_optimizer.plan.top_arity == 3
     assert optimizer.tree_optimizer.plan.is_binary()
 
-    binary_root = pepsy.TreeStabOptimizer(5, top_arity=2)
+    binary_root = pepsy.StabilizerTreeSimulator(5, top_arity=2)
     assert binary_root.tree_optimizer.plan.top_arity == 2
 
 
@@ -75,16 +75,16 @@ def _tree_stab_entangled_coefficient_state():
     coefficient.run()
     tableau = stim.TableauSimulator()
     tableau.set_num_qubits(2)
-    return pepsy.TreeStabOptimizer.from_tableau_and_state(
+    return pepsy.StabilizerTreeSimulator.from_tableau_and_state(
         tableau, coefficient.tn, chi=64
     )
 
 
 def test_tree_stab_is_public_and_cliffords_are_tableau_only():
-    from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
+    from pepsy.optimizers.tree_stabilizer import StabilizerTreeSimulator
 
-    assert pepsy.TreeStabOptimizer is TreeStabOptimizer
-    opt = TreeStabOptimizer(2)
+    assert pepsy.StabilizerTreeSimulator is StabilizerTreeSimulator
+    opt = StabilizerTreeSimulator(2)
     initial = opt.p.to_dense().copy()
 
     opt.apply([("h", 0), ("cnot", 0, 1)])
@@ -95,17 +95,27 @@ def test_tree_stab_is_public_and_cliffords_are_tableau_only():
     _assert_same_state(opt.to_statevector(), expected)
 
 
+def test_tree_stab_legacy_alias_warns_and_matches_canonical():
+    import pepsy.optimizers.tree_stabilizer as tree_stabilizer
+
+    tree_stabilizer.__dict__.pop("TreeStabOptimizer", None)
+    with pytest.warns(DeprecationWarning, match="StabilizerTreeSimulator"):
+        old_name = tree_stabilizer.TreeStabOptimizer
+
+    assert old_name is tree_stabilizer.StabilizerTreeSimulator
+
+
 def test_tree_stab_cutoff_defaults_match_tree_quimb_path():
     """TreeStab forwards the TreeOptimizer/Quimb compression defaults."""
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
 
     assert opt.tree_optimizer.cutoff == pytest.approx(1e-10)
     assert opt.tree_optimizer.cutoff_mode == "rsum2"
 
 
 def test_tree_stab_forwards_density_matrix_compression_mode():
-    opt = pepsy.TreeStabOptimizer(2, compression_mode="dm")
-    shorthand = pepsy.TreeStabOptimizer(2, mode="dm")
+    opt = pepsy.StabilizerTreeSimulator(2, compression_mode="dm")
+    shorthand = pepsy.StabilizerTreeSimulator(2, mode="dm")
 
     assert opt.mode == "tree_mpo_dm"
     assert opt.compression_mode == "dm"
@@ -122,7 +132,7 @@ def test_tree_stab_forwards_density_matrix_compression_mode():
     ("tree_mpo_direct", "tree-mpo-direct", "tree_mpo", "tree_mpo_svd"),
 )
 def test_tree_stab_tree_mpo_direct_mode_aliases(requested):
-    opt = pepsy.TreeStabOptimizer(2, mode=requested)
+    opt = pepsy.StabilizerTreeSimulator(2, mode=requested)
 
     assert opt.mode == "tree_mpo_direct"
     assert opt.tree_optimizer.mode == "tree_mpo_direct"
@@ -134,7 +144,7 @@ def test_tree_stab_tree_mpo_direct_mode_aliases(requested):
     ("tree_mpo_dm", "tree-mpo-dm", "tree_mpo_dem", "treempo_dem"),
 )
 def test_tree_stab_tree_mpo_dm_mode_aliases(requested):
-    opt = pepsy.TreeStabOptimizer(2, mode=requested)
+    opt = pepsy.StabilizerTreeSimulator(2, mode=requested)
 
     assert opt.mode == "tree_mpo_dm"
     assert opt.tree_optimizer.mode == "tree_mpo_dm"
@@ -144,7 +154,7 @@ def test_tree_stab_tree_mpo_dm_mode_aliases(requested):
 def test_tree_stab_c_basis_updates_use_tree_mpo_active_span(monkeypatch):
     from pepsy.optimizers.tree import TreeMPO
 
-    opt = pepsy.TreeStabOptimizer(3, mode="tree-mpo-dm")
+    opt = pepsy.StabilizerTreeSimulator(3, mode="tree-mpo-dm")
     calls = []
     apply_sub_mpotree = opt.tree_optimizer.apply_sub_mpotree
 
@@ -183,7 +193,7 @@ def test_tree_stab_coefficient_route_uses_lossless_qr_before_compression(
         return tensor_split(*args, **kwargs)
 
     monkeypatch.setattr(qtc, "tensor_split", traced_tensor_split)
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         8, chi=64, cutoff=1e-10, track_truncation=False,
     )
     opt.apply([("rzz", 0.37, 0, 7)])
@@ -199,7 +209,7 @@ def test_tree_stab_isometry_api_and_backend_conversion_preserve_proofs():
     def converter(array):
         return np.array(array, copy=True)
 
-    opt = pepsy.TreeStabOptimizer(6, to_backend=converter)
+    opt = pepsy.StabilizerTreeSimulator(6, to_backend=converter)
     directions = opt.isometry_map()
 
     assert directions == opt.tree_optimizer.isometry_map()
@@ -230,7 +240,7 @@ def test_tree_stab_routes_reuse_proven_path_isometries(
     n = 8
     where = (0, 7)
     plan = TreePlan.from_order(range(n), structure="balanced")
-    opt = pepsy.TreeStabOptimizer(n, tree=plan, mode=route)
+    opt = pepsy.StabilizerTreeSimulator(n, tree=plan, mode=route)
     reductions = []
     compress_edge = opt.tree_optimizer._compress_edge_with_diagnostics
 
@@ -286,7 +296,7 @@ def test_tree_stab_routes_reuse_proven_path_isometries(
 
 
 def test_tree_stab_chi_none_is_uncapped_and_sampling_is_conditional():
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         2,
         chi=None,
         gates=[("h", 0), ("cnot", 0, 1)],
@@ -312,21 +322,21 @@ def test_tree_stab_chi_none_is_uncapped_and_sampling_is_conditional():
 
 def test_tree_stab_basis_sampling_matches_mps_and_keeps_tree_projection(monkeypatch):
     """TreeStab adds MPS basis semantics without borrowing chain projection."""
-    tree = pepsy.TreeStabOptimizer(2)
-    mps = pepsy.MpsStabOptimizer(2)
+    tree = pepsy.StabilizerTreeSimulator(2)
+    mps = pepsy.StabilizerMpsSimulator(2)
     stream = [("h", 0), ("cnot", 0, 1)]
     tree.apply(stream)
     mps.apply(stream)
 
     calls = []
-    original = pepsy.TreeStabOptimizer._condition_computational_bit
+    original = pepsy.StabilizerTreeSimulator._condition_computational_bit
 
     def record_projection(self, *args, **kwargs):
         calls.append(type(self).__name__)
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        pepsy.TreeStabOptimizer,
+        pepsy.StabilizerTreeSimulator,
         "_condition_computational_bit",
         record_projection,
     )
@@ -341,11 +351,11 @@ def test_tree_stab_basis_sampling_matches_mps_and_keeps_tree_projection(monkeypa
     samples = tree.sample_basis(32, basis="X", seed=4, shuffle=False)
     assert samples.shape == (32, 2)
     assert calls
-    assert all(name == "TreeStabOptimizer" for name in calls)
+    assert all(name == "StabilizerTreeSimulator" for name in calls)
 
 
 def test_tree_stab_basis_sampling_aliases_and_random_resolution():
-    opt = pepsy.TreeStabOptimizer(3)
+    opt = pepsy.StabilizerTreeSimulator(3)
     opt.apply([("h", 0), ("h", 1)])
 
     np.testing.assert_array_equal(
@@ -369,26 +379,26 @@ def test_tree_stab_basis_sampling_aliases_and_random_resolution():
 
 
 def test_tree_stab_exposes_mps_compatible_event_helpers():
-    assert pepsy.TreeStabOptimizer.measure_event("Z", 0) == (
+    assert pepsy.StabilizerTreeSimulator.measure_event("Z", 0) == (
         "measure", "Z", (0,)
     )
-    assert pepsy.TreeStabOptimizer.measure_event("Z", 0, +1, True) == (
+    assert pepsy.StabilizerTreeSimulator.measure_event("Z", 0, +1, True) == (
         "measure", "Z", (0,), +1, True
     )
-    assert pepsy.TreeStabOptimizer.reset_event([0, 1], basis="X") == (
+    assert pepsy.StabilizerTreeSimulator.reset_event([0, 1], basis="X") == (
         "reset", (0, 1), "XX"
     )
-    assert pepsy.TreeStabOptimizer.measure_reset_event("Y", 0, -1) == (
+    assert pepsy.StabilizerTreeSimulator.measure_reset_event("Y", 0, -1) == (
         "measure_reset", "Y", (0,), -1
     )
 
-    marker = pepsy.TreeStabOptimizer.submpo_event(object(), [0, 2])
-    assert pepsy.TreeStabOptimizer.is_submpo_event(marker)
-    assert pepsy.TreeStabOptimizer.submpo_event_parts(
+    marker = pepsy.StabilizerTreeSimulator.submpo_event(object(), [0, 2])
+    assert pepsy.StabilizerTreeSimulator.is_submpo_event(marker)
+    assert pepsy.StabilizerTreeSimulator.submpo_event_parts(
         marker, normalize_where=True
     )[1] == (0, 2)
 
-    cap = pepsy.TreeStabOptimizer.cap_event(1, [1.0, 0.0], absorb="right")
+    cap = pepsy.StabilizerTreeSimulator.cap_event(1, [1.0, 0.0], absorb="right")
     assert cap[0:2] == ("cap", 1)
     np.testing.assert_allclose(cap[2], [1.0, 0.0])
     assert cap[3] == "right"
@@ -405,13 +415,13 @@ def test_tree_stab_routes_complete_treempo_event_on_coefficient_tree():
         {(0, 1, 2): term},
         compress=False,
     )
-    event = pepsy.TreeStabOptimizer.subtreempo_event(operator)
-    assert pepsy.TreeStabOptimizer.is_subtreempo_event(event)
-    assert pepsy.TreeStabOptimizer.subtreempo_event_parts(event)[1] == (
+    event = pepsy.StabilizerTreeSimulator.subtreempo_event(operator)
+    assert pepsy.StabilizerTreeSimulator.is_subtreempo_event(event)
+    assert pepsy.StabilizerTreeSimulator.subtreempo_event_parts(event)[1] == (
         0, 1, 2,
     )
 
-    optimizer = pepsy.TreeStabOptimizer.from_bits(
+    optimizer = pepsy.StabilizerTreeSimulator.from_bits(
         "000",
         tree=plan,
         chi=None,
@@ -430,7 +440,7 @@ def test_tree_stab_routes_complete_treempo_event_on_coefficient_tree():
 
 
 def test_tree_stab_frame_layout_uses_current_conjugated_supports():
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         4,
         gates=[("h", 0), ("cnot", 0, 3), ("rz", 0.23, 3)],
         frame_layout="auto",
@@ -442,7 +452,7 @@ def test_tree_stab_frame_layout_uses_current_conjugated_supports():
 
 
 def test_tree_stab_layout_kwargs_enable_cost_aware_refinement():
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         6,
         gates=[("h", 0), ("cnot", 0, 5), ("cnot", 1, 4), ("rz", 0.3, 5)],
         layout_kwargs={
@@ -457,7 +467,7 @@ def test_tree_stab_layout_kwargs_enable_cost_aware_refinement():
 
 
 def test_tree_stab_from_stim_and_stream_analysis():
-    opt = pepsy.TreeStabOptimizer.from_stim(stim.Circuit("H 0\nCX 0 1"))
+    opt = pepsy.StabilizerTreeSimulator.from_stim(stim.Circuit("H 0\nCX 0 1"))
 
     assert opt.stim_plan.num_qubits == 2
     assert opt.stim_sample.gate_stream
@@ -472,7 +482,7 @@ def test_tree_stab_from_stim_and_stream_analysis():
 
 
 def test_tree_stab_from_stim_lowers_record_control_to_feed_forward():
-    opt = pepsy.TreeStabOptimizer.from_stim(
+    opt = pepsy.StabilizerTreeSimulator.from_stim(
         stim.Circuit("X 0\nM 0\nCX rec[-1] 1")
     )
     assert any(
@@ -499,8 +509,8 @@ def test_tree_stab_submpo_matches_mps_coefficient_frame_contract():
     )
     stream = [("h", 0), ("cnot", 0, 1), ("submpo", submpo, (0, 1))]
 
-    tree = pepsy.TreeStabOptimizer(3, chi=None, gates=stream)
-    mps = pepsy.MpsStabOptimizer(3, chi=None, gates=stream)
+    tree = pepsy.StabilizerTreeSimulator(3, chi=None, gates=stream)
+    mps = pepsy.StabilizerMpsSimulator(3, chi=None, gates=stream)
     assert tree.current_frame_layout()["frame_events"][0]["support"] == (0, 1)
     tree.run()
     mps.run()
@@ -535,7 +545,7 @@ def test_tree_stab_submpo_uses_native_tree_router_for_unacted_root(monkeypatch):
         raise AssertionError("TreeStab sub-MPO was unexpectedly materialized")
 
     monkeypatch.setattr(submpo, "to_dense", fail_to_dense)
-    opt = pepsy.TreeStabOptimizer(5, tree=plan, chi=64, cutoff=0.0)
+    opt = pepsy.StabilizerTreeSimulator(5, tree=plan, chi=64, cutoff=0.0)
     opt.apply([("submpo", submpo, where)])
 
     _assert_same_state(opt.to_statevector(), expected)
@@ -544,7 +554,7 @@ def test_tree_stab_submpo_uses_native_tree_router_for_unacted_root(monkeypatch):
 
 def test_tree_stab_mpo_mode_reuses_tree_two_factor_kernel(monkeypatch):
     """TreeStab's MPO mode uses the same TreeOptimizer factor kernel."""
-    opt = pepsy.TreeStabOptimizer(2, mode="mpo")
+    opt = pepsy.StabilizerTreeSimulator(2, mode="mpo")
     calls = []
     apply_factors = opt.tree_optimizer._apply_2q_factors_impl
 
@@ -563,7 +573,7 @@ def test_tree_stab_mpo_mode_reuses_tree_two_factor_kernel(monkeypatch):
 
 
 def test_tree_stab_amplitude_probability_match_dense_readout():
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         2, gates=[("h", 0), ("cnot", 0, 1)]
     ).run()
 
@@ -576,23 +586,23 @@ def test_tree_stab_amplitude_probability_match_dense_readout():
 def test_tree_stab_parity_advice_runner_ghz_and_rank():
     from pepsy.optimizers.tree_stabilizer import StabilizerTreeRunResult
 
-    ghz = pepsy.TreeStabOptimizer.ghz(3)
+    ghz = pepsy.StabilizerTreeSimulator.ghz(3)
     np.testing.assert_allclose(
         np.abs(ghz.to_statevector()),
         [1 / np.sqrt(2), 0, 0, 0, 0, 0, 0, 1 / np.sqrt(2)],
     )
-    assert pepsy.TreeStabOptimizer(1).apply(
+    assert pepsy.StabilizerTreeSimulator(1).apply(
         [("ry", 0.37, 0)]
     ).pseudo_stabilizer_rank() == 2
 
-    advice = pepsy.TreeStabOptimizer.recommend_settings(
+    advice = pepsy.StabilizerTreeSimulator.recommend_settings(
         [("h", 0), ("t", 0)], n_qubits=1
     )
     assert advice.settings["max_operator_qubits"] == 2
     assert advice.settings["track_infidelity"] is True
     assert "stabilize_unitary" not in advice.settings
     assert "track_truncation" not in advice.settings
-    result = pepsy.TreeStabOptimizer.run_stream(
+    result = pepsy.StabilizerTreeSimulator.run_stream(
         [("h", 0), ("t", 0)], n_qubits=1, settings={"chi": None}
     )
     assert isinstance(result, StabilizerTreeRunResult)
@@ -602,10 +612,10 @@ def test_tree_stab_parity_advice_runner_ghz_and_rank():
 
 def test_tree_stab_norm_tracking_is_separate_from_truncation_tracking():
     """TreeStab exposes both tracking controls without conflating them."""
-    tracked = pepsy.TreeStabOptimizer(
+    tracked = pepsy.StabilizerTreeSimulator(
         1, chi=1, track_infidelity=True, track_truncation=False
     ).apply([("t", 0)])
-    disabled = pepsy.TreeStabOptimizer(
+    disabled = pepsy.StabilizerTreeSimulator(
         1, chi=1, track_infidelity=False, track_truncation=False
     ).apply([("t", 0)])
 
@@ -619,7 +629,7 @@ def test_tree_stab_norm_tracking_is_separate_from_truncation_tracking():
 
 
 def test_tree_stab_norm_diagnostics_and_sampling_copy_contract():
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         2,
         chi=1,
         track_truncation=True,
@@ -646,8 +656,8 @@ def test_tree_stab_torch_backend_matches_numpy():
         ("rz", 0.37, 1),
         ("measure", "Z", 1, 1),
     ]
-    cpu = pepsy.TreeStabOptimizer(2).apply(stream)
-    gpu = pepsy.TreeStabOptimizer(2, to_backend=backend).apply(stream)
+    cpu = pepsy.StabilizerTreeSimulator(2).apply(stream)
+    gpu = pepsy.StabilizerTreeSimulator(2, to_backend=backend).apply(stream)
 
     assert gpu.backend_info()["backend"] == "torch"
     assert "torch" in type(gpu.p[0].data).__module__
@@ -661,7 +671,7 @@ def test_tree_stab_torch_backend_matches_numpy():
         TreePlan.from_order(range(3), structure="balanced")
     )
     native_state.apply_to_arrays(backend)
-    inherited = pepsy.TreeStabOptimizer(
+    inherited = pepsy.StabilizerTreeSimulator(
         native_state, max_dense_cap_qubits=4
     )
     assert inherited.backend == "torch"
@@ -686,8 +696,8 @@ def test_tree_stab_torch_backend_matches_numpy():
 def test_tree_stab_cap_matches_mps_and_rebuilds_identity_frame():
     vec = np.array([0.8, -0.3j])
     stream = [("h", 0), ("cnot", 0, 2), ("rz", 0.37, 1)]
-    tree = pepsy.TreeStabOptimizer(3, chi=None, max_dense_cap_qubits=6)
-    mps = pepsy.MpsStabOptimizer(3, chi=None, max_dense_cap_qubits=6)
+    tree = pepsy.StabilizerTreeSimulator(3, chi=None, max_dense_cap_qubits=6)
+    mps = pepsy.StabilizerMpsSimulator(3, chi=None, max_dense_cap_qubits=6)
     tree.apply(stream)
     mps.apply(stream)
 
@@ -712,10 +722,10 @@ def test_tree_stab_cap_stream_remaps_later_compact_labels():
         ("cap", 1, vec),
         ("rz", 0.19, 2),
     ]
-    tree = pepsy.TreeStabOptimizer(
+    tree = pepsy.StabilizerTreeSimulator(
         4, chi=None, gates=stream, max_dense_cap_qubits=6
     )
-    mps = pepsy.MpsStabOptimizer(
+    mps = pepsy.StabilizerMpsSimulator(
         4, chi=None, gates=stream, max_dense_cap_qubits=6
     )
     tree.run()
@@ -731,7 +741,7 @@ def test_tree_stab_cap_does_not_lower_state_replacement_to_dense_operator(
 ):
     from pepsy.optimizers.tree import TreeOptimizer
 
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         4, chi=None, max_dense_cap_qubits=6
     ).apply([
         ("h", 0),
@@ -751,14 +761,14 @@ def test_tree_stab_cap_does_not_lower_state_replacement_to_dense_operator(
 
 
 def test_tree_stab_cap_dense_guard():
-    opt = pepsy.TreeStabOptimizer(3, max_dense_cap_qubits=2)
+    opt = pepsy.StabilizerTreeSimulator(3, max_dense_cap_qubits=2)
     with pytest.raises(ValueError, match="max_dense_cap_qubits=2"):
         opt.cap(0, [1.0, 0.0])
 
 
 def test_tree_stab_frame_maps_pauli_rotation_to_tree_coefficient_state():
     theta = 0.37
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     opt.apply([("h", 0), ("cnot", 0, 1)])
     opt.apply_pauli_rotation(theta, "Z", 0)
 
@@ -772,7 +782,7 @@ def test_tree_stab_frame_maps_pauli_rotation_to_tree_coefficient_state():
 
 
 def test_tree_stab_public_centre_shift_supports_canonical_norm_readout():
-    opt = pepsy.TreeStabOptimizer.from_bits("0000", track_truncation=False)
+    opt = pepsy.StabilizerTreeSimulator.from_bits("0000", track_truncation=False)
     initial_norm = opt.norm()
 
     assert opt.shift_orthogonality_center() is opt
@@ -780,7 +790,7 @@ def test_tree_stab_public_centre_shift_supports_canonical_norm_readout():
 
 
 def test_tree_stab_fixed_measurement_matches_dense_born_probability():
-    opt = pepsy.TreeStabOptimizer(1)
+    opt = pepsy.StabilizerTreeSimulator(1)
     opt.apply(("h", 0))
 
     outcome, probability, diagnostics = opt.measure_pauli(
@@ -795,18 +805,18 @@ def test_tree_stab_fixed_measurement_matches_dense_born_probability():
 
 
 def test_tree_stab_matrix_clifford_and_long_pauli_use_supported_paths():
-    opt = pepsy.TreeStabOptimizer(2, max_operator_qubits=1)
+    opt = pepsy.StabilizerTreeSimulator(2, max_operator_qubits=1)
     opt.apply([(H, 0), (CNOT, (0, 1))])
     expected = _apply_local(_apply_local(np.array([1, 0, 0, 0]), H, (0,), 2), CNOT, (0, 1), 2)
     _assert_same_state(opt.to_statevector(), expected)
 
-    long_opt = pepsy.TreeStabOptimizer(6, max_operator_qubits=1)
+    long_opt = pepsy.StabilizerTreeSimulator(6, max_operator_qubits=1)
     long_opt.apply([("rot", 0.21, "XXXXXX", tuple(range(6)))])
     assert long_opt.norm() == pytest.approx(1.0)
 
 
 def test_tree_stab_basis_updating_measurement_preserves_physical_state():
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     opt.apply([("h", 0), ("cnot", 0, 1)])
 
     before = opt.to_statevector()
@@ -822,18 +832,18 @@ def test_tree_stab_basis_updating_measurement_preserves_physical_state():
 
 
 def test_tree_stab_measure_disentangle_alias():
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     opt.apply([("h", 0), ("cnot", 0, 1)])
 
     assert opt.measure("Z", 0, outcome=+1, disentangle=True) == +1
     assert opt.projection_diagnostics[-1]["basis_updated"] is True
-    assert pepsy.TreeStabOptimizer.measure_event("Z", 0, disentangle=True) == (
+    assert pepsy.StabilizerTreeSimulator.measure_event("Z", 0, disentangle=True) == (
         "measure", "Z", (0,), None, True
     )
 
 
 def test_tree_stab_measure_many_uses_adaptive_tree_span_order():
-    opt = pepsy.TreeStabOptimizer(4).apply([("cnot", 0, 3)])
+    opt = pepsy.StabilizerTreeSimulator(4).apply([("cnot", 0, 3)])
 
     outcomes = opt.measure_many(
         [("Z", 3, +1), ("Z", 1, +1)],
@@ -847,17 +857,17 @@ def test_tree_stab_measure_many_uses_adaptive_tree_span_order():
 
 
 def test_tree_stab_measure_many_accepts_input_or_target_order_override():
-    opt = pepsy.TreeStabOptimizer(3)
+    opt = pepsy.StabilizerTreeSimulator(3)
     opt.measure_many([("Z", 1, +1), ("X", 2, +1)], order="input")
     assert [event["qubit"] for event in opt.last_measurement_schedule] == [1, 2]
 
-    opt = pepsy.TreeStabOptimizer(3)
+    opt = pepsy.StabilizerTreeSimulator(3)
     opt.measure_many([("Z", 1, +1), ("X", 2, +1)], order=[2, 1])
     assert [event["qubit"] for event in opt.last_measurement_schedule] == [2, 1]
 
 
 def test_tree_stab_basis_updating_measurement_handles_tree_support_order():
-    opt = pepsy.TreeStabOptimizer(5)
+    opt = pepsy.StabilizerTreeSimulator(5)
     opt.apply([("h", 0), ("cnot", 0, 4), ("h", 2), ("cnot", 2, 3)])
     before = opt.to_statevector()
 
@@ -884,11 +894,11 @@ def test_tree_stab_basis_updating_measurement_handles_tree_support_order():
 
 
 def test_tree_stab_reset_and_measure_reset_recycle_targets():
-    opt = pepsy.TreeStabOptimizer.from_bits("1")
+    opt = pepsy.StabilizerTreeSimulator.from_bits("1")
     opt.reset(0)
     _assert_same_state(opt.to_statevector(), np.array([1.0, 0.0], dtype=complex))
 
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     opt.apply([("h", 0), ("cnot", 0, 1)])
     measured = opt.measure_reset("Z", 0, outcome=+1)
     assert measured == +1
@@ -897,7 +907,7 @@ def test_tree_stab_reset_and_measure_reset_recycle_targets():
 
 
 def test_tree_stab_reset_many_uses_tree_span_order_without_readout_records():
-    opt = pepsy.TreeStabOptimizer(4).apply([("cnot", 0, 3)])
+    opt = pepsy.StabilizerTreeSimulator(4).apply([("cnot", 0, 3)])
 
     opt.reset_many((3, 1))
 
@@ -906,7 +916,7 @@ def test_tree_stab_reset_many_uses_tree_span_order_without_readout_records():
 
 
 def test_tree_stab_basis_update_stream_events_are_supported():
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         1,
         gates=[("h", 0), ("measure", "Z", 0, +1, True), ("reset", 0)],
     )
@@ -916,7 +926,7 @@ def test_tree_stab_basis_update_stream_events_are_supported():
 
 @pytest.mark.parametrize("outcome", [+1, -1])
 def test_tree_stab_inject_t_matches_dense_branch(outcome):
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     opt.apply(("h", 0))
     opt.prepare_magic(1)
     measured = opt.inject_t(0, 1, outcome=outcome)
@@ -931,7 +941,7 @@ def test_tree_stab_inject_t_matches_dense_branch(outcome):
 
 @pytest.mark.parametrize("phi", [np.pi / 4.0, -np.pi / 4.0, 3.0 * np.pi / 4.0])
 def test_tree_stab_inject_rz_matches_dense_state(phi):
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     opt.apply(("h", 0))
     opt.prepare_magic(1, angle=phi)
     opt.inject_rz(0, 1, phi, outcome=+1)
@@ -943,10 +953,10 @@ def test_tree_stab_inject_rz_matches_dense_state(phi):
 
 def test_tree_stab_with_injection_recycles_ancilla_and_matches_direct():
     stream = [("h", 0), ("t", 0), ("t", 0)]
-    injected = pepsy.TreeStabOptimizer.with_injection(
+    injected = pepsy.StabilizerTreeSimulator.with_injection(
         1, stream, n_ancilla=1, seed=7
     )
-    direct = pepsy.TreeStabOptimizer(2)
+    direct = pepsy.StabilizerTreeSimulator(2)
     direct.apply(stream)
 
     _assert_same_state(injected.to_statevector(), direct.to_statevector())
@@ -957,7 +967,7 @@ def test_tree_stab_with_injection_recycles_ancilla_and_matches_direct():
 
 
 def test_tree_stab_magic_layout_includes_injection_supports_and_finder_options():
-    injected = pepsy.TreeStabOptimizer.with_injection(
+    injected = pepsy.StabilizerTreeSimulator.with_injection(
         2,
         [("h", 0), ("t", 0), ("cnot", 0, 1), ("tdg", 1)],
         n_ancilla=2,
@@ -977,7 +987,7 @@ def test_tree_stab_magic_layout_includes_injection_supports_and_finder_options()
 
 
 def test_tree_stab_injection_protects_reserved_ancillas():
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     with pytest.raises(ValueError, match="reserved ancilla"):
         opt.run_with_injection([("h", 1), ("t", 0)], ancillas=[1])
 
@@ -994,8 +1004,8 @@ def test_tree_stab_deferred_injection_matches_direct_circuit(projection_order):
         ("rz", np.pi / 4.0, 1), ("cnot", 1, 2), ("t", 1),
     ]
     outcomes = [+1, -1, +1, -1]
-    direct = pepsy.TreeStabOptimizer(7).apply(stream)
-    deferred = pepsy.TreeStabOptimizer.with_deferred_injection(
+    direct = pepsy.StabilizerTreeSimulator(7).apply(stream)
+    deferred = pepsy.StabilizerTreeSimulator.with_deferred_injection(
         3,
         stream,
         outcomes=outcomes,
@@ -1018,7 +1028,7 @@ def test_tree_stab_deferred_injection_matches_direct_circuit(projection_order):
 def test_tree_stab_deferred_injection_accepts_explicit_projection_order():
     stream = [("h", 0), ("t", 0), ("tdg", 1), ("t", 1)]
     ancillas = (2, 3, 4)
-    deferred = pepsy.TreeStabOptimizer(5)
+    deferred = pepsy.StabilizerTreeSimulator(5)
     deferred.run_with_deferred_injection(
         stream,
         ancillas=ancillas,
@@ -1035,12 +1045,12 @@ def test_tree_stab_deferred_injection_accepts_explicit_projection_order():
 
 def test_tree_stab_deferred_injection_requires_fresh_ancillas():
     with pytest.raises(ValueError, match="one ancilla per injectable gate"):
-        pepsy.TreeStabOptimizer.with_deferred_injection(
+        pepsy.StabilizerTreeSimulator.with_deferred_injection(
             2, [("t", 0), ("t", 1)], n_ancilla=1
         )
 
     with pytest.raises(ValueError, match="reserved ancilla"):
-        pepsy.TreeStabOptimizer.with_deferred_injection(
+        pepsy.StabilizerTreeSimulator.with_deferred_injection(
             2, [("h", 2), ("t", 0)], n_ancilla=1
         )
 
@@ -1048,20 +1058,20 @@ def test_tree_stab_deferred_injection_requires_fresh_ancillas():
 def test_tree_stab_tableau_state_constructor_validates_qubit_count():
     sim = stim.TableauSimulator()
     sim.set_num_qubits(3)
-    opt = pepsy.TreeStabOptimizer(2)
+    opt = pepsy.StabilizerTreeSimulator(2)
     with pytest.raises(ValueError, match="same number of qubits"):
-        pepsy.TreeStabOptimizer.from_tableau_and_state(sim, opt.p)
+        pepsy.StabilizerTreeSimulator.from_tableau_and_state(sim, opt.p)
 
 
 def test_tree_stab_mps_compatibility_aliases_and_tree_diagnostics():
     import quimb.tensor as qtn
 
     product = qtn.MPS_computational_state("10", dtype="complex128")
-    opt = pepsy.TreeStabOptimizer.from_mps(product, track_truncation=True)
+    opt = pepsy.StabilizerTreeSimulator.from_mps(product, track_truncation=True)
 
     assert (
-        pepsy.TreeStabOptimizer.from_tableau_and_nu.__func__
-        is pepsy.TreeStabOptimizer.from_tableau_and_state.__func__
+        pepsy.StabilizerTreeSimulator.from_tableau_and_nu.__func__
+        is pepsy.StabilizerTreeSimulator.from_tableau_and_state.__func__
     )
     assert opt.max_pauli_decomposition_qubits == opt.max_operator_qubits
     assert opt.expectation_pauli_sum([(1.0, "Z", 0), (0.5, "Z", 1)]) == pytest.approx(
@@ -1075,7 +1085,7 @@ def test_tree_stab_mps_compatibility_aliases_and_tree_diagnostics():
 def test_tree_stab_nonclifford_one_qubit_matrix_matches_dense():
     theta = 0.37
     prep = [("h", 0), (CNOT, (0, 1))]
-    opt = pepsy.TreeStabOptimizer(2).apply(prep + [(_rz(theta), 1)])
+    opt = pepsy.StabilizerTreeSimulator(2).apply(prep + [(_rz(theta), 1)])
 
     expected = _apply_local(
         _apply_local(np.array([1, 0, 0, 0]), H, (0,), 2), CNOT, (0, 1), 2
@@ -1087,7 +1097,7 @@ def test_tree_stab_nonclifford_one_qubit_matrix_matches_dense():
 
 def test_tree_stab_float32_nonclifford_unitary_keeps_norm_tracking():
     gate = np.asarray(_rzz(0.37), dtype=np.complex64)
-    opt = pepsy.TreeStabOptimizer(2, chi=1).apply([(gate, (0, 1))])
+    opt = pepsy.StabilizerTreeSimulator(2, chi=1).apply([(gate, (0, 1))])
 
     assert opt.norm() == pytest.approx(1.0, abs=1e-7)
     assert opt.get_norm_events()
@@ -1098,7 +1108,7 @@ def test_tree_stab_float32_nonclifford_unitary_keeps_norm_tracking():
 
 def test_tree_stab_nonclifford_two_qubit_matrix_matches_dense():
     prep = [(H, 0), (CNOT, (0, 2)), ("t", 1)]
-    opt = pepsy.TreeStabOptimizer(3).apply(prep)
+    opt = pepsy.StabilizerTreeSimulator(3).apply(prep)
     before = opt.to_statevector()
     opt.apply([(_rzz(0.5), (0, 1))])
 
@@ -1114,8 +1124,8 @@ def test_tree_and_mps_stab_accept_the_same_pepsy_dense_gate_stream():
         (pepsy.rzz(0.41), (0, 1)),
         (pepsy.rx(-0.17), 2),
     ]
-    tree = pepsy.TreeStabOptimizer(3, chi=None).apply(stream)
-    mps = pepsy.MpsStabOptimizer(3, chi=None).apply(stream)
+    tree = pepsy.StabilizerTreeSimulator(3, chi=None).apply(stream)
+    mps = pepsy.StabilizerMpsSimulator(3, chi=None).apply(stream)
 
     expected = np.zeros(8, dtype=complex)
     expected[0] = 1.0
@@ -1136,13 +1146,13 @@ def test_tree_stab_three_qubit_dense_operator_matches_mps_and_dense():
     raw = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
     unitary, _ = np.linalg.qr(raw)
     prep = [(H, 0), (CNOT, (0, 1)), (H, 2)]
-    tree = pepsy.TreeStabOptimizer(
+    tree = pepsy.StabilizerTreeSimulator(
         3,
         chi=None,
         max_operator_qubits=3,
         max_pauli_terms=64,
     ).apply(prep + [(unitary, (0, 1, 2))])
-    mps = pepsy.MpsStabOptimizer(
+    mps = pepsy.StabilizerMpsSimulator(
         3,
         chi=None,
         max_pauli_decomposition_qubits=3,
@@ -1169,7 +1179,7 @@ def test_tree_stab_large_dense_operator_term_budget_fails_before_replay():
     rng = np.random.default_rng(18)
     raw = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
     unitary, _ = np.linalg.qr(raw)
-    opt = pepsy.TreeStabOptimizer(
+    opt = pepsy.StabilizerTreeSimulator(
         3, max_operator_qubits=3, max_pauli_terms=8
     )
     before = opt.to_statevector().copy()
@@ -1179,7 +1189,7 @@ def test_tree_stab_large_dense_operator_term_budget_fails_before_replay():
     assert opt._queue == [(unitary, (0, 1, 2))]
 
 
-@pytest.mark.parametrize("backend_cls", [pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer])
+@pytest.mark.parametrize("backend_cls", [pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator])
 def test_stabilizer_tree_and_mps_feed_forward_uses_measurement_record(backend_cls):
     opt = backend_cls(2, seed=3)
     opt.apply([
@@ -1195,7 +1205,7 @@ def test_stabilizer_tree_and_mps_feed_forward_uses_measurement_record(backend_cl
 def test_tree_stab_nonunitary_matrix_matches_dense_without_clifford_coercion():
     probability = 0.2
     gate = (1.0 - probability) * np.eye(2, dtype=complex) + probability * X
-    opt = pepsy.TreeStabOptimizer(2).apply([("h", 0), (gate, 0)])
+    opt = pepsy.StabilizerTreeSimulator(2).apply([("h", 0), (gate, 0)])
 
     expected = _apply_local(
         _apply_local(np.array([1, 0, 0, 0]), H, (0,), 2), gate, (0,), 2
@@ -1230,7 +1240,7 @@ def test_tree_stab_two_site_dense_gate_matches_tree_direct_kernel():
         mode="direct",
         run=False,
     )
-    stabilizer = pepsy.TreeStabOptimizer.from_bits(
+    stabilizer = pepsy.StabilizerTreeSimulator.from_bits(
         "0" * n,
         gates=stream,
         tree=plan,
@@ -1274,7 +1284,7 @@ def test_tree_stab_three_site_dense_gate_preserves_separated_active_support():
         (s, {support[0]: "X", support[1]: "X", support[2]: "X"}),
     ])
 
-    stabilizer = pepsy.TreeStabOptimizer.from_bits(
+    stabilizer = pepsy.StabilizerTreeSimulator.from_bits(
         "0" * n,
         tree=plan,
         chi=2,
@@ -1293,7 +1303,7 @@ def test_tree_stab_three_site_dense_gate_preserves_separated_active_support():
 def test_tree_stab_dense_matrix_budget_is_checked_before_decomposition():
     gate = np.eye(8, dtype=complex)
     gate[0, 0] = 0.5
-    opt = pepsy.TreeStabOptimizer(3, max_operator_qubits=2)
+    opt = pepsy.StabilizerTreeSimulator(3, max_operator_qubits=2)
     before = opt.to_statevector()
 
     with pytest.raises(ValueError, match="max_operator_qubits=2"):
@@ -1304,10 +1314,10 @@ def test_tree_stab_dense_matrix_budget_is_checked_before_decomposition():
 
 
 def test_tree_stab_accepts_mps_decomposition_budget_alias():
-    opt = pepsy.TreeStabOptimizer(2, max_pauli_decomposition_qubits=1)
+    opt = pepsy.StabilizerTreeSimulator(2, max_pauli_decomposition_qubits=1)
     assert opt.max_operator_qubits == 1
     with pytest.raises(ValueError, match="only one of"):
-        pepsy.TreeStabOptimizer(
+        pepsy.StabilizerTreeSimulator(
             2,
             max_operator_qubits=1,
             max_pauli_decomposition_qubits=1,
@@ -1322,10 +1332,10 @@ def test_tree_stab_exact_cooling_preserves_state_and_avoids_bond_growth():
     state = qtn.MPS_product_state([pivot, magic])
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.37, 1)]
 
-    cooled = pepsy.TreeStabOptimizer.from_mps(
+    cooled = pepsy.StabilizerTreeSimulator.from_mps(
         state.copy(), chi=64, exact_cooling=True
     ).apply(stream)
-    plain = pepsy.TreeStabOptimizer.from_mps(
+    plain = pepsy.StabilizerTreeSimulator.from_mps(
         state.copy(), chi=64, exact_cooling=False
     ).apply(stream)
 
@@ -1343,8 +1353,8 @@ def test_tree_stab_exact_cooling_falls_back_without_a_stabilizer_pivot():
     state = qtn.MPS_product_state([magic_a, magic_b])
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.37, 1)]
 
-    cooled = pepsy.TreeStabOptimizer.from_mps(state.copy()).apply(stream)
-    plain = pepsy.TreeStabOptimizer.from_mps(
+    cooled = pepsy.StabilizerTreeSimulator.from_mps(state.copy()).apply(stream)
+    plain = pepsy.StabilizerTreeSimulator.from_mps(
         state.copy(), exact_cooling=False
     ).apply(stream)
 
