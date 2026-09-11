@@ -927,6 +927,114 @@ def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
     )
 
 
+@pytest.mark.parametrize("fit_mode", ("direct", "src", "zipup", "sdc", "dm"))
+def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
+    """Direct compressors can absorb the standard BRA/KET layers separately."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=485, dtype="float64")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=4,
+        fit_mode=fit_mode,
+        fit_layer_mode="sequential",
+        layer_tags=("BRA", "KET"),
+        n_iter=1,
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert np.isfinite(complex(result.cost).real)
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == fit_mode
+        and diagnostic.convergence_reason == "fixed_compression"
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+def test_contract_flat_supports_sequential_three_layer_compression():
+    """A tagged BRA--PEPO--KET target is compressed one layer at a time."""
+
+    def add_unit_layer(tn, layer, *, lx=2, ly=2):
+        for x in range(lx):
+            for y in range(ly):
+                inds = []
+                if x > 0:
+                    inds.append(f"{layer}-h-{x - 1}-{y}")
+                if x < lx - 1:
+                    inds.append(f"{layer}-h-{x}-{y}")
+                if y > 0:
+                    inds.append(f"{layer}-v-{x}-{y - 1}")
+                if y < ly - 1:
+                    inds.append(f"{layer}-v-{x}-{y}")
+                if layer == "BRA":
+                    inds.append(f"phys-in-{x}-{y}")
+                elif layer == "PEPO":
+                    inds.extend((f"phys-in-{x}-{y}", f"phys-out-{x}-{y}"))
+                else:
+                    inds.append(f"phys-out-{x}-{y}")
+                tn.add_tensor(
+                    qtn.Tensor(
+                        data=np.ones((1,) * len(inds)),
+                        inds=inds,
+                        tags={f"X{x}", f"Y{y}", layer},
+                    )
+                )
+
+    sandwich = qtn.TensorNetwork()
+    add_unit_layer(sandwich, "BRA")
+    add_unit_layer(sandwich, "PEPO")
+    add_unit_layer(sandwich, "KET")
+
+    value = pepsy.contract_flat(
+        sandwich,
+        chi=2,
+        method="dmrg",
+        fit_mode="sdc",
+        fit_layer_mode="sequential",
+        layer_tags=("BRA", "PEPO", "KET"),
+        n_iter=1,
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert value == pytest.approx(1.0)
+
+
+def test_compbdy_sequential_layer_mode_is_restricted_to_direct_modes():
+    """Sequential layer compression must not silently alter FIT semantics."""
+    norm = type("TaggedNorm", (), {"tags": {"X0", "Y0", "BRA", "KET"}})()
+
+    assert (
+        pepsy.CompBdy(
+            norm,
+            {},
+            fit_mode="src",
+            fit_layer_mode="layerwise",
+        ).fit_layer_mode
+        == "sequential"
+    )
+    with pytest.raises(ValueError, match="only supported with direct"):
+        pepsy.CompBdy(norm, {}, fit_mode="eff", fit_layer_mode="sequential")
+
+
+def test_sequential_layer_mode_rejects_native_mps_method():
+    """The native Quimb path must not silently ignore the layer policy."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=486, dtype="float64")
+
+    with pytest.raises(ValueError, match="requires method='dmrg'"):
+        pepsy.peps_norm(
+            ket,
+            chi=2,
+            method="mps",
+            fit_layer_mode="sequential",
+            progress=False,
+        )
+
+
 def test_peps_norm_dmrg2_reports_two_site_warmup_and_one_site_refinement():
     """DMRG2 diagnostics should expose both phases of the FIT schedule."""
     ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=484, dtype="complex128")

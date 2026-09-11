@@ -45,6 +45,12 @@ The local boundary solver is selected with `fit_mode`:
 - `"global"` uses the reference global FIT solve.
 - `"dmrg"` is an alias for `"eff"`.
 
+Direct Quimb modes support `fit_layer_mode="joint"` (default) or
+`"sequential"`. Sequential mode applies the selected direct compressor to
+each tagged layer in `layer_tags` order, which can be useful for a
+BRA--PEPO--KET boundary. It is intentionally unavailable for variational FIT
+modes, whose target remains the complete local layered network.
+
 Each boundary FIT can optionally use `fit_init_strategy="guess-direct"`,
 `"guess-src"`, or `"guess-sdc"`. These compress a copy of the exact
 boundary target and give that disposable result to FIT as its initial guess.

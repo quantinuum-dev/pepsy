@@ -12,6 +12,17 @@ the following boundary-compression modes:
   in the same spirit as a two-site-to-one-site MPS optimizer.
 - `fit_mode="global"`: the full-contraction reference fit.
 
+Direct Quimb modes also accept `fit_layer_mode="joint"` (the default) or
+`fit_layer_mode="sequential"`. Joint mode compresses all tagged layers in a
+boundary slice together. Sequential mode compresses them one at a time in the
+order given by `layer_tags`, for example
+`layer_tags=("BRA", "PEPO", "KET")`. Sequential mode is available only for
+the direct Quimb modes; FIT/DMRG modes always use a joint target.
+
+The layer policy applies to the package `method="dmrg"` path. Quimb's native
+`method="mps"` path already handles `layer_tags` itself and rejects
+`fit_layer_mode="sequential"` rather than silently ignoring the option.
+
 Selectors are normalized early: `"two_site"` is accepted as an alias for
 `"two-site"`, `"one-site"` aliases `"eff"`, and `"dmrg"` aliases the
 historical `"eff"` spelling. Unknown values fail before boundary work starts.
@@ -42,6 +53,7 @@ result = pepsy.peps_norm(
     chi=64,
     method="dmrg",
     fit_mode="dmrg2",
+    fit_layer_mode="joint",
     fit_init_strategy="guess-src",
     fit_init_seed=7,
     fit_sweep_sequence="RL",

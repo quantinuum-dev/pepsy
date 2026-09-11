@@ -45,6 +45,7 @@ _FIT_QUIMB_MODES = frozenset({"direct", "src", "zipup", "sdc", "dm"})
 _FIT_CUTOFF_MODES = frozenset(
     {"rel", "rsum2", "rsum1", "abs", "sum2", "sum1"}
 )
+_FIT_LAYER_MODES = frozenset({"joint", "sequential"})
 
 
 def _canonical_fit_mode_selector(fit_mode):
@@ -92,6 +93,26 @@ def _canonical_fit_cutoff_mode(mode):
             f"{allowed}."
         )
     return key
+
+
+def _canonical_fit_layer_mode(mode):
+    """Normalize how direct compressors combine tagged tensor layers."""
+    key = str(mode).strip().lower().replace("_", "-")
+    aliases = {
+        "joint": "joint",
+        "combined": "joint",
+        "all": "joint",
+        "sequential": "sequential",
+        "layerwise": "sequential",
+        "layer-by-layer": "sequential",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(_FIT_LAYER_MODES))
+        raise ValueError(
+            f"Unknown fit_layer_mode={mode!r}. Expected one of {allowed}."
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -168,13 +189,24 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Contraction optimizer used by the local :class:`~pepsy.fitting.local.FIT`
         boundary fits. Kept separate from ``contraction_opt`` so the local
         fitting path can be tuned independently of the final contraction.
-    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "one-site", "dmrg", "dmrg1", "two-site", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff",
+        "one-site", "dmrg", "dmrg1", "two-site", "dmrg2", "global"},
+        default="eff"
         Boundary compression backend. The Quimb modes ``"direct"``,
         ``"src"``, ``"zipup"``, ``"sdc"``, and ``"dm"`` directly compress
         each boundary target. ``"dmrg"`` (also ``"eff"``/``"one-site"``)
         uses one-site FIT. ``"dmrg2"`` uses two-site FIT for the configured
         warm-up sweeps, then one-site refinement. ``"two-site"`` remains the
         legacy all-two-site FIT mode and ``"global"`` uses ``FIT.run``.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        For direct Quimb compression modes, combine all tagged layers in one
+        local boundary target (``"joint"``), or compress them one at a time
+        in the order given by ``layer_tags`` (``"sequential"``). Sequential
+        compression is intentionally unavailable for variational FIT modes.
+    layer_tags : sequence[str] | None, default=None
+        Layer tags and, for ``fit_layer_mode="sequential"``, their absorption
+        order. The standard two-layer order is ``("KET", "BRA")``. Supply
+        tags explicitly for a three-layer BRA--PEPO--KET network.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial guess for each boundary FIT solve. ``"direct"``
         reuses the existing boundary guess. ``"guess-src"`` first applies
@@ -239,6 +271,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         fit_contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_layer_mode="joint",
+        layer_tags=None,
         fit_init_strategy="direct",
         fit_init_seed=0,
         fit_block_size=1,
@@ -263,6 +297,31 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # Validate at construction time rather than after an expensive PEPS
         # boundary has already reached its first local fit.
         self.fit_mode = _canonical_fit_mode_selector(fit_mode)
+        self.fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+        if (
+            self.fit_layer_mode == "sequential"
+            and self.fit_mode not in _FIT_QUIMB_MODES
+        ):
+            raise ValueError(
+                "fit_layer_mode='sequential' is only supported with direct "
+                "Quimb fit modes: 'direct', 'src', 'zipup', 'sdc', or 'dm'."
+            )
+        if layer_tags is None:
+            self.layer_tags = None
+        elif isinstance(layer_tags, str):
+            self.layer_tags = (layer_tags,)
+        else:
+            try:
+                self.layer_tags = tuple(str(tag) for tag in layer_tags)
+            except TypeError as exc:
+                raise TypeError(
+                    "layer_tags must be a string or sequence of strings."
+                ) from exc
+        if self.layer_tags is not None:
+            if not self.layer_tags or any(not tag for tag in self.layer_tags):
+                raise ValueError("layer_tags must contain at least one non-empty tag.")
+            if len(set(self.layer_tags)) != len(self.layer_tags):
+                raise ValueError("layer_tags must not contain duplicates.")
         self.fit_init_strategy = _canonical_fit_init_strategy(fit_init_strategy)
         self.fit_init_seed = fit_init_seed
         if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
@@ -621,7 +680,62 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             )
         )
 
-    def _compress_boundary(self, tn, boundary_mps, boundary_key, site_tag_id):
+    def _resolve_fit_layer_tags(self, tn):
+        """Return layer tags in the requested sequential absorption order."""
+        if self.layer_tags is None:
+            layer_tags = tuple(
+                tag for tag in ("KET", "BRA") if tag in getattr(tn, "tags", ())
+            )
+        else:
+            layer_tags = self.layer_tags
+
+        missing = [tag for tag in layer_tags if tag not in getattr(tn, "tags", ())]
+        if missing:
+            missing_text = ", ".join(repr(tag) for tag in missing)
+            raise ValueError(
+                "fit_layer_mode='sequential' could not find layer tag(s) "
+                f"{missing_text} in the current boundary target. Supply "
+                "layer_tags in the desired absorption order."
+            )
+        if not layer_tags:
+            raise ValueError(
+                "fit_layer_mode='sequential' requires tagged layers. Supply "
+                "layer_tags, for example ('BRA', 'PEPO', 'KET')."
+            )
+        return layer_tags
+
+    def _compress_direct_target(self, tn, *, max_bond, cutoff, site_tags):
+        """Compress one local 1D target with the selected Quimb method."""
+        if len(site_tags) <= 1:
+            return tn.copy()
+
+        method = self.fit_mode
+        if method == "src":
+            # SRC is rank-controlled; keep the explicit zero cutoff to avoid
+            # Quimb's advisory warning and match MPS semantics.
+            cutoff = 0.0
+        compress_kwargs = {
+            "max_bond": int(max_bond),
+            "cutoff": cutoff,
+            "method": method,
+            "site_tags": site_tags,
+            "permute_arrays": False,
+            "inplace": False,
+        }
+        if method == "src":
+            compress_kwargs["seed"] = self.fit_init_seed
+        else:
+            compress_kwargs["cutoff_mode"] = self.fit_cutoff_mode
+        return qtn.tensor_network_1d_compress(tn.copy(), **compress_kwargs)
+
+    def _compress_boundary(  # pylint: disable=too-many-locals
+        self,
+        tn,
+        boundary_mps,
+        boundary_key,
+        site_tag_id,
+        previous=None,
+    ):
         """Compress one boundary target with a direct Quimb method."""
         started = time.perf_counter() if self.fit_timing else None
         if self._uses_symmray_arrays(tn):
@@ -630,51 +744,50 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 "native Symmray boundary targets; use fit_mode='dmrg'."
             )
 
-        if int(boundary_mps.L) <= 1:
-            compressed = tn.copy()
-            compressed.view_as_(
-                qtn.MatrixProductState,
-                L=boundary_mps.L,
-                site_tag_id=site_tag_id,
-                site_ind_id=None,
-                cyclic=False,
+        max_bond = self.fit_max_bond
+        if max_bond is None:
+            max_bond = int(boundary_mps.max_bond())
+        cutoff = self._resolve_fit_cutoff(tn)
+        site_tags = tuple(
+            site_tag_id.format(site) for site in range(int(boundary_mps.L))
+        )
+
+        if self.fit_layer_mode == "joint":
+            compressed = self._compress_direct_target(
+                tn,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                site_tags=site_tags,
             )
         else:
-            max_bond = self.fit_max_bond
-            if max_bond is None:
-                max_bond = int(boundary_mps.max_bond())
-            method = self.fit_mode
-            cutoff = self._resolve_fit_cutoff(tn)
-            if method == "src":
-                # SRC is rank-controlled; keep the explicit zero cutoff to
-                # avoid Quimb's advisory warning and match MPS semantics.
-                cutoff = 0.0
-            site_tags = tuple(
-                site_tag_id.format(site) for site in range(int(boundary_mps.L))
-            )
-            compress_kwargs = {
-                "max_bond": int(max_bond),
-                "cutoff": cutoff,
-                "method": method,
-                "site_tags": site_tags,
-                "permute_arrays": False,
-                "inplace": False,
-            }
-            if method == "src":
-                compress_kwargs["seed"] = self.fit_init_seed
-            else:
-                compress_kwargs["cutoff_mode"] = self.fit_cutoff_mode
-            compressed = qtn.tensor_network_1d_compress(
-                tn.copy(),
-                **compress_kwargs,
-            )
-            compressed.view_as_(
-                qtn.MatrixProductState,
-                L=boundary_mps.L,
-                site_tag_id=site_tag_id,
-                site_ind_id=None,
-                cyclic=False,
-            )
+            compressed = previous
+            layer_tags = self._resolve_fit_layer_tags(tn)
+            for layer_tag in layer_tags:
+                layer_tn = tn.select(layer_tag, "any")
+                target = layer_tn if compressed is None else layer_tn | compressed
+                compressed = self._compress_direct_target(
+                    target,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    site_tags=site_tags,
+                )
+                # The result is now a boundary carrying open indices for the
+                # remaining layers. Do not let its source-layer tags leak into
+                # the next spatial step, where ``select(layer_tag)`` should
+                # see only the newly absorbed physical layer.
+                present_layer_tags = tuple(
+                    tag for tag in layer_tags if tag in compressed.tags
+                )
+                if present_layer_tags:
+                    compressed.drop_tags(present_layer_tags)
+
+        compressed.view_as_(
+            qtn.MatrixProductState,
+            L=boundary_mps.L,
+            site_tag_id=site_tag_id,
+            site_ind_id=None,
+            cyclic=False,
+        )
 
         if self.equalize_norms:
             compressed.equalize_norms_(value=self.equalize_norms)
@@ -911,6 +1024,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 boundary_mps,
                 boundary_key,
                 site_tag_id,
+                previous=previous,
             )
 
         fit_guess = self._build_fit_initial_guess(
