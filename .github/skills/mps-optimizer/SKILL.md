@@ -212,7 +212,7 @@ gates preserve the isometry structure; non-unitary one-site gates need explicit
 recanonicalization.
 
 Do not transfer diagnostic semantics from `MpsOptimizer` to
-`MpsStabOptimizer`. The stabilizer coefficient-MPS simulator has its own sparse
+`StabilizerMpsSimulator`. The stabilizer coefficient-MPS simulator has its own sparse
 normalized-unitary norm-loss contract; read
 `.github/skills/stabilizer-tensor-networks/SKILL.md` before changing it.
 

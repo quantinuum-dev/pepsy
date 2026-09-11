@@ -129,6 +129,7 @@ def test_deprecated_boundary_aliases_warn(alias_name, canonical_name):
     [
         ("QMeraParametricEnergyOptimizer", "QMeraEnergyOptimizer"),
         ("MpsStabOptimizer", "StabilizerMpsSimulator"),
+        ("TreeStabOptimizer", "StabilizerTreeSimulator"),
     ],
 )
 def test_deprecated_optimizer_aliases_warn(alias_name, canonical_name):
@@ -146,9 +147,9 @@ def test_deprecated_stabilizer_alias_warns():
     import pepsy.optimizers.stabilizer_tn as stabilizer_tn
 
     stabilizer_tn.__dict__.pop("StabilizerMps", None)
-    with pytest.warns(DeprecationWarning, match="MpsStabOptimizer"):
+    with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
         alias = stabilizer_tn.StabilizerMps
-    assert alias is stabilizer_tn.MpsStabOptimizer
+    assert alias is stabilizer_tn.StabilizerMpsSimulator
 
 
 def test_deprecated_mera_alias_warns_and_matches_qmera():
@@ -178,6 +179,8 @@ def test_deprecated_aliases_are_documented():
     assert "`pepsy.boundary.infidelity`" in migration
     assert "`pepsy.optimizers.QMeraParametricEnergyOptimizer`" in migration
     assert "`pepsy.optimizers.MpsStabOptimizer`" in migration
+    assert "`pepsy.optimizers.TreeStabOptimizer`" in migration
+    assert "`pepsy.sampling.MpsStabSampler`" in migration
     assert "`pepsy.optimizers.stabilizer_tn.StabilizerMps`" in migration
     assert "`pepsy.experimental.mera`" in migration
     assert "`pepsy.optimizers.mera`" in migration
@@ -187,7 +190,10 @@ def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
     from pepsy.optimizers.tree import TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan
     from pepsy.optimizers.tree_peps import TreePEPO, TreePepo, TreeSubPEPO, TreeSubPepo
-    from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
+    from pepsy.optimizers.tree_stabilizer import (
+        StabilizerTreeSimulator,
+        TreeStabOptimizer,
+    )
 
     assert pepsy.TreeLayoutFinder is TreeLayoutFinder
     assert pepsy.TreeOptimizer is TreeOptimizer
@@ -197,6 +203,7 @@ def test_tree_optimizers_are_available_from_high_level_api():
     assert TreeSubPEPO is TreeSubPepo
     assert pepsy.TreePEPO is TreePepo
     assert pepsy.TreeSubPEPO is TreeSubPepo
+    assert pepsy.StabilizerTreeSimulator is StabilizerTreeSimulator
     assert pepsy.TreeStabOptimizer is TreeStabOptimizer
 
 
@@ -215,13 +222,13 @@ _EXPECTED_IN_ALL = [
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "MpoChannelEvent", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "MpsStabSampler", "StabilizerMpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
-    "MpsStabOptimizer", "STNState", "StabilizerMpsSimulator",
+    "MpsStabOptimizer", "StabilizerMpsSimulator", "STNState",
     "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
     "TreePlan",
-    "TreeStabOptimizer",
+    "TreeStabOptimizer", "StabilizerTreeSimulator",
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
@@ -299,7 +306,7 @@ _CALLABLE_EXPORTS = [
     "TreeLayoutFinder",
     "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
     "TreePlan",
-    "TreeStabOptimizer",
+    "StabilizerTreeSimulator",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "tn_fidelity", "tn_norm", "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",

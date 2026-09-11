@@ -946,7 +946,7 @@ def _symbolic_rotation_gate(theta, paulis):
 def _symbolic_gate_entry(entry):
     """Return ``(gate, where)`` for a named gate entry, or ``None``.
 
-    The grammar mirrors the named stream accepted by ``MpsStabOptimizer``:
+    The grammar mirrors the named stream accepted by ``StabilizerMpsSimulator``:
     fixed gates use ``(name, site[, site])``, rotations use
     ``(name, angle, site[, site])``, and ``rot`` uses
     ``("rot", angle, paulis, sites)``. Unknown names are left untouched so

@@ -41,7 +41,7 @@ separate phases because their physical-space and topology contracts differ.
 
 This plan defines a new tree-embedded PEPS family for finite 2D and 3D
 lattices. It deliberately does not change the existing `TreeTensorNetwork`,
-`TreeMPO`, `TreeOptimizer`, or `TreeStabOptimizer` contracts until the shared
+`TreeMPO`, `TreeOptimizer`, or `StabilizerTreeSimulator` contracts until the shared
 tree primitives and representation boundaries are agreed and tested.
 
 ## Executive definition
@@ -461,7 +461,7 @@ stable and independent of tree node ids.
 
 This should share the existing stabilizer frame, measurement, injection,
 trajectory, and diagnostic semantics, but it should not blindly subclass the
-current `TreeStabOptimizer`: that implementation assumes the current
+current `StabilizerTreeSimulator`: that implementation assumes the current
 `TreeTensorNetwork` physical-site and layout contract. A shared frame/stream
 adapter or composition layer is safer than duplicating the tableau rules or
 forcing leaf-only assumptions into the new state.

@@ -31,6 +31,11 @@ default. `run()` accepts the ordinary MPS FIT controls, including `n_iter`,
 `fit_adaptive_sweeps`, `fit_sweep_sequence`, `finite_check`, and optional
 `fit_overlap_diagnostics`. `fit_rtol="auto"` is dtype-aware; `None` requests
 fixed sweeps. The default FIT warm start is `fit_init_strategy="guess-src"`.
+Optional performance diagnostics are disabled by default: `finite_check=False`,
+`fit_overlap_diagnostics=False`, and `timing=False`. Untimed replay performs no
+profiling clock reads and leaves `get_run_timing()` unset. Per-update STN
+norm-survival tracking remains part of the simulator's fidelity contract and
+is independent of these optional diagnostics.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
 native-compressed FIT guess before active bonds reach their `chi` ceilings;
@@ -83,11 +88,11 @@ deferred MAST, and the two cooling mechanisms, see the
 [STN magic and cooling how-to](../../howto/stabilizer_tn_magic.md).
 
 Before choosing settings, start with the Pepsy-native stream advisor:
-`MpsStabOptimizer.analyze_stream(gates, n_qubits=...)` returns a typed
+`StabilizerMpsSimulator.analyze_stream(gates, n_qubits=...)` returns a typed
 `StreamAnalysisRecord` with counts for Clifford entries, injectable T-family
 rotations, other non-Clifford rotations, dense matrices, coefficient-frame
 sub-MPOs, measurements, resets, caps, touched qubits, and warnings. Then
-`MpsStabOptimizer.recommend_settings(gates, goal="run" | "validate" |
+`StabilizerMpsSimulator.recommend_settings(gates, goal="run" | "validate" |
 "benchmark", ...)` returns a typed `StabilizerMpsSettingsAdvice` containing
 constructor settings (`chi`, `cutoff`, `exact_cooling`, `stabilize_unitary`),
 an explicit execution method (`apply`, `with_injection`, or
@@ -95,7 +100,7 @@ an explicit execution method (`apply`, `with_injection`, or
 human-readable `message`.
 
 `recommend_settings` calls the narrower
-`MpsStabOptimizer.recommend_magic_strategy(gates, ...)` internally for the
+`StabilizerMpsSimulator.recommend_magic_strategy(gates, ...)` internally for the
 `direct` / `immediate` / `deferred` decision. On an unrun simulator,
 `queued_stream_analysis()` and `queued_recommend_settings()` read its queue,
 including a `from_stim(..., stream_transform=...)` result. All of these APIs are
@@ -116,13 +121,13 @@ injection report, and remaining queue length. On a `from_stim` simulator,
 same runner without mutating the original queued simulator.
 
 You can initialize from an ordinary computational-basis qubit MPS directly:
-`MpsStabOptimizer(p)` or `MpsStabOptimizer.from_mps(p)` wraps `p` with the
+`StabilizerMpsSimulator(p)` or `StabilizerMpsSimulator.from_mps(p)` wraps `p` with the
 identity tableau, so initially `C = I` and `|psi> = |p>`. Use this for an
 already-prepared MPS ground state. Pass `inplace=False` to copy the supplied
 MPS before evolution.
 
 For one sampled Stim trajectory, use
-`MpsStabOptimizer.from_stim(circuit, seed=...)`. It compiles the Stim circuit,
+`StabilizerMpsSimulator.from_stim(circuit, seed=...)`. It compiles the Stim circuit,
 infers its qubit count, samples native Pauli noise once, and queues the resulting
 stream. The seed also deterministically initializes its later measurement sampling.
 The returned simulator retains `.stim_plan` and `.stim_sample`, including
@@ -134,7 +139,7 @@ same `analyze_stream` and `recommend_settings` APIs operate directly on any
 Pepsy stream.
 
 ```python
-sim = pepsy.MpsStabOptimizer.from_stim(circuit, chi=32, seed=7)
+sim = pepsy.StabilizerMpsSimulator.from_stim(circuit, chi=32, seed=7)
 sim.run(progbar=True)
 print(sim.stim_sample.faults)
 ```

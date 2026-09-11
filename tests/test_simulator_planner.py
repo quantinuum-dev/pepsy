@@ -22,22 +22,34 @@ def test_planner_prices_actual_dressed_supports_and_ranks_four_candidates():
     advice = recommend_simulator(stream, n_qubits=3, chi=4)
 
     assert isinstance(advice, SimulatorPlan)
-    assert advice.recommended == "MpsStabOptimizer"
+    assert advice.recommended == "StabilizerMpsSimulator"
     assert advice.best is advice.candidates[0]
     assert {candidate.optimizer for candidate in advice.candidates} == {
         "MpsOptimizer",
         "TreeOptimizer",
-        "MpsStabOptimizer",
-        "TreeStabOptimizer",
+        "StabilizerMpsSimulator",
+        "StabilizerTreeSimulator",
     }
     assert all(
         isinstance(candidate, SimulatorCandidate)
         for candidate in advice.candidates
     )
     assert advice.frame_events[-1]["support"] == (0, 1, 2)
-    assert advice.candidate("MpsStabOptimizer").max_geometry == 3
+    assert advice.candidate("StabilizerMpsSimulator").max_geometry == 3
     assert advice.candidates[0].relative_score == pytest.approx(1.0)
     assert advice["analysis"].clifford_entries == 302
+
+
+def test_planner_candidate_accepts_legacy_stabilizer_names():
+    advice = recommend_simulator([("h", 0), ("t", 0)], n_qubits=1, chi=4)
+
+    with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
+        mps = advice.candidate("MpsStabOptimizer")
+    with pytest.warns(DeprecationWarning, match="StabilizerTreeSimulator"):
+        tree = advice.candidate("TreeStabOptimizer")
+
+    assert mps.optimizer == "StabilizerMpsSimulator"
+    assert tree.optimizer == "StabilizerTreeSimulator"
 
 
 def test_planner_exposes_chain_windows_and_tree_steiner_sizes():
@@ -71,8 +83,8 @@ def test_planner_marks_unprepassable_stabilizer_streams_unavailable():
 
     assert advice.candidate("MpsOptimizer").applicable
     assert advice.candidate("TreeOptimizer").applicable
-    assert not advice.candidate("MpsStabOptimizer").applicable
-    assert not advice.candidate("TreeStabOptimizer").applicable
+    assert not advice.candidate("StabilizerMpsSimulator").applicable
+    assert not advice.candidate("StabilizerTreeSimulator").applicable
     assert any("cap changes" in warning for warning in advice.warnings)
 
 

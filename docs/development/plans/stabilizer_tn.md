@@ -15,7 +15,7 @@ MPS is exposed as `.p` (matching `MpsOptimizer.p`); `.nu`, `p_dense`/`nu_dense`,
 `frame_pauli`/`nu_frame_pauli`, and `from_tableau_and_state`/`from_tableau_and_nu`
 are kept as back-compat aliases.
 
-## Mental model: how `MpsStabOptimizer` executes a circuit
+## Mental model: how `StabilizerMpsSimulator` executes a circuit
 
 This is a hybrid **Clifford frame + coefficient MPS** simulator, not a plain
 physical-state MPS simulator and not a nested `MpsOptimizer`. Its exact
@@ -194,15 +194,15 @@ new simulator features.
   frame; any MPO, unitary or not), matching the `MpsOptimizer` contract. A
   *physical*-frame few-qubit operator goes through a dense `(matrix, where)`
   entry instead (frame-mapped automatically).
-- Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, automatic fidelity
+- Simulator front end: `StabilizerMpsSimulator` (gate stream, `chi`, automatic fidelity
   tracking, `stabilize_unitary`, `infidelities`, `bond_history`,
   `set_gates`/`add_gates`/`run`/`apply`).
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
-  matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
+  matching `StabilizerMpsSimulator.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current
   stream part and MPS-compatible `infidelity`); `norm_diagnostics()` reports the same multiplicative `infidelity`
   and `fidelity` names, and `norm()` returns the `|nu>` norm.
-- `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
+- `StabilizerMps` is kept as a backward-compatible alias for `StabilizerMpsSimulator`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
   `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);
   `expectation_pauli_sum(terms)` for `H = sum c_k P_k`; `sample(...)` (Born
@@ -221,7 +221,7 @@ new simulator features.
   errors into the tableau, while `MpsOptimizer` replays the identical stream.
   Detector/observable annotations remain Stim/decoder concerns and do not alter
   the quantum trajectory.
-- **Single-STN Stim convenience** — `MpsStabOptimizer.from_stim(...)` infers the
+- **Single-STN Stim convenience** — `StabilizerMpsSimulator.from_stim(...)` infers the
   register, compiles and samples one Stim trajectory, and retains its plan/sample
   on the simulator. Its `stream_transform` hook permits external schedules to
   add physical Pepsy gates or remove terminal readout without duplicating Stim
@@ -230,7 +230,7 @@ new simulator features.
   `TrajectoryChannel` directly in an ordinary Pepsy gate stream. Fixed
   random-unitary mixtures sample a concrete gate without a state; complete
   Kraus channels evaluate Born branch weights on the live `MpsOptimizer` or
-  `MpsStabOptimizer`, apply one selected branch, and normalize it before the
+  `StabilizerMpsSimulator`, apply one selected branch, and normalize it before the
   following gate segment. This makes state-dependent channels such as amplitude
   damping independent of Stim while retaining one-MPS-per-shot scaling. A
   normalized Kraus outcome closes the prior unitary norm-proxy segment and
@@ -278,7 +278,7 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
   hidden bit shift).
 - Impact: turns our exact non-Clifford path from chi-growing into poly-scaling for
   T-doped circuits. Needs an ancilla-qubit + measurement-conditioned Clifford
-  correction protocol layered on `MpsStabOptimizer`.
+  correction protocol layered on `StabilizerMpsSimulator`.
 - **STATUS: DONE, with two schedules.** `inject_rz(data, ancilla, phi)` plus
   `inject_t` / `inject_tdg` inject every non-Clifford `phi = k*pi/4` diagonal
   rotation, whose `Rz(2*phi)` correction is Clifford. Arbitrary angles have no
@@ -336,7 +336,7 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
     deterministic pre-check has no candidate SVD loop and leaves that update's
     coefficient bond unchanged. It records `exact_cooling_events`; set
     `exact_cooling=False` only to exercise or benchmark the normal MPO fallback.
-  - **Greedy sweep (explicit):** `MpsStabOptimizer.disentangle_cliffords` tests
+  - **Greedy sweep (explicit):** `StabilizerMpsSimulator.disentangle_cliffords` tests
     the 20 two-qubit Clifford classes modulo output-local Cliffords from local
     Schmidt/SVD data (no full-MPS candidate copies), applies an improving `D` to
     `|nu>`, and absorbs `D^dagger` with `STNState.absorb_basis_clifford`. The
@@ -380,16 +380,14 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
   ladder now pivots on the *median* of the support and merges nearest sites
   first, minimising the MPS swap distance (`swap_sites_with_compress` was the
   dominant cost; ~3.6x faster on a spread `n=20` measurement).
-- **Backend / GPU: DONE** — `MpsStabOptimizer(..., to_backend=...)` (e.g.
+- **Backend / GPU: DONE** — `StabilizerMpsSimulator(..., to_backend=...)` (e.g.
   `pepsy.backend_torch` / `backend_cupy` / `backend_jax`) places `|nu>` and every
   gate/MPO on that backend; the stim tableau stays on the CPU. Validated against
   the NumPy path for Torch, JAX, and CuPy (when optional dependencies/runtimes
   are available) across gates, absorb-measurement, injection, and sampling.
 
 ### R5. Packaging & examples
-- Optionally expose `MpsStabOptimizer` at top-level `pepsy.*` + `docs/api/`
-  (already exposed as `pepsy.optimizers.MpsStabOptimizer`; top-level would need
-  updating `tests/test_public_api.py`).
+- Expose `StabilizerMpsSimulator` at top-level `pepsy.*` and in `docs/api/`.
 - A small deterministic example: `|T>^n` at chi=1, and a magic-vs-chi growth demo
   (paper Fig. 2).
 - **STATUS: DONE** — `pepsy.StabilizerMpsSimulator`, `pepsy.MpsStabOptimizer`,
@@ -460,11 +458,11 @@ noise — the natively-2D analog of the decoder idea below.
 - Minimal de-risking slice: `PepsStabOptimizer` skeleton (tableau + `ps_to_peps`
   `|nu>`); one **local** non-Clifford rotation via frame-map -> localizer ->
   small gate/PEPO -> truncate; expectation via `contract_boundary`; validate
-  `|psi> = C|nu>` against dense / `MpsStabOptimizer` on a 2x2 / 2x3 lattice
+  `|psi> = C|nu>` against dense / `StabilizerMpsSimulator` on a 2x2 / 2x3 lattice
   (exact) before any surface-code demo.
 
 ### R9. STN-native DEM / maximum-likelihood decoder
-Decode a detector error model (DEM) directly on `MpsStabOptimizer`. A DEM gate
+Decode a detector error model (DEM) directly on `StabilizerMpsSimulator`. A DEM gate
 stream (Tensy `_dem_gate_stream`) is **all-Clifford XORs (CNOTs) plus one
 single-qubit non-unitary branch weight per mechanism**, which is exactly the STN
 split: XORs -> tableau (free), branch weights -> `|nu>`.
@@ -504,7 +502,7 @@ split: XORs -> tableau (free), branch weights -> `|nu>`.
   - `absorb_basis=True` conditioning keeps the projected detector qubits out of
     `|nu>`; R2 disentangling localises spread `M_j`.
 - **First slice.** Name->index adapter from Tensy `GateStreamModel`
-  (`e*`/`k*` string sites, `kind="branch_weight"|"xor"`) to `MpsStabOptimizer`
+  (`e*`/`k*` string sites, `kind="branch_weight"|"xor"`) to `StabilizerMpsSimulator`
   int qubits + `(matrix, where)` / Clifford entries; decode by conditioning on a
   Stim detector sample and reading the `M_L` margin; validate against the exact
   DEM-TN contraction on a distance-3 surface code, then sweep `chi` vs `p`.
@@ -547,10 +545,10 @@ contracted by `[1,1]`, weights on cap or edges).
   Needed `chi` is small below threshold, grows toward threshold, `= 1` exact at
   `p -> 0` / `beta -> inf`.
 - **The tableau is always there (correction).** When the capped stream is built
-  *on `MpsStabOptimizer`*, every fan-out CNOT goes into the tableau and only the
+  *on `StabilizerMpsSimulator`*, every fan-out CNOT goes into the tableau and only the
   single-qubit coin touches `|nu>`, so the Clifford split is preserved by
   construction — capping never "gives it up". (Earlier wording that plain capping
-  discards the tableau was wrong: `MpsStabOptimizer` always factors out the
+  discards the tableau was wrong: `StabilizerMpsSimulator` always factors out the
   Clifford; only a *plain* MPS build with no tableau, i.e. `to_mps`, keeps the XOR
   in the bond.) Concretely, one error flipping `d1,d2` gives marginal
   `w0|00> + w1|11>` = **bond 2 as a plain MPS** (`to_mps`), but
@@ -588,7 +586,7 @@ contracted by `[1,1]`, weights on cap or edges).
     decoding (operators are syndrome-independent; batch over shots by flipping
     projector signs).
 - **Experiment.** Build the capped weighted-XOR stream (`("cnot", ...)` fan-outs
-  in the tableau + `((1-p)I + p X, s0)` coins) on `MpsStabOptimizer`, decode a
+  in the tableau + `((1-p)I + p X, s0)` coins) on `StabilizerMpsSimulator`, decode a
   distance-3 patch, and plot logical margin + unitary norm loss vs the `chi`
   cap; diff `|nu>` bond against the existing plain capped detector-MPS to see if
   offloading the fan-out CNOTs to the tableau shrinks it.
@@ -602,7 +600,7 @@ contracted by `[1,1]`, weights on cap or edges).
   for graph-like codes) is not beaten by the STN. Still worth checking on
   higher-degree / circuit-level (hyperedge) DEMs where the plain bond is larger,
   but the graph-like case is a negative result. **Caught + fixed a real
-  `MpsStabOptimizer` bug in the process:** `stim.Tableau.from_unitary_matrix` does
+  `StabilizerMpsSimulator` bug in the process:** `stim.Tableau.from_unitary_matrix` does
   not verify unitarity, so a near-Clifford *non-unitary* gate (the coin
   `(1-p)I+pX`) was silently accepted as the identity tableau; `_apply_matrix` now
   guards with `_is_unitary(gate)` first (regression tests added).

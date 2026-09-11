@@ -1,4 +1,4 @@
-"""``MpsStabOptimizer``: an ``MpsOptimizer``-style gate-stream simulator for STN.
+"""``StabilizerMpsSimulator``: an ``MpsOptimizer``-style gate-stream simulator for STN.
 
 Analogous to :class:`pepsy.MpsOptimizer`, but the state is a *stabilizer tensor
 network*: a stim tableau (basis ``B(S, D)``) times a coefficient MPS ``|nu>``
@@ -136,10 +136,10 @@ __all__ = [
     "ImmediateInjectionReport",
     "ImmediateProjectionRecord",
     "MeasurementRecord",
+    "StabilizerMpsSimulator",
     "MpsStabOptimizer",
     "NormEventRecord",
     "StabilizerMpsSettingsAdvice",
-    "StabilizerMpsSimulator",
     "StabilizerMpsRunResult",
     "StreamAnalysisRecord",
     "run_stabilizer_mps_stream",
@@ -380,18 +380,31 @@ def _normalize_outcomes(outcome, where, *, event):
     """Return one optional forced outcome per site."""
     if outcome is None:
         return (None,) * len(where)
-    if isinstance(outcome, Integral):
-        return (int(outcome),) * len(where)
     if isinstance(outcome, (tuple, list)):
         if len(outcome) != len(where):
             raise ValueError(
                 f"{event} outcome sequence has length {len(outcome)} but where "
                 f"{where!r} has {len(where)} site(s)."
             )
-        return tuple(None if value is None else int(value) for value in outcome)
-    raise ValueError(
-        f"{event} outcome must be an int, None, or a sequence matching where."
-    )
+        return tuple(_validate_forced_outcome(value) for value in outcome)
+    value = _validate_forced_outcome(outcome)
+    return (value,) * len(where)
+
+
+def _validate_forced_outcome(outcome):
+    """Return one forced Pauli outcome, requiring exactly integer +/-1."""
+    if outcome is None:
+        return None
+    if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
+        raise ValueError(
+            f"outcome must be exactly +1 or -1, got {outcome!r}."
+        )
+    value = int(outcome)
+    if value not in (-1, 1):
+        raise ValueError(
+            f"outcome must be exactly +1 or -1, got {outcome!r}."
+        )
+    return value
 
 
 def _parse_reset_args(params, *, default_axis=None):
@@ -585,7 +598,7 @@ def _localizing_clifford(terms, n, *, site_position=None):
     return ops, v_tableau, pivot
 
 
-class MpsStabOptimizer:
+class StabilizerMpsSimulator:
     """Replay a gate stream against a stabilizer + MPS (STN) state.
 
     Parameters
@@ -787,9 +800,7 @@ class MpsStabOptimizer:
             )
 
         self.mode = self._normalize_mode(mode)
-        self.chi = None if chi is None else int(chi)
-        if self.mode == "exact":
-            self.chi = None
+        self.chi = self._normalize_chi(chi, mode=self.mode)
         self.fit_init_strategy = self._normalize_fit_init_strategy(
             fit_init_strategy
         )
@@ -973,6 +984,15 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
     _CANONICAL_MPO_MODES = frozenset(_MPO_COMPRESSION_METHODS)
+    _FINITE_CHI_MPO_METHODS = frozenset({
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit-oversample",
+    })
     _LEGACY_MODE_NAMES = frozenset({"quimb", "mpo"})
     _LEGACY_MODE_PREFIXES = ("quimb-", "mpo-")
     _ALLOWED_MODES = frozenset(
@@ -999,7 +1019,7 @@ class MpsStabOptimizer:
                 "dmrg*, svd, swap, perm, or exact"
             )
             raise ValueError(
-                f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}."
+                f"Unknown StabilizerMpsSimulator mode {mode!r}; choose one of {allowed}."
             )
         if mode in cls._LEGACY_MODE_NAMES or mode.startswith(cls._LEGACY_MODE_PREFIXES):
             warnings.warn(
@@ -1094,9 +1114,30 @@ class MpsStabOptimizer:
 
     @staticmethod
     def _validate_positive_int(value, name):
-        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Integral)
+            or value < 1
+        ):
             raise ValueError(f"{name} must be a positive integer.")
         return int(value)
+
+    @classmethod
+    def _normalize_chi(cls, chi, *, mode):
+        """Validate a bond cap and its compression-mode requirements."""
+        if chi is not None:
+            chi = cls._validate_positive_int(chi, "chi")
+        if mode == "exact":
+            return None
+        if (
+            chi is None
+            and cls._is_quimb_mode(mode)
+            and cls._mode_quimb_method(mode) in cls._FINITE_CHI_MPO_METHODS
+        ):
+            raise ValueError(
+                f"StabilizerMpsSimulator mode {mode!r} requires a finite chi."
+            )
+        return chi
 
     @classmethod
     def _normalize_fit_init_strategy(cls, strategy):
@@ -1125,13 +1166,16 @@ class MpsStabOptimizer:
         """Switch compression mode while preserving the represented state."""
         new_mode = self._normalize_mode(mode)
         if new_mode == "exact":
-            self.chi = None
+            new_chi = None
         elif self.mode == "exact" and self.chi is None:
             raise ValueError(
                 "cannot leave mode='exact' after its finite chi was discarded; "
                 "create a new optimizer with chi first."
             )
+        else:
+            new_chi = self._normalize_chi(self.chi, mode=new_mode)
         self.mode = new_mode
+        self.chi = new_chi
         requested_cutoff_mode = self._requested_cutoff_mode
         if requested_cutoff_mode is None or (
             isinstance(requested_cutoff_mode, str)
@@ -1149,19 +1193,19 @@ class MpsStabOptimizer:
         return self
 
     @classmethod
-    def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
+    def from_bits(cls, bits, **kwargs) -> "StabilizerMpsSimulator":
         """Start from a computational-basis product state (``bits`` = str or 0/1 seq)."""
         dtype = kwargs.pop("dtype", "complex128")
         return cls(STNState.from_bits(bits, dtype=dtype), **kwargs)
 
     @classmethod
-    def ghz(cls, n: int, **kwargs) -> "MpsStabOptimizer":
+    def ghz(cls, n: int, **kwargs) -> "StabilizerMpsSimulator":
         """Start from the ``n``-qubit GHZ state (a stabilizer state, chi=1)."""
         dtype = kwargs.pop("dtype", "complex128")
         return cls(STNState.ghz(n, dtype=dtype), **kwargs)
 
     @classmethod
-    def from_tableau_and_state(cls, sim, p, **kwargs) -> "MpsStabOptimizer":
+    def from_tableau_and_state(cls, sim, p, **kwargs) -> "StabilizerMpsSimulator":
         """Start from a user stim tableau ``sim`` and coefficient MPS ``p``."""
         dtype = kwargs.pop("dtype", "complex128")
         return cls(STNState.from_tableau_and_state(sim, p, dtype=dtype), **kwargs)
@@ -1170,14 +1214,14 @@ class MpsStabOptimizer:
     from_tableau_and_nu = from_tableau_and_state
 
     @classmethod
-    def from_mps(cls, p, **kwargs) -> "MpsStabOptimizer":
+    def from_mps(cls, p, **kwargs) -> "StabilizerMpsSimulator":
         """Start from a qubit MPS in the ordinary computational basis."""
         return cls(p, **kwargs)
 
     @classmethod
     def from_stim(
         cls, circuit, *, seed: Optional[int] = None, stream_transform=None, **kwargs
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Build one STN trajectory directly from a Stim circuit.
 
         The circuit is compiled once by :func:`pepsy.compile_stim_circuit`, then
@@ -1203,7 +1247,7 @@ class MpsStabOptimizer:
         """
         if "state" in kwargs or "gates" in kwargs:
             raise TypeError(
-                "MpsStabOptimizer.from_stim derives state and gates from the "
+                "StabilizerMpsSimulator.from_stim derives state and gates from the "
                 "Stim circuit; use stream_transform for stream edits."
             )
         if stream_transform is not None and not callable(stream_transform):
@@ -1274,13 +1318,13 @@ class MpsStabOptimizer:
         """Alias for :attr:`p`."""
         return self.state.p
 
-    def set_gates(self, gates) -> "MpsStabOptimizer":
+    def set_gates(self, gates) -> "StabilizerMpsSimulator":
         """Replace the queued gate stream."""
         entries = self._as_entries(gates)
         self._install_stream_plan(entries)
         return self
 
-    def add_gates(self, gates) -> "MpsStabOptimizer":
+    def add_gates(self, gates) -> "StabilizerMpsSimulator":
         """Append to the queued gate stream."""
         entries = list(self._queue) + self._as_entries(gates)
         self._install_stream_plan(entries)
@@ -1368,7 +1412,7 @@ class MpsStabOptimizer:
         if len(mismatches) > 8:
             details += f"; ... and {len(mismatches) - 8} more"
         raise TypeError(
-            "MpsStabOptimizer requires every gate and sub-MPO payload to "
+            "StabilizerMpsSimulator requires every gate and sub-MPO payload to "
             f"match the coefficient-MPS backend/device and required dtype "
             f"{target_signature!r} "
             f"before use; {details}. Prepare each payload explicitly with "
@@ -1405,6 +1449,7 @@ class MpsStabOptimizer:
     ):
         """Build a canonical Pauli-measurement event shared with MPS."""
         where = _normalize_sites(where)
+        outcome = _validate_forced_outcome(outcome)
         if absorb_basis is not None or disentangle is not None:
             absorb_basis = _resolve_measurement_disentangle(
                 absorb_basis,
@@ -1414,9 +1459,9 @@ class MpsStabOptimizer:
         entry = ("measure", str(pauli), where)
         if absorb_basis is None:
             if outcome is not None:
-                entry += (int(outcome),)
+                entry += (outcome,)
         else:
-            entry += (None if outcome is None else int(outcome), bool(absorb_basis))
+            entry += (outcome, bool(absorb_basis))
         return entry
 
     @staticmethod
@@ -2321,8 +2366,8 @@ class MpsStabOptimizer:
         """Run one Pepsy STN gate stream and return a typed result record.
 
         This is the class-level spelling of :func:`run_stabilizer_mps_stream`
-        for new code that already works through :class:`MpsStabOptimizer` /
-        :class:`StabilizerMpsSimulator`.
+        for new code that already works through :class:`StabilizerMpsSimulator` /
+        :class:`MpsStabOptimizer`.
         """
         return run_stabilizer_mps_stream(gates, **kwargs)
 
@@ -2889,7 +2934,7 @@ class MpsStabOptimizer:
         site_order = plan.get("site_order", ())
         lines = [
             (
-                "MpsStabOptimizer frame layout: "
+                "StabilizerMpsSimulator frame layout: "
                 f"order={selected}, sites={len(site_order)}, "
                 f"events={stats.get('num_events', input_stats.get('num_events', 0))}"
             ),
@@ -2924,7 +2969,7 @@ class MpsStabOptimizer:
         *,
         layout_kwargs=None,
         layout_report: bool = True,
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Install a static STN frame layout while ``|p>`` is still product.
 
         The tableau/physical qubit labels stay unchanged.  Only the coefficient
@@ -3348,14 +3393,19 @@ class MpsStabOptimizer:
         if mode is not None:
             # ``mode`` is retained after the replay; the other run controls are
             # restored in ``_restore_run_configuration`` when the queue ends.
-            self.mode = self._normalize_mode(mode)
-            if self.mode == "exact":
-                self.chi = None
-            elif original["mode"] == "exact" and original["chi"] is None:
+            new_mode = self._normalize_mode(mode)
+            if (
+                new_mode != "exact"
+                and original["mode"] == "exact"
+                and original["chi"] is None
+            ):
                 raise ValueError(
                     "run(mode=...) cannot recover a finite chi after an exact "
                     "optimizer was constructed; create it with chi first."
                 )
+            new_chi = self._normalize_chi(self.chi, mode=new_mode)
+            self.mode = new_mode
+            self.chi = new_chi
             self._dmrg1_one_site_locked = False
 
         requested_cutoff = self.cutoff if cutoff is None else cutoff
@@ -3563,7 +3613,8 @@ class MpsStabOptimizer:
             Show one aggregate rank-zero progress bar for MPI runs.
         timing : bool
             Record a lightweight wall-clock replay record available through
-            :meth:`get_run_timing`.
+            :meth:`get_run_timing`. The default ``False`` performs no replay
+            profiling clock reads and allocates no timing record.
         transactional : bool
             If true, restore the STN state and diagnostics when an entry fails;
             the failed entry and suffix remain queued for retry. This is opt-in
@@ -3646,7 +3697,7 @@ class MpsStabOptimizer:
             or checkpoint_path is not None
         )
         if shot_requested:
-            started = time.perf_counter()
+            started = time.perf_counter() if timing else None
             result = self._run_shots(
                 shots,
                 error_model=error_model,
@@ -3672,12 +3723,13 @@ class MpsStabOptimizer:
                 collect_diagnostics=collect_diagnostics,
                 checkpoint_id=checkpoint_id,
             )
-            self._last_run_timing = {
-                "enabled": bool(timing),
-                "mode": "trajectory" if error_model is None else "noisy",
-                "entries": len(self._gate_stream),
-                "elapsed_seconds": float(time.perf_counter() - started),
-            }
+            if timing:
+                self._last_run_timing = {
+                    "enabled": True,
+                    "mode": "trajectory" if error_model is None else "noisy",
+                    "entries": len(self._gate_stream),
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                }
             return result
 
         run_configuration = self._prepare_run_configuration(
@@ -3707,7 +3759,7 @@ class MpsStabOptimizer:
         pbar = None
         snapshot = self._execution_snapshot() if transactional else None
         rolled_back = False
-        started = time.perf_counter()
+        started = time.perf_counter() if timing else None
         if progbar and queue:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
@@ -3738,20 +3790,21 @@ class MpsStabOptimizer:
                 pbar.close()
             if completed and not rolled_back:
                 del self._queue[:completed]
-            self._last_run_timing = {
-                "enabled": bool(timing),
-                "mode": "direct",
-                "entries": len(queue),
-                "completed": completed,
-                "elapsed_seconds": float(time.perf_counter() - started),
-            }
+            if timing:
+                self._last_run_timing = {
+                    "enabled": True,
+                    "mode": "direct",
+                    "entries": len(queue),
+                    "completed": completed,
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                }
             self._restore_run_configuration(
                 run_configuration,
                 keep_mode=mode is not None,
             )
         return self
 
-    def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
+    def apply(self, gates, *, progbar: bool = False) -> "StabilizerMpsSimulator":
         """Convenience: queue ``gates`` and run immediately."""
         return self.set_gates(gates).run(progbar=progbar)
 
@@ -4855,9 +4908,9 @@ class MpsStabOptimizer:
             rows.append(row)
         return rows
 
-    def copy(self) -> "MpsStabOptimizer":
+    def copy(self) -> "StabilizerMpsSimulator":
         """Return an independent copy (state deep-copied; queue/history reset)."""
-        copied = MpsStabOptimizer(
+        copied = StabilizerMpsSimulator(
             self.state.copy(),
             chi=self.chi,
             mode=self.mode,
@@ -5261,7 +5314,7 @@ class MpsStabOptimizer:
         ):
             self._backend_conversion_warnings.add(warning_key)
             warnings.warn(
-                f"MpsStabOptimizer is converting a {kind} payload from "
+                f"StabilizerMpsSimulator is converting a {kind} payload from "
                 f"backend/dtype/device {source_signature!r} to the live "
                 f"coefficient-MPS state {target_signature!r}; provide matching "
                 f"{kind} payloads to avoid this transfer or cast.",
@@ -5373,7 +5426,7 @@ class MpsStabOptimizer:
         return np.asarray(to_numpy(gate))
 
     # ------------------------------------------------------------------ #
-    # State primitives used by MpsStabSampler
+    # State primitives used by StabilizerMpsSampler
     # ------------------------------------------------------------------ #
     def _sample_rng(self, seed):
         """Return the RNG used by sampler branch operations.
@@ -5460,15 +5513,15 @@ class MpsStabOptimizer:
 
     # Sampling compatibility delegates
     # ------------------------------------------------------------------ #
-    # Sampling is implemented by MpsStabSampler, next to MpsSampler. Keep
+    # Sampling is implemented by StabilizerMpsSampler, next to MpsSampler. Keep
     # these optimizer methods as thin compatibility shims for existing users
     # and trajectory/noise result objects that expose optimizer sampling.
     @staticmethod
     def pack_bit_samples(samples) -> np.ndarray:
         """Compatibility delegate for packing raw sampler bit arrays."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler.pack_bit_samples(samples)
+        return StabilizerMpsSampler.pack_bit_samples(samples)
 
     def sample_bits(
         self,
@@ -5482,10 +5535,10 @@ class MpsStabOptimizer:
         absorb_basis: Optional[bool] = None,
         disentangle: Optional[bool] = None,
     ) -> np.ndarray:
-        """Compatibility delegate to :class:`pepsy.MpsStabSampler`."""
-        from ...sampling.stabilizer import MpsStabSampler
+        """Compatibility delegate to :class:`pepsy.StabilizerMpsSampler`."""
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler(
+        return StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -5537,9 +5590,9 @@ class MpsStabOptimizer:
         disentangle=None,
     ) -> float:
         """Compatibility delegate for one product-basis probability."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler(
+        return StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -5561,9 +5614,9 @@ class MpsStabOptimizer:
         disentangle=None,
     ) -> np.ndarray:
         """Compatibility delegate for many product-basis probabilities."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler(
+        return StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -5628,9 +5681,9 @@ class MpsStabOptimizer:
         disentangle: Optional[bool] = None,
     ):
         """Compatibility delegate for chunked bit sampling."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        yield from MpsStabSampler(
+        yield from StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -6035,18 +6088,9 @@ class MpsStabOptimizer:
     def _apply_quimb_submpo(self, p, mpo, where, *, method, max_bond, info):
         """Apply one coefficient-frame sub-MPO with the selected Quimb method."""
         method = self._normalize_quimb_method(method)
-        requires_chi = {
-            "src",
-            "src-first",
-            "src-oversample",
-            "srcmps",
-            "srcmps-first",
-            "srcmps-oversample",
-            "fit-oversample",
-        }
-        if max_bond is None and method in requires_chi:
+        if max_bond is None and method in self._FINITE_CHI_MPO_METHODS:
             raise ValueError(
-                f"MpsStabOptimizer mode {method!r} requires a finite chi."
+                f"StabilizerMpsSimulator mode {method!r} requires a finite chi."
             )
 
         opts = self._quimb_compress_opts(method)
@@ -6701,14 +6745,7 @@ class MpsStabOptimizer:
     @staticmethod
     def _validate_outcome(outcome):
         """Return a forced Pauli outcome, requiring exactly integer +/-1."""
-        if outcome is None:
-            return None
-        if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
-            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
-        value = int(outcome)
-        if value not in (-1, 1):
-            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
-        return value
+        return _validate_forced_outcome(outcome)
 
     @staticmethod
     def _outcome_probability(expectation, outcome):
@@ -6835,7 +6872,7 @@ class MpsStabOptimizer:
                 event="measure_many",
             )
             outcome = entry[2] if len(entry) == 3 else None
-            outcome = MpsStabOptimizer._validate_outcome(outcome)
+            outcome = StabilizerMpsSimulator._validate_outcome(outcome)
             operations.append((axis, sites[0], outcome))
             targets.append(sites[0])
 
@@ -6905,72 +6942,87 @@ class MpsStabOptimizer:
         remaining = list(range(len(operations)))
         result = [None] * len(operations)
         schedule = []
+        # A later impossible forced outcome must not leave an earlier collapse,
+        # reset, diagnostic, or RNG draw committed. Only forced multi-operation
+        # batches need this snapshot; sampled-only batches cannot fail due to
+        # impossible postselection.
+        snapshot = (
+            self._execution_snapshot()
+            if len(operations) > 1
+            and any(operation[2] is not None for operation in operations)
+            else None
+        )
 
-        for step in range(len(operations)):
-            if normalized_order == "input":
-                input_index = remaining.pop(0)
-            elif normalized_order == "min_span":
-                candidate_info = {
-                    index: self._measurement_span_info(
-                        operations[index][0],
-                        operations[index][1],
+        try:
+            for step in range(len(operations)):
+                if normalized_order == "input":
+                    input_index = remaining.pop(0)
+                elif normalized_order == "min_span":
+                    candidate_info = {
+                        index: self._measurement_span_info(
+                            operations[index][0],
+                            operations[index][1],
+                            absorb_basis=absorb_basis,
+                        )
+                        for index in remaining
+                    }
+                    input_index = min(
+                        remaining,
+                        key=lambda index: (
+                            candidate_info[index]["span"],
+                            candidate_info[index]["localizer_distance"],
+                            len(candidate_info[index]["frame_support"]),
+                            index,
+                        ),
+                    )
+                    remaining.remove(input_index)
+                else:
+                    rank = {
+                        index: position
+                        for position, index in enumerate(normalized_order)
+                    }
+                    input_index = min(remaining, key=rank.__getitem__)
+                    remaining.remove(input_index)
+
+                axis, qubit, forced = operations[input_index]
+                info = (
+                    candidate_info[input_index]
+                    if normalized_order == "min_span"
+                    else self._measurement_span_info(
+                        axis,
+                        qubit,
                         absorb_basis=absorb_basis,
                     )
-                    for index in remaining
-                }
-                input_index = min(
-                    remaining,
-                    key=lambda index: (
-                        candidate_info[index]["span"],
-                        candidate_info[index]["localizer_distance"],
-                        len(candidate_info[index]["frame_support"]),
-                        index,
-                    ),
                 )
-                remaining.remove(input_index)
-            else:
-                rank = {
-                    index: position
-                    for position, index in enumerate(normalized_order)
-                }
-                input_index = min(remaining, key=rank.__getitem__)
-                remaining.remove(input_index)
-
-            axis, qubit, forced = operations[input_index]
-            info = (
-                candidate_info[input_index]
-                if normalized_order == "min_span"
-                else self._measurement_span_info(
-                    axis,
-                    qubit,
-                    absorb_basis=absorb_basis,
-                )
-            )
-            if reset:
-                m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
-                outcome = self._absorb_measure(
-                    m_pauli,
-                    None,
-                    norm_event_kind="reset",
-                )
-            else:
-                outcome = self.measure(
-                    axis,
-                    qubit,
-                    outcome=forced,
-                    absorb_basis=absorb_basis,
-                )
-            if (reset or reset_after) and outcome < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
-                self._record()
-            result[input_index] = int(outcome)
-            schedule.append({
-                "order": int(step),
-                "input_index": int(input_index),
-                "pauli": str(axis),
-                "qubit": int(qubit),
-                **info,
-            })
+                if reset:
+                    m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
+                    outcome = self._absorb_measure(
+                        m_pauli,
+                        None,
+                        norm_event_kind="reset",
+                    )
+                else:
+                    outcome = self.measure(
+                        axis,
+                        qubit,
+                        outcome=forced,
+                        absorb_basis=absorb_basis,
+                    )
+                if (reset or reset_after) and outcome < 0:
+                    self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+                    self._record()
+                result[input_index] = int(outcome)
+                schedule.append({
+                    "order": int(step),
+                    "input_index": int(input_index),
+                    "pauli": str(axis),
+                    "qubit": int(qubit),
+                    **info,
+                })
+        except BaseException:
+            if snapshot is not None:
+                self._restore_execution_snapshot(snapshot)
+            raise
 
         self.last_measurement_schedule = tuple(schedule)
         return tuple(result)
@@ -7086,7 +7138,7 @@ class MpsStabOptimizer:
         self.measurements.append(MeasurementRecord(pauli, where, int(m)))
         return m
 
-    def reset(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
+    def reset(self, where, basis="Z", *, order="min_span") -> "StabilizerMpsSimulator":
         """Reset qubit(s) to the ``+1`` eigenstate of ``basis``.
 
         Each target is measured with the basis-updating path (so it
@@ -7115,7 +7167,7 @@ class MpsStabOptimizer:
         )
         return self
 
-    def reset_many(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
+    def reset_many(self, where, basis="Z", *, order="min_span") -> "StabilizerMpsSimulator":
         """Reset several independent qubits using the metadata-only span scheduler."""
         return self.reset(where, basis=basis, order=order)
 
@@ -7165,7 +7217,7 @@ class MpsStabOptimizer:
         )
         return measured[0] if len(measured) == 1 else measured
 
-    def cap(self, where, vec, *, absorb="left") -> "MpsStabOptimizer":
+    def cap(self, where, vec, *, absorb="left") -> "StabilizerMpsSimulator":
         """Contract one physical qubit with ``vec`` and shorten the simulator.
 
         With an identity basis frame, the physical leg is contracted directly
@@ -7304,7 +7356,7 @@ class MpsStabOptimizer:
                 "converter (for example to_backend=backend_torch(...))."
             )
         physical = self.to_mps(mode="exact", logical_order=True)
-        lowered = MpsStabOptimizer.from_mps(
+        lowered = StabilizerMpsSimulator.from_mps(
             physical,
             chi=self.chi,
             cutoff=self.cutoff,
@@ -7527,7 +7579,7 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Magic-state injection (R1)
     # ------------------------------------------------------------------ #
-    def prepare_magic(self, ancilla, *, angle: float = math.pi / 4) -> "MpsStabOptimizer":
+    def prepare_magic(self, ancilla, *, angle: float = math.pi / 4) -> "StabilizerMpsSimulator":
         """Prepare the magic state ``|M> = Rz(angle)|+>`` on a fresh ``|0>`` ancilla.
 
         The default ``angle = pi/4`` gives the ``T`` resource
@@ -7791,7 +7843,7 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Replay ``gates``, teleporting ``Z``-rotations through magic-state injection.
 
         Every injectable gate (``("t", q)`` / ``("tdg", q)`` / ``("rz", phi, q)``
@@ -7911,7 +7963,7 @@ class MpsStabOptimizer:
     @classmethod
     def with_injection(
         cls, n_data: int, gates, *, n_ancilla: int = 1, **kwargs
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Build an ``(n_data + n_ancilla)``-qubit simulator and run ``gates`` with injection.
 
         Data qubits are ``0 .. n_data - 1``; the last ``n_ancilla`` qubits are the
@@ -7958,7 +8010,7 @@ class MpsStabOptimizer:
                 f"outcomes must contain one value per injectable gate ({count}), "
                 f"got {len(values)}."
             )
-        return tuple(MpsStabOptimizer._validate_outcome(value) for value in values)
+        return tuple(StabilizerMpsSimulator._validate_outcome(value) for value in values)
 
     def _deferred_projection_metrics(self, ancilla) -> tuple[int, int]:
         """Return current coefficient-frame support size and MPS span for ``Z_a``."""
@@ -8028,7 +8080,7 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Replay a circuit using MAST-style deferred magic-state projections.
 
         Each injectable ``T``/``T-dagger``/non-Clifford ``pi/4``-multiple
@@ -8205,7 +8257,7 @@ class MpsStabOptimizer:
     @classmethod
     def with_deferred_injection(
         cls, n_data: int, gates, *, n_ancilla: Optional[int] = None, **kwargs
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Build a simulator and replay ``gates`` with deferred magic projections.
 
         When ``n_ancilla`` is omitted, allocate exactly one trailing ancilla for
@@ -8818,7 +8870,7 @@ class MpsStabOptimizer:
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
-            f"MpsStabOptimizer(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
+            f"StabilizerMpsSimulator(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
             f"fit_init_strategy={self.fit_init_strategy!r}, "
             f"operator_tol={self.operator_tol}, "
             f"max_pauli_decomposition_qubits="
@@ -8893,7 +8945,7 @@ def _runner_bond_value(value) -> int:
 
 
 def _runner_collect_result(
-    sim: MpsStabOptimizer,
+    sim: StabilizerMpsSimulator,
     *,
     mode: str,
     requested_mode: str,
@@ -8954,11 +9006,11 @@ def run_stabilizer_mps_stream(
 
     ``mode`` defaults to ``"direct"``. Use ``mode="recommended"`` only when the
     caller explicitly wants to execute the mode selected by
-    :meth:`MpsStabOptimizer.recommend_settings`.
+    :meth:`StabilizerMpsSimulator.recommend_settings`.
     """
-    entries = MpsStabOptimizer._as_entries(gates)
+    entries = StabilizerMpsSimulator._as_entries(gates)
     if advice is None:
-        advice = MpsStabOptimizer.recommend_settings(
+        advice = StabilizerMpsSimulator.recommend_settings(
             entries,
             n_qubits=n_qubits,
             ancilla_budget=ancilla_budget,
@@ -8987,7 +9039,7 @@ def run_stabilizer_mps_stream(
     if actual_mode == "direct":
         settings_used = {"n_qubits": n_data, **ctor}
         start = time.perf_counter()
-        sim = MpsStabOptimizer(n_data, entries, **ctor)
+        sim = StabilizerMpsSimulator(n_data, entries, **ctor)
         sim.run(**run_opts)
         elapsed = time.perf_counter() - start
         return _runner_collect_result(
@@ -9012,7 +9064,7 @@ def run_stabilizer_mps_stream(
         settings_used = {"n_data": n_data, "n_ancilla": n_ancilla, **ctor}
         kwargs = {**ctor, **run_opts}
         start = time.perf_counter()
-        sim = MpsStabOptimizer.with_injection(
+        sim = StabilizerMpsSimulator.with_injection(
             n_data,
             entries,
             n_ancilla=n_ancilla,
@@ -9043,7 +9095,7 @@ def run_stabilizer_mps_stream(
         settings_used = {"n_data": n_data, "n_ancilla": n_ancilla, **ctor}
         kwargs = {**ctor, **run_opts}
         start = time.perf_counter()
-        sim = MpsStabOptimizer.with_deferred_injection(
+        sim = StabilizerMpsSimulator.with_deferred_injection(
             n_data,
             entries,
             n_ancilla=n_ancilla,
@@ -9071,7 +9123,7 @@ def run_stabilizer_mps_stream(
     raise AssertionError(f"unreachable mode {actual_mode!r}")  # pragma: no cover
 
 
-StabilizerMpsSimulator = MpsStabOptimizer
+MpsStabOptimizer = StabilizerMpsSimulator
 
 
 def _looks_like_stream(gates) -> bool:

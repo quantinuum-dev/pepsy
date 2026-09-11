@@ -62,6 +62,7 @@ _SYMBOL_MODULES = {
     "TreePepo": ".tree_peps",
     "TreeSubPepo": ".tree_peps",
     "TreePepsOptimizer": ".tree_peps",
+    "StabilizerTreeSimulator": ".tree_stabilizer",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",
     "CoalescedMeasurementRecord": ".noise",
@@ -116,11 +117,11 @@ _SYMBOL_MODULES = {
     "ImmediateInjectionReport": ".stabilizer_tn",
     "ImmediateProjectionRecord": ".stabilizer_tn",
     "MeasurementRecord": ".stabilizer_tn",
+    "StabilizerMpsSimulator": ".stabilizer_tn",
     "MpsStabOptimizer": ".stabilizer_tn",
     "NormEventRecord": ".stabilizer_tn",
     "STNState": ".stabilizer_tn",
     "StabilizerMpsSettingsAdvice": ".stabilizer_tn",
-    "StabilizerMpsSimulator": ".stabilizer_tn",
     "StabilizerMpsRunResult": ".stabilizer_tn",
     "StabilizerTreeRunResult": ".stabilizer_tn",
     "StreamAnalysisRecord": ".stabilizer_tn",
@@ -152,6 +153,7 @@ __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 _DEPRECATED_ALIASES = {
     "QMeraParametricEnergyOptimizer": "QMeraEnergyOptimizer",
     "MpsStabOptimizer": "StabilizerMpsSimulator",
+    "TreeStabOptimizer": "StabilizerTreeSimulator",
 }
 
 def __getattr__(name):
@@ -165,7 +167,10 @@ def __getattr__(name):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        value = getattr(import_module(module_name, __name__), name)
+        # Resolve deprecated names through the canonical package export so a
+        # root/optimizers import emits one deprecation warning rather than
+        # cascading into the nested stabilizer package's alias resolver.
+        value = getattr(import_module(module_name, __name__), canonical or name)
         globals()[name] = value
         return value
     if name in _SUBMODULES:

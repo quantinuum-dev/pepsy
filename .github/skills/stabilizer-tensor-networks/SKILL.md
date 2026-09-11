@@ -26,7 +26,7 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   unless stim genuinely cannot express the step; the paper's own outlook recommends stim.
 - **Coefficient MPS $|p\rangle$ (the paper's $|\nu\rangle$)** → quimb MPS owned by
   `STNState.p`; `.nu` is a compatibility alias. Construct and evolve it through
-  `MpsStabOptimizer`, not through a nested `MpsOptimizer`.
+  `StabilizerMpsSimulator`, not through a nested `MpsOptimizer`.
   - Single-support frame Paulis use `p.gate_(..., contract=True)` and do not grow a bond.
   - Multi-support rotations/projectors use `pauli_combo_submpo` on the true contiguous
     support window followed by `p.gate_with_submpo_`. This is the live replacement for the
@@ -37,10 +37,10 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
     require an explicit limit of at least `4` because of the `4**k` cost. A
     `("submpo", mpo, where)` event instead acts directly in the
     coefficient frame.
-- **Exact vs approximate (bounded-$\chi$) mode** is selected on `MpsStabOptimizer`:
-  - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
+- **Exact vs approximate (bounded-$\chi$) mode** is selected on `StabilizerMpsSimulator`:
+  - *Exact*: `StabilizerMpsSimulator(..., chi=None)`. The SVD `cutoff` still removes exact
     numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
-  - *Approximate*: `MpsStabOptimizer(..., chi=cap)`. Fidelity tracking is automatic:
+  - *Approximate*: `StabilizerMpsSimulator(..., chi=cap)`. Fidelity tracking is automatic:
     each compressed unitary update records local and cumulative norm-survival loss.
     By default bounded evolution keeps the raw coefficient-MPS norm so compression
     loss remains visible; `stabilize_unitary=True` restores the pre-compression working
@@ -77,7 +77,7 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 
 ## Diagnostic contract
 
-- Treat fidelity tracking as an unconditional part of the `MpsStabOptimizer` API;
+- Treat fidelity tracking as an unconditional part of the `StabilizerMpsSimulator` API;
   there is no `track_infidelity` switch. For unitary updates the diagnostic is the
   normalized norm-loss proxy; for compressed dense
   non-unitary matrices the retained norm ratio is measured against the local
@@ -137,7 +137,7 @@ is packaged under `src/` and adds disentangling experiments. Its main class `gen
 inherits **Qiskit's** `Clifford` for the tableau and a **quimb** MPS for the complex
 coefficient vector; `gen_clifford.compose(...)` accepts non-Clifford unitaries, decomposed by
 their own methods. **We deliberately differ:** use **stim** (not Qiskit `Clifford`) for the
-tableau and direct quimb MPS operations orchestrated by **`MpsStabOptimizer`** for the
+tableau and direct quimb MPS operations orchestrated by **`StabilizerMpsSimulator`** for the
 coefficient side. Consult their `stabilizers_example.ipynb` and `.compose` logic to validate
 the decomposition/update math, but do not copy internals (repo `AGENTS.md`).
 
@@ -258,12 +258,12 @@ replacement:
   must not touch the reserved ancillas. `middle_out` is the default static order; `input`
   preserves injection order; `min_span` greedily selects the current shortest frame span.
 
-Use `MpsStabOptimizer.analyze_stream(gates, ...)` and
-`MpsStabOptimizer.recommend_settings(gates, ...)` before selecting settings. These are
+Use `StabilizerMpsSimulator.analyze_stream(gates, ...)` and
+`StabilizerMpsSimulator.recommend_settings(gates, ...)` before selecting settings. These are
 Pepsy-stream-first APIs: they inspect Clifford, T-family, other non-Clifford, dense matrix,
 sub-MPO, measurement/reset/cap, and qubit-use features, then return typed,
 mapping-compatible advice records. `recommend_settings` delegates only the
-direct/immediate/deferred part to `MpsStabOptimizer.recommend_magic_strategy(gates, ...)`,
+direct/immediate/deferred part to `StabilizerMpsSimulator.recommend_magic_strategy(gates, ...)`,
 which remains available when the caller wants just the injection schedule. On an unrun
 `from_stim` simulator, `sim.queued_stream_analysis()` and
 `sim.queued_recommend_settings()` analyze the sampled and optionally transformed Pepsy

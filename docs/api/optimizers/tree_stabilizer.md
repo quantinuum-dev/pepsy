@@ -1,7 +1,8 @@
 # `pepsy.optimizers.tree_stabilizer`
 
-`TreeStabOptimizer` is the first tree-backed Stabilizer Tensor Network
-milestone. It represents the state as
+`StabilizerTreeSimulator` is the first tree-backed Stabilizer Tensor Network
+milestone. `TreeStabOptimizer` remains a deprecated compatibility alias. It
+represents the state as
 
 ```text
 |psi> = C |p>
@@ -94,7 +95,7 @@ The first milestone supports:
 ```python
 import pepsy
 
-sim = pepsy.TreeStabOptimizer(4, gates=[
+sim = pepsy.StabilizerTreeSimulator(4, gates=[
     ("h", 0),
     ("cnot", 0, 1),
     ("rz", 0.2, 0),
@@ -186,7 +187,7 @@ MpsStab: `submpo_event`, `submpo_event_parts`, `is_submpo_event`,
 Sampling is not bounded by `max_dense_sample_qubits`; that constructor
 argument remains accepted for compatibility with older callers.
 
-`TreeStabOptimizer.run` also accepts the shared shot and MPI options:
+`StabilizerTreeSimulator.run` also accepts the shared shot and MPI options:
 
 ```python
 result = sim.run(
@@ -224,7 +225,7 @@ state ``|p>`` in the same way as the MPS STN API; it is not conjugated through
 the physical Clifford frame. The payload must expose a usable MPO interface,
 or TreeOptimizer may lower it to a bounded dense operator. A complete
 ``TreeMPO``/TTNO can instead be scheduled with
-``TreeStabOptimizer.subtreempo_event(tree_operator)`` (or ``subttno_event``). Its
+``StabilizerTreeSimulator.subtreempo_event(tree_operator)`` (or ``subttno_event``). Its
 TreePlan must match the coefficient tree and its declared support must include
 all TreePlan physical sites, or exactly the complete operator's explicit
 ``operator_support`` (for example, one produced by ``TreeMPO.from_gate``); the

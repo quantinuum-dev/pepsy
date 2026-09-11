@@ -133,7 +133,7 @@ def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
 
 
 def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
-    optimizer = pepsy.MpsStabOptimizer(1, gates=[("x", 0)])
+    optimizer = pepsy.StabilizerMpsSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=3,
         seed=42,
@@ -191,7 +191,7 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
 
 
 def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
-    optimizer = pepsy.TreeStabOptimizer(1, gates=[("x", 0)])
+    optimizer = pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=3,
         seed=48,
@@ -217,7 +217,7 @@ def test_tree_optimizer_run_validates_non_integral_shots(shots):
 
 @pytest.mark.parametrize("shots", [True, 1.0])
 def test_tree_stabilizer_run_validates_non_integral_shots(shots):
-    optimizer = pepsy.TreeStabOptimizer(1)
+    optimizer = pepsy.StabilizerTreeSimulator(1)
 
     with pytest.raises(ValueError, match="shots must be a nonnegative integer"):
         optimizer.run(shots=shots, progress=False)
@@ -236,7 +236,7 @@ def test_tree_run_auto_fault_threshold_dispatches_shots():
 
 
 def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
-    optimizer = pepsy.TreeStabOptimizer(1)
+    optimizer = pepsy.StabilizerTreeSimulator(1)
 
     result = optimizer.run(
         auto_max_expected_faults=0.2,
@@ -254,7 +254,7 @@ def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
         chi=4,
         run=False,
     ),
-    lambda: pepsy.TreeStabOptimizer(1, gates=[("x", 0)]),
+    lambda: pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)]),
 ])
 def test_tree_run_local_progress_is_aggregate(monkeypatch, optimizer_factory):
     import importlib
@@ -732,7 +732,7 @@ def test_mpi_runner_can_use_existing_local_thread_backend():
 
 def test_mpi_runner_supports_rank_local_coalesced_batches():
     result = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
         comm=_FakeComm(),
     ).run(
@@ -757,7 +757,7 @@ def test_mpi_importance_reduction_matches_unbiased_result_estimate(strategy):
     )
     policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
     result = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [pepsy.TrajectoryEvent(channel, 0)],
         comm=_FakeComm(),
     ).run(
@@ -837,9 +837,9 @@ def test_mpi_failure_is_surfaced_as_one_error():
             pepsy.MpsOptimizer,
         ),
         (
-            lambda: pepsy.MpsStabOptimizer(1, chi=4),
+            lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
             {},
-            pepsy.MpsStabOptimizer,
+            pepsy.StabilizerMpsSimulator,
         ),
         (
             lambda: pepsy.TreeOptimizer(None, n=1, chi=4, run=False),
@@ -847,9 +847,9 @@ def test_mpi_failure_is_surfaced_as_one_error():
             pepsy.TreeOptimizer,
         ),
         (
-            lambda: pepsy.TreeStabOptimizer(1),
+            lambda: pepsy.StabilizerTreeSimulator(1),
             {},
-            pepsy.TreeStabOptimizer,
+            pepsy.StabilizerTreeSimulator,
         ),
     ],
 )

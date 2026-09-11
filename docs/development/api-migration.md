@@ -32,7 +32,9 @@ New code and documentation should use the canonical import on the right.
 | `pepsy.boundary.infidelity` | `pepsy.boundary.peps_infidelity` |
 | `pepsy.optimizers.QMeraParametricEnergyOptimizer` | `pepsy.optimizers.QMeraEnergyOptimizer` |
 | `pepsy.optimizers.MpsStabOptimizer` | `pepsy.optimizers.StabilizerMpsSimulator` |
-| `pepsy.optimizers.stabilizer_tn.StabilizerMps` | `pepsy.optimizers.stabilizer_tn.MpsStabOptimizer` |
+| `pepsy.optimizers.TreeStabOptimizer` | `pepsy.optimizers.StabilizerTreeSimulator` |
+| `pepsy.sampling.MpsStabSampler` | `pepsy.sampling.StabilizerMpsSampler` |
+| `pepsy.optimizers.stabilizer_tn.StabilizerMps` | `pepsy.optimizers.stabilizer_tn.StabilizerMpsSimulator` |
 | `pepsy.experimental.mera` | `pepsy.experimental.qmera` |
 | `pepsy.optimizers.mera` | `pepsy.optimizers.qmera` |
 | `ham_tn.build_mpo(...)` | `ham_tn.to_mpo(...)` |

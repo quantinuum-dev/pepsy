@@ -1,4 +1,4 @@
 interface:
-  display_name: "Tree Stabilizer Optimizer"
+  display_name: "Stabilizer Tree Simulator"
   short_description: "Implement and validate TTN stabilizer simulation"
-  default_prompt: "Use $tree-stabilizer-optimizer to extend or validate TreeStabOptimizer."
+  default_prompt: "Use $tree-stabilizer-optimizer to extend or validate StabilizerTreeSimulator."
