@@ -40,6 +40,7 @@ optimizer = pepsy.PepsOptimizer(
     boundary_engine="dmrg",
     boundary_kwargs={
         "fit_mode": "dmrg2",
+        "fit_layer_mode": "joint",
         "fit_init_strategy": "guess-src",
         "fit_init_seed": 7,
         "fit_sweep_sequence": "LR",
@@ -56,6 +57,13 @@ optimizer = pepsy.PepsOptimizer(
 addition to the default `"direct"`. The exact boundary target, live state,
 and reusable boundary handles remain authoritative. Symmray boundaries safely
 fall back to direct initialization with a warning for dense Quimb guesses.
+
+`fit_layer_mode` and `layer_tags` use the same semantics as the lower-level
+boundary APIs. Keep the default `"joint"` for the ordinary PEPS BRA--KET
+double layer. Direct Quimb modes may use `"sequential"` with explicit tags;
+the shared `boundary_kwargs` mapping forwards this policy to normalization,
+infidelity checks, and the delegated `SweepOptimizer`. `fit_timing` and
+`fit_timing_sync_device` are forwarded the same way.
 
 For sweep cleanup, tuple `boundary_chi` values cap the norm and overlap
 boundaries independently. Normalization and diagnostic contractions receive

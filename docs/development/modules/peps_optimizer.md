@@ -41,6 +41,7 @@ optimizer = PepsOptimizer(
     boundary_chi=boundary_chi,
     boundary_kwargs={
         "fit_mode": "dmrg2",
+        "fit_layer_mode": "joint",
         "fit_init_strategy": "guess-src",
         "fit_init_seed": 7,
         "fit_sweep_sequence": "LR",
@@ -60,6 +61,13 @@ refinement, while `"two-site"` remains fixed two-site FIT. The Quimb modes
 `fit_init_strategy` only initializes FIT from a disposable copy
 (`"guess-direct"`, `"guess-src"`, or `"guess-sdc"`) and leaves the exact
 target and reusable boundary handles unchanged.
+
+`fit_layer_mode` and `layer_tags` are forwarded consistently to normalization,
+infidelity, and the delegated `SweepOptimizer`. The ordinary PEPS BRA--KET
+double layer uses the default `"joint"` policy. Direct Quimb boundary modes
+can request `"sequential"` absorption with explicit layer tags. Timing is
+opt-in through `fit_timing`; `fit_timing_sync_device` has an effect only when
+timing is enabled.
 
 ## Extraction map
 

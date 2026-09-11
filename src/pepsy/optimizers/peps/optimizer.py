@@ -1335,6 +1335,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if values is not None:
                 summary[target_key] = len(values)
 
+        fit_diagnostics = result.get("fit_diagnostics")
+        if fit_diagnostics is not None:
+            summary["fit_diagnostic_count"] = len(fit_diagnostics)
+            summary["fit_timing_count"] = sum(
+                bool(getattr(diagnostic, "sweep_timings", ()))
+                for diagnostic in fit_diagnostics
+            )
+
         best_traces = result.get("inner_best_loss_traces")
         if best_traces:
             best_values = [

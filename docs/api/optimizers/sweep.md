@@ -28,6 +28,17 @@ When enabled for the `eff` path, stopping waits for at least two completed
 sweeps and compares consecutive retained-center norms. The default boundary
 sequence is `RL`: left-to-right followed by right-to-left.
 
+`SweepOptimizer` uses the same layer and diagnostic controls as the public
+boundary functions. `fit_layer_mode="joint"` is the default and is required
+for FIT/DMRG modes. Direct Quimb modes can use
+`fit_layer_mode="sequential"` with an explicit `layer_tags` absorption order.
+`fit_timing=True` enables FIT timing diagnostics, and
+`fit_timing_sync_device=True` adds accelerator synchronization only when
+timing is enabled. These options can be supplied at construction or through
+`normalize_kwargs` / `infidelity(...)` per-call overrides.
+The latest metric diagnostics are available as `optimizer.fit_diagnostics`,
+and sweep runs also return them under the `fit_diagnostics` result key.
+
 `SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
 are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for
 that diagnostic; omitting `fit_rtol` inherits the constructor value. The same

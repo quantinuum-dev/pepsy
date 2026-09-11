@@ -203,6 +203,113 @@ def test_peps_optimizer_routes_adaptive_eff_boundary_policy(monkeypatch):
         assert init_kwargs[key] == value
 
 
+def test_peps_optimizer_routes_layered_boundary_policy(monkeypatch):
+    """Layer and timing policies reach all three PEPS boundary entry points."""
+    calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def _fake_infidelity(_state, _target, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+    policy = {
+        "fit_mode": "direct",
+        "fit_layer_mode": "sequential",
+        "layer_tags": ("KET", "BRA"),
+        "fit_timing": True,
+        "fit_timing_sync_device": True,
+    }
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs=policy,
+        normalize_initial=False,
+    )
+
+    opt.normalize()
+    opt.estimate_infidelity(DummyState(), DummyState())
+    init_kwargs, _, _ = opt._sweep_boundary_kwargs(progress=False)
+
+    for key, value in policy.items():
+        assert calls[-1][1][key] == value
+        assert infidelity_calls[-1][key] == value
+        assert init_kwargs[key] == value
+
+
+def test_sweep_optimizer_forwards_per_call_boundary_fit_options(monkeypatch):
+    """Sweep metric calls can override the stored layer and timing policy."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=6)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=3,
+        fit_mode="eff",
+        simplify=False,
+        renormalize_state=False,
+    )
+    normalize_calls = []
+    infidelity_calls = []
+
+    def _fake_normalize(_state, **kwargs):
+        normalize_calls.append(dict(kwargs))
+        return 1.0
+
+    def _fake_infidelity(_state, _target, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(sweep_mod, "peps_normalize", _fake_normalize)
+    monkeypatch.setattr(sweep_mod, "boundary_infidelity", _fake_infidelity)
+
+    sweep.normalize(
+        fit_mode="direct",
+        fit_layer_mode="sequential",
+        layer_tags=("KET", "BRA"),
+        fit_timing=True,
+        fit_timing_sync_device=True,
+    )
+    sweep.infidelity(
+        fit_mode="direct",
+        fit_layer_mode="sequential",
+        layer_tags=("KET", "BRA"),
+        fit_timing=True,
+        fit_timing_sync_device=True,
+    )
+
+    for calls in (normalize_calls, infidelity_calls):
+        assert calls[-1]["fit_mode"] == "direct"
+        assert calls[-1]["fit_layer_mode"] == "sequential"
+        assert calls[-1]["layer_tags"] == ("KET", "BRA")
+        assert calls[-1]["fit_timing"] is True
+        assert calls[-1]["fit_timing_sync_device"] is True
+
+
+def test_sweep_optimizer_retains_fit_diagnostics_in_run_result():
+    """Higher-level sweep results keep the CompBdy FIT diagnostics."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="float64", seed=7)
+    target = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="float64", seed=8)
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=2,
+        fit_mode="dmrg2",
+        fit_timing=True,
+        simplify=False,
+        renormalize_state=False,
+    )
+    sweep.set_optimize_kwargs(axes=("y",), n_cycles=0)
+
+    result = sweep.run(progress=False, renormalize=False)
+
+    assert result["fit_diagnostics"]
+    assert tuple(sweep.fit_diagnostics) == result["fit_diagnostics"]
+
+
 def test_sweep_optimizer_builds_two_site_cached_boundary_pair():
     """PEPS sweep cleanup should construct both CompBdy objects consistently."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=5)
