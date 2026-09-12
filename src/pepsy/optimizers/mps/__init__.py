@@ -2,7 +2,7 @@
 
 from importlib import import_module
 
-from .layout import MpsGateStreamLayoutFinder
+from .layout import MpsGateStreamLayoutFinder, MpsGateStreamSchedule
 from .gibbs import GibbsMps
 from .optimizer import (
     MpsOptimizer,
@@ -18,6 +18,7 @@ __all__ = [
     "MpsOptimizer",
     "guess",
     "MpsGateStreamLayoutFinder",
+    "MpsGateStreamSchedule",
     "is_submpo_event",
     "normalize_submpo_where",
     "submpo_event_parts",

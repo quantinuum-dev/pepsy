@@ -5,7 +5,80 @@ import pytest
 import quimb as qu
 import quimb.tensor as qtn
 
-from pepsy import FIT, MpsOptimizer, TrajectoryChannel
+from pepsy import FIT, MpsOptimizer, TrajectoryChannel, rx, rzz
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "where", "factory"),
+    [
+        (("RZZ", 0.23), (0, 1), rzz),
+        (("rx", 0.41), 0, rx),
+    ],
+)
+def test_bundled_named_rotation_descriptor_accepts_separate_targets(
+    descriptor, where, factory
+):
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    opt = MpsOptimizer(state.copy(), [(descriptor, where)], chi=4)
+    reference = state.copy()
+    reference.gate_(factory(descriptor[1]), where, cutoff=0.0)
+    opt.run(cutoff=0.0)
+    np.testing.assert_allclose(opt.to_dense(), reference.to_dense())
+
+
+@pytest.mark.parametrize("descriptor", [("rx", 0.41), ("rzz", 0.23)])
+def test_named_rotation_without_targets_is_rejected(descriptor):
+    with pytest.raises(ValueError, match="expects"):
+        MpsOptimizer(qtn.MPS_computational_state("00"), [descriptor], chi=4)
+
+
+@pytest.mark.parametrize(
+    ("entry", "state_bits", "where", "theta", "factory"),
+    [
+        (("rx-0.41", 0), "0", 0, 0.41, rx),
+        (("rzz-0.23", 0, 1), "00", (0, 1), 0.23, rzz),
+        (("RZZ--0.23", 0, 1), "00", (0, 1), -0.23, rzz),
+    ],
+)
+def test_embedded_named_rotation_descriptor_matches_numeric_form(
+    entry, state_bits, where, theta, factory
+):
+    state = qtn.MPS_computational_state(state_bits, dtype="complex128")
+    opt = MpsOptimizer(state.copy(), [entry], chi=4)
+    reference = state.copy()
+    reference.gate_(factory(theta), where, cutoff=0.0)
+    opt.run(cutoff=0.0)
+    np.testing.assert_allclose(opt.to_dense(), reference.to_dense())
+
+
+def test_qubit_roles_are_available_to_layout_finder():
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    roles = {0: "data", 1: "data", 2: "aux", 3: "data"}
+    opt = MpsOptimizer(
+        state,
+        [("rzz-0.23", 0, 2), ("CZ", 1, 3)],
+        chi=8,
+        qubit_roles=roles,
+    )
+
+    assert opt.qubit_roles == {0: "data", 1: "data", 2: "ancilla", 3: "data"}
+    assert opt.site_roles == opt.qubit_roles
+    assert opt.gate_stream_info()["qubit_roles"] == opt.qubit_roles
+
+    plan = opt.current_gate_stream_layout(
+        order="quality",
+        role_order=("data", "ancilla"),
+    )
+    assert plan["qubit_roles"] == opt.qubit_roles
+    assert plan["role_order"] == ("data", "ancilla")
+    assert "role_grouped" in plan["candidate_plans"]
+    assert set(plan["site_order"]) == {0, 1, 2, 3}
+    schedule = opt.current_gate_stream_schedule(
+        layout_kwargs={"role_order": ("data", "ancilla")},
+    )
+    assert schedule.metadata["qubit_roles"] == opt.qubit_roles
+    assert schedule.metadata["site_usage"][2]["role"] == "ancilla"
+    assert opt.copy().qubit_roles == opt.qubit_roles
 
 
 @pytest.mark.parametrize("axis", ["X", "Y"])

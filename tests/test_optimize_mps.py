@@ -6805,16 +6805,16 @@ def test_mps_compression_layout_pilot_rejects_conflicting_modes(kwargs, match):
         )
 
 
-def test_mps_compression_layout_pilot_rejects_cap_stream():
-    """Pilot selection should reject length-changing streams early."""
+def test_mps_compression_layout_pilot_accepts_direct_cap_stream():
+    """Pilot selection tracks a direct cap's shortened replay state."""
     opt = py.MpsOptimizer(
         qtn.MPS_computational_state("0000"),
         gates=[("cap", 1, [1.0, 1.0])],
         chi=4,
         mode="direct",
     )
-    with pytest.raises(ValueError, match="cap control events"):
-        opt.select_layout_for_compression(pilot_candidates=1, pilot_steps=1)
+    plan = opt.select_layout_for_compression(pilot_candidates=1, pilot_steps=1)
+    assert plan["pilot"]["reports"]["input"]["status"] == "ok"
 
 
 def test_mps_compression_layout_pilot_accepts_none_mode_override():
@@ -7278,16 +7278,35 @@ def test_mps_optimizer_persistent_layout_remaps_submpo_without_mutating_stream()
     assert stream[0][2] == (0, 3)
 
 
-def test_mps_optimizer_persistent_layout_rejects_cap_events():
-    """Persistent layout cannot survive a stream that changes MPS length."""
-    opt = py.MpsOptimizer(
-        qtn.MPS_computational_state("0000"),
-        gates=[("cap", 1, [1.0, 1.0])],
-        chi=8,
-        mode="mpo",
+def test_mps_optimizer_persistent_layout_tracks_direct_cap_events():
+    """Persistent layouts update logical labels when a cap shortens the chain."""
+    stream = [
+        (qu.hadamard(), (0,)),
+        ("cap", 1, [1.0, 0.0], "left"),
+        (qu.CNOT(), (0, 1)),
+    ]
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=stream,
+        chi=16,
+        mode="svd",
     )
-    with pytest.raises(ValueError, match="cap control events"):
-        opt.apply_layout((0, 2, 3, 1), layout_report=False)
+    reference.run(progbar=False, cutoff=0.0)
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=stream,
+        chi=16,
+        mode="svd",
+    )
+    opt.apply_layout((2, 0, 1), layout_report=False)
+    opt.run(progbar=False, cutoff=0.0)
+
+    assert opt.mps_length_diagnostics()["length_history"] == (3, 2)
+    assert opt.logical_order == [1, 0]
+    assert np.allclose(
+        np.asarray(opt.to_dense()).reshape(-1),
+        np.asarray(reference.to_dense()).reshape(-1),
+    )
 
 
 def test_mps_optimizer_layout_run_reports_score_reduction(capsys):
@@ -8902,17 +8921,39 @@ def test_mps_optimizer_measure_reset_support_layout_finder():
     assert np.allclose(np.abs(lay.p.to_dense(inds)), np.abs(ref.p.to_dense(inds)))
 
 
-def test_mps_optimizer_cap_events_reject_layout_finder():
-    """cap events change the MPS length, so the layout finder is rejected."""
+def test_mps_optimizer_cap_events_replay_through_layout_finder():
+    """Direct caps replay through a transient layout and restore readout order."""
     su4 = qu.rand_uni(4, seed=1)
-    opt = py.MpsOptimizer(
-        qtn.MPS_computational_state("0000"),
-        [(su4, (0, 3)), ("cap", 1, [1.0, 1.0])],
+    stream = [
+        (su4, (0, 3)),
+        ("cap", 1, [1.0, 1.0]),
+        (qu.CNOT(), (0, 2)),
+    ]
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        stream,
         chi=8,
         mode="mpo",
     )
-    with pytest.raises(ValueError, match="cap control"):
-        opt.run(progbar=False, use_layout_finder=True)
+    reference.run(progbar=False, cutoff=0.0)
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        stream,
+        chi=8,
+        mode="mpo",
+    )
+    opt.run(
+        progbar=False,
+        use_layout_finder=True,
+        layout_report=False,
+        cutoff=0.0,
+    )
+    assert opt.logical_order == [0, 1, 2]
+    assert opt.mps_length_diagnostics()["length_history"] == (4, 3)
+    assert np.allclose(
+        np.asarray(opt.to_dense()).reshape(-1),
+        np.asarray(reference.to_dense()).reshape(-1),
+    )
 
 
 def test_mps_optimizer_conditional_cap_rejects_layouts():
@@ -8924,11 +8965,11 @@ def test_mps_optimizer_conditional_cap_rejects_layouts():
     initial = qtn.MPS_computational_state("0000", dtype="complex128")
 
     persistent = py.MpsOptimizer(initial.copy(), stream, chi=8, mode="direct")
-    with pytest.raises(ValueError, match="cap control events"):
+    with pytest.raises(ValueError, match="conditional cap"):
         persistent.apply_layout((0, 2, 3, 1), layout_report=False)
 
     transient = py.MpsOptimizer(initial.copy(), stream, chi=8, mode="direct")
-    with pytest.raises(ValueError, match="cap control events"):
+    with pytest.raises(ValueError, match="conditional cap"):
         transient.run(
             progbar=False,
             use_layout_finder=True,

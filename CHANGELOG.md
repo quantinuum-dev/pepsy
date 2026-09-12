@@ -14,6 +14,20 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- MPS gate-stream layout search now accepts arbitrary logical-site coordinates,
+  infers deterministic pseudo-coordinates from interaction graphs when none
+  are supplied, consumes raw measurement/reset events in the layout-only API,
+  and automatically adds role-interleaved and lifetime candidates when
+  data/ancilla information is available. The new ``objective="smart"`` alias
+  performs bounded replay against private copies of the initial MPS.
+
+- MPS gate-stream layout finders can now expose per-site use windows and
+  measure/reset-separated lifetimes. An explicit ``order="lifetime"`` seed,
+  ``order="role-grouped"` candidate, or ``role_order`` together with
+  ``qubit_roles``, gives the locality,
+  compression, and replay objectives a general QEC-oriented candidate without
+  forcing data and ancilla sites into contiguous blocks.
+
 - Changed `MpsOptimizer(mode="mix")` to use the same transactional algorithm
   in both bond-growth and fixed-`chi` phases: each eligible multi-site gate
   builds a disposable chi-capped `guess-direct` state, then runs one-site FIT
@@ -40,6 +54,19 @@ Changes for the next release should be added here before the version is bumped.
   SRC/SDC and consistent per-call caps/cutoffs. Certified one-site unitaries
   preserve the canonical center and isometry metadata. Unsupported native
   DM rejects before update accounting or state changes.
+
+- Tree SRC now has an opt-in `src-oversample` mode. It uses Quimb's default
+  larger sampling rank and a final direct tree sweep at the requested `chi`,
+  while the existing fixed-rank `src` mode remains seeded and Quimb-parity
+  compatible. JAX complex64 SRC diagnostics use scoped high-precision
+  accumulation; no global backend setting is changed. FIT variants remain
+  separate from TreeFIT/DMRG.
+
+- Added dense-only tree `sdcr` compression. It keeps the SDC complementary
+  environment and nested target projection, but uses Quimb's static randomized
+  SVD driver (`svd:rand`) for environment factors, with seeded replay and no
+  oversampling or power iterations by default. `sdcr-oversample` remains
+  intentionally deferred pending branched-tree accuracy validation.
 
 - TreeFIT now reuses a canonical region contained inside its next local
   block, preserving exterior environments without an isometry rescan or
@@ -81,6 +108,21 @@ Changes for the next release should be added here before the version is bumped.
   truncation behavior is preserved.
 
 ### Added
+
+- Added an explicit state-aware MPS layout objective. An optimizer-backed
+  `MpsGateStreamLayoutFinder` now jointly evaluates bounded static layout
+  candidates and dependency-safe mountain gate ordering on private copies,
+  reports the event-by-event `max_bond()`/`bond_sizes()` profile, and selects
+  by the measured transient peak without changing the existing locality or
+  compression defaults. Measurement/reset/feed-forward events remain fixed
+  barriers; direct caps are replayed with dynamic lifetime remapping, while
+  conditional caps and trajectory streams remain explicit branching work.
+  Added `MpsGateStreamSchedule` with direct-cap support.
+
+- Added an opt-in `replay_schedule="measure-early"` policy for state-aware MPS
+  layout replay. Measurements and resets may move left across immediately
+  preceding ordinary events on disjoint supports, while shared-site gates,
+  feed-forward, and cap dependencies remain fixed.
 
 - Preserve TreeMPO represented exponents across direct/DM, SRC/SDC, zipup,
   copies, exact readout, and operator arithmetic, matching FIT target scaling.

@@ -96,7 +96,14 @@ Torch and Quimb split registrations.
 `[(gate, where), ...]`. It also accepts stabilizer-style symbolic entries
 `("H", site)`, `("CNOT", control, target)`, and
 `("rzz", angle, site_a, site_b)`, along with the matching one- and two-qubit
-rotation forms. Symbolic names are resolved through Pepsy's standard gate
+rotation forms. Angles can also be embedded in the name for compact streams:
+`("rx-0.41", site)` and `("rzz-0.23", site_a, site_b)` (the suffix must be
+numeric, including a leading minus sign when needed). For a bundled entry, the
+symbolic descriptor can also be kept separate from its targets:
+`(("rx", angle), site)` and `(("rzz", angle), (site_a, site_b))`. A bare
+`("rx", angle)` or
+`("rzz", angle)` is intentionally rejected because it does not specify the
+target qubit(s). Symbolic names are resolved through Pepsy's standard gate
 constructors before replay, so uppercase names are accepted. Pass
 `to_backend=...` to convert those internally generated matrices before the
 strict stream/backend check; if omitted, the converter is inferred from the
@@ -115,6 +122,62 @@ opt = pepsy.MpsOptimizer(
     to_backend=backend,
 )
 ```
+
+Optional logical-qubit roles can travel with the stream without changing gate
+semantics. Supply a site-to-role mapping (or one role per site), then request a
+role-grouped candidate when useful:
+
+```python
+roles = {0: "data", 1: "data", 2: "ancilla", 3: "ancilla"}
+opt = pepsy.MpsOptimizer(state, [("rzz-0.23", 0, 2)], chi=16,
+                         qubit_roles=roles)
+plan = opt.current_gate_stream_layout(
+    objective="replay", role_order=("data", "ancilla"), replay_candidates=4,
+)
+opt.gate_stream_info()["qubit_roles"]
+```
+
+For code-agnostic QEC streams, coordinates can be supplied independently of
+the code representation. They become layout candidates, not just plotting
+metadata:
+
+```python
+coords = {
+    0: (0, 0), 1: (1, 0),       # data
+    2: (0, 1), 3: (1, 1),       # ancillas
+}
+plan = opt.current_gate_stream_layout(
+    site_coords=coords,
+    objective="smart",
+    replay_candidates=4,
+    replay_steps=128,
+)
+```
+
+The finder also accepts raw measurement/reset events in the class-level
+layout API. When coordinates are absent, it constructs deterministic
+pseudo-coordinates from the interaction graph and records them as inferred
+geometry; these are search aids, not claims about CSS-code coordinates. The
+quality search automatically adds coordinate, lifetime, role-interleaved, and
+graph-embedding candidates when the relevant information is available.
+`objective="smart"` is the state-aware alias for the bounded replay pilot: it
+applies each candidate to a private copy of the initial MPS, replays the
+stream, and selects by the observed transient bond profile. The source
+optimizer and its initial state remain unchanged.
+
+When both `data` and `ancilla` roles are present, the quality search adds
+role-grouped, role-interleaved, and lifetime candidates automatically.
+`role_order` overrides the default data-first preference; use
+`order="role-grouped"` when the explicit role-grouped candidate should be
+selected. Connectivity and the selected objective still decide the winner
+unless that explicit order is requested. The
+`lifetime` candidate uses event timing, measure/reset boundaries, interaction
+degree, and role labels as soft hints, while `role_interleaved` keeps inferred
+ancillas near their strongest data neighborhoods. The plan and compiled
+schedule retain `qubit_roles`, `site_coords`, and role evidence, and the plan
+exposes `site_usage` with per-site use windows and reusable lifetime intervals.
+Direct cap events are supported as explicit lifetime barriers; conditional caps
+remain a state-dependent branching choice.
 
 Numeric matrix gates and sub-MPO payloads retain the explicit-preparation
 contract described below. Bare Quimb compression names such as `mode="src"`,
@@ -963,9 +1026,70 @@ dimension and elapsed time, and returns per-candidate records under
 layout are unchanged. Perform this before installing a persistent layout;
 reordering an already-entangled MPS remains explicitly guarded because the
 reorder itself can be lossy or expensive. Compression pilots reject
-`mode="perm"`, cap events, and caller-supplied `layout`/
+`mode="perm"`, conditional-cap events, and caller-supplied `layout`/
 `use_layout_finder` options because the pilot must control one fixed layout
 per trial.
+
+For the paper-style transient ``chi`` objective, use an optimizer-backed
+finder explicitly:
+
+```python
+finder = opt.layout_finder()
+plan = finder.run(
+    objective="replay",
+    replay_candidates=4,
+    replay_steps=64,
+    replay_kwargs={"cutoff": 1e-12, "n_iter": 8},
+)
+profile = plan["stats"]["replay"]["profile"]
+print(plan["stats"]["replay"]["peak_bond"])
+```
+
+This objective uses the static compression score only to bound the candidate
+set, schedules each ordinary gate segment, then replays each candidate on a
+private copy and records
+`max_bond()`/`bond_sizes()` after every event. The reported peak is therefore
+an actual replay measurement, not a claim about the static operator-cut
+proxy. It is opt-in and non-mutating. The default
+`replay_schedule="mountain"` preserves input order for events sharing a
+logical site and reorders only disjoint gate/sub-MPO events. Measurement,
+reset, and feed-forward events remain fixed barriers by default. The opt-in
+`replay_schedule="measure-early"` policy moves a measurement or reset left
+across only immediately preceding ordinary events on disjoint supports;
+shared-site gates, feed-forward events, and caps remain barriers. This is a
+generic safe subset of measure-early scheduling and does not require a
+circuit-specific commutation oracle. Direct caps remain fixed barriers and
+are replayed with their shortened-chain position map; conditional caps and
+trajectory streams are still unsupported. An already-entangled initial state needs the explicit
+`replay_allow_lossy_reorder=True` opt-in if its physical order must be
+changed. The `objective="smart"` alias makes that private-copy reorder
+explicitly as part of the smart initial-state pilot. The returned plan includes
+`replay_event_order` and
+`scheduled_stream`, and passing that plan to `run(layout=plan)` executes the
+selected event order.
+
+The finder can also compile a dependency-safe gate schedule for the existing
+`set_gate_schedule` hook:
+
+```python
+schedule = opt.current_gate_stream_schedule(
+    layout_order="quality",
+    schedule_order="mountain",
+)
+trial = pepsy.MpsOptimizer(state.copy(), chi=64, mode="dmrg2")
+trial.set_gate_schedule(schedule).run()
+```
+
+`"mountain"` preserves input order for events sharing a logical site and
+only reorders disjoint ordinary gates. Direct caps are emitted as fixed
+lifetime barriers; the compiler shifts later physical positions after each
+removal and records `metadata["final_site_order"]`. Measurement, reset, and
+feed-forward events remain in the stateful run path. Use
+`MpsOptimizer.gate_stream_schedule(...)` for a standalone stream. The
+compiled stream is physical-order data by design; use `schedule.site_order`
+and `schedule.metadata["final_site_order"]` with
+`to_dense(logical_order=False)` or `remap_sample` when reading a non-identity
+scheduled layout.
 
 The layout can be inspected graphically without changing the optimizer. The
 finder returns a Matplotlib `(fig, ax)` pair. The original lattice and gate
