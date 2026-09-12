@@ -603,6 +603,11 @@ Changes for the next release should be added here before the version is bumped.
 - Added opt-in Quimb `sdc` and `sdc-oversample` MPS compression mode names
   with execution-time capability checks; existing compression defaults and
   modes are unchanged.
+- Added opt-in Quimb `sdcr` and `sdcr-oversample` compression mode names to
+  `MpsOptimizer` and `MpoOptimizer`, including `guess-sdcr` FIT warm starts.
+  Base SDCR uses a rank-only randomized environment with a relative cutoff
+  compatibility policy; existing defaults and seeded SRC/SRCMPS behavior are
+  unchanged.
 - Updated randomized MPS compression to use Quimb's explicit `seed` support
   when available, while retaining a compatibility fallback for older builds.
 - Added opt-in fourth-order Suzuki-Yoshida gate streams to the symmetric

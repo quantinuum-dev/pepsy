@@ -83,6 +83,7 @@ from ..._internal.cutoff import dtype_auto_cutoff
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_method_available as _quimb_compression_method_available,  # noqa: F401
+    quimb_1d_compression_cutoff_mode as _quimb_compression_cutoff_mode,
     quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
     require_quimb_1d_compression_method as _require_quimb_compression_method,
 )
@@ -132,6 +133,8 @@ _MPO_COMPRESSION_METHODS = frozenset(
         "srcmps-oversample",
         "sdc",
         "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
         "fit",
         "fit-zipup",
         "fit-projector",
@@ -139,7 +142,7 @@ _MPO_COMPRESSION_METHODS = frozenset(
     }
 )
 _MPO_METHODS_IGNORE_CUTOFF_MODE = frozenset({"src", "srcmps"})
-_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps"})
+_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps", "sdcr"})
 _MPO_METHODS_USE_SEED = frozenset(
     {
         "src",
@@ -1243,6 +1246,7 @@ def _apply_submpo_with_interior_workaround_impl(
     site_tags = [p.site_tag(site) for site in range(si, sf + 1)]
     _, subp = p.partition(site_tags, which="any", inplace=True)
 
+    cutoff_mode = _quimb_compression_cutoff_mode(method, cutoff_mode)
     common = {
         "site_tags": site_tags,
         "max_bond": chi,
@@ -1370,6 +1374,7 @@ def _apply_dense_gate_with_method(
             opts["cutoff"] = (
                 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
             )
+        cutoff_mode = _quimb_compression_cutoff_mode(method, cutoff_mode)
         if cutoff_mode is not None and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE:
             opts["cutoff_mode"] = cutoff_mode
         if optimize is not None:
@@ -1705,11 +1710,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return compression options for a sub-MPO method."""
         opts = {}
         # ``cutoff`` controls discarded singular weight for ordinary methods.
-        # SRC/SRCMPS are rank-controlled randomized projections, so Quimb
+        # SRC/SRCMPS/SDCR are rank-controlled randomized projections, so Quimb
         # intentionally ignores a singular-value cutoff for those methods.
         opts["cutoff"] = (
             0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
         )
+        cutoff_mode = _quimb_compression_cutoff_mode(method, cutoff_mode)
         if (
             cutoff_mode is not None
             and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
@@ -5248,8 +5254,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             qualified ``mode="quimb-<method>"`` selects the method;
             the default ``mode="direct"`` selects ``"direct"``. The opt-in
             ``"sdc"`` and ``"sdc-oversample"`` methods require a Quimb build
-            that provides those compressors; they never replace an existing
-            default. The legacy
+            that provides those compressors; ``"sdcr"`` and
+            ``"sdcr-oversample"`` are the randomized-environment variants.
+            These methods never replace an existing default. The legacy
             ``mode="mpo-<method>"`` / ``mode="mpo"`` spellings remain valid.
             The method
             is forwarded to Quimb for both dense gates and explicit sub-MPO

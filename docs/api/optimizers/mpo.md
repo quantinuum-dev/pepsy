@@ -40,10 +40,14 @@ The dense MPO compression backend exposes the same Quimb compressor family as
 legacy-qualified `mode="mpo-src"` spelling is equivalent as well. The same
 aliases are available for `direct`, `dm`, `zipup`, `zipup-first`,
 `zipup-oversample`, `src`, `src-first`, `src-oversample`, `srcmps`,
-`srcmps-first`, `srcmps-oversample`, `sdc`, `sdc-oversample`, `fit-zipup`,
-`fit-projector`, and `fit-oversample`. Use the qualified `quimb-fit` or
+`srcmps-first`, `srcmps-oversample`, `sdc`, `sdc-oversample`, `sdcr`,
+`sdcr-oversample`, `fit-zipup`, `fit-projector`, and `fit-oversample`. Use the
+qualified `quimb-fit` or
 `mpo-fit` spelling for Quimb's FIT compressor because bare `mode="fit"`
-remains the historical DMRG alias. These modes compress the ket and bra
+remains the historical DMRG alias. The `sdcr` pair uses randomized SVDs for
+its successive environments; base `sdcr` uses a relative cutoff there because
+cumulative cutoff modes are not valid for that randomized stage. These modes
+compress the ket and bra
 physical layers independently through `gate_nonlocal_opt` except for the
 native bare/default two-site `mode="direct"` route described above; they do not
 turn MPO evolution into an MPS-only `mix`, `su`, `perm`, or `swap` algorithm.

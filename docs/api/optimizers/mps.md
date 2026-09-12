@@ -187,9 +187,10 @@ to `quimb-<method>`. The qualified `mode="quimb-<method>"` forms, direct alias
 remain supported. The bare name `fit` remains the DMRG alias, so Quimb's
 `fit` compression method is selected as `mode="quimb-fit"`. Quimb's newer
 successive deterministic compressors are available explicitly as
-`mode="quimb-sdc"` and `mode="quimb-sdc-oversample"` when the installed Quimb
-build provides them. These modes are opt-in and do not change existing
-defaults.
+`mode="quimb-sdc"`, `mode="quimb-sdc-oversample"`, `mode="quimb-sdcr"`, and
+`mode="quimb-sdcr-oversample"` when the installed Quimb build provides them.
+The `sdcr` pair uses randomized SVDs for its successive environments. These
+modes are opt-in and do not change existing defaults.
 
 ## Lazy permutation swap-and-split
 
@@ -405,9 +406,12 @@ Bare Quimb method names and their `quimb-<method>` qualified forms are passed
 to Quimb's native 1D compression dispatcher. The legacy `mpo-<method>` names
 remain accepted as aliases. The bare `fit` name is reserved for DMRG; use
 `quimb-fit` when selecting Quimb's one-site FIT compressor.
-This includes bare `mode="sdc"` and `mode="sdc-oversample"`, which normalize to
-the corresponding `quimb-*` modes. They are version-gated through Quimb's
-compressor registry and never silently fall back to another method.
+This includes bare `mode="sdc"`, `mode="sdc-oversample"`, `mode="sdcr"`, and
+`mode="sdcr-oversample"`, which normalize to the corresponding `quimb-*`
+modes. They are version-gated through Quimb's compressor registry and never
+silently fall back to another method. Base `sdcr` is rank-controlled by
+`max_bond` and uses a relative cutoff for its randomized environment stage;
+cumulative cutoff modes are not valid for that stage.
 Oversampled methods retain Quimb's two-stage structure: an intermediate larger
 bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
@@ -425,7 +429,9 @@ sector-preserving randomized SVD (`svd:rand`) instead, so the guess remains
 native and never enters dense SRC. The equivalent
 `fit_init_strategy="guess_src"` spelling is accepted as a compatibility alias
 and is normalized internally to `guess_src`. Set `compression_seed` for reproducible randomized
-MPO replay; `fit_init_seed` controls randomized disposable FIT guesses.
+MPO replay; `fit_init_seed` controls randomized disposable FIT guesses. The
+Quimb method spelling is `srcmps` (without a hyphen); `src-mps` is not a
+separate compressor or alias.
 
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
@@ -479,10 +485,12 @@ Quimb-specific guess methods retain their native direct fallback. The available 
 `direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
 `src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`, `sdc`, and `sdc-oversample`. The latter two
-require a Quimb build containing the corresponding successive deterministic
-compressor. They are also valid FIT warm-start policies as
-`fit_init_strategy="guess-sdc"` and `fit_init_strategy="guess-sdc-oversample"`.
+`fit-projector`, `fit-oversample`, `sdc`, `sdc-oversample`, `sdcr`, and
+`sdcr-oversample`. The successive modes require a Quimb build containing the
+corresponding compressor. They are also valid FIT warm-start policies as
+`fit_init_strategy="guess-sdc"`, `fit_init_strategy="guess-sdc-oversample"`,
+`fit_init_strategy="guess-sdcr"`, and
+`fit_init_strategy="guess-sdcr-oversample"`.
 For ordinary DMRG, `auto` selects `guess-src` in both phases;
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).

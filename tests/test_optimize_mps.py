@@ -935,9 +935,11 @@ def test_mps_optimizer_mpo_method_modes(method):
     assert optimizer.mode == f"quimb-{method}"
 
 
-@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
-def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
-    """New SDC modes never silently fall back on older Quimb installations."""
+@pytest.mark.parametrize(
+    "method", ["sdc", "sdc-oversample", "sdcr", "sdcr-oversample"]
+)
+def test_mps_optimizer_successive_compression_modes_are_version_gated(method):
+    """New SDC/SDCR modes never silently fall back on older Quimb."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
@@ -947,7 +949,10 @@ def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
     supported = mps_optimizer_module._quimb_compression_method_available(method)
 
     if not supported:
-        with pytest.raises(NotImplementedError, match="sdc compressor"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{method.split('-', 1)[0]} compressor",
+        ):
             optimizer.run(progbar=False, cutoff=1.0e-12)
         return
 
@@ -960,18 +965,22 @@ def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
     assert optimizer.mode == f"quimb-{method}"
 
 
-def test_mps_optimizer_bare_sdc_mode_normalizes_to_quimb_sdc():
-    """The bare SDC spelling is a first-class MPS compression mode."""
+@pytest.mark.parametrize("method", ["sdc", "sdcr"])
+def test_mps_optimizer_bare_successive_mode_normalizes_to_quimb(method):
+    """Bare SDC and SDCR spellings are first-class MPS modes."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
         chi=2,
-        mode="sdc",
+        mode=method,
     )
-    assert optimizer.mode == "quimb-sdc"
+    assert optimizer.mode == f"quimb-{method}"
 
-    if not mps_optimizer_module._quimb_compression_method_available("sdc"):
-        with pytest.raises(NotImplementedError, match="sdc compressor"):
+    if not mps_optimizer_module._quimb_compression_method_available(method):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{method} compressor",
+        ):
             optimizer.run(progbar=False, cutoff=1.0e-12)
         return
 
@@ -983,9 +992,30 @@ def test_mps_optimizer_bare_sdc_mode_normalizes_to_quimb_sdc():
     assert out.max_bond() <= 2
 
 
-@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
-def test_mps_optimizer_sdc_fit_init_strategies_are_version_gated(method):
-    """SDC is available both as a mode and as a FIT warm-start method."""
+def test_mps_optimizer_sdcr_uses_relative_environment_cutoff():
+    """SDCR never forwards cumulative cutoffs to randomized environments."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="quimb-sdcr",
+    )
+
+    options = optimizer._submpo_compress_opts(  # pylint: disable=protected-access
+        "sdcr",
+        cutoff=1.0e-12,
+        cutoff_mode="rsum2",
+    )
+
+    assert options["cutoff"] == 0.0
+    assert options["cutoff_mode"] == "rel"
+
+
+@pytest.mark.parametrize(
+    "method", ["sdc", "sdc-oversample", "sdcr", "sdcr-oversample"]
+)
+def test_mps_optimizer_successive_fit_init_strategies_are_version_gated(method):
+    """SDC and SDCR are available as FIT warm-start methods when installed."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
@@ -995,7 +1025,10 @@ def test_mps_optimizer_sdc_fit_init_strategies_are_version_gated(method):
     supported = mps_optimizer_module._quimb_compression_method_available(method)
 
     if not supported:
-        with pytest.raises(NotImplementedError, match="sdc compressor"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{method.split('-', 1)[0]} compressor",
+        ):
             optimizer.run(
                 progbar=False,
                 n_iter=2,

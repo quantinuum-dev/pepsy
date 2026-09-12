@@ -65,7 +65,10 @@ import autoray as ar
 import numpy as np
 
 from ..._internal.random import backend_random_array
-from ..._internal.quimb import require_quimb_1d_compression_method
+from ..._internal.quimb import (
+    quimb_1d_compression_cutoff_mode,
+    require_quimb_1d_compression_method,
+)
 from ..._internal.validation import normalize_integer_tuple
 from ...backends import (
     backend_infer,
@@ -133,6 +136,8 @@ _MPO_COMPRESSION_METHODS = frozenset(
         "srcmps-oversample",
         "sdc",
         "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
         "fit",
         "fit-zipup",
         "fit-projector",
@@ -145,7 +150,7 @@ _FIT_INIT_STRATEGIES = frozenset(
 )
 _DEFAULT_FIT_INIT_STRATEGY = "guess_src"
 _MPO_METHODS_IGNORE_CUTOFF_MODE = frozenset({"src", "srcmps"})
-_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps"})
+_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps", "sdcr"})
 _MPO_METHODS_USE_SEED = frozenset(
     {
         "src",
@@ -574,6 +579,7 @@ class MpoOptimizer:
             "max_bond": max_bond,
             "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff,
         }
+        cutoff_mode = quimb_1d_compression_cutoff_mode(method, cutoff_mode)
         if cutoff_mode is not None and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE:
             options["cutoff_mode"] = cutoff_mode
         if seed is not None and method in _MPO_METHODS_USE_SEED:
