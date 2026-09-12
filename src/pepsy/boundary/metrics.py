@@ -16,6 +16,7 @@ from .states import BdyMPS
 from .sweeps import (
     BoundaryFitDiagnostic,
     CompBdy,
+    _canonical_fit_layer_mode,
     _canonical_fit_mode_selector,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "BoundaryFitDiagnostic",
     "contract_boundary",
     "contract_flat",
+    "contract_layered",
     "quimb_ctmrg_projector_compat",
     "peps_normalize",
     "normalize",
@@ -833,6 +835,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -861,10 +864,18 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     """Contract a double-layer PEPS norm/overlap network by the selected method."""
     method = _normalize_contraction_method(method)
     chi = _validate_chi(chi)
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
     if layer_tags is None and not flat:
         layer_tags = _DEFAULT_LAYER_TAGS
+    elif isinstance(layer_tags, str):
+        layer_tags = (layer_tags,)
     elif layer_tags is not None:
         layer_tags = tuple(layer_tags)
+    if fit_layer_mode == "sequential" and method != "dmrg":
+        raise ValueError(
+            "fit_layer_mode='sequential' requires method='dmrg'; "
+            "method='mps' uses Quimb's native layer_tags handling."
+        )
 
     if method == "dmrg":
         fit_mode = _canonical_fit_mode_selector(fit_mode)
@@ -891,12 +902,14 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
                     chi=initial_chi,
                     flat=True,
                     single_layer=single_layer,
+                    lazy=True,
                 )
             else:
                 bdy_obj = BdyMPS(
                     tn_double=norm,
                     chi=initial_chi,
                     single_layer=single_layer,
+                    lazy=True,
                 )
             if bdy_holder is not None:
                 bdy_holder["bdy"] = bdy_obj
@@ -906,6 +919,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             bdy=bdy_obj,
             contraction_opt=contraction_opt,
             fit_mode=fit_mode,
+            fit_layer_mode=fit_layer_mode,
             fit_init_strategy=fit_init_strategy,
             fit_init_seed=fit_init_seed,
             fit_block_size=fit_block_size,
@@ -924,6 +938,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             direction=direction,
             max_separation=max_separation,
             track_boundary_fidelity=track_boundary_fidelity,
+            layer_tags=layer_tags,
             visualize=visualize,
             strip_exponent=strip_exponent,
             equalize_norms=equalize_norms,
@@ -969,6 +984,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -992,13 +1008,21 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
 ):
-    """Contract an already-flat PEPS-like tensor network.
+    """Contract one already-flattened effective PEPS-like layer.
 
-    This helper is for networks that have already been flattened into a scalar
-    tensor network, so it does not call :func:`build_bra_ket`. With
-    ``method="auto"`` it uses the PEPSY DMRG/FIT boundary path for 2D networks
-    and quimb's ``contract_boundary`` path for 3D networks. Explicit methods
-    are ``"dmrg"``, ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and ``"exact"``.
+    This helper is for a single lattice layer whose local bra/ket or operator
+    contractions have already been performed. It does not call
+    :func:`build_bra_ket`, and ``flat=True`` selects the direct first-slice
+    boundary initialization in :class:`~pepsy.boundary.states.BdyMPS`.
+    ``tn`` may still have ordinary lattice boundary indices, but it must not be
+    interpreted as a stack of separately tagged ``BRA``/``PEPO``/``KET``
+    layers. Use :func:`contract_boundary` with ``flat=False`` and a
+    ``BdyMPS(tn_double=...)`` for an explicitly layered target.
+
+    With ``method="auto"`` this uses the PEPSY DMRG/FIT boundary path for 2D
+    networks and Quimb's ``contract_boundary`` path for 3D networks. Explicit
+    methods are ``"dmrg"``, ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and
+    ``"exact"``.
 
     Parameters
     ----------
@@ -1018,6 +1042,13 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         Boundary compression mode. The Quimb modes directly compress each
         boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
         uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Must remain ``"joint"`` for this single-effective-layer API.
+        Sequential layer absorption belongs to the multilayer
+        :func:`contract_boundary` path.
+    layer_tags : sequence[str] | None, default=None
+        Optional layer tags forwarded to Quimb's native contraction methods.
+        They do not turn this single-layer API into a multilayer contraction.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -1045,6 +1076,14 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     if tn is None:
         raise ValueError("tn must not be None.")
 
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    if fit_layer_mode != "joint":
+        raise ValueError(
+            "contract_flat handles one already-flattened effective layer and "
+            "requires fit_layer_mode='joint'; use contract_boundary with "
+            "flat=False for multilayer sequential compression."
+        )
+
     method = _normalize_flat_contraction_method(method, tn)
     if method == "dmrg" and _infer_lattice_ndim(tn) == 3:
         raise ValueError(
@@ -1064,6 +1103,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1088,6 +1128,163 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         flat=True,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
+    )
+    cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+    if return_info:
+        return replace(result, cost=cost)
+    return cost
+
+
+def _validate_layer_tags(layer_tags, tn):
+    """Validate and canonicalize the explicit tags for ``contract_layered``."""
+    if isinstance(layer_tags, str):
+        tags = (layer_tags,)
+    else:
+        try:
+            tags = tuple(str(tag) for tag in layer_tags)
+        except TypeError as exc:
+            raise TypeError(
+                "layer_tags must be a string or sequence of strings."
+            ) from exc
+
+    if len(tags) < 2:
+        raise ValueError(
+            "contract_layered requires at least two distinct layer_tags."
+        )
+    if any(not tag for tag in tags):
+        raise ValueError("layer_tags must contain only non-empty tags.")
+    if len(set(tags)) != len(tags):
+        raise ValueError("layer_tags must not contain duplicates.")
+
+    network_tags = set(getattr(tn, "tags", ()))
+    missing = tuple(tag for tag in tags if tag not in network_tags)
+    if missing:
+        missing_text = ", ".join(repr(tag) for tag in missing)
+        raise ValueError(
+            "contract_layered could not find layer tag(s) "
+            f"{missing_text} in the supplied tensor network."
+        )
+    return tags
+
+
+def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    tn,
+    *,
+    layer_tags,
+    chi=None,
+    bdy=None,
+    method="dmrg",
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="auto",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
+    visualize=False,
+    strip_exponent=False,
+    return_info=False,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+):
+    """Contract an explicitly tagged multilayer boundary network.
+
+    This is the multilayer counterpart to :func:`contract_flat`. ``tn`` is
+    expected to contain two or more distinct layer tags, supplied in the
+    desired absorption order. The network is passed directly to the shared
+    :class:`~pepsy.boundary.sweeps.CompBdy` engine with ``flat=False``; no
+    giant flattened BRA--PEPO--KET tensor network is formed.
+
+    Parameters
+    ----------
+    tn : qtn.TensorNetwork
+        Preassembled, tagged multilayer tensor network.
+    layer_tags : sequence[str]
+        Distinct layer tags in absorption order, for example
+        ``("BRA", "PEPO", "KET")``.
+    chi : int | None, default=None
+        Boundary bond dimension. Required when ``bdy`` is not supplied.
+    bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
+        Optional reusable boundary handle.
+    method : {"dmrg"}, default="dmrg"
+        Layered networks use the Pepsy ``CompBdy`` engine. Native Quimb
+        ``method="mps"`` remains available through :func:`contract_boundary`
+        or the scalar metric helpers.
+    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Direct Quimb modes can be combined with
+        ``fit_layer_mode="sequential"``; FIT modes use a joint target.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Whether to compress all tagged layers jointly or absorb them one at a
+        time in ``layer_tags`` order. Sequential mode is intended for the
+        direct Quimb fit modes.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess used by FIT modes.
+    strip_exponent : bool, default=False
+        If ``True``, return the scalar as ``(mantissa, exponent)``.
+    return_info : bool, default=False
+        If ``True``, return :class:`BoundaryContractResult` with diagnostics.
+
+    Other parameters match :func:`contract_flat` and
+    :func:`contract_boundary` where applicable.
+    """
+    if tn is None:
+        raise ValueError("tn must not be None.")
+
+    method = _normalize_contraction_method(method)
+    if method != "dmrg":
+        raise ValueError(
+            "contract_layered uses method='dmrg' and the CompBdy engine; "
+            "use contract_boundary for native Quimb method='mps'."
+        )
+    layer_tags = _validate_layer_tags(layer_tags, tn)
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+
+    result, _ = _contract_peps_double_layer(
+        tn,
+        method="dmrg",
+        chi=chi,
+        bdy=bdy,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
+        single_layer=False,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+        bdy_name="bdy",
+        flat=False,
     )
     cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
     if return_info:
@@ -1171,6 +1368,7 @@ def contract_boundary(
     contraction_opt="auto-hq",
     flat=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_max_bond=None,
@@ -1194,14 +1392,16 @@ def contract_boundary(
     strip_exponent=False,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
+    layer_tags=None,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     """Approximate a scalar contraction using boundary-MPS sweeps.
 
     Parameters
     ----------
     norm : qtn.TensorNetwork
-        Prebuilt double-layer network, usually from
-        :func:`build_bra_ket`.
+        Prebuilt 2D contraction network, usually the BRA--KET double layer
+        returned by :func:`build_bra_ket`. Explicitly layered targets such as
+        BRA--PEPO--KET may also be supplied here with ``flat=False``.
     bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
         Boundary handle:
 
@@ -1210,11 +1410,18 @@ def contract_boundary(
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer passed through to :class:`pepsy.boundary.sweeps.CompBdy`.
     flat : bool, default=False
-        Forwarded to sweep backend.
+        Use the single-effective-layer initialization shortcut. Keep this
+        ``False`` for a multi-layer target; use ``BdyMPS(tn_double=...)`` for
+        the corresponding boundary object.
     fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
         Boundary compression mode. The Quimb modes directly compress each
         boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
         uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``. Only direct Quimb fit modes support the
+        sequential policy.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -1226,6 +1433,10 @@ def contract_boundary(
         For ``fit_mode="eff"`` and block size 2 or 3, number of initial
         block-SVD sweeps before one-site refinement. ``None`` keeps fixed
         block-size sweeps.
+    layer_tags : sequence[str] | None, default=None
+        Layer tags used for sequential direct compression, in absorption
+        order. The standard two-layer order defaults to ``("KET", "BRA")``;
+        supply tags such as ``("BRA", "PEPO", "KET")`` for three layers.
     fit_max_bond : int | None, default=None
         Two-site SVD cap. If omitted, use the boundary object's current bond.
         Higher-level PEPS helpers pass their requested ``chi`` explicitly.
@@ -1283,6 +1494,13 @@ def contract_boundary(
         raise ValueError("norm must not be None.")
     if bdy is None:
         raise ValueError("Provide bdy.")
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    if flat and fit_layer_mode != "joint":
+        raise ValueError(
+            "flat=True handles one already-flattened effective layer and "
+            "requires fit_layer_mode='joint'; use contract_layered or "
+            "contract_boundary(..., flat=False) for multilayer compression."
+        )
     if hasattr(bdy, "mps_b"):
         bdy_obj = bdy
         mps_boundaries = bdy.mps_b
@@ -1308,6 +1526,7 @@ def contract_boundary(
         mps_boundaries,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1321,6 +1540,7 @@ def contract_boundary(
         fit_patience=fit_patience,
         fit_timing=fit_timing,
         fit_timing_sync_device=fit_timing_sync_device,
+        layer_tags=layer_tags,
     )
 
     cost = comp_bdy.run(
@@ -1360,6 +1580,7 @@ def _contract_state_norm(
     progress,
     track_boundary_fidelity,
     fit_mode,
+    fit_layer_mode,
     fit_init_strategy,
     fit_init_seed,
     fit_block_size,
@@ -1406,6 +1627,7 @@ def _contract_state_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1444,6 +1666,7 @@ def peps_normalize(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -1511,6 +1734,13 @@ def peps_normalize(
         Boundary compression mode. The Quimb modes directly compress each
         boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
         uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``.
+    layer_tags : sequence[str] | None, default=None
+        Layer tags used for sequential direct compression, in absorption
+        order. Use e.g. ``("BRA", "PEPO", "KET")`` for three layers.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -1579,6 +1809,7 @@ def peps_normalize(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1646,6 +1877,7 @@ def boundary_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -1701,6 +1933,10 @@ def boundary_norm(
         Boundary compression mode. The Quimb modes directly compress each
         boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
         uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -1761,6 +1997,7 @@ def boundary_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1801,6 +2038,7 @@ def peps_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -1832,6 +2070,11 @@ def peps_norm(
     ``fit_block_size`` and ``fit_adaptive_sweeps`` are forwarded to the
     ``fit_mode="eff"`` boundary solver.
 
+    For direct ``fit_mode`` values, ``fit_layer_mode="sequential"`` absorbs
+    layers one at a time in the order given by ``layer_tags``. The default is
+    ``fit_layer_mode="joint"``; use e.g. ``("BRA", "PEPO", "KET")`` for a
+    tagged three-layer target.
+
     Returns
     -------
     complex | float | tuple[complex | float, float] | BoundaryContractResult
@@ -1851,6 +2094,7 @@ def peps_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1893,6 +2137,7 @@ def peps_infidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -1983,6 +2228,10 @@ def peps_infidelity(
         Boundary compression mode. The Quimb modes directly compress each
         boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
         uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -2048,6 +2297,7 @@ def peps_infidelity(
         chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -2160,6 +2410,7 @@ def peps_fidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -2214,6 +2465,7 @@ def peps_fidelity(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,

@@ -164,6 +164,7 @@ compile_trajectory_stream
 compress_all_gauge
 contract_boundary
 contract_flat
+contract_layered
 contract_hypercompressed_tn
 contract_hypercompressed_tn_batch
 cphase

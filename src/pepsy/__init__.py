@@ -71,6 +71,7 @@ if TYPE_CHECKING:
         build_bra_ket,
         contract_boundary,
         contract_flat,
+        contract_layered,
         infidelity,
         make_numpy_array_caster,
         normalize,

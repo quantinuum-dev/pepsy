@@ -10,6 +10,7 @@ _SYMBOL_MODULES = {
     "build_bra_ket": ".metrics",
     "contract_boundary": ".metrics",
     "contract_flat": ".metrics",
+    "contract_layered": ".metrics",
     "infidelity": ".metrics",
     "normalize": ".metrics",
     "peps_fidelity": ".metrics",

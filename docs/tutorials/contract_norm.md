@@ -28,8 +28,8 @@ ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
 
 ```python
 bdy = pepsy.BdyMPS(
-    tn_flat=ket_tagged,
-    tn_double=norm,
+    tn_flat=ket_tagged,  # optional single-layer shape/backend reference
+    tn_double=norm,      # BRA--KET target used because flat=False
     chi=64,
     single_layer=False,
 )

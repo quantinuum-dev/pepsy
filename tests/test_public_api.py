@@ -211,7 +211,7 @@ _EXPECTED_IN_ALL = [
     "backends", "boundary", "experimental", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
     "BdyMPS", "CompBdy", "BoundaryContractResult", "BoundaryFitDiagnostic", "contract_boundary",
-    "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
+    "contract_flat", "contract_layered", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
     "peps_norm", "peps_infidelity", "peps_fidelity", "GlobalOptimizer", "FIT",
     "tns_align", "measure_obs", "build_pepo_from_gates", "build_mpo_from_gates",
     "pauli", "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
@@ -286,7 +286,7 @@ def test_internal_symbols_not_exported():
 
 
 _CALLABLE_EXPORTS = [
-    "contract_boundary", "contract_flat", "build_bra_ket", "normalize", "peps_normalize",
+    "contract_boundary", "contract_flat", "contract_layered", "build_bra_ket", "normalize", "peps_normalize",
     "boundary_norm", "peps_norm", "infidelity", "peps_infidelity", "peps_fidelity",
     "backend_infer", "to_float", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp",
     "GlobalOptimizer", "FIT", "tns_align", "measure_obs",

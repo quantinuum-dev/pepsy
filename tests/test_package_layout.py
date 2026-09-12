@@ -12,6 +12,7 @@ from pepsy.boundary import (
     BdyMPS,
     contract_boundary,
     contract_flat,
+    contract_layered,
     peps_fidelity,
     peps_infidelity,
     peps_norm,
@@ -114,6 +115,7 @@ def test_new_namespace_imports_resolve():
     assert BdyMPS is not None
     assert callable(contract_boundary)
     assert callable(contract_flat)
+    assert callable(contract_layered)
     assert callable(peps_norm)
     assert callable(peps_normalize)
     assert callable(peps_infidelity)

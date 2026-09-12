@@ -12,6 +12,35 @@ the following boundary-compression modes:
   in the same spirit as a two-site-to-one-site MPS optimizer.
 - `fit_mode="global"`: the full-contraction reference fit.
 
+Direct Quimb modes on the normal `peps_norm` / `boundary_norm` path also
+accept `fit_layer_mode="joint"` (the default) or
+`fit_layer_mode="sequential"`. Joint mode compresses all tagged layers in a
+boundary slice together. Sequential mode compresses them one at a time in the
+order given by `layer_tags`; the standard double layer is automatically tagged
+`KET`/`BRA`, while a custom multilayer target can use tags such as
+`layer_tags=("BRA", "PEPO", "KET")`. Sequential mode is available only for
+the direct Quimb modes; FIT/DMRG modes always use a joint target.
+
+`contract_flat` has a narrower meaning: it contracts one already-flattened
+effective layer and uses `flat=True` boundary initialization. It requires
+`fit_layer_mode="joint"`; it is not the entry point for a stack of separate
+PEPS/PEPO layers. For that case, provide the tagged network and
+`BdyMPS(tn_double=network, flat=False)` to `contract_boundary`.
+
+`contract_layered` is the explicit façade for a preassembled multilayer
+network. It requires `layer_tags`, for example
+`contract_layered(network, layer_tags=("BRA", "PEPO", "KET"), chi=64)`, and
+uses the same `CompBdy` engine with `flat=False`. Set
+`fit_layer_mode="sequential"` to absorb those layers one at a time in the
+given order, or keep the default `"joint"` policy. It does not flatten the
+stack into one giant tensor network. Use `contract_boundary` when you need
+lower-level control over an already-created `BdyMPS` or Quimb's native
+`method="mps"` path.
+
+The layer policy applies to the package `method="dmrg"` path. Quimb's native
+`method="mps"` path already handles `layer_tags` itself and rejects
+`fit_layer_mode="sequential"` rather than silently ignoring the option.
+
 Selectors are normalized early: `"two_site"` is accepted as an alias for
 `"two-site"`, `"one-site"` aliases `"eff"`, and `"dmrg"` aliases the
 historical `"eff"` spelling. Unknown values fail before boundary work starts.
@@ -42,6 +71,7 @@ result = pepsy.peps_norm(
     chi=64,
     method="dmrg",
     fit_mode="dmrg2",
+    fit_layer_mode="joint",
     fit_init_strategy="guess-src",
     fit_init_seed=7,
     fit_sweep_sequence="RL",

@@ -21,6 +21,14 @@ with:
   public `BoundaryFitDiagnostic`; add `fit_timing_sync_device=True` only when
   kernel-complete accelerator profiling is required.
 
+For the direct modes on a multilayer, non-flat target,
+`fit_layer_mode="joint"` (default) compresses all tagged layers in a boundary
+target together. Set `fit_layer_mode="sequential"` to compress layers one at a
+time in the order specified by `layer_tags`; this supports explicitly tagged
+targets such as `("BRA", "PEPO", "KET")`. FIT modes do not support sequential
+layer compression. The separate `contract_flat` API is for one already-
+flattened effective layer and requires the joint policy.
+
 The implementation builds the fixed environment once per sweep and updates
 the moving environment after each pair. Thus it does not turn a linear cached
 boundary sweep into a full environment rebuild at every bond.

@@ -15,6 +15,7 @@ _SYMBOL_MODULES = {
     "build_bra_ket": ".boundary",
     "contract_boundary": ".boundary",
     "contract_flat": ".boundary",
+    "contract_layered": ".boundary",
     "infidelity": ".boundary",
     "make_numpy_array_caster": ".boundary",
     "normalize": ".boundary",
