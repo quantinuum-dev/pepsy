@@ -14,6 +14,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Extended PEPS boundary `fit_mode` selection with Quimb's oversampled and
+  randomized direct compressors: `src-oversample`, `srcmps` (also the
+  readable `src-mps` alias), `srcmps-oversample`, `sdc-oversample`,
+  `zipup-oversample`, and `sdcr` variants. These remain opt-in direct
+  compression paths and do not alter the FIT/DMRG defaults.
+
 - Changed `MpsOptimizer(mode="mix")` to use the same transactional algorithm
   in both bond-growth and fixed-`chi` phases: each eligible multi-site gate
   builds a disposable chi-capped `guess-direct` state, then runs one-site FIT

@@ -13,6 +13,7 @@ import warnings
 from collections import deque
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -28,6 +29,25 @@ __all__ = [
     "FIT",
     "internal_inds",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTarget:
+    """Immutable structural plan for a FIT target.
+
+    The plan contains only index/tag metadata. Tensor data remains owned by
+    ``FIT.tn`` and is never cached here, which keeps this object safe to share
+    between effective-environment calls without pinning backend arrays or
+    accidentally mutating a cached tensor. In particular, layered targets
+    avoid rebuilding their tag map and chain-bond search on every local update.
+    """
+
+    site_order: tuple[str, ...]
+    site_tensor_ids: tuple[tuple[int, ...], ...]
+    boundary_bond_map: tuple[tuple[int, int, str | None], ...]
+    layer_tags: tuple[str, ...]
+    reindexing_map: tuple[tuple[str, str], ...]
+    contraction_metadata: tuple[tuple[str, str], ...]
 
 
 class _SweepEnvironmentCache:
@@ -450,7 +470,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         # Randomize only internal target indices. Physical outer indices must
         # remain aligned with the fitted network for the overlap objective.
-        self.tn.reindex_({idx: qtn.rand_uuid() for idx in self.tn.inner_inds()})
+        target_reindexing = {
+            idx: qtn.rand_uuid() for idx in self.tn.inner_inds()
+        }
+        self.tn.reindex_(target_reindexing)
 
         if set(self.tn.outer_inds()) != set(self.p.outer_inds()):
             raise ValueError("tn and p have different outer indices.")
@@ -468,15 +491,55 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             {tensor_id: order for order, tensor_id in enumerate(self.tn.tensor_map)}
             if self._target_site_tensors is None else {}
         )
-        # A gate fit visits only its active site tags. Build those selections
-        # lazily rather than duplicating the complete target's tag map.
-        # Global run/run_eff populate the same cache as they visit each site.
-        self._target_tag_tensor_ids = {}
+        # Prepare all structural routing metadata once. A gate fit visits only
+        # a small active interval, but the target's tag map and chain bonds do
+        # not change during a FIT run, so rebuilding them per update is wasted
+        # work. The immutable plan stores ids and index names, not tensor data.
+        self._target_tag_tensor_ids = {
+            self.site_tag_id.format(site): tuple(
+                self.tn.tag_map.get(self.site_tag_id.format(site), ())
+            )
+            for site in range(self.L)
+        }
         # Layered targets can carry several tensors per site, so their chain
         # bond is not available through ``TensorNetwork.bond``. The target
         # graph is immutable during FIT: resolve each boundary locally once
         # and retain only its index name, never tensor data.
         self._target_bond_cache = {}
+        boundary_bond_map = []
+        for left_site in range(self.L - 1):
+            right_site = left_site + 1
+            try:
+                bond = self._target_bond(left_site, right_site)
+            except (KeyError, ValueError):
+                # Preserve the historical failure point for malformed active
+                # gate targets: construction succeeds, but use raises a
+                # precise error from ``_target_bond``.
+                bond = None
+            boundary_bond_map.append((left_site, right_site, bond))
+        site_tags = tuple(self.site_tag_id.format(site) for site in range(self.L))
+        self.prepared_target = _PreparedTarget(
+            site_order=site_tags,
+            site_tensor_ids=tuple(
+                self._target_tag_tensor_ids[site_tag]
+                for site_tag in site_tags
+            ),
+            boundary_bond_map=tuple(boundary_bond_map),
+            layer_tags=tuple(
+                sorted(tag for tag in self.tn.tags if tag not in site_tags)
+            ),
+            reindexing_map=tuple(sorted(target_reindexing.items())),
+            contraction_metadata=(
+                ("site_tag_id", str(self.site_tag_id)),
+                ("target_tensor_count", str(len(self.tn.tensor_map))),
+                (
+                    "one_tensor_per_site",
+                    str(self._target_site_tensors is not None),
+                ),
+                ("target_fermionic", str(bool(self.tn.isfermionic()))),
+                ("fitted_type", type(self.p).__name__),
+            ),
+        )
         # One metadata pass supplies all routing decisions, including mixed
         # dense/native inputs. No tensor values or device scalars are read.
         array_kinds = {
@@ -927,6 +990,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         cutoff=None,
         cutoff_mode="rsum2",
         collect_split_diagnostics=True,
+        adaptive_bond_growth=False,
         adaptive_block_sweeps=None,
         min_iter=None,
         rtol=None,
@@ -976,6 +1040,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             Quimb SVD cutoff mode for block sizes 2 and 3.
         collect_split_diagnostics : bool, default=True
             Store native SVD metadata in ``self.info`` for block sizes 2 and 3.
+        adaptive_bond_growth : bool, default=False
+            Grow the local SVD cap when the discarded weight exceeds the
+            resolved cutoff, up to ``max_bond``. The learned per-bond caps are
+            retained on ``self`` so a later sweep reuses them.
         adaptive_block_sweeps : int | None, default=None
             If set for ``block_size=2`` or ``block_size=3``, use the selected
             block update for this many initial sweeps and then use one-site
@@ -1017,6 +1085,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if not math.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("cutoff must be a finite non-negative number.")
         collect_split_diagnostics = bool(collect_split_diagnostics)
+        self._configure_adaptive_bonds(
+            self.p,
+            0,
+            self.L - 1,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            enabled=adaptive_bond_growth,
+        )
         if adaptive_block_sweeps is not None:
             if block_size not in {2, 3}:
                 raise ValueError(
@@ -1439,6 +1515,72 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     # Effective-environment and target assembly helpers
     # ------------------------------------------------------------------
 
+    def _configure_adaptive_bonds(
+        self,
+        psi,
+        start,
+        stop,
+        *,
+        max_bond,
+        cutoff,
+        enabled,
+    ):
+        """Initialize the per-bond adaptive SVD caps for one FIT run."""
+        self._adaptive_bond_growth = bool(enabled and max_bond is not None)
+        self._adaptive_bond_max = None if max_bond is None else int(max_bond)
+        self._adaptive_bond_cutoff = float(cutoff)
+        self._adaptive_bond_caps = {}
+        if not self._adaptive_bond_growth:
+            return
+        for site in range(int(start), int(stop)):
+            try:
+                current = int(psi.bond_size(site, site + 1))
+            except (AttributeError, ValueError):
+                current = 1
+            self._adaptive_bond_caps[psi.bond(site, site + 1)] = min(
+                self._adaptive_bond_max,
+                max(1, current),
+            )
+        self.info["adaptive_bond_caps"] = {
+            str(bond): int(cap)
+            for bond, cap in self._adaptive_bond_caps.items()
+        }
+
+    def _split_max_bond(self, bond, max_bond):
+        """Return the current local cap, respecting the requested ceiling."""
+        if not self._adaptive_bond_growth or max_bond is None:
+            return max_bond
+        cap = self._adaptive_bond_caps.get(bond)
+        if cap is None:
+            cap = min(int(max_bond), 1)
+            self._adaptive_bond_caps[bond] = cap
+        return min(int(max_bond), int(cap))
+
+    def _observe_split_error(self, bond, split_info, max_bond):
+        """Increase a local cap after a split discards too much weight."""
+        if not self._adaptive_bond_growth or not split_info:
+            return
+        error = split_info.get("error")
+        try:
+            error = float(error)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(error) or error <= self._adaptive_bond_cutoff:
+            return
+        old = self._adaptive_bond_caps.get(bond, 1)
+        new = min(int(max_bond), max(old + 1, 2 * old))
+        if new > old:
+            self._adaptive_bond_caps[bond] = new
+            self.info.setdefault("adaptive_bond_events", []).append(
+                {
+                    "bond": str(bond),
+                    "error": error,
+                    "old_max_bond": int(old),
+                    "new_max_bond": int(new),
+                }
+            )
+            self.info["adaptive_bond_caps"][str(bond)] = int(new)
+
     def _target_components(self, sites, *, reindex=None):
         """Return target tensors for ``sites`` without changing the target.
 
@@ -1453,10 +1595,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             tensor_ids = set()
             for site in sites:
                 tag = self.site_tag_id.format(site)
-                if tag not in self._target_tag_tensor_ids:
-                    self._target_tag_tensor_ids[tag] = tuple(
-                        self.tn.tag_map.get(tag, ())
-                    )
                 tensor_ids.update(self._target_tag_tensor_ids[tag])
             components = [
                 self.tn.tensor_map[tensor_id]
@@ -1512,6 +1650,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             return self.tn.bond(left_site, right_site)
 
         key = (int(left_site), int(right_site))
+        prepared_target = getattr(self, "prepared_target", None)
+        if prepared_target is not None:
+            for left, right, bond in prepared_target.boundary_bond_map:
+                if (left, right) == key and bond is not None:
+                    return bond
         try:
             return self._target_bond_cache[key]
         except KeyError:
@@ -2561,13 +2704,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 else None
             )
 
-            split_info = {} if collect_split_diagnostics else None
+            split_info = (
+                {}
+                if collect_split_diagnostics or self._adaptive_bond_growth
+                else None
+            )
             new_left, new_right = theta.split(
                 left_inds=left_inds,
                 right_inds=right_inds,
                 method="svd",
                 absorb="right" if direction == "R" else "left",
-                max_bond=max_bond,
+                max_bond=self._split_max_bond(bond, max_bond),
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 bond_ind=bond,
@@ -2576,6 +2723,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 get="tensors",
                 info=split_info,
             )
+            self._observe_split_error(bond, split_info, max_bond)
             split_finished = (
                 self._timing_mark(new_left, new_right)
                 if timing_record is not None
@@ -2808,15 +2956,23 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 else None
             )
 
-            split_info_left = {} if collect_split_diagnostics else None
-            split_info_right = {} if collect_split_diagnostics else None
+            split_info_left = (
+                {}
+                if collect_split_diagnostics or self._adaptive_bond_growth
+                else None
+            )
+            split_info_right = (
+                {}
+                if collect_split_diagnostics or self._adaptive_bond_growth
+                else None
+            )
             if direction == "R":
                 new_left, middle_right = theta.split(
                     left_inds=left_inds,
                     right_inds=middle_inds + right_inds,
                     method="svd",
                     absorb="right",
-                    max_bond=max_bond,
+                    max_bond=self._split_max_bond(left_bond, max_bond),
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     bond_ind=left_bond,
@@ -2825,6 +2981,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     get="tensors",
                     info=split_info_left,
                 )
+                self._observe_split_error(left_bond, split_info_left, max_bond)
                 middle_left_inds = tuple(
                     index
                     for index in middle_right.inds
@@ -2835,7 +2992,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     right_inds=right_inds,
                     method="svd",
                     absorb="right",
-                    max_bond=max_bond,
+                    max_bond=self._split_max_bond(right_bond, max_bond),
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     bond_ind=right_bond,
@@ -2844,13 +3001,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     get="tensors",
                     info=split_info_right,
                 )
+                self._observe_split_error(right_bond, split_info_right, max_bond)
             else:
                 left_middle, new_right = theta.split(
                     left_inds=left_inds + middle_inds,
                     right_inds=right_inds,
                     method="svd",
                     absorb="left",
-                    max_bond=max_bond,
+                    max_bond=self._split_max_bond(right_bond, max_bond),
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     bond_ind=right_bond,
@@ -2859,6 +3017,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     get="tensors",
                     info=split_info_right,
                 )
+                self._observe_split_error(right_bond, split_info_right, max_bond)
                 middle_right_inds = tuple(
                     index
                     for index in left_middle.inds
@@ -2869,7 +3028,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     right_inds=middle_right_inds,
                     method="svd",
                     absorb="left",
-                    max_bond=max_bond,
+                    max_bond=self._split_max_bond(left_bond, max_bond),
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     bond_ind=left_bond,
@@ -2878,6 +3037,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     get="tensors",
                     info=split_info_left,
                 )
+                self._observe_split_error(left_bond, split_info_left, max_bond)
             split_finished = (
                 self._timing_mark(new_left, new_middle, new_right)
                 if timing_record is not None
@@ -3020,6 +3180,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         max_bond=None,
         cutoff=None,
         cutoff_mode="rsum2",
+        adaptive_bond_growth=False,
         min_iter=2,
         rtol="auto",
         patience=2,
@@ -3099,6 +3260,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         three sites; it is ignored for a two-site window.
         ``collect_split_diagnostics=False`` avoids allocating SVD metadata when
         the caller only needs the fitted state.
+        ``adaptive_bond_growth=True`` starts each bond at its current rank and
+        raises that local cap only after a split reports discarded weight above
+        the cutoff. Growth is bounded by ``max_bond`` and is reused by later
+        sweeps in this FIT run.
         The supplied ``p`` is always the live variational initial state. If
         active bonds need a larger dense initialization, callers should
         expand and seed that MPS before constructing FIT; FIT itself never
@@ -3122,6 +3287,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if not isinstance(n_iter, Integral) or int(n_iter) < 1:
             raise ValueError("n_iter must be a positive integer.")
         n_iter = int(n_iter)
+        self._configure_adaptive_bonds(
+            self.p,
+            0,
+            self.L - 1,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            enabled=adaptive_bond_growth,
+        )
         if not isinstance(three_site_sweeps, Integral) or int(three_site_sweeps) < 1:
             raise ValueError("three_site_sweeps must be a positive integer.")
         three_site_sweeps = min(int(three_site_sweeps), n_iter)

@@ -449,8 +449,23 @@ def test_compbdy_fit_mode_is_canonicalized_and_validated_early():
     assert pepsy.CompBdy(norm, {}, fit_mode="one-site").fit_mode == "eff"
     assert pepsy.CompBdy(norm, {}, fit_mode="dmrg").fit_mode == "eff"
     assert pepsy.CompBdy(norm, {}, fit_mode="dmrg2").fit_mode == "dmrg2"
-    for mode in ("direct", "src", "zipup", "sdc", "dm"):
-        assert pepsy.CompBdy(norm, {}, fit_mode=mode).fit_mode == mode
+    for mode in (
+        "direct",
+        "src",
+        "src-oversample",
+        "src-mps",
+        "src-mps-oversample",
+        "zipup-oversample",
+        "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
+        "dm",
+    ):
+        canonical = {
+            "src-mps": "srcmps",
+            "src-mps-oversample": "srcmps-oversample",
+        }.get(mode, mode)
+        assert pepsy.CompBdy(norm, {}, fit_mode=mode).fit_mode == canonical
 
     assert (
         pepsy.CompBdy(norm, {}, fit_init_strategy="guess_direct").fit_init_strategy
@@ -900,7 +915,21 @@ def test_peps_norm_and_infidelity_support_dmrg2_src_boundary_guesses():
         )
 
 
-@pytest.mark.parametrize("fit_mode", ["direct", "src", "zipup", "sdc", "dm"])
+@pytest.mark.parametrize(
+    "fit_mode",
+    [
+        "direct",
+        "src",
+        "src-oversample",
+        "src-mps",
+        "src-mps-oversample",
+        "zipup-oversample",
+        "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
+        "dm",
+    ],
+)
 def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
     """Non-variational Quimb boundary compressors should share the API."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=483, dtype="complex128")
@@ -919,8 +948,12 @@ def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
     )
 
     assert result.fit_diagnostics
+    canonical = {
+        "src-mps": "srcmps",
+        "src-mps-oversample": "srcmps-oversample",
+    }.get(fit_mode, fit_mode)
     assert all(
-        diagnostic.fit_mode == fit_mode
+        diagnostic.fit_mode == canonical
         and diagnostic.convergence_reason == "fixed_compression"
         and diagnostic.fit_init_strategy == "not-applicable"
         for diagnostic in result.fit_diagnostics

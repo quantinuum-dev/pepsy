@@ -41,8 +41,10 @@ multi-layer boundary path, normally used for the tagged BRA--KET network.
 
 The local boundary solver is selected with `fit_mode`:
 
-- `"direct"`, `"src"`, `"zipup"`, `"sdc"`, and `"dm"` use Quimb
-  boundary compression directly, without FIT.
+- `"direct"`, `"src"`, `"src-mps"`, `"zipup"`, `"sdc"`, `"sdcr"`, and
+  `"dm"` use Quimb boundary compression directly, without FIT. Their
+  supported `*-first` and `*-oversample` variants are accepted as well;
+  `"src-mps"` is the readable alias for Quimb's canonical `"srcmps"`.
 - `"eff"` is the compatibility default and performs cached one-site sweeps.
 - `"two-site"` forms neighboring boundary wavefunctions, splits them with a
   backend-native SVD, and can discover bond subspaces up to `fit_max_bond`.
@@ -58,6 +60,10 @@ order, which can be useful for a BRA--PEPO--KET boundary. It is intentionally
 unavailable for variational FIT modes, whose target remains the complete local
 layered network. `contract_flat(...)` is separate: it uses `flat=True` for one
 effective layer and requires the joint policy.
+The default `fit_layer_order="input"` preserves the supplied semantic order;
+`fit_layer_order="auto"` is opt-in, requires explicit tags whose layers are
+known to be mathematically interchangeable, and orders dense layers by an
+estimated intermediate tensor size.
 
 Each boundary FIT can optionally use `fit_init_strategy="guess-direct"`,
 `"guess-src"`, or `"guess-sdc"`. These compress a copy of the exact
@@ -84,6 +90,9 @@ environment construction remains linear in boundary length. PEPS helpers pass
 the requested `chi` as the default two-site bond cap; direct `CompBdy` users
 should set `fit_max_bond` when they want a lower-rank boundary to grow. New
 two-site boundaries start at bond 1 and grow through these local splits.
+With `fit_cutoff="auto"`, two-/three-site FIT starts each bond at its current
+rank, grows only when the reported discarded weight exceeds the resolved
+cutoff, and reuses learned per-bond caps on later sweeps up to `fit_max_bond`.
 Reusing a boundary at a larger `chi` does not globally pad it first; lowering
 `chi` still compresses existing bonds immediately.
 

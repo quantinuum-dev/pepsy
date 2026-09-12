@@ -14,17 +14,19 @@ import autoray as ar
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
-from ...boundary.metrics import peps_infidelity as boundary_infidelity
-from ...boundary.metrics import build_bra_ket, peps_normalize
-from ...boundary.states import BdyMPS
-from ...boundary.sweeps import (
-    CompBdy,
+from ...boundary._fit_policy import (
+    _FIT_POLICY_KEYS,
     _FIT_QUIMB_MODES,
     _canonical_fit_cutoff_mode,
     _canonical_fit_init_strategy,
     _canonical_fit_layer_mode,
+    _canonical_fit_layer_order,
     _canonical_fit_mode_selector,
 )
+from ...boundary.metrics import peps_infidelity as boundary_infidelity
+from ...boundary.metrics import build_bra_ket, peps_normalize
+from ...boundary.states import BdyMPS
+from ...boundary.sweeps import CompBdy
 from ...boundary._lattice import infer_lattice_shape
 from ...tensors.core import tn_fidelity
 from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
@@ -102,6 +104,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         compresses all tagged layers together; ``"sequential"`` absorbs them
         one at a time in ``layer_tags`` order. FIT/DMRG modes require the
         default joint policy.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential direct-layer order. ``"auto"`` uses estimated dense layer
+        size, and requires explicit ``layer_tags`` whose order is known to be
+        mathematically interchangeable.
     layer_tags : sequence[str] | None, default=None
         Optional layer tags and absorption order for direct sequential
         compression. The standard PEPS overlap target uses ``("KET", "BRA")``
@@ -151,6 +157,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         ``mode``, ``layer_tags``, ``compress_opts``, and ``equalize_norms``.
         ``cutoff_mode`` is translated into Quimb's ``compress_opts`` so it
         reaches the boundary SVD rather than the boundary-contraction API.
+    simplify : bool, default=False
+        Run full Quimb ``full_simplify`` on each local norm/overlap network.
+        This is a correctness/debug escape hatch; the default keeps the hot
+        path on the narrower prepared network structure.
+    normalize_boundaries : bool, default=False
+        Normalize reusable boundary MPS stores before each axis. This is an
+        explicit safety option and is independent of physical-state
+        ``renormalize``.
     """
 
     _NORMALIZE_KEYS = frozenset({
@@ -161,29 +175,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
-        "fit_mode",
-        "fit_init_strategy",
-        "fit_init_seed",
-        "fit_block_size",
-        "fit_adaptive_sweeps",
-        "fit_max_bond",
-        "fit_sweep_sequence",
-        "fit_cutoff_mode",
-        "fit_min_iter",
-        "fit_rtol",
-        "fit_patience",
-        "fit_layer_mode",
-        "fit_timing",
-        "fit_timing_sync_device",
         "strip_exponent",
         "method",
         "mode_",
         "sequence",
         "cutoff",
         "equalize_norms",
-        "layer_tags",
         "balance_bonds",
-    })
+    }) | _FIT_POLICY_KEYS
     _INFIDELITY_KEYS = frozenset({
         "chi",
         "norm",
@@ -194,20 +193,6 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
-        "fit_mode",
-        "fit_init_strategy",
-        "fit_init_seed",
-        "fit_block_size",
-        "fit_adaptive_sweeps",
-        "fit_max_bond",
-        "fit_sweep_sequence",
-        "fit_cutoff_mode",
-        "fit_min_iter",
-        "fit_rtol",
-        "fit_patience",
-        "fit_layer_mode",
-        "fit_timing",
-        "fit_timing_sync_device",
         "single_layer",
         "strip_exponent",
         "method",
@@ -215,8 +200,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "sequence",
         "cutoff",
         "equalize_norms",
-        "layer_tags",
-    })
+    }) | _FIT_POLICY_KEYS
     _OPTIMIZE_KEYS = frozenset({
         "axes",
         "n_cycles",
@@ -233,6 +217,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "debug_loss_mode",
         "debug_loss_kwargs",
         "renormalize",
+        "normalize_boundaries",
         "boundary_engine",
         "boundary_options",
     })
@@ -479,6 +464,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         fit_mode="eff",
         fit_layer_mode="joint",
+        fit_layer_order="input",
         layer_tags=None,
         fit_init_strategy="direct",
         fit_init_seed=0,
@@ -494,10 +480,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_timing=False,
         fit_timing_sync_device=False,
         single_layer=False,
-        simplify=True,
+        simplify=False,
         normalize_kwargs: Mapping[str, Any] | None = None,
         optimize_kwargs: Mapping[str, Any] | None = None,
         renormalize_state=False,
+        normalize_boundaries=False,
         renormalize_kwargs: Mapping[str, Any] | None = None,
         boundary_engine: str | None = "auto",
         boundary_options: Mapping[str, Any] | None = None,
@@ -513,6 +500,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         # whether a new dense DMRG boundary should start at rank one.
         fit_mode = _canonical_fit_mode_selector(fit_mode)
         fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+        fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
         if (
             fit_layer_mode == "sequential"
             and fit_mode not in _FIT_QUIMB_MODES
@@ -615,6 +603,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.contraction_opt = contraction_opt
         self.fit_mode = fit_mode
         self.fit_layer_mode = fit_layer_mode
+        self.fit_layer_order = fit_layer_order
         self.layer_tags = layer_tags
         self.fit_init_strategy = fit_init_strategy
         self.fit_init_seed = fit_init_seed
@@ -635,6 +624,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.chi = chi if chi is not None else getattr(bdy_obj, "chi", None)
         self.single_layer = single_layer
         self.simplify = bool(simplify)
+        # Boundary MPS normalization is a gauge/safety pass, not part of the
+        # variational update. FIT already controls the retained scale through
+        # its terminal center norm, so avoid an additional full-boundary pass
+        # unless callers explicitly request it.
+        self.normalize_boundaries = bool(normalize_boundaries)
         # Symmray block-sparse states need special handling in the local slice
         # optimizer. NumPy-backed blocks use the finite-difference fallback,
         # while Torch-backed blocks remain on Torch and use autograd normally.
@@ -1143,6 +1137,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_layer_mode = _canonical_fit_layer_mode(
             opts.get("fit_layer_mode", self.fit_layer_mode)
         )
+        fit_layer_order = _canonical_fit_layer_order(
+            opts.get("fit_layer_order", self.fit_layer_order)
+        )
         contraction_opt = opts.get("contraction_opt", self.contraction_opt)
         n_iter = opts.get("n_iter", 10)
         direction = opts.get("direction", "y")
@@ -1177,6 +1174,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=fit_mode,
                 fit_layer_mode=fit_layer_mode,
+                fit_layer_order=fit_layer_order,
                 fit_init_strategy=opts.get(
                     "fit_init_strategy", self.fit_init_strategy
                 ),
@@ -1221,6 +1219,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=fit_mode,
             fit_layer_mode=fit_layer_mode,
+            fit_layer_order=fit_layer_order,
             fit_init_strategy=opts.get(
                 "fit_init_strategy", self.fit_init_strategy
             ),
@@ -1291,6 +1290,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_rtol=_INHERIT_FIT_OPTION,
         fit_patience=_INHERIT_FIT_OPTION,
         fit_layer_mode=_INHERIT_FIT_OPTION,
+        fit_layer_order=_INHERIT_FIT_OPTION,
         fit_timing=_INHERIT_FIT_OPTION,
         fit_timing_sync_device=_INHERIT_FIT_OPTION,
         single_layer=False,
@@ -1375,6 +1375,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             ),
             fit_layer_mode=_canonical_fit_layer_mode(
                 _resolve_fit_option(fit_layer_mode, self.fit_layer_mode)
+            ),
+            fit_layer_order=_canonical_fit_layer_order(
+                _resolve_fit_option(fit_layer_order, self.fit_layer_order)
             ),
             fit_init_strategy=_resolve_fit_option(
                 fit_init_strategy,
@@ -2307,6 +2310,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "contraction_opt": self.contraction_opt,
             "fit_mode": self.fit_mode,
             "fit_layer_mode": self.fit_layer_mode,
+            "fit_layer_order": self.fit_layer_order,
             "layer_tags": self.layer_tags,
             "fit_init_strategy": self.fit_init_strategy,
             "fit_init_seed": self.fit_init_seed,
@@ -2607,6 +2611,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug_loss_mode="exact",
         debug_loss_kwargs=None,
         renormalize=True,
+        normalize_boundaries=None,
     ):
         """Run one axis with forward + round-trip sweeps.
 
@@ -2629,6 +2634,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             If ``True``, request boundary fidelity sampling during boundary moves.
         renormalize : bool, default=True
             If ``True``, normalize state at axis start and append to ``norm_trace``.
+        normalize_boundaries : bool | None, default=None
+            If ``True``, run the optional boundary-store normalization pass at
+            axis start. ``None`` uses the constructor default, which is
+            ``False``. This is separate from ``renormalize``: it does not
+            change the physical PEPS normalization contract.
         """
         if self.state_target is None:
             raise ValueError(
@@ -2642,8 +2652,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         all_runs = []
 
-        self.bdy.normalize()
-        self.bdy_overlap.normalize()
+        if normalize_boundaries is None:
+            normalize_boundaries = self.normalize_boundaries
+        if normalize_boundaries:
+            self.bdy.normalize()
+            self.bdy_overlap.normalize()
 
         if renormalize:
             old_norm = self._normalize_state(env_n_iter)
@@ -2715,6 +2728,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug_loss_kwargs=None,
         track_boundary_fidelity=None,
         renormalize=True,
+        normalize_boundaries=None,
     ):
         """Run alternating axis sweeps and return a result dict.
 
@@ -2742,6 +2756,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             ``False`` when not set explicitly.
         renormalize : bool, default=True
             If ``True``, normalize state at axis start and once again at run end.
+        normalize_boundaries : bool | None, default=None
+            If ``True``, normalize both reusable boundary stores before each
+            axis. ``None`` uses ``self.normalize_boundaries`` (``False`` by
+            default). This is an explicit safety option for legacy workflows.
 
         """
         if self.state_target is None:
@@ -2749,6 +2767,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "state_target is required for run(). "
                 "Set it in constructor or via set_target()."
             )
+        if normalize_boundaries is None:
+            normalize_boundaries = self.normalize_boundaries
+        normalize_boundaries = bool(normalize_boundaries)
         self._ensure_boundary_chi(chi)
         self._reset_run_traces()
         if track_boundary_fidelity is None:
@@ -2884,6 +2905,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     debug_loss_mode=debug_loss_mode,
                     debug_loss_kwargs=debug_loss_kwargs,
                     renormalize=renormalize,
+                    normalize_boundaries=normalize_boundaries,
                 )
                 all_runs.extend(axis_runs)
                 self._collect_axis_run_traces(
@@ -2964,6 +2986,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "fit_diagnostics": tuple(self.fit_diagnostics),
             "bdy_norm": bdy_norm,
             "bdy_overlap_norm": bdy_overlap_norm,
+            "normalize_boundaries": normalize_boundaries,
         })
 
     def run(
@@ -2976,6 +2999,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug_loss_mode=None,
         debug_loss_kwargs=None,
         renormalize=None,
+        normalize_boundaries=None,
         track_boundary_fidelity=None,
     ):
         """High-level global sweep entrypoint.
@@ -2990,6 +3014,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Show global sweep progress bar.
         renormalize : bool | None, default=None
             Override stored ``renormalize`` option for this call.
+        normalize_boundaries : bool | None, default=None
+            Override the optional boundary-store normalization safety pass for
+            this call. The default is disabled.
         """
         opts = dict(getattr(self, "optimize_kwargs", {}))
         if n_cycles is not None:
@@ -3006,6 +3033,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             opts["debug_loss_kwargs"] = debug_loss_kwargs
         if renormalize is not None:
             opts["renormalize"] = renormalize
+        if normalize_boundaries is not None:
+            opts["normalize_boundaries"] = normalize_boundaries
         if track_boundary_fidelity is not None:
             opts["track_boundary_fidelity"] = track_boundary_fidelity
 
@@ -3024,5 +3053,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             debug_loss_mode=opts.get("debug_loss_mode", "exact"),
             debug_loss_kwargs=opts.get("debug_loss_kwargs"),
             renormalize=opts.get("renormalize", True),
+            normalize_boundaries=opts.get(
+                "normalize_boundaries", self.normalize_boundaries
+            ),
             track_boundary_fidelity=opts.get("track_boundary_fidelity", False),
         )

@@ -11,108 +11,20 @@ import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
 from .._internal.cutoff import dtype_auto_cutoff
+from .._internal.quimb import require_quimb_1d_compression_method
 from ..tensors.core import tn_fidelity
 from ..fitting.local import FIT
+from ._fit_policy import (
+    _FIT_QUIMB_MODES,
+    _canonical_fit_cutoff_mode,
+    _canonical_fit_init_strategy,
+    _canonical_fit_layer_mode,
+    _canonical_fit_layer_order,
+    _canonical_fit_mode_selector,
+)
 from ._lattice import has_numbered_axis_tag, infer_lattice_shape
 
 __all__ = ["BoundaryFitDiagnostic", "CompBdy"]
-
-
-_FIT_MODE_ALIASES = {
-    "direct": "direct",
-    "src": "src",
-    "zipup": "zipup",
-    "sdc": "sdc",
-    "dm": "dm",
-    "eff": "eff",
-    "one-site": "eff",
-    "dmrg": "eff",
-    "dmrg1": "eff",
-    "two-site": "two-site",
-    "dmrg2": "dmrg2",
-    "global": "global",
-}
-
-_FIT_INIT_STRATEGY_ALIASES = {
-    "auto": "direct",
-    "direct": "direct",
-    "guess-direct": "guess-direct",
-    "guess-src": "guess-src",
-    "guess-sdc": "guess-sdc",
-}
-
-_FIT_QUIMB_MODES = frozenset({"direct", "src", "zipup", "sdc", "dm"})
-_FIT_CUTOFF_MODES = frozenset(
-    {"rel", "rsum2", "rsum1", "abs", "sum2", "sum1"}
-)
-_FIT_LAYER_MODES = frozenset({"joint", "sequential"})
-
-
-def _canonical_fit_mode_selector(fit_mode):
-    """Return the canonical boundary-FIT mode or fail with a useful error.
-
-    Underscores are accepted as spelling aliases so configuration-file values
-    such as ``"two_site"`` behave like the documented ``"two-site"`` form.
-    ``"one-site"`` is also accepted as a descriptive alias for the historical
-    ``"eff"`` mode; the canonical values stored on runtime objects remain
-    stable for downstream comparisons and serialization.
-    """
-    key = str(fit_mode).strip().lower().replace("_", "-")
-    if key not in _FIT_MODE_ALIASES:
-        raise ValueError(
-            f"Unknown fit_mode={fit_mode!r}. Expected 'direct', 'src', "
-            "'zipup', 'sdc', 'dm', 'eff', 'two-site', 'dmrg', 'dmrg2', "
-            "or 'global'."
-        )
-    return _FIT_MODE_ALIASES[key]
-
-
-def _canonical_fit_init_strategy(strategy):
-    """Return the supported disposable boundary-guess strategy."""
-    key = str(strategy).strip().lower().replace("_", "-")
-    try:
-        return _FIT_INIT_STRATEGY_ALIASES[key]
-    except KeyError as exc:
-        raise ValueError(
-            f"Unknown fit_init_strategy={strategy!r}. Expected 'direct', "
-            "'auto', 'guess-direct', 'guess-src', or 'guess-sdc'."
-        ) from exc
-
-
-def _canonical_fit_cutoff_mode(mode):
-    """Resolve the boundary cutoff-mode policy before calling Quimb."""
-    if mode is None:
-        return "rsum2"
-    key = str(mode).strip().lower()
-    if key == "auto":
-        return "rsum2"
-    if key not in _FIT_CUTOFF_MODES:
-        allowed = ", ".join(sorted(_FIT_CUTOFF_MODES))
-        raise ValueError(
-            f"Unknown fit_cutoff_mode={mode!r}. Expected 'auto' or one of "
-            f"{allowed}."
-        )
-    return key
-
-
-def _canonical_fit_layer_mode(mode):
-    """Normalize how direct compressors combine tagged tensor layers."""
-    key = str(mode).strip().lower().replace("_", "-")
-    aliases = {
-        "joint": "joint",
-        "combined": "joint",
-        "all": "joint",
-        "sequential": "sequential",
-        "layerwise": "sequential",
-        "layer-by-layer": "sequential",
-    }
-    try:
-        return aliases[key]
-    except KeyError as exc:
-        allowed = ", ".join(sorted(_FIT_LAYER_MODES))
-        raise ValueError(
-            f"Unknown fit_layer_mode={mode!r}. Expected one of {allowed}."
-        ) from exc
 
 
 @dataclass(frozen=True)
@@ -152,6 +64,9 @@ class BoundaryFitDiagnostic:
     fit_init_strategy: str = "direct"
     adaptive_sweeps: int = 0
     one_site_refinement_sweeps: int = 0
+    sweep_norm_trace: tuple[float, ...] = ()
+    adaptive_bond_caps: tuple[tuple[str, int], ...] = ()
+    adaptive_bond_events: tuple[dict[str, object], ...] = ()
 
 
 class CompBdy:  # pylint: disable=too-many-instance-attributes
@@ -178,12 +93,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Contraction optimizer used by the local :class:`~pepsy.fitting.local.FIT`
         boundary fits. Kept separate from ``contraction_opt`` so the local
         fitting path can be tuned independently of the final contraction.
-    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff",
-        "one-site", "dmrg", "dmrg1", "two-site", "dmrg2", "global"},
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm",
+        "eff", "one-site", "dmrg", "dmrg1", "two-site", "dmrg2", "global"},
         default="eff"
         Boundary compression backend. The Quimb modes ``"direct"``,
-        ``"src"``, ``"zipup"``, ``"sdc"``, and ``"dm"`` directly compress
-        each boundary target. ``"dmrg"`` (also ``"eff"``/``"one-site"``)
+        ``"src"``, ``"src-mps"``, ``"zipup"``, ``"sdc"``, ``"sdcr"``, and
+        ``"dm"`` directly compress each boundary target. Each supports the
+        corresponding ``*-first``/``*-oversample`` variant where Quimb does.
+        ``"dmrg"`` (also ``"eff"``/``"one-site"``)
         uses one-site FIT. ``"dmrg2"`` uses two-site FIT for the configured
         warm-up sweeps, then one-site refinement. ``"two-site"`` remains the
         legacy all-two-site FIT mode and ``"global"`` uses ``FIT.run``.
@@ -193,6 +110,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         in the order given by ``layer_tags`` (``"sequential"``). Sequential
         compression is intended for explicitly layered non-flat targets and
         is unavailable for variational FIT modes.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Ordering policy for sequential direct compression. ``"input"``
+        preserves ``layer_tags`` exactly. ``"auto"`` estimates the dense
+        intermediate size of each explicitly tagged layer and absorbs the
+        largest first. Use ``"auto"`` only when those layers are
+        mathematically interchangeable.
     layer_tags : sequence[str] | None, default=None
         Layer tags and, for ``fit_layer_mode="sequential"``, their absorption
         order. The standard two-layer order is ``("KET", "BRA")``. Supply
@@ -262,6 +185,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         fit_contraction_opt="auto-hq",
         fit_mode="eff",
         fit_layer_mode="joint",
+        fit_layer_order="input",
         layer_tags=None,
         fit_init_strategy="direct",
         fit_init_seed=0,
@@ -288,13 +212,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # boundary has already reached its first local fit.
         self.fit_mode = _canonical_fit_mode_selector(fit_mode)
         self.fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+        self.fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
         if (
             self.fit_layer_mode == "sequential"
             and self.fit_mode not in _FIT_QUIMB_MODES
         ):
             raise ValueError(
                 "fit_layer_mode='sequential' is only supported with direct "
-                "Quimb fit modes: 'direct', 'src', 'zipup', 'sdc', or 'dm'."
+                "Quimb compression modes."
             )
         if layer_tags is None:
             self.layer_tags = None
@@ -562,7 +487,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             max_bond = self.fit_max_bond
             if max_bond is None and self.fit_block_size in {2, 3}:
                 max_bond = int(boundary_mps.max_bond())
-            fit.run_eff(
+            run_kwargs = dict(
                 n_iter=self.n_iter,
                 verbose=verbose,
                 block_size=self.fit_block_size,
@@ -575,6 +500,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 rtol=self.fit_rtol,
                 patience=self.fit_patience,
             )
+            if (
+                isinstance(self.fit_cutoff, str)
+                and self.fit_cutoff.strip().lower() == "auto"
+            ):
+                run_kwargs["adaptive_bond_growth"] = True
+            fit.run_eff(**run_kwargs)
             return
         if self.fit_mode in {"two-site", "dmrg2"}:
             # The complete boundary is the active DMRG interval. ``run_gate``
@@ -614,6 +545,11 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 patience=self.fit_patience,
                 collect_split_diagnostics=False,
             )
+            if (
+                isinstance(self.fit_cutoff, str)
+                and self.fit_cutoff.strip().lower() == "auto"
+            ):
+                run_kwargs["adaptive_bond_growth"] = True
             if getattr(self, "fit_timing", False):
                 run_kwargs["timing"] = True
                 run_kwargs["timing_sync_device"] = bool(
@@ -676,6 +612,9 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 fit_init_strategy="not-applicable",
                 adaptive_sweeps=0,
                 one_site_refinement_sweeps=0,
+                sweep_norm_trace=(),
+                adaptive_bond_caps=(),
+                adaptive_bond_events=(),
             )
         )
 
@@ -701,6 +640,26 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 "fit_layer_mode='sequential' requires tagged layers. Supply "
                 "layer_tags, for example ('BRA', 'PEPO', 'KET')."
             )
+        if self.fit_layer_order == "auto":
+            if self.layer_tags is None:
+                raise ValueError(
+                    "fit_layer_order='auto' requires explicit layer_tags; "
+                    "the default BRA/KET order is semantically significant."
+                )
+
+            def layer_cost(layer_tag):
+                layer_tn = tn.select(layer_tag, "any")
+                tensor_sizes = [
+                    int(np.prod(tuple(tensor.shape), dtype=np.int64))
+                    for tensor in layer_tn.tensors
+                ]
+                return (
+                    sum(tensor_sizes),
+                    max(tensor_sizes, default=0),
+                    len(tensor_sizes),
+                )
+
+            layer_tags = tuple(sorted(layer_tags, key=layer_cost, reverse=True))
         return layer_tags
 
     def _compress_direct_target(self, tn, *, max_bond, cutoff, site_tags):
@@ -709,7 +668,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             return tn.copy()
 
         method = self.fit_mode
-        if method == "src":
+        require_quimb_1d_compression_method(method)
+        if method in {"src", "srcmps"}:
             # SRC is rank-controlled; keep the explicit zero cutoff to avoid
             # Quimb's advisory warning and match MPS semantics.
             cutoff = 0.0
@@ -721,11 +681,28 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             "permute_arrays": False,
             "inplace": False,
         }
-        if method == "src":
+        if method in {
+            "src",
+            "src-first",
+            "src-oversample",
+            "srcmps",
+            "srcmps-first",
+            "srcmps-oversample",
+        }:
             compress_kwargs["seed"] = self.fit_init_seed
-        else:
-            compress_kwargs["cutoff_mode"] = self.fit_cutoff_mode
-        return qtn.tensor_network_1d_compress(tn.copy(), **compress_kwargs)
+        if method not in {"src", "srcmps"}:
+            cutoff_mode = self.fit_cutoff_mode
+            # Quimb's randomized ``sdcr`` split only supports absolute or
+            # relative cutoffs, whereas the shared boundary default is the
+            # cumulative ``rsum2`` policy. Keep the public default usable by
+            # selecting the equivalent scale-relative policy for this mode.
+            if method == "sdcr" and cutoff_mode not in {"abs", "rel"}:
+                cutoff_mode = "rel"
+            compress_kwargs["cutoff_mode"] = cutoff_mode
+        # Quimb owns the non-inplace result when ``inplace=False``. Avoid an
+        # extra full target copy here: ``tn`` is a disposable local target and
+        # the compressor's public ownership contract already protects it.
+        return qtn.tensor_network_1d_compress(tn, **compress_kwargs)
 
     def _compress_boundary(  # pylint: disable=too-many-locals
         self,
@@ -864,6 +841,24 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         sweep_timings = (
             tuple(deepcopy(fit.get_timing())) if self.fit_timing else ()
         )
+        sweep_norm_trace = tuple(
+            float(value)
+            for value in getattr(fit, "sweep_norm_trace", ())
+        )
+        adaptive_bond_caps = tuple(
+            sorted(
+                (
+                    str(bond),
+                    int(cap),
+                )
+                for bond, cap in getattr(fit, "info", {})
+                .get("adaptive_bond_caps", {})
+                .items()
+            )
+        )
+        adaptive_bond_events = tuple(
+            deepcopy(getattr(fit, "info", {}).get("adaptive_bond_events", ()))
+        )
         self.fit_diagnostics.append(
             BoundaryFitDiagnostic(
                 boundary_key=str(boundary_key),
@@ -888,6 +883,9 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 fit_init_strategy=str(self._fit_init_strategy_used),
                 adaptive_sweeps=adaptive_sweeps,
                 one_site_refinement_sweeps=one_site_refinement_sweeps,
+                sweep_norm_trace=sweep_norm_trace,
+                adaptive_bond_caps=adaptive_bond_caps,
+                adaptive_bond_events=adaptive_bond_events,
             )
         )
 
@@ -992,7 +990,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             guess_kwargs["seed"] = self.fit_init_seed
         else:
             guess_kwargs["cutoff_mode"] = self.fit_cutoff_mode
-        guess = qtn.tensor_network_1d_compress(tn.copy(), **guess_kwargs)
+        guess = qtn.tensor_network_1d_compress(tn, **guess_kwargs)
         guess.view_as_(
             qtn.MatrixProductState,
             L=boundary_mps.L,

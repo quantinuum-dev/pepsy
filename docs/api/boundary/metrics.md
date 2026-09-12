@@ -3,8 +3,13 @@
 `peps_norm`, `peps_normalize`, `peps_infidelity`, and `contract_flat` accept
 the following boundary-compression modes:
 
-- `fit_mode="direct"`, `"src"`, `"zipup"`, `"sdc"`, or `"dm"`:
-  direct Quimb boundary compression.
+- `fit_mode="direct"`, `"src"`, `"src-mps"`, `"zipup"`, `"sdc"`,
+  `"sdcr"`, or `"dm"`: direct Quimb boundary compression. Quimb's
+  `*-first` and `*-oversample` variants are also accepted, including
+  `"srcmps"`/`"src-mps"`, `"srcmps-oversample"`/`"src-mps-oversample"`,
+  `"src-oversample"`, `"sdc-oversample"`, and `"zipup-oversample"`.
+  Because Quimb's randomized `sdcr` split does not support cumulative cutoff
+  modes, the shared `fit_cutoff_mode="auto"` policy uses `"rel"` for `sdcr`.
 - `fit_mode="eff"` (also `"dmrg"`): cached one-site FIT sweeps and the
   compatibility default.
 - `fit_mode="two-site"`: fixed two-site FIT updates.

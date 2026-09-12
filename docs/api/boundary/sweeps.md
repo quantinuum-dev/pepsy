@@ -3,9 +3,14 @@
 `CompBdy(..., fit_mode="dmrg2")` fits the complete boundary interval with
 `FIT.run_gate(block_size=2)`, using two-site warm-up sweeps followed by
 one-site refinement. The legacy `fit_mode="two-site"` remains fixed
-two-site FIT. The direct modes `"direct"`, `"src"`, `"zipup"`, `"sdc"`,
-and `"dm"` use Quimb boundary compression without FIT. Configure FIT modes
-with:
+two-site FIT. The direct modes `"direct"`, `"src"`, `"src-mps"`, `"zipup"`,
+`"sdc"`, `"sdcr"`, and `"dm"` use Quimb boundary compression without FIT.
+Quimb's supported `*-first` and `*-oversample` variants are accepted too;
+`"src-mps"` is the readable alias for `"srcmps"`. Configure FIT modes with:
+
+The randomized `"sdcr"` split accepts only absolute or relative cutoff
+interpretations. If the shared default resolves to cumulative `"rsum2"`,
+`CompBdy` uses `"rel"` for that mode so the request remains valid.
 
 - `fit_max_bond`: required for rank growth beyond the current boundary bond;
   omission safely caps direct `CompBdy` use at the current bond.

@@ -13,7 +13,21 @@ import inspect
 import quimb.tensor as qtn
 
 
-_SDC_METHODS = frozenset({"sdc", "sdc-oversample"})
+_OPTIONAL_1D_METHODS = frozenset(
+    {
+        "sdc",
+        "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "zipup-first",
+        "zipup-oversample",
+    }
+)
 _SEEDED_METHODS = frozenset(
     {
         "src",
@@ -174,7 +188,7 @@ def quimb_1d_compression_function(method):
 def quimb_1d_compression_method_available(method):
     """Return whether an optional Quimb 1D compressor is installed."""
     method = str(method).strip().lower()
-    if method not in _SDC_METHODS:
+    if method not in _OPTIONAL_1D_METHODS:
         return True
     return callable(quimb_1d_compression_function(method))
 
@@ -185,9 +199,8 @@ def require_quimb_1d_compression_method(method):
         return
     raise NotImplementedError(
         f"Quimb compression method {method!r} is not available in the installed "
-        "Quimb build. Install a Quimb build containing the sdc compressor "
-        "(available in the v1.16 development line) to use this mode. Existing "
-        "compression modes remain available."
+        "Quimb build. Install a newer Quimb build containing this optional "
+        "1D compressor. Existing compression modes remain available."
     )
 
 

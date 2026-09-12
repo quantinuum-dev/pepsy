@@ -9,6 +9,13 @@ from dataclasses import replace
 from numbers import Integral
 from typing import Any
 
+from ...boundary._fit_policy import (
+    _FIT_QUIMB_MODES,
+    _SWEEP_BOUNDARY_INIT_KEYS,
+    _canonical_fit_layer_mode,
+    _canonical_fit_layer_order,
+    _canonical_fit_mode_selector,
+)
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import peps_normalize as boundary_normalize
 from ...backends import TorchLinalgConfig
@@ -203,11 +210,24 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         If ``False``, copy ``state`` before applying gates.
     normalize_initial : bool, default=True
         Normalize the initial state once, on the first :meth:`run` call.
+    fit_* : optional
+        The boundary FIT controls accepted by :class:`SweepOptimizer` may be
+        supplied directly here (for example ``fit_mode="dmrg2"`` or
+        ``fit_layer_mode="sequential"``). Direct values override matching
+        entries in ``boundary_kwargs``. Leaving them as ``None`` preserves the
+        mapping-based compatibility API and the lower-level defaults.
     boundary_kwargs : mapping, optional
         Shared PEPS boundary controls used for normalization, infidelity
         estimates, and sweep environment updates. Defaults are
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
+        FIT controls such as ``fit_mode``, ``fit_layer_mode``, ``layer_tags``,
+        the ``fit_*`` initialization/convergence options, and ``cutoff`` are
+        shared across all three paths. Metric-only controls such as
+        ``method``, ``mode_``, ``sequence``, and ``equalize_norms`` remain
+        valid for standalone metric calls but are not passed to the delegated
+        ``SweepOptimizer`` constructor. ``balance_bonds`` is a normalization-
+        only option and belongs in ``normalize_kwargs``.
     boundary_engine : {"auto", "dmrg", "quimb-mps"}, default="auto"
         Boundary engine used by sweep cleanup. ``"auto"`` keeps dense inputs
         on Pepsy ``BdyMPS``/``CompBdy`` boundaries and routes Symmray-looking
@@ -217,6 +237,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Extra options forwarded to :class:`SweepOptimizer`'s Quimb MPS
         boundary store, such as ``cutoff``, ``canonize``, ``compress_opts``,
         ``equalize_norms``, ``layer_tags``, and ``mode``.
+        These configure the reusable Quimb sweep environment; standalone
+        :meth:`normalize` and :meth:`estimate_infidelity` use
+        ``normalize_kwargs``/``infidelity_kwargs`` for metric-only options.
     normalize_kwargs, infidelity_kwargs : mapping, optional
         Extra keyword arguments for boundary normalization and local infidelity
         estimates. These are merged after ``boundary_kwargs``.
@@ -290,6 +313,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         which=None,
         inplace=False,
         normalize_initial=True,
+        fit_mode=None,
+        fit_layer_mode=None,
+        fit_layer_order=None,
+        layer_tags=None,
+        fit_init_strategy=None,
+        fit_init_seed=None,
+        fit_block_size=None,
+        fit_adaptive_sweeps=None,
+        fit_max_bond=None,
+        fit_sweep_sequence=None,
+        fit_cutoff_mode=None,
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=None,
+        fit_timing=None,
+        fit_timing_sync_device=None,
         boundary_kwargs: Mapping[str, Any] | None = None,
         boundary_engine="auto",
         boundary_options: Mapping[str, Any] | None = None,
@@ -343,11 +382,35 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.gates = _normalize_gate_queue(gates)
 
         self.normalize_initial = bool(normalize_initial)
+        direct_fit_kwargs = {
+            key: value
+            for key, value in {
+                "fit_mode": fit_mode,
+                "fit_layer_mode": fit_layer_mode,
+                "fit_layer_order": fit_layer_order,
+                "layer_tags": layer_tags,
+                "fit_init_strategy": fit_init_strategy,
+                "fit_init_seed": fit_init_seed,
+                "fit_block_size": fit_block_size,
+                "fit_adaptive_sweeps": fit_adaptive_sweeps,
+                "fit_max_bond": fit_max_bond,
+                "fit_sweep_sequence": fit_sweep_sequence,
+                "fit_cutoff_mode": fit_cutoff_mode,
+                "fit_min_iter": fit_min_iter,
+                "fit_rtol": fit_rtol,
+                "fit_patience": fit_patience,
+                "fit_timing": fit_timing,
+                "fit_timing_sync_device": fit_timing_sync_device,
+            }.items()
+            if value is not None
+        }
         self.boundary_kwargs = _merge_opts(
             _DEFAULT_BOUNDARY_KWARGS,
             boundary_kwargs,
+            direct_fit_kwargs,
         )
         self.boundary_engine = canonical_boundary_engine_selector(boundary_engine)
+        self._validate_boundary_fit_policy()
         self.boundary_options = dict(boundary_options or {})
         self.normalize_kwargs = dict(normalize_kwargs or {})
         self.infidelity_kwargs = dict(infidelity_kwargs or {})
@@ -448,6 +511,46 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             return int(self.evaluation_chi)
         return 2 * self._boundary_chi_max()
 
+    def _validate_boundary_fit_policy(self):
+        """Validate constructor-level FIT/layer policy before any contraction."""
+        fit_mode = _canonical_fit_mode_selector(
+            self.boundary_kwargs.get("fit_mode", "eff")
+        )
+        fit_layer_mode = _canonical_fit_layer_mode(
+            self.boundary_kwargs.get("fit_layer_mode", "joint")
+        )
+        _canonical_fit_layer_order(
+            self.boundary_kwargs.get("fit_layer_order", "input")
+        )
+        if fit_layer_mode == "sequential" and fit_mode not in _FIT_QUIMB_MODES:
+            raise ValueError(
+                "fit_layer_mode='sequential' is only supported with direct "
+                "Quimb fit modes: 'direct', 'src', 'zipup', 'sdc', or 'dm'."
+            )
+
+        metric_method = self.boundary_kwargs.get("method")
+        if (
+            fit_layer_mode == "sequential"
+            and metric_method is not None
+            and str(metric_method).strip().lower().replace("-", "_") != "dmrg"
+        ):
+            raise ValueError(
+                "fit_layer_mode='sequential' requires method='dmrg' for "
+                "Pepsy layered compression; native Quimb MPS metrics handle "
+                "layer tags jointly."
+            )
+
+        if (
+            fit_layer_mode == "sequential"
+            and normalize_boundary_engine(self.boundary_engine, self.state)
+            == "quimb-mps"
+        ):
+            raise ValueError(
+                "fit_layer_mode='sequential' is not supported by the native "
+                "Quimb MPS boundary engine; use boundary_engine='dmrg' for "
+                "direct layered compression."
+            )
+
     def set_boundary_chi(
         self,
         boundary_chi=None,
@@ -494,6 +597,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.local_infidelities = []
         self.step_records = []
         self.normalizations = []
+        self.fit_diagnostics = []
         self._fidelity_log_sum = 0.0
         self._fidelity_count = 0
         self.last_result = None
@@ -546,9 +650,17 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
         _prefer_boundary_engine_mps(opts, self.boundary_engine, state, normalize=True)
-        old_norm = boundary_normalize(state, **opts)
+        requested_info = bool(opts.get("return_info", False))
+        if opts.get("fit_timing", False):
+            # Timing records live on BoundaryContractResult. Preserve the
+            # historical scalar return from PepsOptimizer.normalize unless
+            # the caller explicitly requested structured information.
+            opts["return_info"] = True
+        result = boundary_normalize(state, **opts)
+        self._append_fit_diagnostics(result)
+        old_norm = getattr(result, "cost", result)
         self.normalizations.append(self._normalization_record(state, old_norm))
-        return old_norm
+        return result if requested_info else old_norm
 
     def _ensure_initial_normalized(
         self,
@@ -890,6 +1002,23 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             "state_max_bond": self._max_bond(state),
         }
 
+    def _append_fit_diagnostics(self, result):
+        """Retain boundary FIT diagnostics without retaining contraction TNs."""
+        if result is None:
+            return
+        records = getattr(result, "fit_diagnostics", None)
+        if records is not None:
+            self.fit_diagnostics.extend(tuple(records))
+            return
+        if not isinstance(result, Mapping):
+            return
+        for key in ("norm_result", "norm_target_result", "overlap_result"):
+            metric = result.get(key)
+            if metric is not None:
+                self.fit_diagnostics.extend(
+                    tuple(getattr(metric, "fit_diagnostics", ()))
+                )
+
     def estimate_infidelity(self, state, target, *, evaluation_chi=None, **kwargs):
         """Estimate local boundary infidelity between normalized states.
 
@@ -899,7 +1028,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         call only.
         """
         opts = _merge_opts(
-            self.boundary_kwargs,
+            {
+                key: value
+                for key, value in self.boundary_kwargs.items()
+                if key != "balance_bonds"
+            },
             self.infidelity_kwargs,
             kwargs,
         )
@@ -909,7 +1042,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("norm", 1.0)
         opts.setdefault("norm_target", 1.0)
         _prefer_boundary_engine_mps(opts, self.boundary_engine, state, target)
-        return self._clean_infidelity(boundary_infidelity(state, target, **opts))
+        result = boundary_infidelity(state, target, **opts)
+        self._append_fit_diagnostics(result)
+        return self._clean_infidelity(result)
 
     def _sweep_boundary_kwargs(self, *, progress, sweep_progress=None):
         opts = _merge_opts(self.boundary_kwargs)
@@ -917,6 +1052,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("chi", self.boundary_chi)
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
+        # ``boundary_kwargs`` also configures the standalone metric helpers.
+        # Keep metric-only names such as ``method`` and ``mode_`` in those
+        # calls, but do not pass them as unsupported SweepOptimizer init args.
+        boundary_init_kwargs = {
+            key: value
+            for key, value in opts.items()
+            if key in _SWEEP_BOUNDARY_INIT_KEYS
+        }
         inner_progress = bool(progress) if sweep_progress is None else bool(sweep_progress)
         # SweepOptimizer.run uses env_n_iter for boundary moves during sweeps.
         # Keep boundary-contraction progress silent, but let its one
@@ -931,7 +1074,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             "progress_position": 1 if progress and inner_progress else 0,
             "progress_leave": False,
         }
-        return opts, opt_kwargs, strip_exponent
+        return boundary_init_kwargs, opt_kwargs, strip_exponent
 
     def _apply_sweep_optimizer_options(self, opt_kwargs):
         opt_kwargs = dict(opt_kwargs or {})
@@ -1186,6 +1329,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             sweeper.set_optimize_kwargs(**opt_kwargs)
 
         result = sweeper.run()
+        self._append_fit_diagnostics(getattr(sweeper, "fit_diagnostics", None))
         best_state = result.get("best_state") if isinstance(result, Mapping) else None
         state_out = best_state if best_state is not None else sweeper.state
         final_infidelity = None
@@ -1971,3 +2115,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     def get_normalizations(self):
         """Return lightweight normalization events recorded by this optimizer."""
         return list(self.normalizations)
+
+    def get_fit_diagnostics(self):
+        """Return FIT diagnostics collected from metric and sweep boundaries.
+
+        Records are populated when ``fit_timing=True`` is enabled through
+        ``boundary_kwargs`` or a per-call normalization/infidelity mapping.
+        """
+        return list(self.fit_diagnostics)
