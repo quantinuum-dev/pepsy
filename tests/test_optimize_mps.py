@@ -935,9 +935,11 @@ def test_mps_optimizer_mpo_method_modes(method):
     assert optimizer.mode == f"quimb-{method}"
 
 
-@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
-def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
-    """New SDC modes never silently fall back on older Quimb installations."""
+@pytest.mark.parametrize(
+    "method", ["sdc", "sdc-oversample", "sdcr", "sdcr-oversample"]
+)
+def test_mps_optimizer_successive_compression_modes_are_version_gated(method):
+    """New SDC/SDCR modes never silently fall back on older Quimb."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
@@ -947,7 +949,10 @@ def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
     supported = mps_optimizer_module._quimb_compression_method_available(method)
 
     if not supported:
-        with pytest.raises(NotImplementedError, match="sdc compressor"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{method.split('-', 1)[0]} compressor",
+        ):
             optimizer.run(progbar=False, cutoff=1.0e-12)
         return
 
@@ -960,18 +965,22 @@ def test_mps_optimizer_sdc_modes_are_opt_in_and_version_gated(method):
     assert optimizer.mode == f"quimb-{method}"
 
 
-def test_mps_optimizer_bare_sdc_mode_normalizes_to_quimb_sdc():
-    """The bare SDC spelling is a first-class MPS compression mode."""
+@pytest.mark.parametrize("method", ["sdc", "sdcr"])
+def test_mps_optimizer_bare_successive_mode_normalizes_to_quimb(method):
+    """Bare SDC and SDCR spellings are first-class MPS modes."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
         chi=2,
-        mode="sdc",
+        mode=method,
     )
-    assert optimizer.mode == "quimb-sdc"
+    assert optimizer.mode == f"quimb-{method}"
 
-    if not mps_optimizer_module._quimb_compression_method_available("sdc"):
-        with pytest.raises(NotImplementedError, match="sdc compressor"):
+    if not mps_optimizer_module._quimb_compression_method_available(method):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{method} compressor",
+        ):
             optimizer.run(progbar=False, cutoff=1.0e-12)
         return
 
@@ -983,9 +992,30 @@ def test_mps_optimizer_bare_sdc_mode_normalizes_to_quimb_sdc():
     assert out.max_bond() <= 2
 
 
-@pytest.mark.parametrize("method", ["sdc", "sdc-oversample"])
-def test_mps_optimizer_sdc_fit_init_strategies_are_version_gated(method):
-    """SDC is available both as a mode and as a FIT warm-start method."""
+def test_mps_optimizer_sdcr_uses_relative_environment_cutoff():
+    """SDCR never forwards cumulative cutoffs to randomized environments."""
+    optimizer = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[],
+        chi=2,
+        mode="quimb-sdcr",
+    )
+
+    options = optimizer._submpo_compress_opts(  # pylint: disable=protected-access
+        "sdcr",
+        cutoff=1.0e-12,
+        cutoff_mode="rsum2",
+    )
+
+    assert options["cutoff"] == 0.0
+    assert options["cutoff_mode"] == "rel"
+
+
+@pytest.mark.parametrize(
+    "method", ["sdc", "sdc-oversample", "sdcr", "sdcr-oversample"]
+)
+def test_mps_optimizer_successive_fit_init_strategies_are_version_gated(method):
+    """SDC and SDCR are available as FIT warm-start methods when installed."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("0000", dtype="complex128"),
         [(qu.CNOT(), (0, 3))],
@@ -995,7 +1025,10 @@ def test_mps_optimizer_sdc_fit_init_strategies_are_version_gated(method):
     supported = mps_optimizer_module._quimb_compression_method_available(method)
 
     if not supported:
-        with pytest.raises(NotImplementedError, match="sdc compressor"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"{method.split('-', 1)[0]} compressor",
+        ):
             optimizer.run(
                 progbar=False,
                 n_iter=2,
@@ -6805,16 +6838,16 @@ def test_mps_compression_layout_pilot_rejects_conflicting_modes(kwargs, match):
         )
 
 
-def test_mps_compression_layout_pilot_rejects_cap_stream():
-    """Pilot selection should reject length-changing streams early."""
+def test_mps_compression_layout_pilot_accepts_direct_cap_stream():
+    """Pilot selection tracks a direct cap's shortened replay state."""
     opt = py.MpsOptimizer(
         qtn.MPS_computational_state("0000"),
         gates=[("cap", 1, [1.0, 1.0])],
         chi=4,
         mode="direct",
     )
-    with pytest.raises(ValueError, match="cap control events"):
-        opt.select_layout_for_compression(pilot_candidates=1, pilot_steps=1)
+    plan = opt.select_layout_for_compression(pilot_candidates=1, pilot_steps=1)
+    assert plan["pilot"]["reports"]["input"]["status"] == "ok"
 
 
 def test_mps_compression_layout_pilot_accepts_none_mode_override():
@@ -7278,16 +7311,35 @@ def test_mps_optimizer_persistent_layout_remaps_submpo_without_mutating_stream()
     assert stream[0][2] == (0, 3)
 
 
-def test_mps_optimizer_persistent_layout_rejects_cap_events():
-    """Persistent layout cannot survive a stream that changes MPS length."""
-    opt = py.MpsOptimizer(
-        qtn.MPS_computational_state("0000"),
-        gates=[("cap", 1, [1.0, 1.0])],
-        chi=8,
-        mode="mpo",
+def test_mps_optimizer_persistent_layout_tracks_direct_cap_events():
+    """Persistent layouts update logical labels when a cap shortens the chain."""
+    stream = [
+        (qu.hadamard(), (0,)),
+        ("cap", 1, [1.0, 0.0], "left"),
+        (qu.CNOT(), (0, 1)),
+    ]
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=stream,
+        chi=16,
+        mode="svd",
     )
-    with pytest.raises(ValueError, match="cap control events"):
-        opt.apply_layout((0, 2, 3, 1), layout_report=False)
+    reference.run(progbar=False, cutoff=0.0)
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=stream,
+        chi=16,
+        mode="svd",
+    )
+    opt.apply_layout((2, 0, 1), layout_report=False)
+    opt.run(progbar=False, cutoff=0.0)
+
+    assert opt.mps_length_diagnostics()["length_history"] == (3, 2)
+    assert opt.logical_order == [1, 0]
+    assert np.allclose(
+        np.asarray(opt.to_dense()).reshape(-1),
+        np.asarray(reference.to_dense()).reshape(-1),
+    )
 
 
 def test_mps_optimizer_layout_run_reports_score_reduction(capsys):
@@ -8902,17 +8954,39 @@ def test_mps_optimizer_measure_reset_support_layout_finder():
     assert np.allclose(np.abs(lay.p.to_dense(inds)), np.abs(ref.p.to_dense(inds)))
 
 
-def test_mps_optimizer_cap_events_reject_layout_finder():
-    """cap events change the MPS length, so the layout finder is rejected."""
+def test_mps_optimizer_cap_events_replay_through_layout_finder():
+    """Direct caps replay through a transient layout and restore readout order."""
     su4 = qu.rand_uni(4, seed=1)
-    opt = py.MpsOptimizer(
-        qtn.MPS_computational_state("0000"),
-        [(su4, (0, 3)), ("cap", 1, [1.0, 1.0])],
+    stream = [
+        (su4, (0, 3)),
+        ("cap", 1, [1.0, 1.0]),
+        (qu.CNOT(), (0, 2)),
+    ]
+    reference = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        stream,
         chi=8,
         mode="mpo",
     )
-    with pytest.raises(ValueError, match="cap control"):
-        opt.run(progbar=False, use_layout_finder=True)
+    reference.run(progbar=False, cutoff=0.0)
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        stream,
+        chi=8,
+        mode="mpo",
+    )
+    opt.run(
+        progbar=False,
+        use_layout_finder=True,
+        layout_report=False,
+        cutoff=0.0,
+    )
+    assert opt.logical_order == [0, 1, 2]
+    assert opt.mps_length_diagnostics()["length_history"] == (4, 3)
+    assert np.allclose(
+        np.asarray(opt.to_dense()).reshape(-1),
+        np.asarray(reference.to_dense()).reshape(-1),
+    )
 
 
 def test_mps_optimizer_conditional_cap_rejects_layouts():
@@ -8924,11 +8998,11 @@ def test_mps_optimizer_conditional_cap_rejects_layouts():
     initial = qtn.MPS_computational_state("0000", dtype="complex128")
 
     persistent = py.MpsOptimizer(initial.copy(), stream, chi=8, mode="direct")
-    with pytest.raises(ValueError, match="cap control events"):
+    with pytest.raises(ValueError, match="conditional cap"):
         persistent.apply_layout((0, 2, 3, 1), layout_report=False)
 
     transient = py.MpsOptimizer(initial.copy(), stream, chi=8, mode="direct")
-    with pytest.raises(ValueError, match="cap control events"):
+    with pytest.raises(ValueError, match="conditional cap"):
         transient.run(
             progbar=False,
             use_layout_finder=True,

@@ -83,6 +83,7 @@ from ..._internal.cutoff import dtype_auto_cutoff
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_method_available as _quimb_compression_method_available,  # noqa: F401
+    quimb_1d_compression_cutoff_mode as _quimb_compression_cutoff_mode,
     quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
     require_quimb_1d_compression_method as _require_quimb_compression_method,
 )
@@ -95,6 +96,8 @@ from ...operators import primitives as _gate_primitives
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
+    _normalize_site_roles,
+    _gate_stream_site_usage,
     _unique_ordered,
 )
 
@@ -130,6 +133,8 @@ _MPO_COMPRESSION_METHODS = frozenset(
         "srcmps-oversample",
         "sdc",
         "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
         "fit",
         "fit-zipup",
         "fit-projector",
@@ -137,7 +142,7 @@ _MPO_COMPRESSION_METHODS = frozenset(
     }
 )
 _MPO_METHODS_IGNORE_CUTOFF_MODE = frozenset({"src", "srcmps"})
-_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps"})
+_MPO_METHODS_IGNORE_CUTOFF = frozenset({"src", "srcmps", "sdcr"})
 _MPO_METHODS_USE_SEED = frozenset(
     {
         "src",
@@ -272,6 +277,30 @@ def _array_backend_signature(array):
 def _normalize_event_name(name):
     """Normalize a stream event name for matching."""
     return str(name).replace("-", "_").strip().lower()
+
+
+def _symbolic_rotation_name(name):
+    """Return ``(base, angle)`` for a named rotation, if angle is embedded."""
+    raw_name = str(name).strip().lower()
+    normalized = _normalize_event_name(raw_name)
+    for base in (*_SYMBOLIC_ONE_QUBIT_ROTATIONS, *_SYMBOLIC_TWO_QUBIT_ROTATIONS):
+        prefix = f"{base}-"
+        if raw_name.startswith(prefix):
+            text = raw_name[len(prefix):]
+            if not text:
+                raise ValueError(
+                    f"{name!r} gate has an empty embedded angle; use "
+                    f"{base!r} with a numeric angle."
+                )
+            try:
+                angle = float(text)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{name!r} gate must embed a numeric angle after "
+                    f"{base}-; got {text!r}."
+                ) from exc
+            return base, angle
+    return normalized, None
 
 
 def _normalize_submpo_where(where):
@@ -957,7 +986,7 @@ def _symbolic_gate_entry(entry):
     name = entry[0]
     if not isinstance(name, str):
         return None
-    name = _normalize_event_name(name)
+    name, embedded_theta = _symbolic_rotation_name(name)
 
     if name in _SYMBOLIC_ONE_QUBIT_GATES:
         if len(entry) != 2:
@@ -977,12 +1006,22 @@ def _symbolic_gate_entry(entry):
         return _SYMBOLIC_TWO_QUBIT_GATES[name](), where
 
     if name in _SYMBOLIC_ONE_QUBIT_ROTATIONS:
+        if embedded_theta is not None:
+            if len(entry) != 2:
+                raise ValueError(
+                    f"{name!r} gate with an embedded angle expects one target site."
+                )
+            where = _symbolic_targets((entry[1],), name=name, arity=1)
+            return _SYMBOLIC_ONE_QUBIT_ROTATIONS[name](embedded_theta), where[0]
         if len(entry) != 3:
             raise ValueError(f"{name!r} gate expects an angle and one target site.")
         where = _symbolic_targets((entry[2],), name=name, arity=1)
         return _SYMBOLIC_ONE_QUBIT_ROTATIONS[name](entry[1]), where[0]
 
     if name in _SYMBOLIC_TWO_QUBIT_ROTATIONS:
+        if embedded_theta is not None:
+            where = _symbolic_targets(entry[1:], name=name, arity=2)
+            return _SYMBOLIC_TWO_QUBIT_ROTATIONS[name](embedded_theta), where
         if len(entry) == 4:
             where = _symbolic_targets(entry[2:], name=name, arity=2)
         elif len(entry) == 3:
@@ -1004,6 +1043,25 @@ def _symbolic_gate_entry(entry):
 
 def _resolve_symbolic_gate_entry(entry, converter):
     """Resolve one named gate while preserving non-gate stream events."""
+    # Also accept the bundled shorthand ``((name, angle), where)``. This is
+    # useful when callers want the symbolic gate descriptor to remain separate
+    # from its target locations, while the canonical stream still ends up as
+    # ``(matrix, where)``.
+    if (
+        isinstance(entry, (tuple, list))
+        and len(entry) == 2
+        and isinstance(entry[0], (tuple, list))
+        and entry[0]
+        and isinstance(entry[0][0], str)
+    ):
+        gate_spec = tuple(entry[0]) + (entry[1],)
+        symbolic = _symbolic_gate_entry(gate_spec)
+        if symbolic is not None:
+            gate, where = symbolic
+            if converter is not None:
+                gate = converter(gate)
+            return (gate, where)
+
     if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
         name = _normalize_event_name(entry[0])
         if name in _CONDITIONAL_EVENT_ALIASES and len(entry) == 4:
@@ -1038,8 +1096,14 @@ def _resolve_symbolic_gate_entry(entry, converter):
 def _contains_symbolic_gate(entry):
     """Return whether an entry (including a conditional action) is named."""
     if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
-        name = _normalize_event_name(entry[0])
+        raw_name = entry[0].strip().lower()
+        name = _normalize_event_name(raw_name)
         if name in _SYMBOLIC_GATE_NAMES:
+            return True
+        if any(
+            raw_name.startswith(f"{base}-")
+            for base in (*_SYMBOLIC_ONE_QUBIT_ROTATIONS, *_SYMBOLIC_TWO_QUBIT_ROTATIONS)
+        ):
             return True
         return (
             name in _CONDITIONAL_EVENT_ALIASES
@@ -1182,6 +1246,7 @@ def _apply_submpo_with_interior_workaround_impl(
     site_tags = [p.site_tag(site) for site in range(si, sf + 1)]
     _, subp = p.partition(site_tags, which="any", inplace=True)
 
+    cutoff_mode = _quimb_compression_cutoff_mode(method, cutoff_mode)
     common = {
         "site_tags": site_tags,
         "max_bond": chi,
@@ -1309,6 +1374,7 @@ def _apply_dense_gate_with_method(
             opts["cutoff"] = (
                 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
             )
+        cutoff_mode = _quimb_compression_cutoff_mode(method, cutoff_mode)
         if cutoff_mode is not None and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE:
             opts["cutoff_mode"] = cutoff_mode
         if optimize is not None:
@@ -1401,7 +1467,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
         applied on the ket family only (state evolution), using :func:`pepsy.operators.gates.gate`.
         Named entries matching the stabilizer stream grammar are also accepted,
-        for example ``("H", 0)`` and ``("rzz", theta, 0, 1)``. They are
+        for example ``("H", 0)``, ``("rzz", theta, 0, 1)``, and the compact
+        ``("rzz-0.23", 0, 1)`` form. They are
         materialized as ordinary gate matrices before stream validation.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
         For a bare Quimb method such as ``mode="src"`` or the qualified
@@ -1475,6 +1542,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         before they cross the stream boundary. When omitted, the converter is
         inferred from the initial MPS for named gates. Existing numeric gate
         and sub-MPO payloads retain the strict explicit-preparation contract.
+    qubit_roles : mapping or sequence, optional
+        Optional logical-site metadata such as ``{0: "data", 1: "ancilla"}``
+        or one role label per initial MPS site. The metadata is preserved in
+        layout plans and can be used with ``role_order`` during layout search;
+        it does not alter execution semantics.
     Attributes
     ----------
     measurements : list[tuple]
@@ -1638,11 +1710,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return compression options for a sub-MPO method."""
         opts = {}
         # ``cutoff`` controls discarded singular weight for ordinary methods.
-        # SRC/SRCMPS are rank-controlled randomized projections, so Quimb
+        # SRC/SRCMPS/SDCR are rank-controlled randomized projections, so Quimb
         # intentionally ignores a singular-value cutoff for those methods.
         opts["cutoff"] = (
             0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else cutoff
         )
+        cutoff_mode = _quimb_compression_cutoff_mode(method, cutoff_mode)
         if (
             cutoff_mode is not None
             and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
@@ -1773,6 +1846,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         L=None,
         lattice_shape=None,
         lattice_site=None,
+        site_coords=None,
         order="quality",
         objective="locality",
         refine_passes=8,
@@ -1789,6 +1863,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         weight_mode="auto",
         schmidt_max_dim=4,
         max_operator_qubits=8,
+        qubit_roles=None,
+        role_order=None,
     ):
         """Find a good 1D MPS layout for a bundled gate stream.
 
@@ -1802,7 +1878,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ----------
         gate_stream
             Canonical bundled stream accepted by :class:`MpsOptimizer`,
-            including explicit sub-MPO events.
+            including explicit sub-MPO and direct cap events. Direct caps are
+            treated as fixed lifetime boundaries by compiled replay.
         sites : sequence[hashable] | None
             Complete logical site labels to arrange. If omitted, sites are
             inferred from first use in ``gate_stream`` unless ``L`` is given.
@@ -1815,13 +1892,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         lattice_site : callable, optional
             Optional ``(x, y) -> logical_site`` mapper for named geometric
             orders. The default is ``x * Ly + y``.
+        site_coords : mapping or sequence, optional
+            Optional arbitrary logical-site coordinates. Unlike
+            ``lattice_shape``, this accepts irregular data/ancilla layouts and
+            contributes coordinate and snake candidates to the search.
         objective : {"locality", "compression"}
             ``"locality"`` minimizes support span and cut congestion using
             event weights. ``"compression"`` ranks layouts by operator-
             Schmidt load over the MPS cuts, with path span as a tie-breaker.
         order : str
             One of ``"quality"``/``"auto"``/``"best"``, ``"recursive"``,
-            ``"input"``, ``"degree"``, ``"bfs"``, ``"spectral"``,
+            ``"lifetime"``/``"role-grouped"``, ``"input"``, ``"degree"``,
+            ``"bfs"``, ``"spectral"``,
             ``"nevergrad"``, ``"kahypar"``, the geometric lattice presets
             ``"row-major"``, ``"col-major"``, ``"snake"``,
             ``"folded-snake"``, and ``"hilbert"``, or the ``"*_refined"``
@@ -1864,6 +1946,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             compression objective. Larger or opaque operators use a
             conservative operator-space rank bound and are marked as bounded
             in the returned diagnostics.
+        qubit_roles : mapping or sequence, optional
+            Optional logical-site role metadata, for example
+            ``{0: "data", 1: "ancilla"}``, or one role per site. It is
+            carried into the plan and diagnostics. When both ``data`` and
+            ``ancilla`` are present, the quality search automatically adds
+            role-grouped, role-interleaved, and lifetime candidates.
+        role_order : sequence[str] or {"data_first", "ancilla_first"}, optional
+            If ``qubit_roles`` is supplied, add role-grouped and lifetime-aware
+            candidates to the scored search. The connectivity objective still
+            chooses the winner; roles never force one contiguous block.
+        site_usage : plan entry
+            The returned plan includes per-site first/last use, interaction
+            counts, measure/reset boundaries, and reusable lifetime intervals.
 
         Returns
         -------
@@ -1879,6 +1974,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             L=L,
             lattice_shape=lattice_shape,
             lattice_site=lattice_site,
+            qubit_roles=qubit_roles,
+            site_coords=site_coords,
         )
         return finder.run(
             order=order,
@@ -1897,6 +1994,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             weight_mode=weight_mode,
             schmidt_max_dim=schmidt_max_dim,
             max_operator_qubits=max_operator_qubits,
+            role_order=role_order,
         )
 
     @classmethod
@@ -1905,6 +2003,45 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return cls.gate_stream_layout(gate_stream, **kwargs)
 
+    @classmethod
+    def gate_stream_schedule(
+        cls,
+        gate_stream,
+        *,
+        sites=None,
+        L=None,
+        qubit_roles=None,
+        site_coords=None,
+        layout_order="quality",
+        schedule_order="mountain",
+        layout_kwargs=None,
+    ):
+        """Compile a layout plus dependency-safe gate ordering.
+
+        The returned schedule is directly consumable by
+        :meth:`set_gate_schedule`. It contains physical locations and a
+        position-to-logical-site ``site_order``. Ordinary gate entries and
+        direct cap events are accepted; sub-MPO entries require an identity
+        layout because their site tags are not relabeled here. Measurement,
+        reset, and feed-forward events need a stateful control path and must
+        remain outside this compiled schedule.
+        """
+        finder_kwargs, run_kwargs = cls._split_layout_finder_kwargs(
+            layout_kwargs
+        )
+        if qubit_roles is not None:
+            finder_kwargs.setdefault("qubit_roles", qubit_roles)
+        if site_coords is not None:
+            finder_kwargs.setdefault("site_coords", site_coords)
+        finder = cls.LayoutFinder(
+            gate_stream,
+            sites=sites,
+            L=L,
+            **finder_kwargs,
+        )
+        plan = finder.run(order=layout_order, **run_kwargs)
+        return finder.compile_schedule(plan, strategy=schedule_order)
+
     def layout_finder(
         self,
         *,
@@ -1912,6 +2049,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         L=None,
         lattice_shape=None,
         lattice_site=None,
+        qubit_roles=None,
+        site_coords=None,
     ):
         """Return a layout finder for the currently queued gate stream."""
 
@@ -1921,6 +2060,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             L=L,
             lattice_shape=lattice_shape,
             lattice_site=lattice_site,
+            qubit_roles=qubit_roles,
+            site_coords=site_coords,
         )
 
     def current_gate_stream_layout(
@@ -1930,23 +2071,74 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         L=None,
         lattice_shape=None,
         lattice_site=None,
+        qubit_roles=None,
+        site_coords=None,
         **kwargs,
     ):
-        """Find a layout for the optimizer's currently queued gate stream."""
+        """Find a layout for the queued stream, optionally overriding roles."""
 
         return self.layout_finder(
             sites=sites,
             L=L,
             lattice_shape=lattice_shape,
             lattice_site=lattice_site,
+            qubit_roles=qubit_roles,
+            site_coords=site_coords,
         ).run(**kwargs)
+
+    def current_gate_stream_schedule(
+        self,
+        *,
+        sites=None,
+        L=None,
+        lattice_shape=None,
+        lattice_site=None,
+        qubit_roles=None,
+        site_coords=None,
+        layout_order="quality",
+        schedule_order="mountain",
+        layout_kwargs=None,
+    ):
+        """Compile the queued stream for :meth:`set_gate_schedule`.
+
+        Direct cap events are fixed lifetime barriers: their physical
+        positions are removed before later locations are emitted. Measurement,
+        reset, and feed-forward events remain in the stateful :meth:`run` path.
+        """
+        unsupported = set(self.event_types) - {"gate", "submpo", "cap"}
+        if unsupported:
+            raise ValueError(
+                "current_gate_stream_schedule accepts ordinary gate, sub-MPO, "
+                "and direct cap events; measurement/reset/conditional events "
+                f"must remain in the stateful run path ({sorted(unsupported)!r})."
+            )
+        finder_kwargs, run_kwargs = self._split_layout_finder_kwargs(
+            layout_kwargs
+        )
+        finder_options = dict(finder_kwargs)
+        for name, value in (
+            ("lattice_shape", lattice_shape),
+            ("lattice_site", lattice_site),
+            ("qubit_roles", qubit_roles),
+            ("site_coords", site_coords),
+        ):
+            if value is not None:
+                finder_options.setdefault(name, value)
+        finder = self.layout_finder(sites=sites, L=L, **finder_options)
+        plan = finder.run(order=layout_order, **run_kwargs)
+        return finder.compile_schedule(plan, strategy=schedule_order)
 
     @staticmethod
     def _split_layout_finder_kwargs(layout_kwargs):
         """Split finder-construction options from per-run layout options."""
         kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
         finder_kwargs = {}
-        for name in ("lattice_shape", "lattice_site"):
+        for name in (
+            "lattice_shape",
+            "lattice_site",
+            "qubit_roles",
+            "site_coords",
+        ):
             if name in kwargs:
                 finder_kwargs[name] = kwargs.pop(name)
         return finder_kwargs, kwargs
@@ -1992,12 +2184,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "mode; mode='perm' changes the order during replay."
             )
         if any(
-            _control_event_contains_cap(event_type, payload)
+            event_type == "conditional"
+            and _control_event_contains_cap(event_type, payload)
             for payload, event_type in zip(self.G, self.event_types)
         ):
             raise ValueError(
-                "compression layout pilots are not supported with cap control "
-                "events because caps change the MPS length."
+                "compression layout pilots do not support conditional cap "
+                "events; the active branch is needed to update the shrinking "
+                "layout."
             )
         try:
             pilot_candidates = int(pilot_candidates)
@@ -2145,6 +2339,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         inplace=False,
         _capture_initial=True,
         to_backend=None,
+        qubit_roles=None,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -2160,6 +2355,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.inplace = bool(inplace)
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
+        self._qubit_roles = _normalize_site_roles(
+            qubit_roles, range(int(getattr(self.p, "L", 0)))
+        )
         # Dynamic cap streams shorten the live MPS during replay. Keep a
         # small structural ledger separate from norm/compression diagnostics so
         # callers can inspect the effective register length without inferring
@@ -3435,6 +3633,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 contraction_opt=self.contraction_opt, ind_id=self.ind_id,
                 inplace=True,
                 _capture_initial=False, to_backend=self._symbolic_gate_to_backend,
+                qubit_roles=self._qubit_roles,
             )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
@@ -3736,6 +3935,35 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return self._gate_stream
 
     @property
+    def qubit_roles(self):
+        """Return a copy of optional logical-site role metadata."""
+        return dict(self._qubit_roles)
+
+    @property
+    def site_roles(self):
+        """Alias for :attr:`qubit_roles` used by layout-oriented callers."""
+        return self.qubit_roles
+
+    def gate_stream_info(self):
+        """Return stable stream and role metadata for layout tooling."""
+        supports = tuple(
+            _normalize_layout_support(where) for where in self.where
+        )
+        return {
+            "sites": tuple(range(int(self._initial_mps_length))),
+            "event_count": len(self._gate_stream),
+            "event_types": tuple(self.event_types),
+            "qubit_roles": self.qubit_roles,
+            "site_usage": _gate_stream_site_usage(
+                range(int(self._initial_mps_length)),
+                supports,
+                self.event_types,
+                site_roles=self._qubit_roles,
+            ),
+            "has_trajectory_events": self.has_trajectory_events,
+        }
+
+    @property
     def allocated_length(self) -> int:
         """Return the current allocated MPS register length."""
         return int(getattr(self.p, "L", self._mps_length_history[-1]))
@@ -3893,6 +4121,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "contraction_opt": self.contraction_opt,
             "ind_id": self.ind_id,
             "to_backend": self._symbolic_gate_to_backend,
+            "qubit_roles": self._qubit_roles,
         }
 
         def make_optimizer():
@@ -4509,12 +4738,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "persistent layouts cannot be combined with mode='perm'; choose one."
             )
         if any(
-            _control_event_contains_cap(event_type, payload)
+            event_type == "conditional"
+            and _control_event_contains_cap(event_type, payload)
             for payload, event_type in zip(self.G, self.event_types)
         ):
             raise ValueError(
-                "persistent layouts are not supported with cap control events "
-                "because cap changes the MPS length."
+                "persistent layouts do not support conditional cap events; "
+                "the active branch is needed to update the shrinking layout."
             )
 
         plan = self._resolve_layout_plan_argument(plan_or_order, layout_kwargs)
@@ -4698,17 +4928,67 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return mpo
 
     def _layout_run_sequences(self, G_seq, where_seq, event_seq, plan):
-        """Return run-local payloads and mapped locations for ``plan``."""
+        """Return run-local payloads and mapped locations for ``plan``.
+
+        Direct cap events are handled as compile-time lifetime boundaries:
+        after mapping a cap at the current physical position, the removed
+        logical label is dropped and higher labels are compacted. This keeps
+        later gate/control locations aligned with the live shortened MPS. A
+        conditional cap cannot be compiled safely without knowing the branch,
+        so callers reject that form before entering this path.
+        """
         site_map = plan.get("site_map", plan.get("layout"))
+        if not isinstance(site_map, Mapping):
+            raise ValueError("layout plan must contain a site_map/layout mapping.")
+        if self._persistent_layout_plan is not None:
+            runtime_order = list(self.logical_order)
+        else:
+            runtime_order = list(plan.get("site_order", ()))
+        if not runtime_order:
+            raise ValueError("layout plan must contain a non-empty site_order.")
         mapped_G = []
         mapped_where = []
         for payload, where, event_type in zip(G_seq, where_seq, event_seq):
             support = _normalize_layout_support(where)
-            mapped = tuple(site_map[site] for site in support)
+            try:
+                mapped = tuple(runtime_order.index(site) for site in support)
+            except ValueError as exc:
+                raise ValueError(
+                    "layout stream references a logical site that is no longer "
+                    f"live: {support!r}; current order is {runtime_order!r}."
+                ) from exc
             if event_type == "submpo":
-                payload = self._copy_submpo_for_layout(payload, site_map, support)
+                payload = self._copy_submpo_for_layout(
+                    payload,
+                    dict(zip(support, mapped)),
+                    support,
+                )
             mapped_G.append(payload)
             mapped_where.append(mapped)
+            if event_type == "cap":
+                if len(support) != 1:
+                    raise ValueError(
+                        "layout cap events must target exactly one logical site."
+                    )
+                logical_site = int(support[0])
+                physical_site = int(mapped[0])
+                if runtime_order[physical_site] != logical_site:
+                    raise ValueError(
+                        "layout cap lifetime mapping lost its logical site "
+                        f"at physical position {physical_site}."
+                    )
+                runtime_order.pop(physical_site)
+                runtime_order = [
+                    site if site < logical_site else site - 1
+                    for site in runtime_order
+                ]
+            elif event_type == "conditional" and _control_event_contains_cap(
+                event_type, payload
+            ):
+                raise ValueError(
+                    "layout streams do not support conditional cap events; "
+                    "the active branch is needed to update the shrinking layout."
+                )
         return mapped_G, mapped_where
 
     @staticmethod
@@ -4744,6 +5024,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         site_order = plan.get("site_order", plan.get("qubit_inds", ()))
         weight_mode = plan.get("weight_mode", "count")
         objective = plan.get("objective", "locality")
+        score_before = input_stats.get("loss", input_stats.get("score", 0.0))
+        score_after = stats.get("loss", stats.get("score", 0.0))
+        score_label = "score"
+        if objective == "replay":
+            # Replay selection replaces the primary score with a large,
+            # lexicographically scalarized bond objective. Keep this report
+            # line about the comparable static graph proxy instead.
+            score_before = input_stats.get(
+                "loss", input_stats.get("score", 0.0)
+            )
+            score_after = stats.get(
+                "static_loss", stats.get("path_loss", stats.get("loss", 0.0))
+            )
+            score_label = "graph proxy score"
         lines = [
             (
                 "MpsOptimizer layout finder: "
@@ -4774,10 +5068,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 + cls._format_layout_value(stats.get("weighted_mean_event_span", 0.0))
             ),
             (
-                "  score: "
+                f"  {score_label}: "
                 + cls._format_layout_reduction(
-                    input_stats.get("loss", input_stats.get("score", 0.0)),
-                    stats.get("loss", stats.get("score", 0.0)),
+                    score_before,
+                    score_after,
                 )
                 + " | graph span: "
                 + cls._format_layout_reduction(
@@ -4804,6 +5098,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 + " | bounded cut probes: "
                 + cls._format_layout_value(stats.get("rank_bounded_cuts", 0))
             )
+        elif objective == "replay":
+            replay = stats.get("replay", {})
+            if replay.get("status") == "ok":
+                lines.append(
+                    "  replay peak bond/log2: "
+                    + cls._format_layout_value(replay.get("peak_bond", 0))
+                    + "/"
+                    + cls._format_layout_value(replay.get("peak_log2_bond", 0.0))
+                    + " | profiled events: "
+                    + cls._format_layout_value(len(replay.get("profile", ())))
+                )
         return "\n".join(lines)
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -4949,8 +5254,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             qualified ``mode="quimb-<method>"`` selects the method;
             the default ``mode="direct"`` selects ``"direct"``. The opt-in
             ``"sdc"`` and ``"sdc-oversample"`` methods require a Quimb build
-            that provides those compressors; they never replace an existing
-            default. The legacy
+            that provides those compressors; ``"sdcr"`` and
+            ``"sdcr-oversample"`` are the randomized-environment variants.
+            These methods never replace an existing default. The legacy
             ``mode="mpo-<method>"`` / ``mode="mpo"`` spellings remain valid.
             The method
             is forwarded to Quimb for both dense gates and explicit sub-MPO
@@ -5362,13 +5668,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "use either the perm mode or a persistent/transient layout, "
                 "not both."
             )
-        if has_cap and (
-            persistent_layout_active or self._layout_request_enabled(layout_request)
-        ):
+        if has_cap and any(
+            event_type == "conditional"
+            and _control_event_contains_cap(event_type, payload)
+            for payload, event_type in zip(G_seq, event_seq)
+        ) and (persistent_layout_active or self._layout_request_enabled(layout_request)):
             raise ValueError(
-                "layout replay is not supported together with cap control events "
-                "because cap changes the MPS length; run cap streams without a "
-                "layout. measure/reset control events support layouts."
+                "layout replay does not support conditional cap events; the "
+                "active branch is needed to update the shrinking layout."
             )
         # Preserve the logical (pre-layout) event locations so control-event
         # bookkeeping (e.g. recorded measurement sites) always refers to the
@@ -5401,6 +5708,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 report = self._layout_report_text(layout_plan)
                 if report:
                     print(report)
+            replay_event_order = layout_plan.get("replay_event_order")
+            if replay_event_order is not None:
+                try:
+                    replay_event_order = tuple(
+                        int(index) for index in replay_event_order
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "layout replay event order must contain integer indices."
+                    ) from exc
+                expected_event_order = tuple(range(len(G_seq)))
+                if (
+                    len(replay_event_order) != len(G_seq)
+                    or set(replay_event_order) != set(expected_event_order)
+                ):
+                    raise ValueError(
+                        "layout replay event order must be a permutation of the "
+                        "queued stream events."
+                    )
+                G_seq = [G_seq[index] for index in replay_event_order]
+                where_seq = [where_seq[index] for index in replay_event_order]
+                event_seq = [event_seq[index] for index in replay_event_order]
+                logical_where_seq = [
+                    logical_where_seq[index] for index in replay_event_order
+                ]
             layout_order_tuple = tuple(layout_plan["site_order"])
             G_seq, where_seq = self._layout_run_sequences(
                 G_seq,
@@ -5658,6 +5990,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # paths below restore the order in their finally blocks.
         if layout_plan is not None and not persistent_layout_active:
             layout_current_order = self._reorder_mps_to_logical_order(layout_order_tuple)
+            if has_cap:
+                # Control dispatch receives already-mapped physical positions,
+                # while cap bookkeeping still needs the logical label at each
+                # live position in order to compact the shrinking register.
+                self._set_site_order(layout_current_order)
 
         if has_control:
             try:
@@ -5681,9 +6018,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             finally:
                 if layout_current_order is not None:
+                    current_order = (
+                        tuple(self.logical_order)
+                        if has_cap
+                        else tuple(layout_current_order)
+                    )
                     self._reorder_mps_to_logical_order(
                         tuple(range(int(getattr(self.p, "L", 0)))),
-                        current_order=layout_current_order,
+                        current_order=current_order,
+                    )
+                    self._set_site_order(
+                        tuple(range(int(getattr(self.p, "L", 0))))
                     )
                     self._normalize_visible_mps_order()
 
@@ -5704,9 +6049,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         finally:
             if layout_current_order is not None:
+                current_order = (
+                    tuple(self.logical_order)
+                    if has_cap
+                    else tuple(layout_current_order)
+                )
                 self._reorder_mps_to_logical_order(
                     tuple(range(int(getattr(self.p, "L", 0)))),
-                    current_order=layout_current_order,
+                    current_order=current_order,
+                )
+                self._set_site_order(
+                    tuple(range(int(getattr(self.p, "L", 0))))
                 )
                 self._normalize_visible_mps_order()
 

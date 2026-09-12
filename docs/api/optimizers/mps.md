@@ -96,7 +96,14 @@ Torch and Quimb split registrations.
 `[(gate, where), ...]`. It also accepts stabilizer-style symbolic entries
 `("H", site)`, `("CNOT", control, target)`, and
 `("rzz", angle, site_a, site_b)`, along with the matching one- and two-qubit
-rotation forms. Symbolic names are resolved through Pepsy's standard gate
+rotation forms. Angles can also be embedded in the name for compact streams:
+`("rx-0.41", site)` and `("rzz-0.23", site_a, site_b)` (the suffix must be
+numeric, including a leading minus sign when needed). For a bundled entry, the
+symbolic descriptor can also be kept separate from its targets:
+`(("rx", angle), site)` and `(("rzz", angle), (site_a, site_b))`. A bare
+`("rx", angle)` or
+`("rzz", angle)` is intentionally rejected because it does not specify the
+target qubit(s). Symbolic names are resolved through Pepsy's standard gate
 constructors before replay, so uppercase names are accepted. Pass
 `to_backend=...` to convert those internally generated matrices before the
 strict stream/backend check; if omitted, the converter is inferred from the
@@ -116,6 +123,62 @@ opt = pepsy.MpsOptimizer(
 )
 ```
 
+Optional logical-qubit roles can travel with the stream without changing gate
+semantics. Supply a site-to-role mapping (or one role per site), then request a
+role-grouped candidate when useful:
+
+```python
+roles = {0: "data", 1: "data", 2: "ancilla", 3: "ancilla"}
+opt = pepsy.MpsOptimizer(state, [("rzz-0.23", 0, 2)], chi=16,
+                         qubit_roles=roles)
+plan = opt.current_gate_stream_layout(
+    objective="replay", role_order=("data", "ancilla"), replay_candidates=4,
+)
+opt.gate_stream_info()["qubit_roles"]
+```
+
+For code-agnostic QEC streams, coordinates can be supplied independently of
+the code representation. They become layout candidates, not just plotting
+metadata:
+
+```python
+coords = {
+    0: (0, 0), 1: (1, 0),       # data
+    2: (0, 1), 3: (1, 1),       # ancillas
+}
+plan = opt.current_gate_stream_layout(
+    site_coords=coords,
+    objective="smart",
+    replay_candidates=4,
+    replay_steps=128,
+)
+```
+
+The finder also accepts raw measurement/reset events in the class-level
+layout API. When coordinates are absent, it constructs deterministic
+pseudo-coordinates from the interaction graph and records them as inferred
+geometry; these are search aids, not claims about CSS-code coordinates. The
+quality search automatically adds coordinate, lifetime, role-interleaved, and
+graph-embedding candidates when the relevant information is available.
+`objective="smart"` is the state-aware alias for the bounded replay pilot: it
+applies each candidate to a private copy of the initial MPS, replays the
+stream, and selects by the observed transient bond profile. The source
+optimizer and its initial state remain unchanged.
+
+When both `data` and `ancilla` roles are present, the quality search adds
+role-grouped, role-interleaved, and lifetime candidates automatically.
+`role_order` overrides the default data-first preference; use
+`order="role-grouped"` when the explicit role-grouped candidate should be
+selected. Connectivity and the selected objective still decide the winner
+unless that explicit order is requested. The
+`lifetime` candidate uses event timing, measure/reset boundaries, interaction
+degree, and role labels as soft hints, while `role_interleaved` keeps inferred
+ancillas near their strongest data neighborhoods. The plan and compiled
+schedule retain `qubit_roles`, `site_coords`, and role evidence, and the plan
+exposes `site_usage` with per-site use windows and reusable lifetime intervals.
+Direct cap events are supported as explicit lifetime barriers; conditional caps
+remain a state-dependent branching choice.
+
 Numeric matrix gates and sub-MPO payloads retain the explicit-preparation
 contract described below. Bare Quimb compression names such as `mode="src"`,
 `mode="zipup"`, and `mode="direct"` are accepted; they normalize internally
@@ -124,9 +187,10 @@ to `quimb-<method>`. The qualified `mode="quimb-<method>"` forms, direct alias
 remain supported. The bare name `fit` remains the DMRG alias, so Quimb's
 `fit` compression method is selected as `mode="quimb-fit"`. Quimb's newer
 successive deterministic compressors are available explicitly as
-`mode="quimb-sdc"` and `mode="quimb-sdc-oversample"` when the installed Quimb
-build provides them. These modes are opt-in and do not change existing
-defaults.
+`mode="quimb-sdc"`, `mode="quimb-sdc-oversample"`, `mode="quimb-sdcr"`, and
+`mode="quimb-sdcr-oversample"` when the installed Quimb build provides them.
+The `sdcr` pair uses randomized SVDs for its successive environments. These
+modes are opt-in and do not change existing defaults.
 
 ## Lazy permutation swap-and-split
 
@@ -342,9 +406,12 @@ Bare Quimb method names and their `quimb-<method>` qualified forms are passed
 to Quimb's native 1D compression dispatcher. The legacy `mpo-<method>` names
 remain accepted as aliases. The bare `fit` name is reserved for DMRG; use
 `quimb-fit` when selecting Quimb's one-site FIT compressor.
-This includes bare `mode="sdc"` and `mode="sdc-oversample"`, which normalize to
-the corresponding `quimb-*` modes. They are version-gated through Quimb's
-compressor registry and never silently fall back to another method.
+This includes bare `mode="sdc"`, `mode="sdc-oversample"`, `mode="sdcr"`, and
+`mode="sdcr-oversample"`, which normalize to the corresponding `quimb-*`
+modes. They are version-gated through Quimb's compressor registry and never
+silently fall back to another method. Base `sdcr` is rank-controlled by
+`max_bond` and uses a relative cutoff for its randomized environment stage;
+cumulative cutoff modes are not valid for that stage.
 Oversampled methods retain Quimb's two-stage structure: an intermediate larger
 bond followed by a direct sweep to `chi`. `fit-projector` disables only the
 optional simple-update pre-gauge, which is singular on exact product-state
@@ -362,7 +429,9 @@ sector-preserving randomized SVD (`svd:rand`) instead, so the guess remains
 native and never enters dense SRC. The equivalent
 `fit_init_strategy="guess_src"` spelling is accepted as a compatibility alias
 and is normalized internally to `guess_src`. Set `compression_seed` for reproducible randomized
-MPO replay; `fit_init_seed` controls randomized disposable FIT guesses.
+MPO replay; `fit_init_seed` controls randomized disposable FIT guesses. The
+Quimb method spelling is `srcmps` (without a hyphen); `src-mps` is not a
+separate compressor or alias.
 
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
@@ -416,10 +485,12 @@ Quimb-specific guess methods retain their native direct fallback. The available 
 `direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
 `src-first`, `src-oversample`, `srcmps`,
 `srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`, `sdc`, and `sdc-oversample`. The latter two
-require a Quimb build containing the corresponding successive deterministic
-compressor. They are also valid FIT warm-start policies as
-`fit_init_strategy="guess-sdc"` and `fit_init_strategy="guess-sdc-oversample"`.
+`fit-projector`, `fit-oversample`, `sdc`, `sdc-oversample`, `sdcr`, and
+`sdcr-oversample`. The successive modes require a Quimb build containing the
+corresponding compressor. They are also valid FIT warm-start policies as
+`fit_init_strategy="guess-sdc"`, `fit_init_strategy="guess-sdc-oversample"`,
+`fit_init_strategy="guess-sdcr"`, and
+`fit_init_strategy="guess-sdcr-oversample"`.
 For ordinary DMRG, `auto` selects `guess-src` in both phases;
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).
@@ -963,9 +1034,70 @@ dimension and elapsed time, and returns per-candidate records under
 layout are unchanged. Perform this before installing a persistent layout;
 reordering an already-entangled MPS remains explicitly guarded because the
 reorder itself can be lossy or expensive. Compression pilots reject
-`mode="perm"`, cap events, and caller-supplied `layout`/
+`mode="perm"`, conditional-cap events, and caller-supplied `layout`/
 `use_layout_finder` options because the pilot must control one fixed layout
 per trial.
+
+For the paper-style transient ``chi`` objective, use an optimizer-backed
+finder explicitly:
+
+```python
+finder = opt.layout_finder()
+plan = finder.run(
+    objective="replay",
+    replay_candidates=4,
+    replay_steps=64,
+    replay_kwargs={"cutoff": 1e-12, "n_iter": 8},
+)
+profile = plan["stats"]["replay"]["profile"]
+print(plan["stats"]["replay"]["peak_bond"])
+```
+
+This objective uses the static compression score only to bound the candidate
+set, schedules each ordinary gate segment, then replays each candidate on a
+private copy and records
+`max_bond()`/`bond_sizes()` after every event. The reported peak is therefore
+an actual replay measurement, not a claim about the static operator-cut
+proxy. It is opt-in and non-mutating. The default
+`replay_schedule="mountain"` preserves input order for events sharing a
+logical site and reorders only disjoint gate/sub-MPO events. Measurement,
+reset, and feed-forward events remain fixed barriers by default. The opt-in
+`replay_schedule="measure-early"` policy moves a measurement or reset left
+across only immediately preceding ordinary events on disjoint supports;
+shared-site gates, feed-forward events, and caps remain barriers. This is a
+generic safe subset of measure-early scheduling and does not require a
+circuit-specific commutation oracle. Direct caps remain fixed barriers and
+are replayed with their shortened-chain position map; conditional caps and
+trajectory streams are still unsupported. An already-entangled initial state needs the explicit
+`replay_allow_lossy_reorder=True` opt-in if its physical order must be
+changed. The `objective="smart"` alias makes that private-copy reorder
+explicitly as part of the smart initial-state pilot. The returned plan includes
+`replay_event_order` and
+`scheduled_stream`, and passing that plan to `run(layout=plan)` executes the
+selected event order.
+
+The finder can also compile a dependency-safe gate schedule for the existing
+`set_gate_schedule` hook:
+
+```python
+schedule = opt.current_gate_stream_schedule(
+    layout_order="quality",
+    schedule_order="mountain",
+)
+trial = pepsy.MpsOptimizer(state.copy(), chi=64, mode="dmrg2")
+trial.set_gate_schedule(schedule).run()
+```
+
+`"mountain"` preserves input order for events sharing a logical site and
+only reorders disjoint ordinary gates. Direct caps are emitted as fixed
+lifetime barriers; the compiler shifts later physical positions after each
+removal and records `metadata["final_site_order"]`. Measurement, reset, and
+feed-forward events remain in the stateful run path. Use
+`MpsOptimizer.gate_stream_schedule(...)` for a standalone stream. The
+compiled stream is physical-order data by design; use `schedule.site_order`
+and `schedule.metadata["final_site_order"]` with
+`to_dense(logical_order=False)` or `remap_sample` when reading a non-identity
+scheduled layout.
 
 The layout can be inspected graphically without changing the optimizer. The
 finder returns a Matplotlib `(fig, ax)` pair. The original lattice and gate

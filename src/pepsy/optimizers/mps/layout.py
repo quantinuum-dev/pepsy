@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from itertools import combinations
 import math
 from numbers import Integral
 import os
+import time
 
 import autoray as ar
 import numpy as np
@@ -23,11 +25,28 @@ from .._layout_visualization import (
 )
 from ...tensors.maps import OneDMap
 
-__all__ = ["MpsGateStreamLayoutFinder"]
+__all__ = ["MpsGateStreamLayoutFinder", "MpsGateStreamSchedule"]
 
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NUMBA_GATE_STREAM_REFINE = None
+
+
+@dataclass(frozen=True)
+class MpsGateStreamSchedule:
+    """Compiled fixed-layout schedule accepted by ``set_gate_schedule``.
+
+    ``stream`` contains physical MPS positions, while ``site_order`` maps
+    those positions back to logical site labels.  This small duck-typed
+    object deliberately lives beside the finder so callers can compile a
+    schedule without making :class:`MpsOptimizer` depend on a scheduler
+    implementation.
+    """
+
+    stream: tuple
+    site_order: tuple
+    layout_plan: Mapping | None = None
+    metadata: Mapping | None = None
 
 
 def _normalize_event_name(name):
@@ -84,6 +103,95 @@ def _is_submpo_event(entry):
     return _submpo_event_parts(entry) is not None
 
 
+def _layout_cap_event_parts(entry):
+    """Return ``(payload, where)`` for a direct cap layout event.
+
+    The optimizer-backed finder already receives normalized control metadata,
+    but the class-level layout/schedule helpers also accept raw streams. Keep
+    this small parser local so layout analysis can understand a direct cap
+    without importing the optimizer module (which would create a cycle).
+    """
+    if isinstance(entry, (tuple, list)) and entry:
+        if isinstance(entry[0], str) and _normalize_event_name(entry[0]) == "cap":
+            if len(entry) < 3:
+                raise ValueError("cap event must be ('cap', where, vec[, absorb]).")
+            where = _normalize_layout_support(entry[1])
+            if len(where) != 1:
+                raise ValueError("cap event where must reference exactly one site.")
+            absorb = str(entry[3]).strip().lower() if len(entry) > 3 else "left"
+            if absorb not in {"left", "right"}:
+                raise ValueError("cap absorb direction must be 'left' or 'right'.")
+            return {
+                "vec": np.asarray(ar.to_numpy(entry[2]), dtype=complex).ravel(),
+                "absorb": absorb,
+            }, where
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind", entry.get("type", entry.get("event")))
+        if kind is not None and _normalize_event_name(kind) == "cap":
+            where = entry.get("where", entry.get("site", _MISSING))
+            vector = entry.get("vec", entry.get("vector", _MISSING))
+            if where is _MISSING or vector is _MISSING:
+                raise ValueError("cap event mapping needs 'where' and 'vec'.")
+            where = _normalize_layout_support(where)
+            if len(where) != 1:
+                raise ValueError("cap event where must reference exactly one site.")
+            absorb = str(entry.get("absorb", "left")).strip().lower()
+            if absorb not in {"left", "right"}:
+                raise ValueError("cap absorb direction must be 'left' or 'right'.")
+            return {
+                "vec": np.asarray(ar.to_numpy(vector), dtype=complex).ravel(),
+                "absorb": absorb,
+            }, where
+    return None
+
+
+def _layout_control_event_parts(entry):
+    """Return ``(name, payload, where)`` for raw measure/reset events.
+
+    ``MpsOptimizer`` owns the full control grammar.  The layout-only facade
+    needs a small backend-neutral subset so a caller can give it the same raw
+    stream without first constructing an optimizer.  Payloads stay opaque:
+    controls contribute lifetime boundaries, not interaction edges.
+    """
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind", entry.get("type", entry.get("event")))
+        if kind is None:
+            return None
+        name = _normalize_event_name(kind)
+        if name not in {"measure", "reset", "measure_reset"}:
+            return None
+        where = entry.get("where", entry.get("sites", entry.get("site", _MISSING)))
+        if where is _MISSING:
+            raise ValueError(f"{name} event mapping needs 'where'.")
+        return name, dict(entry), _normalize_layout_support(where)
+
+    if not isinstance(entry, (tuple, list)) or not entry:
+        return None
+    head = entry[0]
+    if not isinstance(head, str):
+        return None
+    name = _normalize_event_name(head)
+    if name == "measure":
+        if len(entry) < 3:
+            raise ValueError("measure event needs a basis and a site.")
+        return name, {"axes": entry[1]}, _normalize_layout_support(entry[2])
+    if name == "measure_reset":
+        if len(entry) < 3:
+            raise ValueError("measure_reset event needs a basis and a site.")
+        return name, {"axes": entry[1]}, _normalize_layout_support(entry[2])
+    if name == "reset":
+        if len(entry) == 2:
+            where = entry[1]
+            payload = {"axes": "Z"}
+        elif len(entry) >= 3 and isinstance(entry[1], str):
+            payload = {"axes": entry[1]}
+            where = entry[2]
+        else:
+            raise ValueError("reset event needs a site, or basis and a site.")
+        return name, payload, _normalize_layout_support(where)
+    return None
+
+
 def _normalize_gate_where(where):
     """Return canonical one-/two-site gate locations for layout analysis."""
     if isinstance(where, Integral):
@@ -100,8 +208,21 @@ def _normalize_layout_gate_queue(gates):
         mpo, where = submpo_parts
         return [mpo], [_normalize_submpo_where(where)], ["submpo"]
 
+    cap_parts = _layout_cap_event_parts(gates)
+    if cap_parts is not None:
+        payload, where = cap_parts
+        return [payload], [where], ["cap"]
+
+    control_parts = _layout_control_event_parts(gates)
+    if control_parts is not None:
+        name, payload, where = control_parts
+        return [payload], [where], [name]
+
     if isinstance(gates, (tuple, list)) and any(
-        _is_submpo_event(entry) for entry in gates
+        _is_submpo_event(entry)
+        or _layout_cap_event_parts(entry) is not None
+        or _layout_control_event_parts(entry) is not None
+        for entry in gates
     ):
         payloads = []
         wheres = []
@@ -113,6 +234,20 @@ def _normalize_layout_gate_queue(gates):
                 payloads.append(mpo)
                 wheres.append(_normalize_submpo_where(where))
                 event_types.append("submpo")
+                continue
+            cap_parts = _layout_cap_event_parts(entry)
+            if cap_parts is not None:
+                payload, where = cap_parts
+                payloads.append(payload)
+                wheres.append(where)
+                event_types.append("cap")
+                continue
+            control_parts = _layout_control_event_parts(entry)
+            if control_parts is not None:
+                name, payload, where = control_parts
+                payloads.append(payload)
+                wheres.append(where)
+                event_types.append(name)
                 continue
             gate_entries = _normalize_gate_entries(
                 (entry,),
@@ -243,6 +378,325 @@ def _normalize_layout_sites(supports, *, sites=None, L=None):
             f"{unknown!r}."
         )
     return site_list
+
+
+def _normalize_site_role(role):
+    """Normalize one optional logical-qubit role label."""
+    if not isinstance(role, str):
+        raise TypeError("qubit roles must be strings such as 'data' or 'ancilla'.")
+    role = role.strip().lower().replace("-", "_")
+    role = {
+        "anc": "ancilla",
+        "aux": "ancilla",
+        "auxiliary": "ancilla",
+        "data_qubit": "data",
+    }.get(role, role)
+    if not role:
+        raise ValueError("qubit role labels must be non-empty strings.")
+    return role
+
+
+def _normalize_site_roles(roles, sites):
+    """Normalize optional site-to-role metadata against a complete site set."""
+    if roles is None:
+        return {}
+    sites = tuple(sites)
+    known = set(sites)
+    if isinstance(roles, Mapping):
+        normalized = {}
+        for raw_site, role in roles.items():
+            site = _freeze_site_label(raw_site)
+            if site not in known:
+                raise ValueError(
+                    "qubit_roles contains site(s) not present in the layout: "
+                    f"{site!r}."
+                )
+            if site in normalized:
+                raise ValueError(f"qubit_roles repeats site {site!r}.")
+            normalized[site] = _normalize_site_role(role)
+        return normalized
+    if isinstance(roles, (str, bytes)):
+        raise TypeError(
+            "qubit_roles must be a site-to-role mapping or a role sequence."
+        )
+    try:
+        role_values = tuple(roles)
+    except TypeError as exc:
+        raise TypeError(
+            "qubit_roles must be a site-to-role mapping or a role sequence."
+        ) from exc
+    if len(role_values) != len(sites):
+        raise ValueError(
+            "a qubit_roles sequence must contain one role per layout site."
+        )
+    return {
+        site: _normalize_site_role(role)
+        for site, role in zip(sites, role_values)
+    }
+
+
+def _normalize_role_order(role_order, site_roles):
+    """Normalize an optional role grouping preference."""
+    if role_order is None:
+        return None
+    if isinstance(role_order, str):
+        aliases = {
+            "data_first": ("data", "ancilla"),
+            "ancilla_first": ("ancilla", "data"),
+        }
+        role_order = aliases.get(role_order.strip().lower(), (role_order,))
+    elif isinstance(role_order, (bytes,)):
+        raise TypeError("role_order must be a role name or a sequence of names.")
+    try:
+        role_order = tuple(_normalize_site_role(role) for role in role_order)
+    except TypeError as exc:
+        raise TypeError("role_order must be a role name or a sequence of names.") from exc
+    if not role_order:
+        raise ValueError("role_order must contain at least one role name.")
+    if len(set(role_order)) != len(role_order):
+        raise ValueError("role_order must not repeat role names.")
+    known_roles = set(site_roles.values())
+    unknown = [role for role in role_order if role not in known_roles]
+    if unknown:
+        raise ValueError(
+            "role_order contains role(s) not present in qubit_roles: "
+            f"{unknown!r}."
+        )
+    return role_order
+
+
+def _role_grouped_order(sites, site_roles, role_order):
+    """Group tagged sites by role while preserving input order within groups."""
+    selected = []
+    selected_set = set()
+    for role in role_order:
+        for site in sites:
+            if site_roles.get(site) == role:
+                selected.append(site)
+                selected_set.add(site)
+    selected.extend(site for site in sites if site not in selected_set)
+    return selected
+
+
+def _default_role_order(site_roles):
+    """Return the useful generic role order when data/ancilla are known."""
+    known = set(site_roles.values())
+    if {"data", "ancilla"}.issubset(known):
+        return ("data", "ancilla")
+    return None
+
+
+def _infer_site_roles(sites, supports, event_types):
+    """Infer conservative data/ancilla hints from stream control lifetimes.
+
+    This is deliberately not a CSS-code classifier.  A site is called
+    ancilla-like only when a measurement/reset boundary is followed by a
+    later lifetime or when it is reset and participates in a multi-site
+    interaction.  A final data readout therefore does not automatically turn
+    a data site into an ancilla.  The result is a soft candidate hint and is
+    always exposed with its evidence for inspection.
+    """
+    usage = _gate_stream_site_usage(sites, supports, event_types)
+    roles = {}
+    evidence = {}
+    for site in sites:
+        record = usage[site]
+        boundaries = (
+            len(record["measurement_indices"])
+            + len(record["reset_indices"])
+            + len(record["cap_indices"])
+        )
+        reused = int(record["lifetime_count"]) > 1
+        reset = bool(record["reset_indices"])
+        repeated_interaction = int(record["multi_site_events"]) >= 2
+        ancilla_score = float(
+            3.0 * bool(reset)
+            + 2.0 * reused
+            + 0.5 * max(0, boundaries - int(reused))
+            + 0.25 * repeated_interaction
+        )
+        data_score = float(
+            1.0 * int(record["multi_site_events"])
+            + 0.1 * int(record["event_count"])
+        )
+        if reset or reused:
+            roles[site] = "ancilla"
+        elif record["event_count"] and boundaries == 0:
+            roles[site] = "data"
+        evidence[site] = {
+            "role": roles.get(site),
+            "ancilla_score": ancilla_score,
+            "data_score": data_score,
+            "boundary_count": int(boundaries),
+            "reused_lifetime": bool(reused),
+            "reset_count": len(record["reset_indices"]),
+            "multi_site_events": int(record["multi_site_events"]),
+        }
+
+    # A partial inference is still useful as diagnostics, but only expose a
+    # role-grouping candidate when the stream gives us both sides of a useful
+    # partition.  This avoids inventing an all-data/all-ancilla split for an
+    # ordinary unitary circuit.
+    if not ({"data", "ancilla"}.issubset(set(roles.values()))):
+        roles = {}
+    return roles, evidence
+
+
+def _normalize_site_coords(site_coords, sites):
+    """Normalize optional logical-site coordinates for layout search."""
+    if site_coords is None:
+        return None
+    return resolve_site_coords(sites, site_coords)
+
+
+def _coordinate_layout_order(sites, site_coords, *, axis="row", snake=False):
+    """Return a deterministic 1D order from arbitrary 2D site coordinates."""
+    sites = tuple(sites)
+    if not site_coords:
+        return list(sites)
+    rank = {site: index for index, site in enumerate(sites)}
+    primary = 1 if axis == "row" else 0
+    secondary = 0 if axis == "row" else 1
+    groups = {}
+    for site in sites:
+        key = site_coords[site][primary]
+        groups.setdefault(key, []).append(site)
+    ordered_groups = sorted(groups.items(), key=lambda item: item[0])
+    result = []
+    for group_index, (_key, group) in enumerate(ordered_groups):
+        group = sorted(
+            group,
+            key=lambda site: (site_coords[site][secondary], rank[site]),
+        )
+        if snake and group_index % 2:
+            group.reverse()
+        result.extend(group)
+    return result
+
+
+def _gate_stream_graph_coords(sites, pair_weights, *, dense_max=512):
+    """Infer pseudo-2D coordinates from the interaction graph.
+
+    These coordinates are a visualization/search aid, not claims about the
+    physical code geometry.  Spectral coordinates are useful for arbitrary
+    gate streams because they preserve strongly interacting neighborhoods
+    without requiring a CSS or lattice representation.
+    """
+    sites = tuple(sites)
+    n = len(sites)
+    if n == 0 or n > int(dense_max) or not pair_weights:
+        return None
+    if n == 1:
+        return {sites[0]: (0.0, 0.0)}
+
+    rank = {site: index for index, site in enumerate(sites)}
+    adjacency = _gate_stream_adjacency(sites, pair_weights)
+    unused = set(sites)
+    components = []
+    while unused:
+        start = min(unused, key=rank.__getitem__)
+        stack = [start]
+        unused.remove(start)
+        component = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if neighbor in unused:
+                    unused.remove(neighbor)
+                    stack.append(neighbor)
+        components.append(sorted(component, key=rank.__getitem__))
+
+    coords = {}
+    x_offset = 0.0
+    for component in components:
+        m = len(component)
+        if m == 1:
+            coords[component[0]] = (x_offset, 0.0)
+            x_offset += 2.0
+            continue
+        local = {site: index for index, site in enumerate(component)}
+        weights = np.zeros((m, m), dtype=float)
+        for left in component:
+            for right, weight in adjacency[left].items():
+                if right in local:
+                    weights[local[left], local[right]] += float(weight)
+        weights = np.maximum(weights, weights.T)
+        degrees = weights.sum(axis=1)
+        laplacian = np.diag(degrees) - weights
+        try:
+            _values, vectors = np.linalg.eigh(laplacian)
+        except np.linalg.LinAlgError:
+            vectors = None
+        if vectors is None or m < 3:
+            x_values = np.arange(m, dtype=float)
+            y_values = np.zeros(m, dtype=float)
+        else:
+            x_values = np.asarray(vectors[:, 1], dtype=float)
+            y_values = (
+                np.asarray(vectors[:, 2], dtype=float)
+                if m > 2 else np.zeros(m, dtype=float)
+            )
+            centered_rank = np.arange(m, dtype=float) - (m - 1) / 2.0
+            for values in (x_values, y_values):
+                if np.dot(values, centered_rank) < 0.0:
+                    values *= -1.0
+        x_values = x_values - float(np.min(x_values))
+        if np.ptp(x_values) > 0.0:
+            x_values = x_values / float(np.ptp(x_values))
+        y_values = y_values - float(np.min(y_values))
+        if np.ptp(y_values) > 0.0:
+            y_values = y_values / float(np.ptp(y_values))
+        for index, site in enumerate(component):
+            coords[site] = (x_offset + float(x_values[index]), float(y_values[index]))
+        x_offset += 2.0
+    return coords
+
+
+def _gate_stream_role_interleaved_order(sites, pair_weights, site_roles):
+    """Seed an order that keeps inferred ancillas near their data neighbors."""
+    sites = tuple(sites)
+    if not site_roles:
+        return list(sites)
+    adjacency = _gate_stream_adjacency(sites, pair_weights)
+    rank = {site: index for index, site in enumerate(sites)}
+    anchors = [site for site in sites if site_roles.get(site) == "data"]
+    anchors.sort(
+        key=lambda site: (
+            -sum(adjacency[site].values()),
+            rank[site],
+        )
+    )
+    unused = set(sites)
+    result = []
+    for anchor in anchors:
+        if anchor not in unused:
+            continue
+        result.append(anchor)
+        unused.remove(anchor)
+        neighbors = sorted(
+            (site for site in adjacency[anchor] if site in unused),
+            key=lambda site: (
+                site_roles.get(site) != "ancilla",
+                -adjacency[anchor][site],
+                rank[site],
+            ),
+        )
+        for neighbor in neighbors:
+            if site_roles.get(neighbor) == "ancilla":
+                result.append(neighbor)
+                unused.remove(neighbor)
+    while unused:
+        site = max(
+            unused,
+            key=lambda candidate: (
+                sum(adjacency[candidate].get(done, 0.0) for done in result),
+                -rank[candidate],
+            ),
+        )
+        result.append(site)
+        unused.remove(site)
+    return result
 
 
 def _normalize_lattice_shape(shape):
@@ -498,12 +952,17 @@ def _gate_stream_layout_objective(objective):
         "compress": "compression",
         "bond": "compression",
         "bond_load": "compression",
+        "pilot": "replay",
+        "state_aware": "replay",
+        "stateful": "replay",
+        "transient": "replay",
+        "chi": "replay",
     }
     name = aliases.get(name, name)
-    if name not in {"locality", "compression"}:
+    if name not in {"locality", "compression", "replay", "smart"}:
         raise ValueError(
             f"Unknown MPS layout objective {objective!r}. Expected "
-            "'locality' or 'compression'."
+            "'locality', 'compression', 'replay', or 'smart'."
         )
     return name
 
@@ -657,6 +1116,199 @@ def _gate_stream_pair_weights(supports, sites, event_weights=None):
                 left, right = right, left
             weights[(left, right)] = weights.get((left, right), 0.0) + event_weight
     return weights
+
+
+_LIFETIME_BOUNDARY_EVENT_TYPES = frozenset({
+    "measure",
+    "reset",
+    "measure_reset",
+    "cap",
+})
+
+
+def _gate_stream_site_usage(sites, supports, event_types, site_roles=None):
+    """Summarize temporal use and reusable lifetimes for each logical site.
+
+    A measurement, reset, or cap closes the current use interval for the
+    touched site.  The summary is metadata only: it never changes stream
+    semantics or permits a layout to move an event across a control barrier.
+    Keeping this helper independent of optimizer state lets static finders
+    and optimizer-backed replay finders expose the same information.
+    """
+    sites = tuple(sites)
+    supports = tuple(tuple(support) for support in supports)
+    event_types = tuple(event_types)
+    if len(supports) != len(event_types):
+        raise ValueError(
+            "gate-stream site-usage analysis requires one event type per support."
+        )
+    site_roles = {} if site_roles is None else dict(site_roles)
+    usage = {}
+    for site in sites:
+        usage[site] = {
+            "role": site_roles.get(site),
+            "event_indices": [],
+            "first_event": None,
+            "last_event": None,
+            "event_count": 0,
+            "multi_site_events": 0,
+            "control_indices": [],
+            "measurement_indices": [],
+            "reset_indices": [],
+            "cap_indices": [],
+            "lifetimes": [],
+        }
+
+    open_starts = {site: None for site in sites}
+    open_ends = {site: None for site in sites}
+    known_sites = set(sites)
+    for event_index, (support, event_type) in enumerate(zip(supports, event_types)):
+        normalized_type = _normalize_event_name(event_type)
+        unique_support = _unique_ordered(support)
+        boundary = normalized_type in _LIFETIME_BOUNDARY_EVENT_TYPES
+        for site in unique_support:
+            if site not in known_sites:
+                continue
+            record = usage[site]
+            record["event_indices"].append(int(event_index))
+            if record["first_event"] is None:
+                record["first_event"] = int(event_index)
+            record["last_event"] = int(event_index)
+            record["event_count"] += 1
+            if len(unique_support) > 1:
+                record["multi_site_events"] += 1
+            if boundary:
+                record["control_indices"].append(int(event_index))
+                if normalized_type == "measure":
+                    record["measurement_indices"].append(int(event_index))
+                elif normalized_type in {"reset", "measure_reset"}:
+                    record["reset_indices"].append(int(event_index))
+                elif normalized_type == "cap":
+                    record["cap_indices"].append(int(event_index))
+            if open_starts[site] is None:
+                open_starts[site] = int(event_index)
+            open_ends[site] = int(event_index)
+            if boundary:
+                record["lifetimes"].append(
+                    (open_starts[site], open_ends[site])
+                )
+                open_starts[site] = None
+                open_ends[site] = None
+
+    for site in sites:
+        if open_starts[site] is not None:
+            usage[site]["lifetimes"].append(
+                (open_starts[site], open_ends[site])
+            )
+        record = usage[site]
+        # Tuples make diagnostics stable and easier to serialize in plans.
+        for key in (
+            "event_indices",
+            "control_indices",
+            "measurement_indices",
+            "reset_indices",
+            "cap_indices",
+            "lifetimes",
+        ):
+            record[key] = tuple(record[key])
+        record["lifetime_count"] = len(record["lifetimes"])
+        record["active_span"] = (
+            0
+            if record["first_event"] is None
+            else int(record["last_event"] - record["first_event"])
+        )
+    return usage
+
+
+def _gate_stream_lifetime_order(
+    sites,
+    pair_weights,
+    supports,
+    event_types,
+    *,
+    site_roles=None,
+    role_order=None,
+):
+    """Seed a generic interaction layout from use windows and role metadata.
+
+    The seed is deliberately soft.  First-use order, reusable lifetime count,
+    interaction degree, and optional role preference only break construction
+    ties; the ordinary layout objective subsequently scores and refines it.
+    This gives QEC streams a useful temporal candidate while avoiding a hard
+    data/ancilla block that can be poor for irregular or rotated circuits.
+    """
+    sites = tuple(sites)
+    if len(sites) < 2:
+        return list(sites)
+    usage = _gate_stream_site_usage(
+        sites,
+        supports,
+        event_types,
+        site_roles=site_roles,
+    )
+    rank = {site: pos for pos, site in enumerate(sites)}
+    degree = {site: 0.0 for site in sites}
+    adjacency = _gate_stream_adjacency(sites, pair_weights)
+    for site in sites:
+        degree[site] = float(sum(adjacency[site].values()))
+
+    role_rank = {role: pos for pos, role in enumerate(role_order or ())}
+    no_event = len(supports)
+
+    def temporal_key(site):
+        record = usage[site]
+        first = no_event if record["first_event"] is None else record["first_event"]
+        role = role_rank.get(record.get("role"), len(role_rank))
+        return (
+            int(first),
+            int(role),
+            -int(record["lifetime_count"]),
+            -float(degree[site]),
+            int(record["active_span"]),
+            rank[site],
+        )
+
+    # The temporal seed is already useful for streams with sparse or opaque
+    # operators.  A weighted BFS variant keeps connected interaction islands
+    # together, while using the same temporal keys for deterministic ties.
+    temporal = sorted(sites, key=temporal_key)
+    if not pair_weights:
+        return temporal
+
+    unused = set(sites)
+    walked = []
+    while unused:
+        start = min(unused, key=temporal_key)
+        queue = [start]
+        unused.remove(start)
+        while queue:
+            current = queue.pop(0)
+            walked.append(current)
+            neighbors = [
+                neighbor
+                for neighbor in adjacency[current]
+                if neighbor in unused
+            ]
+            neighbors.sort(
+                key=lambda neighbor: (
+                    -float(adjacency[current][neighbor]),
+                    *temporal_key(neighbor),
+                )
+            )
+            for neighbor in neighbors:
+                unused.remove(neighbor)
+                queue.append(neighbor)
+
+    # Compare temporal and interaction-walk seeds using the same static proxy
+    # as the finder.  Refinement is performed by the caller so candidate
+    # diagnostics retain both the raw seed and its polished form.
+    temporal_loss = _gate_stream_layout_stats(
+        temporal, pair_weights, num_events=0
+    )["loss"]
+    walked_loss = _gate_stream_layout_stats(
+        walked, pair_weights, num_events=0
+    )["loss"]
+    return temporal if temporal_loss <= walked_loss else walked
 
 
 def _gate_stream_support_span_stats(order, supports, event_weights):
@@ -1563,6 +2215,17 @@ def _normalize_gate_stream_layout_order(order):
         "bfs_refined": "bfs_refined",
         "degree_refined": "degree_refined",
         "input_refined": "input_refined",
+        "roles": "role_grouped",
+        "role": "role_grouped",
+        "role_group": "role_grouped",
+        "role_grouped": "role_grouped",
+        "coords": "coordinate_row",
+        "coordinate": "coordinate_row",
+        "coordinate_row_major": "coordinate_row",
+        "coordinate_col_major": "coordinate_col",
+        "coordinate_snake_row": "coordinate_snake",
+        "graph_coords": "graph_embedding",
+        "embedding": "graph_embedding",
         "row": "row_major",
         "row_major": "row_major",
         "column": "col_major",
@@ -1591,6 +2254,14 @@ def _normalize_gate_stream_layout_order(order):
         "auto",
         "input",
         "input_refined",
+        "role_grouped",
+        "lifetime",
+        "lifetime_refined",
+        "coordinate_row",
+        "coordinate_col",
+        "coordinate_snake",
+        "graph_embedding",
+        "graph_embedding_col",
         "degree",
         "degree_refined",
         "bfs",
@@ -1645,6 +2316,9 @@ def _gate_stream_layout_candidates(
     sites,
     pair_weights,
     *,
+    supports=None,
+    event_types=None,
+    include_lifetime=False,
     include_input=True,
     refine_passes=8,
     spectral_dense_max=512,
@@ -1657,11 +2331,48 @@ def _gate_stream_layout_candidates(
     include_kahypar=False,
     kahypar_config_path=None,
     kahypar_seed=0,
+    site_roles=None,
+    role_order=None,
+    site_coords=None,
+    graph_coords=None,
 ):
     """Return deterministic candidate orders for gate-stream layout search."""
     candidates = {}
     if include_input:
         candidates["input"] = list(sites)
+    if site_roles and role_order is not None:
+        candidates["role_grouped"] = _role_grouped_order(
+            sites, site_roles, role_order
+        )
+        candidates["role_interleaved"] = _gate_stream_role_interleaved_order(
+            sites, pair_weights, site_roles
+        )
+    if include_lifetime and supports is not None and event_types is not None:
+        candidates["lifetime"] = _gate_stream_lifetime_order(
+            sites,
+            pair_weights,
+            supports,
+            event_types,
+            site_roles=site_roles,
+            role_order=role_order,
+        )
+    if site_coords is not None:
+        candidates["coordinate_row"] = _coordinate_layout_order(
+            sites, site_coords, axis="row"
+        )
+        candidates["coordinate_col"] = _coordinate_layout_order(
+            sites, site_coords, axis="col"
+        )
+        candidates["coordinate_snake"] = _coordinate_layout_order(
+            sites, site_coords, axis="row", snake=True
+        )
+    if graph_coords is not None:
+        candidates["graph_embedding"] = _coordinate_layout_order(
+            sites, graph_coords, axis="row"
+        )
+        candidates["graph_embedding_col"] = _coordinate_layout_order(
+            sites, graph_coords, axis="col"
+        )
     if not pair_weights:
         if not candidates:
             candidates["unweighted"] = list(sites)
@@ -1713,12 +2424,218 @@ def _gate_stream_layout_candidates(
     return candidates
 
 
+def _normalize_gate_stream_schedule_strategy(strategy):
+    """Normalize gate-stream scheduling strategy names."""
+    name = str(strategy).replace("-", "_").strip().lower()
+    aliases = {
+        "none": "input",
+        "original": "input",
+        "dependency_safe": "dependency",
+        "greedy": "mountain",
+        "frontier": "mountain",
+        "early": "mountain_early",
+        "measure_early": "mountain_early",
+        "measurement_early": "mountain_early",
+        "mountain_measure_early": "mountain_early",
+    }
+    name = aliases.get(name, name)
+    if name not in {"input", "dependency", "mountain", "mountain_early"}:
+        raise ValueError(
+            f"Unknown MPS gate-stream schedule strategy {strategy!r}. "
+            "Expected 'input', 'dependency', 'mountain', or 'measure-early'."
+        )
+    return name
+
+
+def _gate_stream_dependency_order(supports, *, strategy="mountain", order=None):
+    """Return a dependency-safe event ordering.
+
+    Gates that touch a common logical site retain their input order.  Only
+    events on disjoint supports can move past each other.  The ``mountain``
+    strategy chooses among ready events using a cheap time-resolved frontier
+    cut proxy; it is intentionally a scheduler heuristic, not a replacement
+    for the state-aware replay objective.
+    """
+    strategy = _normalize_gate_stream_schedule_strategy(strategy)
+    # ``mountain_early`` is meaningful only at the mixed-stream replay
+    # layer; ordinary gate segments use the same frontier heuristic as
+    # ``mountain``.
+    if strategy == "mountain_early":
+        strategy = "mountain"
+    supports = tuple(tuple(support) for support in supports)
+    n_events = len(supports)
+    if strategy == "input" or n_events < 2:
+        return tuple(range(n_events))
+
+    predecessors = [set() for _ in range(n_events)]
+    last_event = {}
+    for event_index, support in enumerate(supports):
+        for site in _unique_ordered(support):
+            previous = last_event.get(site)
+            if previous is not None:
+                predecessors[event_index].add(previous)
+            last_event[site] = event_index
+
+    if strategy == "dependency":
+        # Stable topological order: the smallest input index wins every tie.
+        key = lambda event_index: event_index
+    else:
+        if order is None:
+            order = _unique_ordered(
+                site for support in supports for site in support
+            )
+        order = tuple(order)
+        position = {site: pos for pos, site in enumerate(order)}
+
+        def frontier_key(event_index, scheduled):
+            completed = set(scheduled)
+            completed.add(event_index)
+            seen_sites = {
+                site
+                for index in completed
+                for site in _unique_ordered(supports[index])
+            }
+            cut_loads = np.zeros(max(0, len(order) - 1), dtype=float)
+            for future_index, support in enumerate(supports):
+                if future_index in completed:
+                    continue
+                support = _unique_ordered(support)
+                points = [position[site] for site in support]
+                if len(points) < 2:
+                    continue
+                support_set = set(support)
+                if not (support_set & seen_sites) or support_set <= seen_sites:
+                    continue
+                lo, hi = min(points), max(points)
+                cut_loads[lo:hi] += 1.0
+            max_cut = float(cut_loads.max()) if cut_loads.size else 0.0
+            cut_l2 = float(np.dot(cut_loads, cut_loads))
+            span = 0
+            points = [position[site] for site in supports[event_index]]
+            if len(points) > 1:
+                span = max(points) - min(points)
+            # The lexicographic order prioritizes the transient frontier peak,
+            # then congestion, then the selected gate's own chain span.
+            return (
+                max_cut,
+                cut_l2,
+                float(cut_loads.sum()),
+                int(span),
+                int(event_index),
+            )
+
+        key = frontier_key
+
+    scheduled = []
+    scheduled_set = set()
+    while len(scheduled) < n_events:
+        ready = [
+            event_index
+            for event_index in range(n_events)
+            if event_index not in scheduled_set
+            and predecessors[event_index] <= scheduled_set
+        ]
+        if not ready:  # pragma: no cover - defensive DAG invariant
+            raise RuntimeError("gate-stream dependency graph contains a cycle")
+        if strategy == "mountain":
+            selected = min(
+                ready,
+                key=lambda event_index: key(event_index, scheduled),
+            )
+        else:
+            selected = min(ready, key=key)
+        scheduled.append(selected)
+        scheduled_set.add(selected)
+    return tuple(scheduled)
+
+
+def _gate_stream_replay_order(
+    supports,
+    event_types,
+    *,
+    strategy="mountain",
+    order=None,
+):
+    """Return a legal replay order while respecting control dependencies.
+
+    By default, a measurement, reset, conditional, or cap stays at its input
+    position and ordinary gate/sub-MPO segments on either side are scheduled
+    independently. The opt-in ``mountain_early`` strategy moves a
+    measurement/reset left across only the immediately preceding ordinary
+    events whose supports are disjoint from the control support. Such local
+    operations commute even on an entangled state; shared-site gates and all
+    classical/cap dependencies remain barriers. Within each ordinary segment,
+    the dependency scheduler preserves input order for every pair of events
+    sharing a logical site, so only disjoint operations move.
+    """
+    supports = tuple(tuple(support) for support in supports)
+    event_types = tuple(event_types)
+    strategy = _normalize_gate_stream_schedule_strategy(strategy)
+    measure_early = strategy == "mountain_early"
+    ordinary_strategy = "mountain" if measure_early else strategy
+    if len(supports) != len(event_types):
+        raise ValueError(
+            "MPS replay scheduling requires one support per stream event."
+        )
+    ordinary = {"gate", "submpo"}
+    scheduled = []
+    segment = []
+
+    def flush_segment():
+        if not segment:
+            return
+        local_supports = tuple(supports[index] for index in segment)
+        local_order = _gate_stream_dependency_order(
+            local_supports,
+            strategy=ordinary_strategy,
+            order=order,
+        )
+        scheduled.extend(segment[index] for index in local_order)
+        segment.clear()
+
+    for event_index, event_type in enumerate(event_types):
+        if event_type in ordinary:
+            segment.append(event_index)
+        elif measure_early and event_type in {"measure", "reset", "measure_reset"}:
+            control_support = set(_unique_ordered(supports[event_index]))
+            movable = 0
+            while movable < len(segment):
+                preceding_support = set(
+                    _unique_ordered(supports[segment[-1 - movable]])
+                )
+                if control_support.intersection(preceding_support):
+                    break
+                movable += 1
+            if movable:
+                # Keep the ordinary prefix before the control, then replay
+                # the disjoint suffix after it. This is the closest safe
+                # equivalent of paper-style measure-early scheduling without
+                # requiring a circuit-specific commutation oracle.
+                prefix = segment[:-movable]
+                suffix = segment[-movable:]
+                segment[:] = prefix
+                flush_segment()
+                scheduled.append(event_index)
+                segment.extend(suffix)
+            else:
+                flush_segment()
+                scheduled.append(event_index)
+        else:
+            flush_segment()
+            scheduled.append(event_index)
+    flush_segment()
+    return tuple(scheduled)
+
+
 class MpsGateStreamLayoutFinder:
     """Find reversible 1D MPS layouts for an optimizer gate stream.
 
     The finder is intentionally independent of MPS tensor values: it scores
     only which sites the stream touches.  Plans describe site maps and internal
     mapped locations, but never mutate or replace the original gate stream.
+    An optimizer-backed finder additionally offers the explicit
+    ``objective="replay"`` pilot, which measures the transient MPS bond peak
+    on copied state rather than confusing a static proxy with that peak.
     """
 
     def __init__(
@@ -1729,6 +2646,8 @@ class MpsGateStreamLayoutFinder:
         L=None,
         lattice_shape=None,
         lattice_site=None,
+        qubit_roles=None,
+        site_coords=None,
     ):
         self.lattice_shape = _normalize_lattice_shape(lattice_shape)
         L = _normalize_layout_length(L)
@@ -1760,12 +2679,51 @@ class MpsGateStreamLayoutFinder:
                 f"got {self.lattice_shape[0]} * {self.lattice_shape[1]} "
                 f"!= {len(self.sites)}."
             )
+        self.qubit_roles = _normalize_site_roles(qubit_roles, self.sites)
+        self.site_coords = _normalize_site_coords(site_coords, self.sites)
         self.event_weights = tuple(1.0 for _support in self.supports)
         self.pair_weights = _gate_stream_pair_weights(
             self.supports,
             self.sites,
             self.event_weights,
         )
+        self.site_usage = _gate_stream_site_usage(
+            self.sites,
+            self.supports,
+            self.event_types,
+            site_roles=self.qubit_roles,
+        )
+        self.inferred_site_roles, self.role_evidence = _infer_site_roles(
+            self.sites,
+            self.supports,
+            self.event_types,
+        ) if not self.qubit_roles else ({}, {})
+        self.effective_site_roles = (
+            dict(self.qubit_roles)
+            if self.qubit_roles
+            else dict(self.inferred_site_roles)
+        )
+        if self.effective_site_roles:
+            self.site_usage = _gate_stream_site_usage(
+                self.sites,
+                self.supports,
+                self.event_types,
+                site_roles=self.effective_site_roles,
+            )
+        self.inferred_site_coords = None
+        self.coordinate_source = "provided" if self.site_coords is not None else None
+        if self.site_coords is None:
+            self.inferred_site_coords = _gate_stream_graph_coords(
+                self.sites,
+                self.pair_weights,
+            )
+            if self.inferred_site_coords is not None:
+                self.coordinate_source = "interaction_graph"
+        self._optimizer = None
+        self._replay_stream = ()
+        self._replay_supports = ()
+        self._replay_event_types = ()
+        self._replay_event_indices = ()
 
     @classmethod
     def from_optimizer(
@@ -1776,49 +2734,106 @@ class MpsGateStreamLayoutFinder:
         L=None,
         lattice_shape=None,
         lattice_site=None,
+        qubit_roles=None,
+        site_coords=None,
     ):
         """Construct from an optimizer's queued stream without mutating it.
 
-        Pure state-control events (measure/cap/reset) do not constrain gate
-        locality, so they are omitted from the layout search. Conditional
-        actions are retained because an executed gate or sub-MPO still creates
-        the same routing/compression pressure as an unconditional action. Every
-        site is covered through ``L``/``sites`` so the plan is a full
-        permutation.
+        Pure state-control events (measure/reset) do not constrain gate
+        locality, so they are omitted from the static layout search. Direct
+        caps are retained as lifetime boundaries for replay and compiled
+        schedules because they shorten the physical chain. Conditional actions
+        are retained because an executed gate or sub-MPO still creates the same
+        routing/compression pressure as an unconditional action. Every site is
+        covered through ``L``/``sites`` so the plan is a full permutation.
         """
         if sites is None and L is None:
             L = getattr(optimizer.p, "L", None)
         stream = []
         layout_event_types = []
+        replay_event_indices = []
         for payload, where, event_type in zip(
             optimizer.G,
             optimizer.where,
             optimizer.event_types,
         ):
+            replay_event_indices.append(len(replay_event_indices))
             if event_type == "submpo":
                 stream.append(("submpo", payload, where))
                 layout_event_types.append("submpo")
             elif event_type == "gate":
                 stream.append((payload, where))
                 layout_event_types.append("gate")
+            elif event_type == "cap":
+                stream.append(
+                    (
+                        "cap",
+                        where[0],
+                        payload["vec"],
+                        payload.get("absorb", "left"),
+                    )
+                )
+                layout_event_types.append("cap")
             elif event_type == "conditional":
                 stream.append(
                     (_conditional_layout_payload(payload["action"]), where)
                 )
                 layout_event_types.append("conditional")
-            # Pure measure/cap/reset controls are skipped: they do not add an
-            # operator-routing edge to the layout objective.
+            # Pure measurement/reset controls do not add an operator-routing
+            # edge to the static layout objective.
         finder = cls(
             stream,
             sites=sites,
             L=L,
             lattice_shape=lattice_shape,
             lattice_site=lattice_site,
+            qubit_roles=(
+                getattr(optimizer, "qubit_roles", None)
+                if qubit_roles is None else qubit_roles
+            ),
+            site_coords=site_coords,
         )
         # The generic bundled-stream parser labels the synthetic conditional
         # entry as a gate. Restore its semantic type for diagnostics and custom
         # weight functions; supports and payloads are already canonical.
         finder.event_types = tuple(layout_event_types)
+        finder._optimizer = optimizer
+        finder._replay_stream = tuple(getattr(optimizer, "_gate_stream", ()))
+        finder._replay_supports = tuple(
+            _normalize_layout_support(where) for where in optimizer.where
+        )
+        finder._replay_event_types = tuple(optimizer.event_types)
+        finder._replay_event_indices = tuple(replay_event_indices)
+        finder.site_usage = _gate_stream_site_usage(
+            finder.sites,
+            finder._replay_supports,
+            finder._replay_event_types,
+            site_roles=finder.qubit_roles,
+        )
+        finder.inferred_site_roles, finder.role_evidence = _infer_site_roles(
+            finder.sites,
+            finder._replay_supports,
+            finder._replay_event_types,
+        ) if not finder.qubit_roles else ({}, {})
+        finder.effective_site_roles = (
+            dict(finder.qubit_roles)
+            if finder.qubit_roles
+            else dict(finder.inferred_site_roles)
+        )
+        if finder.effective_site_roles:
+            finder.site_usage = _gate_stream_site_usage(
+                finder.sites,
+                finder._replay_supports,
+                finder._replay_event_types,
+                site_roles=finder.effective_site_roles,
+            )
+        if finder.site_coords is None:
+            finder.inferred_site_coords = _gate_stream_graph_coords(
+                finder.sites,
+                finder.pair_weights,
+            )
+            if finder.inferred_site_coords is not None:
+                finder.coordinate_source = "interaction_graph"
         return finder
 
     @classmethod
@@ -1852,6 +2867,307 @@ class MpsGateStreamLayoutFinder:
             site=self.lattice_site,
         )
 
+    @staticmethod
+    def _stream_entry_contains_cap(entry):
+        """Return whether a normalized stream entry contains a cap."""
+        if isinstance(entry, Mapping):
+            kind = entry.get("kind", entry.get("type", entry.get("event")))
+            if kind is None:
+                return False
+            name = _normalize_event_name(kind)
+            action = entry.get("action", entry.get("then"))
+            return name == "cap" or (
+                name in {"if", "conditional", "condition", "feed_forward", "feedforward"}
+                and action is not None
+                and MpsGateStreamLayoutFinder._stream_entry_contains_cap(action)
+            )
+        if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+            name = _normalize_event_name(entry[0])
+            if name == "cap":
+                return True
+            if name in {"if", "conditional", "condition", "feed_forward", "feedforward"}:
+                return len(entry) > 3 and MpsGateStreamLayoutFinder._stream_entry_contains_cap(entry[3])
+        return False
+
+    def _replay_candidate(
+        self,
+        site_order,
+        *,
+        replay_steps=None,
+        replay_kwargs=None,
+        replay_allow_lossy_reorder=False,
+        replay_schedule="mountain",
+    ):
+        """Replay one layout candidate on a private optimizer copy."""
+        optimizer = self._optimizer
+        if optimizer is None:
+            raise ValueError(
+                "objective='replay' requires an optimizer-backed finder; "
+                "use opt.layout_finder() or opt.select_layout_for_compression()."
+            )
+        if getattr(optimizer, "_has_trajectory_events", False):
+            raise ValueError(
+                "objective='replay' does not support trajectory streams; "
+                "replay a fixed ordinary stream instead."
+            )
+        if getattr(optimizer, "_persistent_layout_plan", None) is not None:
+            raise ValueError(
+                "objective='replay' must run before a persistent layout is "
+                "installed; create a fresh optimizer copy."
+            )
+        mode = getattr(optimizer, "mode", None)
+        if mode in {"exact", "perm"}:
+            raise ValueError(
+                "objective='replay' requires a fixed-layout MPS compression "
+                "mode, not mode='exact' or mode='perm'."
+            )
+
+        stream = tuple(self._replay_stream)
+        if len(stream) != len(self._replay_event_types):
+            raise ValueError(
+                "optimizer-backed replay requires a normalized stream."
+            )
+        replay_stream = stream
+        if any(
+            event_type == "conditional"
+            and self._stream_entry_contains_cap(entry)
+            for entry, event_type in zip(stream, self._replay_event_types)
+        ):
+            raise ValueError(
+                "objective='replay' does not support conditional cap events; "
+                "the active branch is needed to update the shrinking layout."
+            )
+        run_kwargs = dict(replay_kwargs or {})
+        conflicting = sorted({"layout", "use_layout_finder"}.intersection(run_kwargs))
+        if conflicting:
+            raise ValueError(
+                "replay_kwargs must not contain "
+                f"{', '.join(conflicting)}; the replay objective owns the layout."
+            )
+        run_kwargs.setdefault("progbar", False)
+        run_kwargs.setdefault("layout_report", False)
+        run_kwargs.setdefault("cutoff", 1e-12)
+        run_kwargs.setdefault("cutoff_mode", "rsum2")
+        replay_mode = run_kwargs.get("mode", mode)
+        if replay_mode is None:
+            replay_mode = mode
+        if str(replay_mode).strip().lower() in {"exact", "perm"}:
+            raise ValueError(
+                "objective='replay' requires a fixed-layout MPS compression "
+                "mode in replay_kwargs."
+            )
+
+        layout_cutoff = run_kwargs.get("cutoff", 1e-12)
+        if isinstance(layout_cutoff, (str, bytes)) or layout_cutoff is None:
+            layout_cutoff = 1e-12
+        layout_cutoff = float(layout_cutoff)
+        layout_cutoff_mode = run_kwargs.get("cutoff_mode", "rsum2")
+        plan = {
+            "kind": "mps_gate_stream_layout",
+            "site_order": tuple(site_order),
+            "site_map": {
+                site: position for position, site in enumerate(site_order)
+            },
+        }
+        trial = optimizer.copy()
+        trial.apply_layout(
+            plan,
+            cutoff=layout_cutoff,
+            cutoff_mode=layout_cutoff_mode,
+            allow_lossy_reorder=bool(replay_allow_lossy_reorder),
+            layout_report=False,
+        )
+
+        event_order = _gate_stream_replay_order(
+            self._replay_supports,
+            self._replay_event_types,
+            strategy=replay_schedule,
+            order=site_order,
+        )
+        if replay_steps is not None:
+            event_order = event_order[: int(replay_steps)]
+        initial_bond = int(trial.p.max_bond())
+        profile = []
+        started = time.perf_counter()
+        for schedule_position, event_index in enumerate(event_order):
+            entry = replay_stream[event_index]
+            event_type = self._replay_event_types[event_index]
+            trial.set_gates((entry,))
+            logical_where = tuple(trial.where[0]) if trial.where else ()
+            physical_where = tuple(
+                int(trial.position(site)) for site in logical_where
+            )
+            trial.run(**run_kwargs)
+            length_diagnostics = trial.mps_length_diagnostics()
+            profile.append({
+                "event_index": int(event_index),
+                "schedule_position": int(schedule_position),
+                "event_type": event_type,
+                "logical_where": logical_where,
+                "physical_where": physical_where,
+                "max_bond": int(trial.p.max_bond()),
+                "bond_sizes": tuple(int(size) for size in trial.p.bond_sizes()),
+                "allocated_length": int(length_diagnostics["allocated_length"]),
+                "effective_length": int(length_diagnostics["effective_length"]),
+            })
+        elapsed = time.perf_counter() - started
+        bonds = [initial_bond]
+        bonds.extend(record["max_bond"] for record in profile)
+        peak_bond = max(bonds) if bonds else initial_bond
+        mean_bond = float(np.mean(bonds)) if bonds else float(initial_bond)
+        final_bond = bonds[-1] if bonds else initial_bond
+        replay_score_tuple = (
+            int(peak_bond),
+            float(mean_bond),
+            int(final_bond),
+            float(elapsed),
+        )
+        replay_loss = float(
+            peak_bond * 1.0e9
+            + mean_bond * 1.0e6
+            + final_bond * 1.0e3
+            + elapsed
+        )
+        return {
+            "status": "ok",
+            "initial_bond": initial_bond,
+            "final_bond": int(final_bond),
+            "peak_bond": int(peak_bond),
+            "peak_log2_bond": float(np.log2(max(1, peak_bond))),
+            "mean_bond": mean_bond,
+            "elapsed_seconds": float(elapsed),
+            "profile": tuple(profile),
+            "schedule_strategy": str(replay_schedule),
+            "event_order": tuple(int(index) for index in event_order),
+            "score_tuple": replay_score_tuple,
+            "score": replay_loss,
+            "loss": replay_loss,
+        }
+
+    def compile_schedule(
+        self,
+        plan=None,
+        *,
+        strategy="mountain",
+    ):
+        """Compile a dependency-safe ordered stream for ``set_gate_schedule``.
+
+        Ordinary gate and sub-MPO events are ordered within dependency-safe
+        segments. Direct cap events are barriers: their physical location is
+        mapped against the current live chain, then later positions are
+        compacted and higher logical labels are decremented. Measurement,
+        reset, trajectory, and conditional events still require a stateful
+        replay path and are rejected here.
+        """
+        strategy = _normalize_gate_stream_schedule_strategy(strategy)
+        optimizer_backed = bool(self._optimizer is not None and self._replay_stream)
+        if optimizer_backed:
+            supports = tuple(self._replay_supports)
+            event_types = tuple(self._replay_event_types)
+            payloads = tuple(getattr(self._optimizer, "G", ()))
+        else:
+            supports = tuple(self.supports)
+            event_types = tuple(self.event_types)
+            payloads = tuple(self.payloads)
+        unsupported = sorted(
+            set(event_types) - {"gate", "submpo", "cap"}
+        )
+        if unsupported:
+            raise ValueError(
+                "gate-stream scheduling accepts ordinary gate, sub-MPO, and "
+                "direct cap events; measurement/reset, conditional, and "
+                f"trajectory events are unsupported ({unsupported!r})."
+            )
+        if plan is None:
+            plan = self.run(order="input")
+        if not isinstance(plan, Mapping) or "site_order" not in plan:
+            raise TypeError("plan must be a layout mapping returned by run().")
+        site_order = tuple(plan["site_order"])
+        event_order = _gate_stream_replay_order(
+            supports,
+            event_types,
+            strategy=strategy,
+            order=site_order,
+        )
+        runtime_order = list(site_order)
+        stream = []
+        logical_where = []
+        mapped_where = []
+        for event_index in event_order:
+            event_type = event_types[event_index]
+            support = tuple(supports[event_index])
+            try:
+                mapped = tuple(runtime_order.index(site) for site in support)
+            except ValueError as exc:
+                raise ValueError(
+                    "cap-aware schedule references a logical site that is no "
+                    f"longer live: {support!r}; current order is {runtime_order!r}."
+                ) from exc
+            payload = payloads[event_index]
+            if event_type == "submpo" and site_order != tuple(self.sites):
+                raise ValueError(
+                    "compile_schedule cannot relabel sub-MPO site tags yet; "
+                    "use an identity layout or compile the sub-MPO tags first."
+                )
+            if event_type == "submpo":
+                stream.append(("submpo", payload, mapped))
+            elif event_type == "cap":
+                if len(support) != 1:
+                    raise ValueError(
+                        "scheduled cap events must target exactly one logical site."
+                    )
+                logical_site = support[0]
+                if not isinstance(logical_site, Integral):
+                    raise ValueError(
+                        "scheduled cap events require integer logical site labels."
+                    )
+                logical_site = int(logical_site)
+                physical_site = int(mapped[0])
+                if runtime_order[physical_site] != logical_site:
+                    raise ValueError(
+                        "cap-aware schedule lost the logical site at physical "
+                        f"position {physical_site}."
+                    )
+                if not isinstance(payload, Mapping) or "vec" not in payload:
+                    raise ValueError(
+                        "normalized cap payloads must contain a 'vec' entry."
+                    )
+                stream.append(
+                    (
+                        "cap",
+                        physical_site,
+                        payload["vec"],
+                        payload.get("absorb", "left"),
+                    )
+                )
+                runtime_order.pop(physical_site)
+                runtime_order = [
+                    site if site < logical_site else site - 1
+                    for site in runtime_order
+                ]
+            else:
+                stream.append((payload, mapped))
+            logical_where.append(support)
+            mapped_where.append(mapped)
+
+        return MpsGateStreamSchedule(
+            stream=tuple(stream),
+            site_order=site_order,
+            layout_plan=plan,
+            metadata={
+                "strategy": strategy,
+                "event_order": tuple(event_order),
+                "logical_where": tuple(logical_where),
+                "mapped_where": tuple(mapped_where),
+                "event_types": tuple(event_types[index] for index in event_order),
+                "qubit_roles": dict(self.effective_site_roles),
+                "role_order": plan.get("role_order"),
+                "site_usage": plan.get("site_usage", self.site_usage),
+                "initial_site_order": site_order,
+                "final_site_order": tuple(runtime_order),
+            },
+        )
+
     def run(
         self,
         order="quality",
@@ -1871,6 +3187,12 @@ class MpsGateStreamLayoutFinder:
         weight_mode="auto",
         schmidt_max_dim=4,
         max_operator_qubits=8,
+        replay_candidates=4,
+        replay_steps=None,
+        replay_kwargs=None,
+        replay_allow_lossy_reorder=False,
+        replay_schedule="mountain",
+        role_order=None,
     ):
         """Return a layout plan for the stored gate stream.
 
@@ -1883,7 +3205,41 @@ class MpsGateStreamLayoutFinder:
         Graph-derived candidates are still allowed: the gate supports are the
         data being optimized, while the original order is only a diagnostic
         baseline.
+
+        ``objective="replay"`` is an explicit optimizer-backed joint pilot. The
+        ``objective="smart"`` alias additionally permits the private pilot
+        copy to pay the one-time initial-state reorder needed for an
+        initially entangled MPS. It
+        ranks static candidates with the compression proxy, schedules each
+        candidate's ordinary gate segments, replays the best
+        ``replay_candidates`` on private copies, and selects by the measured
+        transient maximum MPS bond dimension. ``replay_steps`` can limit the
+        scheduled prefix, and ``replay_kwargs`` are forwarded to each one-event
+        ``MpsOptimizer.run`` call. ``replay_schedule`` accepts ``"mountain"``
+        (the default), ``"dependency"``, ``"input"``, or the opt-in
+        ``"measure-early"``. The latter moves measurements/resets left only
+        across immediately preceding ordinary events on disjoint supports;
+        shared-site gates, conditionals, and caps remain barriers. This
+        objective requires ``opt.layout_finder`` and never mutates the source
+        optimizer.
+
+        The ``"lifetime"`` candidate is a general QEC-oriented seed. It uses
+        first/last use, measure/reset reuse boundaries, interaction degree,
+        and optional ``role_order`` as soft construction hints. When both
+        data and ancilla roles are present, role-grouped, role-interleaved,
+        and lifetime seeds are added automatically. All are scored by the
+        selected objective; none forces data and ancilla blocks or reorders
+        control events.
         """
+        requested_objective = _normalize_event_name(objective)
+        smart_initial_state = requested_objective in {
+            "smart",
+            "state_aware_auto",
+        }
+        site_roles = dict(self.effective_site_roles)
+        if role_order is None:
+            role_order = _default_role_order(site_roles)
+        role_order = _normalize_role_order(role_order, site_roles)
         fixed_order = None
         if isinstance(order, (str, type(None))):
             order_name = _normalize_gate_stream_layout_order(order)
@@ -1891,6 +3247,33 @@ class MpsGateStreamLayoutFinder:
             fixed_order = normalize_fixed_order(order, self.sites)
             order_name = "fixed"
         objective = _gate_stream_layout_objective(objective)
+        if objective == "smart":
+            objective = "replay"
+        if objective == "replay":
+            if self._optimizer is None:
+                raise ValueError(
+                    "objective='replay' requires an optimizer-backed finder; "
+                    "use opt.layout_finder() or opt.select_layout_for_compression()."
+                )
+            try:
+                replay_candidates = int(replay_candidates)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "replay_candidates must be a positive integer."
+                ) from exc
+            if replay_candidates < 1:
+                raise ValueError("replay_candidates must be a positive integer.")
+            if replay_steps is not None:
+                try:
+                    replay_steps = int(replay_steps)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "replay_steps must be a positive integer or None."
+                    ) from exc
+                if replay_steps < 1:
+                    raise ValueError(
+                        "replay_steps must be a positive integer or None."
+                    )
         if max_operator_qubits is not None:
             try:
                 max_operator_qubits = int(max_operator_qubits)
@@ -1916,7 +3299,8 @@ class MpsGateStreamLayoutFinder:
             self.event_types,
             max_operator_qubits=max_operator_qubits,
         )
-        if objective == "compression":
+        static_objective = "compression" if objective == "replay" else objective
+        if static_objective == "compression":
             pair_weights = _gate_stream_pair_weights(
                 self.supports,
                 self.sites,
@@ -1930,6 +3314,13 @@ class MpsGateStreamLayoutFinder:
                 event_weights,
             )
             score_event_weights = event_weights
+        coordinate_candidates = self.site_coords
+        graph_coords = self.inferred_site_coords
+        if coordinate_candidates is None and graph_coords is None and pair_weights:
+            graph_coords = _gate_stream_graph_coords(
+                self.sites,
+                pair_weights,
+            )
         geometric_order = order_name in _GEOMETRIC_LAYOUT_ORDERS
         if fixed_order is None and geometric_order:
             candidates = {order_name: list(self._preset_order(order_name))}
@@ -1943,6 +3334,33 @@ class MpsGateStreamLayoutFinder:
             candidates = _gate_stream_layout_candidates(
                 self.sites,
                 pair_weights,
+                supports=(
+                    self._replay_supports
+                    if self._optimizer is not None
+                    else self.supports
+                ),
+                event_types=(
+                    self._replay_event_types
+                    if self._optimizer is not None
+                    else self.event_types
+                ),
+                include_lifetime=(
+                    role_order is not None
+                    or bool(site_roles)
+                    or any(
+                        event_type in _LIFETIME_BOUNDARY_EVENT_TYPES
+                        for event_type in (
+                            self._replay_event_types
+                            if self._optimizer is not None
+                            else self.event_types
+                        )
+                    )
+                    or order_name in {
+                        "lifetime",
+                        "lifetime_refined",
+                        "role_grouped",
+                    }
+                ),
                 include_input=not from_scratch,
                 refine_passes=refine_passes,
                 refine_numba=refine_numba,
@@ -1955,6 +3373,10 @@ class MpsGateStreamLayoutFinder:
                 include_kahypar=include_kahypar,
                 kahypar_config_path=kahypar_config_path,
                 kahypar_seed=kahypar_seed,
+                site_roles=site_roles,
+                role_order=role_order,
+                site_coords=(coordinate_candidates or graph_coords),
+                graph_coords=graph_coords,
             )
         else:
             # Keep the input baseline in diagnostics so a fixed order can be
@@ -1975,7 +3397,7 @@ class MpsGateStreamLayoutFinder:
             stats = dict(locality_stats)
             stats["path_loss"] = locality_stats["loss"]
             stats["path_score"] = locality_stats["score"]
-            if objective == "compression":
+            if static_objective == "compression":
                 stats.update(_gate_stream_compression_stats(
                     candidate,
                     self.payloads,
@@ -1993,6 +3415,65 @@ class MpsGateStreamLayoutFinder:
             name: score_candidate(candidate)
             for name, candidate in candidates.items()
         }
+
+        replay_reports = {}
+        if objective == "replay":
+            ranked_names = sorted(
+                candidate_stats,
+                key=lambda name: candidate_stats[name]["loss"],
+            )
+            replay_names = list(ranked_names[:replay_candidates])
+            # Explicit orders should always be evaluated even if their static
+            # proxy rank is outside the bounded pilot set.
+            if order_name in candidate_stats and order_name not in replay_names:
+                replay_names.append(order_name)
+            for name in replay_names:
+                static_stats = candidate_stats[name]
+                static_stats["static_loss"] = static_stats["loss"]
+                static_stats["static_score"] = static_stats["score"]
+                try:
+                    replay = self._replay_candidate(
+                        candidates[name],
+                        replay_steps=replay_steps,
+                        replay_kwargs=replay_kwargs,
+                        replay_allow_lossy_reorder=(
+                            bool(replay_allow_lossy_reorder)
+                            or smart_initial_state
+                        ),
+                        replay_schedule=replay_schedule,
+                    )
+                except Exception as exc:  # pragma: no cover - backend-specific
+                    replay = {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "score": float("inf"),
+                        "loss": float("inf"),
+                    }
+                replay_reports[name] = replay
+                static_stats["replay"] = replay
+                if replay["status"] == "ok":
+                    static_stats["replay_status"] = "ok"
+                    static_stats["replay_score"] = replay["score"]
+                    static_stats["replay_score_tuple"] = replay["score_tuple"]
+                    static_stats["loss"] = replay["loss"]
+                    static_stats["score"] = replay["score"]
+                else:
+                    static_stats["replay_status"] = "error"
+                    static_stats["loss"] = float("inf")
+                    static_stats["score"] = float("inf")
+            if not any(
+                report.get("status") == "ok"
+                for report in replay_reports.values()
+            ):
+                raise RuntimeError(
+                    "All MPS replay layout candidates failed. "
+                    f"Diagnostics: {replay_reports!r}"
+                )
+            for name, stats in candidate_stats.items():
+                if name not in replay_reports:
+                    stats["replay_status"] = "not_replayed"
+                    stats["loss"] = float("inf")
+                    stats["score"] = float("inf")
 
         if order_name == "auto":
             selected_order = min(
@@ -2024,15 +3505,46 @@ class MpsGateStreamLayoutFinder:
                         f"{hint}"
                     )
 
+        def mapped_supports(site_order):
+            """Map supports through direct-cap lifetime boundaries."""
+            runtime_order = list(site_order)
+            mapped = []
+            for support, event_type in zip(self.supports, self.event_types):
+                try:
+                    physical = tuple(runtime_order.index(site) for site in support)
+                except ValueError as exc:
+                    raise ValueError(
+                        "layout plan references a logical site that is no "
+                        f"longer live: {support!r}; current order is "
+                        f"{runtime_order!r}."
+                    ) from exc
+                mapped.append(physical)
+                if event_type == "cap":
+                    if len(support) != 1 or not isinstance(support[0], Integral):
+                        raise ValueError(
+                            "direct cap layout events require one integer site."
+                        )
+                    logical_site = int(support[0])
+                    physical_site = int(physical[0])
+                    runtime_order.pop(physical_site)
+                    runtime_order = [
+                        site if site < logical_site else site - 1
+                        for site in runtime_order
+                    ]
+            return tuple(mapped)
+
         def make_plan(name):
             site_order = tuple(candidates[name])
             site_map = {site: pos for pos, site in enumerate(site_order)}
-            mapped_where = tuple(
-                tuple(site_map[site] for site in support)
-                for support in self.supports
-            )
+            if "cap" in self.event_types:
+                mapped_where = mapped_supports(site_order)
+            else:
+                mapped_where = tuple(
+                    tuple(site_map[site] for site in support)
+                    for support in self.supports
+                )
             stats = candidate_stats[name]
-            return {
+            plan = {
                 "kind": "mps_gate_stream_layout",
                 "selected_order": name,
                 "qubit_inds": site_order,
@@ -2055,12 +3567,40 @@ class MpsGateStreamLayoutFinder:
                 },
                 "weight_mode": _normalize_weight_mode(weight_mode),
                 "objective": objective,
+                "requested_objective": requested_objective,
+                "qubit_roles": dict(site_roles),
+                "role_order": role_order,
+                "site_usage": self.site_usage,
+                "site_coords": (
+                    dict(coordinate_candidates)
+                    if coordinate_candidates is not None else None
+                ),
+                "inferred_site_coords": (
+                    dict(graph_coords) if graph_coords is not None else None
+                ),
+                "coordinate_source": (
+                    "provided" if coordinate_candidates is not None
+                    else "interaction_graph" if graph_coords is not None
+                    else None
+                ),
+                "inferred_site_roles": dict(self.inferred_site_roles),
+                "role_evidence": dict(self.role_evidence),
                 "max_operator_qubits": max_operator_qubits,
                 "from_scratch": bool(from_scratch),
                 "stats": stats,
                 "input_stats": input_stats,
                 "score": stats["score"],
             }
+            replay = stats.get("replay")
+            if replay is not None and replay.get("status") == "ok":
+                plan["replay_schedule"] = replay.get("schedule_strategy")
+                plan["replay_event_order"] = replay.get("event_order")
+                if self._optimizer is not None:
+                    plan["scheduled_stream"] = tuple(
+                        self._replay_stream[index]
+                        for index in replay.get("event_order", ())
+                    )
+            return plan
 
         candidate_plans = {
             name: make_plan(name) for name in candidates
@@ -2080,6 +3620,7 @@ class MpsGateStreamLayoutFinder:
             "candidate_score_tuples": {
                 name: info["score_tuple"] for name, info in candidate_stats.items()
             },
+            "replay": replay_reports if objective == "replay" else None,
         })
         return selected_plan
 
@@ -2148,6 +3689,11 @@ class MpsGateStreamLayoutFinder:
             if not show_axes:
                 ax.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
         fig = ax.figure
+        if site_coords is None and isinstance(plan, Mapping):
+            site_coords = (
+                plan.get("site_coords")
+                or plan.get("inferred_site_coords")
+            )
         coords = resolve_site_coords(self.sites, site_coords)
         site_order = tuple(plan["site_order"])
         position = {site: index for index, site in enumerate(site_order)}

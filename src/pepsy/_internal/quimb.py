@@ -193,14 +193,35 @@ def quimb_1d_compression_method_available(method):
     return callable(quimb_1d_compression_function(method))
 
 
+def quimb_1d_compression_cutoff_mode(method, cutoff_mode):
+    """Return a cutoff mode safe for the selected Quimb compressor.
+
+    ``sdcr`` uses randomized SVDs to form its successive environments. Newer
+    Quimb releases reject cumulative cutoff modes for that randomized stage,
+    while older releases accepted them. Keep the compatibility decision at
+    Pepsy's boundary and preserve ``None`` so each installed Quimb release can
+    select its own native default.
+    """
+    method = str(method).strip().lower()
+    if method == "sdcr" and str(cutoff_mode).strip().lower() in {
+        "sum1",
+        "sum2",
+        "rsum1",
+        "rsum2",
+    }:
+        return "rel"
+    return cutoff_mode
+
+
 def require_quimb_1d_compression_method(method):
     """Require an optional Quimb compressor at execution time."""
     if quimb_1d_compression_method_available(method):
         return
+    compressor_family = method.split("-", 1)[0]
     raise NotImplementedError(
         f"Quimb compression method {method!r} is not available in the installed "
-        "Quimb build. Install a newer Quimb build containing this optional "
-        "1D compressor. Existing compression modes remain available."
+        f"Quimb build. Install a Quimb build containing the {compressor_family} "
+        "compressor. Existing compression modes remain available."
     )
 
 

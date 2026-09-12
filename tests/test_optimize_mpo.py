@@ -8,6 +8,7 @@ import quimb as qu
 import quimb.tensor as qtn
 
 import pepsy as py
+from pepsy._internal.quimb import quimb_1d_compression_method_available
 import pepsy.optimizers.mpo.optimizer as mpo_optimizer_module
 
 
@@ -97,6 +98,26 @@ def test_mpo_optimizer_accepts_mps_quimb_compression_mode_aliases(
 
     assert out.max_bond() <= 4
     assert calls == [expected_method, expected_method]
+
+
+@pytest.mark.parametrize("method", ["sdcr", "sdcr-oversample"])
+def test_mpo_optimizer_sdcr_modes_are_version_gated(method):
+    """MPO SDCR aliases use Quimb when present and fail explicitly otherwise."""
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(4, dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=4,
+        mode=method,
+    )
+
+    if not quimb_1d_compression_method_available(method):
+        with pytest.raises(NotImplementedError, match="sdcr compressor"):
+            opt.run(n_iter=1, cutoff=0.0)
+        return
+
+    out = opt.run(n_iter=1, cutoff=0.0)
+    assert out.max_bond() <= 4
+    assert opt.mode == f"quimb-{method}"
 
 
 def test_mpo_optimizer_submpo_method_overrides_mpo_mode():
