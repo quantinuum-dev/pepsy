@@ -343,6 +343,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             return self.Lx
         raise ValueError(f"Unsupported cut_tag_id: {cut_tag_id}")
 
+    def _boundary_length_from_cut_tag(self, cut_tag_id):
+        """Return MPS length perpendicular to the selected cut axis."""
+        if cut_tag_id == "Y{}":
+            return self.Lx
+        if cut_tag_id == "X{}":
+            return self.Ly
+        raise ValueError(f"Unsupported cut_tag_id: {cut_tag_id}")
+
     def _direction_tags(self, direction):
         """Return ``(cut_tag_id, site_tag_id, n_steps)`` for a direction."""
         base = self._direction_base(direction)
@@ -444,15 +452,16 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         return self.flat and step_idx == 0
 
     def _cut_idx_and_key(self, side, step_idx, cut_tag_id):
-        """Return ``(cut_idx, boundary_key, axis_len)`` for sweep side/step."""
-        axis_len = self._axis_length_from_cut_tag(cut_tag_id)
+        """Return cut index, storage key, and perpendicular MPS length."""
+        cut_axis_len = self._axis_length_from_cut_tag(cut_tag_id)
+        boundary_len = self._boundary_length_from_cut_tag(cut_tag_id)
         if side == "right":
-            cut_idx = axis_len - step_idx - 1
+            cut_idx = cut_axis_len - step_idx - 1
             boundary_key = f"{cut_tag_id.format(step_idx)}_r"
         else:
             cut_idx = step_idx
             boundary_key = f"{cut_tag_id.format(step_idx)}_l"
-        return cut_idx, boundary_key, axis_len
+        return cut_idx, boundary_key, boundary_len
 
     @staticmethod
     def _previous_boundary_key(side, step_idx, cut_tag_id):
@@ -709,7 +718,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         tn,
         boundary_key,
         site_tag_id,
-        axis_len,
+        boundary_len,
         previous=None,
     ):
         """Compress one boundary target with a direct Quimb method."""
@@ -729,7 +738,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             max_bond = int(self.mps_boundaries[boundary_key].max_bond())
         cutoff = self._resolve_fit_cutoff(tn)
         site_tags = tuple(
-            site_tag_id.format(site) for site in range(int(axis_len))
+            site_tag_id.format(site) for site in range(int(boundary_len))
         )
 
         if self.fit_layer_mode == "joint":
@@ -763,7 +772,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         compressed.view_as_(
             qtn.MatrixProductState,
-            L=axis_len,
+            L=boundary_len,
             site_tag_id=site_tag_id,
             site_ind_id=None,
             cyclic=False,
@@ -1014,7 +1023,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         boundary_key,
         previous,
         site_tag_id,
-        axis_len,
+        boundary_len,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         """Fit one boundary MPS against ``tn`` and return the owned result."""
         if self.fit_mode in _FIT_QUIMB_MODES:
@@ -1022,7 +1031,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 tn,
                 boundary_key,
                 site_tag_id,
-                axis_len,
+                boundary_len,
                 previous=previous,
             )
 
@@ -1041,7 +1050,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             contraction_opt=self.fit_contraction_opt,
             retag=self.retag,
         )
-        self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
+        self._maybe_visualize_fit(
+            tn,
+            boundary_mps,
+            fit,
+            site_tag_id,
+            boundary_len,
+        )
         if self.fit_timing_sync_device:
             FIT.synchronize_backend(fit.p)
         started = time.perf_counter() if self.fit_timing else None
@@ -1104,7 +1119,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         previous = None
 
         for step_idx in range(steps):
-            cut_idx, boundary_key, axis_len = self._cut_idx_and_key(
+            cut_idx, boundary_key, boundary_len = self._cut_idx_and_key(
                 side,
                 step_idx,
                 cut_tag_id,
@@ -1127,7 +1142,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 boundary_key,
                 previous if step_idx > 0 else None,
                 site_tag_id=site_tag_id,
-                axis_len=axis_len,
+                boundary_len=boundary_len,
             )
 
             if progress_bar is not None:
@@ -1154,7 +1169,11 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         """Fit a single boundary step for one side and return updated MPS."""
         previous = None
 
-        cut_idx, boundary_key, axis_len = self._cut_idx_and_key(side, step_, cut_tag_id)
+        cut_idx, boundary_key, boundary_len = self._cut_idx_and_key(
+            side,
+            step_,
+            cut_tag_id,
+        )
         tn_slice = self.norm.select(cut_tag_id.format(cut_idx), "any")
 
         if step_ > 0:
@@ -1177,7 +1196,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             boundary_key,
             previous if step_ > 0 else None,
             site_tag_id=site_tag_id,
-            axis_len=axis_len,
+            boundary_len=boundary_len,
         )
 
         return previous

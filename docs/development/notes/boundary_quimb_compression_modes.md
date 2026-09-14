@@ -42,8 +42,9 @@ warning and its private registry import has moved to
 `quimb.tensor.tn1d.compress`; Pepsy does not import either private registry.
 
 - **Adopt:** continue calling the public `quimb.tensor` function. Direct PEPS
-  compression now derives its MPS length from the boundary sweep geometry and
-  avoids constructing or copying an unused FIT guess.
+  compression now derives its MPS length from the lattice axis perpendicular
+  to the boundary sweep, including for rectangular lattices, and avoids
+  constructing or copying an unused FIT guess.
 - **Compatibility shim:** retain the narrow `sdcr` cumulative-cutoff coercion
   and readable `src-mps` aliases. Current Quimb still rejects cumulative
   cutoff modes in randomized SVD while accepting the final exact cutoff for

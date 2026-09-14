@@ -69,8 +69,9 @@ explicit `layer_tags` satisfy the metadata requirement.
 
 Direct Quimb modes do not consume a variational boundary guess. New direct
 contractions therefore start with product-rank boundary metadata, and the
-compression sweep derives its site count from the lattice axis rather than
-constructing and copying a random chi-wide MPS. Reused lower-rank boundaries
+compression sweep derives its site count from the lattice axis perpendicular
+to the sweep rather than constructing and copying a random chi-wide MPS. This
+distinction is required for rectangular lattices. Reused lower-rank boundaries
 are not globally padded before direct compression; each visited boundary is
 replaced by the selected Quimb compressor at the requested cap.
 

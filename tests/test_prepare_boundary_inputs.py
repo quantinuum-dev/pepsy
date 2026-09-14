@@ -961,9 +961,29 @@ def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
     )
 
 
-def test_direct_compression_skips_unused_boundary_guess(monkeypatch):
-    """Direct compression should not initialize or globally expand a FIT guess."""
-    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=487, dtype="complex128")
+@pytest.mark.parametrize(
+    ("shape", "direction", "boundary_length"),
+    (
+        ((2, 3), "y", 2),
+        ((3, 2), "y", 3),
+        ((3, 2), "x", 2),
+        ((2, 3), "x", 3),
+    ),
+)
+def test_direct_compression_skips_unused_boundary_guess(
+    monkeypatch,
+    shape,
+    direction,
+    boundary_length,
+):
+    """Direct compression should use geometry without constructing a FIT guess."""
+    ket = qtn.PEPS.rand(
+        Lx=shape[0],
+        Ly=shape[1],
+        bond_dim=2,
+        seed=487,
+        dtype="complex128",
+    )
     _, norm = pepsy.build_bra_ket(ket=ket.copy())
     bdy = pepsy.BdyMPS(tn_double=norm, chi=1, lazy=True)
 
@@ -975,11 +995,12 @@ def test_direct_compression_skips_unused_boundary_guess(monkeypatch):
 
     result = pepsy.peps_norm(
         ket.copy(),
-        chi=4,
+        chi=16,
         bdy=bdy,
         fit_mode="direct",
-        fit_max_bond=4,
+        fit_max_bond=16,
         n_iter=1,
+        direction=direction,
         max_separation=0,
         cutoff=0.0,
         contraction_opt="greedy",
@@ -990,7 +1011,8 @@ def test_direct_compression_skips_unused_boundary_guess(monkeypatch):
 
     assert result.cost == pytest.approx(exact)
     assert dict.__len__(bdy.mps_b) > 0
-    assert all(mps.max_bond() <= 4 for mps in bdy.mps_b.values())
+    assert all(mps.L == boundary_length for mps in bdy.mps_b.values())
+    assert all(mps.max_bond() <= 16 for mps in bdy.mps_b.values())
 
 
 @pytest.mark.parametrize("fit_mode", ("direct", "src", "zipup", "sdc", "dm"))
@@ -1178,6 +1200,29 @@ def test_contract_flat_supports_all_fit_modes_for_one_effective_layer(fit_mode):
         method="dmrg",
         fit_mode=fit_mode,
         n_iter=n_iter,
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert value == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("shape", "direction"),
+    (((2, 3), "y"), ((3, 2), "x")),
+)
+def test_contract_flat_direct_supports_rectangular_boundaries(shape, direction):
+    """Flat direct compression should use the perpendicular lattice extent."""
+    flat_layer = _make_unit_flat_layer(lx=shape[0], ly=shape[1])
+
+    value = pepsy.contract_flat(
+        flat_layer,
+        chi=2,
+        method="dmrg",
+        fit_mode="direct",
+        n_iter=1,
+        direction=direction,
         max_separation=0,
         contraction_opt="greedy",
         progress=False,
