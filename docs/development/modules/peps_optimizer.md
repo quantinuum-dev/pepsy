@@ -68,10 +68,11 @@ optimizer = PepsOptimizer(
 ```
 
 The boundary `chi` is used as the native two-site SVD cap unless
-`fit_max_bond` is supplied. `fit_mode="dmrg"` aliases the one-site/effective
-`"eff"` path; `"dmrg2"` runs two-site warm-up followed by one-site
-refinement, while `"two-site"` remains fixed two-site FIT. The Quimb modes
-`"direct"`, `"src"`, `"zipup"`, `"sdc"`, and `"dm"` bypass FIT.
+`fit_max_bond` is supplied. `fit_mode="dmrg"` and `"dmrg1"` alias the
+one-site/effective `"eff"` path; `"dmrg2"` runs two-site warm-up followed by
+one-site refinement, while `"two-site"` remains fixed two-site FIT. The Quimb modes
+`"direct"`, `"src"`/`"src-mps"`, `"zipup"`, `"sdc"`/`"sdcr"`, and `"dm"`,
+including supported `*-first` and `*-oversample` variants, bypass FIT.
 `fit_init_strategy` only initializes FIT from a disposable copy
 (`"guess-direct"`, `"guess-src"`, or `"guess-sdc"`) and leaves the exact
 target and reusable boundary handles unchanged.

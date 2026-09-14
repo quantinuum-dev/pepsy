@@ -525,7 +525,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if fit_layer_mode == "sequential" and fit_mode not in _FIT_QUIMB_MODES:
             raise ValueError(
                 "fit_layer_mode='sequential' is only supported with direct "
-                "Quimb fit modes: 'direct', 'src', 'zipup', 'sdc', or 'dm'."
+                f"Quimb fit modes; got fit_mode={fit_mode!r}."
             )
 
         metric_method = self.boundary_kwargs.get("method")

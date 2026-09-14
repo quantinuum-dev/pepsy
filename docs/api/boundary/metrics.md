@@ -10,8 +10,8 @@ the following boundary-compression modes:
   `"src-oversample"`, `"sdc-oversample"`, and `"zipup-oversample"`.
   Because Quimb's randomized `sdcr` split does not support cumulative cutoff
   modes, the shared `fit_cutoff_mode="auto"` policy uses `"rel"` for `sdcr`.
-- `fit_mode="eff"` (also `"dmrg"`): cached one-site FIT sweeps and the
-  compatibility default.
+- `fit_mode="eff"` (also `"dmrg"` and `"dmrg1"`): cached one-site FIT
+  sweeps and the compatibility default.
 - `fit_mode="two-site"`: fixed two-site FIT updates.
 - `fit_mode="dmrg2"`: two-site FIT warm-up followed by one-site refinement,
   in the same spirit as a two-site-to-one-site MPS optimizer.
@@ -37,18 +37,19 @@ network. It requires `layer_tags`, for example
 `contract_layered(network, layer_tags=("BRA", "PEPO", "KET"), chi=64)`, and
 uses the same `CompBdy` engine with `flat=False`. Set
 `fit_layer_mode="sequential"` to absorb those layers one at a time in the
-given order, or keep the default `"joint"` policy. It does not flatten the
-stack into one giant tensor network. Use `contract_boundary` when you need
-lower-level control over an already-created `BdyMPS` or Quimb's native
-`method="mps"` path.
+given order, or keep the default `"joint"` policy. The façade also accepts
+`fit_layer_order="auto"` for explicitly tagged layers that are mathematically
+interchangeable. It does not flatten the stack into one giant tensor network.
+Use `contract_boundary` when you need lower-level control over an
+already-created `BdyMPS` or Quimb's native `method="mps"` path.
 
 The layer policy applies to the package `method="dmrg"` path. Quimb's native
 `method="mps"` path already handles `layer_tags` itself and rejects
 `fit_layer_mode="sequential"` rather than silently ignoring the option.
 
 Selectors are normalized early: `"two_site"` is accepted as an alias for
-`"two-site"`, `"one-site"` aliases `"eff"`, and `"dmrg"` aliases the
-historical `"eff"` spelling. Unknown values fail before boundary work starts.
+`"two-site"`, `"one-site"`, `"dmrg"`, and `"dmrg1"` alias the historical
+`"eff"` spelling. Unknown values fail before boundary work starts.
 
 `fit_init_strategy="direct"` (or the compatibility alias `"auto"`) preserves
 the existing boundary guess. `"guess-direct"`, `"guess-src"`, and
@@ -59,6 +60,8 @@ boundaries. These strategies are initialization choices only: the selected
 fall back to `direct` with a warning for dense Quimb guesses.
 The direct Quimb `fit_mode` values are currently dense-only; use
 `fit_mode="dmrg"` or `"dmrg2"` for native Symmray boundaries.
+They replace each visited boundary directly and do not construct, copy, or
+globally expand an unused FIT initial guess.
 
 For `fit_mode="eff"`, set `fit_block_size=2` or `3` to use native block-SVD
 growth through `FIT.run_eff`. Add `fit_adaptive_sweeps=2` to perform two

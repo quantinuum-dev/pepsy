@@ -38,6 +38,9 @@ multi-layer boundary path, normally used for the tagged BRA--KET network.
 
 `CompBdy` updates those environments with `move_bdy(...)` or
 `move_step_bdy(...)`, then contracts a final boundary network in `run(...)`.
+With `max_separation=1`, one center slice remains unabsorbed; if the sweep axis
+itself has length one, no boundary update is needed and that slice is
+contracted directly.
 
 The local boundary solver is selected with `fit_mode`:
 
@@ -51,7 +54,7 @@ The local boundary solver is selected with `fit_mode`:
 - `"dmrg2"` performs two-site FIT warm-up sweeps followed by one-site
   refinement; it is distinct from the fixed two-site `"two-site"` mode.
 - `"global"` uses the reference global FIT solve.
-- `"dmrg"` is an alias for `"eff"`.
+- `"dmrg"` and `"dmrg1"` are aliases for `"eff"`.
 
 Direct Quimb modes support `fit_layer_mode="joint"` (default) or
 `"sequential"` on the multilayer, non-flat boundary path. Sequential mode
@@ -64,6 +67,16 @@ The default `fit_layer_order="input"` preserves the supplied semantic order;
 `fit_layer_order="auto"` is opt-in, requires explicit tags whose layers are
 known to be mathematically interchangeable, and orders dense layers by an
 estimated intermediate tensor size.
+`contract_layered(...)` exposes the same order control directly because its
+explicit `layer_tags` satisfy the metadata requirement.
+
+Direct Quimb modes do not consume a variational boundary guess. New direct
+contractions therefore start with product-rank boundary metadata, and the
+compression sweep derives its site count from the lattice axis perpendicular
+to the sweep rather than constructing and copying a random chi-wide MPS. This
+distinction is required for rectangular lattices. Reused lower-rank boundaries
+are not globally padded before direct compression; each visited boundary is
+replaced by the selected Quimb compressor at the requested cap.
 
 Each boundary FIT can optionally use `fit_init_strategy="guess-direct"`,
 `"guess-src"`, or `"guess-sdc"`. These compress a copy of the exact
@@ -116,7 +129,8 @@ Reusing a boundary at a larger `chi` does not globally pad it first; lowering
 - `contract_layered(...)`: contract a preassembled multilayer network with
   explicit `layer_tags`, using the shared `CompBdy` engine and `flat=False`.
   This is the high-level façade for sequential BRA--PEPO--KET-style
-  absorption without flattening the stack into one giant tensor network.
+  absorption without flattening the stack into one giant tensor network. It
+  accepts `fit_layer_order="input"` or the opt-in `"auto"` policy.
 
 Use `result.cost`, `result.fidel`, and `result.fit_diagnostics` from
 `BoundaryContractResult`; do not rely on tuple unpacking. Each typed boundary

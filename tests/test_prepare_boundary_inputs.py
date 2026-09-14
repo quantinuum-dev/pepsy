@@ -448,6 +448,7 @@ def test_compbdy_fit_mode_is_canonicalized_and_validated_early():
     assert pepsy.CompBdy(norm, {}, fit_mode="two_site").fit_mode == "two-site"
     assert pepsy.CompBdy(norm, {}, fit_mode="one-site").fit_mode == "eff"
     assert pepsy.CompBdy(norm, {}, fit_mode="dmrg").fit_mode == "eff"
+    assert pepsy.CompBdy(norm, {}, fit_mode="dmrg1").fit_mode == "eff"
     assert pepsy.CompBdy(norm, {}, fit_mode="dmrg2").fit_mode == "dmrg2"
     for mode in (
         "direct",
@@ -960,6 +961,97 @@ def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
     )
 
 
+@pytest.mark.parametrize(
+    ("shape", "direction", "boundary_length"),
+    (
+        ((2, 3), "y", 2),
+        ((3, 2), "y", 3),
+        ((3, 2), "x", 2),
+        ((2, 3), "x", 3),
+    ),
+)
+def test_direct_compression_skips_unused_boundary_guess(
+    monkeypatch,
+    shape,
+    direction,
+    boundary_length,
+):
+    """Direct compression should use geometry without constructing a FIT guess."""
+    ket = qtn.PEPS.rand(
+        Lx=shape[0],
+        Ly=shape[1],
+        bond_dim=2,
+        seed=487,
+        dtype="complex128",
+    )
+    _, norm = pepsy.build_bra_ket(ket=ket.copy())
+    bdy = pepsy.BdyMPS(tn_double=norm, chi=1, lazy=True)
+
+    def fail_unused_guess(*_args, **_kwargs):
+        raise AssertionError("direct compression constructed an unused boundary guess")
+
+    monkeypatch.setattr(bdy, "expand_bnd", fail_unused_guess)
+    monkeypatch.setattr(pepsy.BdyMPS, "_prepare_boundary_mps", fail_unused_guess)
+
+    result = pepsy.peps_norm(
+        ket.copy(),
+        chi=16,
+        bdy=bdy,
+        fit_mode="direct",
+        fit_max_bond=16,
+        n_iter=1,
+        direction=direction,
+        max_separation=0,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    assert result.cost == pytest.approx(exact)
+    assert dict.__len__(bdy.mps_b) > 0
+    assert all(mps.L == boundary_length for mps in bdy.mps_b.values())
+    assert all(mps.max_bond() <= 16 for mps in bdy.mps_b.values())
+
+
+@pytest.mark.parametrize("fit_mode", ("direct", "eff"))
+@pytest.mark.parametrize(
+    ("shape", "direction"),
+    (((1, 3), "x"), ((3, 1), "y")),
+)
+def test_max_separation_one_handles_single_slice_axis(
+    shape,
+    direction,
+    fit_mode,
+):
+    """A one-slice sweep axis should contract its center without boundary fits."""
+    ket = qtn.PEPS.rand(
+        Lx=shape[0],
+        Ly=shape[1],
+        bond_dim=2,
+        seed=489,
+        dtype="complex128",
+    )
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        fit_mode=fit_mode,
+        n_iter=1,
+        direction=direction,
+        max_separation=1,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert result.cost == pytest.approx(exact)
+    assert result.fit_diagnostics == ()
+
+
 @pytest.mark.parametrize("fit_mode", ("direct", "src", "zipup", "sdc", "dm"))
 def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
     """Direct compressors can absorb the standard BRA/KET layers separately."""
@@ -987,7 +1079,10 @@ def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
     )
 
 
-def test_contract_layered_supports_sequential_three_layer_compression():
+@pytest.mark.parametrize("fit_layer_order", ("input", "auto"))
+def test_contract_layered_supports_sequential_three_layer_compression(
+    fit_layer_order,
+):
     """A tagged BRA--PEPO--KET target uses the multilayer boundary façade."""
 
     def add_unit_layer(tn, layer, *, lx=2, ly=2):
@@ -1025,6 +1120,7 @@ def test_contract_layered_supports_sequential_three_layer_compression():
         chi=2,
         fit_mode="sdc",
         fit_layer_mode="sequential",
+        fit_layer_order=fit_layer_order,
         layer_tags=("BRA", "PEPO", "KET"),
         n_iter=1,
         max_separation=0,
@@ -1141,6 +1237,29 @@ def test_contract_flat_supports_all_fit_modes_for_one_effective_layer(fit_mode):
         method="dmrg",
         fit_mode=fit_mode,
         n_iter=n_iter,
+        max_separation=0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert value == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("shape", "direction"),
+    (((2, 3), "y"), ((3, 2), "x")),
+)
+def test_contract_flat_direct_supports_rectangular_boundaries(shape, direction):
+    """Flat direct compression should use the perpendicular lattice extent."""
+    flat_layer = _make_unit_flat_layer(lx=shape[0], ly=shape[1])
+
+    value = pepsy.contract_flat(
+        flat_layer,
+        chi=2,
+        method="dmrg",
+        fit_mode="direct",
+        n_iter=1,
+        direction=direction,
         max_separation=0,
         contraction_opt="greedy",
         progress=False,

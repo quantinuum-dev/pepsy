@@ -28,6 +28,20 @@ Changes for the next release should be added here before the version is bumped.
   chi-capped direct guess with one-node TreeFIT against the original layered
   target; failed fits do not commit the guess. Existing defaults are unchanged.
 
+- Direct Quimb PEPS boundary compression no longer initializes, globally
+  expands, or copies an unused random boundary-MPS guess. Direct sweeps derive
+  their output length from the lattice axis perpendicular to the sweep,
+  including on rectangular PEPS, while preserving the existing bond cap,
+  diagnostics, and dense-only backend policy.
+
+- Boundary contraction with `max_separation=1` now handles a sweep axis of
+  length one by contracting the sole center slice without requesting a
+  nonexistent boundary fit.
+
+- Added `fit_layer_order` to the public `contract_layered` façade and aligned
+  boundary documentation with the accepted `dmrg1` alias and complete direct
+  Quimb compression family.
+
 - Extended PEPS boundary `fit_mode` selection with Quimb's oversampled and
   randomized direct compressors: `src-oversample`, `srcmps` (also the
   readable `src-mps` alias), `srcmps-oversample`, `sdc-oversample`,

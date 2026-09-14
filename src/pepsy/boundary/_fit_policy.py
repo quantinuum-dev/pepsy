@@ -116,7 +116,8 @@ def _canonical_fit_mode_selector(fit_mode):
             f"Unknown fit_mode={fit_mode!r}. Expected a supported Quimb "
             "compression mode ('direct', 'src', 'src-mps', 'zipup', "
             "'sdc', 'sdcr', or 'dm', including oversampling variants), "
-            "a FIT mode ('eff', 'two-site', 'dmrg', 'dmrg2'), or 'global'."
+            "a FIT mode ('eff', 'two-site', 'dmrg', 'dmrg1', 'dmrg2'), "
+            "or 'global'."
         )
     return _FIT_MODE_ALIASES[key]
 

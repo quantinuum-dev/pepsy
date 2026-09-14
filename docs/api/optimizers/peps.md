@@ -34,10 +34,11 @@ options.
 ## Boundary DMRG modes and SRC guesses
 
 Dense PEPS boundaries can select the one-site/effective DMRG path with
-`fit_mode="dmrg"`, mixed two-site/one-site DMRG with `fit_mode="dmrg2"`,
-fixed two-site FIT with `fit_mode="two-site"`, or Quimb compression with
-`fit_mode="direct"`, `"src"`, `"zipup"`, `"sdc"`, or `"dm"`, through
-`boundary_kwargs`:
+`fit_mode="dmrg"` or `"dmrg1"`, mixed two-site/one-site DMRG with
+`fit_mode="dmrg2"`, fixed two-site FIT with `fit_mode="two-site"`, or Quimb
+compression with `fit_mode="direct"`, `"src"`/`"src-mps"`, `"zipup"`,
+`"sdc"`/`"sdcr"`, or `"dm"`, including their supported `*-first` and
+`*-oversample` variants, through `boundary_kwargs`:
 
 ```python
 optimizer = pepsy.PepsOptimizer(

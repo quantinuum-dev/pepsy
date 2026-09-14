@@ -6,11 +6,22 @@ one-site refinement. The legacy `fit_mode="two-site"` remains fixed
 two-site FIT. The direct modes `"direct"`, `"src"`, `"src-mps"`, `"zipup"`,
 `"sdc"`, `"sdcr"`, and `"dm"` use Quimb boundary compression without FIT.
 Quimb's supported `*-first` and `*-oversample` variants are accepted too;
-`"src-mps"` is the readable alias for `"srcmps"`. Configure FIT modes with:
+`"src-mps"` is the readable alias for `"srcmps"`.
+
+Direct modes derive their output length from the lattice axis perpendicular to
+the sweep and replace each visited boundary outright. They do not initialize
+or copy a variational MPS guess, and increasing the requested cap does not
+globally pad reused boundaries before compression.
+
+With `max_separation=1`, the boundary engine leaves one center slice for the
+final contraction. A sweep axis of length one therefore performs no boundary
+fits and contracts that sole slice directly.
 
 The randomized `"sdcr"` split accepts only absolute or relative cutoff
 interpretations. If the shared default resolves to cumulative `"rsum2"`,
 `CompBdy` uses `"rel"` for that mode so the request remains valid.
+
+Configure FIT modes with:
 
 - `fit_max_bond`: required for rank growth beyond the current boundary bond;
   omission safely caps direct `CompBdy` use at the current bond.
