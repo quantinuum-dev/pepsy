@@ -1015,6 +1015,43 @@ def test_direct_compression_skips_unused_boundary_guess(
     assert all(mps.max_bond() <= 16 for mps in bdy.mps_b.values())
 
 
+@pytest.mark.parametrize("fit_mode", ("direct", "eff"))
+@pytest.mark.parametrize(
+    ("shape", "direction"),
+    (((1, 3), "x"), ((3, 1), "y")),
+)
+def test_max_separation_one_handles_single_slice_axis(
+    shape,
+    direction,
+    fit_mode,
+):
+    """A one-slice sweep axis should contract its center without boundary fits."""
+    ket = qtn.PEPS.rand(
+        Lx=shape[0],
+        Ly=shape[1],
+        bond_dim=2,
+        seed=489,
+        dtype="complex128",
+    )
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        fit_mode=fit_mode,
+        n_iter=1,
+        direction=direction,
+        max_separation=1,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+
+    assert result.cost == pytest.approx(exact)
+    assert result.fit_diagnostics == ()
+
+
 @pytest.mark.parametrize("fit_mode", ("direct", "src", "zipup", "sdc", "dm"))
 def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
     """Direct compressors can absorb the standard BRA/KET layers separately."""

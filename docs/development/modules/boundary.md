@@ -38,6 +38,9 @@ multi-layer boundary path, normally used for the tagged BRA--KET network.
 
 `CompBdy` updates those environments with `move_bdy(...)` or
 `move_step_bdy(...)`, then contracts a final boundary network in `run(...)`.
+With `max_separation=1`, one center slice remains unabsorbed; if the sweep axis
+itself has length one, no boundary update is needed and that slice is
+contracted directly.
 
 The local boundary solver is selected with `fit_mode`:
 

@@ -20,6 +20,10 @@ Changes for the next release should be added here before the version is bumped.
   including on rectangular PEPS, while preserving the existing bond cap,
   diagnostics, and dense-only backend policy.
 
+- Boundary contraction with `max_separation=1` now handles a sweep axis of
+  length one by contracting the sole center slice without requesting a
+  nonexistent boundary fit.
+
 - Added `fit_layer_order` to the public `contract_layered` façade and aligned
   boundary documentation with the accepted `dmrg1` alias and complete direct
   Quimb compression family.

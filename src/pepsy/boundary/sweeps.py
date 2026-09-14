@@ -427,13 +427,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             self.x_left = self.Lx // 2
             self.x_right = self.Lx - (self.Lx // 2)
         elif self.max_separation == 1:
-            # y dir
-            self.y_left = (self.Ly // 2) - 1
-            self.y_right = self.Ly - (self.Ly // 2)
+            # Leave exactly one center slice unabsorbed. Expressing the right
+            # extent as the remainder keeps both extents non-negative for a
+            # valid one-row or one-column sweep axis.
+            self.y_left = max((self.Ly // 2) - 1, 0)
+            self.y_right = self.Ly - self.y_left - 1
 
-            # x dir
-            self.x_left = (self.Lx // 2) - 1
-            self.x_right = self.Lx - (self.Lx // 2)
+            self.x_left = max((self.Lx // 2) - 1, 0)
+            self.x_right = self.Lx - self.x_left - 1
         else:
             raise ValueError("max_separation must be 0 or 1.")
 
@@ -1209,12 +1210,24 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
     def _build_final_boundary_network(self, spec, p_previous_l, p_previous_r):
         """Build final TN by combining left/right fitted boundaries."""
-        if p_previous_r is None:
-            raise ValueError("Boundary contraction failed: missing right boundary MPS.")
+        if spec.left_steps > 0 and p_previous_l is None:
+            raise ValueError(
+                "Boundary contraction failed: missing left boundary MPS."
+            )
+        if spec.right_steps > 0 and p_previous_r is None:
+            raise ValueError(
+                "Boundary contraction failed: missing right boundary MPS."
+            )
         if self.max_separation == 0:
+            if p_previous_r is None:
+                raise ValueError(
+                    "Boundary contraction failed: missing right boundary MPS."
+                )
             return p_previous_r if p_previous_l is None else (p_previous_r | p_previous_l)
 
         center = self.norm.select(spec.cut_tag_id.format(spec.left_index), "any")
+        if p_previous_r is None:
+            return center if p_previous_l is None else (center | p_previous_l)
         if p_previous_l is None:
             return p_previous_r | center
         return p_previous_r | center | p_previous_l
