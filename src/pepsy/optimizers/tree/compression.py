@@ -52,11 +52,12 @@ def _oversample_bond(max_bond, max_bond_oversample=None):
 
     Quimb interprets floating point ``max_bond_oversample`` values as
     multipliers and integral values as explicit ranks. Keep that convention
-    shared by all three successive oversampling modes.
+    shared by successive and zipup oversampling modes. Zipup supplies its
+    distinct default multiplier explicitly.
     """
     if max_bond is None:
         raise ValueError(
-            "oversampled successive compression requires max_bond."
+            "oversampled compression requires max_bond."
         )
     max_bond = int(max_bond)
     if max_bond < 1:

@@ -281,7 +281,8 @@ def test_native_global_svd_preserves_degenerate_boundary_policy():
     np.testing.assert_allclose((left @ right).data.to_dense(), data.to_dense(), atol=1e-12)
 
 
-def test_tree_fit_rejects_unsupported_odd_parity_without_installing_state():
+@pytest.mark.parametrize("mode", ["dmrg2", "mix"])
+def test_tree_fit_rejects_unsupported_odd_parity_without_installing_state(mode):
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype="complex128")
     plan = TreePlan.from_order(range(4), structure="balanced")
@@ -290,7 +291,7 @@ def test_tree_fit_rejects_unsupported_odd_parity_without_installing_state():
         occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
     )
     optimizer = TreeOptimizer(None, state=state.copy(), chi=16, cutoff=0.,
-                              mode="dmrg2", run=False)
+                              mode=mode, run=False)
     with pytest.raises(NotImplementedError, match="odd-parity fermionic"):
         optimizer.apply_gate(fermion.hopping_gate(.1, t=1., imaginary=False), (0, 3))
     assert float(pepsy.tensors.tn_fidelity(optimizer.tn, state)) > 1 - 1e-10

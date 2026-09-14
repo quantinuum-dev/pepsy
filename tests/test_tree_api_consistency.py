@@ -202,6 +202,7 @@ def test_replacing_tree_layout_invalidates_cached_gate_operators(mode, setter):
 @pytest.mark.parametrize("mode,compression", [
     ("direct", "direct"), ("dem", "direct"), ("src", "direct"),
     ("sdc", "direct"), ("zipup", "direct"), ("fit", "direct"),
+    ("zipup-oversample", "direct"), ("zipup-first", "direct"), ("mix", "direct"),
     ("dmrg1", "direct"), ("dmrg2", "direct"), ("dmrg3", "direct"),
     ("tree-mpo-dm", "direct"), ("treempo", "direct"), ("auto", "dm"),
 ])
@@ -224,6 +225,8 @@ def test_constructor_run_and_legacy_modes_agree(mode, compression):
 @pytest.mark.parametrize("overrides", [
     {"mode": "src", "compression_mode": "dm"},
     {"mode": "zipup", "compression_mode": "dm"},
+    {"mode": "zipup-first", "compression_mode": "dm"},
+    {"mode": "mix", "compression_mode": "src"},
     {"mode": "direct", "compression_seed": -1},
     {"mode": "direct", "shots": -1},
     {"mode": "direct", "normalize_every": True},
@@ -457,7 +460,9 @@ def test_fit_constructor_options_are_not_silently_accepted_by_run_or_shots():
         opt.run(shots=2, strategy="independent", run_kwargs={"fit_n_iter": 2})
 
 
-@pytest.mark.parametrize("mode", ["direct", "dm", "src", "sdc", "zipup", "dmrg2"])
+@pytest.mark.parametrize("mode", [
+    "direct", "dm", "src", "sdc", "zipup", "zipup-oversample", "zipup-first", "mix", "dmrg2",
+])
 def test_ordinary_gates_use_primary_sub_mpotree_entry_point(mode, monkeypatch):
     opt = TreeOptimizer(None, n=5, mode=mode, cutoff=0., chi=8, run=False)
     primary = opt.apply_sub_mpotree

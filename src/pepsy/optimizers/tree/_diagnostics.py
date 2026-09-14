@@ -93,7 +93,7 @@ def summarize_update(active, edge_events, bond_record, *, elapsed, mode,
             log_survival,
         )
     else:
-        if track_truncation and mode != "zipup":
+        if track_truncation and mode not in {"zipup", "zipup_oversample"}:
             relative_loss = 0.0
             absolute_loss = 0.0
             max_edge_loss = 0.0
