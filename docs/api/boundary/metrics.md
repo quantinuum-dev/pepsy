@@ -128,6 +128,12 @@ per attempted boundary fit, with the boundary key, actual iteration count,
 convergence reason, relative change, final center/direction, and reached bond
 dimension. These fields are collected without per-site timing overhead.
 
+For differentiable flat-network objectives, pass
+`contract_flat(..., preserve_backend=True)`. This bypasses only Pepsy's final
+Python-scalar formatting and returns the raw NumPy, Torch, or JAX scalar. With
+`strip_exponent=True`, the raw `(mantissa, exponent)` pair is retained. The
+contraction algorithm and its truncations are otherwise unchanged.
+
 Set `fit_timing=True` to additionally populate each diagnostic's
 `elapsed_seconds` and detailed two-site `sweep_timings`. On asynchronous
 accelerators, `fit_timing_sync_device=True` adds device barriers so those

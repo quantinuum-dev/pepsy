@@ -24,6 +24,11 @@ Changes for the next release should be added here before the version is bumped.
   length one by contracting the sole center slice without requesting a
   nonexistent boundary fit.
 
+- `contract_flat(..., preserve_backend=True)` now returns the raw NumPy,
+  Torch, or JAX scalar instead of converting it to a Python number, preserving
+  autodiff graphs for downstream flat-network optimization. The default
+  reporting-oriented return behavior is unchanged.
+
 - Added `fit_layer_order` to the public `contract_layered` façade and aligned
   boundary documentation with the accepted `dmrg1` alias and complete direct
   Quimb compression family.

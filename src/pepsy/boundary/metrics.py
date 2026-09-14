@@ -1016,6 +1016,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     visualize=False,
     strip_exponent=False,
     return_info=False,
+    preserve_backend=False,
     mode_=None,
     sequence=None,
     cutoff=1.0e-12,
@@ -1077,6 +1078,11 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     return_info : bool, default=False
         Return :class:`BoundaryContractResult` instead of only its ``cost``.
         The result includes per-boundary convergence diagnostics for DMRG.
+    preserve_backend : bool, default=False
+        Return the raw backend scalar (or raw ``(mantissa, exponent)`` pair)
+        without converting it to Python numbers. Enable this for Torch/JAX
+        autodiff through a flat contraction. The default preserves the
+        reporting-oriented scalar API.
     ctmrg_reduce_opts : mapping | None, default=None
         Optional options forwarded to Quimb's squared-environment
         factorization for ``method="ctmrg"``. Symmray networks receive
@@ -1147,7 +1153,14 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
-    cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+    cost = (
+        result.cost
+        if preserve_backend
+        else _format_scaled_output(
+            result.cost,
+            strip_exponent=strip_exponent,
+        )
+    )
     if return_info:
         return replace(result, cost=cost)
     return cost
