@@ -14,6 +14,15 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Direct Quimb PEPS boundary compression no longer initializes, globally
+  expands, or copies an unused random boundary-MPS guess. Direct sweeps derive
+  their output length from lattice geometry while preserving the existing
+  bond cap, diagnostics, and dense-only backend policy.
+
+- Added `fit_layer_order` to the public `contract_layered` façade and aligned
+  boundary documentation with the accepted `dmrg1` alias and complete direct
+  Quimb compression family.
+
 - Extended PEPS boundary `fit_mode` selection with Quimb's oversampled and
   randomized direct compressors: `src-oversample`, `srcmps` (also the
   readable `src-mps` alias), `srcmps-oversample`, `sdc-oversample`,

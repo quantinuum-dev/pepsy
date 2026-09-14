@@ -707,9 +707,9 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     def _compress_boundary(  # pylint: disable=too-many-locals
         self,
         tn,
-        boundary_mps,
         boundary_key,
         site_tag_id,
+        axis_len,
         previous=None,
     ):
         """Compress one boundary target with a direct Quimb method."""
@@ -722,10 +722,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         max_bond = self.fit_max_bond
         if max_bond is None:
-            max_bond = int(boundary_mps.max_bond())
+            # Preserve the direct ``CompBdy`` compatibility fallback when no
+            # explicit cap was supplied. High-level boundary helpers always
+            # pass the requested chi and therefore avoid materializing this
+            # otherwise unused initial boundary.
+            max_bond = int(self.mps_boundaries[boundary_key].max_bond())
         cutoff = self._resolve_fit_cutoff(tn)
         site_tags = tuple(
-            site_tag_id.format(site) for site in range(int(boundary_mps.L))
+            site_tag_id.format(site) for site in range(int(axis_len))
         )
 
         if self.fit_layer_mode == "joint":
@@ -759,7 +763,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         compressed.view_as_(
             qtn.MatrixProductState,
-            L=boundary_mps.L,
+            L=axis_len,
             site_tag_id=site_tag_id,
             site_ind_id=None,
             cyclic=False,
@@ -1013,17 +1017,16 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         axis_len,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         """Fit one boundary MPS against ``tn`` and return the owned result."""
-        boundary_mps = self._initial_boundary_mps(boundary_key, previous)
-
         if self.fit_mode in _FIT_QUIMB_MODES:
             return self._compress_boundary(
                 tn,
-                boundary_mps,
                 boundary_key,
                 site_tag_id,
+                axis_len,
                 previous=previous,
             )
 
+        boundary_mps = self._initial_boundary_mps(boundary_key, previous)
         fit_guess = self._build_fit_initial_guess(
             tn,
             boundary_mps,

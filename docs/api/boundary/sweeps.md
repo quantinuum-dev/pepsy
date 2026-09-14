@@ -8,6 +8,11 @@ two-site FIT. The direct modes `"direct"`, `"src"`, `"src-mps"`, `"zipup"`,
 Quimb's supported `*-first` and `*-oversample` variants are accepted too;
 `"src-mps"` is the readable alias for `"srcmps"`. Configure FIT modes with:
 
+Direct modes derive their output length from the sweep axis and replace each
+visited boundary outright. They do not initialize or copy a variational MPS
+guess, and increasing the requested cap does not globally pad reused
+boundaries before compression.
+
 The randomized `"sdcr"` split accepts only absolute or relative cutoff
 interpretations. If the shared default resolves to cumulative `"rsum2"`,
 `CompBdy` uses `"rel"` for that mode so the request remains valid.

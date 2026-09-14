@@ -14,6 +14,7 @@ import autoray as ar
 from ..tensors.validation import _PHYS_OUTER, validate_tensor_network_tags
 from .states import BdyMPS
 from ._fit_policy import (
+    _FIT_QUIMB_MODES,
     _canonical_fit_layer_mode,
     _canonical_fit_layer_order,
     _canonical_fit_mode_selector,
@@ -891,22 +892,25 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     if method == "dmrg":
         fit_mode = _canonical_fit_mode_selector(fit_mode)
         bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
+        direct_compression = fit_mode in _FIT_QUIMB_MODES
         block_fit = fit_mode in {"two-site", "dmrg2"} or (
             fit_mode == "eff" and fit_block_size in {2, 3}
         )
+        low_rank_start = direct_compression or block_fit
         _retune_bdy_to_chi(
             bdy_obj,
             chi,
             bdy_name,
-            expand_growth=not block_fit,
+            expand_growth=not low_rank_start,
         )
         if bdy_obj is None:
             if chi is None:
                 raise ValueError(f"Provide chi when {bdy_name} is not supplied.")
-            # A two-site SVD can discover rank as it sweeps. Starting from a
-            # product boundary avoids allocating and canonicalizing chi-wide
-            # random bonds that may be immediately truncated away.
-            initial_chi = 1 if block_fit else chi
+            # Block-SVD fits discover rank as they sweep, while direct Quimb
+            # modes replace each boundary without consuming an initial guess.
+            # A product boundary avoids allocating and canonicalizing random
+            # chi-wide bonds in either case.
+            initial_chi = 1 if low_rank_start else chi
             if flat:
                 bdy_obj = BdyMPS(
                     tn_flat=norm,
@@ -1050,12 +1054,12 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         Contraction backend. ``"dmrg"`` is only supported for 2D flat
         PEPS-like networks; quimb methods are used for 2D and 3D when the
         input network exposes the corresponding method.
-    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Boundary compression mode. Quimb also accepts the supported
         ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
         ``srcmps``. The direct modes compress each
-        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
-        uses two-site warm-up followed by one-site refinement.
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
     fit_layer_mode : {"joint", "sequential"}, default="joint"
         Must remain ``"joint"`` for this single-effective-layer API.
         Sequential layer absorption belongs to the multilayer
@@ -1196,6 +1200,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
     track_boundary_fidelity=False,
     fit_mode="eff",
     fit_layer_mode="joint",
+    fit_layer_order="input",
     fit_init_strategy="direct",
     fit_init_seed=0,
     fit_block_size=1,
@@ -1237,7 +1242,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         Layered networks use the Pepsy ``CompBdy`` engine. Native Quimb
         ``method="mps"`` remains available through :func:`contract_boundary`
         or the scalar metric helpers.
-    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Boundary compression mode. Quimb also accepts the supported
         ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
         ``srcmps``. Direct Quimb modes can be combined with
@@ -1246,6 +1251,10 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         Whether to compress all tagged layers jointly or absorb them one at a
         time in ``layer_tags`` order. Sequential mode is intended for the
         direct Quimb fit modes.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and is only appropriate
+        when the explicitly tagged layers are mathematically interchangeable.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess used by FIT modes.
     strip_exponent : bool, default=False
@@ -1267,6 +1276,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         )
     layer_tags = _validate_layer_tags(layer_tags, tn)
     fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
 
     result, _ = _contract_peps_double_layer(
         tn,
@@ -1281,6 +1291,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
         fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
         fit_init_strategy=fit_init_strategy,
         fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
@@ -1430,17 +1441,21 @@ def contract_boundary(
         Use the single-effective-layer initialization shortcut. Keep this
         ``False`` for a multi-layer target; use ``BdyMPS(tn_double=...)`` for
         the corresponding boundary object.
-    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Boundary compression mode. Quimb also accepts the supported
         ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
         ``srcmps``. The direct modes compress each
-        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
-        uses two-site warm-up followed by one-site refinement.
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
     fit_layer_mode : {"joint", "sequential"}, default="joint"
         Direct-mode layer policy. ``"joint"`` compresses all tagged layers
         together; ``"sequential"`` compresses them one at a time in the
         order given by ``layer_tags``. Only direct Quimb fit modes support the
         sequential policy.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -1753,16 +1768,20 @@ def peps_normalize(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Boundary compression mode. Quimb also accepts the supported
         ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
         ``srcmps``. The direct modes compress each
-        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
-        uses two-site warm-up followed by one-site refinement.
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
     fit_layer_mode : {"joint", "sequential"}, default="joint"
         Direct-mode layer policy. ``"joint"`` compresses all tagged layers
         together; ``"sequential"`` compresses them one at a time in the
         order given by ``layer_tags``.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
     layer_tags : sequence[str] | None, default=None
         Layer tags used for sequential direct compression, in absorption
         order. Use e.g. ``("BRA", "PEPO", "KET")`` for three layers.
@@ -1956,16 +1975,20 @@ def boundary_norm(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Boundary compression mode. Quimb also accepts the supported
         ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
         ``srcmps``. The direct modes compress each
-        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
-        uses two-site warm-up followed by one-site refinement.
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
     fit_layer_mode : {"joint", "sequential"}, default="joint"
         Direct-mode layer policy. ``"joint"`` compresses all tagged layers
         together; ``"sequential"`` compresses them one at a time in the
         order given by ``layer_tags``.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.
@@ -2257,16 +2280,20 @@ def peps_infidelity(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track per-step fidelity during boundary contraction.
-    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Boundary compression mode. Quimb also accepts the supported
         ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
         ``srcmps``. The direct modes compress each
-        boundary target; ``"dmrg"`` aliases ``"eff"`` and ``"dmrg2"``
-        uses two-site warm-up followed by one-site refinement.
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
     fit_layer_mode : {"joint", "sequential"}, default="joint"
         Direct-mode layer policy. ``"joint"`` compresses all tagged layers
         together; ``"sequential"`` compresses them one at a time in the
         order given by ``layer_tags``.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess. ``"guess-src"`` applies Quimb
         SRC to a copy of each exact boundary target before FIT.

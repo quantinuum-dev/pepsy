@@ -448,6 +448,7 @@ def test_compbdy_fit_mode_is_canonicalized_and_validated_early():
     assert pepsy.CompBdy(norm, {}, fit_mode="two_site").fit_mode == "two-site"
     assert pepsy.CompBdy(norm, {}, fit_mode="one-site").fit_mode == "eff"
     assert pepsy.CompBdy(norm, {}, fit_mode="dmrg").fit_mode == "eff"
+    assert pepsy.CompBdy(norm, {}, fit_mode="dmrg1").fit_mode == "eff"
     assert pepsy.CompBdy(norm, {}, fit_mode="dmrg2").fit_mode == "dmrg2"
     for mode in (
         "direct",
@@ -960,6 +961,38 @@ def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
     )
 
 
+def test_direct_compression_skips_unused_boundary_guess(monkeypatch):
+    """Direct compression should not initialize or globally expand a FIT guess."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=487, dtype="complex128")
+    _, norm = pepsy.build_bra_ket(ket=ket.copy())
+    bdy = pepsy.BdyMPS(tn_double=norm, chi=1, lazy=True)
+
+    def fail_unused_guess(*_args, **_kwargs):
+        raise AssertionError("direct compression constructed an unused boundary guess")
+
+    monkeypatch.setattr(bdy, "expand_bnd", fail_unused_guess)
+    monkeypatch.setattr(pepsy.BdyMPS, "_prepare_boundary_mps", fail_unused_guess)
+
+    result = pepsy.peps_norm(
+        ket.copy(),
+        chi=4,
+        bdy=bdy,
+        fit_mode="direct",
+        fit_max_bond=4,
+        n_iter=1,
+        max_separation=0,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+        return_info=True,
+    )
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    assert result.cost == pytest.approx(exact)
+    assert dict.__len__(bdy.mps_b) > 0
+    assert all(mps.max_bond() <= 4 for mps in bdy.mps_b.values())
+
+
 @pytest.mark.parametrize("fit_mode", ("direct", "src", "zipup", "sdc", "dm"))
 def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
     """Direct compressors can absorb the standard BRA/KET layers separately."""
@@ -987,7 +1020,10 @@ def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
     )
 
 
-def test_contract_layered_supports_sequential_three_layer_compression():
+@pytest.mark.parametrize("fit_layer_order", ("input", "auto"))
+def test_contract_layered_supports_sequential_three_layer_compression(
+    fit_layer_order,
+):
     """A tagged BRA--PEPO--KET target uses the multilayer boundary façade."""
 
     def add_unit_layer(tn, layer, *, lx=2, ly=2):
@@ -1025,6 +1061,7 @@ def test_contract_layered_supports_sequential_three_layer_compression():
         chi=2,
         fit_mode="sdc",
         fit_layer_mode="sequential",
+        fit_layer_order=fit_layer_order,
         layer_tags=("BRA", "PEPO", "KET"),
         n_iter=1,
         max_separation=0,

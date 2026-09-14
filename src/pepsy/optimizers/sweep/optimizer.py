@@ -93,12 +93,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         place.
     contraction_opt : object | str, default="auto-hq"
         Contraction optimizer.
-    fit_mode : {"direct", "src", "zipup", "sdc", "dm", "eff", "two-site", "dmrg", "dmrg2", "global"}, default="eff"
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary.sweeps.CompBdy`.
-        Quimb modes directly compress boundary targets. ``"dmrg"`` aliases
-        ``"eff"`` and ``"dmrg2"`` uses two-site warm-up followed by
-        one-site refinement. ``"two-site"`` remains the legacy fixed
-        two-site mode.
+        Quimb modes, including supported ``*-first`` and ``*-oversample``
+        variants, directly compress boundary targets. ``"dmrg"`` and
+        ``"dmrg1"`` alias ``"eff"``; ``"dmrg2"`` uses two-site warm-up
+        followed by one-site refinement. ``"two-site"`` remains the legacy
+        fixed two-site mode.
     fit_layer_mode : {"joint", "sequential"}, default="joint"
         Layer policy for direct Quimb boundary compression. ``"joint"``
         compresses all tagged layers together; ``"sequential"`` absorbs them
@@ -507,7 +508,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         ):
             raise ValueError(
                 "fit_layer_mode='sequential' is only supported with direct "
-                "Quimb fit modes: 'direct', 'src', 'zipup', 'sdc', or 'dm'."
+                f"Quimb fit modes; got fit_mode={fit_mode!r}."
             )
         if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
             1,
