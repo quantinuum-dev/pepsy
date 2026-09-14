@@ -32,7 +32,7 @@ def test_environment_plan_is_immutable_bounded_and_directional():
             plan(invalid, 2)
 
 
-@pytest.mark.parametrize("method", ["src", "sdc"])
+@pytest.mark.parametrize("method", ["src", "sdc", "sdcr"])
 def test_environment_objects_are_reused_then_released(monkeypatch, method):
     import pepsy.optimizers.tree.compression as tc
 
@@ -47,6 +47,7 @@ def test_environment_objects_are_reused_then_released(monkeypatch, method):
     built = []
     references = {}
     reads = {}
+    environment_split_methods = []
     projecting = False
 
     def remember(tensor):
@@ -77,8 +78,10 @@ def test_environment_objects_are_reused_then_released(monkeypatch, method):
         nonlocal projecting
         if kwargs.get("method") == "qr":
             projecting = True
+        elif not projecting:
+            environment_split_methods.append(kwargs.get("method"))
         result = original_split(self, *args, **kwargs)
-        if method == "sdc" and not projecting:
+        if method in {"sdc", "sdcr"} and not projecting:
             remember(result[1])
         return result
 
@@ -91,6 +94,75 @@ def test_environment_objects_are_reused_then_released(monkeypatch, method):
     assert len(built) == len(tc._successive_environment_plan(order, 3)[1]) == 6
     assert max(reads.values()) >= 2
     assert all(reference() is None for reference in references.values())
+    if method == "sdcr":
+        assert set(environment_split_methods) == {"svd:rand"}
+
+
+@pytest.mark.parametrize("method", ["sdc", "sdcr"])
+def test_successive_environment_cutoffs_follow_randomized_svd_contract(
+    monkeypatch, method,
+):
+    """SDCR uses rank-only, relative-cutoff environment sketches."""
+    state = qtn.MPS_rand_state(5, 3, dtype="complex128", seed=17)
+    local = {i: [state[i]] for i in range(5)}
+    calls = []
+    original_split = qtn.Tensor.split
+
+    def split(self, *args, **kwargs):
+        if kwargs.get("method") in {"svd", "svd:rand"}:
+            calls.append((kwargs["method"], kwargs["cutoff"], kwargs["cutoff_mode"]))
+            if method == "sdcr" and kwargs["method"] == "svd:rand":
+                assert kwargs["cutoff"] == 0.0
+                assert kwargs["cutoff_mode"] == "rel"
+        return original_split(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.Tensor, "split", split)
+    successive_tree_compress(
+        local,
+        [(i, i - 1) for i in range(4, 0, -1)],
+        0,
+        method=method,
+        max_bond=2,
+        cutoff=1e-4,
+        cutoff_mode="rsum2",
+        seed=29,
+    )
+    environment_calls = [call for call in calls if call[0] == ("svd:rand" if method == "sdcr" else "svd")]
+    assert environment_calls
+    if method == "sdcr":
+        assert {(cutoff, mode) for _, cutoff, mode in environment_calls} == {(0.0, "rel")}
+    else:
+        assert {(cutoff, mode) for _, cutoff, mode in environment_calls} == {(1e-4, "rsum2")}
+
+
+@pytest.mark.parametrize("method", ["sdc_oversample", "sdcr_oversample"])
+def test_tree_oversample_modes_use_explicit_intermediate_rank(monkeypatch, method):
+    """SDC and SDCR oversampling pass the requested intermediate rank."""
+    import pepsy.optimizers.tree.compression as tc
+
+    plan = TreePlan.from_order(range(6), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=3, seed=8, dtype="complex128")
+    calls = []
+    original = tc.successive_tree_compress
+
+    def record(*args, **kwargs):
+        calls.append((kwargs["method"], kwargs["max_bond"], kwargs["cutoff_mode"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tc, "successive_tree_compress", record)
+    state.compress(
+        max_bond=2,
+        max_bond_oversample=5,
+        cutoff=0.0,
+        cutoff_oversample=1e-5,
+        cutoff_mode_oversample="rel",
+        compression_mode=method,
+        compression_seed=31,
+    )
+
+    assert calls == [(method.removesuffix("_oversample"), 5, "rel")]
+    assert state.max_bond() <= 2
+    assert state.is_canonical_form()
 
 
 def test_cached_plan_cannot_reuse_stale_values_shapes_or_failed_work(monkeypatch):
@@ -222,7 +294,7 @@ def test_layered_src_matches_unmodified_quimb_seed_and_work(monkeypatch, backend
                                rtol=tolerance, atol=tolerance)
 
 
-@pytest.mark.parametrize("method", ["src", "sdc"])
+@pytest.mark.parametrize("method", ["src", "sdc", "sdcr"])
 def test_path_reduces_to_quimb_successive_algorithm(monkeypatch, method):
     import quimb.tensor.tn1d.compress as qc
     import pepsy.optimizers.tree.compression as tc
@@ -249,8 +321,11 @@ def test_path_reduces_to_quimb_successive_algorithm(monkeypatch, method):
             return [qtn.Tensor(next(counter), inds=(Bix, *inds))]
 
         monkeypatch.setattr(qc, "_src_get_local_noise_tensors", same_noise)
+    reference_kwargs = {"max_bond": 2, "cutoff": 0}
+    if method == "sdcr":
+        reference_kwargs["seed"] = 71
     reference = getattr(qc, f"tensor_network_1d_compress_{method}")(
-        state, max_bond=2, cutoff=0,
+        state, **reference_kwargs,
     )
     actual = qtn.TensorNetwork(tensors.values()).to_dense(
         [f"k{i}" for i in range(5)]
@@ -260,8 +335,11 @@ def test_path_reduces_to_quimb_successive_algorithm(monkeypatch, method):
 
 @pytest.mark.parametrize("method,backend,chi", [
     ("src", "numpy", 2), ("sdc", "numpy", 2),
+    ("sdcr", "numpy", 2),
     ("src", "torch", 16), ("sdc", "torch", 16),
+    ("sdcr", "torch", 16),
     ("src", "jax", 2), ("sdc", "jax", 2),
+    ("sdcr", "jax", 2),
     ("zipup", "numpy", 16), ("zipup", "torch", 2),
 ])
 def test_layered_tree_compression_uses_real_algorithm(monkeypatch, method, backend, chi):
@@ -291,7 +369,7 @@ def test_layered_tree_compression_uses_real_algorithm(monkeypatch, method, backe
     monkeypatch.setattr(opt, "_route_subtree_messages", forbidden)
     monkeypatch.setattr(opt, "_compress_subtree", forbidden)
     monkeypatch.setattr(opt.tn, "compress_edge_", forbidden)
-    if method in {"src", "sdc"}:
+    if method in {"src", "sdc", "sdcr"}:
         original_install = opt._install_routed_subtree
         original_move = opt._move_center
         installing = False
@@ -324,6 +402,40 @@ def test_layered_tree_compression_uses_real_algorithm(monkeypatch, method, backe
     assert all(event["kind"] == method for event in opt.truncation_history)
 
 
+def test_sdcr_state_compress_uses_randomized_environment_svd(monkeypatch):
+    """SDCR randomizes only the successive environment factorization."""
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=3, seed=62, dtype="complex128")
+    methods = []
+    original = qtn.Tensor.split
+
+    def split(self, *args, **kwargs):
+        if kwargs.get("method") != "qr":
+            methods.append(kwargs.get("method"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.Tensor, "split", split)
+    state.compress(
+        max_bond=2,
+        cutoff=0.0,
+        compression_mode="sdcr",
+        compression_seed=12,
+    )
+    assert methods
+    assert set(methods) == {"svd:rand"}
+    assert state.max_bond() <= 2
+    assert state.is_canonical_form()
+
+
+@pytest.mark.parametrize("method", ["src_oversample", "sdc_oversample", "sdcr", "sdcr_oversample"])
+def test_rank_based_successive_modes_require_explicit_max_bond(method):
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=3, seed=62, dtype="complex128")
+
+    with pytest.raises(ValueError, match="requires max_bond"):
+        state.compress(compression_mode=method)
+
+
 @pytest.mark.parametrize("method", ["src", "sdc"])
 def test_state_compress_uses_environment_algorithm(monkeypatch, method):
     plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
@@ -341,7 +453,7 @@ def test_state_compress_uses_environment_algorithm(monkeypatch, method):
     assert state.is_canonical_form()
 
 
-@pytest.mark.parametrize("method", ["src", "sdc", "zipup"])
+@pytest.mark.parametrize("method", ["src", "sdc", "sdcr", "zipup"])
 def test_partial_span_preserves_exterior_and_weak_branch(method):
     plan = TreePlan.from_order(range(7), structure="balanced", top_arity=3)
     state = TreeTensorNetwork.rand(plan, D=2, seed=11, dtype="complex64")
@@ -357,7 +469,7 @@ def test_partial_span_preserves_exterior_and_weak_branch(method):
     assert opt.tn.is_canonical_form(tol=2e-5)
 
 
-@pytest.mark.parametrize("method", ["src", "sdc"])
+@pytest.mark.parametrize("method", ["src", "sdc", "sdcr"])
 def test_zero_target_and_low_level_edge_are_finite(method):
     state = TreeTensorNetwork.from_order(range(4), dtype="complex128")
     a = next(u for u in state.plan.nodes() if u != state.plan.root)
@@ -372,7 +484,12 @@ def test_zero_target_and_low_level_edge_are_finite(method):
     np.testing.assert_allclose(state.to_dense(), 0)
 
 
-@pytest.mark.parametrize("method", ["src", "sdc"])
+@pytest.mark.parametrize(
+    "method", [
+        "src", "src_oversample", "sdc", "sdc_oversample", "sdcr",
+        "sdcr_oversample",
+    ]
+)
 def test_native_successive_request_is_explicitly_rejected(method):
     import pepsy
 

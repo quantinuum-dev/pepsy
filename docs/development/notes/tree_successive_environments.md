@@ -158,11 +158,12 @@ regressions explicitly forbid the full-target routing and final canonical
 compression paths while checking its state and isometries. It remains
 different from both direct compression and SRC/SDC.
 
-Edge histories record dimensions for all three algorithms; local singular
+Edge histories record dimensions for all successive algorithms; local singular
 spectra of approximate environments are not reported as global discarded
 weights. Norm-survival diagnostics retain their existing separate semantics.
-TreeFIT's SRC/SDC guesses use the actual environment algorithms; its later
-local variational refinements use ordinary direct SVD.
+The existing TreeFIT `guess-src`/`guess-sdc` initialization options use their
+corresponding environment algorithms; TreeFIT's later variational refinements
+use ordinary direct SVD. `sdcr` is not a FIT variant.
 
 SRC/SDC currently reject native symmetry arrays rather than replacing the
 algorithm or densifying the state. This also removes the former native SDC
@@ -328,3 +329,127 @@ independently reproduced upstream DM complex64 failure described above.
 Ruff, skill/catalog validation, and whitespace checks passed. The full
 repository suite was not run because this follow-up is confined to tree
 compression and validation covered its callers.
+
+## 2026-09-11 SRC accuracy follow-up
+
+The dense tree SRC path remains the fixed-rank Quimb-parity implementation:
+the default `compression_mode="src"` still draws exactly `chi` common-column
+product sketches, caches only the required directed environments for one
+call, and projects the original layered target with Q-only QR factors. No
+numerical environment is reused across gates. The existing path comparison
+and branch reference tests remain unchanged.
+
+Added the opt-in `compression_mode="src-oversample"` / `mode="src-oversample"`:
+the first SRC pass uses Quimb's default intermediate rank
+`max(round(1.5 * chi), chi + 10)`, then a direct tree-native rounding sweep
+returns every active edge to `chi`. Path-shaped regions reverse the first
+peel direction, matching Quimb's oversampled SRC/direct-sweep arrangement;
+branching regions retain their valid inward peel order because a tree has no
+unique opposite endpoint. The round uses direct edge SVDs, lossless return
+QRs between sibling branches, and never materializes a dense state. FIT and
+TreeFIT/DMRG ownership are unchanged.
+
+The active environment reports Quimb `1.15.1.dev51+g2e99c793e`, Autoray
+`0.11.1.dev3+g1b476b305`, Cotengra `0.8.3.dev7+g1d7fd333f`, and Symmray
+`0.3.2.dev8+g6c6dd34b5`. Probes rechecked Quimb's `src` and
+`src-oversample` signatures, `Tensor.split`, `TensorNetwork.compress_between`,
+Autoray `random.default_rng` / `random.array`, and JAX's scoped
+`default_matmul_precision` context. The official [Quimb compression
+documentation](https://quimb.readthedocs.io/en/latest/autoapi/quimb/tensor/tn1d/compress/index.html)
+and [changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray random API](https://autoray.readthedocs.io/en/stable/random.html),
+Cotengra documentation/changelog, and Symmray documentation/repository were
+reviewed again. The Symmray Abelian HTML page remains unavailable to the
+retrieval tool.
+
+Disposition: **adopt** the opt-in oversampled SRC/direct-rounding composition;
+**adopt** scoped highest-available JAX accumulation for complex64 tree SRC
+contractions and canonical diagnostics; **defer** `srcmps`, native graded SRC,
+and adaptive SRC tolerance. The deferred methods require separate tree-native
+semantics and should not be aliases of the dense path.
+
+Focused validation after this change: 43 selected tree SRC/successive and
+ordinary TreeMPO-mode tests passed, including NumPy/Torch/JAX dense paths,
+seed reproducibility, branch canonicality, direct-round dispatch, and the
+existing environment-reuse checks. The complete tree compression and optimizer
+suite passed with 431 tests, the public API/package-layout suite passed with
+48 tests, Python compilation passed for the modified tree modules, and Ruff
+passed on the modified tree source and tests.
+
+## 2026-09-11 SDCR follow-up
+
+Added `sdcr` as a separate dense-only successive environment mode. It retains
+the SDC geometry, environment lifetime/release schedule, original layered
+target projection, and Q-only QR stage, but calls the public Quimb split driver
+`method="svd:rand"` for each low-rank environment factor. The installed
+Quimb `tensor_network_1d_compress_sdcr` signature was rechecked as
+`(tn, max_bond, cutoff=1e-10, site_tags=None, normalize=False,
+cutoff_mode="rel", permute_arrays=True, optimize="auto-hq",
+sweep_reverse=False, canonize=True, equalize_norms=False, contract_opts=None,
+project_opts=None, compress_opts=None, inplace=False, **kwargs)`. Its default
+environment options are `num_iterations=0` and `oversample=0`; `max_bond` is
+the static randomized sketch rank, and the default randomized step does not
+use a dynamic cutoff. Pepsy forwards `compression_seed` into every randomized
+environment split to preserve the same seeded per-split contract as Quimb.
+
+The mode is wired through `TreeTensorNetwork` and `TreeOptimizer`, including
+ordinary TreeMPO replay, direct state compression, mode normalization, copy
+settings, truncation metadata, and explicit native Symmray rejection.
+FIT/TreeFIT/DMRG remains separate and unchanged.
+
+The active dependency audit remains Quimb
+`1.15.1.dev51+g2e99c793e`, Autoray `0.11.1.dev3+g1b476b305`, Cotengra
+`0.8.3.dev7+g1d7fd333f`, and Symmray `0.3.2.dev8+g6c6dd34b5`. The public
+Quimb compression documentation and randomized-SVD dispatch were inspected;
+the relevant upstream references are the [Quimb compression
+API](https://quimb.readthedocs.io/en/latest/autoapi/quimb/tensor/tn1d/compress/index.html)
+and the [SDC/SDCR paper](https://arxiv.org/abs/2601.19650). Disposition:
+**adopt** dense SDCR as opt-in and **adopt** the deterministic/randomized
+oversampled tree variants; **defer** `srcmps`, native graded randomized
+environments, and adaptive chi growth.
+
+Validation added path parity against Quimb SDCR, randomized-environment driver
+dispatch checks, NumPy/Torch/JAX dense branch replay, reproducibility,
+zero-target handling, partial spans, native rejection, explicit-`max_bond`
+validation, and ordinary optimizer mode coverage. The focused successive
+suite passed with 56 tests; the broader tree compression/optimizer suite
+passed with 443 tests, the public API/package-layout suite passed with 48
+tests, and Ruff plus whitespace checks passed.
+
+## 2026-09-11 Quimb oversampling compatibility follow-up
+
+The local upstream audit confirmed that Quimb exposes `sdc-oversample` and
+`sdcr-oversample` in addition to `src-oversample`. Pepsy now adopts these as
+opt-in dense tree modes. They use the shared Quimb intermediate-rank policy
+(`max(round(1.5 * max_bond), max_bond + 10)` by default), accept explicit
+integer ranks or floating-point multipliers through `max_bond_oversample`, and
+finish with a direct tree round at the requested final cap. SDC oversampling
+also exposes `cutoff_oversample` and `cutoff_mode_oversample`; the default
+intermediate mode is `rel`, while the final round retains Pepsy's configured
+cutoff and cutoff mode.
+
+The Quimb v1.16 development changelog notes that randomized SVD rejects active
+cumulative cutoff modes. Pepsy therefore sends `cutoff=0` and
+`cutoff_mode="rel"` to all SDCR environment splits, including
+`sdcr-oversample`; this is a narrow in-memory compatibility shim and does not
+change the final direct-round diagnostics. The existing tree default
+`cutoff_mode="rsum2"` remains unchanged for SDC and final direct splits.
+`srcmps` remains deferred because it requires an explicit MPS input and is not
+a valid tree-native mode.
+
+Installed versions rechecked in the shared environment were Quimb
+`1.15.1.dev51+g2e99c793e`, Autoray `0.11.1.dev3+g1b476b305`, Cotengra
+`0.8.3.dev7+g1d7fd333f`, and Symmray `0.3.2.dev8+g6c6dd34b5`. Callable
+signatures and dispatches were probed for Quimb's six successive compressors,
+`Tensor.split`, Autoray random-array and linear-algebra dispatch, and the
+relevant Cotengra/Symmray modules. Disposition: **adopt** the three
+oversampled dense tree routes and **compatibility shim** randomized SDCR
+cutoffs; **defer** `srcmps`, native graded successive environments, and making
+any new method a default.
+
+Focused validation added explicit-rank and final-round tests for SDC/SDCR
+oversampling, randomized-cutoff contract coverage, mode normalization, copy
+and run persistence, and existing path/branch behavior. CPU-focused selected
+tests passed; four unrelated CUDA-only tests were unavailable in this
+environment because CuSolver/CUDA reported internal-error or out-of-memory
+failures.

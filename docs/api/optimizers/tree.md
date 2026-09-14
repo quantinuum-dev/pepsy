@@ -145,7 +145,7 @@ compression or `to_dense()` lowering occurs. Native Symmray MPOs retain their
 graded contraction and fermionic sign rules.
 
 The optimizer-level `opt.expectation_mpo(...)` retains the configured update
-algorithm for TreeMPO input: direct/DM, SRC/SDC, zipup, or FIT. It preserves
+algorithm for TreeMPO input: direct/DM, SRC/SDC/SDCR, zipup, or FIT. It preserves
 the parent state and sampling RNG, including when a private copy fails.
 Private readout starts with fresh histories and does not copy the queued gate
 stream. Public `copy()` retains independent histories and the queued stream.
@@ -363,8 +363,10 @@ node.
 
 Gates are absorbed into the tree according to the selected optimizer mode:
 
-- **ordinary `apply_gate` entries** in `auto`, `direct`, `dm`, `sdc`, `src`,
-  and `mpo` are lowered to `SubTreeMPO` with `SubTreeMPO.from_gate`,
+- **ordinary `apply_gate` entries** in `auto`, `direct`, `dm`, `sdc`,
+  `sdc-oversample`, `sdcr`, `sdcr-oversample`, `src`, `src-oversample`, and
+  `mpo` are lowered to `SubTreeMPO` with
+  `SubTreeMPO.from_gate`,
   factorized on the minimal TreePlan Steiner subtree, and applied with
   `apply_sub_mpotree`. The compression mode controls the tree-edge state
   compression, and gate width no longer causes a dense-route cliff.
@@ -619,8 +621,9 @@ Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
 only). Every mode first factorizes the operator into a compact `SubTreeMPO` on the
 **minimal connected subtree** (Steiner subtree) spanning the target physical
 nodes, then uses `apply_sub_mpotree`, just like ordinary `apply_gate`.
-SRC/SDC compute complementary environments from the original operator/state
-layers. Zipup streams truncation and DMRG fits that same exact layered target.
+SRC/SDC/SDCR compute complementary environments from the original
+operator/state layers. Zipup streams truncation and DMRG fits that same exact
+layered target.
 Direct/DM application proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
@@ -701,7 +704,8 @@ MPS backend, whose compression domain is a chain interval.
 
 The two explicit two-site families preserve native Symmray gates and their
 block-sparse fermionic grading. Ordinary `apply_gate` entries in
-`auto`/`direct`/`dm`/`sdc`/`src`/`mpo` are lowered to a true TreeMPO and
+`auto`/`direct`/`dm`/`sdc`/`sdc-oversample`/`sdcr`/`sdcr-oversample`/`src`/
+`src-oversample`/`mpo` are lowered to a true TreeMPO and
 contracted through `apply_sub_mpotree` on the active canonical Steiner region.
 `tree_mpo_direct` and `tree_mpo_dm` are explicit names for that same route,
 selecting direct SVD or density-matrix compression. The `submpo` mode remains
@@ -712,7 +716,9 @@ an explicit structured `apply_submpo` retains its chain-operator routing and
 final subtree compression even when the configured mode is DMRG.
 
 For an ordinary gate stream, any of `mode="direct"`, `mode="dm"`,
-`mode="sdc"`, `mode="src"`, or `mode="mpo"` now uses the TreeMPO path;
+`mode="sdc"`, `mode="sdc-oversample"`, `mode="sdcr"`,
+`mode="sdcr-oversample"`, `mode="src"`, `mode="src-oversample"`, or `mode="mpo"` now
+uses the TreeMPO path;
 `mode="tree_mpo"` is an alias for `tree_mpo_direct`, hyphenated names are
 accepted, and `tree_mpo_dem` is kept as a compatibility spelling for
 `tree_mpo_dm`. The combined `tree_mpo_*` names own their compression suffix,
@@ -725,6 +731,7 @@ for shared frontends.
 
 Constructor `mode`, deprecated `two_site_mode`, and `run(mode=...)` share
 normalization, aliases, and conflict validation. `dm`, `src`, `sdc`,
+`sdc-oversample`, `sdcr`, `sdcr-oversample`,
 `tree_mpo_direct`, and `tree_mpo_dm` select their named compressor; `zipup`
 selects its streamed direct splits. These names accept the neutral
 `compression_mode="direct"` constructor default or their matching compressor.
@@ -736,7 +743,7 @@ switch an existing optimizer to direct compression, use
 | Option entry point | Scope |
 | --- | --- |
 | Constructor `fit_*` controls | Inherited by copies and shot children; unsupported as `run` keywords or inside `run_kwargs` |
-| Ordinary `run(mode=..., compression_mode=..., compression_seed=..., track_infidelity=...)` | Persistent after argument/stream validation succeeds |
+| Ordinary `run(mode=..., compression_mode=..., compression_seed=..., max_bond_oversample=..., cutoff_oversample=..., cutoff_mode_oversample=..., track_infidelity=...)` | Persistent after argument/stream validation succeeds |
 | Operator `max_bond=...`, `cutoff=...` | One call, including its compressed guess and FIT; `None` inherits optimizer settings |
 | Shot top-level replay options | Child overrides; parent state, queue, configuration, and RNG remain unchanged |
 | Shot `run_kwargs` | Explicit child replay settings take precedence over corresponding top-level options |
@@ -770,7 +777,7 @@ For a path-shaped active subtree, direct and DM prepare the complete operator
 losslessly, then compress each edge once from one endpoint to the other.
 Exact TreeMPO preparation can peel from both ends to keep QR matrices small;
 it then moves the completed center to the compression entry endpoint.
-Before routing, direct/DM and SRC/SDC reuse a canonical region already inside
+Before routing, direct/DM and SRC/SDC/SDCR reuse a canonical region already inside
 the active subtree. Otherwise, a known center moves only to the first subtree
 entry; an unknown gauge uses exterior canonicalization. Interior preparation
 QRs are unnecessary because the routing algorithm replaces those tensors.
@@ -784,7 +791,7 @@ subtree-operator and sub-MPO paths use the same directional compression.
 Branched regions retain their tree sweep. Finite-cap results can change from
 the previous interior-hub order.
 
-SRC/SDC likewise use an endpoint hub on paths, building only the complementary
+SRC/SDC/SDCR and their oversampled variants likewise use an endpoint hub on paths, building only the complementary
 environments needed for the opposite projection sweep. Zipup uses a directional
 path sweep with immediate truncation. These modes keep their distinct algorithms;
 the tree is not converted to an MPS.
@@ -845,8 +852,20 @@ hub. Arrays, dimensions, sketches, and consumption counters are always fresh:
 in-place edits, new operators, ranks, seeds, backends, and failed retries cannot
 reuse stale numerical environments.
 Intermediate contractions drop tags; final tensors retain their local tags.
-Only the exterior is canonicalized before SRC/SDC; the active tensors are
+Only the exterior is canonicalized before SRC/SDC/SDCR; the active tensors are
 replaced by the projector sweep without an initial internal center move.
+
+`compression_mode="src-oversample"`, `"sdc-oversample"`, and
+`"sdcr-oversample"` are accuracy-oriented opt-in variants. Each first uses
+the corresponding successive environment method at an intermediate rank, then
+uses direct SVD compression with the requested final cutoff. The default
+intermediate rank is Quimb's
+`max(round(1.5 * chi), chi + 10)`; set `max_bond_oversample` to an explicit
+rank or to a floating-point multiplier of `chi`. Path-shaped sweeps reverse
+their first direction so the final direct round sees the opposite environment;
+branching regions retain their valid tree peel order. None of these routes
+materializes a dense state. The branched-tree behavior is a Pepsy tree
+extension of Quimb's chain algorithms.
 
 `compression_mode="sdc"` uses the same successive projection structure with
 deterministic low-rank complementary environments. Their factors are computed
@@ -854,19 +873,35 @@ using direct truncated SVD, avoiding squared conditioning and a NumPy
 complex64 JIT failure in the installed Quimb eigendecomposition driver.
 `cutoff`, `cutoff_mode`, and `chi` control those environment factors.
 
-These are distinct environment algorithms, not randomized local SVD or aliases
-of `direct`. On a path they reproduce Quimb's SRC/SDC sweeps (SRC comparisons
-use identical sketches). On a branching tree, each retained node incorporates
+`compression_mode="sdcr"` keeps the same successive environment geometry and
+target projection, but computes each low-rank environment factor with
+Quimb's static randomized SVD driver (`svd:rand`, with no oversampling or
+power iterations by default). `chi` is both the sketch rank and the output
+cap; `cutoff` is ignored by this randomized environment step, matching
+Quimb. `compression_seed` controls reproducibility. Pepsy explicitly sends
+`cutoff=0` and `cutoff_mode="rel"` to randomized environment splits, so
+future Quimb releases that reject cumulative cutoff modes remain compatible;
+the configured final cutoff is still applied by the final direct round.
+`sdc-oversample` instead uses `cutoff_oversample` and
+`cutoff_mode_oversample` for its deterministic intermediate factors. These
+modes are dense-only and should be benchmarked against `sdc` on representative
+branched trees before changing defaults.
+
+These are distinct environment algorithms, not local randomized SVD aliases
+of `direct`. On a path they reproduce Quimb's SRC/SDC/SDCR sweeps (SRC/SDCR
+comparisons use the corresponding randomized seeds). On a branching tree, each retained node incorporates
 its already projected children and a cached complementary environment.
 They never materialize the complete operator-applied tree before compression.
 The final hub is canonical and retains the projected target norm.
 
-Both environment methods currently require dense arrays. Native symmetry
+All successive environment methods currently require dense arrays. Native symmetry
 trees reject them explicitly; use native `direct` or `zipup`. Edge records
 report dimensions, but do not invent discarded spectra or global error bounds
-from these approximate environments. TreeFIT guesses use these algorithms;
-its subsequent local refinement uses direct SVD. A Cholesky-based compressor
-is not implemented by either mode.
+from these approximate environments. The existing TreeFIT
+`guess-src`/`guess-sdc` initialization options use their corresponding
+environment algorithms; TreeFIT's subsequent variational refinement uses
+direct SVD. `sdcr` is not a FIT variant. A Cholesky-based compressor is not
+implemented by these modes.
 
 ### Tree-native FIT / DMRG
 
@@ -904,6 +939,11 @@ a new fit for its new target. Initial exterior contractions can visit the
 whole state even when the operator itself is compact. Subsequent local
 updates reuse unaffected messages. The cache holds at most one tensor per
 directed tree edge, with tensor sizes determined by the live bond dimensions.
+For dense compact circuit targets, an unchanged canonical exterior component
+can instead be relabelled to its boundary identity without contracting the
+dangling branch; `environment_cache_info()["identity_shortcuts"]` reports
+these uses. Native Symmray and fermionic fits retain the graded message
+contraction.
 
 Standalone callers who directly edit `fit.p` tensor data must invalidate its
 canonical metadata and call `fit.clear_environment_cache()` before resuming.
@@ -972,7 +1012,7 @@ optimizer.apply_sub_mpotree(tree_operator)
 The same policies apply to `dmrg1`, `dmrg2`, and `dmrg3`, whether the input
 is an ordinary gate or an explicit multi-site `sub_mpotree`. A few-body
 operator whose physical sites lie on one path still benefits from the
-automatic path route. Direct/SRC/SDC/zipup keep their own compression sweeps;
+automatic path route. Direct/SRC/SDC/SDCR/zipup keep their own compression sweeps;
 `fit_traversal` controls FIT and does not change those algorithms.
 
 Auto freezes a reference path before constructing the guess, beginning at
@@ -985,7 +1025,7 @@ previous center. The order stays fixed through the 3→2→1 transitions.
 
 Automatic guesses remain SRC for dense trees and direct for native fermionic
 trees. Compressed guesses finish at the actual first FIT endpoint, including
-when the pass order is reversed. SRC/SDC retain the original layered target
+when the pass order is reversed. SRC/SDC/SDCR retain the original layered target
 and their per-call environment caches. This changes seeded approximations
 from the previous hub order while remaining reproducible with the same
 state, seed, and options. Finite-bond fidelity and convergence can change;
@@ -1056,7 +1096,7 @@ historical FIT records; replacing the state through `set_tn` / `set_p` clears
 both the history and latest record along with the other update diagnostics.
 The record's `split_method` identifies the actual local factorization:
 `"direct"` or `"dm"`. Explicit direct/DM compression settings are retained;
-SRC/SDC settings map to direct local SVD because complementary-environment
+SRC/SDC/SDCR settings map to direct local SVD because complementary-environment
 compression is a separate whole-subtree algorithm. `fit_init_strategy`
 independently determines the disposable guess method.
 
@@ -1093,7 +1133,7 @@ tensor must belong to exactly one structural node group; local layer bonds
 stay inside a group, and one or more inter-group bonds must follow the fitted
 tree edges. Ambiguous or untagged layer tensors are rejected rather than
 dropped. The separate two-layer path compressor remains the `TreePeps`
-`sdc`/`src`/`zipup` route when that direct Quimb path is desired.
+`sdc`/`sdcr`/`src`/`zipup` route when that direct Quimb path is desired.
 
 `TreeOptimizer`'s DMRG target is built as a layered operator--state network:
 the state and TreeMPO virtual bonds are not fused, and only corresponding

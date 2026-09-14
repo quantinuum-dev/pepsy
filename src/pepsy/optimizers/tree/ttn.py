@@ -56,6 +56,12 @@ from .layout import TreePlan, _DEFAULT_TOP_ARITY
 __all__ = ["TreeTensorNetwork"]
 
 
+_SUCCESSIVE_COMPRESSION_MODES = frozenset({
+    "src", "src_oversample", "sdc", "sdc_oversample", "sdcr",
+    "sdcr_oversample",
+})
+
+
 def _normalize_compression_mode(mode):
     """Normalize the local tree-bond compression decomposition mode."""
 
@@ -67,11 +73,31 @@ def _normalize_compression_mode(mode):
         "densitymatrix": "dm",
     }
     mode = aliases.get(mode, mode)
-    if mode not in {"direct", "dm", "sdc", "src"}:
+    if mode not in {
+        "direct", "dm", "sdc", "sdc_oversample", "sdcr", "sdcr_oversample",
+        "src", "src_oversample",
+    }:
         raise ValueError(
-            "compression_mode must be 'direct', 'dm', 'sdc', or 'src'."
+            "compression_mode must be 'direct', 'dm', 'sdc', 'sdc-oversample', "
+            "'sdcr', 'sdcr-oversample', 'src', or 'src-oversample'."
         )
     return mode
+
+
+def _normalize_oversample_options(cutoff, cutoff_mode):
+    """Normalize the intermediate cutoff controls for direct TTN callers."""
+    if cutoff is None:
+        cutoff = 0.0
+    else:
+        cutoff = float(cutoff)
+        if not np.isfinite(cutoff) or cutoff < 0.0:
+            raise ValueError("cutoff_oversample must be finite and non-negative.")
+    if cutoff_mode is None or (
+        isinstance(cutoff_mode, str)
+        and cutoff_mode.strip().lower() == "auto"
+    ):
+        cutoff_mode = "rel"
+    return cutoff, cutoff_mode
 
 
 def _compression_method(mode):
@@ -80,8 +106,11 @@ def _compression_method(mode):
     mode = _normalize_compression_mode(mode)
     if mode == "dm":
         return "svd:eig"
-    if mode in {"src", "sdc"}:
-        raise ValueError("SRC/SDC require complementary environments, not a local split driver")
+    if mode in _SUCCESSIVE_COMPRESSION_MODES:
+        raise ValueError(
+            "successive modes require complementary environments, not a "
+            "local split driver"
+        )
     return "svd"
 
 
@@ -2174,6 +2203,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         reduced=True,
         compression_mode="direct",
         compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
         _reduction_proven=False,
     ):
         """Compress the tree edge ``a -> b`` in place.
@@ -2198,10 +2230,26 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         ``svd:eig`` decomposition on the local canonical core. ``"sdc"``
         and ``"src"`` construct deterministic or random complementary
         environments for this two-node region and then apply QR projectors.
+        ``"sdcr"`` uses the same successive environments with Quimb's
+        static randomized-SVD environment factors. The ``*-oversample``
+        variants use a larger intermediate rank, then a direct final rounding
+        sweep to ``max_bond``; ``max_bond_oversample`` and the corresponding
+        cutoff controls select that intermediate pass.
         Their whole-tree versions are available through :meth:`compress`.
         """
         compression_mode = _normalize_compression_mode(compression_mode)
-        if compression_mode in {"src", "sdc"}:
+        if compression_mode in {
+            "src_oversample", "sdc_oversample", "sdcr", "sdcr_oversample",
+        } and max_bond is None:
+            raise ValueError(
+                f"compression_mode={compression_mode!r} requires max_bond."
+            )
+        if compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
+            cutoff_oversample, cutoff_mode_oversample = (
+                _normalize_oversample_options(
+                    cutoff_oversample, cutoff_mode_oversample
+                )
+            )
             if absorb not in {"left", "right"}:
                 raise ValueError("successive edge compression requires left or right absorption")
             hub = b if absorb == "right" else a
@@ -2209,6 +2257,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             return self._compress_successive_region(
                 [(source, hub)], hub, max_bond=max_bond, cutoff=cutoff,
                 cutoff_mode=cutoff_mode, method=compression_mode, seed=compression_seed,
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode_oversample=cutoff_mode_oversample,
             )
         if compression_mode == "dm" and self.fermionic:
             raise NotImplementedError(
@@ -2254,8 +2305,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
-    def _compress_successive_region(self, order, hub, *, max_bond, cutoff,
-                                    cutoff_mode, method, seed):
+    def _compress_successive_region(
+        self, order, hub, *, max_bond, cutoff, cutoff_mode, method, seed,
+        max_bond_oversample=None, cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
+    ):
         from .compression import successive_tree_compress
 
         nodes = {hub, *(u for u, _ in order)}
@@ -2263,20 +2317,94 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             raise NotImplementedError(
                 f"tree {method} environments require dense tensors; use direct or zipup"
             )
+        successive_order = tuple(order)
+        successive_hub = hub
+        sample_bond = None
+        oversampled = method in {
+            "src_oversample", "sdc_oversample", "sdcr_oversample",
+        }
+        base_method = method.removesuffix("_oversample")
+        if oversampled:
+            from .compression import _oversample_bond, _oversample_order
+
+            sample_bond = _oversample_bond(max_bond, max_bond_oversample)
+            successive_order, successive_hub = _oversample_order(
+                successive_order, hub
+            )
+        if base_method in {"src", "sdcr"}:
+            environment_cutoff = 0.0
+            environment_cutoff_mode = "rel" if base_method == "sdcr" else cutoff_mode
+        elif oversampled:
+            environment_cutoff = cutoff_oversample
+            environment_cutoff_mode = cutoff_mode_oversample
+        else:
+            environment_cutoff = cutoff
+            environment_cutoff_mode = cutoff_mode
         self.canonize_subtree_(nodes)
         local = {u: [self.tensor_map[self.node_tid(u)].copy()] for u in nodes}
         result, _ = successive_tree_compress(
-            local, order, hub, method=method, max_bond=max_bond,
-            cutoff=cutoff, cutoff_mode=cutoff_mode, seed=seed,
+            local,
+            successive_order,
+            successive_hub,
+            method=base_method,
+            max_bond=sample_bond if oversampled else max_bond,
+            cutoff=environment_cutoff,
+            cutoff_mode=environment_cutoff_mode,
+            seed=seed,
+            sample_bond=sample_bond,
         )
         for u, tensor in result.items():
             self.tensor_map[self.node_tid(u)].modify(
                 data=tensor.data, inds=tensor.inds,
-                left_inds=None if u == hub else tensor.left_inds,
+                left_inds=None if u == successive_hub else tensor.left_inds,
             )
+        self._canonical_region = frozenset({successive_hub})
+        self._invalidate_norm_cache()
+        if oversampled:
+            self._round_successive_region(
+                nodes,
+                successive_hub,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        return self
+
+    def _round_successive_region(self, nodes, hub, *, max_bond, cutoff,
+                                 cutoff_mode):
+        """Round an oversampled dense successive result with direct SVDs."""
+        if max_bond is None:
+            raise ValueError(
+                "oversampled successive compression requires max_bond."
+            )
+        max_bond = int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be positive")
+        self.shift_orthogonality_center(hub)
+        nodes = frozenset(nodes)
+
+        def descend(node, parent):
+            children = sorted(
+                neighbor for neighbor in self.neighbors(node)
+                if neighbor in nodes and neighbor != parent
+            )
+            for child in children:
+                self.compress_edge_(
+                    child,
+                    node,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    absorb="left",
+                    reduced="right",
+                    compression_mode="direct",
+                )
+                descend(child, node)
+                self.canonize_edge_(child, node, absorb="right")
+
+        descend(hub, None)
         self._canonical_region = frozenset({hub})
         self._invalidate_norm_cache()
-        return self
 
     def compress(
         self,
@@ -2288,6 +2416,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         reduced=True,
         compression_mode="direct",
         compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
     ):
         """Compress the complete tree with a centre-oriented SVD sweep.
 
@@ -2319,12 +2450,26 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             when no centre is known.
         reduced : bool, optional
             Use the reduced two-sided edge compression path where available.
-        compression_mode : {"direct", "dm", "sdc", "src"}, optional
+        compression_mode : {"direct", "dm", "sdc", "sdc-oversample", "sdcr", "sdcr-oversample", "src", "src-oversample"}, optional
             ``direct``/``dm`` use canonical edge compression. ``sdc``/``src``
             use deterministic/random complementary environments and a
             successive projector sweep on the original target.
+            ``sdcr`` uses randomized SVDs for the successive environment
+            factors, without oversampling or power iterations.
+            ``*-oversample`` adds a larger successive sketch followed by
+            direct tree rounding to ``max_bond``.
         compression_seed : int, optional
-            Seed for ``compression_mode="src"``.
+            Seed for randomized ``compression_mode="src"``, ``"sdcr"``, or
+            an oversampled variant.
+        max_bond_oversample : int or float, optional
+            Intermediate rank for an oversampled successive mode. Integers
+            are explicit ranks; floats are multipliers of ``max_bond``. If
+            omitted, use Quimb's ``max(round(1.5 * max_bond), max_bond + 10)``.
+        cutoff_oversample : float, optional
+            Intermediate environment cutoff for ``sdc-oversample``.
+            It is ignored by SRC and SDCR oversampling.
+        cutoff_mode_oversample : str, optional
+            Cutoff convention for the intermediate SDC oversampling pass.
 
         Returns
         -------
@@ -2340,7 +2485,6 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             max_bond = int(max_bond)
             if max_bond < 1:
                 raise ValueError("max_bond must be at least one.")
-
         if center is None:
             center = self.orthogonality_center
             if center is None:
@@ -2349,7 +2493,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             raise ValueError(f"{center!r} is not a node of the tree.")
 
         compression_mode = _normalize_compression_mode(compression_mode)
-        if compression_mode in {"src", "sdc"}:
+        if compression_mode in {
+            "src_oversample", "sdc_oversample", "sdcr", "sdcr_oversample",
+        } and max_bond is None:
+            raise ValueError(
+                f"compression_mode={compression_mode!r} requires max_bond."
+            )
+        if compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
+            cutoff_oversample, cutoff_mode_oversample = (
+                _normalize_oversample_options(
+                    cutoff_oversample, cutoff_mode_oversample
+                )
+            )
             order = sorted(
                 ((u, self._plan.node_path(u, center)[1])
                  for u in self._plan.nodes() if u != center),
@@ -2358,6 +2513,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             return self._compress_successive_region(
                 order, center, max_bond=max_bond, cutoff=cutoff,
                 cutoff_mode=cutoff_mode, method=compression_mode, seed=compression_seed,
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode_oversample=cutoff_mode_oversample,
             )
 
         # Establish a known centre once. The subsequent post-order traversal
@@ -2384,6 +2542,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 reduced=reduced,
                 compression_mode=compression_mode,
                 compression_seed=compression_seed,
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode_oversample=cutoff_mode_oversample,
             )
 
         # ``compress_edge_`` conservatively clears the global centre when the
@@ -2604,6 +2765,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             toward = self._toward_region(nid, region)
             t = self.node_tensor(nid)
             bond = next(iter(qtn.bonds(t, self.node_tensor(toward))))
+            data = t.data
             if self.fermionic:
                 # A singleton TensorNetwork.H applies the parity phase flips
                 # on all outer legs. The contraction order must also follow
@@ -2619,16 +2781,42 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 else:
                     output_inds = [bond + "*", bond]
                     prod = qtn.tensor_contract(tc, t, output_inds=output_inds)
+                data = prod.data
+                d = int(prod.shape[0])
+            elif ar.infer_backend(data) == "jax":
+                # JAX's default complex64 contraction precision can lose a
+                # few ulps per reduction and make an actually isometric QR
+                # factor look non-isometric at the 1e-4 diagnostic tolerance.
+                # Request the backend's highest available accumulation
+                # precision for this small scalar diagnostic only; the live
+                # SRC contractions retain their configured performance path.
+                axis = t.inds.index(bond)
+                moved = ar.do("moveaxis", data, axis, -1)
+                shape = tuple(ar.shape(moved))
+                matrix = ar.do(
+                    "reshape",
+                    moved,
+                    (-1, shape[-1]),
+                )
+                prod = ar.do(
+                    "einsum",
+                    "mi,mj->ij",
+                    ar.do("conj", matrix),
+                    matrix,
+                    precision="highest",
+                )
+                data = prod
+                d = int(shape[-1])
             else:
                 tc = t.H.reindex({bond: bond + "*"})
                 output_inds = [bond, bond + "*"]
                 prod = qtn.tensor_contract(t, tc, output_inds=output_inds)
-            d = int(prod.shape[0])
-            data = prod.data
+                d = int(prod.shape[0])
+                data = prod.data
             # Keep the diagnostic on the live backend. In particular,
             # ``ar.to_numpy`` cannot move a CUDA tensor to the host, while a
             # scalar reduction can be transferred safely and cheaply.
-            if hasattr(data, "to_dense"):
+            if ar.infer_backend(data) != "jax" and hasattr(data, "to_dense"):
                 data = data.to_dense()
             identity = ar.do("eye", d, like=data)
             close = ar.do(

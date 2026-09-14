@@ -102,6 +102,7 @@ from ._policy import (
 )
 from .ttn import (
     TreeTensorNetwork,
+    _SUCCESSIVE_COMPRESSION_MODES,
     _contract_two_tensors,
     _normalize_compression_mode,
 )
@@ -411,7 +412,9 @@ class TreeOptimizer:
         ``1e-3`` for 16-bit data, ``1e-6`` for 32-bit data, and ``1e-12``
         for 64-bit data, resolved from the installed state at construction.
         SRC ignores this threshold with a warning and uses ``chi`` samples;
-        SDC uses it when truncating deterministic environment factors.
+        oversampled modes use ``cutoff_oversample`` for their intermediate
+        environment pass and this cutoff for their final direct round. SDC
+        uses it when truncating deterministic environment factors.
     cutoff_mode : str | None | {"auto"}
         Quimb singular-value cutoff mode. ``"auto"`` (and the compatibility
         spelling ``None``) selects Pepsy's relative discarded-squared-weight
@@ -420,10 +423,12 @@ class TreeOptimizer:
         MPS MPO DM's ``"rsum1"`` rule on density-matrix eigenvalues.
         Explicit modes are passed through unchanged; use ``"rel"`` for a
         relative largest-singular-value threshold.
-    mode : {"auto", "direct", "dm", "sdc", "src", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
+    mode : {"auto", "direct", "dm", "sdc", "sdc-oversample", "sdcr", "sdcr-oversample", "src", "src-oversample", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"}
         Gate/operator route and state-compression method. Ordinary gate
         entries in ``"auto"``, ``"direct"``, ``"dm"``, ``"sdc"``,
-        ``"src"``, and ``"mpo"`` are converted to a true :class:`TreeMPO`
+        ``"sdc-oversample"``, ``"sdcr"``, ``"sdcr-oversample"``,
+        ``"src"``, ``"src-oversample"``, and ``"mpo"`` are converted to a
+        true :class:`TreeMPO`
         and applied with :meth:`apply_sub_mpotree` on the active Steiner
         subtree; the compression spelling selects the configured tree
         decomposition. ``"tree_mpo_direct"`` and ``"tree_mpo_dm"`` retain
@@ -431,8 +436,12 @@ class TreeOptimizer:
         compression. ``"submpo"`` declares that the stream is already made
         of explicit chain-MPO entries. Explicit sub-MPO entries are accepted
         in the other legacy modes for compatibility.
-        ``"sdc"`` and ``"src"`` are shorthands for automatic routing with
-        deterministic or randomized complementary-environment compression.
+        ``"sdc"``, ``"sdc-oversample"``, ``"sdcr"``, ``"sdcr-oversample"``,
+        and ``"src"`` are shorthands for automatic routing with successive
+        deterministic, randomized-SVD, or product-noise
+        complementary-environment compression; the three ``*-oversample``
+        variants add a larger intermediate pass followed by direct final
+        rounding.
         ``"zipup"`` contracts one operator/state node with incoming child
         messages, then immediately truncates its outgoing message by SVD.
         Its intermediate cuts do not have a canonical right environment.
@@ -443,16 +452,19 @@ class TreeOptimizer:
         transition to one-node refinement within the iteration budget.
         Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
         ``"tree_mpo_dem"`` and ``"tree_mpo"`` compatibility spellings.
-    compression_mode : {"direct", "dm", "sdc", "src"}
+    compression_mode : {"direct", "dm", "sdc", "sdc-oversample", "sdcr", "sdcr-oversample", "src", "src-oversample"}
         Decomposition used by ordinary tree compression and FIT local splits.
-        FIT retains direct/DM but maps SRC/SDC to direct local SVD;
+        FIT retains direct/DM but maps SRC/SDC/SDCR to direct local SVD;
         ``fit_init_strategy`` independently selects its guess algorithm.
         ``"direct"`` uses SVD; ``"dm"`` uses Quimb's
         density-matrix-equivalent ``svd:eig`` decomposition on the local
-        canonical compression core; ``"sdc"`` uses the deterministic
-        low-rank complementary environments and ``"src"`` uses contracted
-        product-noise environments. Both then construct nested QR projectors
-        from the layered target. They do not build a global dense state.
+        canonical compression core; ``"sdc"`` uses deterministic low-rank
+        complementary environments, ``"sdcr"`` uses randomized SVDs for
+        those environments, and ``"src"`` uses contracted product-noise
+        environments. These modes then construct nested QR projectors from
+        the layered target. They do not build a global dense state. The
+        ``*-oversample`` variants use a configurable larger intermediate rank
+        and a final direct tree round to the requested ``chi``.
     structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
     max_arity : int, None, or iterable of ints
@@ -525,7 +537,19 @@ class TreeOptimizer:
         non-unitary transfer-operator streams where norm changes are physical.
     compression_seed : int, optional
         Seed forwarded to randomized tree-edge compression when
-        ``compression_mode='src'``. It is ignored by deterministic modes.
+        ``compression_mode`` is ``'src'``, ``'sdcr'``, or an oversampled
+        variant. It is
+        ignored by deterministic modes.
+    max_bond_oversample : int or float, optional
+        Intermediate rank for an oversampled successive mode. Integers are
+        explicit ranks; floats are multipliers of ``chi``. If omitted, use
+        Quimb's ``max(round(1.5 * chi), chi + 10)`` policy.
+    cutoff_oversample : float or {"auto"}, optional
+        Intermediate environment cutoff for ``sdc-oversample``. It is ignored
+        by SRC and SDCR oversampling.
+    cutoff_mode_oversample : str or {"auto"}, optional
+        Cutoff convention for the intermediate SDC oversampling pass. The
+        default is ``"rel"``, matching Quimb's oversampling default.
     fit_block_size : {1, 2, 3}, default=2
         Generic ``dmrg`` local block size. Named aliases select their own
         warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
@@ -659,6 +683,32 @@ class TreeOptimizer:
             raise ValueError("max_bond must be a positive integer or None.")
         return max_bond
 
+    @staticmethod
+    def _normalize_max_bond_oversample(value):
+        """Validate Quimb's integer-rank or floating multiplier control."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise TypeError(
+                "max_bond_oversample must be a positive integer, multiplier, or None."
+            )
+        if isinstance(value, Integral):
+            value = int(value)
+            if value < 1:
+                raise ValueError("max_bond_oversample must be positive.")
+            return value
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "max_bond_oversample must be a positive integer, multiplier, or None."
+            ) from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "max_bond_oversample must be a positive integer, multiplier, or None."
+            )
+        return value
+
     def _resolve_cutoff(self, value):
         """Return a validated truncation cutoff, including ``"auto"``."""
         if isinstance(value, str) and value.strip().lower() == "auto":
@@ -699,6 +749,15 @@ class TreeOptimizer:
             "'rsum1', 'rsum2', or a Quimb integer code 1..6."
         )
 
+    @classmethod
+    def _resolve_oversample_cutoff_mode(cls, value):
+        """Resolve the intermediate cutoff mode used by SDC oversampling."""
+        if value is None or (
+            isinstance(value, str) and value.strip().lower() == "auto"
+        ):
+            return "rel"
+        return cls._resolve_cutoff_mode(value)
+
     def _resolve_fit_rtol(self, value):
         """Resolve the same dtype-aware stopping tolerance as MpsOptimizer."""
         if value == "auto":
@@ -727,6 +786,8 @@ class TreeOptimizer:
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
                  compression_mode="direct",
                  compression_seed=None,
+                 max_bond_oversample=None, cutoff_oversample=0.0,
+                 cutoff_mode_oversample="rel",
                  fit_block_size=2, fit_n_iter=4, fit_adaptive_sweeps=2,
                  fit_two_site_transition_sweeps=1,
                  fit_min_iter=2, fit_rtol="auto", fit_patience=1,
@@ -923,6 +984,9 @@ class TreeOptimizer:
         self.chi = self._normalize_max_bond(chi)
         self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
+        self.max_bond_oversample = max_bond_oversample
+        self.cutoff_oversample = cutoff_oversample
+        self.cutoff_mode_oversample = cutoff_mode_oversample
         if (isinstance(fit_block_size, bool) or not isinstance(fit_block_size, Integral)
                 or int(fit_block_size) not in {1, 2, 3}):
             raise ValueError("fit_block_size must be 1, 2, or 3.")
@@ -1119,6 +1183,15 @@ class TreeOptimizer:
         )
         self.cutoff = self._resolve_cutoff(cutoff)
         self.cutoff_mode = self._resolve_cutoff_mode(cutoff_mode)
+        self.max_bond_oversample = self._normalize_max_bond_oversample(
+            self.max_bond_oversample
+        )
+        self.cutoff_oversample = self._resolve_cutoff(
+            0.0 if self.cutoff_oversample is None else self.cutoff_oversample
+        )
+        self.cutoff_mode_oversample = self._resolve_oversample_cutoff_mode(
+            self.cutoff_mode_oversample
+        )
         self.fit_rtol = self._resolve_fit_rtol(self._fit_rtol_requested)
 
         if run and self.G:
@@ -2997,7 +3070,7 @@ class TreeOptimizer:
             },
             "backend": "tree_fit",
             "split_method": (
-                "direct" if self.compression_mode in {"src", "sdc"}
+                "direct" if self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES
                 else self.compression_mode
             ),
             "support": tuple(application.support),
@@ -3048,10 +3121,11 @@ class TreeOptimizer:
             guess_backend = None
         else:
             guess, strategy, random_info, guess_backend = guess_result
-        # SRC/SDC are complete environment algorithms, not local SVD drivers.
+        # SRC/SDC/SDCR are complete environment algorithms, not local SVD
+        # drivers.
         # Keep an explicit DM local split; the guess strategy is independent.
         split_method = (
-            "direct" if self.compression_mode in {"src", "sdc"}
+            "direct" if self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES
             else self.compression_mode
         )
         block_size = self._fit_block_size()
@@ -3444,6 +3518,9 @@ class TreeOptimizer:
         mode=None,
         compression_mode=None,
         compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=None,
+        cutoff_mode_oversample=None,
         non_unitary=False,
         normalize_every=False,
         normalize_final=False,
@@ -3486,7 +3563,7 @@ class TreeOptimizer:
             maximum bond. The bar uses the same core readout as
             :class:`MpsOptimizer`; tree-specific ``kq``, ``ctrl``, and
             explicit-operator ``mpo`` counters are added when present.
-        mode : {"auto", "direct", "dm", "sdc", "src", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
+        mode : {"auto", "direct", "dm", "sdc", "sdc-oversample", "sdcr", "sdcr-oversample", "src", "src-oversample", "zipup", "dmrg", "dmrg1", "dmrg2", "dmrg3", "tree_mpo_direct", "tree_mpo_dm", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
             Optional persistent gate/sub-MPO replay selection: a supplied
             value updates :attr:`mode` before replay and remains active for
             future runs and copies. ``"submpo"`` validates an explicit chain
@@ -3494,20 +3571,32 @@ class TreeOptimizer:
             TreeMPO routing. ``"tree"``/``"ttn"`` are deprecated no-op
             compatibility selectors for shared coefficient frontends.
             ``"dm"`` selects automatic gate routing with density-matrix
-            compression. ``"sdc"`` and ``"src"`` select automatic routing
-            with deterministic or randomized complementary-environment
-            compression, respectively. ``"dmrg"`` selects TreeFIT with the
+            compression. ``"sdc"``, ``"sdc-oversample"``, ``"sdcr"``,
+            ``"sdcr-oversample"``, and ``"src"`` select automatic routing
+            with successive deterministic, randomized-SVD, or product-noise
+            complementary-environment compression, respectively; the
+            ``*-oversample`` variants add a direct final round after a larger
+            intermediate sketch. ``"dmrg"`` selects TreeFIT with the
             configured adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
             use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
             warm-up blocks followed by its configured two-node transition;
             each named schedule then performs one-node refinement.
-        compression_mode : {"direct", "dm", "sdc", "src"} | None, default=None
+        compression_mode : {"direct", "dm", "sdc", "sdc-oversample", "sdcr", "sdcr-oversample", "src", "src-oversample"} | None, default=None
             Persistent TreeMPO compression algorithm. FIT local splits retain
-            direct/DM; SRC/SDC settings use direct local SVD. The separate
+            direct/DM; SRC/SDC/SDCR settings use direct local SVD. The separate
             fit_init_strategy controls the guess algorithm.
         compression_seed : int | None, default=None
             Persistently replace the randomized-compression seed for ordinary
             replay. Shot replay applies this override only to its children.
+        max_bond_oversample : int or float or None, default=None
+            Persistently replace the intermediate rank control for an
+            oversampled successive mode. Integers are explicit ranks and
+            floats are multipliers of ``chi``.
+        cutoff_oversample : float or {"auto"} or None, default=None
+            Persistently replace the intermediate SDC oversampling cutoff.
+        cutoff_mode_oversample : str or {"auto"} or None, default=None
+            Persistently replace the intermediate SDC oversampling cutoff
+            convention. Omitted values retain the current configuration.
         finite_check : bool, default=False
             Optional finite-value scans after each FIT iteration and at the
             end of replay in every mode, including empty streams. Warns once
@@ -3573,6 +3662,16 @@ class TreeOptimizer:
             compression_seed = int(compression_seed)
             if compression_seed < 0:
                 raise ValueError("compression_seed must be non-negative.")
+        if max_bond_oversample is not None:
+            max_bond_oversample = self._normalize_max_bond_oversample(
+                max_bond_oversample
+            )
+        if cutoff_oversample is not None:
+            cutoff_oversample = self._resolve_cutoff(cutoff_oversample)
+        if cutoff_mode_oversample is not None:
+            cutoff_mode_oversample = self._resolve_oversample_cutoff_mode(
+                cutoff_mode_oversample
+            )
         non_unitary = bool(non_unitary)
         if not non_unitary and normalize_every not in (False, None):
             raise ValueError("normalize_every requires non_unitary=True.")
@@ -3626,6 +3725,16 @@ class TreeOptimizer:
                 child_kwargs.setdefault("compression_mode", compression_mode)
             if compression_seed is not None:
                 child_kwargs.setdefault("compression_seed", compression_seed)
+            if max_bond_oversample is not None:
+                child_kwargs.setdefault(
+                    "max_bond_oversample", max_bond_oversample
+                )
+            if cutoff_oversample is not None:
+                child_kwargs.setdefault("cutoff_oversample", cutoff_oversample)
+            if cutoff_mode_oversample is not None:
+                child_kwargs.setdefault(
+                    "cutoff_mode_oversample", cutoff_mode_oversample
+                )
             child_kwargs.setdefault("track_infidelity", track_infidelity)
             child_kwargs.setdefault("progbar", progbar)
             child_kwargs.setdefault("finite_check", finite_check)
@@ -3672,6 +3781,12 @@ class TreeOptimizer:
             self._last_fit_diagnostics = None
         if compression_seed is not None:
             self.compression_seed = compression_seed
+        if max_bond_oversample is not None:
+            self.max_bond_oversample = max_bond_oversample
+        if cutoff_oversample is not None:
+            self.cutoff_oversample = cutoff_oversample
+        if cutoff_mode_oversample is not None:
+            self.cutoff_mode_oversample = cutoff_mode_oversample
         if track_infidelity is not None:
             self.track_infidelity = bool(track_infidelity)
         self.rng = next_rng
@@ -5065,7 +5180,7 @@ class TreeOptimizer:
         leaves the centre at ``path[0]``.  This is the re-orthonormalisation
         sweep of Seitz et al. (Fig. 6) applied along the gate geodesic.
         """
-        if self.compression_mode in {"src", "sdc"}:
+        if self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
             return self._compress_subtree(
                 path, path[0], max_bond=max_bond, cutoff=cutoff,
                 preserve_subcap=preserve_subcap,
@@ -5097,7 +5212,7 @@ class TreeOptimizer:
     ):
         """Compress a connected updated subtree using the selected method.
 
-        SRC/SDC dispatch to successive environments on the supplied state;
+        SRC/SDC/SDCR dispatch to successive environments on the supplied state;
         ordinary TreeMPO replay enters that kernel earlier with target layers.
         Direct/DM prepare a path endpoint and compress once to the other end.
         On branches, start at ``hub`` and descend. Compressing ``node -> child``
@@ -5105,7 +5220,7 @@ class TreeOptimizer:
         Each direct/DM cut sees the completed update with canonical boundaries.
         """
         snodes = frozenset(snodes)
-        if self.compression_mode in {"src", "sdc"}:
+        if self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
             self.tn.canonize_subtree_(snodes)
             order = sorted(
                 ((u, self.plan.node_path(u, hub)[1]) for u in snodes if u != hub),
@@ -5350,12 +5465,47 @@ class TreeOptimizer:
 
     def _successive_subtree_messages(self, local, order, hub, *, max_bond, cutoff):
         """Compress layered targets using actual complementary environments."""
-        from .compression import successive_tree_compress
+        from .compression import (
+            _oversample_bond,
+            _oversample_order,
+            successive_tree_compress,
+        )
 
+        successive_order = tuple(order)
+        successive_hub = hub
+        sample_bond = None
+        oversampled = self.compression_mode in {
+            "src_oversample", "sdc_oversample", "sdcr_oversample",
+        }
+        base_method = self.compression_mode.removesuffix("_oversample")
+        if oversampled:
+            sample_bond = _oversample_bond(
+                max_bond, self.max_bond_oversample
+            )
+            successive_order, successive_hub = _oversample_order(
+                successive_order, hub
+            )
+        if base_method in {"src", "sdcr"}:
+            environment_cutoff = 0.0
+            environment_cutoff_mode = (
+                "rel" if base_method == "sdcr" else self.cutoff_mode
+            )
+        elif oversampled:
+            environment_cutoff = self.cutoff_oversample
+            environment_cutoff_mode = self.cutoff_mode_oversample
+        else:
+            environment_cutoff = cutoff
+            environment_cutoff_mode = self.cutoff_mode
         result, records = successive_tree_compress(
-            local, order, hub, method=self.compression_mode,
-            max_bond=max_bond, cutoff=cutoff, cutoff_mode=self.cutoff_mode,
+            local,
+            successive_order,
+            successive_hub,
+            method=base_method,
+            max_bond=sample_bond if oversampled else max_bond,
+            cutoff=environment_cutoff,
+            cutoff_mode=environment_cutoff_mode,
             seed=self.compression_seed,
+            sample_bond=sample_bond,
         )
         physical_map = {
             self._phys(q) + "*": self._phys(q)
@@ -5364,13 +5514,73 @@ class TreeOptimizer:
         }
         for tensor in result.values():
             tensor.reindex_(physical_map)
-        self._install_routed_subtree(result, frozenset(local), hub)
+        self._install_routed_subtree(
+            result, frozenset(local), successive_hub
+        )
+        if oversampled:
+            records = self._round_successive_subtree(
+                frozenset(local),
+                successive_hub,
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
         for u, v, before, after, bond in records:
             self._record_truncation(
                 kind=self.compression_mode, edge=(u, v), before_bond=before,
                 after_bond=after, bond_ind=bond, max_bond=max_bond,
-                cutoff=0.0 if self.compression_mode == "src" else cutoff,
+                cutoff=(
+                    0.0
+                    if base_method in {"src", "sdcr"}
+                    else cutoff
+                ),
             )
+
+    def _round_successive_subtree(self, snodes, hub, *, max_bond, cutoff):
+        """Directly round a dense oversampled successive subtree in place."""
+        if max_bond is None:
+            raise ValueError(
+                "oversampled successive compression requires max_bond."
+            )
+        max_bond = int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be positive")
+        self._move_center(hub)
+        snodes = frozenset(snodes)
+        records = []
+
+        def descend(node, parent):
+            children = sorted(
+                neighbor for neighbor in self._neighbors(node)
+                if neighbor in snodes and neighbor != parent
+            )
+            for child in children:
+                before = int(self.tn.ind_size(self.tn.bond(child, node)))
+                self.tn.compress_edge_(
+                    child,
+                    node,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    cutoff_mode=self.cutoff_mode,
+                    absorb="left",
+                    reduced="right",
+                    compression_mode="direct",
+                )
+                after_bond = self.tn.bond(child, node)
+                records.append(
+                    (
+                        child,
+                        node,
+                        before,
+                        int(self.tn.ind_size(after_bond)),
+                        after_bond,
+                    )
+                )
+                descend(child, node)
+                self.tn.canonize_edge_(child, node, absorb="right")
+
+        descend(hub, None)
+        self.center = hub
+        return records
 
     def _zipup_subtree_messages(self, local, state_inds, order, hub, *, max_bond, cutoff):
         """Contract and truncate one layered tree node at a time toward a hub.
@@ -5428,7 +5638,8 @@ class TreeOptimizer:
         """Install routed tensors and recover their proven hub centre.
 
         Each peeled non-hub tensor is isometric toward ``hub``: direct routing
-        and SRC/SDC retain QR factors, while zipup retains QR or left SVD factors.
+        and SRC/SDC/SDCR retain QR factors, while zipup retains QR or left SVD
+        factors.
         Retaining their ``left_inds`` lets Quimb's canonical
         recovery walk short-circuit those decompositions while still advancing
         the canonical-region state machine honestly. Native graded routing
@@ -5577,9 +5788,10 @@ class TreeOptimizer:
 
         * Direct/DM route the complete action losslessly with QR, then make
           one canonical compression sweep (SVD / density-matrix factorization).
-        * SRC/SDC project the layered target successively using complementary
-          randomized / deterministic environments, without building its full
-          enlarged state. Numerical environments live only for this update.
+        * SRC/SDC/SDCR project the layered target successively using
+          complementary product-noise / deterministic / randomized-SVD
+          environments, without building its full enlarged state. Numerical
+          environments live only for this update.
         * Zipup contracts and caps each outgoing message immediately; its
           intermediate cuts do not see a canonical complementary environment.
         * DMRG refines a separate guess against the exact layered target.
@@ -5658,14 +5870,17 @@ class TreeOptimizer:
                 )
                 route_path = path
                 if path is not None and (
-                    self.compression_mode in {"src", "sdc"}
+                    self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES
                     or (self.mode == "zipup" and _path_order is not None)
                 ):
                     # Complementary environments travel opposite to the
                     # projection sweep. Finish at the incoming endpoint (or
                     # the frozen first FIT endpoint for a disposable guess).
                     route_path = path[::-1]
-                successive = self.mode == "zipup" or self.compression_mode in {"src", "sdc"}
+                successive = (
+                    self.mode == "zipup"
+                    or self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES
+                )
                 # Exact QR preparation may consume both path endpoints. This
                 # bounds intermediate ranks by both sides before the final
                 # single-direction SVD sweep. Strictly one-ended preparation
@@ -5688,7 +5903,7 @@ class TreeOptimizer:
                 if self.mode == "zipup":
                     self._move_center(route_path[0] if route_path is not None else hub)
                 else:
-                    # Direct routing and SRC/SDC replace the active region.
+                    # Direct routing and SRC/SDC/SDCR replace the active region.
                     # Only its exterior must be isometric: stop at the first
                     # entry instead of QR-moving through tensors about to be
                     # refactored. Reuse an already-contained canonical region.
@@ -5708,7 +5923,7 @@ class TreeOptimizer:
                     phase_event=self._profile_phase_event,
                 )
 
-                if self.compression_mode in {"src", "sdc"}:
+                if self.compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
                     # Project the original layers using complementary branch
                     # environments, not local randomized SVD of routed edges.
                     self._successive_subtree_messages(
@@ -7037,8 +7252,13 @@ class TreeOptimizer:
         the same ``k0, k1, ..., k(n-1)`` ordering.
         """
         _ = logical_order
+        from .compression import _high_precision_matmul
+
         with self._thread_ctx():
-            return self.tn.to_statevector(range(self.n))
+            with _high_precision_matmul(
+                self.tn.node_tensor(self.plan.root).data
+            ):
+                return self.tn.to_statevector(range(self.n))
 
     @property
     def qubits(self):

@@ -115,7 +115,12 @@ def test_tree_mpo_higher_order_term_routes_and_replays_natively():
     )
 
 
-@pytest.mark.parametrize("compression_mode", ("sdc", "src"))
+@pytest.mark.parametrize(
+    "compression_mode", (
+        "sdc", "sdc_oversample", "sdcr", "sdcr_oversample", "src",
+        "src_oversample",
+    )
+)
 def test_tree_successive_compression_modes_are_reproducible(compression_mode):
     """Tree compression modes preserve the tree sweep and randomized seed API."""
 
@@ -144,6 +149,66 @@ def test_tree_successive_compression_modes_are_reproducible(compression_mode):
     assert first.tn.max_bond() <= 1
     assert first.tn.validate(check_canonical=True) is first.tn
     np.testing.assert_allclose(first.to_dense(), second.to_dense())
+
+
+def test_tree_oversample_controls_are_copyable_and_persist_from_run():
+    """Intermediate-rank and cutoff controls are ordinary optimizer policy."""
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        mode="sdc-oversample",
+        chi=2,
+        max_bond_oversample=5,
+        cutoff_oversample=1e-5,
+        cutoff_mode_oversample="rel",
+        run=False,
+    )
+    copied = optimizer.copy()
+    assert copied.max_bond_oversample == 5
+    assert copied.cutoff_oversample == 1e-5
+    assert copied.cutoff_mode_oversample == "rel"
+
+    optimizer.run(
+        max_bond_oversample=6,
+        cutoff_oversample=2e-5,
+        cutoff_mode_oversample="abs",
+    )
+    assert optimizer.max_bond_oversample == 6
+    assert optimizer.cutoff_oversample == 2e-5
+    assert optimizer.cutoff_mode_oversample == "abs"
+
+
+@pytest.mark.parametrize(
+    "compression_mode", ("src_oversample", "sdc_oversample", "sdcr_oversample")
+)
+def test_successive_oversample_modes_round_with_direct_tree_sweep(
+    monkeypatch, compression_mode,
+):
+    """Every oversampled successive mode has a final direct tree sweep."""
+    plan = TreePlan.from_order(range(7), structure="balanced", top_arity=3)
+    state = TreeTensorNetwork.rand(plan, D=4, seed=18, dtype="complex128")
+    calls = []
+    original = state.compress_edge_
+
+    def record(*args, **kwargs):
+        calls.append(kwargs.get("compression_mode"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(state, "compress_edge_", record)
+    state.compress(
+        max_bond=2,
+        max_bond_oversample=5,
+        cutoff=0.0,
+        compression_mode=compression_mode,
+        compression_seed=31,
+    )
+
+    assert calls
+    assert set(calls) == {"direct"}
+    assert state.max_bond() <= 2
+    assert state.is_canonical_form()
 
 
 @pytest.mark.parametrize(
@@ -400,6 +465,44 @@ def test_tree_fit_environment_cache_reuses_untouched_branches():
     assert diagnostics["cache"]["messages"] > 0
     assert diagnostics["cache"]["hits"] > 0
     assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+
+
+def test_tree_fit_skips_exact_dense_identity_exterior_messages():
+    """Unchanged canonical dangling branches use identity boundaries."""
+
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    initial = TreeTensorNetwork.from_plan(plan)
+    target_optimizer = TreeOptimizer(
+        None,
+        n=5,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+        run=False,
+        tn=initial,
+    )
+    gate = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0],
+         [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    target_optimizer.apply_gate(gate, (0, 4), track_norm=False)
+    region = initial.steiner_nodes(
+        [plan.node_of_qubit[0], plan.node_of_qubit[4]]
+    )
+
+    fast = TreeFIT(target_optimizer.tn, initial, max_bond=2, cutoffs=0.0)
+    reference = TreeFIT(target_optimizer.tn, initial, max_bond=2, cutoffs=0.0)
+    fast.run_gate(region, n_iter=1, block_size=2)
+    reference._identity_environment = lambda outside, inside: None
+    reference.run_gate(region, n_iter=1, block_size=2)
+
+    assert fast.identity_environment_shortcuts > 0
+    assert fast.environment_cache_info()["identity_shortcuts"] == (
+        fast.identity_environment_shortcuts
+    )
+    np.testing.assert_allclose(fast.p.to_dense(), reference.p.to_dense())
+    assert fast.p.validate(check_canonical=True) is fast.p
 
 
 def test_tree_fit_invalidates_effective_cache_through_branch_dependencies():
@@ -1014,7 +1117,14 @@ def test_tree_mpo_gate_modes_use_tree_mpo_not_chain_submpo(monkeypatch):
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
-@pytest.mark.parametrize("mode", ("auto", "direct", "dm", "sdc", "src", "zipup", "mpo", "dmrg2"))
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "auto", "direct", "dm", "sdc", "sdc_oversample", "sdcr",
+        "sdcr_oversample", "src", "src_oversample", "zipup", "mpo",
+        "dmrg2",
+    ),
+)
 def test_tree_ordinary_gate_modes_all_lower_to_subtreempo(monkeypatch, mode):
     """Every ordinary gate mode shares the TreeMPO active-region kernel."""
     cnot = np.array(

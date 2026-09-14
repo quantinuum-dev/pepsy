@@ -642,9 +642,11 @@ class TreeFIT:
         self._prepare_private_target_indices()
 
         self._messages = {}
+        self._identity_message_edges = {}
         self._effective_cache = {}
         self.environment_cache_hits = 0
         self.environment_cache_misses = 0
+        self.identity_environment_shortcuts = 0
         self.iterations_run = 0
         self.converged = False
         self.convergence_reason = None
@@ -935,8 +937,110 @@ class TreeFIT:
         """Discard cached branch entanglement environments."""
 
         self._messages.clear()
+        self._identity_message_edges.clear()
         self._effective_cache.clear()
         return self
+
+    def _identity_environment(self, outside, inside):
+        """Return an exact inactive-branch overlap proof when provable.
+
+        A compact circuit target contains no operator layer outside its
+        active region. If the target and fitted tensors on an exterior
+        component are also exactly the same dense tensors, and the fitted
+        network is canonical towards the current local block, that branch
+        contracts to the identity map on its boundary bond. Avoiding the
+        branch contraction is worthwhile for long Steiner paths with several
+        dangling branches. The proof contains the two boundary indices, the
+        bond dimension, and the dense dtype; the identity tensor is created
+        only if a caller actually needs it as a message.
+
+        This deliberately does not infer identity for native Symmray or
+        fermionic tensors: their graded boundary metric is not the ordinary
+        dense identity used here. Non-identical gauges also fall back to the
+        general message contraction, even when they represent the same state.
+        """
+        block = getattr(self, "_message_block", None)
+        if block is None:
+            return None
+        canonical_region = getattr(self.p, "canonical_region", None)
+        if (
+            canonical_region is None
+            or not frozenset(canonical_region).issubset(block)
+        ):
+            return None
+
+        target_bonds = self._target_bonds.get((outside, inside), ())
+        if len(target_bonds) != 1:
+            # A layered target bond represents a non-trivial local map, not
+            # the one-index identity boundary handled by this shortcut.
+            return None
+        target_bond = target_bonds[0]
+        state_bond = self.p.bond(outside, inside)
+        target_dim = int(self.tn.ind_size(target_bond))
+        state_dim = int(self.p.ind_size(state_bond))
+        if target_dim != state_dim:
+            return None
+
+        target_group = self._target_tensors[outside]
+        if len(target_group) != 1:
+            return None
+        target_tensor = target_group[0]
+        fitted_tensor = _tensor_of(self.p, outside)
+        target_data = target_tensor.data
+        fitted_data = fitted_tensor.data
+        if (
+            ar.infer_backend(target_data) != "numpy"
+            or ar.infer_backend(fitted_data) != "numpy"
+            or target_data.shape != fitted_data.shape
+            or not np.array_equal(target_data, fitted_data)
+        ):
+            # Reject the common non-identity case before walking the whole
+            # component. Gauge-equivalent but differently based branches also
+            # take the general contraction path.
+            return None
+        dtype = np.result_type(target_data.dtype, fitted_data.dtype)
+
+        component = _component_of(self.p, outside, inside)
+        for node in component:
+            target_group = self._target_tensors[node]
+            if len(target_group) != 1:
+                # An operator layer or another local target layer reaches the
+                # component, so its overlap is not an exterior identity.
+                return None
+            target_tensor = target_group[0]
+            fitted_tensor = _tensor_of(self.p, node)
+            target_data = target_tensor.data
+            fitted_data = fitted_tensor.data
+            if node != outside and (
+                ar.infer_backend(target_data) != "numpy"
+                or ar.infer_backend(fitted_data) != "numpy"
+                or target_data.shape != fitted_data.shape
+                or not np.array_equal(target_data, fitted_data)
+            ):
+                # Keep backend/device data native and avoid treating a mere
+                # gauge-equivalent branch as an identity in mismatched bases.
+                return None
+            physical = self._target_physical[node]
+            if physical is not None:
+                try:
+                    if target_tensor.inds.index(physical) != (
+                        fitted_tensor.inds.index(physical)
+                    ):
+                        return None
+                except ValueError:
+                    return None
+            for neighbor in self._neighbors[node]:
+                node_target_bonds = self._target_bonds.get((node, neighbor), ())
+                if len(node_target_bonds) != 1:
+                    return None
+                try:
+                    if target_tensor.inds.index(node_target_bonds[0]) != (
+                        fitted_tensor.inds.index(self.p.bond(node, neighbor))
+                    ):
+                        return None
+                except ValueError:
+                    return None
+        return target_bond, state_bond, target_dim, dtype
 
     @staticmethod
     def _normalize_traversal(value):
@@ -960,6 +1064,7 @@ class TreeFIT:
             "effective_blocks": len(self._effective_cache),
             "hits": int(self.environment_cache_hits),
             "misses": int(self.environment_cache_misses),
+            "identity_shortcuts": int(self.identity_environment_shortcuts),
         }
 
     def _message(self, outside, inside):
@@ -981,6 +1086,23 @@ class TreeFIT:
             edge = (node, destination)
             if edge in self._messages:
                 self.environment_cache_hits += 1
+                continue
+            identity = self._identity_message_edges.get(edge)
+            new_identity = False
+            if identity is None:
+                identity = self._identity_environment(node, destination)
+                if identity is not None:
+                    self._identity_message_edges[edge] = identity
+                    new_identity = True
+            if identity is not None:
+                target_bond, state_bond, target_dim, dtype = identity
+                self._messages[edge] = qtn.Tensor(
+                    np.eye(target_dim, dtype=dtype),
+                    inds=(target_bond, state_bond),
+                )
+                if new_identity:
+                    self.identity_environment_shortcuts += 1
+                    self.environment_cache_misses += 1
                 continue
             incoming = tuple(
                 (neighbor, node) for neighbor in self._neighbors[node]
@@ -1029,14 +1151,37 @@ class TreeFIT:
             self.environment_cache_hits += 1
             return cached.copy()
         self.environment_cache_misses += 1
-        tensors = [
-            tensor
-            for node in block
-            for tensor in self._target_tensors[node]
-        ]
         boundary = self._boundary_edges(block)
+        identity_relabels = {}
         for inside, outside in boundary:
-            tensors.append(self._message(outside, inside))
+            edge = (outside, inside)
+            identity = self._identity_message_edges.get(edge)
+            if identity is None and edge not in self._messages:
+                identity = self._identity_environment(outside, inside)
+                if identity is not None:
+                    self._identity_message_edges[edge] = identity
+                    self.identity_environment_shortcuts += 1
+                    self.environment_cache_misses += 1
+            if identity is None:
+                continue
+            target_bond, state_bond, _, _ = identity
+            identity_relabels[target_bond] = state_bond
+
+        tensors = []
+        for node in block:
+            for tensor in self._target_tensors[node]:
+                replacements = {
+                    index: identity_relabels[index]
+                    for index in tensor.inds
+                    if index in identity_relabels
+                }
+                if replacements:
+                    tensor = tensor.copy()
+                    tensor.reindex_(replacements)
+                tensors.append(tensor)
+        for inside, outside in boundary:
+            if (outside, inside) not in self._identity_message_edges:
+                tensors.append(self._message(outside, inside))
         output_inds = tuple(
             self._target_physical[node]
             for node in sorted(block)
@@ -1078,10 +1223,13 @@ class TreeFIT:
         ]
         while pending:
             node, destination = pending.pop()
-            if self._messages.pop((node, destination), None) is None:
+            edge = (node, destination)
+            identity = self._identity_message_edges.pop(edge, None)
+            if self._messages.pop(edge, None) is None:
                 # Every cached message retains its dependencies. If this
                 # input is absent, no downstream cached message can use it.
-                continue
+                if identity is None:
+                    continue
             pending.extend(
                 (destination, neighbor) for neighbor in self._neighbors[destination]
                 if neighbor != node
@@ -1520,7 +1668,11 @@ class TreeFIT:
             raise ValueError("fit block must be a connected subtree")
         center = self._block_center(block, preferred=center)
         self._canonicalize_for_block(block, center)
-        effective = self._effective_block(block)
+        self._message_block = block
+        try:
+            effective = self._effective_block(block)
+        finally:
+            self._message_block = None
         factors = self._factor_block(effective, block, center)
         self._install_block(factors, block, center, validate=validate)
         self._invalidate_for_block(block)

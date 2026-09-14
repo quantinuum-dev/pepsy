@@ -14,7 +14,8 @@ from .ttn import _normalize_compression_mode
 # boundary. Keep this list separate from transient replay/diagnostic state.
 COPY_SETTINGS = (
     "n", "chi", "cutoff", "cutoff_mode", "mode", "compression_mode",
-    "compression_seed", "fit_block_size", "fit_n_iter", "fit_adaptive_sweeps",
+    "compression_seed", "max_bond_oversample", "cutoff_oversample",
+    "cutoff_mode_oversample", "fit_block_size", "fit_n_iter", "fit_adaptive_sweeps",
     "fit_two_site_transition_sweeps", "fit_min_iter", "fit_patience",
     "fit_init_strategy", "fit_init_rand_strength", "fit_init_seed",
     "fit_sweep_sequence", "fit_traversal", "fit_environment_strategy",
@@ -28,7 +29,9 @@ COPY_SETTINGS = (
 )
 
 _ALGORITHM_MODES = frozenset({
-    "dm", "sdc", "src", "zipup", "tree_mpo_direct", "tree_mpo_dm",
+    "dm", "sdc", "sdc_oversample", "sdcr", "sdcr_oversample", "src",
+    "src_oversample", "zipup",
+    "tree_mpo_direct", "tree_mpo_dm",
 })
 
 
@@ -49,11 +52,16 @@ def normalize_mode(mode):
     }
     mode = aliases.get(mode, mode)
     if mode not in {
-        "auto", "direct", "dm", "sdc", "src", "zipup", "mpo", "submpo",
+        "auto", "direct", "dm", "sdc", "sdc_oversample", "sdcr",
+        "sdcr_oversample", "src", "src_oversample",
+        "zipup",
+        "mpo", "submpo",
         "tree_mpo_direct", "tree_mpo_dm", "dmrg", "dmrg1", "dmrg2", "dmrg3",
     }:
         raise ValueError(
-            "mode must be one of 'auto', 'direct', 'dm', 'sdc', 'src', 'zipup', 'mpo', "
+            "mode must be one of 'auto', 'direct', 'dm', 'sdc', "
+            "'sdc-oversample', 'sdcr', 'sdcr-oversample', 'src', "
+            "'src-oversample', 'zipup', 'mpo', "
             "'submpo', 'dmrg', 'dmrg1', 'dmrg2', 'dmrg3', "
             "'tree_mpo_direct', or 'tree_mpo_dm'."
         )
@@ -76,7 +84,10 @@ def resolve_replay_mode(mode, compression_mode):
     """Return route, compression method and named FIT schedule without mutation."""
     mode = normalize_mode(mode)
     compression_mode = _normalize_compression_mode(compression_mode)
-    if mode in {"dm", "sdc", "src"}:
+    if mode in {
+        "dm", "sdc", "sdc_oversample", "sdcr", "sdcr_oversample", "src",
+        "src_oversample",
+    }:
         if compression_mode not in {"direct", mode}:
             raise ValueError(
                 f"mode={mode!r} cannot be combined with a different compression_mode."
@@ -115,7 +126,10 @@ def replay_mode_name(mode, compression_mode, dmrg_alias):
         return "dm"
     if mode in {"auto", "direct", "mpo", "submpo", "tree_mpo_direct"}:
         compression_mode = str(compression_mode).strip().lower()
-        if compression_mode in {"direct", "dm", "sdc", "src"}:
+        if compression_mode in {
+            "direct", "dm", "sdc", "sdc_oversample", "sdcr",
+            "sdcr_oversample", "src", "src_oversample"
+        }:
             return compression_mode
         return "direct"
     return mode

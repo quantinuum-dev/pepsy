@@ -68,11 +68,14 @@ Changes for the next release should be added here before the version is bumped.
   accumulation; no global backend setting is changed. FIT variants remain
   separate from TreeFIT/DMRG.
 
-- Added dense-only tree `sdcr` compression. It keeps the SDC complementary
-  environment and nested target projection, but uses Quimb's static randomized
-  SVD driver (`svd:rand`) for environment factors, with seeded replay and no
-  oversampling or power iterations by default. `sdcr-oversample` remains
-  intentionally deferred pending branched-tree accuracy validation.
+- Added dense-only tree `sdcr` compression and opt-in `sdc-oversample` /
+  `sdcr-oversample` variants. Oversampled modes use Quimb's intermediate-rank
+  policy followed by a direct tree round; `max_bond_oversample`,
+  `cutoff_oversample`, and `cutoff_mode_oversample` expose the intermediate
+  controls. SDCR environment splits use a rank-only relative cutoff contract
+  so they remain compatible with Quimb releases that reject cumulative cutoff
+  modes for randomized SVD. `srcmps` remains MPS-only and is not added to
+  `TreeOptimizer`.
 
 - TreeFIT now reuses a canonical region contained inside its next local
   block, preserving exterior environments without an isometry rescan or
