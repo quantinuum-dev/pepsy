@@ -1124,6 +1124,64 @@ def test_pauli_pepo_basis_keeps_torch_coefficient_and_time_graph():
     assert torch.isfinite(time_gradient)
 
 
+def test_pauli_pepo_basis_promotes_channel_maps_for_complex_torch_coefficients():
+    """Complex Torch slots align the static maps without detaching gradients."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [
+            PauliPEPOTerm(
+                "onsite",
+                "X",
+                coefficient=lambda params: -0.5j * params["theta"],
+            )
+        ],
+        order=1,
+    )
+    theta = torch.tensor(0.17, dtype=torch.float64, requires_grad=True)
+
+    dense = basis.exp(
+        1.0,
+        parameters={"theta": theta},
+        materialize=True,
+    ).to_dense()
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    identity = torch.eye(2, dtype=torch.complex128)
+    hamiltonian = torch.kron(x, identity) + torch.kron(identity, x)
+    expected = torch.matrix_exp(-0.5j * theta * hamiltonian)
+
+    assert torch.allclose(dense, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradient = torch.autograd.grad(dense.real.sum(), theta)[0]
+    assert torch.isfinite(gradient)
+
+
+def test_ordered_pepo_product_promotes_complex_factor_without_value_loss():
+    """A complex product prefactor is promoted, never cast to real zero."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "X", coefficient=MPOParameter("theta"))],
+        order=1,
+    )
+    product = PEPOClusterProductExpansion.from_bases(
+        (basis,),
+        coefficients=(-0.5j,),
+    ).compile_exp()
+    theta = torch.tensor(0.17, dtype=torch.float64, requires_grad=True)
+
+    dense = product.exp(1.0, parameters={"theta": theta}).to_dense()
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    identity = torch.eye(2, dtype=torch.complex128)
+    hamiltonian = torch.kron(x, identity) + torch.kron(identity, x)
+    expected = torch.matrix_exp(-0.5j * theta * hamiltonian)
+
+    assert torch.allclose(dense, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradient = torch.autograd.grad(dense.real.sum(), theta)[0]
+    assert torch.isfinite(gradient)
+
+
 def test_pauli_pepo_basis_resolves_mpo_parameter_references_with_autodiff():
     """PEPO coefficient references follow the MPOBasis parameter contract."""
     torch = pytest.importorskip("torch")

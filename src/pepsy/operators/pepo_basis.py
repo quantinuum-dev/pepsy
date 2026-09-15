@@ -567,8 +567,20 @@ class PauliPEPOBasis:
         """Fuse coefficient slots into onsite and edge Pauli components."""
         reference = _backend_reference((*values, beta))
         coefficient_batch = _backend_stack(values)
-        onsite_map = _as_backend(self._onsite_term_map, like=reference)
-        edge_map = _as_backend(self._edge_term_map, like=reference)
+        # Torch's tensordot deliberately requires equal dtypes.  A complex
+        # trainable coefficient therefore also needs complex static channel
+        # maps; backend conversion alone would retain their host float dtype.
+        coefficient_dtype = getattr(coefficient_batch, "dtype", None)
+        onsite_map = _as_backend(
+            self._onsite_term_map,
+            like=reference,
+            dtype=coefficient_dtype,
+        )
+        edge_map = _as_backend(
+            self._edge_term_map,
+            like=reference,
+            dtype=coefficient_dtype,
+        )
         return (
             ar.do(
                 "tensordot",

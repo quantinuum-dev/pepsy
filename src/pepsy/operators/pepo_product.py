@@ -50,9 +50,9 @@ def _resolve_pepo_factor_value(value, parameters):
 
 
 def _as_backend_dtype(value, *, like):
-    """Convert a scalar to a backend and dtype compatible with ``like``."""
-    value = _as_backend(value, like=like)
-    target_dtype = getattr(like, "dtype", None)
+    """Convert a scalar to ``like``'s backend without losing its dtype."""
+    target_dtype = ar.do("result_type", like, value)
+    value = _as_backend(value, like=like, dtype=target_dtype)
     if target_dtype is not None and getattr(value, "dtype", None) != target_dtype:
         value = ar.do("astype", value, target_dtype)
     return value

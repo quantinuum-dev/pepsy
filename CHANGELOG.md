@@ -94,6 +94,10 @@ Changes for the next release should be added here before the version is bumped.
   low-level `apply_1q`/`apply_2q` compatibility paths retain their existing
   specialized behavior.
 
+- Fixed complex Torch coefficient slots in `PauliPEPOBasis` by promoting the
+  static fixed-channel maps before fused contractions, preserving autodiff for
+  complex generators in single and ordered-product PEPO builds.
+
 - Extended `contract_flat(...)` with readable bottom/top/left/right and
   four-sided boundary schedules shared by Quimb MPS and CTMRG contraction,
   plus a middle-out target that absorbs opposing boundaries towards a
