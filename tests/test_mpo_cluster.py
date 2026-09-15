@@ -358,6 +358,46 @@ def test_three_ordered_factors_keep_all_torch_autodiff_graphs_finite():
     assert all(torch.isfinite(gradient) for gradient in gradients)
 
 
+@pytest.mark.parametrize("graph", (None, ((0, 1), ((0, 1),))))
+def test_complex_ordered_factor_prefactors_promote_product_identity(graph):
+    """Real Torch slots and complex prefactors use a complex product dtype."""
+    torch = pytest.importorskip("torch")
+    x, z = (
+        torch.as_tensor(matrix, dtype=torch.complex128)
+        for matrix in _paulis()
+    )
+    first = MPOBasis.from_local_terms(
+        2,
+        [MPOProductTerm((0,), (x,), MPOParameter("x"))],
+    )
+    second = MPOBasis.from_local_terms(
+        2,
+        [MPOProductTerm((1,), (z,), MPOParameter("z"))],
+    )
+    options = {} if graph is None else {"graph": graph}
+    expansion = MPOClusterBasisExpansion.from_mpo_bases(
+        (first, second),
+        coefficients=(-0.5j, -0.25j),
+        cluster_size=2,
+        **options,
+    )
+    coefficients = {
+        "x": torch.tensor(0.2, dtype=torch.float64, requires_grad=True),
+        "z": torch.tensor(-0.3, dtype=torch.float64, requires_grad=True),
+    }
+    actual = expansion.exp(1.0, parameters=coefficients).to_mpo().to_dense()
+    identity = torch.eye(2, dtype=torch.complex128)
+    expected = torch.matrix_exp(
+        -0.5j * coefficients["x"] * torch.kron(x, identity)
+    ) @ torch.matrix_exp(
+        -0.25j * coefficients["z"] * torch.kron(identity, z)
+    )
+
+    assert torch.allclose(actual, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradients = torch.autograd.grad(actual.real.sum(), tuple(coefficients.values()))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+
 def test_three_ordered_factors_keep_jax_autodiff_graph_finite():
     """The JAX path uses a static, trace-safe local factorization."""
     jax = pytest.importorskip("jax")

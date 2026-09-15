@@ -69,6 +69,13 @@ then inserts the residual into one MPO/PEPO topology. It is not a sequence of
 three independently truncated full-lattice layers. The PEPO implementation
 records this invariant as `cache_info["joint_cluster_residual"]`.
 
+`PauliPEPOTerm.where` is the finite-square exception to the homogeneous PEPO
+slot model. Located onsite and nearest-neighbour edge slots dispatch to the
+open-boundary order-one/two builder, which evaluates local backgrounds and
+edge residuals per embedding but reuses one fixed 16-channel Pauli bond space.
+Keep higher inhomogeneous residuals separate until per-embedding connected
+subtraction and its storage growth have dedicated convergence tests.
+
 The public facades are:
 
 - `operators.mpo_higher_order` — paper-style higher-order MPOs;

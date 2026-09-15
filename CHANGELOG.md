@@ -94,6 +94,15 @@ Changes for the next release should be added here before the version is bumped.
   low-level `apply_1q`/`apply_2q` compatibility paths retain their existing
   specialized behavior.
 
+
+- Extended `PauliPEPOTerm` with optional explicit site/edge locations and added
+  a fixed-channel open-boundary order-one/two builder for inhomogeneous
+  ordered PEPO products. Homogeneous orders through nine are unchanged.
+- Fixed ordered MPO cluster products with real Torch term slots and complex
+  factor prefactors by initializing products from their first exponential,
+  avoiding a real identity/complex matrix dtype mismatch in interval and graph
+  modes.
+
 - Fixed complex Torch coefficient slots in `PauliPEPOBasis` by promoting the
   static fixed-channel maps before fused contractions, preserving autodiff for
   complex generators in single and ordered-product PEPO builds.

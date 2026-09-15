@@ -44,6 +44,9 @@ def _lazy_cluster_proxy(name):
 def _add_generic_active_levels(*args, **kwargs):
     return _cluster_helper("_add_generic_active_levels")(*args, **kwargs)
 
+def _add_block(*args, **kwargs):
+    return _cluster_helper("_add_block")(*args, **kwargs)
+
 def _add_pair_block_at_site(*args, **kwargs):
     return _cluster_helper("_add_pair_block_at_site")(*args, **kwargs)
 
@@ -162,6 +165,9 @@ def _validate_cyclic(*args, **kwargs):
 def _validate_shape(*args, **kwargs):
     return _cluster_helper("_validate_shape")(*args, **kwargs)
 
+def _normalize_pauli_where(*args, **kwargs):
+    return _cluster_helper("_normalize_pauli_where")(*args, **kwargs)
+
 def _SectorAllocator(*args, **kwargs):
     return _cluster_helper("_SectorAllocator")(*args, **kwargs)
 
@@ -172,11 +178,15 @@ def generate_connected_cluster_shapes(*args, **kwargs):
 
 @dataclass(frozen=True)
 class PauliPEPOTerm:
-    """One translation-invariant Pauli slot in a square-lattice PEPO basis.
+    """One homogeneous or explicitly located Pauli slot in a PEPO basis.
 
     ``support="onsite"`` contributes the same one-site Pauli operator to
     every lattice site. ``support="edge"`` contributes the same ordered
     two-site Pauli operator to every positive (``u`` and ``r``) lattice edge.
+    Set ``where=(i, j)`` for one site or
+    ``where=((i0, j0), (i1, j1))`` for one nearest-neighbour edge. Explicitly
+    located slots currently use the finite, open-boundary order-one/two
+    builder; the homogeneous higher-order builder is unchanged.
     The scalar ``coefficient`` may be a Python number, a Torch/JAX scalar, or
     a callable accepting the parameter container passed to
     :meth:`PauliPEPOBasis.exp`.
@@ -185,17 +195,20 @@ class PauliPEPOTerm:
     support: str
     paulis: object
     coefficient: object = 1.0
+    where: object = None
 
     def __post_init__(self):
         support = _normalize_pauli_support(self.support)
         labels = _normalize_paulis(self.paulis, support=support)
+        where = _normalize_pauli_where(self.where, support=support)
         object.__setattr__(self, "support", support)
         object.__setattr__(self, "paulis", labels)
+        object.__setattr__(self, "where", where)
 
     @classmethod
-    def from_pauli(cls, support, paulis, *, coefficient=1.0):
+    def from_pauli(cls, support, paulis, *, coefficient=1.0, where=None):
         """Construct a term from ``"X"`` or ``"ZZ"`` labels."""
-        return cls(support, paulis, coefficient)
+        return cls(support, paulis, coefficient, where)
 
 
 class CompiledPEPOExp:
@@ -297,25 +310,97 @@ class PauliPEPOBasis:
         self._terms = tuple(_normalize_pauli_term(term) for term in terms)
         if not self._terms:
             raise ValueError("terms must contain at least one Pauli slot.")
+        self.inhomogeneous = any(term.where is not None for term in self._terms)
+        if self.inhomogeneous:
+            if self.cyclic != (False, False):
+                raise NotImplementedError(
+                    "explicit Pauli PEPO locations currently require open boundaries."
+                )
+            if self.order > 2:
+                raise NotImplementedError(
+                    "explicit Pauli PEPO locations currently support joint orders "
+                    "one and two."
+                )
+            if self.symmetry is not None:
+                raise ValueError(
+                    "explicit Pauli PEPO locations cannot use geometric symmetry."
+                )
+        self.site_directions = {
+            (i, j): _site_directions(i, j, self.lx, self.ly, *self.cyclic)
+            for i in range(self.lx)
+            for j in range(self.ly)
+        }
+        self._sites = tuple(self.site_directions)
+        self._site_indices = {
+            site: index for index, site in enumerate(self._sites)
+        }
+        self._positive_edges = tuple(
+            (
+                site,
+                _site_after(site, direction, self.lx, self.ly, self.cyclic),
+                direction,
+            )
+            for site, directions in self.site_directions.items()
+            for direction in directions
+            if direction in _POSITIVE_DIRECTIONS
+        )
+        self._edge_indices = {
+            (source, target): index
+            for index, (source, target, _direction) in enumerate(self._positive_edges)
+        }
         # Static one-hot maps let each evaluation fuse all coefficient slots
         # into onsite and edge Pauli components in two backend contractions.
         # They contain topology only, so they are safe to retain across
         # Torch/JAX autodiff calls.
         self._onsite_term_map = np.zeros((len(self._terms), 4), dtype=float)
         self._edge_term_map = np.zeros((len(self._terms), 16), dtype=float)
+        self._site_term_map = np.zeros(
+            (len(self._terms), len(self._sites), 4),
+            dtype=float,
+        )
+        self._lattice_edge_term_map = np.zeros(
+            (len(self._terms), len(self._positive_edges), 16),
+            dtype=float,
+        )
         for term_index, term in enumerate(self._terms):
             labels = tuple(_PAULI_LABELS.index(label) for label in term.paulis)
             if term.support == "onsite":
                 self._onsite_term_map[term_index, labels[0]] = 1.0
+                if term.where is None:
+                    self._site_term_map[term_index, :, labels[0]] = 1.0
+                else:
+                    try:
+                        site_index = self._site_indices[term.where]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"onsite Pauli location {term.where!r} is outside "
+                            f"the {self.lx}x{self.ly} lattice."
+                        ) from exc
+                    self._site_term_map[term_index, site_index, labels[0]] = 1.0
             else:
                 self._edge_term_map[term_index, labels[0] * 4 + labels[1]] = 1.0
+                if term.where is None:
+                    self._lattice_edge_term_map[
+                        term_index, :, labels[0] * 4 + labels[1]
+                    ] = 1.0
+                else:
+                    source, target = term.where
+                    edge_index = self._edge_indices.get((source, target))
+                    if edge_index is None:
+                        edge_index = self._edge_indices.get((target, source))
+                        if edge_index is not None:
+                            labels = labels[::-1]
+                    if edge_index is None:
+                        raise ValueError(
+                            f"edge Pauli location {term.where!r} is not one open "
+                            "nearest-neighbour lattice edge."
+                        )
+                    component = labels[0] * 4 + labels[1]
+                    self._lattice_edge_term_map[
+                        term_index, edge_index, component
+                    ] = 1.0
         self._cluster_embedding_cache = {}
         self._generic_cluster_cache = {}
-        self.site_directions = {
-            (i, j): _site_directions(i, j, self.lx, self.ly, *self.cyclic)
-            for i in range(self.lx)
-            for j in range(self.ly)
-        }
         self.plaquette_starts = _plaquette_starts(self.lx, self.ly, self.cyclic)
         self.pair_orbits = _pair_orbits() if symmetry == "C4" else tuple(
             (pair, (pair,)) for pair in _all_direction_pairs()
@@ -337,7 +422,7 @@ class PauliPEPOBasis:
 
     @property
     def terms(self):
-        """Read-only translation-invariant Pauli slots."""
+        """Read-only homogeneous or explicitly located Pauli slots."""
         return self._terms
 
     @property
@@ -369,6 +454,7 @@ class PauliPEPOBasis:
                 np.count_nonzero(self._onsite_term_map)
                 + np.count_nonzero(self._edge_term_map)
             ),
+            "inhomogeneous": self.inhomogeneous,
             "cyclic": self.cyclic,
             "symmetry": self.symmetry,
             "max_tree_rank": self.max_tree_rank,
@@ -392,6 +478,8 @@ class PauliPEPOBasis:
         # per-basis cluster maps.
         _backend_pauli_basis(1)
         _backend_pauli_basis(2)
+        if self.inhomogeneous:
+            return self
         # The joint ordered-product path always evaluates the one-site
         # background and positive reference edge, including at order two.
         self._cluster_embedding_plan(1, ())
@@ -594,6 +682,183 @@ class PauliPEPOBasis:
                 edge_map,
                 axes=([0], [0]),
             ),
+        )
+
+    def _localized_hamiltonian_components(self, values):
+        """Fuse slots into one Pauli-component vector per site and edge."""
+        reference = _backend_reference(values)
+        coefficient_batch = _backend_stack(values)
+        coefficient_dtype = getattr(coefficient_batch, "dtype", None)
+        site_map = _as_backend(
+            self._site_term_map,
+            like=reference,
+            dtype=coefficient_dtype,
+        )
+        edge_map = _as_backend(
+            self._lattice_edge_term_map,
+            like=reference,
+            dtype=coefficient_dtype,
+        )
+        return (
+            ar.do("tensordot", coefficient_batch, site_map, axes=([0], [0])),
+            ar.do("tensordot", coefficient_batch, edge_map, axes=([0], [0])),
+        )
+
+    def _build_inhomogeneous_active(self, factor_sources):
+        """Build an open-boundary order-one/two PEPO with local coefficients."""
+        factor_sources = tuple(factor_sources)
+        if not factor_sources:
+            raise ValueError("factor_sources must contain at least one factor.")
+        if self.order > 2:
+            raise NotImplementedError(
+                "inhomogeneous ordered PEPO products currently support order <= 2."
+            )
+        localized = []
+        for basis, beta, values in factor_sources:
+            if (basis.lx, basis.ly, basis.cyclic) != (
+                self.lx,
+                self.ly,
+                self.cyclic,
+            ):
+                raise ValueError("inhomogeneous PEPO factors must share one lattice.")
+            site_components, edge_components = (
+                basis._localized_hamiltonian_components(values)
+            )
+            localized.append((beta, site_components, edge_components))
+
+        reference = _backend_reference(
+            tuple(
+                value
+                for beta, site_components, edge_components in localized
+                for value in (beta, site_components, edge_components)
+            )
+        )
+        localized = [
+            (
+                _as_backend(beta, like=reference),
+                _as_backend(site_components, like=reference),
+                _as_backend(edge_components, like=reference),
+            )
+            for beta, site_components, edge_components in localized
+        ]
+        paulis = _backend_pauli_basis(1, like=reference)
+        one_basis = ar.do("stack", paulis, axis=0)
+        two_basis = ar.do(
+            "stack",
+            _backend_pauli_basis(2, like=reference),
+            axis=0,
+        )
+        identity = paulis[0]
+
+        def ordered_product(site_indices, edge_index=None):
+            result = None
+            for beta, site_components, edge_components in localized:
+                onsite_operators = tuple(
+                    ar.do(
+                        "tensordot",
+                        _complexify_backend(site_components[site_index]),
+                        one_basis,
+                        axes=([0], [0]),
+                    )
+                    for site_index in site_indices
+                )
+                if len(site_indices) == 1:
+                    hamiltonian = onsite_operators[0]
+                else:
+                    edge_operator = ar.do(
+                        "tensordot",
+                        _complexify_backend(edge_components[edge_index]),
+                        two_basis,
+                        axes=([0], [0]),
+                    )
+                    hamiltonian = ar.do(
+                        "add",
+                        ar.do(
+                            "add",
+                            ar.do("kron", onsite_operators[0], identity),
+                            ar.do("kron", identity, onsite_operators[1]),
+                        ),
+                        edge_operator,
+                    )
+                local_exp = _backend_expm(ar.do("multiply", -beta, hamiltonian))
+                result = (
+                    local_exp
+                    if result is None
+                    else ar.do("matmul", result, local_exp)
+                )
+            return result
+
+        one_exps = tuple(
+            ordered_product((site_index,))
+            for site_index in range(len(self._sites))
+        )
+        blocks = {
+            site: {
+                (0,) * len(self.site_directions[site]): one_exps[site_index]
+            }
+            for site_index, site in enumerate(self._sites)
+        }
+        allocator = _SectorAllocator()
+        if self.order >= 2:
+            channels = tuple(product(range(4), repeat=2))
+            sectors = allocator.allocate(len(channels))
+            source_factors = _backend_stack(
+                [paulis[first] for first, _second in channels]
+            )
+            for edge_index, (source, target, direction) in enumerate(
+                self._positive_edges
+            ):
+                exact = ordered_product(
+                    (self._site_indices[source], self._site_indices[target]),
+                    edge_index,
+                )
+                residual = ar.do(
+                    "subtract",
+                    exact,
+                    _backend_operator_product(
+                        [
+                            one_exps[self._site_indices[source]],
+                            one_exps[self._site_indices[target]],
+                        ]
+                    ),
+                )
+                coefficients = _backend_pauli_expand(residual, 2)
+                target_factors = _backend_stack(
+                    [
+                        ar.do(
+                            "multiply",
+                            coefficients[first, second],
+                            paulis[second],
+                        )
+                        for first, second in channels
+                    ]
+                )
+                opposite = _OPPOSITE_DIRECTION[direction]
+                for channel, sector in enumerate(sectors):
+                    _add_block(
+                        blocks,
+                        self.site_directions,
+                        source,
+                        {direction: sector},
+                        source_factors[channel],
+                    )
+                    _add_block(
+                        blocks,
+                        self.site_directions,
+                        target,
+                        {opposite: sector},
+                        target_factors[channel],
+                    )
+
+        self._build_count += 1
+        return ActivePEPOBlocks(
+            lx=self.lx,
+            ly=self.ly,
+            cyclic=self.cyclic,
+            bond_dim=allocator.next_sector,
+            physical_dim=2,
+            site_directions=self.site_directions,
+            blocks=blocks,
         )
 
     @staticmethod
@@ -1431,7 +1696,13 @@ class PauliPEPOBasis:
             else:
                 raise TypeError("exp requires step, tau, or beta.")
         values = self._coefficient_values(parameters, coefficients)
-        active = self._build_active(-step, values)
+        beta = -step
+        if self.inhomogeneous:
+            reference = _backend_reference((beta, *values))
+            beta = _as_backend(beta, like=reference)
+            active = self._build_inhomogeneous_active(((self, beta, values),))
+        else:
+            active = self._build_active(beta, values)
         return active.to_pepo() if materialize else active
 
     def evaluate(

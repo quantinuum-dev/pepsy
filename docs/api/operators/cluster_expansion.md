@@ -392,6 +392,37 @@ such as `("edge", "ZZ", J)`, and `PauliPEPOTerm` values are accepted. Pass
 `beta=1j * tau` explicitly when using the cluster convention
 `exp(-beta * H)` rather than the real-time `tau` shorthand.
 
+For finite colorings or independent coefficients, add an explicit location:
+
+```python
+from pepsy.operators import PauliPEPOBasis, PauliPEPOTerm
+
+basis = PauliPEPOBasis.compile(
+    2,
+    3,
+    [
+        PauliPEPOTerm("onsite", "X", coefficient=h00, where=(0, 0)),
+        PauliPEPOTerm(
+            "edge",
+            "ZZ",
+            coefficient=j01,
+            where=((0, 0), (0, 1)),
+        ),
+    ],
+    order=2,
+)
+```
+
+Unlocated and located slots can be mixed, including across
+`PEPOClusterProductExpansion` factors. The localized builder computes a
+different one-site background and two-site connected residual on every
+physical edge while reusing the same 16 Pauli virtual labels, so its bond
+dimension remains 17 rather than growing with the edge count. This initial
+path is explicitly limited to open boundaries, `order <= 2`, and no C4
+quotient. Requests outside that scope raise instead of silently restoring
+translation invariance. The existing homogeneous order-one-through-nine path
+is unchanged.
+
 The Pauli basis is physical and fixed. The PEPO virtual channels are separate
 active history sectors for edge, pair, star, and path clusters. Coefficient
 slots are fused into the 4 onsite and 16 edge Pauli components before local

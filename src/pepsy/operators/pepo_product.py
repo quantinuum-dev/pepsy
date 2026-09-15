@@ -54,7 +54,10 @@ def _as_backend_dtype(value, *, like):
     target_dtype = ar.do("result_type", like, value)
     value = _as_backend(value, like=like, dtype=target_dtype)
     if target_dtype is not None and getattr(value, "dtype", None) != target_dtype:
-        value = ar.do("astype", value, target_dtype)
+        if hasattr(value, "astype"):
+            value = ar.do("astype", value, target_dtype)
+        else:
+            value = ar.do("array", value, like=like, dtype=target_dtype)
     return value
 
 
@@ -250,6 +253,7 @@ class PEPOClusterProductExpansion:
         """
         factor_coefficients = self._factor_coefficients(coefficients)
         factor_data = []
+        factor_sources = []
         for factor, term_coefficients in zip(self.factors, factor_coefficients):
             coefficient = _resolve_pepo_factor_value(
                 factor.coefficient,
@@ -283,12 +287,18 @@ class PEPOClusterProductExpansion:
                     edge_components,
                 )
             )
+            factor_sources.append((factor.basis, factor_beta, values))
 
-        active = self.factors[0].basis._build_active(
-            None,
-            None,
-            factor_data=factor_data,
-        )
+        if any(factor.basis.inhomogeneous for factor in self.factors):
+            active = self.factors[0].basis._build_inhomogeneous_active(
+                factor_sources
+            )
+        else:
+            active = self.factors[0].basis._build_active(
+                None,
+                None,
+                factor_data=factor_data,
+            )
         result = active.to_pepo()
         if compress:
             result.compress(**compress_opts)

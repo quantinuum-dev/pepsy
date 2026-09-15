@@ -711,6 +711,34 @@ def _normalize_pauli_support(support):
         raise ValueError("PauliPEPOTerm support must be 'onsite' or 'edge'.") from exc
 
 
+def _normalize_pauli_where(where, *, support):
+    if where is None:
+        return None
+
+    def coordinate(value, name):
+        try:
+            value = tuple(value)
+        except TypeError as exc:
+            raise TypeError(f"{name} must be a two-integer coordinate.") from exc
+        if len(value) != 2 or not all(isinstance(item, Integral) for item in value):
+            raise TypeError(f"{name} must be a two-integer coordinate.")
+        return tuple(int(item) for item in value)
+
+    if support == "onsite":
+        return coordinate(where, "onsite Pauli location")
+    try:
+        source, target = tuple(where)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "edge Pauli location must contain two lattice coordinates."
+        ) from exc
+    source = coordinate(source, "edge source")
+    target = coordinate(target, "edge target")
+    if source == target:
+        raise ValueError("edge Pauli endpoints must be distinct.")
+    return source, target
+
+
 def _normalize_pauli_term(term):
     if isinstance(term, PauliPEPOTerm):
         return term
@@ -725,16 +753,18 @@ def _normalize_pauli_term(term):
             support,
             paulis,
             term.get("coefficient", 1.0),
+            term.get("where"),
         )
-    if isinstance(term, (tuple, list)) and len(term) in (2, 3):
+    if isinstance(term, (tuple, list)) and len(term) in (2, 3, 4):
         return PauliPEPOTerm(
             term[0],
             term[1],
-            term[2] if len(term) == 3 else 1.0,
+            term[2] if len(term) >= 3 else 1.0,
+            term[3] if len(term) == 4 else None,
         )
     raise TypeError(
         "Pauli PEPO terms must be PauliPEPOTerm values, mappings, or "
-        "(support, paulis[, coefficient]) tuples."
+        "(support, paulis[, coefficient[, where]]) tuples."
     )
 
 

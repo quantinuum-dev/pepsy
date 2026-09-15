@@ -1790,7 +1790,7 @@ class MPOClusterProductExpansion:
                 if operator is None:
                     operator = string_factors.get(site)
                 if operator is None:
-                    operator = np.eye(self.phys_dim)
+                    operator = ar.do("eye", self.phys_dim, like=reference)
                 matrices.append(operator)
             matrices = [
                 _as_backend(matrix, like=reference)
@@ -1803,10 +1803,16 @@ class MPOClusterProductExpansion:
         operator = term.operator
         support_start = min(term.sites)
         support_end = max(term.sites)
-        left = np.eye(self.phys_dim ** (support_start - start))
-        right = np.eye(self.phys_dim ** (end - support_end))
-        left = _as_backend(left, like=operator)
-        right = _as_backend(right, like=operator)
+        left = ar.do(
+            "eye",
+            self.phys_dim ** (support_start - start),
+            like=operator,
+        )
+        right = ar.do(
+            "eye",
+            self.phys_dim ** (end - support_end),
+            like=operator,
+        )
         return _kron_all((_kron(left, operator), right))
 
     def _graph_term_matrix(self, term, cluster):
@@ -1949,8 +1955,8 @@ class MPOClusterProductExpansion:
             local_exponentials.append(_matrix_exponential(exponent))
         if len(local_exponentials) == 1:
             return local_exponentials[0]
-        total = _identity(dimension, like=reference)
-        for local_exponential in local_exponentials:
+        total = local_exponentials[0]
+        for local_exponential in local_exponentials[1:]:
             total = ar.do("matmul", total, local_exponential)
         return total
 
@@ -2003,8 +2009,8 @@ class MPOClusterProductExpansion:
             local_exponentials.append(_matrix_exponential(exponent))
         if len(local_exponentials) == 1:
             return local_exponentials[0]
-        total = _identity(dimension, like=reference)
-        for local_exponential in local_exponentials:
+        total = local_exponentials[0]
+        for local_exponential in local_exponentials[1:]:
             total = ar.do("matmul", total, local_exponential)
         return total
 
