@@ -195,6 +195,7 @@ if TYPE_CHECKING:
         id_to_pepo,
         measure_obs,
         mps_to_ttn,
+        mps_to_treepeps,
         ps_to_3dpeps,
         ps_to_mpo,
         ps_to_mps,

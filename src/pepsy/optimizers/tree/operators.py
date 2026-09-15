@@ -676,14 +676,15 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         node_tag_id="N{}",
         layout_finder=None,
     ):
-        """Build a compact TreeMPO for a weighted Pauli-product sum.
+        """Build a tree operator for a weighted Pauli-product sum.
 
         ``weighted_terms`` contains ``(coefficient, {site: axis})`` pairs.
         One virtual channel is used per retained branch, but channels are
         installed only on the union of the branches' TreePlan Steiner
-        subtrees. Exterior tensors remain explicit bond-one identities, so
-        the result can use the support-aware :meth:`TreeOptimizer` route
-        without constructing a ``2**n`` dense matrix or a chain MPO.
+        subtrees. ``TreeMPO.from_pauli_sum`` retains explicit bond-one
+        exterior identities, while ``SubTreeMPO.from_pauli_sum`` omits them
+        and makes identity outside the active region implicit. Neither form
+        constructs a ``2**n`` dense matrix or a chain MPO.
         """
         network, support = _pauli_sum_tree_operator(
             plan,
@@ -693,13 +694,26 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             node_tag_id=node_tag_id,
+            active_only=issubclass(cls, SubTreeMPO),
+        )
+        compact = issubclass(cls, SubTreeMPO)
+        active_nodes = (
+            _tree_subtree_span(
+                plan,
+                tuple(plan.node_of_qubit[q] for q in support),
+            )
+            if compact else None
         )
         operator = cls(
             plan,
             network,
             backend="dense",
             fermionic=False,
-            sites=tuple(sorted(plan.node_of_qubit)),
+            sites=tuple(sorted(
+                plan.qubit_of_node[node]
+                for node in active_nodes
+                if node in plan.qubit_of_node
+            )) if compact else tuple(sorted(plan.node_of_qubit)),
             site_tag_id=site_tag_id,
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
@@ -3301,8 +3315,9 @@ def _pauli_sum_tree_operator(
     upper_ind_id="k{}",
     lower_ind_id="b{}",
     node_tag_id="N{}",
+    active_only=False,
 ):
-    """Construct a compact dense TTNO for a sparse Pauli-product sum."""
+    """Construct a dense TTNO for a sparse Pauli-product sum."""
     import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
     from ..stabilizer_tn.operators import pauli_matrix
@@ -3371,9 +3386,13 @@ def _pauli_sum_tree_operator(
         return f"_pepsy_tnno_{min(node, neighbor)}_{max(node, neighbor)}"
 
     tensors = []
-    for node in plan.nodes():
+    nodes = tuple(sorted(active_nodes)) if active_only else tuple(plan.nodes())
+    for node in nodes:
         qubit = plan.qubit_of_node.get(node)
-        neighbors = _tree_plan_neighbors(plan, node)
+        neighbors = tuple(
+            neighbor for neighbor in _tree_plan_neighbors(plan, node)
+            if not active_only or neighbor in active_nodes
+        )
         inds = [
             *((f"k{qubit}", f"b{qubit}") if qubit is not None else ()),
             *(edge_name(node, neighbor) for neighbor in neighbors),
@@ -3427,6 +3446,7 @@ def _pauli_sum_tree_operator(
         upper_ind_id=upper_ind_id,
         lower_ind_id=lower_ind_id,
         node_tag_id=node_tag_id,
+        nodes=nodes,
     )
     return network, route_support
 

@@ -284,6 +284,7 @@ _SYMBOL_MODULES = {
     "ps_to_mps": ".tensors",
     "ps_to_ttn": ".tensors",
     "mps_to_ttn": ".tensors",
+    "mps_to_treepeps": ".tensors",
     "ps_to_pepo": ".tensors",
     "ps_to_peps": ".tensors",
     "random_haar_qubit": ".tensors",

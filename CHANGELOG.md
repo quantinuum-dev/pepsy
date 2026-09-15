@@ -14,6 +14,44 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- `TreeSubPepo` now has a genuine compact operator core. Its public
+  `operator`/`active_operator` contains only the connected compression span;
+  exterior identity action is implicit, while `full_operator` is retained only
+  for compatibility dense readout. TreePEPS fused, path, and TreeFIT/DMRG
+  updates all consume the compact view, so inactive operator layers and bonds
+  are not materialized in the hot update target.
+
+- TreePEPS canonical-region preparation now follows cached `left_inds`: a
+  contained region is adopted without checking every tensor, and disjoint
+  regions move only along their connector path. Local path compression keeps
+  the resulting metadata and recovers the requested center without a redundant
+  full-tree QR sweep; subtree compression leaves exterior state bonds alone.
+
+- Matured `TreePepsOptimizer` compression and FIT/DMRG parity. It now
+  exposes Quimb's `sdc`/`sdcr`/`src` oversampled families and
+  `zipup-oversample`, including seeded path routing, fixed-topology branching
+  fallbacks, intermediate bond controls, and explicit mode diagnostics.
+  TreeFIT updates now accept traversal, environment-strategy, transition,
+  single-site fast-path, finite-check, and dtype-aware `fit_rtol` controls;
+  topology boundaries remain unchanged.
+
+- `TreePepsOptimizer` now defaults TreeFIT to `fit_traversal="auto"`, using
+  path-local environment reuse for ordinary one- and two-site gate spans and
+  depth-first traversal for branching multi-site spans. `fit_sweep_sequence`
+  continues to default to the RL-compatible inward-outward schedule.
+
+- Added explicit `mps_to_treepeps` conversion for site-complete `TreePeps`
+  plans. Uncapped conversion is lossless up to floating-point roundoff;
+  finite-`chi` projection remains caller-controlled and reports no implicit
+  normalization or relayout.
+
+- Dense tree Pauli sums, rotations, and product-Pauli projectors now build a
+  true compact `SubTreeMPO` on their active Steiner region. The full
+  `TreeMPO.from_pauli_sum` constructor remains available for callers that
+  require explicit exterior identity tensors; explicit chain `submpo` and
+  low-level `apply_1q`/`apply_2q` compatibility paths retain their existing
+  specialized behavior.
+
 - Extended `contract_flat(...)` with readable bottom/top/left/right and
   four-sided boundary schedules shared by Quimb MPS and CTMRG contraction,
   plus a middle-out target that absorbs opposing boundaries towards a

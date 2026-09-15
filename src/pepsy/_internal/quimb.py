@@ -172,7 +172,7 @@ def quimb_mpo_auto_swap_function(mpo):
 
 def quimb_1d_compression_function(method):
     """Return Quimb's concrete 1D compressor for *method*, if available."""
-    method = str(method).strip().lower()
+    method = str(method).strip().lower().replace("_", "-")
     function_name = f"tensor_network_1d_compress_{method.replace('-', '_')}"
     function = getattr(qtn, function_name, None)
     if callable(function):
@@ -187,7 +187,7 @@ def quimb_1d_compression_function(method):
 
 def quimb_1d_compression_method_available(method):
     """Return whether an optional Quimb 1D compressor is installed."""
-    method = str(method).strip().lower()
+    method = str(method).strip().lower().replace("_", "-")
     if method not in _OPTIONAL_1D_METHODS:
         return True
     return callable(quimb_1d_compression_function(method))
@@ -223,7 +223,7 @@ def quimb_1d_compression_cutoff_mode(method, cutoff_mode):
     Pepsy's boundary and preserve ``None`` so each installed Quimb release can
     select its own native default.
     """
-    method = str(method).strip().lower()
+    method = str(method).strip().lower().replace("_", "-")
     if method == "sdcr" and str(cutoff_mode).strip().lower() in {
         "sum1",
         "sum2",
@@ -306,7 +306,7 @@ def require_quimb_ctmrg_projector_canonize(canonize):
 
 def quimb_1d_compression_method_supports_seed(method):
     """Return whether Quimb's concrete compressor explicitly accepts ``seed``."""
-    method = str(method).strip().lower()
+    method = str(method).strip().lower().replace("_", "-")
     if method not in _SEEDED_METHODS:
         return False
     function = quimb_1d_compression_function(method)

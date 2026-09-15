@@ -6,6 +6,7 @@ import quimb as qu
 import quimb.tensor as qtn
 
 from pepsy.fitting import TreeFIT
+from pepsy.fitting.tree import _build_layered_operator_state_target
 from pepsy.optimizers import (
     MpsOptimizer,
     TreePeps,
@@ -14,6 +15,7 @@ from pepsy.optimizers import (
     TreePepo,
     TreeSubPepo,
 )
+from pepsy.tensors import mps_to_treepeps
 
 pytestmark = pytest.mark.smoke
 
@@ -35,6 +37,85 @@ def _path_plan(shape, **kwargs):
 
     kwargs.setdefault("topology", "path")
     return TreePepsPlan.from_shape(shape, **kwargs)
+
+
+def test_tree_peps_dmrg_defaults_use_rl_and_path_aware_traversal():
+    """Ordinary gate FIT defaults to the bidirectional path schedule."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(TreePepsPlan.from_shape((2, 3))),
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        track_infidelity=False,
+        run=False,
+    )
+
+    assert optimizer.fit_sweep_sequence == "inward-outward"
+    assert optimizer.fit_traversal == "auto"
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["sweep_sequence"] == "inward-outward"
+    assert diagnostics["resolved_traversal"] == "path"
+
+
+def test_tree_peps_threads_cap_tensor_updates_and_copy_policy(monkeypatch):
+    """PEPS uses the same bounded host-thread policy as TreeOptimizer."""
+
+    import importlib
+
+    optimizer_module = importlib.import_module(
+        "pepsy.optimizers.tree_peps.optimizer"
+    )
+    calls = []
+
+    class Limit:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Controller:
+        def limit(self, *, limits):
+            calls.append(limits)
+            return Limit()
+
+    monkeypatch.setattr(optimizer_module, "_THREAD_CONTROLLER", Controller())
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode="dmrg2",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        threads=3,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    assert calls == [3]
+    assert optimizer.copy().threads == 3
+
+    unlimited = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode="dmrg2",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        threads=None,
+        track_infidelity=False,
+        run=False,
+    )
+    unlimited.apply_gate(_cnot(), (0, 4))
+    assert calls == [3]
 
 
 def test_chain_compression_matches_mps_svd_when_cap_is_sufficient():
@@ -102,6 +183,84 @@ def test_path_compression_modes_use_seeded_quimb_kernels(compression_mode):
     )
 
 
+@pytest.mark.parametrize(
+    "compression_mode",
+    ("sdc_oversample", "sdcr", "sdcr_oversample", "src_oversample", "zipup_oversample"),
+)
+def test_path_advanced_compression_modes_preserve_treepeps_contract(compression_mode):
+    """The newer Quimb path compressors are exposed without losing metadata."""
+
+    plan = _path_plan((1, 6))
+    state = TreePeps.rand(plan, bond_dim=3, seed=53)
+    optimizer = TreePepsOptimizer(
+        state,
+        mode=compression_mode,
+        chi=1,
+        cutoff=0.0,
+        compression_seed=7,
+        max_bond_oversample=2,
+        cutoff_oversample=0.0,
+        run=False,
+        track_infidelity=False,
+    )
+    reference = optimizer.copy()
+
+    optimizer.apply_gate(_cnot(), (0, 5))
+    reference.apply_gate(_cnot(), (0, 5))
+
+    assert optimizer.compression_mode == compression_mode
+    assert optimizer.state.max_bond() <= 1
+    np.testing.assert_allclose(optimizer.to_dense(), reference.to_dense())
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+@pytest.mark.parametrize(
+    "compression_mode",
+    ("sdc_oversample", "sdcr", "sdcr_oversample", "src_oversample"),
+)
+def test_branching_advanced_compression_modes_use_edge_sweeps(compression_mode):
+    """Successive path modes have a defined fixed-topology tree fallback."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.rand(plan, bond_dim=3, seed=59),
+        mode=compression_mode,
+        chi=1,
+        cutoff=0.0,
+        compression_seed=11,
+        max_bond_oversample=2,
+        run=False,
+        track_infidelity=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    span = optimizer.last_report["span"]
+    assert all(
+        optimizer.state.bond_sizes()[edge] <= 1
+        for edge in plan.tree_edges
+        if edge[0] in span and edge[1] in span
+    )
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_zipup_oversample_rejects_branching_edge_compression():
+    """Zip-up remains explicitly limited to a complete path network."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode="zipup_oversample",
+        chi=1,
+        cutoff=0.0,
+        run=False,
+        track_infidelity=False,
+    )
+
+    with pytest.raises(NotImplementedError, match="complete path"):
+        optimizer.apply_gate(_cnot(), (0, 4))
+
+
 @pytest.mark.parametrize("compression_mode", ("sdc", "src", "zipup"))
 def test_path_two_layer_and_fused_operator_application_agree(compression_mode):
     """Path compression can retain either the MPO-MPS or fused application."""
@@ -152,6 +311,28 @@ def test_path_two_layer_layout_rejects_branching_tree():
         )
 
 
+def test_tree_peps_replay_preserves_live_bonds_after_mps_handoff():
+    """Direct replay accepts generated bond names from lossless conversion."""
+
+    plan = TreePepsPlan.from_shape(
+        (2, 3), order="hilbert", tree_order="row-major"
+    )
+    mps = qtn.MPS_rand_state(6, bond_dim=2, seed=42, dtype="complex128")
+    state = mps_to_treepeps(mps, plan=plan, chi=None)
+    optimizer = TreePepsOptimizer(
+        state,
+        mode="direct",
+        chi=2,
+        cutoff=0.0,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
 @pytest.mark.parametrize(
     ("mode", "fit_n_iter", "expected_block_size"),
     (("dmrg1", 3, 2), ("dmrg2", 1, 2), ("dmrg3", 1, 3)),
@@ -187,6 +368,33 @@ def test_tree_peps_dmrg_uses_tree_fit_engine(
     assert diagnostics["target_layout"] == "layered"
     assert diagnostics["cache"]["hits"] > 0
     assert diagnostics["local_fidelity"] > 1.0 - 1.0e-10
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_block_size"),
+    [("dmrg1", 2), ("dmrg2", 2), ("dmrg3", 3)],
+)
+def test_tree_peps_one_shot_dmrg_alias_is_preserved(mode, expected_block_size):
+    """An apply-time DMRG alias selects its named TreeFIT schedule."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode="direct",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=3,
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply(np.eye(4), (0, 4), mode=mode)
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["requested_block_size"] == expected_block_size
+    assert optimizer.mode == "direct"
+    assert optimizer._dmrg_mode_alias is None
     assert optimizer.validate(check_canonical=True) is optimizer
 
 
@@ -286,6 +494,150 @@ def test_tree_peps_dmrg_fits_explicit_sub_treepepo():
 
     assert optimizer.get_fit_diagnostics()["backend"] == "tree_fit"
     assert optimizer.get_fit_diagnostics()["local_fidelity"] > 1.0 - 1.0e-10
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_tree_sub_treepepo_materializes_only_its_active_span():
+    """A support fragment stores no exterior identity operator layer."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 4))
+
+    assert subop.active_nodes == subop.span
+    assert subop.active_operator.sites == tuple(sorted(subop.span))
+    assert len(subop.active_operator.tensors) == len(subop.span)
+    assert set(subop.operator_bond_dims) == {
+        tuple(sorted(edge))
+        for edge in plan.tree_edges
+        if set(edge).issubset(subop.span)
+    }
+    assert subop.active_operator.validate()
+    # Keep the complete representation available for the compatibility dense
+    # readout while routing updates through the compact view.
+    assert len(subop.operator.tensors) == len(subop.span)
+    assert len(subop.full_operator.tensors) == plan.size
+
+
+def test_tree_peps_fit_target_has_operator_layers_only_on_active_span():
+    """TreeFIT receives state-only exterior branches and compact PEPO layers."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    state = TreePeps.from_plan(plan)
+    subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 4))
+    target = _build_layered_operator_state_target(
+        state,
+        subop.active_operator,
+        active_nodes=subop.span,
+    )
+
+    for node in state.sites:
+        assert len(target.tag_map[state.node_tag(node)]) == (
+            2 if node in subop.span else 1
+        )
+    fit = TreeFIT(target, state.copy(), max_bond=2, cutoffs=0.0)
+    assert fit.target_layout == "layered"
+
+
+def test_tree_peps_path_subtree_does_not_fallback_to_full_canonize(monkeypatch):
+    """Path compression reuses left-indices and only walks the active path."""
+
+    plan = _path_plan((1, 6))
+    state = TreePeps.from_plan(plan)
+    subop = TreeSubPepo.from_operator(plan, _cnot(), support=(2, 5))
+    called = []
+
+    def fail_full_canonize(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("path compression unexpectedly requested full QR")
+
+    monkeypatch.setattr(state, "canonize_to", fail_full_canonize)
+    result = subop.apply_to(
+        state,
+        inplace=True,
+        compress=True,
+        max_bond=1,
+        cutoff=0.0,
+    )
+
+    assert result is state
+    assert not called
+    assert state.validate(check_canonical=True)
+
+
+def test_tree_peps_dmrg_exposes_treefit_traversal_and_transition_controls():
+    """TreePEPS DMRG forwards the mature TreeFIT scheduling controls."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(TreePepsPlan.from_shape((2, 3))),
+        mode="dmrg3",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=3,
+        fit_two_site_transition_sweeps=1,
+        fit_traversal="depth-first",
+        fit_environment_strategy="default",
+        fit_single_node_fast_path=False,
+        fit_finite_check=False,
+        fit_init_strategy="direct",
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["traversal"] == "depth-first"
+    assert diagnostics["resolved_traversal"] == "depth-first"
+    assert diagnostics["environment_strategy"] == "default"
+    assert diagnostics["finite_check"] is False
+    assert diagnostics["split_method"] == "direct"
+    assert diagnostics["block_size_trace"][0] == 3
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_tree_peps_dmrg_single_site_fast_path_can_be_disabled():
+    """One-site FIT updates retain an explicit opt-out for repeated sweeps."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(_path_plan((1, 3))),
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=2,
+        fit_single_node_fast_path=False,
+        fit_init_strategy="direct",
+        track_infidelity=False,
+        run=False,
+    )
+
+    optimizer.apply_gate(qu.hadamard(), (1,))
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["iterations"] == 2
+    assert diagnostics["block_size_trace"] == (1, 1)
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_tree_peps_run_finite_check_is_a_temporary_override():
+    """Replay-level finite checks do not permanently alter optimizer state."""
+
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(TreePepsPlan.from_shape((2, 3))),
+        gates=[(_cnot(), (0, 4))],
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        track_infidelity=False,
+        run=False,
+    )
+
+    with pytest.warns(RuntimeWarning, match="finite_check"):
+        optimizer.run(finite_check=True)
+
+    assert optimizer._finite_check_enabled is False
+    assert optimizer.get_fit_diagnostics()["finite_check"] is True
     assert optimizer.validate(check_canonical=True) is optimizer
 
 
@@ -494,8 +846,12 @@ def test_optimizer_owns_a_persistent_stream_and_supports_replacement():
         ("auto", "auto", "direct"),
         ("dm", "direct", "dm"),
         ("sdc", "direct", "sdc"),
+        ("sdc-oversample", "direct", "sdc_oversample"),
+        ("sdcr", "direct", "sdcr"),
+        ("src-oversample", "direct", "src_oversample"),
         ("src", "direct", "src"),
         ("zipup", "direct", "zipup"),
+        ("zipup-first", "direct", "zipup_oversample"),
         ("sub_treepepsmpo", "sub_treepepo", "direct"),
         ("dmrg", "dmrg", "direct"),
     ],
@@ -637,6 +993,7 @@ def test_optimizer_matches_ttn_state_aliases_and_readout_helpers():
 
     assert optimizer.p is optimizer.state
     assert optimizer.tn is optimizer.state
+    assert optimizer.state.center == optimizer.state.orthogonality_center
     assert optimizer.orthogonality_center == optimizer.center
     assert optimizer.qubits == [0, 1, 2]
     assert optimizer.logical_order == optimizer.qubits
@@ -668,6 +1025,14 @@ def test_optimizer_estimate_and_preflight_report_conservative_tree_bonds():
     assert not report["ok"]
     assert report["violations"]
 
+    identity = TreePepo.identity(plan)
+    identity_estimate = optimizer.estimate_bonds(
+        [TreePepsOptimizer.tree_pepo_event(identity)]
+    )
+    identity_event = identity_estimate["events"][0]
+    assert identity_event["support"] == identity.sites
+    assert identity_event["span_nodes"] == plan.size
+
 
 def test_optimizer_truncation_report_and_normalize_are_available():
     plan = _path_plan((1, 2))
@@ -684,6 +1049,27 @@ def test_optimizer_truncation_report_and_normalize_are_available():
     old_norm = optimizer.normalize()
     assert old_norm > 0.0
     assert np.allclose(optimizer.norm(), 1.0)
+
+
+def test_optimizer_set_state_clears_tree_fit_diagnostics():
+    """Replacing the state cannot leave a report for the old state behind."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.from_plan(plan),
+        mode="dmrg",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        track_infidelity=False,
+    )
+    optimizer.apply_gate(_cnot(), (0, 4))
+    assert optimizer.get_fit_diagnostics() is not None
+
+    optimizer.set_state(TreePeps.from_plan(plan))
+
+    assert optimizer.get_fit_diagnostics() is None
+    assert optimizer.fit_diagnostics == []
 
 
 def test_optimizer_canonicalization_and_info_c_are_state_owned():

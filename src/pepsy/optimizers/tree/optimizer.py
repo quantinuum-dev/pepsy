@@ -6249,11 +6249,12 @@ class TreeOptimizer:
     ):
         """Apply ``exp(-i theta * sign * P / 2)`` on a Pauli support.
 
-        The operator is represented as a compact TreeMPO on the true support
-        Steiner subtree, so this remains efficient when ``where`` is sparse or
-        long. Explicit ``mode='submpo'`` retains the chain-MPO compatibility
-        route. This method is deliberately frame-neutral: callers such as a
-        stabilizer wrapper may pass a tableau-conjugated Pauli here.
+        The operator is represented as a compact ``SubTreeMPO`` on the true
+        support Steiner subtree, so this remains efficient when ``where`` is
+        sparse or long. Explicit ``mode='submpo'`` retains the chain-MPO
+        compatibility route. This method is deliberately frame-neutral:
+        callers such as a stabilizer wrapper may pass a tableau-conjugated
+        Pauli here.
         """
         self._require_dense_qubit_state("apply_pauli_rotation")
         from ..stabilizer_tn.operators import pauli_combo_submpo
@@ -6275,9 +6276,9 @@ class TreeOptimizer:
             self._coerce_tensor_network_backend(mpo, warn=False)
             return self._apply_submpo_resolved(mpo, mpo_where)
 
-        from .operators import TreeMPO
+        from .operators import SubTreeMPO
 
-        tree_mpo = TreeMPO.from_pauli_sum(
+        tree_mpo = SubTreeMPO.from_pauli_sum(
             self.plan,
             [(c, {}), (coef, terms)],
             dtype=self.dtype,
@@ -6293,14 +6294,14 @@ class TreeOptimizer:
         self, weighted_terms, *, max_bond=None, cutoff=None, track_norm=True,
         _force_tree_mpo=False,
     ):
-        """Apply a weighted sum of Pauli products as one native TreeMPO.
+        """Apply a weighted sum of Pauli products as one compact SubTreeMPO.
 
         ``weighted_terms`` contains ``(coefficient, mapping)`` pairs, where
-        each mapping is ``{qubit: 'X'|'Y'|'Z'}``. The exact TTNO bond is
-        bounded by the number of branches, its exterior legs remain bond one,
-        and the resulting operator is absorbed through the native TreeMPO
-        QR-routing and compression path. ``mode='submpo'`` retains the
-        explicit MPS-style compatibility implementation.
+        each mapping is ``{qubit: 'X'|'Y'|'Z'}``. The exact active-tree TTNO
+        bond is bounded by the number of branches, and the resulting operator
+        is absorbed through the native tree-MPO QR-routing and compression
+        path. ``mode='submpo'`` retains the explicit chain-MPO compatibility
+        implementation.
         """
         self._require_dense_qubit_state("apply_pauli_sum")
 
@@ -6332,9 +6333,9 @@ class TreeOptimizer:
                 track_norm=track_norm,
             )
 
-        from .operators import TreeMPO
+        from .operators import SubTreeMPO
 
-        tree_mpo = TreeMPO.from_pauli_sum(
+        tree_mpo = SubTreeMPO.from_pauli_sum(
             self.plan,
             resolved_terms,
             dtype=self.dtype,
@@ -6803,7 +6804,8 @@ class TreeOptimizer:
         before = self._projection_snapshot(where)
         with self._update("measure", where) as started:
             # Build every projector, including the one-site case, as the
-            # same two-branch TreeMPO. ``where`` is in compact Tree positions;
+            # same two-branch compact SubTreeMPO. ``where`` is in compact
+            # Tree positions;
             # map it back to logical qubit labels before constructing the
             # operator so custom/snake layouts remain correct.
             logical_where = tuple(self._logical_qubits[q] for q in where)

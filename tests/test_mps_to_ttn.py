@@ -45,6 +45,37 @@ def test_exact_conversion_preserves_state_and_source(layout, monkeypatch):
         assert (tensor.inds, tuple(tensor.tags), tensor.left_inds) == meta
 
 
+def test_exact_conversion_to_treepeps_preserves_state_and_canonical_region():
+    """A site-complete TreePeps can receive an explicit MPS handoff."""
+
+    mps = qtn.MPS_rand_state(6, 3, seed=37, dtype="complex128")
+    mps.exponent = 0.75
+    before = np.asarray(mps.to_dense()).reshape(-1)
+    plan = py.TreePepsPlan.from_shape(
+        (2, 3), order="row-major", tree_order="row-major"
+    )
+
+    state = py.mps_to_treepeps(mps, plan=plan)
+
+    assert isinstance(state, py.TreePeps)
+    assert state.orthogonality_center == plan.root
+    assert state.canonical_region == frozenset({plan.root})
+    assert state.exponent == mps.exponent
+    np.testing.assert_allclose(state.to_statevector(), before, atol=2e-12, rtol=2e-12)
+    assert state.validate(check_canonical=True)
+
+
+def test_capped_mps_to_treepeps_is_explicit_and_bond_bounded():
+    """Finite TreePeps conversion projects only when the caller sets chi."""
+
+    mps = qtn.MPS_rand_state(6, 3, seed=38, dtype="complex128")
+    plan = py.TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+    state = py.mps_to_treepeps(mps, plan=plan, chi=2)
+
+    assert state.max_bond() <= 2
+    assert state.validate(check_canonical=True)
+
+
 def test_smaller_tree_cap_can_still_be_exact():
     # Two crossing Bell pairs have chain Schmidt rank four, but tree rank two
     # when each pair sits below its own parent.

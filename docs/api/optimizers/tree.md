@@ -342,11 +342,13 @@ sectors; configured operator compression remains explicit.
 `TreeMPO.from_gate` remains the full-tree constructor for callers that need
 a complete operator for general operator algebra. It includes exterior
 bond-one identities and is not the ordinary local gate replay builder.
-`TreeMPO.from_pauli_sum(plan, weighted_terms)` provides the analogous compact
-TTNO for a weighted sum of product-Pauli branches. It uses one virtual branch
-channel per retained term only on the union of the active Steiner subtrees,
-with bond-one identity legs outside; it never constructs a full-system dense
-matrix or a chain MPO.
+`TreeMPO.from_pauli_sum(plan, weighted_terms)` provides a full-tree TTNO for a
+weighted sum of product-Pauli branches. It uses one virtual branch channel per
+retained term only on the union of the active Steiner subtrees, with bond-one
+identity legs outside; it never constructs a full-system dense matrix or a
+chain MPO. `SubTreeMPO.from_pauli_sum(plan, weighted_terms)` provides the
+compact form: it omits those exterior identity tensors and makes identity
+outside the union of the active Steiner subtrees implicit.
 
 The conventional binary TTN with a three-leg top tensor is the default when
 there are at least three leaves and no `root_qubit`. Pass
@@ -696,8 +698,8 @@ stream consumers; TreeOptimizer also accepts raw `"sub_mpotree"` markers. Set
 `track_norm=False` for a general non-unitary TreeMPO so its physical norm
 change is not recorded as compression loss.
 
-The internal Pauli rotation and Pauli-sum constructors have a separate compact
-support form for Tree evolution. A sparse operator on qubits such as
+The internal Pauli rotation, Pauli-sum, and product-Pauli projector constructors
+use a true compact `SubTreeMPO` for Tree evolution. A sparse operator on qubits such as
 `(q0, q7)` is represented by MPO tensors only at `q0` and `q7`; identity-only
 sites between them are not inserted into a fictitious chain window. The native
 Tree MPO router therefore receives the true active support and computes the
@@ -708,8 +710,9 @@ MPS backend, whose compression domain is a chain interval.
 The two explicit two-site families preserve native Symmray gates and their
 block-sparse fermionic grading. Ordinary `apply_gate` entries in
 `auto`/`direct`/`dm`/`sdc`/`sdc-oversample`/`sdcr`/`sdcr-oversample`/`src`/
-`src-oversample`/`mpo` are lowered to a true TreeMPO and
-contracted through `apply_sub_mpotree` on the active canonical Steiner region.
+`src-oversample`/`mpo` are lowered to a true compact `SubTreeMPO` (a
+`TreeMPO` subclass) and contracted through `apply_sub_mpotree` on the active
+canonical Steiner region.
 `tree_mpo_direct` and `tree_mpo_dm` are explicit names for that same route,
 selecting direct SVD or density-matrix compression. The `submpo` mode remains
 the explicit chain-MPO stream mode. The low-level `apply_1q`/`apply_2q`
@@ -722,7 +725,7 @@ final subtree compression even when the configured mode is DMRG.
 For an ordinary gate stream, any of `mode="direct"`, `mode="dm"`,
 `mode="sdc"`, `mode="sdc-oversample"`, `mode="sdcr"`,
 `mode="sdcr-oversample"`, `mode="src"`, `mode="src-oversample"`, or `mode="mpo"` now
-uses the TreeMPO path;
+uses the compact `SubTreeMPO` path;
 `mode="tree_mpo"` is an alias for `tree_mpo_direct`, hyphenated names are
 accepted, and `tree_mpo_dem` is kept as a compatibility spelling for
 `tree_mpo_dm`. The combined `tree_mpo_*` names own their compression suffix,

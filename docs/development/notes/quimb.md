@@ -191,3 +191,52 @@ to the user gate, never to internal routing SWAPs.
   clean. The implementation remains SVD-based on arbitrary trees; Quimb's
   path-only SDC/SRC/ZipUp and the paper's projected-Cholesky CBC algorithm are
   unchanged.
+
+## 2026-09-14 TreePeps advanced compression and FIT audit
+
+- The active Pepsy environment reports Quimb `1.15.1.dev51+g2e99c793e`,
+  Autoray `0.11.1.dev3+g1b476b305`, Cotengra `0.8.3.dev7+g1d7fd333f`, and
+  Symmray `0.3.2.dev8+g6c6dd34b5`. The audit checked the installed callable
+  signatures and private 1D compression dispatch table, in addition to the
+  upstream [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+  [Autoray repository](https://github.com/jcmgray/autoray),
+  [Cotengra documentation](https://cotengra.readthedocs.io/en/latest/), and
+  [Symmray repository](https://github.com/jcmgray/symmray).
+- The installed Quimb dispatch table provides `sdc`, `sdc-oversample`,
+  `sdcr`, `sdcr-oversample`, `src`, `src-oversample`, `zipup`, and
+  `zipup-oversample`. `TreePeps` adopts these methods on path topologies and
+  keeps a fixed-topology local SVD fallback for branching trees. Integer or
+  multiplier oversampling, seeded SRC/SDCR paths, and final direct rounding
+  are covered by the TreePeps adapter and focused regression tests.
+- The installed oversampled Quimb callables expose one `cutoff_mode` for both
+  intermediate and final passes, not a separate `cutoff_mode_oversample`.
+  Pepsy therefore accepts and records the separate control for its branching
+  two-pass edge implementation, while path calls use the supported Quimb
+  argument. This is classified as a narrow **compatibility shim**, not a
+  global patch.
+- TreeFIT's installed signatures expose `traversal`,
+  `environment_strategy`, `finite_check`, `single_node_fast_path`, and
+  `two_site_transition_sweeps`. TreePeps adopts those controls while keeping
+  its existing default block/sweep schedule; the PEPS-specific DMRG mode
+  mapping of successive compression families to TreeFIT's supported local
+  `direct`/`src` split methods is classified as **adopt**.
+- Focused validation: `112` TreePeps state/optimizer tests passed, including
+  path and branching advanced modes, DMRG diagnostics, canonicality, and
+  seeded SDCR replay. Broad validation and documentation build remain
+  deferred to the normal Pepsy release gate.
+- The compact TreeSubPepo/FIT implementation uses the audited
+  `TensorNetworkGenVector.canonize_between`, `compress_between`, and
+  `TreeFIT.run_gate` contracts only. Its active target retains state-only
+  exterior groups, and its path adapter consumes the installed Quimb
+  `site_tags`/`canonize` interface; this is classified as **adopt**. No
+  installed Quimb, Autoray, Cotengra, or Symmray source is patched. The FIT
+  cache reports identity exterior services as hits and keeps their separate
+  `identity_shortcuts` counter.
+- Callable probes recorded for this route were
+  `canonize_between(self, tags1, tags2, absorb='right', **canonize_opts)`,
+  `compress_between(self, tags1, tags2, max_bond=None, cutoff=1e-10, ...)`,
+  `TreeFIT.run_gate(..., block_size=2, sweep_sequence='inward-outward',
+  ..., single_node_fast_path=True, _path_order=None)`, and
+  `AbelianArray.tensordot(..., mode='auto', preserve_array=False)`. The
+  inspected `TensorNetworkGenVector` 1D methods are the adopted zero-copy
+  boundary; no private Quimb signature is required by the compact route.

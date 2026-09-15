@@ -350,7 +350,7 @@ def _scale_stripped(mantissa, exponent):
         return np.inf if float(exponent) >= 0.0 else 0.0
 
 
-def _build_layered_operator_state_target(state, operator):
+def _build_layered_operator_state_target(state, operator, *, active_nodes=None):
     """Build a layered operator--state target without fusing tree bonds.
 
     The state and operator retain independent virtual tree layers. At a
@@ -358,7 +358,9 @@ def _build_layered_operator_state_target(state, operator):
     through a fresh internal index; the operator output is renamed to the
     state's physical index. This is the tree equivalent of the ordinary
     two-layer MPS operator application network and is accepted by ``TreeFIT``
-    as a correctly tagged layered target.
+    as a correctly tagged layered target. If ``active_nodes`` is supplied,
+    operator layers are emitted only on that connected subtree; state-only
+    exterior groups represent implicit identity action.
     """
 
     if getattr(operator, "tree_networks", None) is not None and len(
@@ -375,15 +377,64 @@ def _build_layered_operator_state_target(state, operator):
         state_node_tag = lambda node: f"N{node}"
 
     plan = state.plan
-    operator_nodes = getattr(operator, "active_nodes", None)
+    all_nodes = frozenset(_nodes_of(state))
+    if active_nodes is None:
+        operator_nodes = getattr(operator, "active_nodes", None)
+        if operator_nodes is None:
+            operator_nodes = all_nodes
+            active_nodes = all_nodes
+        else:
+            operator_nodes = frozenset(operator_nodes)
+            active_nodes = operator_nodes
+    else:
+        active_nodes = frozenset(active_nodes)
+        operator_nodes = getattr(operator, "active_nodes", None)
+        if operator_nodes is None:
+            operator_nodes = all_nodes
+        else:
+            operator_nodes = frozenset(operator_nodes)
+    if not active_nodes or not active_nodes.issubset(all_nodes):
+        raise ValueError("active_nodes must be a non-empty state subtree")
+    if not _is_connected(state, active_nodes):
+        raise ValueError("active_nodes must form a connected state subtree")
+    if not active_nodes.issubset(operator_nodes):
+        raise ValueError("operator does not contain all active target nodes")
+
+    def slice_boundary_bonds(tensor, node):
+        """Remove trivial operator legs crossing the active target window."""
+
+        for neighbor in _neighbors_of(state, node):
+            if neighbor in active_nodes or neighbor not in operator_nodes:
+                continue
+            if callable(getattr(operator, "bond", None)):
+                bond = operator.bond(node, neighbor)
+            else:
+                shared = qtn.bonds(
+                    tensor,
+                    operator.node_tensor(neighbor),
+                )
+                if len(shared) != 1:
+                    raise ValueError(
+                        "operator target boundary must expose one virtual bond"
+                    )
+                bond = next(iter(shared))
+            if int(tensor.ind_size(bond)) != 1:
+                raise ValueError(
+                    "active TreeFIT target has a non-trivial operator bond "
+                    f"crossing ({node}, {neighbor})"
+                )
+            tensor = tensor.isel({bond: 0})
+        return tensor
+
     for node in _nodes_of(state):
         state_tensor = _tensor_of(state, node).copy()
-        if operator_nodes is not None and node not in operator_nodes:
+        if node not in active_nodes:
             # An absent compact-operator node means implicit identity, so
             # retain the original state tensor without an operator layer.
             state_tensors.append(state_tensor)
             continue
         operator_tensor = operator.node_tensor(node).copy()
+        operator_tensor = slice_boundary_bonds(operator_tensor, node)
         qubit_of_node = getattr(plan, "qubit_of_node", None)
         if qubit_of_node is None:
             qubit = node
@@ -1057,12 +1108,20 @@ class TreeFIT:
         return value
 
     def environment_cache_info(self):
-        """Return cache size and hit/miss counters."""
+        """Return cache size and hit/miss counters.
+
+        An identity exterior proof is counted as a hit as well as being
+        reported separately: it serves the requested boundary without a
+        branch contraction, even though the proof itself was established on
+        this sweep.
+        """
 
         return {
             "messages": len(self._messages),
             "effective_blocks": len(self._effective_cache),
-            "hits": int(self.environment_cache_hits),
+            "hits": int(
+                self.environment_cache_hits + self.identity_environment_shortcuts
+            ),
             "misses": int(self.environment_cache_misses),
             "identity_shortcuts": int(self.identity_environment_shortcuts),
         }

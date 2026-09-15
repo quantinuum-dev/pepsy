@@ -58,3 +58,18 @@ total memory or QR/eigensolver workspace; it never silently changes `chi`.
 For MPS/tree replay comparisons, perform conversion before starting the
 replay timer. Check the initial conversion fidelity separately when using
 a finite cap, so its approximation error is not attributed to replay.
+
+## Explicit MPS-to-TreePeps conversion
+
+For a lattice-embedded tree whose every site carries a physical index, use
+`pepsy.tensors.mps_to_treepeps` with an explicit `TreePepsPlan`:
+
+```python
+peps_plan = py.TreePepsPlan.from_shape((2, 3), tree_order="row-major")
+tree_peps = py.mps_to_treepeps(p0, plan=peps_plan, chi=None)
+```
+
+`chi=None` is lossless up to floating-point roundoff. A finite `chi` is an
+explicit nested reduced-density projection and can be approximate; it never
+silently relayouts an entangled state or normalizes it. The result is a real
+`TreePeps` with its canonical region recorded at the plan root.

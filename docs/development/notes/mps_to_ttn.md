@@ -121,3 +121,26 @@ contraction-dependency, and namespace-capability run passed 40 tests.
 Repository-wide Ruff passed. Full repository tests were not run; the earlier
 broader API/layout/constructor run had 70 passes, two sandbox GPU skips,
 and the installed-version mismatch described above.
+
+## 2026-09-15 TreePeps handoff audit
+
+`mps_to_treepeps` is implemented as a thin public adapter over the same
+postorder builder rather than a second conversion algorithm. It maps every
+logical site onto the supplied `TreePepsPlan`, preserves the source array
+backend/device/dtype and Quimb exponent, and validates the root-canonical
+TreePeps before returning it. `chi=None` uses the lossless QR path; finite
+`chi` uses the residual-network density-matrix projection path and does not
+construct an exact TTN or dense statevector first. The existing contraction
+and local-density resource guard remains active for both output types.
+
+The active environment probes are Quimb `1.15.1.dev51+g2e99c793e`, Autoray
+`0.11.1.dev3+g1b476b305`, Cotengra `0.8.3.dev7+g1d7fd333f`, Symmray
+`0.3.2.dev8+g6c6dd34b5`, and Torch `2.11.0`. The inspected public signatures
+for `Tensor.split`, `TensorNetwork.contraction_tree`, `TensorNetwork.contract`,
+and `autoray.get_namespace` match the conversion calls. Symmray/fermionic MPS
+conversion remains explicitly deferred rather than silently densifying or
+dropping charge structure.
+
+Validation on this audit: all 34 `tests/test_mps_to_ttn.py` tests passed with
+`-o addopts=''`; the full Pepsy smoke suite passed 131 tests; and the 28-cell
+`dmrg_treepeps` example completed on Torch CUDA with no notebook cell errors.

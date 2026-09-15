@@ -18,7 +18,7 @@ import quimb.tensor as qtn
 
 from ..backends import infer_backend_signature
 
-__all__ = ["mps_to_ttn"]
+__all__ = ["mps_to_ttn", "mps_to_treepeps"]
 
 
 def _check_size(size, limit, operation):
@@ -42,6 +42,7 @@ def _postorder(plan):
     """Iterative traversal also handles long, unbalanced trees."""
     if plan.root not in plan.children or plan.parent.get(plan.root) is not None:
         raise ValueError("tree must have a known root with no parent.")
+    nodes = set(plan.nodes()) if hasattr(plan, "nodes") else set(plan.children)
     stack = [(plan.root, False)]
     visited = set()
     while stack:
@@ -57,7 +58,7 @@ def _postorder(plan):
             if child not in plan.children or plan.parent.get(child) != node:
                 raise ValueError("tree has inconsistent parent/child links.")
             stack.append((child, False))
-    if visited != set(plan.nodes()):
+    if visited != nodes:
         raise ValueError("tree has disconnected nodes.")
 
 
@@ -106,6 +107,121 @@ def _projector(remainder, left_inds, chi, sample, optimize, limit):
         # The residual network below carries the state amplitudes instead.
         basis = vectors[:, -chi:]
     return ar.do("reshape", basis, (*shape, min(dimension, chi)))
+
+
+def _build_mps_tree_tensors(
+    mps,
+    *,
+    tree,
+    node_to_site,
+    chi,
+    optimize,
+    max_intermediate_elements,
+    node_tag_id,
+    tags_for_site=None,
+    output_site_ind=None,
+):
+    """Build the tensors shared by the MPS-to-tree conversion paths."""
+
+    sites = tuple(mps.sites)
+    order = tuple(_postorder(tree))
+    node_to_site = dict(node_to_site)
+    if set(node_to_site.values()) != set(sites):
+        raise ValueError("tree and mps must have the same physical site labels.")
+    physical = {q: mps.site_ind(q) for q in sites}
+    if set(mps.outer_inds()) != set(physical.values()):
+        raise ValueError("MPS outer indices must be exactly its physical indices.")
+
+    # Private copies isolate metadata and contractions from the source state.
+    sources = {q: mps[q].copy(deep=True) for q in sites}
+    bonds = {node: qtn.rand_uuid() for node in order if node != tree.root}
+    outputs = []
+    messages = {}
+    frontiers = {}
+    remainder = qtn.TensorNetwork(tuple(sources.values())) if chi is not None else None
+    sample = next(iter(sources.values())).data
+
+    for node in order:
+        children = tree.children[node]
+        q = node_to_site.get(node)
+        left = tuple(bonds[child] for child in children)
+        tags = [node_tag_id.format(node)]
+        if q is not None:
+            left += (physical[q],)
+            if tags_for_site is None:
+                tags.extend(sources[q].tags)
+            else:
+                tags.extend(tags_for_site(q))
+
+        # Every original virtual bond crossing this partition contributes
+        # its dimension to an exact upper bound on the tree Schmidt rank.
+        # Earlier projections act wholly on one side of this cut and cannot
+        # increase that rank. Avoid padding a small-rank MPS up to chi.
+        frontier = set()
+        for child in children:
+            frontier.symmetric_difference_update(frontiers.pop(child))
+        if q is not None:
+            frontier.symmetric_difference_update(
+                ix for ix in sources[q].inds if ix != physical[q]
+            )
+        frontiers[node] = frontier
+
+        if chi is None:
+            # Contract only the messages within this subtree. ``left`` is
+            # the physical/child-tree side; ``boundary`` comprises original
+            # MPS bonds still connecting this subtree to its complement.
+            local = [messages.pop(child) for child in children]
+            if q is not None:
+                local.append(sources[q])
+            network = qtn.TensorNetwork(local)
+            boundary = tuple(ix for ix in network.outer_inds() if ix not in left)
+            tensor = _contract(
+                network,
+                (*left, *boundary),
+                optimize,
+                max_intermediate_elements,
+            )
+            if node != tree.root:
+                # M[left, boundary] = Q[left, new_bond] R[new_bond, boundary].
+                # Reduced QR removes only a structural dimension excess,
+                # never directions selected by a numerical rank tolerance.
+                # Q is an inward isometry; R retains scale and phase.
+                tensor, messages[node] = tensor.split(
+                    left,
+                    right_inds=boundary,
+                    method="qr",
+                    stabilized=False,
+                    get="tensors",
+                    bond_ind=bonds[node],
+                )
+        elif node == tree.root:
+            # All selected subspaces have been installed. These are the
+            # remaining coefficients in their product basis, with the
+            # original working scale and phase, not a normalized root.
+            tensor = _contract(remainder, left, optimize, max_intermediate_elements)
+        else:
+            rank_cap = min(int(chi), prod(mps.ind_size(ix) for ix in frontier))
+            data = _projector(
+                remainder,
+                left,
+                rank_cap,
+                sample,
+                optimize,
+                max_intermediate_elements,
+            )
+            tensor = qtn.Tensor(data, inds=(*left, bonds[node]), left_inds=left)
+            # Store U as an output isometry and replace x in the residual
+            # by U^dagger Psi. This inserts the orthogonal projection U U^dagger
+            # into the eventual state. H conjugates the entries; named-index
+            # contraction supplies the matrix-transpose part of the adjoint.
+            remainder.add_tensor(tensor.H)
+
+        tensor.modify(tags=tags)
+        if q is not None and output_site_ind is not None:
+            tensor.reindex_({physical[q]: output_site_ind(q)})
+        outputs.append(tensor)
+
+    return outputs
 
 
 def mps_to_ttn(
@@ -191,82 +307,18 @@ def mps_to_ttn(
     if set(tree.node_of_qubit) != set(sites):
         raise ValueError("tree and mps must have the same physical site labels.")
     order = tuple(_postorder(tree))
-    physical = {q: mps.site_ind(q) for q in sites}
-    if set(mps.outer_inds()) != set(physical.values()):
-        raise ValueError("MPS outer indices must be exactly its physical indices.")
     node_tags = {node_tag_id.format(node) for node in order}
     if len(node_tags) != len(order) or node_tags.intersection(mps.tags):
         raise ValueError("node_tag_id must produce unique tags absent from the MPS.")
-    # Private copies isolate metadata and contractions from the source state.
-    sources = {q: mps[q].copy(deep=True) for q in sites}
-    bonds = {node: qtn.rand_uuid() for node in order if node != tree.root}
-    outputs = []
-    messages = {}
-    frontiers = {}
-    remainder = qtn.TensorNetwork(tuple(sources.values())) if chi is not None else None
-    sample = next(iter(sources.values())).data
-
-    for node in order:
-        children = tree.children[node]
-        q = tree.qubit_of_node.get(node)
-        left = tuple(bonds[child] for child in children)
-        tags = [node_tag_id.format(node)]
-        if q is not None:
-            left += (physical[q],)
-            tags.extend(sources[q].tags)
-        # Every original virtual bond crossing this partition contributes
-        # its dimension to an exact upper bound on the tree Schmidt rank.
-        # Earlier projections act wholly on one side of this cut and cannot
-        # increase that rank. Avoid padding a small-rank MPS up to chi.
-        frontier = set()
-        for child in children:
-            frontier.symmetric_difference_update(frontiers.pop(child))
-        if q is not None:
-            frontier.symmetric_difference_update(ix for ix in sources[q].inds if ix != physical[q])
-        frontiers[node] = frontier
-
-        if chi is None:
-            # Contract only the messages within this subtree. ``left`` is
-            # the physical/child-tree side; ``boundary`` comprises original
-            # MPS bonds still connecting this subtree to its complement.
-            local = [messages.pop(child) for child in children]
-            if q is not None:
-                local.append(sources[q])
-            network = qtn.TensorNetwork(local)
-            boundary = tuple(ix for ix in network.outer_inds() if ix not in left)
-            tensor = _contract(network, (*left, *boundary), optimize, max_intermediate_elements)
-            if node != tree.root:
-                # M[left, boundary] = Q[left, new_bond] R[new_bond, boundary].
-                # Reduced QR removes only a structural dimension excess,
-                # never directions selected by a numerical rank tolerance.
-                # Q is an inward isometry; R retains scale and phase.
-                tensor, messages[node] = tensor.split(
-                    left,
-                    right_inds=boundary,
-                    method="qr",
-                    stabilized=False,
-                    get="tensors",
-                    bond_ind=bonds[node],
-                )
-        elif node == tree.root:
-            # All selected subspaces have been installed. These are the
-            # remaining coefficients in their product basis, with the
-            # original working scale and phase, not a normalized root.
-            tensor = _contract(remainder, left, optimize, max_intermediate_elements)
-        else:
-            rank_cap = min(int(chi), prod(mps.ind_size(ix) for ix in frontier))
-            data = _projector(
-                remainder, left, rank_cap, sample, optimize, max_intermediate_elements
-            )
-            tensor = qtn.Tensor(data, inds=(*left, bonds[node]), left_inds=left)
-            # Store U as an output isometry and replace x in the residual
-            # by U^dagger Psi. This inserts the orthogonal projection U U^dagger
-            # into the eventual state. H conjugates the entries; named-index
-            # contraction supplies the matrix-transpose part of the adjoint.
-            remainder.add_tensor(tensor.H)
-
-        tensor.modify(tags=tags)
-        outputs.append(tensor)
+    outputs = _build_mps_tree_tensors(
+        mps,
+        tree=tree,
+        node_to_site=tree.qubit_of_node,
+        chi=chi,
+        optimize=optimize,
+        max_intermediate_elements=max_intermediate_elements,
+        node_tag_id=node_tag_id,
+    )
 
     result = TreeTensorNetwork(
         outputs,
@@ -283,3 +335,94 @@ def mps_to_ttn(
     # the center needs no additional (potentially expensive) canonical sweep.
     result.orthogonality_center = tree.root
     return result.validate()
+
+
+def mps_to_treepeps(
+    mps,
+    *,
+    plan,
+    chi=None,
+    optimize="greedy",
+    max_intermediate_elements=2**26,
+):
+    """Convert an MPS to a site-complete :class:`TreePeps`.
+
+    Unlike :func:`mps_to_ttn`, every node of the supplied ``TreePepsPlan``
+    carries a physical site tensor. ``chi=None`` preserves the MPS exactly
+    (up to floating-point roundoff); a finite ``chi`` applies the same
+    caller-controlled nested reduced-density projections as ``mps_to_ttn``.
+    The result is canonical toward ``plan.root`` and keeps the source
+    backend, dtype, device, exponent, and global phase.
+
+    Parameters
+    ----------
+    mps : quimb.tensor.MatrixProductState
+        Dense-array MPS with one site labelled ``0 .. L-1``. Symmray and
+        fermionic MPS conversion is not currently supported.
+    plan : TreePepsPlan
+        Site-complete lattice tree with the same logical site labels.
+    chi : positive int or None
+        Output TreePeps bond cap. ``None`` is lossless; a finite cap can be
+        approximate when the tree Schmidt ranks exceed it.
+    optimize : contraction optimizer, optional
+        Quimb/Cotengra path optimizer for intermediate contractions.
+    max_intermediate_elements : positive int or None
+        Guard on planned contraction intermediates and local density matrices.
+
+    Returns
+    -------
+    TreePeps
+        A validated tree-embedded PEPS-like state, canonical at ``plan.root``.
+    """
+    from ..optimizers.tree_peps import TreePeps, TreePepsPlan
+
+    if not isinstance(mps, qtn.MatrixProductState):
+        raise TypeError("mps must be a quimb MatrixProductState.")
+    for name, value in (
+        ("chi", chi),
+        ("max_intermediate_elements", max_intermediate_elements),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, Integral) or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer or None.")
+    if chi is not None and not callable(getattr(ar, "get_namespace", None)):
+        raise RuntimeError(
+            "Finite-chi mps_to_treepeps requires Autoray's get_namespace(like=...) "
+            "API for dtype/device-preserving array creation."
+        )
+    sites = tuple(mps.sites)
+    if not sites or set(sites) != set(range(mps.L)) or mps.num_tensors != mps.L:
+        raise ValueError("mps must have one tensor per site with labels 0..L-1.")
+    signatures = {infer_backend_signature(t.data) for t in mps.tensors}
+    if any(sig[0] == "symmray" for sig in signatures) or getattr(mps, "fermionic", False):
+        raise TypeError("mps_to_treepeps does not yet support Symmray/fermionic MPS.")
+    if len(signatures) != 1:
+        raise TypeError("MPS tensors must share one backend, dtype, and device.")
+    dtype = next(iter(signatures))[1]
+    if not any(kind in dtype for kind in ("float", "complex")):
+        raise TypeError("MPS arrays must have floating-point or complex dtype.")
+    if not isinstance(plan, TreePepsPlan):
+        raise TypeError("plan must be a TreePepsPlan.")
+    if set(range(plan.size)) != set(sites):
+        raise ValueError("plan and mps must have the same physical site labels.")
+    node_tags = {f"N{q}" for q in range(plan.size)}
+    if node_tags.intersection(mps.tags):
+        raise ValueError("TreePeps node tags must be absent from the MPS.")
+
+    outputs = _build_mps_tree_tensors(
+        mps,
+        tree=plan,
+        node_to_site={q: q for q in range(plan.size)},
+        chi=chi,
+        optimize=optimize,
+        max_intermediate_elements=max_intermediate_elements,
+        node_tag_id="N{}",
+        tags_for_site=lambda q: TreePeps._tags_for_plan(plan, q),
+        output_site_ind=lambda q: TreePeps._site_ind_for_plan(plan, q),
+    )
+    result = TreePeps(outputs, plan=plan)
+    result.exponent = mps.exponent
+    result.orthogonality_center = plan.root
+    result.validate(check_canonical=True)
+    return result

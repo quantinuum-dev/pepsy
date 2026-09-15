@@ -188,6 +188,14 @@ canonical method and event names are `apply_sub_treepepo` and
 the same implementation. The full-operator event also accepts the matching
 `tree_pepsmpo_event` spelling. No second MPO representation is created.
 
+`TreeSubPEPO.operator` is the real compact operator network: it contains one
+tensor per node in `span`, with identity action outside that span implicit.
+`active_operator` is an explicit alias for this view, while `full_operator` is
+kept only for compatibility dense readout through `to_dense()`. Consequently,
+TreeFIT targets, bond estimates, and state application never allocate exterior
+identity layers or operator bonds. The complete source is used only when a
+caller explicitly requests the compatibility dense representation.
+
 Dense `TreePEPO` term sums also receive an exact structural edge sweep before
 their center-oriented SVD compression. The sweep is restricted to NumPy
 arrays, removes proportional and roundoff-safe linearly dependent boundary
@@ -283,6 +291,19 @@ available as `gate_stream`. Convenience methods `apply_1q`,
 `apply_2q`, `apply_multi_site`, and `apply_pepo` match the corresponding
 optimizer vocabulary.
 
+An MPS can be handed to a site-complete TreePeps explicitly when a common
+initial state is useful for a comparison:
+
+```python
+tree_state = py.mps_to_treepeps(mps, plan=plan, chi=None)
+```
+
+The conversion preserves the state exactly up to floating-point roundoff when
+`chi=None`, returns a real `TreePeps`, and records a root canonical region.
+Setting a finite `chi` makes the tree-bond projection explicit. This is a
+conversion into the selected tree geometry, not an implicit relayout performed
+by `TreePepsOptimizer`.
+
 Use `set_state(new_state)` (or assign `optimizer.tn`) to replace the live
 state. The new state must have the same tree plan, and all queued operator
 payloads must match its backend, device, and required dtype contract before
@@ -293,14 +314,22 @@ the replacement is installed. By default the replacement is copied; use
 Compression is selected independently from the operator route with
 `compression_mode="direct"` (the default SVD decomposition) or
 `compression_mode="dm"` (Quimb's density-matrix-equivalent `svd:eig`
-decomposition of the local fused compression core). `compression_mode="zipup"`
-is also available for path operator-state compression. In fused mode the
+decomposition of the local fused compression core). The successive families
+`sdc`, `sdcr`, and `src`, together with `sdc-oversample`, `sdcr-oversample`,
+and `src-oversample`, are also accepted. The oversampled variants first
+compress to `max_bond_oversample` (an integer rank or multiplier) with
+`cutoff_oversample`, then perform the final direct truncation to `max_bond`.
+`compression_mode="zipup"` and `"zipup-oversample"` are available for path
+operator-state compression. In fused mode the
 state is canonicalized around the active span first, the PEPO is fused locally
 with the state, and only then are the combined tree bonds truncated. In
 two-layer mode, the state and PEPO tensors are grouped by the same site tags
 and passed to Quimb's 1D compressor as an MPO-MPS-like network. No global
 dense lattice state is formed. For convenience, `mode="dm"` is accepted as a
 shorthand for direct TreePepo routing with `compression_mode="dm"`.
+On path topologies, the installed Quimb interface has one cutoff-mode control
+for both stages; `cutoff_mode_oversample` is retained for the branching
+two-pass implementation and future-compatible forwarding.
 
 For branching updates, `TreePepsOptimizer` applies the complete operator to
 the active connected span before truncating it. Its native leaf-to-center
@@ -309,16 +338,18 @@ the next choice sees the current live bond dimensions; exterior branches are
 not compressed. This is a geometry-aware local SVD policy, not a global search
 over all possible tree gauges or layouts.
 
-`mode="sdc"`, `mode="src"`, and `mode="zipup"` are also accepted shorthands
-for direct TreePepo routing with the corresponding compression mode. On an
-explicit path topology, `compression_layout="auto"` uses Quimb's actual 1D
-SDC/SRC/ZipUp kernels with the separate operator and state layers, then
-restores the TreePeps plan, tags, exponent, and canonical metadata. On a
-branching topology, `sdc` uses the tree's deterministic successive edge sweep
-and `src` uses randomized SVD per edge; neither silently invokes a chain-only
-environment algorithm, while `zipup` is path-only. Truncating path `sdc`/`src`
-requires finite `chi`/`max_bond` (`sdc` with zero cutoff may still be used as a
-lossless canonicalization), and `compression_seed=...` makes randomized
+`mode="sdc"`, `mode="sdcr"`, `mode="src"`, and their oversampled spellings
+are also accepted shorthands for direct TreePepo routing with the
+corresponding compression mode; `mode="zipup-first"` is an alias for
+`zipup-oversample`. On an explicit path topology,
+`compression_layout="auto"` uses Quimb's actual 1D kernels with the separate
+operator and state layers, then restores the TreePeps plan, tags, exponent,
+and canonical metadata. On a branching topology, successive modes use the
+fixed-topology leaf-to-center edge sweep and `sdcr`/`src` use randomized local
+SVDs; neither silently invokes a chain-only environment algorithm, while
+zip-up remains path-only. Truncating `sdc`/`sdcr`/`src` requires finite
+`chi`/`max_bond` (`sdc` with zero cutoff may still be used as a lossless
+canonicalization), and `compression_seed=...` makes randomized path and local
 results reproducible. The paper's full projected Cholesky (CBC) tree
 compressor is not represented by these aliases and remains a separate future
 method.
@@ -346,12 +377,27 @@ Generic `dmrg` uses `fit_block_size=2` and its configured adaptive warm-up.
 `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
 three-node warm-up blocks; all named modes then refine with one-node sweeps.
 The remaining controls are `fit_adaptive_sweeps`, `fit_min_iter`, `fit_rtol`,
-`fit_patience`, `fit_sweep_sequence`,
-`fit_init_rand_strength`, and `fit_init_seed`. Initial guesses may be
-`"direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-dm"`, `"random"`, or
-`"random_expand"`; random policies are disposable, seeded, and active-span
-only. `get_fit_diagnostics()` reports the cache hit/miss counts, block size,
-convergence, and the MPS-compatible retained-centre-norm `local_fidelity`.
+`fit_patience`, `fit_sweep_sequence`, `fit_two_site_transition_sweeps`,
+`fit_traversal`, `fit_environment_strategy`, `fit_single_node_fast_path`,
+and `fit_finite_check`. `fit_traversal` accepts `"depth"`, `"depth-first"`,
+or `"auto"` (the default). `"auto"` uses path-local sweeps for the one- and
+two-site spans produced by ordinary gates and depth-first sweeps for branching
+multi-site spans. `fit_environment_strategy="native-blockwise"` is reserved
+for native Symmray tensors. `fit_rtol="auto"` selects a dtype-aware tolerance,
+and `run(finite_check=True)` temporarily enables finite-value scans. Initial
+guesses may be `"direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-dm"`,
+`"random"`, or `"random_expand"`; random policies are disposable, seeded,
+and active-span only. `get_fit_diagnostics()` reports the cache hit/miss
+counts, block schedule, traversal, convergence, and the MPS-compatible
+retained-centre-norm `local_fidelity`.
+As with `TreeOptimizer`, small tensor updates use one BLAS/OpenMP thread by
+default (`threads=1`) to avoid oversubscribing the many local SVDs and
+contractions. Pass `threads=None` to use the process-wide library setting.
+For a `TreeSubPEPO` update, the target contains state-only tensors outside the
+active span, so unchanged canonical branches can be served by the FIT identity
+environment shortcut without constructing their operator layers. Reported
+cache hits include those shortcut services, while `identity_shortcuts` reports
+their separate count.
 TreeFIT records one terminal centre norm per sweep in
 `local_norm_trace` (with stripped mantissa/exponent pairs in
 `local_norm_stripped_trace`). A genuine normalized target overlap is optional

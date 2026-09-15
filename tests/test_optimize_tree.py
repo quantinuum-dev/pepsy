@@ -11,6 +11,7 @@ import pepsy
 
 from pepsy.optimizers.tree import (
     TreeLayoutFinder,
+    SubTreeMPO,
     TreeMPO,
     TreeOptimizer,
     TreePlan,
@@ -1150,8 +1151,59 @@ def test_tree_ordinary_gate_modes_all_lower_to_subtreempo(monkeypatch, mode):
     opt.apply_gate(cnot, (0, 3))
 
     assert routed
-    assert isinstance(routed[0], TreeMPO)
+    assert isinstance(routed[0], SubTreeMPO)
+    assert routed[0].num_tensors == len(routed[0].active_nodes)
     assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "auto", "direct", "dm", "sdc", "sdc-oversample", "sdcr",
+        "sdcr-oversample", "src", "src-oversample", "zipup",
+        "zipup-oversample", "mix", "dmrg", "dmrg1", "dmrg2", "dmrg3",
+        "mpo", "tree_mpo_direct", "tree_mpo_dm",
+    ),
+)
+def test_tree_dense_two_site_gate_is_exact_and_compact_in_every_mode(
+    mode, monkeypatch,
+):
+    """All ordinary dense two-site modes share the compact operator boundary."""
+    rng = np.random.default_rng(923)
+    plan = TreePlan.from_order(range(8), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=2, seed=924, dtype="complex128")
+    gate, _ = np.linalg.qr(
+        rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    )
+    reference = TreeOptimizer(
+        None, tree=plan, state=state.copy(), mode="direct", chi=64,
+        cutoff=0.0, run=False,
+    )
+    reference.apply_gate(gate, (0, 7), track_norm=False)
+
+    routed = []
+    original_apply = TreeOptimizer.apply_sub_mpotree
+
+    def traced_apply(optimizer, operator, *args, **kwargs):
+        routed.append(operator)
+        return original_apply(optimizer, operator, *args, **kwargs)
+
+    def no_chain_mpo(*args, **kwargs):
+        raise AssertionError("ordinary dense gate constructed a chain MPO")
+
+    monkeypatch.setattr(TreeOptimizer, "apply_sub_mpotree", traced_apply)
+    monkeypatch.setattr(qtn.MatrixProductOperator, "from_dense", no_chain_mpo)
+    actual = TreeOptimizer(
+        None, tree=plan, state=state.copy(), mode=mode, chi=64,
+        cutoff=0.0, fit_n_iter=3, fit_rtol=None, run=False,
+    )
+    actual.apply_gate(gate, (0, 7), track_norm=False)
+
+    assert routed
+    assert all(isinstance(operator, SubTreeMPO) for operator in routed)
+    assert all(operator.num_tensors == len(operator.active_nodes) for operator in routed)
+    np.testing.assert_allclose(actual.to_dense(), reference.to_dense(), atol=1e-10)
+    assert actual.tn.validate(check_canonical=True) is actual.tn
 
 
 def test_tree_gate_mode_uses_subtreempo_for_four_qubits(monkeypatch):
@@ -4816,6 +4868,37 @@ def test_tree_pauli_sum_routes_only_active_support_over_steiner_subtree():
     assert routes[-1]["subtree_nodes"] == len(
         opt._steiner_nodes([opt.plan.node_of_qubit[q] for q in active])
     )
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+@pytest.mark.parametrize("operation", ["sum", "rotation", "projector"])
+def test_tree_pauli_operator_helpers_use_compact_subtreempo(monkeypatch, operation):
+    """Dense Pauli helpers lower to the same compact tree operator route."""
+    plan = TreePlan.from_order(range(8), structure="balanced")
+    opt = TreeOptimizer(
+        None, n=8, tree=plan, chi=8, cutoff=0.0, mode="direct", run=False,
+    )
+    seen = []
+    apply = opt.apply_sub_mpotree
+
+    def traced(operator, *args, **kwargs):
+        seen.append(operator)
+        return apply(operator, *args, **kwargs)
+
+    monkeypatch.setattr(opt, "apply_sub_mpotree", traced)
+    if operation == "sum":
+        opt.apply_pauli_sum([
+            (0.7, {0: "X", 2: "Y", 7: "Z"}),
+            (0.2, {0: "Z", 7: "X"}),
+        ])
+    elif operation == "rotation":
+        opt.apply_pauli_rotation(0.37, "XYZ", (0, 2, 7))
+    else:
+        opt.project_pauli("XYZ", (0, 2, 7), +1)
+
+    assert seen
+    assert all(isinstance(operator, SubTreeMPO) for operator in seen)
+    assert all(operator.num_tensors < len(plan.nodes()) for operator in seen)
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
