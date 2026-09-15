@@ -96,14 +96,20 @@ class CompiledPEPOClusterProduct:
         parameters=None,
         *,
         coefficients=None,
+        materialize=True,
         compress=False,
         **compress_opts,
     ):
-        """Evaluate the ordered product ``exp(A) exp(B) ...``."""
+        """Evaluate the ordered product ``exp(A) exp(B) ...``.
+
+        Set ``materialize=False`` to return the sparse active blocks before
+        allocating Quimb PEPO site tensors.
+        """
         return self.expansion.exp(
             step,
             parameters,
             coefficients=coefficients,
+            materialize=materialize,
             compress=compress,
             **compress_opts,
         )
@@ -242,6 +248,7 @@ class PEPOClusterProductExpansion:
         parameters=None,
         *,
         coefficients=None,
+        materialize=True,
         compress=False,
         **compress_opts,
     ):
@@ -249,7 +256,9 @@ class PEPOClusterProductExpansion:
 
         The exponentials are multiplied only on each small connected cluster.
         Their connected residuals are combined into a single PEPO topology;
-        independent full-lattice factor PEPOs are never materialized.
+        independent full-lattice factor PEPOs are never materialized. Set
+        ``materialize=False`` to return those active blocks directly;
+        compression requires a materialized Quimb PEPO.
         """
         factor_coefficients = self._factor_coefficients(coefficients)
         factor_data = []
@@ -299,6 +308,11 @@ class PEPOClusterProductExpansion:
                 None,
                 factor_data=factor_data,
             )
+        if compress and not materialize:
+            raise ValueError("compress=True requires materialize=True.")
+        if not materialize:
+            self._build_count += 1
+            return active
         result = active.to_pepo()
         if compress:
             result.compress(**compress_opts)

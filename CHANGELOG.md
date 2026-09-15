@@ -94,10 +94,13 @@ Changes for the next release should be added here before the version is bumped.
   low-level `apply_1q`/`apply_2q` compatibility paths retain their existing
   specialized behavior.
 
-
-- Extended `PauliPEPOTerm` with optional explicit site/edge locations and added
-  a fixed-channel open-boundary order-one/two builder for inhomogeneous
-  ordered PEPO products. Homogeneous orders through nine are unchanged.
+- Extended `PauliPEPOTerm` with explicit site/edge locations and optional
+  directed bond occurrences. Inhomogeneous ordered PEPO products now support
+  open and periodic square lattices through order nine, using per-embedding
+  connected residuals and fixed Pauli histories by default. Dense Quimb
+  materialization compacts global history labels independently on each bond.
+  The fixed-channel open-boundary order-one/two builder remains available, and
+  homogeneous translated-cluster construction is unchanged.
 - Fixed ordered MPO cluster products with real Torch term slots and complex
   factor prefactors by initializing products from their first exponential,
   avoiding a real identity/complex matrix dtype mismatch in interval and graph

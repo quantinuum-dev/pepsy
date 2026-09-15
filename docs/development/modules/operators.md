@@ -71,10 +71,15 @@ records this invariant as `cache_info["joint_cluster_residual"]`.
 
 `PauliPEPOTerm.where` is the finite-square exception to the homogeneous PEPO
 slot model. Located onsite and nearest-neighbour edge slots dispatch to the
-open-boundary order-one/two builder, which evaluates local backgrounds and
-edge residuals per embedding but reuses one fixed 16-channel Pauli bond space.
-Keep higher inhomogeneous residuals separate until per-embedding connected
-subtraction and its storage growth have dedicated convergence tests.
+finite-lattice connected-subset builder for every supported order (one through
+nine) on open or periodic boundaries. On a length-two periodic dimension,
+`PauliPEPOTerm.direction` distinguishes the two physical bonds with identical
+endpoints. Each embedding subtracts the completed lower-order active PEPO and
+stores its correction in a fixed Pauli-history tree; dense materialization
+then compacts those global histories independently on each physical bond.
+Exact localized ranks grow exponentially with cluster size, so inspect the
+active representation or set `max_tree_rank` before materializing larger
+higher-order lattices.
 
 The public facades are:
 

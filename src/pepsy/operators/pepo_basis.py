@@ -22,6 +22,7 @@ __all__ = ["PauliPEPOTerm", "CompiledPEPOExp", "PauliPEPOBasis"]
 
 _PAULI_LABELS = ("I", "X", "Y", "Z")
 _PAULI_BASIS_CACHE = {}
+_DIRECTIONS = ("u", "r", "d", "l")
 _POSITIVE_DIRECTIONS = frozenset(("u", "r"))
 _OPPOSITE_DIRECTION = {"u": "d", "r": "l", "d": "u", "l": "r"}
 
@@ -184,9 +185,11 @@ class PauliPEPOTerm:
     every lattice site. ``support="edge"`` contributes the same ordered
     two-site Pauli operator to every positive (``u`` and ``r``) lattice edge.
     Set ``where=(i, j)`` for one site or
-    ``where=((i0, j0), (i1, j1))`` for one nearest-neighbour edge. Explicitly
-    located slots currently use the finite, open-boundary order-one/two
-    builder; the homogeneous higher-order builder is unchanged.
+    ``where=((i0, j0), (i1, j1))`` for one nearest-neighbour edge. On a
+    periodic dimension of length two, two distinct bonds have the same
+    endpoints; set ``direction="u"``/``"r"``/``"d"``/``"l"`` to select the
+    directed occurrence from the first endpoint. Explicitly located slots use
+    a finite-lattice connected-subset builder at every supported order.
     The scalar ``coefficient`` may be a Python number, a Torch/JAX scalar, or
     a callable accepting the parameter container passed to
     :meth:`PauliPEPOBasis.exp`.
@@ -196,19 +199,48 @@ class PauliPEPOTerm:
     paulis: object
     coefficient: object = 1.0
     where: object = None
+    direction: str | None = None
 
     def __post_init__(self):
         support = _normalize_pauli_support(self.support)
         labels = _normalize_paulis(self.paulis, support=support)
         where = _normalize_pauli_where(self.where, support=support)
+        direction = self.direction
+        if direction is not None:
+            direction = str(direction).strip().lower()
+            if direction not in _DIRECTIONS:
+                raise ValueError("direction must be 'u', 'r', 'd', 'l', or None.")
+            if support != "edge" or where is None:
+                raise ValueError(
+                    "direction is valid only for an explicitly located edge."
+                )
         object.__setattr__(self, "support", support)
         object.__setattr__(self, "paulis", labels)
         object.__setattr__(self, "where", where)
+        object.__setattr__(self, "direction", direction)
 
     @classmethod
-    def from_pauli(cls, support, paulis, *, coefficient=1.0, where=None):
+    def from_pauli(
+        cls,
+        support,
+        paulis,
+        *,
+        coefficient=1.0,
+        where=None,
+        direction=None,
+    ):
         """Construct a term from ``"X"`` or ``"ZZ"`` labels."""
-        return cls(support, paulis, coefficient, where)
+        return cls(support, paulis, coefficient, where, direction)
+
+
+@dataclass(frozen=True)
+class _LocalizedClusterRecord:
+    """One connected finite-lattice site subset and its bond occurrences."""
+
+    sites: tuple[tuple[int, int], ...]
+    site_indices: tuple[int, ...]
+    edges: tuple[tuple[int, int, str], ...]
+    edge_indices: tuple[int, ...]
 
 
 class CompiledPEPOExp:
@@ -312,15 +344,6 @@ class PauliPEPOBasis:
             raise ValueError("terms must contain at least one Pauli slot.")
         self.inhomogeneous = any(term.where is not None for term in self._terms)
         if self.inhomogeneous:
-            if self.cyclic != (False, False):
-                raise NotImplementedError(
-                    "explicit Pauli PEPO locations currently require open boundaries."
-                )
-            if self.order > 2:
-                raise NotImplementedError(
-                    "explicit Pauli PEPO locations currently support joint orders "
-                    "one and two."
-                )
             if self.symmetry is not None:
                 raise ValueError(
                     "explicit Pauli PEPO locations cannot use geometric symmetry."
@@ -345,8 +368,10 @@ class PauliPEPOBasis:
             if direction in _POSITIVE_DIRECTIONS
         )
         self._edge_indices = {
-            (source, target): index
-            for index, (source, target, _direction) in enumerate(self._positive_edges)
+            (source, target, direction): index
+            for index, (source, target, direction) in enumerate(
+                self._positive_edges
+            )
         }
         # Static one-hot maps let each evaluation fuse all coefficient slots
         # into onsite and edge Pauli components in two backend contractions.
@@ -385,22 +410,63 @@ class PauliPEPOBasis:
                     ] = 1.0
                 else:
                     source, target = term.where
-                    edge_index = self._edge_indices.get((source, target))
-                    if edge_index is None:
-                        edge_index = self._edge_indices.get((target, source))
-                        if edge_index is not None:
-                            labels = labels[::-1]
-                    if edge_index is None:
+                    candidates = []
+                    if term.direction is not None:
+                        if (
+                            _site_after(
+                                source,
+                                term.direction,
+                                self.lx,
+                                self.ly,
+                                self.cyclic,
+                            )
+                            != target
+                        ):
+                            raise ValueError(
+                                f"edge direction {term.direction!r} does not lead "
+                                f"from {source!r} to {target!r}."
+                            )
+                        if term.direction in _POSITIVE_DIRECTIONS:
+                            key = (source, target, term.direction)
+                            candidates.append((self._edge_indices.get(key), labels))
+                        else:
+                            positive = _OPPOSITE_DIRECTION[term.direction]
+                            key = (target, source, positive)
+                            candidates.append(
+                                (self._edge_indices.get(key), labels[::-1])
+                            )
+                    else:
+                        for edge_index, (edge_source, edge_target, _direction) in enumerate(
+                            self._positive_edges
+                        ):
+                            if (source, target) == (edge_source, edge_target):
+                                candidates.append((edge_index, labels))
+                            elif (source, target) == (edge_target, edge_source):
+                                candidates.append((edge_index, labels[::-1]))
+                    candidates = [
+                        candidate
+                        for candidate in candidates
+                        if candidate[0] is not None
+                    ]
+                    if not candidates:
                         raise ValueError(
-                            f"edge Pauli location {term.where!r} is not one open "
-                            "nearest-neighbour lattice edge."
+                            f"edge Pauli location {term.where!r} is not a nearest-"
+                            "neighbour lattice bond occurrence."
                         )
+                    if len(candidates) > 1:
+                        raise ValueError(
+                            f"edge Pauli location {term.where!r} is ambiguous on "
+                            "this periodic lattice; pass direction explicitly."
+                        )
+                    edge_index, labels = candidates[0]
                     component = labels[0] * 4 + labels[1]
                     self._lattice_edge_term_map[
                         term_index, edge_index, component
                     ] = 1.0
         self._cluster_embedding_cache = {}
         self._generic_cluster_cache = {}
+        self._localized_cluster_cache = None
+        self._localized_embedding_cache = {}
         self.plaquette_starts = _plaquette_starts(self.lx, self.ly, self.cyclic)
         self.pair_orbits = _pair_orbits() if symmetry == "C4" else tuple(
             (pair, (pair,)) for pair in _all_direction_pairs()
@@ -450,6 +516,14 @@ class PauliPEPOBasis:
                 sum(len(record[1]) for record in level)
                 for level in self._generic_cluster_cache.values()
             ),
+            "localized_cluster_counts": (
+                {}
+                if self._localized_cluster_cache is None
+                else {
+                    order: len(records)
+                    for order, records in self._localized_cluster_cache.items()
+                }
+            ),
             "fused_pauli_slots": int(
                 np.count_nonzero(self._onsite_term_map)
                 + np.count_nonzero(self._edge_term_map)
@@ -479,6 +553,7 @@ class PauliPEPOBasis:
         _backend_pauli_basis(1)
         _backend_pauli_basis(2)
         if self.inhomogeneous:
+            self._localized_cluster_records()
             return self
         # The joint ordered-product path always evaluates the one-site
         # background and positive reference edge, including at order two.
@@ -704,15 +779,422 @@ class PauliPEPOBasis:
             ar.do("tensordot", coefficient_batch, edge_map, axes=([0], [0])),
         )
 
+    def _localized_cluster_records(self):
+        """Enumerate connected finite-lattice site subsets once.
+
+        The connectivity graph deduplicates endpoint pairs, while each record
+        retains every oriented PEPO bond occurrence inside its site set. This
+        distinction is required on length-two periodic dimensions, where two
+        physical virtual bonds connect the same pair of sites.
+        """
+        if self._localized_cluster_cache is not None:
+            return self._localized_cluster_cache
+
+        adjacency = {index: set() for index in range(len(self._sites))}
+        for source, target, _direction in self._positive_edges:
+            source_index = self._site_indices[source]
+            target_index = self._site_indices[target]
+            adjacency[source_index].add(target_index)
+            adjacency[target_index].add(source_index)
+
+        levels = {
+            1: {
+                frozenset((site_index,))
+                for site_index in range(len(self._sites))
+            }
+        }
+        for size in range(2, min(self.order, len(self._sites)) + 1):
+            candidates = set()
+            for selected in levels[size - 1]:
+                frontier = {
+                    neighbor
+                    for site_index in selected
+                    for neighbor in adjacency[site_index]
+                    if neighbor not in selected
+                }
+                candidates.update(
+                    selected | frozenset((neighbor,))
+                    for neighbor in frontier
+                )
+            levels[size] = candidates
+
+        records = {}
+        for size, selected_sets in levels.items():
+            level = []
+            for selected in sorted(
+                selected_sets,
+                key=lambda value: tuple(sorted(value)),
+            ):
+                site_indices = tuple(sorted(selected))
+                sites = tuple(self._sites[index] for index in site_indices)
+                local_index = {
+                    site: index for index, site in enumerate(sites)
+                }
+                internal = tuple(
+                    (
+                        local_index[source],
+                        local_index[target],
+                        direction,
+                        edge_index,
+                    )
+                    for edge_index, (source, target, direction) in enumerate(
+                        self._positive_edges
+                    )
+                    if source in local_index and target in local_index
+                )
+                level.append(
+                    _LocalizedClusterRecord(
+                        sites=sites,
+                        site_indices=site_indices,
+                        edges=tuple(edge[:3] for edge in internal),
+                        edge_indices=tuple(edge[3] for edge in internal),
+                    )
+                )
+            records[size] = tuple(level)
+        self._localized_cluster_cache = records
+        return records
+
+    def _localized_embedding_plan(self, record):
+        """Return static local Pauli embeddings for one finite site subset."""
+        key = (record.site_indices, record.edge_indices)
+        try:
+            return self._localized_embedding_cache[key]
+        except KeyError:
+            pass
+
+        nsites = len(record.sites)
+        onsite_basis = np.stack(
+            [
+                np.stack(
+                    [
+                        np.asarray(
+                            _backend_embed_operator(
+                                matrix,
+                                (local_site,),
+                                nsites,
+                                2,
+                            )
+                        )
+                        for matrix in _backend_pauli_basis(1)
+                    ],
+                    axis=0,
+                )
+                for local_site in range(nsites)
+            ],
+            axis=0,
+        )
+        edge_basis = np.stack(
+            [
+                np.stack(
+                    [
+                        np.asarray(
+                            _backend_embed_operator(
+                                matrix,
+                                (source, target),
+                                nsites,
+                                2,
+                            )
+                        )
+                        for matrix in _backend_pauli_basis(2)
+                    ],
+                    axis=0,
+                )
+                for source, target, _direction in record.edges
+            ],
+            axis=0,
+        ) if record.edges else None
+        plan = (onsite_basis, edge_basis)
+        self._localized_embedding_cache[key] = plan
+        return plan
+
+    def _localized_cluster_hamiltonian(
+        self,
+        record,
+        site_components,
+        edge_components,
+        *,
+        like,
+    ):
+        """Assemble one occurrence-specific cluster Hamiltonian."""
+        onsite_basis, edge_basis = self._localized_embedding_plan(record)
+        site_values = _complexify_backend(
+            _backend_stack(
+                [site_components[index] for index in record.site_indices]
+            )
+        )
+        onsite_basis = _as_backend(
+            onsite_basis,
+            like=like,
+            dtype=getattr(site_values, "dtype", None),
+        )
+        hamiltonian = ar.do(
+            "tensordot",
+            site_values,
+            onsite_basis,
+            axes=([0, 1], [0, 1]),
+        )
+        if record.edge_indices:
+            edge_values = _complexify_backend(
+                _backend_stack(
+                    [edge_components[index] for index in record.edge_indices]
+                )
+            )
+            edge_basis = _as_backend(
+                edge_basis,
+                like=like,
+                dtype=getattr(edge_values, "dtype", None),
+            )
+            hamiltonian = ar.do(
+                "add",
+                hamiltonian,
+                ar.do(
+                    "tensordot",
+                    edge_values,
+                    edge_basis,
+                    axes=([0, 1], [0, 1]),
+                ),
+            )
+        return hamiltonian
+
+    def _localized_ordered_product(self, localized, record, *, like):
+        """Evaluate all ordered factors on one actual finite-lattice subset."""
+        result = None
+        for basis, beta, site_components, edge_components in localized:
+            hamiltonian = basis._localized_cluster_hamiltonian(
+                record,
+                site_components,
+                edge_components,
+                like=like,
+            )
+            local_exp = _backend_expm(
+                ar.do("multiply", -beta, hamiltonian)
+            )
+            result = (
+                local_exp
+                if result is None
+                else ar.do("matmul", result, local_exp)
+            )
+        return result
+
+    @staticmethod
+    def _localized_tree_topology(edges, nsites):
+        """Choose a deterministic spanning tree and a low-width root."""
+        adjacency = [[] for _ in range(nsites)]
+        for source, target, direction in edges:
+            adjacency[source].append((target, direction))
+            adjacency[target].append(
+                (source, _OPPOSITE_DIRECTION[direction])
+            )
+
+        tree_adjacency = [[] for _ in range(nsites)]
+        visited = {0}
+        queue = [0]
+        for source in queue:
+            for target, direction in adjacency[source]:
+                if target in visited:
+                    continue
+                visited.add(target)
+                queue.append(target)
+                tree_adjacency[source].append((target, direction))
+                tree_adjacency[target].append(
+                    (source, _OPPOSITE_DIRECTION[direction])
+                )
+        if len(visited) != nsites:
+            raise ValueError("localized cluster graph must be connected.")
+
+        def rooted(root):
+            parent = {root: None}
+            parent_direction = {}
+            traversal = [root]
+            for source in traversal:
+                for target, direction in sorted(tree_adjacency[source]):
+                    if target in parent:
+                        continue
+                    parent[target] = source
+                    parent_direction[target] = direction
+                    traversal.append(target)
+            children = {site: [] for site in range(nsites)}
+            subtree_sizes = {site: 1 for site in range(nsites)}
+            for site in traversal[1:]:
+                children[parent[site]].append(site)
+            for site in reversed(traversal[1:]):
+                subtree_sizes[parent[site]] += subtree_sizes[site]
+            width = max(
+                (subtree_sizes[child] for child in children[root]),
+                default=0,
+            )
+            return width, root, parent, parent_direction, children, traversal
+
+        _, _, parent, parent_direction, children, traversal = min(
+            (rooted(root) for root in range(nsites)),
+            key=lambda item: item[:2],
+        )
+        children = {
+            site: tuple(sorted(site_children))
+            for site, site_children in children.items()
+        }
+        subtree_sites = {}
+        for site in reversed(traversal):
+            descendants = [site]
+            for child in children[site]:
+                descendants.extend(subtree_sites[child])
+            subtree_sites[site] = tuple(sorted(descendants))
+        ranks = {
+            site: 4 ** len(subtree_sites[site])
+            for site in range(nsites)
+            if parent[site] is not None
+        }
+        return parent, parent_direction, children, subtree_sites, ranks
+
+    def _add_localized_pauli_tree(
+        self,
+        blocks,
+        allocator,
+        record,
+        residual,
+    ):
+        """Insert one exact fixed-history Pauli tree correction.
+
+        Only the root carries coefficient-dependent data. Other tensors are
+        deterministic history selectors, so the default localized route has
+        no coefficient-dependent SVD gauge and retains stable autodiff.
+        """
+        nsites = len(record.sites)
+        topology = self._localized_tree_topology(record.edges, nsites)
+        parent, parent_direction, children, subtree_sites, ranks = topology
+        required_rank = max(ranks.values(), default=1)
+        if self.max_tree_rank is not None and self.max_tree_rank < required_rank:
+            factorized = _tree_factorize_operator_backend(
+                residual,
+                record.edges,
+                nsites,
+                2,
+                self.max_tree_rank,
+            )
+            if factorized is None:
+                return
+            local_tensors, parent, parent_direction, children, ranks = factorized
+            tree_directions = {}
+            sectors = {}
+            for child, parent_site in parent.items():
+                if parent_site is None:
+                    continue
+                direction = parent_direction[child]
+                tree_directions[(parent_site, child)] = direction
+                tree_directions[(child, parent_site)] = _OPPOSITE_DIRECTION[
+                    direction
+                ]
+                sectors[child] = allocator.allocate(ranks[child])
+            _add_tree_factor_blocks_backend(
+                blocks,
+                self.site_directions,
+                (record.sites,),
+                local_tensors,
+                parent,
+                tree_directions,
+                sectors,
+                2,
+            )
+            return
+
+        coefficients = _backend_pauli_expand(residual, nsites)
+        paulis = ar.do(
+            "stack",
+            _backend_pauli_basis(1, like=coefficients),
+            axis=0,
+        )
+        root = next(site for site, value in parent.items() if value is None)
+        sectors = {
+            site: allocator.allocate(rank) for site, rank in ranks.items()
+        }
+        tree_directions = {}
+        for child, parent_site in parent.items():
+            if parent_site is None:
+                continue
+            direction = parent_direction[child]
+            tree_directions[(parent_site, child)] = direction
+            tree_directions[(child, parent_site)] = _OPPOSITE_DIRECTION[
+                direction
+            ]
+
+        root_children = children[root]
+        root_axis_order = tuple(
+            descendant
+            for child in root_children
+            for descendant in subtree_sites[child]
+        ) + (root,)
+        root_coefficients = ar.do(
+            "transpose",
+            coefficients,
+            root_axis_order,
+        )
+        root_shape = tuple(ranks[child] for child in root_children) + (4,)
+        root_coefficients = ar.do("reshape", root_coefficients, root_shape)
+        root_blocks = ar.do(
+            "tensordot",
+            root_coefficients,
+            paulis,
+            axes=([len(root_children)], [0]),
+        )
+        for child_histories in np.ndindex(
+            tuple(ranks[child] for child in root_children)
+        ):
+            _add_block(
+                blocks,
+                self.site_directions,
+                record.sites[root],
+                {
+                    tree_directions[(root, child)]: sectors[child][history]
+                    for child, history in zip(root_children, child_histories)
+                },
+                root_blocks[child_histories],
+            )
+
+        for site in range(nsites):
+            if site == root:
+                continue
+            site_children = children[site]
+            child_shapes = tuple(ranks[child] for child in site_children)
+            for child_histories in np.ndindex(child_shapes):
+                assignments = {}
+                for child, history in zip(site_children, child_histories):
+                    labels = np.unravel_index(
+                        history,
+                        (4,) * len(subtree_sites[child]),
+                    )
+                    assignments.update(zip(subtree_sites[child], labels))
+                for pauli_index in range(4):
+                    assignments[site] = pauli_index
+                    parent_history = np.ravel_multi_index(
+                        tuple(
+                            assignments[descendant]
+                            for descendant in subtree_sites[site]
+                        ),
+                        (4,) * len(subtree_sites[site]),
+                    )
+                    sector_by_direction = {
+                        tree_directions[(site, child)]: sectors[child][history]
+                        for child, history in zip(
+                            site_children,
+                            child_histories,
+                        )
+                    }
+                    sector_by_direction[
+                        tree_directions[(site, parent[site])]
+                    ] = sectors[site][parent_history]
+                    _add_block(
+                        blocks,
+                        self.site_directions,
+                        record.sites[site],
+                        sector_by_direction,
+                        paulis[pauli_index],
+                    )
+
     def _build_inhomogeneous_active(self, factor_sources):
-        """Build an open-boundary order-one/two PEPO with local coefficients."""
+        """Build an occurrence-aware finite-lattice connected-cluster PEPO."""
         factor_sources = tuple(factor_sources)
         if not factor_sources:
             raise ValueError("factor_sources must contain at least one factor.")
-        if self.order > 2:
-            raise NotImplementedError(
-                "inhomogeneous ordered PEPO products currently support order <= 2."
-            )
         localized = []
         for basis, beta, values in factor_sources:
             if (basis.lx, basis.ly, basis.cyclic) != (
@@ -724,73 +1206,34 @@ class PauliPEPOBasis:
             site_components, edge_components = (
                 basis._localized_hamiltonian_components(values)
             )
-            localized.append((beta, site_components, edge_components))
+            localized.append(
+                (basis, beta, site_components, edge_components)
+            )
 
         reference = _backend_reference(
             tuple(
                 value
-                for beta, site_components, edge_components in localized
+                for _basis, beta, site_components, edge_components in localized
                 for value in (beta, site_components, edge_components)
             )
         )
         localized = [
             (
+                basis,
                 _as_backend(beta, like=reference),
                 _as_backend(site_components, like=reference),
                 _as_backend(edge_components, like=reference),
             )
-            for beta, site_components, edge_components in localized
+            for basis, beta, site_components, edge_components in localized
         ]
-        paulis = _backend_pauli_basis(1, like=reference)
-        one_basis = ar.do("stack", paulis, axis=0)
-        two_basis = ar.do(
-            "stack",
-            _backend_pauli_basis(2, like=reference),
-            axis=0,
-        )
-        identity = paulis[0]
-
-        def ordered_product(site_indices, edge_index=None):
-            result = None
-            for beta, site_components, edge_components in localized:
-                onsite_operators = tuple(
-                    ar.do(
-                        "tensordot",
-                        _complexify_backend(site_components[site_index]),
-                        one_basis,
-                        axes=([0], [0]),
-                    )
-                    for site_index in site_indices
-                )
-                if len(site_indices) == 1:
-                    hamiltonian = onsite_operators[0]
-                else:
-                    edge_operator = ar.do(
-                        "tensordot",
-                        _complexify_backend(edge_components[edge_index]),
-                        two_basis,
-                        axes=([0], [0]),
-                    )
-                    hamiltonian = ar.do(
-                        "add",
-                        ar.do(
-                            "add",
-                            ar.do("kron", onsite_operators[0], identity),
-                            ar.do("kron", identity, onsite_operators[1]),
-                        ),
-                        edge_operator,
-                    )
-                local_exp = _backend_expm(ar.do("multiply", -beta, hamiltonian))
-                result = (
-                    local_exp
-                    if result is None
-                    else ar.do("matmul", result, local_exp)
-                )
-            return result
-
+        cluster_records = self._localized_cluster_records()
         one_exps = tuple(
-            ordered_product((site_index,))
-            for site_index in range(len(self._sites))
+            self._localized_ordered_product(
+                localized,
+                record,
+                like=reference,
+            )
+            for record in cluster_records[1]
         )
         blocks = {
             site: {
@@ -799,56 +1242,39 @@ class PauliPEPOBasis:
             for site_index, site in enumerate(self._sites)
         }
         allocator = _SectorAllocator()
-        if self.order >= 2:
-            channels = tuple(product(range(4), repeat=2))
-            sectors = allocator.allocate(len(channels))
-            source_factors = _backend_stack(
-                [paulis[first] for first, _second in channels]
+        for cluster_order in range(2, min(self.order, len(self._sites)) + 1):
+            # Residuals at one order subtract the completed lower-order PEPO,
+            # never another correction from the same level.
+            lower_active = ActivePEPOBlocks(
+                lx=self.lx,
+                ly=self.ly,
+                cyclic=self.cyclic,
+                bond_dim=allocator.next_sector,
+                physical_dim=2,
+                site_directions=self.site_directions,
+                blocks={
+                    site: dict(site_blocks)
+                    for site, site_blocks in blocks.items()
+                },
             )
-            for edge_index, (source, target, direction) in enumerate(
-                self._positive_edges
-            ):
-                exact = ordered_product(
-                    (self._site_indices[source], self._site_indices[target]),
-                    edge_index,
+            for record in cluster_records[cluster_order]:
+                exact = self._localized_ordered_product(
+                    localized,
+                    record,
+                    like=reference,
                 )
-                residual = ar.do(
-                    "subtract",
-                    exact,
-                    _backend_operator_product(
-                        [
-                            one_exps[self._site_indices[source]],
-                            one_exps[self._site_indices[target]],
-                        ]
-                    ),
+                lower = _contract_active_support_backend(
+                    lower_active,
+                    record.sites,
+                    record.edges,
                 )
-                coefficients = _backend_pauli_expand(residual, 2)
-                target_factors = _backend_stack(
-                    [
-                        ar.do(
-                            "multiply",
-                            coefficients[first, second],
-                            paulis[second],
-                        )
-                        for first, second in channels
-                    ]
+                residual = ar.do("subtract", exact, lower)
+                self._add_localized_pauli_tree(
+                    blocks,
+                    allocator,
+                    record,
+                    residual,
                 )
-                opposite = _OPPOSITE_DIRECTION[direction]
-                for channel, sector in enumerate(sectors):
-                    _add_block(
-                        blocks,
-                        self.site_directions,
-                        source,
-                        {direction: sector},
-                        source_factors[channel],
-                    )
-                    _add_block(
-                        blocks,
-                        self.site_directions,
-                        target,
-                        {opposite: sector},
-                        target_factors[channel],
-                    )
 
         self._build_count += 1
         return ActivePEPOBlocks(

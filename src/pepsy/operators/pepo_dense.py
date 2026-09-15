@@ -754,17 +754,19 @@ def _normalize_pauli_term(term):
             paulis,
             term.get("coefficient", 1.0),
             term.get("where"),
+            term.get("direction"),
         )
-    if isinstance(term, (tuple, list)) and len(term) in (2, 3, 4):
+    if isinstance(term, (tuple, list)) and len(term) in (2, 3, 4, 5):
         return PauliPEPOTerm(
             term[0],
             term[1],
             term[2] if len(term) >= 3 else 1.0,
-            term[3] if len(term) == 4 else None,
+            term[3] if len(term) >= 4 else None,
+            term[4] if len(term) == 5 else None,
         )
     raise TypeError(
         "Pauli PEPO terms must be PauliPEPOTerm values, mappings, or "
-        "(support, paulis[, coefficient[, where]]) tuples."
+        "(support, paulis[, coefficient[, where[, direction]]]) tuples."
     )
 
 

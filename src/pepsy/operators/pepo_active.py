@@ -47,18 +47,33 @@ def _backend_nonzero(value):
         return True
 
 
-def _materialize_site_blocks(directions, blocks, bond_dim, dtype):
+def _materialize_site_blocks(
+    directions,
+    blocks,
+    bond_dim,
+    dtype,
+    *,
+    sector_maps=None,
+):
     physical_dim = blocks[(0,) * len(directions)].shape[0]
     reference = blocks[(0,) * len(directions)]
-    shape = (bond_dim,) * len(directions) + (physical_dim, physical_dim)
+    if sector_maps is None:
+        sector_maps = tuple(
+            {sector: sector for sector in range(bond_dim)}
+            for _direction in directions
+        )
+    shape = tuple(len(mapping) for mapping in sector_maps)
+    shape += (physical_dim, physical_dim)
     if ar.infer_backend(reference) not in ("builtins", "numpy"):
         data = ar.do("zeros", shape, like=reference)
         for key, block in blocks.items():
             mask = None
             for axis, sector in enumerate(key):
-                selector = ar.do("eye", bond_dim, like=reference)[:, sector]
+                local_dim = len(sector_maps[axis])
+                local_sector = sector_maps[axis][sector]
+                selector = ar.do("eye", local_dim, like=reference)[:, local_sector]
                 selector_shape = [1] * len(directions)
-                selector_shape[axis] = bond_dim
+                selector_shape[axis] = local_dim
                 selector = ar.do("reshape", selector, tuple(selector_shape))
                 mask = selector if mask is None else ar.do("multiply", mask, selector)
             block = ar.do("transpose", block, (1, 0))
@@ -75,8 +90,53 @@ def _materialize_site_blocks(directions, blocks, bond_dim, dtype):
         # Quimb to_dense convention transposes each local b/k block when
         # flattening an operator. Store the inverse local transpose here so
         # the materialized PEPO has the requested matrix orientation.
-        data[key + (slice(None), slice(None))] = block.T
+        local_key = tuple(
+            mapping[sector] for mapping, sector in zip(sector_maps, key)
+        )
+        data[local_key + (slice(None), slice(None))] = block.T
     return data
+
+
+def _local_bond_sector_maps(active):
+    """Return one compact sector map for each physical PEPO bond.
+
+    Active-sector ids are global history labels, but Quimb only needs the
+    labels present on each individual bond.  Remapping at materialization
+    keeps occurrence-specific cluster channels local instead of padding every
+    lattice leg to the total number of histories in the full network.
+    """
+    maps = {}
+    for site, directions in active.site_directions.items():
+        for direction in directions:
+            if direction not in ("u", "r"):
+                continue
+            neighbor = _site_after(
+                site,
+                direction,
+                active.lx,
+                active.ly,
+                active.cyclic,
+            )
+            if neighbor is None:
+                continue
+            opposite = _OPPOSITE_DIRECTION[direction]
+            source_axis = directions.index(direction)
+            target_directions = active.site_directions[neighbor]
+            target_axis = target_directions.index(opposite)
+            sectors = {0}
+            sectors.update(
+                key[source_axis] for key in active.blocks[site]
+            )
+            sectors.update(
+                key[target_axis] for key in active.blocks[neighbor]
+            )
+            mapping = {
+                sector: local
+                for local, sector in enumerate(sorted(sectors))
+            }
+            maps[(site, direction)] = mapping
+            maps[(neighbor, opposite)] = mapping
+    return maps
 
 
 def _site_after(site, direction, lx, ly, cyclic):
@@ -119,15 +179,32 @@ class ActivePEPOBlocks:
 
     @property
     def dense_nbytes(self):
-        """Estimate bytes required by dense PEPO site tensors."""
+        """Estimate bytes required by compact dense PEPO site tensors."""
         reference = next(iter(next(iter(self.blocks.values())).values()))
         itemsize = _backend_dtype_itemsize(reference)
+        sector_maps = _local_bond_sector_maps(self)
         return sum(
-            self.bond_dim ** len(self.site_directions[site])
+            int(
+                np.prod(
+                    [
+                        len(sector_maps[(site, direction)])
+                        for direction in self.site_directions[site]
+                    ],
+                    dtype=int,
+                )
+            )
             * self.physical_dim**2
             * itemsize
             for site in self.blocks
         )
+
+    @property
+    def bond_dimensions(self):
+        """Return compact dimensions keyed by oriented lattice leg."""
+        return {
+            leg: len(mapping)
+            for leg, mapping in _local_bond_sector_maps(self).items()
+        }
 
     @property
     def active_nbytes(self):
@@ -473,25 +550,38 @@ class ActivePEPOBlocks:
             pepo[site].modify(data=native)
         return pepo
 
-    def to_pepo(self):
+    def to_pepo(self, *, compact_bonds=True):
         """Materialize blocks as a dense Quimb ``PEPO``.
 
         This is an explicit interoperability boundary. The active-block
         representation is normally the smaller and clearer object to keep
-        during autodiff or repeated coefficient evaluations.
+        during autodiff or repeated coefficient evaluations. By default,
+        global history ids are remapped independently on every physical bond;
+        set ``compact_bonds=False`` only when inspecting the global sector
+        labeling itself.
         """
         arrays = []
         dtype = next(iter(next(iter(self.blocks.values())).values())).dtype
+        bond_maps = _local_bond_sector_maps(self) if compact_bonds else None
         for i in range(self.lx):
             row = []
             for j in range(self.ly):
                 site = (i, j)
+                directions = self.site_directions[site]
                 row.append(
                     _materialize_site_blocks(
-                        self.site_directions[site],
+                        directions,
                         self.blocks[site],
                         self.bond_dim,
                         dtype,
+                        sector_maps=(
+                            None
+                            if bond_maps is None
+                            else tuple(
+                                bond_maps[(site, direction)]
+                                for direction in directions
+                            )
+                        ),
                     )
                 )
             arrays.append(row)
