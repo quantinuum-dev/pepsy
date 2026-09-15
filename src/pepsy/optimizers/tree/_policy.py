@@ -30,7 +30,7 @@ COPY_SETTINGS = (
 
 _ALGORITHM_MODES = frozenset({
     "dm", "sdc", "sdc_oversample", "sdcr", "sdcr_oversample", "src",
-    "src_oversample", "zipup",
+    "src_oversample", "zipup", "zipup_oversample", "mix",
     "tree_mpo_direct", "tree_mpo_dm",
 })
 
@@ -49,19 +49,20 @@ def normalize_mode(mode):
         "tree_mpo_svd": "tree_mpo_direct",
         "tree_mpo_eig": "tree_mpo_dm",
         "fit": "dmrg",
+        "zipup_first": "zipup_oversample",
     }
     mode = aliases.get(mode, mode)
     if mode not in {
         "auto", "direct", "dm", "sdc", "sdc_oversample", "sdcr",
         "sdcr_oversample", "src", "src_oversample",
-        "zipup",
+        "zipup", "zipup_oversample", "mix",
         "mpo", "submpo",
         "tree_mpo_direct", "tree_mpo_dm", "dmrg", "dmrg1", "dmrg2", "dmrg3",
     }:
         raise ValueError(
             "mode must be one of 'auto', 'direct', 'dm', 'sdc', "
             "'sdc-oversample', 'sdcr', 'sdcr-oversample', 'src', "
-            "'src-oversample', 'zipup', 'mpo', "
+            "'src-oversample', 'zipup', 'zipup-oversample', 'zipup-first', 'mix', 'mpo', "
             "'submpo', 'dmrg', 'dmrg1', 'dmrg2', 'dmrg3', "
             "'tree_mpo_direct', or 'tree_mpo_dm'."
         )
@@ -69,8 +70,8 @@ def normalize_mode(mode):
 
 
 def compression_for_mode(mode, compression_mode):
-    """Combined TreeMPO names and zipup own their compression method."""
-    if mode not in {"zipup", "tree_mpo_direct", "tree_mpo_dm"}:
+    """Combined TreeMPO names, zipup variants and mix own their compressor."""
+    if mode not in {"zipup", "zipup_oversample", "mix", "tree_mpo_direct", "tree_mpo_dm"}:
         return compression_mode
     expected = "dm" if mode == "tree_mpo_dm" else "direct"
     if compression_mode not in {expected, "direct"}:
@@ -94,7 +95,7 @@ def resolve_replay_mode(mode, compression_mode):
             )
         compression_mode, mode = mode, "auto"
     compression_mode = compression_for_mode(mode, compression_mode)
-    alias = mode if mode in {"dmrg1", "dmrg2", "dmrg3"} else None
+    alias = mode if mode in {"dmrg1", "dmrg2", "dmrg3", "mix"} else None
     return "dmrg" if alias is not None else mode, compression_mode, alias
 
 

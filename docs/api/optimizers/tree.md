@@ -433,11 +433,14 @@ isometry check are also desired.
 Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 `compress_between`, and `canonize_around_` invalidate the tracked canonical
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
-it also invalidates the native fermionic norm cache. The optimizer's
+it clears every tensor's `left_inds` proof as well as the native fermionic
+norm cache, without modifying tensor data. Clearing only the region is not
+sufficient after an in-place array edit: a stale local proof can otherwise
+skip a necessary QR. The optimizer's
 state-aware wrappers do both automatically and restore the centre only for
 operations that prove canonicality is preserved. `TreeOptimizer` also exposes
 `sync_canonicalization(center=None)` to explicitly rebuild a single tracked
-centre before replay continues.
+centre before replay continues; this explicit recovery clears local proofs too.
 
 Native fermionic trees use a separate graded edge path. Centre moves explicitly
 QR-split the Symmray tensor and absorb the native carry into the next node;
@@ -710,7 +713,8 @@ contracted through `apply_sub_mpotree` on the active canonical Steiner region.
 `tree_mpo_direct` and `tree_mpo_dm` are explicit names for that same route,
 selecting direct SVD or density-matrix compression. The `submpo` mode remains
 the explicit chain-MPO stream mode. The low-level `apply_1q`/`apply_2q`
-compatibility methods retain their specialized kernels outside DMRG/zipup.
+compatibility methods retain their specialized kernels outside FIT, explicit
+TreeMPO, and oversampled zipup modes.
 DMRG ordinary gates and `apply_subtree_operator` / `apply_sub_mpotree` use FIT;
 an explicit structured `apply_submpo` retains its chain-operator routing and
 final subtree compression even when the configured mode is DMRG.
@@ -733,7 +737,8 @@ Constructor `mode`, deprecated `two_site_mode`, and `run(mode=...)` share
 normalization, aliases, and conflict validation. `dm`, `src`, `sdc`,
 `sdc-oversample`, `sdcr`, `sdcr-oversample`,
 `tree_mpo_direct`, and `tree_mpo_dm` select their named compressor; `zipup`
-selects its streamed direct splits. These names accept the neutral
+and `zipup-oversample` (alias `zipup-first`) select streamed direct splits;
+`mix` selects direct-guess one-node FIT. These names accept the neutral
 `compression_mode="direct"` constructor default or their matching compressor.
 Other route selectors (`auto`, `direct`, `mpo`, `submpo`, and DMRG modes)
 retain the configured compressor when a run override omits it. To explicitly
@@ -779,7 +784,11 @@ Exact TreeMPO preparation can peel from both ends to keep QR matrices small;
 it then moves the completed center to the compression entry endpoint.
 Before routing, direct/DM and SRC/SDC/SDCR reuse a canonical region already inside
 the active subtree. Otherwise, a known center moves only to the first subtree
-entry; an unknown gauge uses exterior canonicalization. Interior preparation
+entry. A known multi-node region is peeled only outside its overlap with the
+active region; disjoint regions require only the old region and their unique
+connector. Unaffected exterior branches and the retained overlap are not
+decomposed. A genuinely unknown gauge uses full exterior canonicalization.
+Interior preparation
 QRs are unnecessary because the routing algorithm replaces those tensors.
 They retain the terminal endpoint as the canonical
 center, without a return QR walk. This includes two-qubit gates and few-body
@@ -812,6 +821,40 @@ discarded spectra as canonical truncation errors, even with
 On a native fermionic tree, an overly small cap can remove every compatible
 charge path. Zipup raises before installing such an empty state; increase
 `chi` or choose `direct`, whose cuts see the complete operator environment.
+
+`mode="zipup-oversample"` (also `"zipup-first"`) first runs streamed zipup
+at an intermediate rank, then directly rounds the active subtree to `chi`
+using the final `cutoff` and `cutoff_mode`. No complete uncompressed target
+tree is materialized. The intermediate rank defaults to `2 * chi`;
+`max_bond_oversample=128` sets an explicit rank, while `2.0` sets a multiplier.
+The final cap must be finite, either from `chi` or the per-call `max_bond`.
+The first pass uses `cutoff_oversample=0.0` and
+`cutoff_mode_oversample="rel"` by default. These controls are independent of
+the final cutoff, whose default convention remains `rsum2`.
+
+```python
+optimizer = TreeOptimizer(
+    gates, state=ttn, chi=64, mode="zipup-oversample",
+    max_bond_oversample=2.0,
+)
+```
+
+Both passes preserve native NumPy/Torch or Symmray arrays and leave the tree
+canonical. Native final cuts retain the shared charge-multiplet policy, so
+a degenerate multiplet may exceed the nominal cap. Truncation history labels
+the intermediate cuts `zipup` and final cuts `zipup_oversample`, including
+each pass's own cap and cutoff convention. As with ordinary zipup,
+intermediate spectral-error estimates are unavailable; the update's norm
+ledger covers the composed operation.
+
+The final round is shared with SRC/SDC/SDCR oversampling. An endpoint-rooted
+path is compressed once toward the opposite endpoint and keeps that endpoint
+as its canonical center, without return QRs. Branches retain depth-first cut
+order and the return moves needed to prepare the next branch. The cuts and
+represented result of an individual round are unchanged up to numerical
+roundoff; later finite-rank gates can change because their routing direction
+depends on the new center. Caps, cutoff conventions, and RNG policy are
+unchanged.
 
 For a full `TreeMPO`, the minimal subtree shortcut requires exterior tensors proven to be unit
 identities by `TreeMPO.from_gate` or `from_pauli_sum`. Copies, scalar scaling
@@ -964,6 +1007,26 @@ transition within that budget; zero restores its previous three-to-one schedule.
 Every block-size change resets the tolerance history, and tolerance stopping
 cannot skip a pending transition or refinement phase.
 
+`TreeOptimizer(mode="mix")` is a separate preset of the same TreeFIT engine:
+apply and directly compress the operator on a private, chi-capped state,
+then refine that guess against the separate original layered target using
+one-node blocks from the first iteration. It fixes the effective
+`fit_init_strategy="guess-direct"`, `fit_block_size=1`, and direct local
+compression; it has no larger-block growth warm-up. Stored generic FIT
+options are retained for later `run(mode="dmrg")` calls. Conflicting explicit
+`compression_mode` values raise. The usual traversal, iteration, and tolerance
+controls still apply, and exact one-node regions keep their fast path.
+
+```python
+optimizer = TreeOptimizer(gates, state=ttn, chi=64, mode="mix")
+```
+
+Mix supports dense and supported even-parity native fermionic trees; odd-parity
+TreeFIT restrictions remain unchanged. A failed fit propagates its exception
+without committing the temporary guess; unlike MPS mix, this tree preset
+does not silently fall back to a direct result. Mix is a TreeOptimizer replay
+mode, not a new standalone TreeFIT or TreePepsOptimizer mode.
+
 `fit_sweep_sequence="inward-outward"` is the TreeOptimizer default. Use
 `"outward-inward"` to reverse the order. Each iteration includes both passes,
 ordered relative to the active region's medial node for branched regions and
@@ -972,7 +1035,7 @@ below. `RL`/`INOUT` and `LR`/`OUTIN` remain compatible aliases
 for the two orders. Standalone TreeFIT uses the same names and default;
 diagnostics report the normalized `sweep_sequence`.
 
-Local gates in `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` build a compact
+Local gates in `dmrg`, `dmrg1`, `dmrg2`, `dmrg3`, and `mix` build a compact
 `SubTreeMPO`; explicit `apply_sub_mpotree(subtree_operator)` uses the same
 FIT route. The exact target has operator tensors only inside that region,
 with original site labels and physical input/output indices preserved.
@@ -986,7 +1049,7 @@ factorization still establishes the requested final center, including explicit
 endpoint centers for three-node `TreeFIT.fit_block` updates.
 
 `fit_traversal="auto"` is the TreeOptimizer default for `dmrg`, `dmrg1`,
-`dmrg2`, and `dmrg3`. It inspects the induced active region: paths use
+`dmrg2`, `dmrg3`, and `mix`. It inspects the induced active region: paths use
 consecutive one-, two-, or three-node windows between endpoints, and branched
 regions use depth-first updates around their medial hub. Both visit the same
 connected block sets as the explicit `"depth"` and `"depth-first"` policies.
@@ -1009,7 +1072,7 @@ optimizer.apply_sub_mpotree(tree_operator)
 | `"depth"` | Explicit distance-from-hub order | Explicit distance-from-hub order |
 | `"depth-first"` | Explicit branch-first order | Finish each branch before the next |
 
-The same policies apply to `dmrg1`, `dmrg2`, and `dmrg3`, whether the input
+The same policies apply to `dmrg1`, `dmrg2`, `dmrg3`, and `mix`, whether the input
 is an ordinary gate or an explicit multi-site `sub_mpotree`. A few-body
 operator whose physical sites lie on one path still benefits from the
 automatic path route. Direct/SRC/SDC/SDCR/zipup keep their own compression sweeps;
@@ -1062,7 +1125,8 @@ The optimizer options `fit_n_iter`, `fit_adaptive_sweeps`,
 `fit_two_site_transition_sweeps`, `fit_min_iter`, `fit_rtol`,
 `fit_patience`, `fit_sweep_sequence`, `fit_init_strategy`,
 `fit_init_rand_strength`, and `fit_init_seed` are forwarded to TreeFIT.
-`fit_init_strategy="auto"` is the default: it selects `guess-src` for dense
+Outside the fixed `mix` preset, `fit_init_strategy="auto"` is the default:
+it selects `guess-src` for dense
 trees and `guess-direct` for native fermionic trees, whose randomized SRC
 compression is unsupported. This preserves the previous dense numerical
 policy. Explicit unsupported native `guess-src`/`guess-dm` requests still

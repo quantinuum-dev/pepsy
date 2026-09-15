@@ -31,6 +31,19 @@ Changes for the next release should be added here before the version is bumped.
   combine `ctmrg_canonize="bp"` with
   `ctmrg_projector_region=(2, 3)` for a BP-dressed three-boundary-site
   projector window; the native two-site behavior remains the default.
+- Tree state invalidation and explicit optimizer synchronization now clear
+  stale tensor-local isometry proofs after raw array edits. Canonical-region
+  preparation reuses known exterior isometries, peeling only the old region
+  outside its overlap or the connector to a disjoint region. Oversampled tree
+  rounding keeps a path's terminal center without a return QR sweep; branch
+  cut order and return moves are unchanged. Subsequent finite-rank replay can
+  differ because endpoint-based routing observes the new center.
+
+- Added opt-in TreeOptimizer `zipup-oversample` (alias `zipup-first`) and
+  `mix` replay modes. Oversampled zipup streams at `2 * chi` by default and
+  directly rounds the active tree to the final cap. Mix refines a disposable
+  chi-capped direct guess with one-node TreeFIT against the original layered
+  target; failed fits do not commit the guess. Existing defaults are unchanged.
 
 - Direct Quimb PEPS boundary compression no longer initializes, globally
   expands, or copies an unused random boundary-MPS guess. Direct sweeps derive

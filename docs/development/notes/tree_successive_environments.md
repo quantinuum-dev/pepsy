@@ -1,5 +1,88 @@
 # Tree SRC, SDC, and zipup algorithm audit
 
+## Canonical-region follow-up (2026-09-14)
+
+Implemented the three requested dense/native state-management fixes:
+
+- Explicit `invalidate_canonical_form()` clears all `left_inds`, the tracked
+  region, and native norm caches, without modifying arrays. Private
+  state-aware mutation bookkeeping still retains freshly established proofs.
+  `sync_canonicalization()` and constructor recovery after rejected numerical
+  canonicality use the same safe invalidation boundary.
+- State and optimizer oversampled rounding share one kernel. Endpoint-rooted
+  paths keep their final center and omit return QRs; branches retain their
+  original cut order and return moves. The one-round represented state is
+  unchanged, but subsequent truncated routing can select another direction.
+  No cap, cutoff, random sketch, or native reduction policy changed.
+- Default inward subtree preparation reuses a known region. Leaf peeling
+  retains its connected overlap with the requested region, or reaches a
+  disjoint region along their unique connector. Unknown gauge retains the
+  Quimb full-exterior fallback. The existing minimum-heap center recovery
+  delegates to the same peeling kernel and preserves its old edge order.
+
+The separate native `absorb="left", reduced="right"` reduction-hint issue
+remains deferred as requested; its conservative full graded-SVD fallback is
+not changed by this work. Explicit invalidation is intentionally O(N), since
+it cannot know which raw arrays were edited; it is not called on normal
+trusted replay steps.
+
+### Upstream audit
+
+Rechecked the [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray repository](https://github.com/jcmgray/autoray),
+[Cotengra documentation](https://cotengra.readthedocs.io/en/latest/) and
+[changelog](https://cotengra.readthedocs.io/en/latest/changelog.html), and
+[Symmray repository](https://github.com/jcmgray/symmray).
+The [Symmray Abelian-array page](https://symmray.readthedocs.io/en/latest/abelian_arrays.html)
+again returned a retrieval error. The installed environment contains Quimb
+`1.15.1.dev51+g2e99c793e`, Autoray `0.11.1.dev3+g1b476b305`, Cotengra
+`0.8.3.dev7+g1d7fd333f`, Cotengrust `0.2.1`, Symmray
+`0.3.2.dev8+g6c6dd34b5`, and Torch `2.6.0+cu124`.
+
+Inspected installed `Tensor.modify`, `Tensor.split`, `tensor_canonize_bond`,
+`tensor_compress_bond`, `TensorNetwork.canonize_around`, `compress_between`,
+`tensor_contract`, and the native QR helper signatures and source contracts.
+`Tensor.modify(data=...)` clears proofs; raw array mutation does not.
+Queried NumPy, Torch, and Symmray dispatch for `svd_truncated`,
+`qr_stabilized`, `linalg.svd`, and `linalg.qr`. Existing explicit cutoff modes
+remain necessary across upstream default changes; native lossless QR retains
+the structural-zero safeguard. Classification: **adopt** existing public
+tensor mutation/QR/SVD contracts for these fixes; **defer** new upstream
+compression defaults and unrelated native reduction work. No compatibility
+shim, dependency update, or installed-package edit is needed.
+
+### Validation and calibration
+
+The relevant optimizer, canonical-region, successive-compression, zipup,
+operator, sampler, FIT, trajectory, stabilizer, conversion, public-API, and
+package-layout selections total **1234 passed, 2 skipped**. The pre-existing
+installed/project package-version consistency test was excluded. This is not
+a full repository test run. Repository-wide Ruff and whitespace checks pass.
+The 37 focused canonical-region regressions cover raw NumPy/Torch/native
+edits and cache recovery, overlap/containment/disjoint preparation, unchanged
+exterior arrays, constant regional work on 16/64-site trees, and path/branch
+rounding against the former cut-and-return sequence. Native reduction
+fallbacks remain unchanged.
+
+A separate 200-case numerical audit of the ten non-FIT modes checked 550
+canonical compression edges, 100 untruncated exact targets, local proofs,
+and exterior preservation. All 1200 routed-install recovery moves continued
+to skip QR. In the overlapping-region reproducer, full-exterior kernel
+visits fell from 28/124 on 16/64 sites to one on either size; the new local
+peeler visits three edges, two of which already have isometry proofs.
+The raw-edit reproducer now reports the actual norm and a numerically valid
+canonical center.
+
+On RTX A5000, the notebook-like 5x5, chi=64, 200-gate complex128/gesvd zipup
+oversampling replay took median **8.485 s**, versus **9.118 s** with the
+previous return-to-hub behavior restored in the same kernel. Each used one
+warmup and three synchronized timed runs, excluding construction/readout
+and progress bars: approximately 6.9% less replay time. All runs finished
+canonical with maximum bond 64. Extra peak Torch allocation was 257.3 MiB
+versus 253.6 MiB; this is not a memory-reduction claim or total VRAM usage.
+Center-dependent later truncations can differ, so the timing is not a claim
+of equal complete-stream approximation error or a universal speedup.
+
 ## Compression review follow-up (2026-09-09)
 
 Reviewed ordinary TreeMPO direct/DM routing, canonical path and branching
@@ -453,3 +536,77 @@ and run persistence, and existing path/branch behavior. CPU-focused selected
 tests passed; four unrelated CUDA-only tests were unavailable in this
 environment because CuSolver/CUDA reported internal-error or out-of-memory
 failures.
+
+## 2026-09-14 Zipup oversampling and mixed FIT replay
+
+Added only the requested TreeOptimizer replay compositions:
+
+- **Adopt** `zipup-oversample`, also spelled `zipup-first`: streamed zipup
+  followed by a direct round on the active tree. The intermediate rank defaults
+  to `2 * chi`, following Quimb's zipup oversampling policy. Explicit integers
+  select ranks and floats select multipliers through the existing shared rank
+  resolver. The intermediate cutoff retains Pepsy's oversampling defaults
+  (`0.0`, `rel`), independently of the final cutoff and its unchanged `rsum2`
+  default. The final round reuses the existing edge compressor, including
+  native multiplet retention and structural-zero-safe QR. It does not
+  materialize an uncompressed target tree or convert the state to an MPS.
+- **Adopt** `mix` as a TreeFIT replay preset: a disposable chi-capped direct
+  guess, a separate original layered target, and one-node refinement from the
+  first iteration. It reuses TreeFIT traversal, tolerances, native even-parity
+  support, and transactional installation. The effective block/guess policy
+  is fixed while stored generic FIT settings survive mode switches. Failed
+  FIT propagates the error without committing the guess.
+- **Defer** MPS mix's silent direct fallback, other MPS-only modes, new
+  state-only compression methods, and any default changes. No solver,
+  dependency, or compatibility shim is introduced by these compositions.
+
+The upstream audit reviewed the [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray repository](https://github.com/jcmgray/autoray),
+[Cotengra documentation](https://cotengra.readthedocs.io/en/latest/) and
+[changelog](https://cotengra.readthedocs.io/en/latest/changelog.html), and
+[Symmray repository](https://github.com/jcmgray/symmray). The
+[Symmray Abelian-array page](https://symmray.readthedocs.io/en/latest/abelian_arrays.html)
+was attempted but unavailable to the retrieval tool. Installed versions in
+the shared Python 3.12 environment remain Quimb `1.15.1.dev51+g2e99c793e`,
+Autoray `0.11.1.dev3+g1b476b305`, Cotengra `0.8.3.dev7+g1d7fd333f`, and
+Symmray `0.3.2.dev8+g6c6dd34b5`.
+
+Callable probes covered Quimb `Tensor.split`, `tensor_contract`,
+`TensorNetwork.compress_between`, `canonize_between`, and the installed
+`tensor_network_1d_compress_zipup_oversample`. The latter has the `2 * max_bond`
+default but does not yet expose the separate intermediate cutoff-mode
+argument mentioned in newer upstream development changes. Pepsy composes
+its existing tree kernels and passes both cutoff conventions explicitly;
+it does not depend on that newer chain signature. Raw Quimb drivers were
+checked as `svd_truncated(x, cutoff=-1.0, cutoff_mode=4, max_bond=-1,
+absorb=0, renorm=0, info=None, **kwargs)` and
+`qr_stabilized(x, absorb=1, stabilized=True, **kwargs)`. Autoray
+`linalg.svd`/`linalg.qr` resolved to native NumPy, Torch, and Symmray functions.
+The raw `svd_truncated`/`qr_stabilized` dispatches resolve to Quimb's specialized
+NumPy drivers and composed defaults for Torch/Symmray before optional Pepsy
+registrations; those registrations were not changed.
+Tree `compress_edge_`, `canonize_edge_`, and `TreeFIT.run_gate` signatures were
+also checked before composing them. Upstream raw split defaults are not
+adopted globally; tree cutoff and native QR policies stay explicit.
+
+Changes are confined to tree replay policy, composition dispatch, diagnostics,
+tests, and documentation. No example notebooks, TreePepsOptimizer, or
+TreeFIT solver code changed. Tests independently compare the final zipup
+round against sequential dense Schmidt truncations and verify that mixed
+FIT refines a direct guess against the original target. Coverage includes
+paths and branches, NumPy complex128/Torch complex64, native even-parity
+fermionic replay and odd-parity rejection, alias/copy/shot overrides,
+per-call caps and non-unitary scale, low-level gate calls, and failed-fit
+state preservation.
+
+The public package-layout check exposed an existing environment mismatch:
+installed Pepsy metadata reports `0.4.0`, while the unchanged HEAD
+`pyproject.toml` declares `0.4.1`. The version-consistency test fails for this
+reason; no package reinstall or unrelated version change was made.
+
+Final validation in the shared Python 3.12 environment: 801 tests passed,
+four CUDA-only tests skipped, and only the known version-consistency test
+was deselected. The selection included tree replay compositions, zipup,
+API consistency, path execution, FIT priorities/messages, successive
+compression, the main tree optimizer, and public API/package-layout tests.
+`python -m ruff check src tests` and `git diff --check` passed.

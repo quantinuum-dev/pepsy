@@ -770,8 +770,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         Quimb exposes mutating tensor-network methods and tensors themselves
         can be modified in place. The TTN cannot intercept every such mutation,
         so direct callers should use this method after changing tensor data
-        outside the state-aware wrappers below.
+        outside the state-aware wrappers below. Since the edited nodes are
+        unknown, clear every local isometry proof as well as the region.
+        State-aware mutators retain their independently established proofs.
         """
+        for tensor in self.tensors:
+            tensor.modify(left_inds=None)
         self._canonical_region = None
         self._invalidate_norm_cache()
         return self
@@ -2371,8 +2375,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self
 
     def _round_successive_region(self, nodes, hub, *, max_bond, cutoff,
-                                 cutoff_mode):
-        """Round an oversampled dense successive result with direct SVDs."""
+                                 cutoff_mode, _record=None):
+        """Round an oversampled result, retaining a path's terminal center.
+
+        Branches retain their depth-first cut order and return moves. An
+        endpoint-rooted path needs no return QR after its final cut. ``_record``
+        optionally receives each cut's dimension record for optimizer history.
+        """
         if max_bond is None:
             raise ValueError(
                 "oversampled successive compression requires max_bond."
@@ -2382,23 +2391,47 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             raise ValueError("max_bond must be positive")
         self.shift_orthogonality_center(hub)
         nodes = frozenset(nodes)
+        adjacency = {
+            node: tuple(sorted(v for v in self.neighbors(node) if v in nodes))
+            for node in nodes
+        }
+
+        def compress(node, child):
+            if _record is not None:
+                before = int(self.ind_size(self.bond(child, node)))
+            self.compress_edge_(
+                child,
+                node,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="left",
+                reduced="right",
+                compression_mode="direct",
+            )
+            if _record is not None:
+                bond = self.bond(child, node)
+                _record((child, node, before, int(self.ind_size(bond)), bond))
+
+        if len(adjacency[hub]) <= 1 and all(
+            len(neighbors) <= 2 for neighbors in adjacency.values()
+        ):
+            parent, node = None, hub
+            while True:
+                child = next((v for v in adjacency[node] if v != parent), None)
+                if child is None:
+                    break
+                compress(node, child)
+                parent, node = node, child
+            self._canonical_region = frozenset({node})
+            self._invalidate_norm_cache()
+            return
 
         def descend(node, parent):
-            children = sorted(
-                neighbor for neighbor in self.neighbors(node)
-                if neighbor in nodes and neighbor != parent
-            )
-            for child in children:
-                self.compress_edge_(
-                    child,
-                    node,
-                    max_bond=max_bond,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    absorb="left",
-                    reduced="right",
-                    compression_mode="direct",
-                )
+            for child in adjacency[node]:
+                if child == parent:
+                    continue
+                compress(node, child)
                 descend(child, node)
                 self.canonize_edge_(child, node, absorb="right")
 
@@ -2583,9 +2616,31 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         node).
 
         ``nodes`` must form a connected subtree; pass ``span=True`` to auto-expand
-        to the minimal connected subtree that spans them.  Returns ``self``.
+        to the minimal connected subtree that spans them. With the default
+        inward absorption, an existing canonical region is peeled locally
+        toward its overlap with the requested region, or along their unique
+        connector. Unknown gauge retains the full-exterior fallback. Call
+        :meth:`invalidate_canonical_form` after unmanaged tensor edits before
+        relying on this metadata. Returns ``self``.
         """
         region = self._validated_region(nodes, span=span)
+        previous = self.canonical_region
+        if previous is not None and absorb == "right":
+            # The exterior of the old region already points inward. Only its
+            # part outside the new region (and a connector if disjoint) needs
+            # gauging; do not revisit every proven exterior tree branch.
+            if not previous.issubset(region):
+                overlap = previous & region
+                if overlap:
+                    self._peel_canonical_region(previous, overlap)
+                else:
+                    path = self._plan.node_path(min(previous), min(region))
+                    entry_index = next(i for i, node in enumerate(path) if node in region)
+                    work = previous.union(path[:entry_index + 1])
+                    self._peel_canonical_region(work, {path[entry_index]})
+            self._canonical_region = region
+            return self
+
         tags = [self.node_tag(n) for n in region]
         canonize_opts = {
             "method": "qr",
@@ -2623,24 +2678,29 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         lossless QR therefore establishes a single centre without touching
         tensors outside the region.
         """
-        region = set(region)
         if target not in region:
             raise ValueError("target centre must lie inside the canonical region.")
+        return self._peel_canonical_region(region, {target}, absorb=absorb)
+
+    def _peel_canonical_region(self, region, keep, *, absorb="right"):
+        """Losslessly peel a known region onto a connected retained subset."""
         if absorb not in {"right", "left"}:
             raise ValueError("absorb must be 'right' or 'left'.")
-
+        region, keep = set(region), frozenset(keep)
+        if not keep or not keep.issubset(region):
+            raise ValueError("retained region must be a nonempty subset of the canonical region.")
         remaining = set(region)
         adjacency = {
             node: tuple(v for v in self.neighbors(node) if v in region)
             for node in region
         }
         degree = {node: len(vs) for node, vs in adjacency.items()}
-        leaves = [node for node in region if node != target and degree[node] == 1]
+        leaves = [node for node in region if node not in keep and degree[node] == 1]
         heapq.heapify(leaves)
-        while len(remaining) > 1:
+        while len(remaining) > len(keep):
             if not leaves:
                 raise ValueError(
-                    "canonical region is not a connected tree containing target."
+                    "canonical region is not a connected tree containing the retained region."
                 )
             # Preserve the former smallest-leaf order without rescanning the
             # whole remaining region after every metadata-only or QR move.
@@ -2660,10 +2720,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             )
             remaining.remove(node)
             degree[neighbour] -= 1
-            if neighbour != target and degree[neighbour] == 1:
+            if neighbour not in keep and degree[neighbour] == 1:
                 heapq.heappush(leaves, neighbour)
 
-        self._canonical_region = frozenset({target})
+        self._canonical_region = keep
         return self
 
     def shift_orthogonality_center(
