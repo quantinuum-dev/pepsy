@@ -2,9 +2,15 @@
 
 import autoray as ar
 import numpy as np
-import pepsy
 import pytest
 import quimb.tensor as qtn
+
+import pepsy
+from pepsy._internal.quimb import (
+    quimb_1d_callable_compression_available,
+    quimb_ctmrg_mode_available,
+    quimb_ctmrg_projector_canonize_available,
+)
 
 
 def test_validate_tensor_network_tags_requires_i_tags():
@@ -2378,6 +2384,256 @@ def test_contract_flat_mps_does_not_add_default_layer_tags():
     assert captured["kwargs"]["final_contract_opts"]["optimize"] == "OPT"
 
 
+@pytest.mark.parametrize(
+    ("boundary_direction", "expected"),
+    [
+        ("bottom-up", ("xmin",)),
+        ("top-down", ("xmax",)),
+        ("top-bottom", ("xmax", "xmin")),
+        ("bottom-top", ("xmin", "xmax")),
+        ("left-to-right", ("ymin",)),
+        ("right-to-left", ("ymax",)),
+        ("left-right", ("ymin", "ymax")),
+        ("right-left", ("ymax", "ymin")),
+        ("four-sided", ("xmax", "xmin", "ymin", "ymax")),
+    ],
+)
+def test_contract_flat_mps_maps_readable_boundary_directions(
+    boundary_direction,
+    expected,
+):
+    """Readable direction presets should map to exact Quimb sequences."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 3
+        Ly = 4
+
+        def contract_boundary(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="mps",
+        chi=5,
+        compression_mode="direct",
+        boundary_direction=boundary_direction,
+    )
+
+    assert out == 2.0
+    assert captured["mode"] == "direct"
+    assert captured["sequence"] == expected
+
+
+def test_contract_flat_ctmrg_accepts_boundary_direction_presets():
+    """CTMRG should share ordinary outside-in direction scheduling."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 3
+        Ly = 4
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="ctmrg",
+        chi=5,
+        boundary_direction="left-right",
+    )
+
+    assert out == 2.0
+    assert captured["sequence"] == ("ymin", "ymax")
+
+
+def test_contract_flat_middle_out_absorbs_outer_columns_to_target():
+    """Left and right boundaries should stop around the requested column."""
+    captured = {}
+
+    class _Reduced:
+        def contract(self, *args, **kwargs):
+            captured["final"] = (args, kwargs)
+            return 2.0
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 5
+
+        def contract_boundary(self, **kwargs):
+            captured["boundary"] = kwargs
+            return _Reduced()
+
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="mps",
+        chi=5,
+        boundary_direction="middle-out-y",
+        middle_slices=2,
+        contraction_opt="OPT",
+        strip_exponent=True,
+    )
+
+    assert out == (2.0, 0.0)
+    assert captured["boundary"]["mode"] == "direct"
+    assert captured["boundary"]["canonize"] is True
+    assert captured["boundary"]["sequence"] == ("ymin", "ymax")
+    assert captured["boundary"]["around"] == ((0, 2), (1, 2))
+    assert captured["boundary"]["final_contract"] is False
+    final_args, final_kwargs = captured["final"]
+    assert final_args == (all,)
+    assert final_kwargs == {"optimize": "OPT", "strip_exponent": True}
+
+
+@pytest.mark.parametrize(
+    ("shape", "boundary_direction", "middle_slices"),
+    [
+        ((5, 3), "middle-out-x", 2),
+        ((3, 4), "middle-out-y", (1, 2)),
+    ],
+)
+def test_contract_flat_middle_out_direct_matches_untruncated_exact(
+    shape,
+    boundary_direction,
+    middle_slices,
+):
+    """Opposing boundaries should meet exactly at the target central slab."""
+    tn = qtn.TN2D_rand(*shape, D=2, seed=sum(shape))
+    tensor_count = len(tn.tensor_map)
+    exact = tn.contract(all, optimize="greedy")
+
+    result = pepsy.contract_flat(
+        tn,
+        method="mps",
+        chi=128,
+        compression_mode="direct",
+        boundary_direction=boundary_direction,
+        middle_slices=middle_slices,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        return_info=True,
+    )
+
+    assert result.cost == pytest.approx(exact, rel=1.0e-12, abs=1.0e-12)
+    assert result.direction == boundary_direction
+    assert len(tn.tensor_map) == tensor_count
+
+
+def test_contract_flat_middle_out_handles_time_cyclic_flat_network():
+    """Left/right middle-out should preserve a trace-like cyclic time bond."""
+    tn = qtn.TN2D_rand(4, 3, D=2, cyclic=(True, False), seed=267)
+    exact = tn.contract(all, optimize="greedy")
+
+    value = pepsy.contract_flat(
+        tn,
+        method="mps",
+        chi=128,
+        compression_mode="direct",
+        boundary_direction="middle-out-y",
+        cutoff=0.0,
+        contraction_opt="greedy",
+    )
+
+    assert value == pytest.approx(exact, rel=1.0e-12, abs=1.0e-12)
+
+
+def test_contract_flat_middle_out_matches_manual_quimb_at_finite_chi():
+    """The facade should exactly compose Quimb's protected-region path."""
+    tn = qtn.TN2D_rand(4, 7, D=3, seed=307, dtype="complex128")
+    around = tuple((x, 3) for x in range(tn.Lx))
+    reduced = tn.contract_boundary(
+        max_bond=3,
+        mode="direct",
+        canonize=True,
+        sequence=("ymin", "ymax"),
+        around=around,
+        final_contract=False,
+        cutoff=1.0e-12,
+        max_separation=1,
+        equalize_norms=False,
+        inplace=False,
+    )
+    expected = reduced.contract(all, optimize="greedy")
+
+    value = pepsy.contract_flat(
+        tn,
+        method="mps",
+        chi=3,
+        compression_mode="direct",
+        boundary_direction="middle-out-y",
+        middle_slices=3,
+        cutoff=1.0e-12,
+        max_separation=1,
+        contraction_opt="greedy",
+    )
+
+    assert value == pytest.approx(expected, rel=1.0e-13, abs=1.0e-13)
+
+
+def test_contract_flat_middle_out_rejects_cyclic_contraction_axis():
+    """A middle target requires two real outer boundaries on its axis."""
+    tn = qtn.TN2D_rand(4, 3, D=2, cyclic=(True, False), seed=268)
+
+    with pytest.raises(ValueError, match="requires two open x boundaries"):
+        pepsy.contract_flat(
+            tn,
+            method="mps",
+            chi=8,
+            boundary_direction="middle-out-x",
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"boundary_direction": "top-bottom", "sequence": ("xmin",)},
+            "only one of boundary_direction and sequence",
+        ),
+        (
+            {"compression_mode": "direct", "mode_": "dm"},
+            "only one of compression_mode and mode_",
+        ),
+        (
+            {"boundary_direction": "middle-out-x", "compression_mode": "dm"},
+            "requires compression_mode='direct'",
+        ),
+        (
+            {"boundary_direction": "middle-out-x", "middle_slices": (0, 2)},
+            "contiguous central slab",
+        ),
+        (
+            {"boundary_direction": "top-bottom", "middle_slices": 1},
+            "middle_slices is used only",
+        ),
+    ],
+)
+def test_contract_flat_rejects_incompatible_direction_options(kwargs, message):
+    """Direction controls should reject ambiguous or unused combinations."""
+    tn = qtn.TN2D_rand(3, 3, D=2, seed=263)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        pepsy.contract_flat(tn, method="mps", chi=4, **kwargs)
+
+
+def test_contract_flat_middle_out_supports_ctmrg():
+    """CTMRG should absorb opposing boundaries towards a protected middle."""
+    tn = qtn.TN2D_rand(3, 5, D=2, seed=269)
+
+    value = pepsy.contract_flat(
+        tn,
+        method="ctmrg",
+        chi=64,
+        boundary_direction="middle-out-y",
+        cutoff=0.0,
+        contraction_opt="greedy",
+    )
+
+    assert np.isfinite(value)
+
+
 def test_contract_flat_dmrg_uses_flat_boundary_path(monkeypatch):
     """method='dmrg' should build a flat BdyMPS and contract with flat=True."""
     captured = {}
@@ -2532,7 +2788,11 @@ def test_contract_flat_quimb_routes_forward_strip_exponent(method):
         assert call_kwargs["final_contract_opts"]["optimize"] == "OPT"
 
 
-def test_contract_flat_ctmrg_enters_projector_compatibility_scope(monkeypatch):
+@pytest.mark.parametrize("ctmrg_mode", ["projector", "projector2d"])
+def test_contract_flat_ctmrg_enters_projector_compatibility_scope(
+    monkeypatch,
+    ctmrg_mode,
+):
     """The shared flat CTMRG route enables the scoped Quimb workaround."""
     events = []
 
@@ -2556,8 +2816,21 @@ def test_contract_flat_ctmrg_enters_projector_compatibility_scope(monkeypatch):
         "quimb_ctmrg_projector_compat",
         lambda: _Scope(),
     )
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
 
-    assert pepsy.contract_flat(_FlatTN(), method="ctmrg", chi=4) == 2.0
+    assert (
+        pepsy.contract_flat(
+            _FlatTN(),
+            method="ctmrg",
+            chi=4,
+            ctmrg_mode=ctmrg_mode,
+        )
+        == 2.0
+    )
     assert events == ["enter", "contract", "exit"]
 
 
@@ -2585,7 +2858,373 @@ def test_contract_flat_ctmrg_forwards_stabilization_options():
     assert out == 2.0
     assert captured["reduce_opts"] == reduce_opts
     assert captured["gauge_smudge"] == 2.0e-8
+    assert captured["mode"] == "projector"
+    assert captured["canonize"] is True
     assert reduce_opts == {"method": "cholesky", "shift": 1.0e-9}
+
+
+def test_contract_flat_ctmrg_forwards_projector_bp_options_without_mutation(
+    monkeypatch,
+):
+    """BP projector gauging should receive copied canonicalization options."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_projector_canonize",
+        lambda canonize: None,
+    )
+    canonize_opts = {"max_iterations": 7, "damping": 0.2}
+    compress_opts = {"cutoff_mode": "rel"}
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="ctmrg",
+        chi=4,
+        ctmrg_mode="projector",
+        ctmrg_canonize="bp",
+        ctmrg_canonize_opts=canonize_opts,
+        ctmrg_compress_opts=compress_opts,
+    )
+
+    assert out == 2.0
+    assert captured["mode"] == "projector"
+    assert captured["canonize"] == "bp"
+    assert captured["canonize_opts"] == canonize_opts
+    assert captured["compress_opts"] == compress_opts
+    assert canonize_opts == {"max_iterations": 7, "damping": 0.2}
+    assert compress_opts == {"cutoff_mode": "rel"}
+
+
+def test_contract_flat_ctmrg_selects_regional_projector_callable(monkeypatch):
+    """The 2x3 option should compose Quimb's projector compressor."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 3
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_projector_canonize",
+        lambda canonize: None,
+    )
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_1d_callable_compression",
+        lambda: None,
+    )
+    canonize_opts = {"max_iterations": 7}
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="ctmrg",
+        chi=4,
+        ctmrg_canonize="bp",
+        ctmrg_projector_region="2x3",
+        ctmrg_canonize_opts=canonize_opts,
+    )
+
+    assert out == 2.0
+    assert captured["mode"] is (
+        pepsy.boundary.metrics._ctmrg_regional_projector_compressor
+    )
+    assert captured["canonize"] == "bp"
+    assert captured["canonize_opts"] == canonize_opts
+    assert canonize_opts == {"max_iterations": 7}
+
+
+def test_contract_flat_ctmrg_forwards_projector2d_options(monkeypatch):
+    """The explicit 2D projector route should omit unused gauge controls."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
+    reduce_opts = {"method": "eigh", "shift": 1.0e-11}
+    compress_opts = {"cutoff_mode": "rel"}
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="ctmrg",
+        chi=4,
+        ctmrg_mode="projector_2d",
+        ctmrg_reduce_opts=reduce_opts,
+        ctmrg_compress_opts=compress_opts,
+    )
+
+    assert out == 2.0
+    assert captured["mode"] == "projector2d"
+    assert captured["canonize"] is False
+    assert captured["reduce_opts"] == reduce_opts
+    assert captured["compress_opts"] == compress_opts
+    assert "gauge_smudge" not in captured
+    assert "canonize_opts" not in captured
+
+
+def test_contract_flat_ctmrg_l2bp_uses_only_bp_compression_options(monkeypatch):
+    """L2BP controls should not leak projector stabilization keywords."""
+    captured = {}
+    events = []
+
+    class _Scope:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "quimb_ctmrg_projector_compat",
+        lambda: _Scope(),
+    )
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
+    compress_opts = {"max_iterations": 9, "tol": 1.0e-7}
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="ctmrg",
+        chi=4,
+        ctmrg_mode="l2bp",
+        ctmrg_compress_opts=compress_opts,
+    )
+
+    assert out == 2.0
+    assert captured["mode"] == "l2bp"
+    assert captured["canonize"] is True
+    assert captured["compress_opts"] == compress_opts
+    assert "reduce_opts" not in captured
+    assert "gauge_smudge" not in captured
+    assert "canonize_opts" not in captured
+    assert not events
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"ctmrg_mode": "unknown"}, "ctmrg_mode must be one of"),
+        (
+            {"ctmrg_mode": "projector2d", "ctmrg_canonize": True},
+            "ctmrg_canonize is not used",
+        ),
+        (
+            {"ctmrg_mode": "l2bp", "ctmrg_canonize": "bp"},
+            "ctmrg_canonize must be",
+        ),
+        (
+            {"ctmrg_mode": "l2bp", "ctmrg_reduce_opts": {"shift": 1e-9}},
+            "apply only to projector",
+        ),
+        (
+            {"ctmrg_projector_region": (3, 3)},
+            "ctmrg_projector_region must be",
+        ),
+        (
+            {"ctmrg_mode": "projector2d", "ctmrg_projector_region": (2, 3)},
+            "supports only its native",
+        ),
+        (
+            {"ctmrg_mode": "l2bp", "ctmrg_projector_region": (2, 2)},
+            "applies only to projector",
+        ),
+        (
+            {
+                "ctmrg_mode": "projector",
+                "ctmrg_canonize": False,
+                "ctmrg_canonize_opts": {"smudge": 1e-9},
+            },
+            "not used when ctmrg_canonize=False",
+        ),
+    ],
+)
+def test_contract_flat_ctmrg_rejects_incompatible_mode_options(
+    monkeypatch,
+    kwargs,
+    message,
+):
+    """Mode-specific options should fail instead of being silently ignored."""
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **call_kwargs):
+            del call_kwargs
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
+    with pytest.raises(ValueError, match=message):
+        pepsy.contract_flat(
+            _FlatTN(),
+            method="ctmrg",
+            chi=4,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"ctmrg_mode": "l2bp"},
+        {"ctmrg_mode": "projector2d"},
+        {"ctmrg_mode": "projector", "ctmrg_canonize": False},
+        {"ctmrg_mode": "projector", "ctmrg_canonize": "bp"},
+        {"ctmrg_mode": "projector", "ctmrg_projector_region": (2, 3)},
+    ],
+)
+def test_contract_flat_unvalidated_ctmrg_rejects_native_symmray(monkeypatch, kwargs):
+    """Unvalidated Quimb modes must not claim native Symmray support."""
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **call_kwargs):  # pragma: no cover
+            del call_kwargs
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "_uses_symmray_arrays",
+        lambda tn: tn is not None,
+    )
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_projector_canonize",
+        lambda canonize: None,
+    )
+
+    with pytest.raises(NotImplementedError, match="Native Symmray CTMRG"):
+        pepsy.contract_flat(
+            _FlatTN(),
+            method="ctmrg",
+            chi=4,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "canonize"),
+    [
+        ("projector", "bp"),
+        ("projector2d", None),
+        ("l2bp", None),
+    ],
+)
+def test_contract_flat_ctmrg_installed_modes_smoke(mode, canonize):
+    """Every exposed mode should execute on a small dense 2D network."""
+    if not quimb_ctmrg_mode_available(mode):
+        pytest.skip(f"installed Quimb does not provide {mode!r}")
+    if isinstance(canonize, str) and not quimb_ctmrg_projector_canonize_available(
+        canonize
+    ):
+        pytest.skip(f"installed Quimb does not provide {canonize!r} gauging")
+
+    tn = qtn.TN2D_rand(2, 3, 2, seed=257)
+    value = pepsy.contract_flat(
+        tn,
+        method="ctmrg",
+        chi=8,
+        max_separation=0,
+        ctmrg_mode=mode,
+        ctmrg_canonize=canonize,
+    )
+
+    assert np.isfinite(value)
+
+
+def test_peps_norm_ctmrg_bp_uses_three_site_projector_regions(monkeypatch):
+    """Regional CTMRG should dress real three-site cuts with fresh D2BP."""
+    import quimb.tensor.tensor_core as qtc
+
+    if not quimb_ctmrg_mode_available("projector"):
+        pytest.skip("installed Quimb does not provide projector compression")
+    if not quimb_ctmrg_projector_canonize_available("bp"):
+        pytest.skip("installed Quimb does not provide BP projector gauging")
+    if not quimb_1d_callable_compression_available():
+        pytest.skip("installed Quimb does not provide callable 1D compression")
+
+    regions = []
+    original = qtc.TensorNetwork.insert_compressor_between_regions
+
+    def record_insert(self, ltags, rtags, *args, **kwargs):
+        regions.append((tuple(ltags), tuple(rtags)))
+        return original(self, ltags, rtags, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qtc.TensorNetwork,
+        "insert_compressor_between_regions",
+        record_insert,
+    )
+
+    ket = qtn.PEPS.rand(
+        Lx=3,
+        Ly=3,
+        bond_dim=2,
+        seed=259,
+        dtype="complex128",
+    )
+    exact = ket.make_norm().contract(all, optimize="greedy")
+    value = pepsy.peps_norm(
+        ket,
+        method="ctmrg",
+        chi=64,
+        cutoff=0.0,
+        max_separation=0,
+        contraction_opt="greedy",
+        ctmrg_canonize="bp",
+        ctmrg_projector_region=(2, 3),
+        ctmrg_canonize_opts={"max_iterations": 5},
+    )
+
+    assert any(len(ltags) + len(rtags) == 3 for ltags, rtags in regions)
+    assert np.isfinite(value)
+    assert abs(value - exact) / abs(exact) < 1.0e-10
 
 
 def test_contract_flat_ctmrg_adds_symmray_stabilization_defaults(monkeypatch):
@@ -2782,6 +3421,11 @@ def test_peps_infidelity_ctmrg_skips_known_target_norm(monkeypatch):
         return ket, _Norm(label)
 
     monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "require_quimb_ctmrg_mode",
+        lambda mode: None,
+    )
 
     out = pepsy.peps_infidelity(
         p,
@@ -2794,6 +3438,8 @@ def test_peps_infidelity_ctmrg_skips_known_target_norm(monkeypatch):
         max_separation=2,
         equalize_norms=True,
         progress=True,
+        ctmrg_mode="l2bp",
+        ctmrg_compress_opts={"max_iterations": 6},
     )
 
     assert build_calls == ["norm", "overlap"]
@@ -2810,6 +3456,9 @@ def test_peps_infidelity_ctmrg_skips_known_target_norm(monkeypatch):
         assert kwargs["progbar"] is True
         assert kwargs["inplace"] is False
         assert kwargs["layer_tags"] == ["KET", "BRA"]
+        assert kwargs["mode"] == "l2bp"
+        assert kwargs["canonize"] is True
+        assert kwargs["compress_opts"] == {"max_iterations": 6}
         assert kwargs["final_contract_opts"]["optimize"] == "OPT"
 
 
@@ -2874,8 +3523,20 @@ def test_peps_metric_aliases(monkeypatch):
     monkeypatch.setattr(pepsy.boundary.metrics, "boundary_norm", fake_boundary_norm)
     monkeypatch.setattr(pepsy.boundary.metrics, "peps_infidelity", fake_infidelity)
 
-    assert pepsy.peps_norm("p", chi=4) == 2.0
-    assert pepsy.peps_fidelity("p", "q", chi=5) == pytest.approx(0.75)
+    assert pepsy.peps_norm(
+        "p",
+        chi=4,
+        method="ctmrg",
+        ctmrg_mode="l2bp",
+        ctmrg_compress_opts={"max_iterations": 5},
+    ) == 2.0
+    assert pepsy.peps_fidelity(
+        "p",
+        "q",
+        chi=5,
+        method="ctmrg",
+        ctmrg_mode="projector2d",
+    ) == pytest.approx(0.75)
     fidelity_info = pepsy.peps_fidelity(
         "p",
         "q",
@@ -2887,11 +3548,14 @@ def test_peps_metric_aliases(monkeypatch):
     assert calls[0][0] == "norm"
     assert calls[0][1] == ("p",)
     assert calls[0][2]["chi"] == 4
-    assert calls[0][2]["method"] == "dmrg"
+    assert calls[0][2]["method"] == "ctmrg"
+    assert calls[0][2]["ctmrg_mode"] == "l2bp"
+    assert calls[0][2]["ctmrg_compress_opts"] == {"max_iterations": 5}
     assert calls[1][0] == "infidelity"
     assert calls[1][1] == ("p", "q")
     assert calls[1][2]["chi"] == 5
-    assert calls[1][2]["method"] == "dmrg"
+    assert calls[1][2]["method"] == "ctmrg"
+    assert calls[1][2]["ctmrg_mode"] == "projector2d"
     assert calls[2][1] == ("p", "q")
     assert calls[2][2]["chi"] == 6
     assert calls[2][2]["method"] == "dmrg"

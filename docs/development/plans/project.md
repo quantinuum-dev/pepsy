@@ -1,7 +1,7 @@
 # PLAN.md — pepsy roadmap
 
 Status: living document
-Last updated: 2026-08-27
+Last updated: 2026-09-14
 Owners: pepsy maintainers + coding agents
 
 This document tracks the planned workstreams for `pepsy` (boundary-MPS tools for
@@ -24,6 +24,11 @@ Four headline workstreams drive the roadmap:
 The conceptual background for each lives in `../notes/belief_propagation.md`,
 `../notes/quimb.md`, `../notes/symmray.md`, and
 `../notes/fermionic_mpo.md`.
+
+A deferred [BP-guided regional CTMRG/RG plan](regional_ctmrg_rg.md) specifies
+systematic 2x2/2x3 coarse-graining, directed D2BP environments, explicit
+bra/ket projector composition, and cached Cotengra execution. It is distinct
+from the current experimental enlarged local-projector window.
 
 ---
 

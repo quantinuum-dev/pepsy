@@ -193,6 +193,27 @@ def quimb_1d_compression_method_available(method):
     return callable(quimb_1d_compression_function(method))
 
 
+def quimb_1d_callable_compression_available():
+    """Return whether Quimb's public 1D dispatcher accepts a callable."""
+    dispatcher = getattr(qtn, "tensor_network_1d_compress", None)
+    if not callable(dispatcher):
+        return False
+    dispatcher = inspect.unwrap(dispatcher)
+    code = getattr(dispatcher, "__code__", None)
+    return code is not None and "callable" in code.co_names
+
+
+def require_quimb_1d_callable_compression():
+    """Require callable 1D compression dispatch at execution time."""
+    if quimb_1d_callable_compression_available():
+        return
+    raise NotImplementedError(
+        "The installed Quimb build does not support custom callable 1D "
+        "compression methods. Upgrade Quimb to use "
+        "ctmrg_projector_region=(2, 3)."
+    )
+
+
 def quimb_1d_compression_cutoff_mode(method, cutoff_mode):
     """Return a cutoff mode safe for the selected Quimb compressor.
 
@@ -222,6 +243,64 @@ def require_quimb_1d_compression_method(method):
         f"Quimb compression method {method!r} is not available in the installed "
         f"Quimb build. Install a Quimb build containing the {compressor_family} "
         "compressor. Existing compression modes remain available."
+    )
+
+
+def _quimb_ag_compression_function(method):
+    """Return a concrete arbitrary-geometry compressor when discoverable."""
+    method = str(method).strip().lower()
+    function_name = f"tensor_network_ag_compress_{method.replace('-', '_')}"
+    function = getattr(qtn, function_name, None)
+    if callable(function):
+        return function
+
+    dispatcher = getattr(qtn, "tensor_network_1d_compress", None)
+    ag_dispatcher = getattr(dispatcher, "__globals__", {}).get(
+        "tensor_network_ag_compress"
+    )
+    methods = getattr(ag_dispatcher, "__globals__", {}).get(
+        "_TNAG_COMPRESS_METHODS", {}
+    )
+    return methods.get(method) if hasattr(methods, "get") else None
+
+
+def quimb_ctmrg_mode_available(mode):
+    """Return whether the installed Quimb build provides a CTMRG mode."""
+    mode = str(mode).strip().lower()
+    if mode == "projector2d":
+        owner = getattr(qtn, "TensorNetwork2D", None)
+        return callable(getattr(owner, "_contract_boundary_projector", None))
+    return callable(_quimb_ag_compression_function(mode))
+
+
+def require_quimb_ctmrg_mode(mode):
+    """Require a concrete Quimb CTMRG boundary mode at execution time."""
+    if quimb_ctmrg_mode_available(mode):
+        return
+    raise NotImplementedError(
+        f"Quimb CTMRG mode {mode!r} is not available in the installed Quimb "
+        "build. Upgrade Quimb to use this Pepsy option."
+    )
+
+
+def quimb_ctmrg_projector_canonize_available(canonize):
+    """Return whether Quimb implements a named projector-gauging policy."""
+    canonize = str(canonize).strip().lower()
+    function = _quimb_ag_compression_function("projector")
+    if callable(function):
+        function = inspect.unwrap(function)
+    code = getattr(function, "__code__", None)
+    return code is not None and canonize in code.co_consts
+
+
+def require_quimb_ctmrg_projector_canonize(canonize):
+    """Require a named Quimb projector-gauging policy at execution time."""
+    if quimb_ctmrg_projector_canonize_available(canonize):
+        return
+    raise NotImplementedError(
+        f"Quimb CTMRG projector canonicalization {canonize!r} is not "
+        "available in the installed Quimb build. Upgrade Quimb to use this "
+        "Pepsy option."
     )
 
 

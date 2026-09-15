@@ -5,6 +5,7 @@ import pytest
 import quimb.tensor as qtn
 
 import pepsy
+from pepsy._internal.quimb import quimb_ctmrg_projector_canonize_available
 from pepsy.optimizers import sym_dmrg as sym_dmrg_mod
 from pepsy.operators import gate, gate_simple
 from pepsy.optimizers.sym_dmrg import (
@@ -4506,8 +4507,17 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
     assert ctmrg_norm == pytest.approx(exact_norm)
 
 
-def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer():
-    """Native fermionic CTMRG should remain finite on a small U1U1 PEPS."""
+@pytest.mark.parametrize("ctmrg_canonize", [None, "layered"])
+def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer(
+    ctmrg_canonize,
+):
+    """Validated native CTMRG gauging should match a small exact U1U1 PEPS."""
+    if isinstance(ctmrg_canonize, str) and not (
+        quimb_ctmrg_projector_canonize_available(ctmrg_canonize)
+    ):
+        pytest.skip(
+            f"installed Quimb does not provide {ctmrg_canonize!r} gauging"
+        )
     site_charge = site_charge_from_occupations(
         {
             (0, 0): (1, 0),
@@ -4537,6 +4547,7 @@ def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer():
         method="ctmrg",
         progress=False,
         cutoff=1.0e-10,
+        ctmrg_canonize=ctmrg_canonize,
     )
 
     assert np.isfinite(ctmrg)

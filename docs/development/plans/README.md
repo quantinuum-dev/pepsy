@@ -8,6 +8,7 @@
 - [PEPS optimizer plan](peps_optimizer.md)
 - [TreePeps and tree-embedded PEPS plan](tree_peps.md)
 - [PEPS direct sampler plan](peps_sampler.md)
+- [BP-guided regional CTMRG/RG plan](regional_ctmrg_rg.md)
 - [Sweep optimizer plan](sweep_optimizer.md)
 - [Stabilizer tensor-network plan](stabilizer_tn.md)
 
@@ -22,6 +23,7 @@ symdmrg_matvec_fanout
 peps_optimizer
 tree_peps
 peps_sampler
+regional_ctmrg_rg
 sweep_optimizer
 stabilizer_tn
 ```

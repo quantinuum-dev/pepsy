@@ -125,7 +125,11 @@ Reusing a boundary at a larger `chi` does not globally pad it first; lowering
   contraction results and their FIT diagnostics with `return_info=True`.
 - `contract_flat(...)`: contract one already-flattened effective PEPS-like
   layer with the `flat=True` first-slice shortcut. It is not a multilayer
-  PEPS--PEPO--PEPS façade.
+  PEPS--PEPO--PEPS façade. For `method="mps"` or `"ctmrg"`, readable
+  `boundary_direction` presets select bottom-up, top-down, two-sided, or
+  four-sided Quimb schedules. The opt-in `middle-out-x` / `middle-out-y`
+  route absorbs opposing boundaries inward around a protected central slab,
+  then exactly contracts the reduced core.
 - `contract_layered(...)`: contract a preassembled multilayer network with
   explicit `layer_tags`, using the shared `CompBdy` engine and `flat=False`.
   This is the high-level façade for sequential BRA--PEPO--KET-style
@@ -143,7 +147,21 @@ The default `method="dmrg"` uses Pepsy's `BdyMPS` plus `CompBdy` path. Other
 methods route to Quimb-style contraction methods when the network exposes them:
 
 - `method="mps"` uses `TensorNetwork.contract_boundary(...)`.
-- `method="ctmrg"` uses `TensorNetwork.contract_ctmrg(...)`.
+- `method="mps"` with `compression_mode="direct"` and an ordinary
+  `boundary_direction` preset uses Quimb's direct-SVD boundary compressor.
+  With `boundary_direction="middle-out-x"` or `"middle-out-y"`, Pepsy instead
+  uses Quimb's `around` support so bottom/top or left/right boundaries meet at
+  `middle_slices`, which can identify a physical interface rather than the
+  geometric center.
+- `method="ctmrg"` uses `TensorNetwork.contract_ctmrg(...)`. The public
+  `ctmrg_mode` selector exposes Quimb's `"projector"`, `"projector2d"`, and
+  `"l2bp"` boundary compressors. `ctmrg_canonize="layered"` or `"bp"`
+  configures the projector route. `ctmrg_projector_region=(2, 3)` composes the
+  public callable-compressor API with Quimb's native projector implementation,
+  expanding each cut to three neighboring boundary sites while preserving
+  sequential `KET`/`BRA` absorption. The regional path and BP dressing are
+  dense-only; native Symmray supports only validated projector contraction
+  with simple or layered gauging and the native region.
 - `method="hotrg"` uses `TensorNetwork.contract_hotrg(...)`.
 - `method="exact"` directly contracts the double-layer network.
 

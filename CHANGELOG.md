@@ -14,6 +14,24 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Extended `contract_flat(...)` with readable bottom/top/left/right and
+  four-sided boundary schedules shared by Quimb MPS and CTMRG contraction,
+  plus a middle-out target that absorbs opposing boundaries towards a
+  configurable central row, column, or contiguous interface before exactly
+  contracting the reduced core. The new `compression_mode` spelling exposes
+  Quimb's 1D compressor without changing the existing `mode_` compatibility
+  argument or default behavior.
+
+- Added opt-in finite-CTMRG boundary modes to PEPS norm, normalization,
+  fidelity, infidelity, and flat-contraction APIs. The existing Quimb
+  `projector` plus simple-gauging default is unchanged; callers can now select
+  `projector2d`, direct `l2bp`, layered projector gauging, or dense
+  D2BP-assisted projector gauging with copied, mode-specific option mappings
+  and execution-time capability checks. Dense finite 2D contractions can also
+  combine `ctmrg_canonize="bp"` with
+  `ctmrg_projector_region=(2, 3)` for a BP-dressed three-boundary-site
+  projector window; the native two-site behavior remains the default.
+
 - Direct Quimb PEPS boundary compression no longer initializes, globally
   expands, or copies an unused random boundary-MPS guess. Direct sweeps derive
   their output length from the lattice axis perpendicular to the sweep,

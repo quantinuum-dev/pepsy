@@ -32,6 +32,70 @@ effective layer and uses `flat=True` boundary initialization. It requires
 PEPS/PEPO layers. For that case, provide the tagged network and
 `BdyMPS(tn_double=network, flat=False)` to `contract_boundary`.
 
+### Flat directional and middle-out compression
+
+For Quimb boundary contraction, `contract_flat` accepts readable
+`boundary_direction` presets in addition to the lower-level `sequence`
+argument:
+
+| `boundary_direction` | Quimb sequence | Behavior |
+| --- | --- | --- |
+| `"bottom-up"` | `("xmin",)` | absorb from the bottom row |
+| `"top-down"` | `("xmax",)` | absorb from the top row |
+| `"top-bottom"` / `"bottom-top"` | both x boundaries | alternate inward in the named order |
+| `"left-to-right"` | `("ymin",)` | absorb from the left column |
+| `"right-to-left"` | `("ymax",)` | absorb from the right column |
+| `"left-right"` / `"right-left"` | both y boundaries | alternate inward in the named order |
+| `"four-sided"` | all four boundaries | cycle top, bottom, left, and right |
+
+These presets work with `method="mps"` and `method="ctmrg"`. They are
+outside-in schedules implemented by Quimb. `compression_mode` selects the 1D
+compressor for `method="mps"`; for example, this requests direct SVD boundary
+compression from both time boundaries:
+
+```python
+value = pepsy.contract_flat(
+    flat,
+    method="mps",
+    chi=64,
+    compression_mode="direct",
+    boundary_direction="top-bottom",
+)
+```
+
+`boundary_direction="middle-out-x"` and `"middle-out-y"` are different:
+they absorb the two opposing outer boundaries inward towards a selected middle
+row or column. Thus `"middle-out-y"` builds compressed left and right boundary
+environments around a central column, while `"middle-out-x"` does the same
+from bottom and top around a central row. Pepsy uses Quimb's `around` target to
+protect that middle slab and then exactly contracts the small remaining core.
+This mode works with direct MPS compression and finite CTMRG; it does not start
+at the center and grow outwards. The selected axis must have two open
+boundaries. For a trace network that is cyclic in x/time, use
+`"middle-out-y"` unless the cyclic x bond is cut explicitly.
+
+By default, the protected target is one central slice for an odd axis or the
+central pair for an even axis. `middle_slices` can instead select a contiguous
+interface explicitly. For a flat time network whose fixed target rows end at
+`u_last` and variational rows begin at `v_first`:
+
+```python
+value = pepsy.contract_flat(
+    flat,
+    method="mps",
+    chi=64,
+    compression_mode="direct",
+    boundary_direction="middle-out-x",
+    middle_slices=(u_last, v_first),
+    preserve_backend=True,
+)
+```
+
+The input network is copied and Pepsy does not convert the backend arrays.
+Torch reverse-mode differentiation is covered explicitly by the regression
+suite. Supplying both `boundary_direction` and `sequence` is an error. The
+existing defaults are unchanged when neither new option is used.
+
 `contract_layered` is the explicit façade for a preassembled multilayer
 network. It requires `layer_tags`, for example
 `contract_layered(network, layer_tags=("BRA", "PEPO", "KET"), chi=64)`, and
@@ -46,6 +110,70 @@ already-created `BdyMPS` or Quimb's native `method="mps"` path.
 The layer policy applies to the package `method="dmrg"` path. Quimb's native
 `method="mps"` path already handles `layer_tags` itself and rejects
 `fit_layer_mode="sequential"` rather than silently ignoring the option.
+
+## CTMRG boundary modes
+
+With `method="ctmrg"`, `ctmrg_mode` selects the finite-boundary compressor:
+
+- `ctmrg_mode="projector"` is the compatibility default. It computes local
+  oblique projectors and preserves the previous Pepsy behavior.
+- `ctmrg_mode="projector2d"` uses Quimb's explicit 2D plaquette-projector
+  contraction.
+- `ctmrg_mode="l2bp"` compresses each boundary with Quimb's lazy 2-norm
+  belief-propagation implementation.
+
+`ctmrg_canonize=None` preserves the existing `True` projector preconditioning
+and enables the normal local gauging for `l2bp`. For `projector`, it can also
+be set to `False`, `"layered"`, or `"bp"`. The `"layered"` choice gauges the
+tensor layers separately; `"bp"` reruns dense D2BP while constructing each
+compressed boundary. Configure those solves with `ctmrg_canonize_opts`, for
+example `{"max_iterations": 10, "tol": 1e-8, "damping": 0.2}`.
+
+`ctmrg_projector_region` selects the local projector window. `None` and
+`(2, 2)` use Quimb's native two-neighbor projector path. The experimental
+`(2, 3)` choice expands each central cut to three neighboring effective
+boundary sites, alternating the extra site between its two sides. On a
+standard norm or overlap, Quimb still absorbs the tagged `KET` and `BRA`
+layers sequentially, so this is a current-boundary/incoming-layer window over
+three sites rather than a periodic 2x3 unit cell. Combining `(2, 3)` with
+`ctmrg_canonize="bp"` makes every such projector BP-dressed; D2BP is rerun for
+each compressed boundary/layer. This first pass is dense, 2D, and
+open-boundary only. It does not persist BP messages between CTMRG steps and is
+not a generalized/Kikuchi BP implementation.
+
+`ctmrg_compress_opts` is copied and forwarded to the selected compressor. For
+`l2bp`, this is where iteration, convergence, damping, and update controls
+belong. `ctmrg_reduce_opts` configures squared-environment factorization for
+the two projector modes, while `ctmrg_gauge_smudge` applies only to
+`projector`. Options that a selected mode cannot consume raise an error rather
+than being silently ignored.
+
+`projector2d`, `l2bp`, `ctmrg_canonize="bp"`, the `(2, 3)` projector region,
+and projector contraction with gauging disabled are currently dense-only.
+Native Symmray contraction supports the validated `projector` route with
+`ctmrg_canonize=True` or `"layered"` and the native region, retaining its
+established factorization safeguards. Pepsy capability-checks each selected
+mode against the installed Quimb build at execution time.
+
+```python
+norm_bp_projectors = pepsy.peps_norm(
+    state,
+    chi=64,
+    method="ctmrg",
+    ctmrg_mode="projector",
+    ctmrg_canonize="bp",
+    ctmrg_projector_region=(2, 3),
+    ctmrg_canonize_opts={"max_iterations": 8, "damping": 0.2},
+)
+
+norm_l2bp = pepsy.peps_norm(
+    state,
+    chi=64,
+    method="ctmrg",
+    ctmrg_mode="l2bp",
+    ctmrg_compress_opts={"max_iterations": 20, "tol": 1e-8},
+)
+```
 
 Selectors are normalized early: `"two_site"` is accepted as an alias for
 `"two-site"`, `"one-site"`, `"dmrg"`, and `"dmrg1"` alias the historical
