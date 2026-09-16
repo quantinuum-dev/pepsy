@@ -290,6 +290,17 @@ Run `python -m ruff check src tests` for the repository lint gate.
 Keep the default smoke loop small. Prefer one deterministic regression for a
 new invariant over broad Cartesian grids or duplicate end-to-end tests.
 
+## Gaugy downstream joint Pauli-cluster validation
+
+The example
+`gaugy_examples/gauge_mps/mpsg/join_pauliexpansion.ipynb` optionally uses
+Pepsy through Gaugy's HRPS/MPS comparison. In that notebook,
+`mps_mode="exact"` means an exact state-vector contraction for the selected
+sample and target state; it is not an exact global operator trace. Do not
+compare that state cost directly with Gaugy's normalized joint Pauli-cluster
+operator cost. The Pauli-cluster target and its spatial-cutoff convergence are
+Gaugy concerns and do not require changes to Pepsy's tensor-network code.
+
 ## Examples and handoff
 
 Use public namespace imports in examples. Do not modify generated notebook
