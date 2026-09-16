@@ -72,8 +72,10 @@ single_edge_entropy = opt.entropy(edges[0])
 ```
 
 The implementation follows Quimb's canonical Schmidt-spectrum approach. It
-canonicalizes one private copy around the root, then performs one local SVD
-per edge; the live state and its canonical centre are unchanged. Dense
+canonicalizes one private copy around the root, then walks the centre through
+the tree and performs one SVD per edge on the centre tensor. Off-centre
+isometries alone do not contain the Schmidt weights. The live state and its
+canonical centre are unchanged. Dense
 Torch/CuPy states stay on their original backend through Autoray linalg, and
 native Symmray states use the sector-aware SVD. Only the one-dimensional
 singular spectra are reduced to scalar entropy values, so the full statevector

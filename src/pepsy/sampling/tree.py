@@ -540,6 +540,12 @@ class TreeSampler:
                 self._extract_symmray(tn, source_tn)
             else:
                 self._extract_arrays(tn, source_tn)
+            # Keep the captured state, rather than the mutable source, for
+            # entropy queries. Its root carries the Schmidt weights missing
+            # from the off-centre isometries in the cached sampling arrays.
+            if not self._is_symmray_ttn(tn):
+                tn.apply_to_arrays(self._as_backend)
+            self._entropy_tn = tn
         return self
 
     @staticmethod
@@ -978,80 +984,16 @@ class TreeSampler:
         return _backend_array_to_numpy(ratios) if to_numpy else ratios
 
     def tree_edge_entropies(self, *, method="svd", return_edges=False):
-        """Measure edge entropies from the cached canonical sampler tree."""
-        if self.resolved_backend == "symmray":
-            return self._symmray_state["tn"].tree_edge_entropies(
+        """Measure edge entropies from the state captured at the last refresh.
+
+        The private centre sweep includes the root's physical weights and
+        leaves the cached sampling arrays unchanged.
+        """
+        with self._thread_ctx():
+            return self._entropy_tn.tree_edge_entropies(
                 method=method,
                 return_edges=return_edges,
             )
-        method = str(method).strip().lower().replace("_", ":")
-        if method not in {"svd", "eig", "svd:eig"}:
-            raise ValueError(
-                "tree entropy method must be 'svd', 'eig', or 'svd:eig'."
-            )
-        values = []
-        for _parent, child in self._edges:
-            matrix = self._arrays[child].reshape(
-                int(self._arrays[child].shape[0]), -1
-            )
-            if method in {"eig", "svd:eig"}:
-                if self.resolved_backend == "torch":
-                    import torch
-
-                    adjoint = matrix.conj().transpose(-2, -1)
-                    gram = (
-                        matrix @ adjoint
-                        if matrix.shape[0] <= matrix.shape[1]
-                        else adjoint @ matrix
-                    )
-                    eigenvalues = torch.linalg.eigvalsh(gram).clamp_min(0.0)
-                    singular_values = torch.sqrt(eigenvalues)
-                else:
-                    xp = self._xp()
-                    adjoint = matrix.conj().T
-                    gram = (
-                        xp.matmul(matrix, adjoint)
-                        if matrix.shape[0] <= matrix.shape[1]
-                        else xp.matmul(adjoint, matrix)
-                    )
-                    eigenvalues = xp.linalg.eigvalsh(gram)
-                    singular_values = xp.sqrt(xp.clip(eigenvalues, 0.0, None))
-            elif self.resolved_backend == "torch":
-                import torch
-
-                singular_values = torch.linalg.svdvals(matrix)
-            else:
-                singular_values = self._xp().linalg.svd(
-                    matrix, full_matrices=False, compute_uv=False
-                )
-            weights = self._xp().abs(singular_values) ** 2
-            total = self._sum(weights)
-            safe_total = self._where(
-                total > 0.0,
-                total,
-                self._ones((), dtype=weights.dtype),
-            )
-            probabilities = weights / safe_total
-            safe = self._where(
-                probabilities > 0.0,
-                probabilities,
-                self._ones(probabilities.shape, dtype=probabilities.dtype),
-            )
-            values.append(-self._sum(probabilities * self._xp().log2(safe)))
-        if values:
-            if self.resolved_backend == "torch":
-                import torch
-
-                entropies = torch.stack(values)
-            else:
-                entropies = self._xp().stack(values)
-            entropies = _backend_array_to_numpy(entropies)
-        else:
-            entropies = np.empty(0, dtype=float)
-        entropies = np.asarray(entropies, dtype=float)
-        if return_edges:
-            return entropies, self._edges
-        return entropies
 
     def _build_configuration_encoding(
         self, tn, arrays, qubit_of_node, *, code_metadata=None

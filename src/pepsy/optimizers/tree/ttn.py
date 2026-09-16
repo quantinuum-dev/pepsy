@@ -525,8 +525,8 @@ def _normalize_entropy_method(method):
 def _tree_bond_singular_values(tensor, bond, *, method="svd"):
     """Return the Schmidt values across ``bond`` without densifying ``tensor``.
 
-    The tensor is expected to be on the child side of a tree bond after the
-    network has been canonicalized towards the parent.  Dense arrays use
+    The tensor must carry the orthogonality centre, with every exterior
+    branch isometric towards it. Dense arrays use
     Autoray's backend linalg dispatch; native Symmray arrays use their
     sector-aware SVD directly because Quimb's generic ``array_svals`` route is
     NumPy-only for this diagnostic.
@@ -1248,8 +1248,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         ``edge`` is a pair of adjacent structural node ids. The calculation
         follows Quimb's MPS entropy pattern: a private copy is canonicalized
-        around one endpoint and the Schmidt values are extracted from the
-        tensor on the other endpoint. The live state, canonical centre, and
+        around one endpoint and the Schmidt values are extracted from that
+        centre tensor. The live state, canonical centre, and
         backend buffers are not changed.
 
         Parameters
@@ -1280,7 +1280,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         method = _normalize_entropy_method(method)
 
         work = self.copy()
-        work.canonize_around_node_(neighbor)
+        work.canonize_around_node_(node)
         tensor = work.node_tensor(node)
         singular_values = _tree_bond_singular_values(
             tensor,
@@ -1294,7 +1294,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         A rooted TTN has one bipartition per parent-child bond rather than a
         single left/right chain cut. This method canonicalizes one private copy
-        around the root, then computes all local Schmidt spectra. Its work is
+        around the root, then walks the centre through the tree to compute
+        each spectrum from the tensor carrying the state weights. Its work is
         linear in the number of tree tensors plus the local SVD costs and it
         never constructs the full statevector. Set ``return_edges=True`` to
         receive ``(entropies, edges)`` with matching deterministic order.
@@ -1303,16 +1304,27 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         edges = self.tree_edges()
         work = self.copy()
         work.canonize_around_node_(work.root)
-        entropies = []
-        for parent, child in edges:
-            tensor = work.node_tensor(child)
+        values = {}
+        # A depth-first traversal crosses each bond at most twice. Reading an
+        # off-centre isometry instead would incorrectly yield log2(bond_dim).
+        stack = [(work.root, iter(work.children(work.root)))]
+        while stack:
+            parent, children = stack[-1]
+            child = next(children, None)
+            if child is None:
+                stack.pop()
+                if stack:
+                    work.shift_orthogonality_center(stack[-1][0])
+                continue
             singular_values = _tree_bond_singular_values(
-                tensor,
+                work.node_tensor(parent),
                 work.bond(parent, child),
                 method=method,
             )
-            entropies.append(_entropy_from_singular_values(singular_values))
-        entropies = np.asarray(entropies, dtype=float)
+            values[parent, child] = _entropy_from_singular_values(singular_values)
+            work.shift_orthogonality_center(child)
+            stack.append((child, iter(work.children(child))))
+        entropies = np.asarray([values[edge] for edge in edges], dtype=float)
         if return_edges:
             return entropies, edges
         return entropies

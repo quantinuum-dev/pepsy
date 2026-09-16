@@ -12,6 +12,14 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+### Fixed
+
+- Tree entropy now extracts Schmidt weights from the orthogonality centre
+  at each cut. Reading off-centre isometries previously returned
+  `log2(bond_dim)` for nonuniform spectra. `TreeSampler` uses the corrected
+  diagnostic on its captured state without changing cached sampling arrays
+  or the live optimizer.
+
 ### Changed
 
 - Roughening benchmark integration defaults now use Torch `complex128` with
