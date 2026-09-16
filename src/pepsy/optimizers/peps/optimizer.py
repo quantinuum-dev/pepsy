@@ -9,6 +9,8 @@ from dataclasses import replace
 from numbers import Integral
 from typing import Any
 
+import autoray as ar
+
 from ...boundary._fit_policy import (
     _FIT_QUIMB_MODES,
     _SWEEP_BOUNDARY_INIT_KEYS,
@@ -18,7 +20,7 @@ from ...boundary._fit_policy import (
 )
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import peps_normalize as boundary_normalize
-from ...backends import TorchLinalgConfig
+from ...backends import TorchLinalgConfig, to_float as _backend_to_float
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
 from ..global_opt import GlobalOptimizer
 from ..sweep import SweepOptimizer
@@ -944,14 +946,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             value = value.get("infidelity")
         if value is None:
             return None
-        value = float(complex(value).real)
+        value = _backend_to_float(value)
         if value < 0.0 and abs(value) < 1.0e-12:
             value = 0.0
         return max(0.0, value)
 
     @staticmethod
     def _clip_fidelity(value):
-        value = float(complex(value).real)
+        value = _backend_to_float(value)
         if value < 0.0 and abs(value) < 1.0e-12:
             value = 0.0
         if value > 1.0 and abs(value - 1.0) < 1.0e-12:
@@ -970,30 +972,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 PepsOptimizer._trace_scalar(exponent),
             )
 
-        work = value
-        for method_name in ("detach", "cpu"):
-            method = getattr(work, method_name, None)
-            if callable(method):
-                try:
-                    work = method()
-                except Exception:  # pragma: no cover - best-effort tracing
-                    break
-
-        item = getattr(work, "item", None)
-        if callable(item):
-            try:
-                work = item()
-            except Exception:  # pragma: no cover - best-effort tracing
-                pass
-
         try:
-            scalar = complex(work)
-        except (TypeError, ValueError):
+            real = _backend_to_float(ar.do("real", value), real=False)
+            imag = _backend_to_float(ar.do("imag", value), real=False)
+        except (TypeError, ValueError, RuntimeError):
             return repr(value)
 
-        if abs(scalar.imag) <= 1.0e-15:
-            return float(scalar.real)
-        return scalar
+        if abs(imag) <= 1.0e-15:
+            return real
+        return complex(real, imag)
 
     def _normalization_record(self, state, old_norm):
         """Build a lightweight normalization event without retaining ``state``."""
@@ -1593,7 +1580,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _real_float(value):
-        return float(complex(value).real)
+        """Convert a backend scalar/tensor-like value to Python float."""
+        return _backend_to_float(value)
 
     @staticmethod
     def _format_progress_infidelity(value):

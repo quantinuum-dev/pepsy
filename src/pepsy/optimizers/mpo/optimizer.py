@@ -74,6 +74,7 @@ from ...backends import (
     backend_infer,
     infer_backend_converter_from_sample,
     infer_backend_signature,
+    to_float as _backend_to_float,
 )
 from ...tensors.core import tn_fidelity, tn_norm
 from ...fitting.local import FIT
@@ -1103,14 +1104,7 @@ class MpoOptimizer:
     @staticmethod
     def _real_float(value):
         """Convert backend scalar/tensor-like values to Python float (real part)."""
-        real_value = ar.do("real", value)
-        item = getattr(real_value, "item", None)
-        if callable(item):
-            try:
-                real_value = item()
-            except TypeError:
-                pass
-        return float(real_value)
+        return _backend_to_float(value)
 
     @staticmethod
     def _log_norm_from_measurement(norm_val):

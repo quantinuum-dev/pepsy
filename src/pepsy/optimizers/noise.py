@@ -18,8 +18,10 @@ from numbers import Integral
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
+import autoray as ar
 import numpy as np
 
+from ..backends import to_float as _backend_to_float
 from .mps.optimizer import MpsOptimizer, _resolve_conditional
 from .tree.optimizer import TreeOptimizer
 
@@ -1451,13 +1453,11 @@ def _is_unitary_matrix(matrix: np.ndarray, *, atol: float = 1e-10) -> bool:
 
 def _trajectory_real_scalar(value, *, label: str) -> float:
     """Convert a backend scalar expected to be real into a Python float."""
-    item = getattr(value, "item", None)
-    if callable(item):
-        value = item()
-    value = complex(value)
-    if abs(value.imag) > 1e-9:
+    real_value = _backend_to_float(ar.do("real", value), real=False)
+    imag_value = _backend_to_float(ar.do("imag", value), real=False)
+    if abs(imag_value) > 1e-9:
         raise ValueError(f"{label} must be real, got {value!r}.")
-    return float(value.real)
+    return real_value
 
 
 def _as_entries(gates) -> list[object]:

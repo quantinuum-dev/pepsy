@@ -77,6 +77,7 @@ from ...backends import (
     backend_signatures_compatible,
     infer_backend_converter_from_sample,
     infer_backend_signature,
+    to_float as _backend_to_float,
 )
 from ...fitting.local import FIT
 from ..._internal.cutoff import dtype_auto_cutoff
@@ -7747,14 +7748,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _real_float(value):
         """Convert backend scalar/tensor-like values to Python float (real part)."""
-        real_value = ar.do("real", value)
-        item = getattr(real_value, "item", None)
-        if callable(item):
-            try:
-                real_value = item()
-            except TypeError:
-                pass
-        return float(real_value)
+        return _backend_to_float(value)
 
     def _start_unitary_norm_tracking(self, p):
         """Initialize scalar working-norm tracking for a unitary stream."""

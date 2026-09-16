@@ -14,6 +14,12 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Roughening benchmark integration defaults now use Torch `complex128` with
+  automatic device selection, disable sampled local-energy and XX estimators,
+  and make `memory_report=False` fully inert. Backend scalar norm reads use
+  Pepsy's shared Autoray conversion helper, and benchmark quality diagnostics
+  are collected once per depth.
+
 - `TreeSampler` now has an explicit `backend="symmray"` / `backend="native"`
   path for ordinary Abelian and fermionic Symmray trees. Sampling,
   amplitudes, probabilities, and edge entropies retain native block-sparse

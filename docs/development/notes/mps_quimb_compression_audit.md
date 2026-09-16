@@ -58,3 +58,24 @@ Disposition:
   filtering through dense gates, sub-MPO events, FIT guesses, and copies;
   Quimb's native defaults remain available through the selected oversample
   methods.
+
+## 2026-09-16 scalar conversion and roughening instrumentation follow-up
+
+The active `py312` environment was rechecked before changing backend scalar
+reads: Python 3.12.13, Quimb `1.15.1.dev51+g2e99c793e`, Autoray
+`0.11.1.dev3+g1b476b305`, Cotengra `0.8.3.dev7+g1d7fd333f`, and Symmray
+`0.3.2.dev8+g6c6dd34b5`. Autoray's public `to_numpy` and `do` signatures were
+probed directly. The MPS, MPO, PEPS, and trajectory scalar conversion paths
+now use Pepsy's shared Autoray-backed `to_float` helper rather than extracting
+backend values with a backend object's `.item()` method.
+
+Disposition:
+
+- **Adopt:** the public Autoray conversion path for scalar norm and trajectory
+  probability reads; no installed dependency was modified.
+- **Adopt:** roughening's disabled memory-report path is now inert, and its
+  wrapper synchronization is opt-in with memory capture or explicit device
+  timing synchronization.
+- **Defer:** removing unavoidable scalar transfers from correctness diagnostics
+  such as unitary norm stabilization; those reads preserve the existing norm
+  ledger and require a separate asynchronous diagnostic design.
