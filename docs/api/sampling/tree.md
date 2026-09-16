@@ -33,6 +33,15 @@ torch_configs = batch.configs
 numpy_configs = batch.to_numpy().configs
 ```
 
+Native Symmray trees can use `backend="symmray"` (or
+`backend="native"`). The sampler keeps the canonical tree block-sparse and
+uses native projected-norm contractions for sampling, amplitudes, and
+probabilities. The default `backend="auto"` remains the fast dense batched
+compatibility path for Symmray trees; select `symmray` when avoiding dense
+materialization is more important than maximum throughput. The
+`physical_code_maps` property exposes each source physical code's
+`(charge, sector_offset)` pair for both ordinary Abelian and fermionic trees.
+
 `amplitudes(..., to_numpy=False)` and `probabilities(..., to_numpy=False)`
 likewise return arrays on the resolved native backend. The legacy `sample()`
 method continues to return host Python lists.
@@ -60,17 +69,14 @@ probability is the exact product of that shot's conditional Born probabilities.
 ## Fermionic tree states
 
 Native Symmray fermionic trees (for example a spinful `phys_dim=4` Fermi-Hubbard
-tree) are sampled with the same `O(L)` sweep. The graded-canonical tensors are
-densified once; because every Born probability contracts a tensor with its own
-conjugate over the shared indices, the fermionic exchange signs enter squared
-and cancel, so the plain dense sweep reproduces the exact graded probabilities
-and marginals (validated to machine precision against the doubled-network
-contraction). No per-conditional graded contraction is required, so fermionic
-sampling runs at the same speed as the dense path.
+tree) are sampled through the native path without calling `to_dense`. The
+canonical tree is projected one physical code at a time and the exact native
+branch norm supplies the conditional Born probability. This is a general
+fallback for Abelian tree geometries; the existing dense path remains
+available for high-throughput batches.
 
-Sampled physical codes follow Symmray's dense basis order — `empty, up, down,
-up-down` for spinful `phys_dim=4` and `empty, occupied` for spinless
-`phys_dim=2`. The batched and list results carry a
+Sampled physical codes retain the source Symmray basis order. For supported
+fermionic sectors, the batched and list results carry a
 `FermionConfigurationEncoding` so the codes decode to `(n_up, n_down)`
 occupations:
 

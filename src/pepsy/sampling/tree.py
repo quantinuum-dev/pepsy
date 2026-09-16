@@ -23,20 +23,16 @@ batched ``einsum`` contractions.  The returned probability of each shot is the
 exact product of its conditional Born probabilities, so it equals
 ``|<config|psi>|**2`` for the normalized state.
 
-Fermionic states
-----------------
-Native Symmray fermionic trees are supported through the same ``O(L)`` sweep.
-The graded-canonical tensors are densified once; because every Born probability
-contracts a tensor with its own conjugate over the shared indices, the fermionic
-exchange signs enter squared and cancel, so the plain dense sweep reproduces the
-exact graded probabilities and marginals (validated to machine precision against
-the doubled-network contraction).  Sampled physical codes follow Symmray's dense
-basis order -- ``empty, up, down, up-down`` for spinful ``phys_dim=4`` and
-``empty, occupied`` for spinless ``phys_dim=2`` -- and decode to ``(n_up,
-n_down)`` occupations through the :class:`FermionConfigurationEncoding` attached
-to the sample results.  Signed :meth:`~TreeSampler.amplitudes` use the same dense
-basis convention and may differ from the graded amplitude ordering by a
-per-configuration sign, whereas :meth:`~TreeSampler.probabilities` are exact.
+Symmray states
+--------------
+Native Symmray trees can be selected with ``backend="symmray"``.  This path
+keeps the canonical tree block-sparse and performs exact projected-norm and
+amplitude contractions without calling ``to_dense``.  It supports both
+ordinary Abelian and fermionic Symmray arrays; source physical charge-sector
+maps are retained so sampled integer codes remain interpretable even when
+canonicalisation removes an identically-zero sector.  Fermionic results also
+carry a :class:`FermionConfigurationEncoding` when their physical sectors are
+one of Pepsy's supported spinless or spinful layouts.
 """
 
 from __future__ import annotations
@@ -44,6 +40,7 @@ from __future__ import annotations
 import contextlib
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -52,6 +49,7 @@ import autoray as ar
 from .samplers import (
     FermionConfigurationEncoding,
     _backend_array_to_numpy,
+    _fermion_symmray_occupations,
     _mps_array_backend,
 )
 
@@ -84,13 +82,16 @@ def _normalize_tree_sampler_backend(backend):
         "pytorch": "torch",
         "cupy": "cupy",
         "cp": "cupy",
+        "symmray": "symmray",
+        "symmetric": "symmray",
+        "block_sparse": "symmray",
     }
     try:
         return aliases[text]
     except KeyError as exc:
         raise ValueError(
             "backend must be one of 'auto', 'native', 'numpy', 'torch', "
-            "or 'cupy'."
+            "'cupy', or 'symmray'."
         ) from exc
 
 
@@ -262,17 +263,18 @@ class TreeSampler:
         node arrays are small (bounded by the bond dimension), so a single
         thread is typically fastest; pass ``None`` to leave the ambient thread
         count untouched.
-    backend : {"auto", "native", "numpy", "torch", "cupy"}, default="auto"
+    backend : {"auto", "native", "numpy", "torch", "cupy", "symmray"}, default="auto"
         Backend used for cached node arrays and batched contractions. ``auto``
-        and ``native`` preserve a NumPy, Torch, or CuPy state backend. The
-        explicit ``numpy`` option is a host-copy escape hatch; explicit Torch
-        or CuPy requests require the live state to already use that backend.
+        preserves the existing dense compatibility path for Symmray trees;
+        ``native`` or ``symmray`` selects the block-sparse Symmray path.
+        Explicit Torch or CuPy requests require the live state to already use
+        that dense backend.
     fermion : pepsy.tensors.Fermion, optional
         Fermionic physical-space convention.  It is optional: a native Symmray
-        fermionic tree is detected automatically and its dense-basis occupation
-        decoder is attached to the sample results regardless.  Supplying a
-        ``fermion`` only pins the recorded ``symmetry``/``spinful`` labels when
-        they cannot be inferred from the state.
+        fermionic tree is detected automatically and its physical-code
+        occupation decoder is attached to the sample results when supported.
+        Supplying a ``fermion`` pins the recorded ``symmetry``/``spinful``
+        labels.
 
     Notes
     -----
@@ -305,6 +307,8 @@ class TreeSampler:
         self._arrays = None
         self._fermionic = False
         self._configuration_encoding = None
+        self._physical_code_maps = None
+        self._symmray_state = None
 
         self.refresh(state)
 
@@ -321,9 +325,49 @@ class TreeSampler:
         """Return a dense view while retaining its native array backend."""
         return data.to_dense() if hasattr(data, "to_dense") else data
 
+    @staticmethod
+    def _state_ttn(state):
+        """Return the tree state owned by a TTN or TreeOptimizer."""
+        tn = getattr(state, "tn", None)
+        if tn is None:
+            tn = state
+        if not hasattr(tn, "plan") or not hasattr(tn, "node_tensor"):
+            raise TypeError(
+                "TreeSampler expects a TreeTensorNetwork or a TreeOptimizer; "
+                f"got {type(state).__name__}."
+            )
+        return tn
+
+    @staticmethod
+    def _is_symmray_ttn(tn):
+        """Check that a TTN uses Symmray data consistently on every node."""
+        backends = {_mps_array_backend(tensor.data) for tensor in tn.tensors}
+        if "symmray" not in backends:
+            return False
+        if backends != {"symmray"}:
+            raise ValueError(
+                "TreeSampler requires either all dense or all Symmray tree "
+                f"tensors; got mixed backends {sorted(backends)!r}."
+            )
+        return True
+
     def _resolve_backend(self, tn):
         """Resolve the requested backend against the live tree state."""
-        data = self._dense_data(tn.node_tensor(tn.root).data)
+        if self._is_symmray_ttn(tn):
+            if self.backend in {"native", "symmray"}:
+                return "symmray"
+            if self.backend in {"auto", "numpy"}:
+                # Keep the established default fast batched path. Native
+                # block-sparse sampling is explicit because its tree branch
+                # contractions currently trade throughput for generality.
+                return "numpy"
+            raise ValueError(
+                f"TreeSampler backend={self.backend!r} requested for a "
+                "Symmray tree. Use backend='symmray' (or 'native') for the "
+                "block-sparse path, or backend='numpy' for dense sampling."
+            )
+
+        data = tn.node_tensor(tn.root).data
         source = _mps_array_backend(data)
         if source not in {"numpy", "torch", "cupy"}:
             source = "numpy"
@@ -466,14 +510,7 @@ class TreeSampler:
     @staticmethod
     def _resolve_ttn(state):
         """Return a canonical, normalized :class:`TreeTensorNetwork` copy."""
-        tn = getattr(state, "tn", None)
-        if tn is None:
-            tn = state
-        if not hasattr(tn, "plan") or not hasattr(tn, "node_tensor"):
-            raise TypeError(
-                "TreeSampler expects a TreeTensorNetwork or a TreeOptimizer; "
-                f"got {type(state).__name__}."
-            )
+        tn = TreeSampler._state_ttn(state)
         tn = tn.copy()
         # Put the orthogonality centre on the root: every other node becomes
         # isometric toward its parent bond, which is what the sampling sweep
@@ -496,12 +533,186 @@ class TreeSampler:
         self._source = state
 
         with self._thread_ctx():
+            source_tn = self._state_ttn(state)
             tn = self._resolve_ttn(state)
             self.resolved_backend = self._resolve_backend(tn)
-            self._extract_arrays(tn)
+            if self.resolved_backend == "symmray":
+                self._extract_symmray(tn, source_tn)
+            else:
+                self._extract_arrays(tn, source_tn)
         return self
 
-    def _extract_arrays(self, tn):
+    @staticmethod
+    def _symmray_code_metadata(index):
+        """Expand a Symmray physical index into ``(charge, sector)`` codes."""
+        chargemap = getattr(index, "chargemap", None)
+        if chargemap is None:
+            raise TypeError("Symmray physical indices must expose a chargemap.")
+        metadata = []
+        for charge, size in chargemap.items():
+            for sector_offset in range(int(size)):
+                metadata.append((charge, sector_offset))
+        return tuple(metadata)
+
+    @classmethod
+    def _symmray_metadata(cls, source_tn, canonical_tn):
+        """Retain source physical codes while indexing canonical tensors."""
+        source_maps = []
+        local_to_source = []
+        source_to_local = []
+        for qubit in range(int(canonical_tn.plan.n)):
+            source_tensor = source_tn.node_tensor(source_tn.node_of_qubit(qubit))
+            canonical_tensor = canonical_tn.node_tensor(
+                canonical_tn.node_of_qubit(qubit)
+            )
+            source_phys = source_tensor.data.indices[
+                source_tensor.inds.index(source_tn.site_ind(qubit))
+            ]
+            canonical_phys = canonical_tensor.data.indices[
+                canonical_tensor.inds.index(canonical_tn.site_ind(qubit))
+            ]
+            source_metadata = cls._symmray_code_metadata(source_phys)
+            canonical_metadata = cls._symmray_code_metadata(canonical_phys)
+            source_lookup = {
+                metadata: code
+                for code, metadata in enumerate(source_metadata)
+            }
+            try:
+                code_map = tuple(source_lookup[metadata] for metadata in canonical_metadata)
+            except KeyError as exc:
+                raise ValueError(
+                    "Canonical Symmray tree changed a physical charge sector "
+                    f"at site {qubit}: {exc.args[0]!r}."
+                ) from exc
+            source_maps.append(dict(enumerate(source_metadata)))
+            local_to_source.append(code_map)
+            source_to_local.append({source: local for local, source in enumerate(code_map)})
+
+        data = source_tn.node_tensor(source_tn.root).data
+        block_backends = {
+            str(getattr(tensor.data, "backend", "unknown"))
+            for tensor in canonical_tn.tensors
+        }
+        if len(block_backends) != 1:
+            raise ValueError(
+                "Symmray tree tensors must use one common underlying block "
+                f"backend; got {sorted(block_backends)!r}."
+            )
+        array_backend = next(iter(block_backends))
+        if array_backend not in {"numpy", "torch", "cupy"}:
+            raise ValueError(
+                "TreeSampler Symmray sampling supports NumPy, Torch, or CuPy "
+                f"blocks, not {array_backend!r}."
+            )
+        return (
+            tuple(source_maps),
+            tuple(local_to_source),
+            tuple(source_to_local),
+            array_backend,
+            data.get_any_array(),
+        )
+
+    @staticmethod
+    def _symmray_scalar(value):
+        """Extract a scalar without densifying a Symmray array."""
+        if hasattr(value, "data") and not np.isscalar(value):
+            value = value.data
+        blocks = getattr(value, "blocks", None)
+        if isinstance(blocks, dict) and not blocks:
+            return 0.0
+        if hasattr(value, "get_scalar_element"):
+            return value.phase_sync().get_scalar_element()
+        return value
+
+    @classmethod
+    def _symmray_norm_squared(cls, tn):
+        """Return a full native Symmray norm without a dense conversion."""
+        value = (tn.H | tn).contract(all, optimize="auto")
+        value = cls._symmray_scalar(value)
+        return float(np.real(ar.to_numpy(value)))
+
+    def _symmray_output(self, values, *, dtype):
+        """Stack host sampling results on the Symmray block backend."""
+        state = self._symmray_state
+        backend = state["array_backend"]
+        template = state["template"]
+        if backend == "torch":
+            import torch
+
+            return torch.as_tensor(values, dtype=dtype, device=template.device)
+        if backend == "cupy":
+            import cupy as cp
+
+            return cp.asarray(values, dtype=dtype)
+        return np.asarray(values, dtype=dtype)
+
+    def _extract_symmray(self, tn, source_tn):
+        """Prepare a native Symmray tree and retain its physical code maps."""
+        (
+            physical_code_maps,
+            local_to_source,
+            source_to_local,
+            array_backend,
+            template,
+        ) = self._symmray_metadata(source_tn, tn)
+        norm_squared = self._symmray_norm_squared(tn)
+        if not np.isfinite(norm_squared) or norm_squared <= 0.0:
+            raise ValueError("Symmray tree state has a zero or non-finite norm.")
+        root_tensor = tn.node_tensor(tn.root)
+        root_tensor.modify(data=root_tensor.data / math.sqrt(norm_squared))
+        if hasattr(tn, "_invalidate_norm_cache"):
+            tn._invalidate_norm_cache()
+
+        plan = tn.plan
+        self._nqubits = int(plan.n)
+        self._root = plan.root
+        self._children = {nid: tuple(plan.children[nid]) for nid in plan.children}
+        self._qubit_of_node = dict(plan.qubit_of_node)
+        self._node_of_qubit = {
+            int(qubit): int(node)
+            for node, qubit in plan.qubit_of_node.items()
+        }
+        self._edges = tuple(
+            (int(parent), int(child))
+            for child, parent in sorted(
+                plan.parent.items(),
+                key=lambda item: (int(item[0]), int(item[1])),
+            )
+        )
+        preorder = []
+        stack = [self._root]
+        while stack:
+            nid = stack.pop()
+            preorder.append(nid)
+            stack.extend(reversed(self._children[nid]))
+        self._sampling_qubits = tuple(
+            int(self._qubit_of_node[nid])
+            for nid in preorder
+            if nid in self._qubit_of_node
+        )
+        self._arrays = None
+        self._fermionic = bool(getattr(tn, "fermionic", False))
+        self._physical_code_maps = physical_code_maps
+        self._symmray_state = {
+            "tn": tn,
+            "physical_code_maps": physical_code_maps,
+            "local_to_source": local_to_source,
+            "source_to_local": source_to_local,
+            "array_backend": array_backend,
+            "template": template,
+        }
+        self._configuration_encoding = (
+            self._build_configuration_encoding(
+                tn,
+                None,
+                self._qubit_of_node,
+                code_metadata=physical_code_maps,
+            )
+            if self._fermionic
+            else None
+        )
+
+    def _extract_arrays(self, tn, source_tn=None):
         """Extract per-node dense arrays with a canonical axis order.
 
         Every array starts with its parent bond, with the root receiving a
@@ -584,10 +795,37 @@ class TreeSampler:
                 key=lambda item: (int(item[0]), int(item[1])),
             )
         )
+        preorder = []
+        stack = [root]
+        while stack:
+            nid = stack.pop()
+            preorder.append(nid)
+            stack.extend(reversed(children[nid]))
+        self._sampling_qubits = tuple(
+            int(qubit_of_node[nid])
+            for nid in preorder
+            if nid in qubit_of_node
+        )
         self._arrays = arrays
         self._fermionic = fermionic
+        self._symmray_state = None
+        if source_tn is not None and self._is_symmray_ttn(source_tn):
+            (
+                self._physical_code_maps,
+                _local_to_source,
+                _source_to_local,
+                _array_backend,
+                _template,
+            ) = self._symmray_metadata(source_tn, tn)
+        else:
+            self._physical_code_maps = None
         self._configuration_encoding = (
-            self._build_configuration_encoding(tn, arrays, qubit_of_node)
+            self._build_configuration_encoding(
+                tn,
+                arrays,
+                qubit_of_node,
+                code_metadata=self._physical_code_maps,
+            )
             if fermionic
             else None
         )
@@ -679,6 +917,33 @@ class TreeSampler:
         site, which is the fallback used by generic samplers.
         """
         configs = self._check_configs(configs)
+        if self.resolved_backend == "symmray":
+            state = self._symmray_state
+            if any(
+                len(state["local_to_source"][qubit]) != 2
+                for qubit in range(self._nqubits)
+            ):
+                raise NotImplementedError(
+                    "single-site flip ratios require binary physical dimensions."
+                )
+            flipped = np.asarray(configs, dtype=np.int64).copy()
+            for qubit in range(self._nqubits):
+                source_to_local = state["source_to_local"][qubit]
+                local_to_source = state["local_to_source"][qubit]
+                try:
+                    flipped[:, qubit] = np.asarray([
+                        local_to_source[1 - source_to_local[int(code)]]
+                        for code in flipped[:, qubit]
+                    ])
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise ValueError(
+                        f"configs contain invalid physical index for site {qubit}."
+                    ) from exc
+            ratios = (
+                self._symmray_amplitudes(flipped)
+                / self._symmray_amplitudes(configs)
+            )
+            return _backend_array_to_numpy(ratios) if to_numpy else ratios
         if any(
             int(self._arrays[node].shape[1]) != 2
             for node in self._node_of_qubit.values()
@@ -714,6 +979,11 @@ class TreeSampler:
 
     def tree_edge_entropies(self, *, method="svd", return_edges=False):
         """Measure edge entropies from the cached canonical sampler tree."""
+        if self.resolved_backend == "symmray":
+            return self._symmray_state["tn"].tree_edge_entropies(
+                method=method,
+                return_edges=return_edges,
+            )
         method = str(method).strip().lower().replace("_", ":")
         if method not in {"svd", "eig", "svd:eig"}:
             raise ValueError(
@@ -783,28 +1053,166 @@ class TreeSampler:
             return entropies, self._edges
         return entropies
 
-    def _build_configuration_encoding(self, tn, arrays, qubit_of_node):
-        """Build the dense-basis occupation decoder for a fermionic tree."""
+    def _build_configuration_encoding(
+        self, tn, arrays, qubit_of_node, *, code_metadata=None
+    ):
+        """Build the physical-code occupation decoder for a fermionic tree."""
         if not qubit_of_node:
             return None
-        phys_dim = int(arrays[next(iter(qubit_of_node))].shape[1])
+        first_node = next(iter(qubit_of_node))
+        phys_dim = (
+            len(code_metadata[0])
+            if code_metadata is not None
+            else int(arrays[first_node].shape[1])
+        )
         fermion = self._fermion
         if fermion is not None and hasattr(fermion, "spinful"):
             spinful = bool(fermion.spinful)
         else:
             spinful = phys_dim == 4
-        table = _fermion_code_occupations(phys_dim, spinful)
-        if table is None:
-            return None
         symmetry = getattr(fermion, "symmetry", None)
         if symmetry is None:
             symmetry = getattr(tn, "symmetry", None)
         symmetry = str(symmetry) if symmetry is not None else "U1U1"
+        if code_metadata is not None:
+            tables = []
+            convention = SimpleNamespace(symmetry=symmetry, spinful=spinful)
+            try:
+                for code_map in code_metadata:
+                    tables.append(tuple(
+                        _fermion_symmray_occupations(charge, offset, convention)
+                        for charge, offset in code_map.values()
+                    ))
+            except (TypeError, ValueError, AttributeError):
+                return None
+            if not tables or any(not table for table in tables):
+                return None
+        else:
+            table = _fermion_code_occupations(phys_dim, spinful)
+            if table is None:
+                return None
+            tables = [tuple(table) for _ in range(self._nqubits)]
         return FermionConfigurationEncoding(
             symmetry=symmetry,
             spinful=spinful,
-            code_to_occupations=tuple(table for _ in range(self._nqubits)),
+            code_to_occupations=tuple(tables),
         )
+
+    @property
+    def physical_code_maps(self):
+        """Return Symmray physical-code to ``(charge, sector)`` maps.
+
+        The maps are ``None`` for dense trees.  For Symmray trees they describe
+        the source physical basis, while sampling and evaluation continue to
+        use the canonical private copy internally.
+        """
+        if self._physical_code_maps is None:
+            return None
+        return tuple(dict(code_map) for code_map in self._physical_code_maps)
+
+    # -- native Symmray path -----------------------------------------------
+
+    def _symmray_project(self, tn, selections):
+        """Return a private Symmray tree with physical codes selected."""
+        branch = tn.copy()
+        branch.isel_({
+            branch.site_ind(int(qubit)): int(code)
+            for qubit, code in selections.items()
+        })
+        return branch
+
+    def _symmray_branch_norm(self, tn):
+        """Return a selected branch norm without converting it to dense."""
+        return self._symmray_norm_squared(tn)
+
+    def _symmray_amplitude_one(self, config):
+        """Contract one physical configuration through native Symmray."""
+        state = self._symmray_state
+        selections = {}
+        for qubit, source_code in enumerate(config):
+            try:
+                selections[qubit] = state["source_to_local"][qubit][int(source_code)]
+            except (KeyError, IndexError, TypeError):
+                return 0.0
+        branch = self._symmray_project(state["tn"], selections)
+        value = branch.contract(all, optimize="auto")
+        return self._symmray_scalar(value)
+
+    def _symmray_probability_one(self, config):
+        """Evaluate one normalized Born probability natively."""
+        state = self._symmray_state
+        selections = {}
+        for qubit, source_code in enumerate(config):
+            try:
+                selections[qubit] = state["source_to_local"][qubit][int(source_code)]
+            except (KeyError, IndexError, TypeError):
+                return 0.0
+        branch = self._symmray_project(state["tn"], selections)
+        return self._symmray_branch_norm(branch)
+
+    def _symmray_amplitudes(self, configs):
+        values = [self._symmray_amplitude_one(config) for config in configs]
+        template = self._symmray_state["template"]
+        if self._symmray_state["array_backend"] in {"torch", "cupy"}:
+            dtype = template.dtype
+        else:
+            dtype = np.result_type(ar.to_numpy(template), complex)
+        return self._symmray_output(values, dtype=dtype)
+
+    def _symmray_probabilities(self, configs):
+        values = [self._symmray_probability_one(config) for config in configs]
+        template = self._symmray_state["template"]
+        if self._symmray_state["array_backend"] in {"torch", "cupy"}:
+            dtype = template.real.dtype
+        else:
+            dtype = np.asarray(ar.to_numpy(template)).real.dtype
+        return self._symmray_output(values, dtype=dtype)
+
+    def _symmray_sample_arrays(self, n_samples, rng):
+        """Sample a general Symmray tree by exact native projected norms.
+
+        A tree has no unique left-to-right prefix boundary.  The canonical
+        depth-first physical order gives a simple, fully general fallback:
+        each candidate is a private native projection of the already-selected
+        tree and its norm supplies the conditional Born probability.  This
+        keeps all state contractions block-sparse and is intentionally
+        separate from the high-throughput dense batched sweep.
+        """
+        state = self._symmray_state
+        configs = np.empty((int(n_samples), self._nqubits), dtype=np.int64)
+        probabilities = np.empty(int(n_samples), dtype=float)
+        local_codes = {
+            qubit: tuple(range(len(state["local_to_source"][qubit])))
+            for qubit in range(self._nqubits)
+        }
+        for sample in range(int(n_samples)):
+            branch = state["tn"]
+            branch_norm = 1.0
+            for qubit in self._sampling_qubits:
+                candidates = []
+                weights = []
+                for local_code in local_codes[qubit]:
+                    candidate = self._symmray_project(
+                        branch,
+                        {qubit: local_code},
+                    )
+                    candidates.append(candidate)
+                    weights.append(self._symmray_branch_norm(candidate))
+                weights = np.maximum(np.asarray(weights, dtype=float), 0.0)
+                total = float(weights.sum())
+                if not np.isfinite(total) or total <= 0.0:
+                    raise ValueError(
+                        "Symmray tree sampling reached a zero or non-finite "
+                        "conditional norm."
+                    )
+                probs = weights / total
+                choice = int(rng.choice(len(probs), p=probs))
+                local_code = local_codes[qubit][choice]
+                branch = candidates[choice]
+                branch_norm = float(weights[choice])
+                configs[sample, qubit] = state["local_to_source"][qubit][local_code]
+            probabilities[sample] = branch_norm
+        return configs, probabilities
 
     @property
     def nqubits(self) -> int:
@@ -922,7 +1330,32 @@ class TreeSampler:
             raise ValueError("n_samples must be a positive integer.")
         rng = self._rng if seed is None else np.random.default_rng(seed)
         with self._thread_ctx():
-            configs, probs = self._sample_arrays(int(n_samples), rng)
+            if self.resolved_backend == "symmray":
+                configs, probs = self._symmray_sample_arrays(int(n_samples), rng)
+                if not to_numpy:
+                    if self._symmray_state["array_backend"] == "torch":
+                        import torch
+
+                        configs = torch.as_tensor(
+                            configs,
+                            dtype=torch.int64,
+                            device=self._symmray_state["template"].device,
+                        )
+                        probs = torch.as_tensor(
+                            probs,
+                            dtype=self._symmray_state["template"].real.dtype,
+                            device=self._symmray_state["template"].device,
+                        )
+                    elif self._symmray_state["array_backend"] == "cupy":
+                        import cupy as cp
+
+                        configs = cp.asarray(configs, dtype=cp.int64)
+                        probs = cp.asarray(
+                            probs,
+                            dtype=self._symmray_state["template"].real.dtype,
+                        )
+            else:
+                configs, probs = self._sample_arrays(int(n_samples), rng)
         if to_numpy:
             return _backend_array_to_numpy(configs), _backend_array_to_numpy(probs)
         return configs, probs
@@ -944,7 +1377,15 @@ class TreeSampler:
             probs=probs,
             nqubits=self._nqubits,
             configuration_encoding=self._configuration_encoding,
-            backend="numpy" if to_numpy else self.resolved_backend,
+            backend=(
+                "numpy"
+                if to_numpy
+                else (
+                    self._symmray_state["array_backend"]
+                    if self.resolved_backend == "symmray"
+                    else self.resolved_backend
+                )
+            ),
         )
 
     def sample(self, n_samples: int = 1, seed=None) -> TreeSampleResult:
@@ -960,7 +1401,9 @@ class TreeSampler:
     # -- evaluation ----------------------------------------------------------
 
     def _check_configs(self, configs):
-        if self.resolved_backend == "torch":
+        if self.resolved_backend == "symmray":
+            configs = np.asarray(_backend_array_to_numpy(configs), dtype=np.int64)
+        elif self.resolved_backend == "torch":
             import torch
 
             configs = torch.as_tensor(
@@ -1029,7 +1472,11 @@ class TreeSampler:
         """
         configs = self._check_configs(configs)
         with self._thread_ctx():
-            out = self._amplitudes(configs)
+            out = (
+                self._symmray_amplitudes(configs)
+                if self.resolved_backend == "symmray"
+                else self._amplitudes(configs)
+            )
         return _backend_array_to_numpy(out) if to_numpy else out
 
     def probabilities(self, configs, *, to_numpy: bool = True):
@@ -1038,7 +1485,11 @@ class TreeSampler:
         For the normalized state captured by the sampler this is the exact
         probability of each supplied configuration.
         """
-        amps = self.amplitudes(configs, to_numpy=to_numpy)
-        if to_numpy:
-            return np.abs(amps) ** 2
-        return self._xp().abs(amps) ** 2
+        configs = self._check_configs(configs)
+        with self._thread_ctx():
+            if self.resolved_backend == "symmray":
+                out = self._symmray_probabilities(configs)
+            else:
+                amps = self._amplitudes(configs)
+                out = self._xp().abs(amps) ** 2
+        return _backend_array_to_numpy(out) if to_numpy else out

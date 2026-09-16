@@ -14,6 +14,13 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- `TreeSampler` now has an explicit `backend="symmray"` / `backend="native"`
+  path for ordinary Abelian and fermionic Symmray trees. Sampling,
+  amplitudes, probabilities, and edge entropies retain native block-sparse
+  tensors, and `physical_code_maps` exposes source charge-sector metadata.
+  The default `backend="auto"` keeps its existing dense batched compatibility
+  behavior for Symmray states.
+
 - TreeSampler now preserves dense NumPy, Torch, and CuPy tree backends for
   cached tensors, sampling, amplitudes, probabilities, and batch results.
   `backend="native"`/`"auto"` select the live state backend,

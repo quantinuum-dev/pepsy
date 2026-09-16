@@ -1511,6 +1511,11 @@ the Symmray arrays native; they do not materialize dense tensor data.
 `pepsy.TreeSampler(state)` samples every registered physical site, including
 the optional root site. Its cached canonical arrays use parent, physical, then
 child axes, so probabilities and amplitudes retain normal `q0..q(n-1)` order.
+For native Abelian or fermionic Symmray trees, pass
+`backend="symmray"` (or `backend="native"`) to keep sampling,
+amplitudes, probabilities, and edge entropy on block-sparse tensors; inspect
+`sampler.physical_code_maps` when the physical basis has degenerate charge
+sectors.
 
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
 tree analogue of a quimb MPS `show()` -- with the root at the top, structural
