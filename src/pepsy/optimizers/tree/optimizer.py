@@ -2220,6 +2220,24 @@ class TreeOptimizer:
         self.tn.validate_isometry_metadata(region)
         return self
 
+    def entropy(self, edge, *, method="svd"):
+        """Return the normalized base-2 entropy across one tree bond."""
+        return self.tn.entropy(edge, method=method)
+
+    def tree_edge_entropies(self, *, method="svd", return_edges=False):
+        """Return entropy for every tree bond without changing the live state."""
+        return self.tn.tree_edge_entropies(
+            method=method,
+            return_edges=return_edges,
+        )
+
+    def entanglement_entropy(self, *, method="svd", return_edges=False):
+        """Alias for :meth:`tree_edge_entropies`."""
+        return self.tn.entanglement_entropy(
+            method=method,
+            return_edges=return_edges,
+        )
+
     @property
     def canonical_region(self):
         """Frozenset of node ids forming the canonicalised subtree (``None`` if unknown).

@@ -239,6 +239,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
 
         if not isinstance(plan, TreePepsPlan):
             raise TypeError("plan must be a TreePepsPlan")
+        active_only = bool(operator_opts.pop("_active_only", False))
         dims = _site_dimensions(plan, phys_dim, name="phys_dim")
         local = {}
         if operators is not None:
@@ -259,20 +260,29 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                     )
                 local[q] = np.asarray(array, dtype=dtype)
 
-        tensors = []
         support = frozenset(local)
-        for q in range(plan.size):
+        active_nodes = plan.subtree_span(support) if support else frozenset()
+        if active_only and not active_nodes:
+            raise ValueError("a compact TreePepo requires non-empty operator support")
+        nodes = sorted(active_nodes) if active_only else range(plan.size)
+        tensors = []
+        for q in nodes:
             dim = dims[q]
             array = local.get(q, np.eye(dim, dtype=dtype))
-            data = np.zeros((dim, dim) + (1,) * len(plan.neighbors(q)), dtype=dtype)
-            data[(slice(None), slice(None)) + (0,) * len(plan.neighbors(q))] = array
+            neighbors = tuple(
+                neighbor
+                for neighbor in plan.neighbors(q)
+                if not active_only or neighbor in active_nodes
+            )
+            data = np.zeros((dim, dim) + (1,) * len(neighbors), dtype=dtype)
+            data[(slice(None), slice(None)) + (0,) * len(neighbors)] = array
             inds = [
                 _output_ind(plan, q, operator_opts.get("output_ind_id")),
                 _input_ind(plan, q, operator_opts.get("input_ind_id")),
             ]
             inds.extend(
                 _edge_name(plan, q, neighbor, operator_opts.get("operator_bond_id"))
-                for neighbor in plan.neighbors(q)
+                for neighbor in neighbors
             )
             tensors.append(
                 qtn.Tensor(
@@ -286,8 +296,9 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             tensors,
             plan=plan,
             operator_support=support,
-            operator_span=plan.subtree_span(support) if support else frozenset(),
+            operator_span=active_nodes,
             physical_dims=dims,
+            active_nodes=active_nodes if active_only else None,
             **operator_opts,
         )
         state.validate()
@@ -318,6 +329,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
 
         if not isinstance(plan, TreePepsPlan):
             raise TypeError("plan must be a TreePepsPlan")
+        active_only = bool(operator_opts.pop("_active_only", False))
         support = _normalize_sites(plan, support, name="support")
         if max_operator_sites is not None and len(support) > int(max_operator_sites):
             raise ValueError(
@@ -342,6 +354,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             output_ind_id=operator_opts.get("output_ind_id"),
             operator_bond_id=operator_opts.get("operator_bond_id"),
             physical_dims=all_dims,
+            active_only=active_only,
         )
         result = cls(
             network.tensor_map.values(),
@@ -349,6 +362,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
             operator_support=frozenset(support),
             operator_span=plan.subtree_span(support),
             physical_dims=all_dims,
+            active_nodes=plan.subtree_span(support) if active_only else None,
             **operator_opts,
         )
         result.validate()
@@ -1570,6 +1584,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         order="rank",
         info_c=None,
         _active_sites=None,
+        _prepared_region=None,
     ):
         """Apply this operator and return a valid ``TreePeps`` state.
 
@@ -1604,6 +1619,14 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 raise ValueError("active_sites must contain the complete operator span")
         if not active_sites.issubset(self.active_nodes):
             raise ValueError("active_sites must be contained in the active operator region")
+        if _prepared_region is not None:
+            prepared_region = frozenset(
+                state.plan.resolve_site(site) for site in _prepared_region
+            )
+            if prepared_region != active_sites:
+                raise ValueError(
+                    "_prepared_region must match the complete active_sites region"
+                )
         compression_mode = _normalize_compression_mode(compression_mode)
         compression_layout = _normalize_compression_layout(compression_layout)
         order = normalize_tree_compression_order(order)
@@ -1645,6 +1668,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 compression_seed=compression_seed,
                 inplace=inplace,
                 info_c=info_c,
+                _prepared_region=_prepared_region,
             )
         tensors = []
         for q in state.sites:
@@ -1716,7 +1740,11 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 )
             )
 
-        result = TreePeps(tensors, plan=state.plan)
+        result = TreePeps(
+            tensors,
+            plan=state.plan,
+            canonical_region=active_sites if _prepared_region is not None else None,
+        )
         result.validate()
         # ``cutoff`` is only meaningful when a compression sweep is requested.
         # In particular, the non-zero default must not silently truncate an
@@ -1777,6 +1805,7 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         compression_seed=None,
         inplace=False,
         info_c=None,
+        _prepared_region=None,
     ):
         """Apply and compress an operator-state path as one Quimb 1D TN.
 
@@ -1860,11 +1889,18 @@ class TreePepo(qtn.TensorNetworkGenOperator):
         if set(order) != set(active_sites):
             raise ValueError("active_sites must be a connected path region")
 
+        if _prepared_region is not None:
+            prepared_region = frozenset(_prepared_region)
+            if prepared_region != active_sites:
+                raise ValueError(
+                    "_prepared_region must match the complete active_sites region"
+                )
         work = state if inplace else state.copy()
         # Only the exterior of the active interval needs a canonical proof.
         # Reuse its cached left-indices and keep all subsequent QR work local
         # to the path rather than rebuilding a full-tree canonical form.
-        work._prepare_canonical_region(active_sites, info_c=info_c)
+        if _prepared_region is None:
+            work._prepare_canonical_region(active_sites, info_c=info_c)
 
         tensors = []
         for site in order:
@@ -2196,9 +2232,9 @@ class TreePepo(qtn.TensorNetworkGenOperator):
 class TreeSubPepo:
     """A compact support/span-aware operator for a ``TreePeps`` update.
 
-    ``operator`` contains only the active span. ``full_operator`` is retained
-    separately for compatibility dense readout and is not used by update
-    kernels.
+    ``operator`` contains only the active span. ``full_operator`` is available
+    for compatibility dense readout and is materialized lazily when the
+    compact source does not already include the full plan.
     """
 
     def __init__(self, operator: TreePepo, support, *, span=None):
@@ -2217,13 +2253,17 @@ class TreeSubPepo:
             raise ValueError("operator does not contain all requested support sites")
         if not set(span).issubset(operator.active_nodes):
             raise ValueError("span must be contained in the operator's active nodes")
+        self._full_source = operator.active_nodes == frozenset(range(operator.plan.size))
         self._full_operator = operator
         self._support = tuple(support)
         self._span = frozenset(span)
         # The compact view is the primary sub-operator. Keep the complete
         # source only for compatibility dense readout; no update, FIT target,
         # or bond estimate needs its exterior identity tensors.
-        self._operator = operator._active_view(self._span)
+        self._operator = (
+            operator if operator.active_nodes == self._span
+            else operator._active_view(self._span)
+        )
 
     @classmethod
     def from_operator(cls, plan_or_operator, operator=None, support=None, **operator_opts):
@@ -2253,6 +2293,7 @@ class TreeSubPepo:
                 plan,
                 operator,
                 support,
+                _active_only=True,
                 **operator_opts,
             )
         return cls(tree_operator, support)
@@ -2262,7 +2303,12 @@ class TreeSubPepo:
 
     @classmethod
     def from_product(cls, plan, operators, support=None, **operator_opts):
-        tree_operator = TreePepo.from_product(plan, operators, **operator_opts)
+        tree_operator = TreePepo.from_product(
+            plan,
+            operators,
+            _active_only=True,
+            **operator_opts,
+        )
         if support is None:
             support = tree_operator.operator_support
         if support is None or not tuple(support):
@@ -2275,9 +2321,126 @@ class TreeSubPepo:
 
     @property
     def full_operator(self):
-        """Return the complete source operator used for compatibility reads."""
+        """Return a complete operator, materializing exterior identities if needed."""
 
+        if self._full_operator.active_nodes != frozenset(range(self.plan.size)):
+            self._full_operator = self._materialize_full_operator()
         return self._full_operator
+
+    def _materialize_full_operator(self):
+        """Embed the compact operator into a complete identity-extended PEPO."""
+
+        source = self._operator
+        plan = self.plan
+        active_nodes = frozenset(source.active_nodes)
+        all_nodes = frozenset(range(plan.size))
+        if active_nodes == all_nodes:
+            return source.copy()
+
+        if source._physical_dims is None:
+            raise ValueError(
+                "cannot materialize TreeSubPepo.full_operator without "
+                "physical_dims for every plan site"
+            )
+        physical_dims = dict(source._physical_dims)
+        missing_dims = sorted(all_nodes.difference(physical_dims))
+        if missing_dims:
+            raise ValueError(
+                "cannot materialize TreeSubPepo.full_operator; physical_dims "
+                f"are missing sites {missing_dims}"
+            )
+        invalid_dims = sorted(
+            q for q, dim in physical_dims.items()
+            if q in all_nodes and (not isinstance(dim, Integral) or int(dim) < 1)
+        )
+        if invalid_dims:
+            raise ValueError(
+                "cannot materialize TreeSubPepo.full_operator; physical_dims "
+                f"must be positive integers at sites {invalid_dims}"
+            )
+        physical_dims = {q: int(physical_dims[q]) for q in all_nodes}
+        for q in active_nodes:
+            tensor = source.node_tensor(q)
+            output_dim = int(tensor.ind_size(source.output_ind(q)))
+            input_dim = int(tensor.ind_size(source.input_ind(q)))
+            if output_dim != input_dim or physical_dims[q] != output_dim:
+                raise ValueError(
+                    "cannot materialize TreeSubPepo.full_operator; "
+                    f"physical_dims do not match the operator at site {q}"
+                )
+        reference = source.node_tensor(next(iter(active_nodes))).data
+
+        tensors = []
+        for q in range(plan.size):
+            neighbors = tuple(plan.neighbors(q))
+            if q in active_nodes:
+                source_tensor = source.node_tensor(q)
+                data = source_tensor.data
+                inds = list(source_tensor.inds)
+                for neighbor in neighbors:
+                    if neighbor in active_nodes:
+                        continue
+                    edge = _edge_name(plan, q, neighbor, source._operator_bond_id)
+                    if edge not in inds:
+                        data = ar.do("expand_dims", data, axis=-1)
+                        inds.append(edge)
+                desired = (
+                    source.output_ind(q),
+                    source.input_ind(q),
+                    *(
+                        _edge_name(plan, q, neighbor, source._operator_bond_id)
+                        for neighbor in neighbors
+                    ),
+                )
+                tensor = qtn.Tensor(
+                    data,
+                    inds=inds,
+                    tags=source_tensor.tags,
+                    left_inds=source_tensor.left_inds,
+                ).transpose(*desired)
+            else:
+                dim = physical_dims[q]
+                data = ar.do("eye", dim, like=reference)
+                data = ar.do(
+                    "reshape",
+                    data,
+                    (dim, dim) + (1,) * len(neighbors),
+                )
+                tensor = qtn.Tensor(
+                    data,
+                    inds=(
+                        source.output_ind(q),
+                        source.input_ind(q),
+                        *(
+                            _edge_name(
+                                plan, q, neighbor, source._operator_bond_id
+                            )
+                            for neighbor in neighbors
+                        ),
+                    ),
+                    tags=_site_tags(plan, q, source._coord_site_tag_id),
+                )
+            tensors.append(tensor)
+
+        result = TreePepo(
+            tensors,
+            plan=plan,
+            coord_site_tag_id=source._coord_site_tag_id,
+            logical_site_tag_id=source._logical_site_tag_id,
+            node_tag_id=source._node_tag_id,
+            operator_bond_id=source._operator_bond_id,
+            input_ind_id=source._input_ind_id,
+            output_ind_id=source._output_ind_id,
+            physical_dims=physical_dims,
+            operator_support=source.operator_support,
+            operator_span=source.operator_span,
+            operator_terms=source._operator_terms,
+            canonical_region=source.canonical_region,
+            layout_finder=source.layout_finder,
+        )
+        result.exponent = source.exponent
+        result.validate()
+        return result
 
     @property
     def active_operator(self):
@@ -2303,7 +2466,7 @@ class TreeSubPepo:
     def layout_finder(self):
         """The layout finder carried by the wrapped tree operator."""
 
-        return self._full_operator.layout_finder
+        return self._operator.layout_finder
 
     @property
     def plan_signature(self):
@@ -2342,11 +2505,14 @@ class TreeSubPepo:
         }
 
     def to_dense(self, *args, **kwargs):
-        return self._full_operator.to_dense(*args, **kwargs)
+        return self.full_operator.to_dense(*args, **kwargs)
 
-    def validate(self, **kwargs):
+    def validate(self, *, full=False, **kwargs):
+        """Validate the compact core, optionally including full readout state."""
+
         self.operator.validate(**kwargs)
-        self._full_operator.validate(**kwargs)
+        if full:
+            self.full_operator.validate(**kwargs)
         return self
 
     def apply_to(self, state, **kwargs):
@@ -2358,7 +2524,8 @@ class TreeSubPepo:
         return self.active_operator.expectation(state, **kwargs)
 
     def copy(self):
-        return type(self)(self._full_operator.copy(), self.support, span=self.span)
+        source = self._full_operator if self._full_source else self._operator
+        return type(self)(source.copy(), self.support, span=self.span)
 
     def __repr__(self):
         return (
@@ -2531,6 +2698,7 @@ def _build_dense_operator_network(
     site_dims,
     physical_dims=None,
     *,
+    active_only=False,
     coord_site_tag_id=None,
     input_ind_id=None,
     output_ind_id=None,
@@ -2595,8 +2763,13 @@ def _build_dense_operator_network(
     if physical_dims is None:
         physical_dims = support_dims
     tensors = []
-    for q in range(plan.size):
-        neighbors = plan.neighbors(q)
+    nodes = sorted(span) if active_only else range(plan.size)
+    for q in nodes:
+        neighbors = tuple(
+            neighbor
+            for neighbor in plan.neighbors(q)
+            if not active_only or neighbor in span
+        )
         if q in factors:
             factor = factors[q]
             tensor_data = np.asarray(factor.data)
@@ -2630,6 +2803,10 @@ def _build_dense_operator_network(
                     inds.append(edge)
                     existing.add(edge)
         else:
+            if active_only:
+                raise RuntimeError(
+                    f"compact operator decomposition has no factor at site {q}"
+                )
             dim = physical_dims[q]
             tensor_data = np.zeros((dim, dim) + (1,) * len(neighbors), dtype=data.dtype)
             tensor_data[(slice(None), slice(None)) + (0,) * len(neighbors)] = np.eye(

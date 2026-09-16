@@ -14,12 +14,28 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- TreeSampler now preserves dense NumPy, Torch, and CuPy tree backends for
+  cached tensors, sampling, amplitudes, probabilities, and batch results.
+  `backend="native"`/`"auto"` select the live state backend,
+  `backend="numpy"` and `to_numpy=True` provide explicit host copies, and
+  explicit Torch/CuPy requests reject mismatched live trees. `to_backend(...)`
+  remains the preparation point for gate and operator payloads.
+
+- Added `TreeTensorNetwork.tree_edge_entropies()` and matching
+  `TreeOptimizer` delegates for normalized base-2 von Neumann entropy on
+  every TreePlan bond. The diagnostic canonicalizes a private copy once and
+  uses backend-native dense or Symmray sector SVDs without forming a full
+  statevector; `return_edges=True` provides deterministic parent-child labels.
+
 - `TreeSubPepo` now has a genuine compact operator core. Its public
   `operator`/`active_operator` contains only the connected compression span;
   exterior identity action is implicit, while `full_operator` is retained only
   for compatibility dense readout. TreePEPS fused, path, and TreeFIT/DMRG
   updates all consume the compact view, so inactive operator layers and bonds
-  are not materialized in the hot update target.
+  are not materialized in the hot update target. Compact construction reuses
+  its single active network, full-view reconstruction requires complete
+  physical-dimension metadata, and `validate(full=True)` provides explicit
+  compatibility-view validation.
 
 - TreePEPS canonical-region preparation now follows cached `left_inds`: a
   contained region is adopted without checking every tensor, and disjoint
@@ -39,6 +55,11 @@ Changes for the next release should be added here before the version is bumped.
   path-local environment reuse for ordinary one- and two-site gate spans and
   depth-first traversal for branching multi-site spans. `fit_sweep_sequence`
   continues to default to the RL-compatible inward-outward schedule.
+
+- TreePeps DMRG updates no longer perform a redundant outer canonical sweep
+  for direct or random disposable guesses. Warm-start `guess-*` policies reuse
+  the one active-region canonical proof during their operator application;
+  `dmrg1`/`dmrg2`/`dmrg3` sweep schedules and numerical behavior are unchanged.
 
 - Added explicit `mps_to_treepeps` conversion for site-complete `TreePeps`
   plans. Uncapped conversion is lossless up to floating-point roundoff;

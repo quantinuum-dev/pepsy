@@ -863,6 +863,32 @@ def test_tree_matches_statevector(n, seed):
     assert _fidelity(psi, opt.to_dense()) > 1 - 1e-8
 
 
+def test_tree_replay_matches_dense_reference_at_multiple_depths():
+    """Persistent tree replay stays equal to dense evolution at each depth."""
+    rng = np.random.default_rng(20260915)
+    n = 5
+    opt = TreeOptimizer(
+        None,
+        n=n,
+        chi=128,
+        cutoff=0.0,
+        mode="direct",
+        run=False,
+    )
+    exact = np.zeros(2**n, dtype=complex)
+    exact[0] = 1.0
+
+    for _depth in range(4):
+        step = _random_stream(n, 6, rng)
+        for gate, where in step:
+            if isinstance(where, int):
+                exact = _sv_apply_1q(exact, gate, where, n)
+            else:
+                exact = _sv_apply_2q(exact, gate, where[0], where[1], n)
+        opt.run(step, progbar=False)
+        assert _fidelity(exact, opt.to_dense()) > 1 - 1e-10
+
+
 def test_tree_two_site_direct_and_mpo_modes_agree():
     """Dense direct threading and gate-to-MPO routing are equivalent."""
     rng = np.random.default_rng(918)
@@ -5884,6 +5910,85 @@ def test_ttn_geometry_helpers_match_plan():
     assert ttn.steiner_nodes([la, lb]) == set(ttn.node_path(la, lb))
     with pytest.raises(ValueError):
         ttn.bond(la, lb)  # non-adjacent
+
+
+def test_tree_edge_entropy_is_zero_for_product_state_and_preserves_gauge():
+    """The all-edge diagnostic is non-mutating and vanishes for |0...0>."""
+    plan = TreePlan.from_order(range(6), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    before = state.to_statevector().copy()
+    region = state.canonical_region
+
+    entropies, edges = state.tree_edge_entropies(return_edges=True)
+
+    assert edges == state.tree_edges()
+    assert len(edges) == len(plan.parent)
+    assert np.all(entropies >= 0.0)
+    np.testing.assert_allclose(entropies, 0.0, atol=1e-13)
+    np.testing.assert_allclose(state.to_statevector(), before, atol=1e-13)
+    assert state.canonical_region == region
+    np.testing.assert_allclose(
+        state.entanglement_entropy(), entropies, atol=1e-13,
+    )
+
+
+def test_tree_edge_entropy_matches_bell_state_and_optimizer_delegate():
+    """Every Bell-state leaf cut carries one bit of tree-edge entropy."""
+    plan = TreePlan.from_order(range(2), structure="balanced", top_arity=2)
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    optimizer = TreeOptimizer(
+        [(h, 0), (cnot, (0, 1))],
+        n=2,
+        tree=plan,
+        chi=None,
+        cutoff=0.0,
+    )
+
+    entropies, edges = optimizer.tree_edge_entropies(return_edges=True)
+
+    assert edges == ((plan.root, plan.leaf_of_qubit[0]),
+                     (plan.root, plan.leaf_of_qubit[1]))
+    np.testing.assert_allclose(entropies, 1.0, atol=1e-12)
+    assert optimizer.entropy(edges[0]) == pytest.approx(1.0)
+    np.testing.assert_allclose(
+        optimizer.to_dense(),
+        np.array([1.0, 0.0, 0.0, 1.0], dtype=complex) / np.sqrt(2.0),
+        atol=1e-12,
+    )
+
+
+def test_tree_edge_entropy_supports_native_u1_and_torch_states():
+    """Entropy uses compact native spectra on structured and Torch trees."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(
+        spinful=False,
+        symmetry="U1",
+        dtype="complex128",
+    )
+    native = pepsy.ps_to_ttn(
+        4,
+        tree=plan,
+        fermion=fermion,
+        occupations=(0, 1, 0, 1),
+    )
+    native_entropies = native.tree_edge_entropies()
+    assert native_entropies.shape == (len(plan.parent),)
+    np.testing.assert_allclose(native_entropies, 0.0, atol=1e-13)
+
+    torch = pytest.importorskip("torch")
+    dense = TreeTensorNetwork.rand(plan, D=2, seed=17, dtype="complex128")
+    dense.apply_to_arrays(
+        lambda array: torch.as_tensor(array, dtype=torch.complex128),
+    )
+    torch_entropies = dense.tree_edge_entropies(method="eig")
+    assert torch_entropies.shape == (len(plan.parent),)
+    assert np.all(np.isfinite(torch_entropies))
+    assert np.all(torch_entropies >= 0.0)
 
 
 def test_ttn_validate_checks_structure_and_canonicality():

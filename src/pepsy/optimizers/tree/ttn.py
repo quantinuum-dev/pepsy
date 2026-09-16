@@ -510,6 +510,104 @@ def _is_symmray_array(value):
         return hasattr(value, "blocks") and hasattr(value, "indices")
 
 
+def _normalize_entropy_method(method):
+    """Normalize the local Schmidt-spectrum method used for tree entropy."""
+    method = str(method).strip().lower().replace("_", ":")
+    if method == "eig":
+        method = "svd:eig"
+    if method not in {"svd", "svd:eig"}:
+        raise ValueError(
+            "tree entropy method must be 'svd', 'eig', or 'svd:eig'."
+        )
+    return method
+
+
+def _tree_bond_singular_values(tensor, bond, *, method="svd"):
+    """Return the Schmidt values across ``bond`` without densifying ``tensor``.
+
+    The tensor is expected to be on the child side of a tree bond after the
+    network has been canonicalized towards the parent.  Dense arrays use
+    Autoray's backend linalg dispatch; native Symmray arrays use their
+    sector-aware SVD directly because Quimb's generic ``array_svals`` route is
+    NumPy-only for this diagnostic.
+    """
+    method = _normalize_entropy_method(method)
+    left_inds = tuple(ind for ind in tensor.inds if ind != bond)
+    transposed = tensor.transpose(*left_inds, bond)
+    nleft = len(left_inds)
+    matrix = ar.do(
+        "fuse",
+        transposed.data,
+        range(nleft),
+        range(nleft, nleft + 1),
+    )
+    if _is_symmray_array(matrix):
+        if method == "svd:eig":
+            return matrix.svd_via_eig(
+                absorb=None,
+                max_bond=-1,
+                cutoff=-1.0,
+            )[1]
+        return matrix.svd(
+            absorb=None,
+            max_bond=-1,
+            cutoff=-1.0,
+        )[1]
+
+    if method == "svd:eig":
+        rows, cols = tuple(matrix.shape)
+        if rows <= cols:
+            gram = ar.do(
+                "matmul",
+                matrix,
+                ar.do("transpose", ar.do("conj", matrix)),
+            )
+        else:
+            gram = ar.do(
+                "matmul",
+                ar.do("transpose", ar.do("conj", matrix)),
+                matrix,
+            )
+        eig_result = ar.do("linalg.eigh", gram)
+        eigenvalues = (
+            eig_result.eigenvalues
+            if hasattr(eig_result, "eigenvalues")
+            else eig_result[0]
+        )
+        eigenvalues = ar.do(
+            "where", eigenvalues > 0.0, eigenvalues, 0.0,
+        )
+        return ar.do("flip", ar.do("sqrt", eigenvalues), axis=0)
+
+    svd_result = ar.do("linalg.svd", matrix, full_matrices=False)
+    return svd_result.S if hasattr(svd_result, "S") else svd_result[1]
+
+
+def _entropy_from_singular_values(singular_values):
+    """Return normalized base-2 von Neumann entropy from Schmidt values."""
+    # Symmray singular values are VectorCommon objects. Only their one-
+    # dimensional spectrum is materialized, never the tensor or full state.
+    if hasattr(singular_values, "to_dense"):
+        singular_values = singular_values.to_dense()
+    weights = ar.do("abs", singular_values) ** 2
+    total = ar.do("sum", weights)
+    total_value = to_float(total, real=True)
+    if not np.isfinite(total_value):
+        raise ValueError("tree entropy requires a finite state norm.")
+    if total_value <= 0.0:
+        return 0.0
+    probabilities = weights / total
+    # Replacing zero probabilities by one only inside log avoids ``0 * -inf``.
+    safe_probabilities = ar.do(
+        "where", probabilities > 0.0, probabilities, 1.0,
+    )
+    value = -ar.do(
+        "sum",
+        probabilities * ar.do("log2", safe_probabilities),
+    )
+    return max(0.0, to_float(value, real=True))
+
+
 def _native_qr_options_for_tensor(tensor):
     """Return the centralized lossless-QR options for one tensor."""
     return {"stabilized": False} if _is_symmray_array(tensor.data) else {}
@@ -1134,6 +1232,97 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                     "count": len(terms),
                     "seconds": time.perf_counter() - profile_started,
                 })
+
+    def tree_edges(self):
+        """Return deterministic ``(parent, child)`` pairs for every tree bond."""
+        return tuple(
+            (int(parent), int(child))
+            for child, parent in sorted(
+                self.plan.parent.items(),
+                key=lambda item: (int(item[0]), int(item[1])),
+            )
+        )
+
+    def entropy(self, edge, *, method="svd"):
+        """Return the normalized base-2 entropy across one tree bond.
+
+        ``edge`` is a pair of adjacent structural node ids. The calculation
+        follows Quimb's MPS entropy pattern: a private copy is canonicalized
+        around one endpoint and the Schmidt values are extracted from the
+        tensor on the other endpoint. The live state, canonical centre, and
+        backend buffers are not changed.
+
+        Parameters
+        ----------
+        edge : pair of int
+            The two adjacent TreePlan node ids defining the bipartition. The
+            orientation is immaterial.
+        method : {"svd", "eig", "svd:eig"}, optional
+            Singular-spectrum decomposition. ``"svd"`` is the default;
+            ``"eig"`` and ``"svd:eig"`` use the Gram-matrix route.
+        """
+        try:
+            node, neighbor = edge
+        except (TypeError, ValueError) as exc:
+            raise TypeError("entropy needs one tree edge: (node, neighbor).") from exc
+        if (
+            isinstance(node, bool)
+            or isinstance(neighbor, bool)
+            or not isinstance(node, Integral)
+            or not isinstance(neighbor, Integral)
+        ):
+            raise TypeError("tree entropy edge endpoints must be integers.")
+        node, neighbor = int(node), int(neighbor)
+        if node == neighbor or node not in self.plan.children:
+            raise ValueError("entropy requires two distinct tree nodes.")
+        if neighbor not in self.neighbors(node):
+            raise ValueError("entropy requires adjacent tree nodes.")
+        method = _normalize_entropy_method(method)
+
+        work = self.copy()
+        work.canonize_around_node_(neighbor)
+        tensor = work.node_tensor(node)
+        singular_values = _tree_bond_singular_values(
+            tensor,
+            work.bond(node, neighbor),
+            method=method,
+        )
+        return _entropy_from_singular_values(singular_values)
+
+    def tree_edge_entropies(self, *, method="svd", return_edges=False):
+        """Return entropy for every tree bond in one canonicalization sweep.
+
+        A rooted TTN has one bipartition per parent-child bond rather than a
+        single left/right chain cut. This method canonicalizes one private copy
+        around the root, then computes all local Schmidt spectra. Its work is
+        linear in the number of tree tensors plus the local SVD costs and it
+        never constructs the full statevector. Set ``return_edges=True`` to
+        receive ``(entropies, edges)`` with matching deterministic order.
+        """
+        method = _normalize_entropy_method(method)
+        edges = self.tree_edges()
+        work = self.copy()
+        work.canonize_around_node_(work.root)
+        entropies = []
+        for parent, child in edges:
+            tensor = work.node_tensor(child)
+            singular_values = _tree_bond_singular_values(
+                tensor,
+                work.bond(parent, child),
+                method=method,
+            )
+            entropies.append(_entropy_from_singular_values(singular_values))
+        entropies = np.asarray(entropies, dtype=float)
+        if return_edges:
+            return entropies, edges
+        return entropies
+
+    def entanglement_entropy(self, *, method="svd", return_edges=False):
+        """Alias for :meth:`tree_edge_entropies` with an explicit name."""
+        return self.tree_edge_entropies(
+            method=method,
+            return_edges=return_edges,
+        )
 
     def expectation_mpo_exact(
         self, mpo, where, *, normalized=True, optimize="auto",

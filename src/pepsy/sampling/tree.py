@@ -42,13 +42,18 @@ per-configuration sign, whereas :meth:`~TreeSampler.probabilities` are exact.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
 import autoray as ar
 
-from .samplers import FermionConfigurationEncoding
+from .samplers import (
+    FermionConfigurationEncoding,
+    _backend_array_to_numpy,
+    _mps_array_backend,
+)
 
 __all__ = [
     "TreeBatchSampleResult",
@@ -62,6 +67,31 @@ try:  # threadpoolctl is a NumPy/SciPy transitive dependency; treat as optional.
     _THREAD_CONTROLLER = _ThreadpoolController()
 except Exception:  # pragma: no cover - threadpoolctl missing
     _THREAD_CONTROLLER = None
+
+
+def _normalize_tree_sampler_backend(backend):
+    """Normalize the small backend vocabulary used by :class:`TreeSampler`."""
+    if backend is None:
+        return "auto"
+    text = str(backend).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "native": "native",
+        "device": "native",
+        "numpy": "numpy",
+        "np": "numpy",
+        "torch": "torch",
+        "pytorch": "torch",
+        "cupy": "cupy",
+        "cp": "cupy",
+    }
+    try:
+        return aliases[text]
+    except KeyError as exc:
+        raise ValueError(
+            "backend must be one of 'auto', 'native', 'numpy', 'torch', "
+            "or 'cupy'."
+        ) from exc
 
 
 def _fermion_code_occupations(phys_dim, spinful):
@@ -143,10 +173,11 @@ class TreeBatchSampleResult:
         Number of physical qubit sites in the tree.
     """
 
-    configs: np.ndarray
-    probs: np.ndarray
+    configs: object
+    probs: object
     nqubits: int
     configuration_encoding: FermionConfigurationEncoding | None = None
+    backend: str = "numpy"
 
     def __len__(self):
         return int(self.configs.shape[0])
@@ -159,10 +190,11 @@ class TreeBatchSampleResult:
     def to_numpy(self) -> "TreeBatchSampleResult":
         """Return a plain NumPy copy of this batched result."""
         return TreeBatchSampleResult(
-            configs=np.asarray(self.configs),
-            probs=np.asarray(self.probs),
+            configs=_backend_array_to_numpy(self.configs),
+            probs=_backend_array_to_numpy(self.probs),
             nqubits=self.nqubits,
             configuration_encoding=self.configuration_encoding,
+            backend="numpy",
         )
 
     def occupations(self, *, to_numpy: bool = False):
@@ -182,18 +214,32 @@ class TreeBatchSampleResult:
 
     def configs_list(self) -> list[list[int]]:
         """Return configurations as Python ``list[list[int]]``."""
-        return [[int(value) for value in config] for config in self.configs]
+        configs = _backend_array_to_numpy(self.configs)
+        return [[int(value) for value in config] for config in configs]
 
-    def magnetizations(self) -> np.ndarray:
+    def magnetizations(self, *, to_numpy: bool = True):
         """Per-sample magnetization ``(1 / n) * sum_i (1 - 2 * bit_i)``."""
-        configs = np.asarray(self.configs, dtype=float)
-        return (1 - 2 * configs).sum(axis=1) / float(self.nqubits)
+        if self.backend == "torch":
+            import torch
+
+            configs = self.configs.to(dtype=torch.float64)
+            values = (1.0 - 2.0 * configs).sum(dim=1) / float(self.nqubits)
+        elif self.backend == "cupy":
+            import cupy as cp
+
+            configs = self.configs.astype(cp.float64, copy=False)
+            values = (1.0 - 2.0 * configs).sum(axis=1) / float(self.nqubits)
+        else:
+            configs = np.asarray(self.configs, dtype=float)
+            values = (1 - 2 * configs).sum(axis=1) / float(self.nqubits)
+        return _backend_array_to_numpy(values) if to_numpy else values
 
     def to_sample_result(self) -> TreeSampleResult:
         """Convert to the list-based :class:`TreeSampleResult`."""
+        batch = self.to_numpy()
         return TreeSampleResult(
-            configs=self.configs_list(),
-            probs=[float(p) for p in np.asarray(self.probs)],
+            configs=batch.configs_list(),
+            probs=[float(p) for p in batch.probs],
             nqubits=self.nqubits,
             configuration_encoding=self.configuration_encoding,
         )
@@ -216,6 +262,11 @@ class TreeSampler:
         node arrays are small (bounded by the bond dimension), so a single
         thread is typically fastest; pass ``None`` to leave the ambient thread
         count untouched.
+    backend : {"auto", "native", "numpy", "torch", "cupy"}, default="auto"
+        Backend used for cached node arrays and batched contractions. ``auto``
+        and ``native`` preserve a NumPy, Torch, or CuPy state backend. The
+        explicit ``numpy`` option is a host-copy escape hatch; explicit Torch
+        or CuPy requests require the live state to already use that backend.
     fermion : pepsy.tensors.Fermion, optional
         Fermionic physical-space convention.  It is optional: a native Symmray
         fermionic tree is detected automatically and its dense-basis occupation
@@ -230,10 +281,21 @@ class TreeSampler:
     sampler keeps representing its previously captured tensor data.
     """
 
-    def __init__(self, state, *, seed=None, threads: int | None = 1, fermion=None):
+    def __init__(
+        self,
+        state,
+        *,
+        seed=None,
+        threads: int | None = 1,
+        backend="auto",
+        fermion=None,
+    ):
         self._rng = np.random.default_rng(seed)
         self.threads = None if threads is None else int(threads)
+        self.backend = _normalize_tree_sampler_backend(backend)
+        self.resolved_backend = None
         self._fermion = fermion
+        self._device = None
 
         # Geometry / cached canonical arrays (populated by refresh).
         self._nqubits = None
@@ -253,6 +315,153 @@ class TreeSampler:
         if _THREAD_CONTROLLER is not None and self.threads is not None:
             return _THREAD_CONTROLLER.limit(limits=self.threads)
         return contextlib.nullcontext()
+
+    @staticmethod
+    def _dense_data(data):
+        """Return a dense view while retaining its native array backend."""
+        return data.to_dense() if hasattr(data, "to_dense") else data
+
+    def _resolve_backend(self, tn):
+        """Resolve the requested backend against the live tree state."""
+        data = self._dense_data(tn.node_tensor(tn.root).data)
+        source = _mps_array_backend(data)
+        if source not in {"numpy", "torch", "cupy"}:
+            source = "numpy"
+
+        if self.backend in {"auto", "native"}:
+            return source
+        if self.backend == "numpy":
+            return "numpy"
+        if source != self.backend:
+            raise ValueError(
+                f"TreeSampler backend={self.backend!r} requires a live "
+                f"{self.backend} tree, but the state uses {source!r}. "
+                "Use TreeOptimizer.to_backend(...) for operators and move "
+                "the live tree tensors to the requested backend first."
+            )
+        return self.backend
+
+    def _xp(self):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch
+        if self.resolved_backend == "cupy":
+            import cupy as cp
+
+            return cp
+        return np
+
+    def _as_backend(self, array, *, dtype=None):
+        """Convert a host/foreign array onto the sampler backend and device."""
+        if self.resolved_backend == "torch":
+            import torch
+
+            if torch.is_tensor(array):
+                kwargs = {"device": self._device}
+                if dtype is not None:
+                    kwargs["dtype"] = dtype
+                return array.to(**kwargs)
+            return torch.as_tensor(
+                _backend_array_to_numpy(array), dtype=dtype, device=self._device
+            )
+        if self.resolved_backend == "cupy":
+            import cupy as cp
+
+            if isinstance(array, cp.ndarray):
+                return array.astype(dtype, copy=False) if dtype is not None else array
+            out = cp.asarray(array)
+            return out.astype(dtype, copy=False) if dtype is not None else out
+        out = np.asarray(_backend_array_to_numpy(array))
+        return out.astype(dtype, copy=False) if dtype is not None else out
+
+    def _zeros(self, shape, *, dtype):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.zeros(shape, dtype=dtype, device=self._device)
+        return self._xp().zeros(shape, dtype=dtype)
+
+    def _ones(self, shape, *, dtype):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.ones(shape, dtype=dtype, device=self._device)
+        return self._xp().ones(shape, dtype=dtype)
+
+    def _arange(self, n):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.arange(n, dtype=torch.int64, device=self._device)
+        return self._xp().arange(n, dtype=np.int64)
+
+    def _sum(self, value, axis=None, *, keepdims=False):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.sum(value, dim=axis, keepdim=keepdims)
+        return self._xp().sum(value, axis=axis, keepdims=keepdims)
+
+    def _einsum(self, equation, *operands):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.einsum(equation, operands)
+        return self._xp().einsum(equation, *operands)
+
+    def _tensordot(self, left, right, axes):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.tensordot(left, right, dims=axes)
+        return self._xp().tensordot(left, right, axes=axes)
+
+    def _moveaxis(self, value, source, destination):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.movedim(value, source, destination)
+        return self._xp().moveaxis(value, source, destination)
+
+    def _cumsum(self, value, axis):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.cumsum(value, dim=axis)
+        return self._xp().cumsum(value, axis=axis)
+
+    def _where(self, condition, left, right):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.where(condition, left, right)
+        return self._xp().where(condition, left, right)
+
+    def _clip_nonnegative(self, value):
+        if self.resolved_backend == "torch":
+            return value.clamp_min(0.0)
+        return self._xp().clip(value, 0.0, None)
+
+    def _clip_max(self, value, maximum):
+        if self.resolved_backend == "torch":
+            return value.clamp_max(maximum)
+        return self._xp().minimum(value, maximum)
+
+    def _as_int64(self, value):
+        if self.resolved_backend == "torch":
+            import torch
+
+            return value.to(dtype=torch.int64)
+        return value.astype(np.int64, copy=False)
+
+    def _broadcast_to(self, value, shape):
+        """Broadcast ``value`` without changing its native backend."""
+        if self.resolved_backend == "torch":
+            import torch
+
+            return torch.broadcast_to(value, tuple(shape))
+        return self._xp().broadcast_to(value, tuple(shape))
 
     @staticmethod
     def _resolve_ttn(state):
@@ -288,6 +497,7 @@ class TreeSampler:
 
         with self._thread_ctx():
             tn = self._resolve_ttn(state)
+            self.resolved_backend = self._resolve_backend(tn)
             self._extract_arrays(tn)
         return self
 
@@ -316,12 +526,14 @@ class TreeSampler:
         # signs cancel in the ket-with-bra reduced-density contraction), so the
         # dense sweep below reproduces the exact fermionic Born probabilities.
         fermionic = bool(getattr(tn, "fermionic", False))
-        if fermionic:
-            def to_arr(data):
-                return np.asarray(ar.to_numpy(data.to_dense()))
-        else:
-            def to_arr(data):
-                return np.asarray(ar.to_numpy(data))
+        self._device = None
+
+        def to_arr(data):
+            data = self._dense_data(data) if fermionic else data
+            arr = self._as_backend(data)
+            if self.resolved_backend == "torch" and self._device is None:
+                self._device = arr.device
+            return arr
 
         def bond_between(a, b):
             shared = set(tn.node_tensor(a).inds) & set(tn.node_tensor(b).inds)
@@ -351,7 +563,9 @@ class TreeSampler:
 
         # Normalize via the root array (state is canonical with centre = root).
         root_arr = arrays[root]
-        nrm = float(np.sqrt(np.sum(np.abs(root_arr) ** 2)))
+        nrm = math.sqrt(
+            float(ar.to_numpy(self._sum(self._xp().abs(root_arr) ** 2)))
+        )
         if nrm > 0:
             arrays[root] = root_arr / nrm
 
@@ -359,6 +573,17 @@ class TreeSampler:
         self._root = root
         self._children = children
         self._qubit_of_node = qubit_of_node
+        self._node_of_qubit = {
+            int(qubit): int(node)
+            for node, qubit in qubit_of_node.items()
+        }
+        self._edges = tuple(
+            (int(parent), int(child))
+            for child, parent in sorted(
+                plan.parent.items(),
+                key=lambda item: (int(item[0]), int(item[1])),
+            )
+        )
         self._arrays = arrays
         self._fermionic = fermionic
         self._configuration_encoding = (
@@ -366,6 +591,197 @@ class TreeSampler:
             if fermionic
             else None
         )
+
+    def _selected_node_array(self, nid, configs):
+        """Select the sampled physical value at one node, in batch form."""
+        arr = self._arrays[nid]
+        qubit = self._qubit_of_node.get(nid)
+        if qubit is not None:
+            return self._moveaxis(arr[:, configs[:, qubit], ...], 1, 0)
+        return self._broadcast_to(
+            arr,
+            (int(configs.shape[0]),) + tuple(arr.shape),
+        )
+
+    def _contract_child_axis(self, value, vector, axis):
+        """Contract one batched tree bond while keeping the first leg open."""
+        value = self._moveaxis(value, axis, 2)
+        batch = int(value.shape[0])
+        target = int(value.shape[1])
+        child = int(value.shape[2])
+        rest = tuple(value.shape[3:])
+        flat = value.reshape(batch, target, child, -1)
+        contracted = self._einsum("BtcF,Bc->BtF", flat, vector)
+        return contracted.reshape((batch, target) + rest)
+
+    def _message_pass(self, configs):
+        """Build upward amplitudes and downward environments for a batch."""
+        batch = int(configs.shape[0])
+        preorder = []
+        stack = [self._root]
+        while stack:
+            nid = stack.pop()
+            preorder.append(nid)
+            stack.extend(reversed(self._children[nid]))
+
+        upward = {}
+        for nid in reversed(preorder):
+            value = self._selected_node_array(nid, configs)
+            for child in self._children[nid]:
+                value = self._contract_child_axis(
+                    value, upward[child], axis=2
+                )
+            upward[nid] = value.reshape(batch, value.shape[1])
+
+        root_dtype = self._arrays[self._root].dtype
+        downward = {
+            self._root: self._ones((batch, 1), dtype=root_dtype),
+        }
+        for nid in preorder:
+            children = self._children[nid]
+            if not children:
+                continue
+            value = self._selected_node_array(nid, configs)
+            flat = value.reshape(batch, value.shape[1], -1)
+            weighted = self._einsum("Bp,BpF->BF", downward[nid], flat)
+            child_shape = tuple(value.shape[2:])
+            weighted = weighted.reshape((batch,) + child_shape)
+            for child_index, child in enumerate(children):
+                value_for_child = self._moveaxis(
+                    weighted, child_index + 1, 1
+                )
+                remaining = list(children)
+                remaining.pop(child_index)
+                for sibling in tuple(remaining):
+                    sibling_axis = 2 + remaining.index(sibling)
+                    value_for_child = self._contract_child_axis(
+                        value_for_child,
+                        upward[sibling],
+                        axis=sibling_axis,
+                    )
+                    remaining.remove(sibling)
+                downward[child] = value_for_child.reshape(
+                    batch, value_for_child.shape[1]
+                )
+        return upward, downward
+
+    def single_site_flip_amplitude_ratios(
+        self,
+        configs,
+        *,
+        to_numpy: bool = True,
+    ):
+        """Return ``psi(x with site flipped) / psi(x)`` for binary trees.
+
+        The upward/downward message pass contracts the tree once per batch and
+        then evaluates each leaf flip from its local environment. This avoids
+        constructing a separate full-tree amplitude contraction for every
+        site, which is the fallback used by generic samplers.
+        """
+        configs = self._check_configs(configs)
+        if any(
+            int(self._arrays[node].shape[1]) != 2
+            for node in self._node_of_qubit.values()
+        ):
+            raise NotImplementedError(
+                "single-site flip ratios require binary physical dimensions."
+            )
+        with self._thread_ctx():
+            upward, downward = self._message_pass(configs)
+            amplitudes = upward[self._root][:, 0]
+            ratios = self._zeros(
+                (int(configs.shape[0]), self._nqubits),
+                dtype=amplitudes.dtype,
+            )
+            for qubit in range(self._nqubits):
+                nid = self._node_of_qubit[qubit]
+                arr = self._arrays[nid]
+                flipped = self._moveaxis(
+                    arr[:, 1 - configs[:, qubit], ...], 1, 0
+                )
+                for child in self._children[nid]:
+                    flipped = self._contract_child_axis(
+                        flipped, upward[child], axis=2
+                    )
+                flipped_amplitudes = self._sum(
+                    downward[nid] * flipped.reshape(
+                        int(configs.shape[0]), flipped.shape[1]
+                    ),
+                    axis=1,
+                )
+                ratios[:, qubit] = flipped_amplitudes / amplitudes
+        return _backend_array_to_numpy(ratios) if to_numpy else ratios
+
+    def tree_edge_entropies(self, *, method="svd", return_edges=False):
+        """Measure edge entropies from the cached canonical sampler tree."""
+        method = str(method).strip().lower().replace("_", ":")
+        if method not in {"svd", "eig", "svd:eig"}:
+            raise ValueError(
+                "tree entropy method must be 'svd', 'eig', or 'svd:eig'."
+            )
+        values = []
+        for _parent, child in self._edges:
+            matrix = self._arrays[child].reshape(
+                int(self._arrays[child].shape[0]), -1
+            )
+            if method in {"eig", "svd:eig"}:
+                if self.resolved_backend == "torch":
+                    import torch
+
+                    adjoint = matrix.conj().transpose(-2, -1)
+                    gram = (
+                        matrix @ adjoint
+                        if matrix.shape[0] <= matrix.shape[1]
+                        else adjoint @ matrix
+                    )
+                    eigenvalues = torch.linalg.eigvalsh(gram).clamp_min(0.0)
+                    singular_values = torch.sqrt(eigenvalues)
+                else:
+                    xp = self._xp()
+                    adjoint = matrix.conj().T
+                    gram = (
+                        xp.matmul(matrix, adjoint)
+                        if matrix.shape[0] <= matrix.shape[1]
+                        else xp.matmul(adjoint, matrix)
+                    )
+                    eigenvalues = xp.linalg.eigvalsh(gram)
+                    singular_values = xp.sqrt(xp.clip(eigenvalues, 0.0, None))
+            elif self.resolved_backend == "torch":
+                import torch
+
+                singular_values = torch.linalg.svdvals(matrix)
+            else:
+                singular_values = self._xp().linalg.svd(
+                    matrix, full_matrices=False, compute_uv=False
+                )
+            weights = self._xp().abs(singular_values) ** 2
+            total = self._sum(weights)
+            safe_total = self._where(
+                total > 0.0,
+                total,
+                self._ones((), dtype=weights.dtype),
+            )
+            probabilities = weights / safe_total
+            safe = self._where(
+                probabilities > 0.0,
+                probabilities,
+                self._ones(probabilities.shape, dtype=probabilities.dtype),
+            )
+            values.append(-self._sum(probabilities * self._xp().log2(safe)))
+        if values:
+            if self.resolved_backend == "torch":
+                import torch
+
+                entropies = torch.stack(values)
+            else:
+                entropies = self._xp().stack(values)
+            entropies = _backend_array_to_numpy(entropies)
+        else:
+            entropies = np.empty(0, dtype=float)
+        entropies = np.asarray(entropies, dtype=float)
+        if return_edges:
+            return entropies, self._edges
+        return entropies
 
     def _build_configuration_encoding(self, tn, arrays, qubit_of_node):
         """Build the dense-basis occupation decoder for a fermionic tree."""
@@ -398,16 +814,37 @@ class TreeSampler:
     # -- sampling ------------------------------------------------------------
 
     def _sample_arrays(self, n_samples, rng):
-        """Batched perfect sampling; returns ``(configs, probs)`` arrays."""
+        """Batched perfect sampling; returns backend-native arrays."""
         B = int(n_samples)
         arrays = self._arrays
         children = self._children
         qubit_of_node = self._qubit_of_node
-        configs = np.zeros((B, self._nqubits), dtype=np.int64)
-        prob = np.ones(B, dtype=np.float64)
-        batch = np.arange(B)
+        if self.resolved_backend == "torch":
+            import torch
+
+            int_dtype = torch.int64
+            prob_dtype = torch.float64
+        elif self.resolved_backend == "cupy":
+            import cupy as cp
+
+            int_dtype = cp.int64
+            prob_dtype = cp.float64
+        else:
+            int_dtype = np.int64
+            prob_dtype = np.float64
+        configs = self._zeros((B, self._nqubits), dtype=int_dtype)
+        prob = self._ones(B, dtype=prob_dtype)
+        batch = self._arange(B)
+        # Draw all uniforms in one host call and, for accelerator backends,
+        # one host-to-device transfer. The previous per-site transfer made a
+        # large tree perform one small synchronization/copy per physical site.
+        physical_draws = self._as_backend(
+            rng.random((len(qubit_of_node), B)), dtype=prob_dtype
+        )
+        draw_index = 0
 
         def visit(nid, rho):
+            nonlocal draw_index
             # rho: (B, d_par, d_par) reduced density on nid's parent bond.
             ch = children[nid]
             arr = arrays[nid]
@@ -415,22 +852,24 @@ class TreeSampler:
             if q is not None:
                 # p[B, x] = Re sum_{a,a'} rho[a,a'] T[a,x] conj(T[a',x]).
                 flat = arr.reshape(arr.shape[0], arr.shape[1], -1)
-                p = np.einsum(
+                p = self._einsum(
                     "BaA,axF,AxF->Bx", rho, flat, flat.conj()
                 ).real
-                p = np.clip(p, 0.0, None)
-                total = p.sum(axis=1, keepdims=True)
-                probs = p / np.where(total > 0.0, total, 1.0)
-                draws = rng.random(B)
-                cdf = np.cumsum(probs, axis=1)
-                x = (draws[:, None] > cdf).sum(axis=1)
-                x = np.minimum(x, probs.shape[1] - 1).astype(np.int64)
+                p = self._clip_nonnegative(p)
+                total = self._sum(p, axis=1, keepdims=True)
+                safe_total = self._where(total > 0.0, total, 1.0)
+                probs = p / safe_total
+                draws = physical_draws[draw_index]
+                draw_index += 1
+                cdf = self._cumsum(probs, axis=1)
+                x = self._sum(draws[:, None] > cdf, axis=1)
+                x = self._as_int64(self._clip_max(x, probs.shape[1] - 1))
                 configs[:, q] = x
                 prob[:] *= probs[batch, x]
                 # Selecting one physical value leaves a batched tensor over
                 # the parent and child bonds. A physical leaf has no remaining
                 # child axes and can return immediately.
-                selected = np.moveaxis(arr[:, x, ...], 1, 0)
+                selected = self._moveaxis(arr[:, x, ...], 1, 0)
                 if not ch:
                     return selected.reshape(B, arr.shape[0])
 
@@ -450,42 +889,46 @@ class TreeSampler:
                 d0 = arr.shape[1]
                 F0 = int(np.prod(arr.shape[2:])) if len(ch) > 1 else 1
                 ur = arr.reshape(par, d0, F0)
-                env = np.einsum("acF,AdF->acAd", ur, ur.conj())
-                rho0 = np.einsum("BaA,acAd->Bcd", rho, env)
+                env = self._einsum("acF,AdF->acAd", ur, ur.conj())
+                rho0 = self._einsum("BaA,acAd->Bcd", rho, env)
                 phi0 = visit(ch[0], rho0)
                 # Collapse child 0 into the node tensor -> batched remainder.
-                K = np.tensordot(phi0, arr, axes=([1], [1]))
+                K = self._tensordot(phi0, arr, axes=([1], [1]))
                 start = 1
 
             for i in range(start, len(ch)):
                 di = K.shape[2]
                 Fi = int(np.prod(K.shape[3:])) if K.ndim > 3 else 1
                 Kf = K.reshape(B, par, di, Fi)
-                X = np.einsum("BaA,BacF->BAcF", rho, Kf)
-                rho_i = np.einsum("BAcF,BAdF->Bcd", X, Kf.conj())
+                X = self._einsum("BaA,BacF->BAcF", rho, Kf)
+                rho_i = self._einsum("BAcF,BAdF->Bcd", X, Kf.conj())
                 phi_i = visit(ch[i], rho_i)
-                Knew = np.einsum("BpcF,Bc->BpF", Kf, phi_i)
+                Knew = self._einsum("BpcF,Bc->BpF", Kf, phi_i)
                 K = Knew.reshape((B, par) + K.shape[3:])
             return K.reshape(B, par)
 
-        rho_root = np.ones((B, 1, 1), dtype=complex)
+        rho_root = self._ones((B, 1, 1), dtype=arrays[self._root].dtype)
         visit(self._root, rho_root)
         return configs, prob
 
-    def sample_arrays(self, n_samples: int = 1, seed=None):
-        """Draw samples and return raw ``(configs, probs)`` NumPy arrays.
+    def sample_arrays(self, n_samples: int = 1, seed=None, *, to_numpy=False):
+        """Draw samples and return raw ``(configs, probs)`` arrays.
 
         ``configs`` has shape ``(n_samples, nqubits)`` and ``probs`` has shape
-        ``(n_samples,)``.
+        ``(n_samples,)``. By default arrays use the resolved sampler backend;
+        pass ``to_numpy=True`` for an explicit host copy.
         """
         if int(n_samples) < 1:
             raise ValueError("n_samples must be a positive integer.")
         rng = self._rng if seed is None else np.random.default_rng(seed)
         with self._thread_ctx():
-            return self._sample_arrays(int(n_samples), rng)
+            configs, probs = self._sample_arrays(int(n_samples), rng)
+        if to_numpy:
+            return _backend_array_to_numpy(configs), _backend_array_to_numpy(probs)
+        return configs, probs
 
     def sample_batch(
-        self, n_samples: int = 1, seed=None
+        self, n_samples: int = 1, seed=None, *, to_numpy=False
     ) -> TreeBatchSampleResult:
         """Draw samples and return a batched :class:`TreeBatchSampleResult`.
 
@@ -493,12 +936,15 @@ class TreeSampler:
         :meth:`sample_arrays` when tuple unpacking is more convenient, or
         :meth:`sample` for the list-based result.
         """
-        configs, probs = self.sample_arrays(n_samples, seed=seed)
+        configs, probs = self.sample_arrays(
+            n_samples, seed=seed, to_numpy=to_numpy
+        )
         return TreeBatchSampleResult(
             configs=configs,
             probs=probs,
             nqubits=self._nqubits,
             configuration_encoding=self._configuration_encoding,
+            backend="numpy" if to_numpy else self.resolved_backend,
         )
 
     def sample(self, n_samples: int = 1, seed=None) -> TreeSampleResult:
@@ -509,12 +955,23 @@ class TreeSampler:
         TreeSampleResult
             Contains per-sample configs and exact Born probabilities.
         """
-        return self.sample_batch(n_samples, seed=seed).to_sample_result()
+        return self.sample_batch(n_samples, seed=seed, to_numpy=True).to_sample_result()
 
     # -- evaluation ----------------------------------------------------------
 
     def _check_configs(self, configs):
-        configs = np.asarray(configs, dtype=np.int64)
+        if self.resolved_backend == "torch":
+            import torch
+
+            configs = torch.as_tensor(
+                configs, dtype=torch.int64, device=self._device
+            )
+        elif self.resolved_backend == "cupy":
+            import cupy as cp
+
+            configs = cp.asarray(configs, dtype=cp.int64)
+        else:
+            configs = np.asarray(configs, dtype=np.int64)
         if configs.ndim != 2 or configs.shape[1] != self._nqubits:
             raise ValueError(
                 f"configs must have shape (batch, nqubits={self._nqubits}); "
@@ -534,7 +991,7 @@ class TreeSampler:
             q = qubit_of_node.get(nid)
             if q is not None:
                 x = configs[:, q]
-                K = np.moveaxis(arr[:, x, ...], 1, 0)
+                K = self._moveaxis(arr[:, x, ...], 1, 0)
                 if not ch:
                     return K.reshape(B, arr.shape[0])
                 start = 0
@@ -550,12 +1007,12 @@ class TreeSampler:
             for i, child in enumerate(ch):
                 phi_c = visit(child)
                 if K is None and i == start:
-                    K = np.tensordot(phi_c, arr, axes=([1], [1]))
+                    K = self._tensordot(phi_c, arr, axes=([1], [1]))
                 else:
                     di = K.shape[2]
                     Fi = int(np.prod(K.shape[3:])) if K.ndim > 3 else 1
                     Kf = K.reshape(B, par, di, Fi)
-                    Knew = np.einsum("BpcF,Bc->BpF", Kf, phi_c)
+                    Knew = self._einsum("BpcF,Bc->BpF", Kf, phi_c)
                     K = Knew.reshape((B, par) + K.shape[3:])
             return K.reshape(B, par)
 
@@ -573,7 +1030,7 @@ class TreeSampler:
         configs = self._check_configs(configs)
         with self._thread_ctx():
             out = self._amplitudes(configs)
-        return np.asarray(out) if to_numpy else out
+        return _backend_array_to_numpy(out) if to_numpy else out
 
     def probabilities(self, configs, *, to_numpy: bool = True):
         """Return Born probabilities ``|<config|psi>|**2`` for ``configs``.
@@ -582,4 +1039,6 @@ class TreeSampler:
         probability of each supplied configuration.
         """
         amps = self.amplitudes(configs, to_numpy=to_numpy)
-        return np.abs(amps) ** 2
+        if to_numpy:
+            return np.abs(amps) ** 2
+        return self._xp().abs(amps) ** 2

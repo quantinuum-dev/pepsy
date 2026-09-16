@@ -80,6 +80,54 @@ def test_amplitudes_match_statevector_up_to_phase():
     assert np.allclose(sampler.probabilities(_all_configs(n)), np.abs(amps) ** 2)
 
 
+def test_tree_flip_ratios_match_batched_amplitude_reference():
+    """Tree local-energy ratios use one message pass and remain exact."""
+    n = 5
+    rng = np.random.default_rng(81)
+    opt = TreeOptimizer(
+        _random_stream(n, 32, rng, two_qubit_frac=0.7),
+        n=n,
+        chi=128,
+    )
+    sampler = TreeSampler(opt)
+    configs = _all_configs(n)[::3]
+    amplitudes = sampler.amplitudes(configs, to_numpy=False)
+    flipped = np.repeat(configs[:, None, :], n, axis=1)
+    for qubit in range(n):
+        flipped[:, qubit, qubit] ^= 1
+    flipped_amplitudes = sampler.amplitudes(
+        flipped.reshape(-1, n),
+        to_numpy=False,
+    ).reshape(-1, n)
+    expected = flipped_amplitudes / amplitudes[:, None]
+    actual = sampler.single_site_flip_amplitude_ratios(
+        configs,
+        to_numpy=False,
+    )
+    np.testing.assert_allclose(actual, expected, atol=1e-11, rtol=1e-11)
+
+
+def test_tree_sampler_entropy_reuses_canonical_edge_spectra():
+    n = 4
+    rng = np.random.default_rng(82)
+    opt = TreeOptimizer(
+        _random_stream(n, 24, rng, two_qubit_frac=0.7),
+        n=n,
+        chi=128,
+    )
+    sampler = TreeSampler(opt)
+    entropies, edges = sampler.tree_edge_entropies(return_edges=True)
+    expected, expected_edges = opt.tree_edge_entropies(return_edges=True)
+    assert edges == expected_edges
+    np.testing.assert_allclose(entropies, expected, atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(
+        sampler.tree_edge_entropies(method="eig"),
+        entropies,
+        atol=1e-11,
+        rtol=1e-11,
+    )
+
+
 def test_physical_root_probabilities_and_amplitudes_match_statevector():
     """Sampling treats the optional root physical leg as an ordinary site."""
     n = 5
@@ -217,6 +265,68 @@ def test_batch_result_helpers():
     np_copy = res.to_numpy()
     assert np.array_equal(np_copy.configs, res.configs)
     assert np.array_equal(np_copy.probs, res.probs)
+
+
+def test_tree_sampler_preserves_torch_backend_and_supports_host_copy():
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    state = TreeOptimizer(None, n=3).tn
+    state.apply_to_arrays(to_backend)
+    h = to_backend(
+        np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    )
+    opt = TreeOptimizer([(h, 0)], state=state, run=True, mode="direct")
+
+    sampler = TreeSampler(opt, backend="native", seed=0)
+    assert sampler.resolved_backend == "torch"
+    configs = _all_configs(3)
+    probs = sampler.probabilities(configs, to_numpy=False)
+    assert torch.is_tensor(probs)
+    assert np.allclose(probs.detach().cpu().numpy(), sampler.probabilities(configs))
+
+    result = sampler.sample_batch(32, seed=3)
+    assert result.backend == "torch"
+    assert torch.is_tensor(result.configs)
+    assert torch.is_tensor(result.probs)
+    assert torch.is_tensor(result.magnetizations(to_numpy=False))
+    host = result.to_numpy()
+    assert isinstance(host.configs, np.ndarray)
+    assert np.allclose(host.probs, sampler.probabilities(host.configs))
+
+    host_sampler = TreeSampler(opt, backend="numpy")
+    host_configs, host_probs = host_sampler.sample_arrays(8, seed=4)
+    assert isinstance(host_configs, np.ndarray)
+    assert isinstance(host_probs, np.ndarray)
+
+
+def test_tree_sampler_rejects_explicit_backend_mismatch():
+    torch = pytest.importorskip("torch")
+    del torch
+    opt = TreeOptimizer(None, n=2)
+    with pytest.raises(ValueError, match="requires a live torch tree"):
+        TreeSampler(opt, backend="torch")
+
+
+def test_tree_sampler_preserves_cupy_backend_when_available():
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    to_backend = lambda array: cupy.asarray(array, dtype=cupy.complex128)
+    state = TreeOptimizer(None, n=2).tn
+    state.apply_to_arrays(to_backend)
+    opt = TreeOptimizer([(to_backend(pepsy.h()), 0)], state=state, mode="direct")
+    sampler = TreeSampler(opt, backend="native")
+
+    result = sampler.sample_batch(16, seed=2)
+    assert sampler.resolved_backend == "cupy"
+    assert isinstance(result.configs, cupy.ndarray)
+    assert isinstance(result.probs, cupy.ndarray)
+    assert isinstance(sampler.probabilities(result.configs, to_numpy=False), cupy.ndarray)
+    assert isinstance(result.to_numpy().configs, np.ndarray)
 
 
 def test_sample_returns_list_result():

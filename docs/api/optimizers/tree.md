@@ -59,6 +59,32 @@ structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
 
+## Tree-edge entanglement entropy
+
+A tree has one physical bipartition for every parent-child bond, not one
+left/right middle cut. `TreeTensorNetwork.tree_edge_entropies()` measures the
+base-2 von Neumann entropy across every such bond:
+
+```python
+entropies, edges = opt.tn.tree_edge_entropies(return_edges=True)
+# edges[i] == (parent_node, child_node)
+single_edge_entropy = opt.entropy(edges[0])
+```
+
+The implementation follows Quimb's canonical Schmidt-spectrum approach. It
+canonicalizes one private copy around the root, then performs one local SVD
+per edge; the live state and its canonical centre are unchanged. Dense
+Torch/CuPy states stay on their original backend through Autoray linalg, and
+native Symmray states use the sector-aware SVD. Only the one-dimensional
+singular spectra are reduced to scalar entropy values, so the full statevector
+is never formed. `method="eig"` (or `"svd:eig"`) selects the Gram-matrix
+variant when that is preferable for the local dimensions.
+
+`TreeOptimizer.entropy(...)`, `TreeOptimizer.tree_edge_entropies(...)`, and
+`TreeOptimizer.entanglement_entropy(...)` are thin state-preserving delegates.
+These values describe tree-edge bipartitions and should not be interpreted as
+an MPS chain-cut profile; each edge is identified by its returned node pair.
+
 ## Layout-aware native MPOs
 
 After selecting a plan, the canonical tree-native operator is built with

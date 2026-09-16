@@ -195,6 +195,9 @@ kept only for compatibility dense readout through `to_dense()`. Consequently,
 TreeFIT targets, bond estimates, and state application never allocate exterior
 identity layers or operator bonds. The complete source is used only when a
 caller explicitly requests the compatibility dense representation.
+`TreeSubPEPO.validate()` validates this compact core; use
+`TreeSubPEPO.validate(full=True)` when the lazily materialized compatibility
+operator should be validated as well.
 
 Dense `TreePEPO` term sums also receive an exact structural edge sweep before
 their center-oriented SVD compression. The sweep is restricted to NumPy
@@ -387,7 +390,12 @@ for native Symmray tensors. `fit_rtol="auto"` selects a dtype-aware tolerance,
 and `run(finite_check=True)` temporarily enables finite-value scans. Initial
 guesses may be `"direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-dm"`,
 `"random"`, or `"random_expand"`; random policies are disposable, seeded,
-and active-span only. `get_fit_diagnostics()` reports the cache hit/miss
+and active-span only. `TreeFIT` prepares the first local block for direct and
+random guesses, while `guess-*` policies reuse the optimizer's prepared
+active-region proof rather than rebuilding it for the disposable operator
+application. Thus the named DMRG modes retain their same sweep schedules;
+`dmrg3` can still cost more per block because its three-site factorization is
+larger. `get_fit_diagnostics()` reports the cache hit/miss
 counts, block schedule, traversal, convergence, and the MPS-compatible
 retained-centre-norm `local_fidelity`.
 As with `TreeOptimizer`, small tensor updates use one BLAS/OpenMP thread by

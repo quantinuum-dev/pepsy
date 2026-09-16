@@ -62,6 +62,66 @@ def test_tree_peps_dmrg_defaults_use_rl_and_path_aware_traversal():
     assert diagnostics["resolved_traversal"] == "path"
 
 
+def test_tree_peps_dmrg_direct_guess_skips_redundant_outer_prepare(monkeypatch):
+    """TreeFIT owns first-block preparation for a direct disposable guess."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.rand(plan, bond_dim=2, seed=31),
+        mode="dmrg2",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="direct",
+        track_infidelity=False,
+        run=False,
+    )
+    prepared = []
+    monkeypatch.setattr(
+        optimizer,
+        "_prepare_span",
+        lambda span: prepared.append(frozenset(span)),
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    assert prepared == []
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
+def test_tree_peps_dmrg_guess_src_prepares_once(monkeypatch):
+    """A warm-start guess reuses the optimizer's one canonical proof."""
+
+    plan = TreePepsPlan.from_shape((2, 3))
+    optimizer = TreePepsOptimizer(
+        TreePeps.rand(plan, bond_dim=2, seed=32),
+        mode="dmrg2",
+        chi=2,
+        cutoff=0.0,
+        fit_n_iter=1,
+        fit_init_strategy="guess-src",
+        track_infidelity=False,
+        run=False,
+    )
+    prepared = []
+    canonicalize_region = TreePeps._canonicalize_region_fast
+
+    def count_canonicalize_region(state, region, *, absorb="right", **opts):
+        prepared.append(frozenset(region))
+        return canonicalize_region(state, region, absorb=absorb, **opts)
+
+    monkeypatch.setattr(
+        TreePeps,
+        "_canonicalize_region_fast",
+        count_canonicalize_region,
+    )
+
+    optimizer.apply_gate(_cnot(), (0, 4))
+
+    assert len(prepared) == 1
+    assert optimizer.validate(check_canonical=True) is optimizer
+
+
 def test_tree_peps_threads_cap_tensor_updates_and_copy_policy(monkeypatch):
     """PEPS uses the same bounded host-thread policy as TreeOptimizer."""
 
@@ -513,9 +573,39 @@ def test_tree_sub_treepepo_materializes_only_its_active_span():
     }
     assert subop.active_operator.validate()
     # Keep the complete representation available for the compatibility dense
-    # readout while routing updates through the compact view.
+    # readout while routing updates through the compact view. It is lazy: the
+    # source held immediately after construction is still compact.
     assert len(subop.operator.tensors) == len(subop.span)
+    assert len(subop._full_operator.tensors) == len(subop.span)
+    assert subop._full_operator is subop.operator
     assert len(subop.full_operator.tensors) == plan.size
+    compact_copy = subop.copy()
+    assert compact_copy._full_operator is compact_copy.operator
+
+
+@pytest.mark.parametrize("mode", ["direct", "dmrg"])
+def test_tree_peps_gate_routes_do_not_materialize_full_sub_treepepo(monkeypatch, mode):
+    plan = TreePepsPlan.from_shape((2, 3))
+    options = {
+        "mode": mode,
+        "chi": 2,
+        "cutoff": 0.0,
+        "track_infidelity": False,
+        "run": False,
+    }
+    if mode == "dmrg":
+        options.update(fit_n_iter=1, fit_init_strategy="direct")
+    optimizer = TreePepsOptimizer(TreePeps.from_plan(plan), **options)
+
+    def fail_full_materialization(*args, **kwargs):
+        raise AssertionError("gate route requested the full TreeSubPepo")
+
+    monkeypatch.setattr(
+        TreeSubPepo,
+        "_materialize_full_operator",
+        fail_full_materialization,
+    )
+    optimizer.apply_gate(_cnot(), (0, 4))
 
 
 def test_tree_peps_fit_target_has_operator_layers_only_on_active_span():

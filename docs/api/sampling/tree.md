@@ -16,6 +16,27 @@ configs = batch.configs        # (n_samples, nqubits) int array
 probs = batch.probs            # (n_samples,) Born probabilities
 ```
 
+For dense NumPy, Torch, or CuPy trees, `TreeSampler` preserves the live array
+backend by default. `backend="native"` makes that choice explicit, while
+`backend="numpy"` requests a host copy. Explicit `backend="torch"` or
+`backend="cupy"` requires the live tree tensors to already use that backend;
+prepare gate/operator payloads with `TreeOptimizer.to_backend(...)`, and use
+the resulting converter with `TreeTensorNetwork.apply_to_arrays(...)` when
+moving the live TTN tensors before constructing the sampler. Native batch
+results and raw arrays remain on the state device, and `batch.to_numpy()` or
+`sample_arrays(..., to_numpy=True)` performs an explicit host conversion:
+
+```python
+sampler = TreeSampler(torch_tree_optimizer, backend="native")
+batch = sampler.sample_batch(n_samples=4096, seed=0)
+torch_configs = batch.configs
+numpy_configs = batch.to_numpy().configs
+```
+
+`amplitudes(..., to_numpy=False)` and `probabilities(..., to_numpy=False)`
+likewise return arrays on the resolved native backend. The legacy `sample()`
+method continues to return host Python lists.
+
 The source object is never mutated: the sampler copies the tree, moves the
 orthogonality centre onto the root, normalizes, and caches the per-node arrays.
 After the source state changes, call `sampler.refresh()` before sampling again.

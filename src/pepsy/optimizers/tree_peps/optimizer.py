@@ -1108,7 +1108,7 @@ class TreePepsOptimizer:
             return ar.do("array", array, like=like)
 
         if isinstance(payload, TreeSubPepo):
-            operator = self.to_backend(payload.full_operator)
+            operator = self.to_backend(payload.operator)
             return TreeSubPepo(operator, payload.support, span=payload.span)
         if isinstance(payload, TreePepo):
             operator = payload.copy()
@@ -1605,6 +1605,7 @@ class TreePepsOptimizer:
             compression_seed=self.fit_init_seed,
             compression_layout=compression_layout,
             _active_sites=span,
+            _prepared_region=span,
         )
         return guess, strategy, None
 
@@ -1829,10 +1830,24 @@ class TreePepsOptimizer:
         fit_diagnostics = None
         fit_target = None
 
-        # The state is canonical around the active region before the complete
-        # PEPO is applied.  This is a fast metadata-aware move when possible.
-        self._prepare_span(span)
         use_tree_fit = bool(compress and mode == "dmrg")
+        if use_tree_fit:
+            fit_init_strategy = self._normalize_fit_init_strategy(
+                self.fit_init_strategy
+            )
+            # TreeFIT prepares each first local block itself.  Direct and
+            # random guesses therefore do not need a separate live-state QR
+            # sweep; guess-* initializers apply the PEPO through the state and
+            # need the exterior canonical proof supplied above.
+            needs_fit_preparation = fit_init_strategy.startswith("guess_") and (
+                fit_init_strategy != "guess_direct"
+            )
+            if needs_fit_preparation:
+                self._prepare_span(span)
+        else:
+            # The non-FIT compression paths still use the prepared live state
+            # as their local gauge and compression starting point.
+            self._prepare_span(span)
         if use_tree_fit:
             result, fit_target, fit_diagnostics = self._apply_operator_fit(
                 operator,
@@ -2108,7 +2123,7 @@ class TreePepsOptimizer:
             raise ValueError("mode='sub_treepepo' requires a TreeSubPepo operator")
         support = self._normalize_support(where)
         self._validate_backend_payload(gate, path="gate")
-        operator = TreePepo.from_operator(
+        suboperator = TreeSubPepo.from_gate(
             self.plan,
             ar.to_numpy(gate),
             support,
@@ -2116,11 +2131,10 @@ class TreePepsOptimizer:
             dtype=self._gate_dtype(gate),
             max_operator_sites=self.max_operator_sites,
         )
-        # Dense TreePepo factorization currently uses host-side NumPy
-        # decompositions. Convert the resulting operator back to the live
-        # state's backend before the strict operator validation boundary.
-        operator = self.to_backend(operator)
-        suboperator = TreeSubPepo(operator, support)
+        # Dense TreeSubPepo factorization uses host-side NumPy decompositions.
+        # Convert only the compact active span back to the live backend before
+        # the strict operator validation boundary.
+        suboperator = self.to_backend(suboperator)
         return self.apply_sub_treepepo(
             suboperator,
             _mode=route_mode,
@@ -2765,14 +2779,14 @@ class TreePepsOptimizer:
             kind = entry[0]
             if kind == "gate":
                 support = tuple(entry[2])
-                operator = TreePepo.from_operator(
+                operator = TreeSubPepo.from_gate(
                     self.plan,
                     entry[1],
                     support,
                     dims=self._physical_dims(),
                     dtype=self._gate_dtype(entry[1]),
                     max_operator_sites=self.max_operator_sites,
-                )
+                ).operator
             elif kind == "sub_treepepo":
                 operator = entry[1].operator
                 support = tuple(entry[1].support)

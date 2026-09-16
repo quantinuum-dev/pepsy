@@ -222,3 +222,63 @@ operator storage does not make every first FIT contraction region-only.
 Caches are reused within a fit, not across unrelated gate targets. Standalone
 raw state edits need explicit cache and canonical-metadata invalidation.
 No numerical implementation change was required by this review.
+
+## TreeSubPepo compact-source follow-up
+
+The 2026-09-15 follow-up removed the remaining compact-source overhead. A
+`TreeSubPepo` built directly from a local gate now keeps one active operator
+network; the compatibility source aliases that network until a full view is
+explicitly requested. Copies of compact sources remain compact, while copies
+of an explicitly supplied complete source preserve that source.
+
+Lazy full-view reconstruction no longer guesses exterior physical dimensions.
+It requires positive dimensions for every plan site and checks that declared
+dimensions agree with the compact physical legs. Missing or inconsistent
+metadata raises before any full identity layer is allocated. Compact validation
+is the hot-path default; `validate(full=True)` explicitly validates the
+compatibility view as well.
+
+Upstream compatibility was rechecked against the existing audited sources:
+[Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray](https://github.com/jcmgray/autoray),
+[Cotengra documentation](https://cotengra.readthedocs.io/en/latest/) and
+[changelog](https://cotengra.readthedocs.io/en/latest/changelog.html), and
+[Symmray](https://github.com/jcmgray/symmray). Installed versions remain
+Quimb `1.15.1.dev51+g2e99c793e`, Autoray `0.11.1.dev3+g1b476b305`, Cotengra
+`0.8.3.dev7+g1d7fd333f`, and Symmray `0.3.2.dev8+g6c6dd34b5`. The installed
+public signatures for `Tensor`, `Tensor.modify`, `Tensor.transpose`, and
+`TensorNetwork.copy` were probed. Classification: **adopt** the existing
+public tensor APIs; no upstream shim or dependency change was needed.
+
+Validation: 128 focused TreePEPO/TreePeps/TreePepsOptimizer tests passed, and
+the broader selected tree regression set also passed 128 tests with 455
+deselected. Added coverage checks single-network compact construction,
+heterogeneous physical dimensions, explicit full validation, missing-dimension
+failure, and direct/DMRG gate routes that forbid full-view materialization.
+
+## TreePeps DMRG setup-cost review
+
+The 2026-09-15 performance review compared `dmrg`, `dmrg1`, `dmrg2`, and
+`dmrg3` on branching TreePeps gate spans. The TreeFIT sweep itself is bounded
+and small relative to setup. The dominant common costs were the default
+`guess-src` disposable operator application and a second canonical-region
+preparation inside that application. `dmrg3` is expected to spend more per
+local block because its factorization is three-site; `dmrg1` can also use one
+extra refinement sweep under its named schedule. Neither alias had an
+unbounded or duplicated sweep loop.
+
+The optimizer now lets TreeFIT prepare the first local block directly for
+`direct` and random guesses, and passes the already prepared active-region
+proof to `TreePepo.apply_to` for `guess-*` warm starts. This removes setup QR
+work without changing target construction, block sizes, sweep counts, or
+canonical validation. The public default remains `guess-src` for quality and
+MPS parity; `fit_init_strategy="direct"` remains the throughput-oriented
+choice when a warm-start compression is not needed.
+
+Validation: focused TreePeps optimizer and TreePEPO tests passed after the
+change, including checks that direct DMRG skips outer preparation, guess-src
+prepares once, and all resulting states pass canonical validation. A timing
+benchmark on representative 8x8--16x16 branching spans showed the direct
+guess path removing the roughly 0.15--0.27 second outer-preparation component;
+the default guess-src path removes its duplicate canonicalization while
+retaining the warm-start application.
