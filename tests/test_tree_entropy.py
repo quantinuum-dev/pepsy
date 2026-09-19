@@ -117,3 +117,26 @@ def test_native_tree_entropy_matches_nonmaximal_charge_sector_state(fermionic):
             expected, atol=1e-10,
         )
     np.testing.assert_allclose(_dense_state(state), before, atol=1e-12)
+
+
+def test_torch_tree_entropy_avoids_host_array_conversion(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import importlib
+
+    ttn_module = importlib.import_module("pepsy.optimizers.tree.ttn")
+    plan = pepsy.TreePlan.from_order(range(4), structure="balanced")
+    state = pepsy.TreeTensorNetwork.rand(plan, D=2, seed=11, dtype="complex128")
+    state.apply_to_arrays(
+        pepsy.backend_torch(device="cpu", dtype=torch.complex128),
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("tree entropy must not convert tensor arrays to NumPy")
+
+    monkeypatch.setattr(ttn_module.ar, "to_numpy", forbidden)
+    monkeypatch.setattr(torch.Tensor, "numpy", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+
+    entropies = state.tree_edge_entropies()
+    assert entropies.shape == (len(plan.parent),)
+    assert np.all(np.isfinite(entropies))

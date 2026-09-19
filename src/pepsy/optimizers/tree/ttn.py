@@ -50,7 +50,7 @@ from quimb.tensor.decomp import qr_stabilized as _quimb_qr_stabilized
 from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
-from ...backends import to_float
+from ...backends import get_torch_linalg_config, to_float
 from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
@@ -579,8 +579,32 @@ def _tree_bond_singular_values(tensor, bond, *, method="svd"):
         )
         return ar.do("flip", ar.do("sqrt", eigenvalues), axis=0)
 
-    svd_result = ar.do("linalg.svd", matrix, full_matrices=False)
-    return svd_result.S if hasattr(svd_result, "S") else svd_result[1]
+    backend = ar.infer_backend(matrix)
+    if backend == "torch":
+        # ``svdvals`` avoids allocating U and Vh while keeping the tree
+        # diagnostic on the tensor device. Honor non-default Pepsy policies
+        # that deliberately select a custom CPU or stabilized SVD wrapper.
+        config = get_torch_linalg_config()
+        use_native_values = config is None or (
+            not config.stabilized and config.cpu_svd == "torch"
+        )
+        if use_native_values:
+            svd_kwargs = {}
+            driver = None if config is None else config.svd_driver
+            if getattr(matrix, "is_cuda", False) and driver not in {None, "auto"}:
+                svd_kwargs["driver"] = driver
+            return ar.do("linalg.svdvals", matrix, **svd_kwargs)
+
+    try:
+        return ar.do(
+            "linalg.svd",
+            matrix,
+            full_matrices=False,
+            compute_uv=False,
+        )
+    except TypeError:
+        svd_result = ar.do("linalg.svd", matrix, full_matrices=False)
+        return svd_result.S if hasattr(svd_result, "S") else svd_result[1]
 
 
 def _entropy_from_singular_values(singular_values):
@@ -591,12 +615,11 @@ def _entropy_from_singular_values(singular_values):
         singular_values = singular_values.to_dense()
     weights = ar.do("abs", singular_values) ** 2
     total = ar.do("sum", weights)
-    total_value = to_float(total, real=True)
-    if not np.isfinite(total_value):
-        raise ValueError("tree entropy requires a finite state norm.")
-    if total_value <= 0.0:
-        return 0.0
-    probabilities = weights / total
+    # Normalize and handle a zero spectrum without reading back ``total``.
+    # The only host synchronization in a scalar entropy query is the final
+    # Python result conversion below.
+    safe_total = ar.do("where", total > 0.0, total, 1.0)
+    probabilities = weights / safe_total
     # Replacing zero probabilities by one only inside log avoids ``0 * -inf``.
     safe_probabilities = ar.do(
         "where", probabilities > 0.0, probabilities, 1.0,
@@ -605,7 +628,10 @@ def _entropy_from_singular_values(singular_values):
         "sum",
         probabilities * ar.do("log2", safe_probabilities),
     )
-    return max(0.0, to_float(value, real=True))
+    value = to_float(value, real=True)
+    if not np.isfinite(value):
+        raise ValueError("tree entropy requires a finite state norm and result.")
+    return max(0.0, value)
 
 
 def _native_qr_options_for_tensor(tensor):

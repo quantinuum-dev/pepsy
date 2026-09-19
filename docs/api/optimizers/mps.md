@@ -13,6 +13,18 @@ opt.run()
 The previous constructor default was `"dmrg"`. Specify `mode="dmrg"` (or a
 named `dmrg1`/`dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
 
+For a normalized base-2 entropy diagnostic, use the middle MPS bond by
+default or pass an explicit bipartition index:
+
+```python
+entropy = opt.entropy()       # sites 0 .. L // 2 - 1 versus the rest
+entropy = opt.entanglement_entropy(cut=8)
+```
+
+Both names canonicalize an owned private copy and keep the SVD and entropy
+reduction on the MPS backend. The live state, exponent, and canonical-center
+metadata are preserved.
+
 For correlation lengths of repeating unit cells or local MPS tensor windows,
 see the [MPS transfer diagnostics](../tensors/observables.md).
 These measurements live in `pepsy.tensors` and do not change optimizer state.
