@@ -1,5 +1,28 @@
 # Tensor observables
 
+## Finite-MPS entanglement entropy
+
+Use `mps_entanglement_entropy` for a normalized base-2 Schmidt entropy across
+an open-MPS bond:
+
+```python
+from pepsy.tensors import mps_entanglement_entropy
+
+entropy = mps_entanglement_entropy(psi)       # middle cut
+entropy = mps_entanglement_entropy(psi, cut=8)
+```
+
+The helper canonicalizes a fully owned private copy, then performs the local
+SVD and entropy reduction through the MPS array backend. Torch and CuPy
+tensors remain on their current device; native Symmray tensors retain their
+sector-aware spectrum. Only scalar reductions are read back for the Python
+`float` result. `method="eig"` selects the Gram-matrix variant. Cyclic MPSs
+are rejected because they do not have a single open-chain Schmidt cut.
+
+`MpsOptimizer.entropy(...)`, `MpsOptimizer.entanglement_entropy(...)`, and
+`MpsSampler.entanglement_entropy(...)` delegate to the same helper and do not
+mutate the live or captured source state.
+
 ## MPS transfer spectra and correlation lengths
 
 ```python

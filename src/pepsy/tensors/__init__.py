@@ -93,7 +93,12 @@ _register(
     "contract_hypercompressed_tn_batch",
     "tn_norm",
 )
-_register(".observables", "measure_obs", "tn_fidelity")
+_register(
+    ".observables",
+    "measure_obs",
+    "mps_entanglement_entropy",
+    "tn_fidelity",
+)
 _register(".mps_transfer", "MpsTransferSpectrum", "mps_transfer_spectrum", "mps_correlation_length")
 _register(".conversions", "mps_to_ttn", "mps_to_treepeps")
 _register(".validation", "validate_tensor_network_tags")

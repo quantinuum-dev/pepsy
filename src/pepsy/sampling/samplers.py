@@ -1211,6 +1211,24 @@ class MpsSampler:
         )
         return self
 
+    def entanglement_entropy(self, cut=None, *, method="svd"):
+        """Measure entropy across one bond of the captured source MPS.
+
+        The source state is not mutated. The calculation is delegated to the
+        backend-native tensor observable, so selecting ``backend="quimb"`` for
+        sampling does not force this diagnostic through the sampler's legacy
+        GPU-to-CPU compatibility copy.
+        """
+        from ..tensors.observables import (  # pylint: disable=import-outside-toplevel
+            mps_entanglement_entropy,
+        )
+
+        return mps_entanglement_entropy(
+            self._source_psi,
+            cut=cut,
+            method=method,
+        )
+
     @property
     def physical_code_maps(self):
         """Per-site Symmray ``physical_code -> (charge, sector_offset)`` maps.

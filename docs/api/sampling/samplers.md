@@ -90,6 +90,11 @@ require quimb to canonicalize Torch or CuPy tensors before sampling.
 It caches those environments for the current MPS tensors: after modifying the
 MPS, call `sampler.refresh()` before sampling again.
 
+`sampler.entanglement_entropy(cut=None)` measures the captured source MPS at
+the requested bond (`None` selects the middle cut). It delegates to
+`pepsy.tensors.mps_entanglement_entropy`, so the entropy diagnostic uses the
+source array backend rather than the legacy Quimb sampling copy.
+
 ### Dense exact-vector sampler
 
 `VecSampler` supports computational-basis and Pauli-basis sampling from a

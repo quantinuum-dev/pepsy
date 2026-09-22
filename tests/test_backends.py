@@ -1071,10 +1071,19 @@ def test_to_float_uses_real_component_by_default():
 
 def test_to_float_handles_torch_scalar_if_available():
     torch = pytest.importorskip("torch")
+    import autoray as ar
 
     value = torch.tensor(3.5 + 1.25j, dtype=torch.complex128, requires_grad=True)
 
-    assert pepsy.to_float(value) == pytest.approx(3.5)
+    def forbidden(_value):
+        raise AssertionError("Torch scalar conversion should use .item() directly.")
+
+    original_to_numpy = ar.to_numpy
+    ar.to_numpy = forbidden
+    try:
+        assert pepsy.to_float(value) == pytest.approx(3.5)
+    finally:
+        ar.to_numpy = original_to_numpy
 
 
 @pytest.mark.parametrize("complex_input", (False, True))

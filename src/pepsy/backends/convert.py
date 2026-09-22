@@ -26,15 +26,25 @@ def _backend_scalar(value):
         if shape != ():
             raise TypeError(f"Expected a scalar-like value, got shape {shape}.")
 
-    if shape is not None:
+    # Prefer the backend scalar protocol before Autoray's host-array bridge.
+    # For Torch/CuPy device scalars this still synchronizes and returns one
+    # Python value, but it avoids materializing a NumPy scalar array and never
+    # transfers the surrounding tensor data.
+    obj = value
+    item = getattr(value, "item", None)
+    if shape is not None and callable(item):
+        try:
+            obj = item()
+        except (TypeError, ValueError, RuntimeError):
+            obj = value
+
+    if obj is value and shape is not None:
         try:
             obj = ar.to_numpy(value)
         except Exception:
             # Keep supporting duck-typed scalar wrappers with ``item`` but no
             # registered Autoray backend.
             obj = value
-    else:
-        obj = value
 
     item = getattr(obj, "item", None)
     if callable(item) and not isinstance(obj, _SCALAR_TYPES):
@@ -56,8 +66,9 @@ def to_float(value, *, real=True):
     """Convert a scalar-like backend value to a Python ``float``.
 
     The input can be a Python scalar, NumPy scalar or scalar array, or a
-    scalar-like backend tensor. Autoray converts backend scalar arrays to host
-    NumPy before extracting ``.item()``. Non-scalar arrays raise ``TypeError``.
+    scalar-like backend tensor. Backend scalar arrays use ``.item()`` directly
+    when available, avoiding an intermediate host NumPy array; unsupported
+    scalar wrappers fall back to Autoray. Non-scalar arrays raise ``TypeError``.
 
     Parameters
     ----------

@@ -88,6 +88,7 @@ from ..._internal.quimb import (
     quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
     require_quimb_1d_compression_method as _require_quimb_compression_method,
 )
+from ...tensors.core import mps_entanglement_entropy as _mps_entanglement_entropy
 from ...tensors.core import tn_fidelity
 from ...operators.gates import (
     _normalize_gate_entries,
@@ -3614,6 +3615,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # stabilization. Rebase that scalar on the next run.
         self._invalidate_unitary_norm_baseline()
         return old_norm
+
+    def entropy(self, cut=None, *, method="svd"):
+        """Return normalized base-2 entropy across one MPS bond.
+
+        The measurement is performed by
+        :func:`pepsy.tensors.mps_entanglement_entropy` on a private copy, so
+        the optimizer's live tensors, exponent, and canonical metadata are
+        preserved.
+        """
+        return _mps_entanglement_entropy(self.p, cut=cut, method=method)
+
+    def entanglement_entropy(self, cut=None, *, method="svd"):
+        """Alias for :meth:`entropy` with an explicit diagnostic name."""
+        return self.entropy(cut=cut, method=method)
 
     def _copy_impl(self, *, capture_initial):
         """Copy optimizer state, optionally retaining a shot-replay template."""
