@@ -282,6 +282,42 @@ blocks. Dense payloads cannot be promoted to native Symmray gates because that
 would lose charge and fermionic metadata; construct those gates with the
 matching Symmray convention instead.
 
+Rebuilding an MPS after exact replay, including before a control event,
+preserves its dense backend, dtype, device, and physical index names. Dense
+measurement/reset replay prepares fixed Pauli/Clifford constants once per
+backend/device/dtype and builds projectors and bond-two MPO tensors with
+Autoray operations on that backend. Constants are copied on-device before
+use to protect the cache from mutation. Native Symmray retains its separate
+metadata-aware route. Explicit random FIT perturbations use an Autoray
+backend generator with `random.array`; a seed is reproducible within the
+same backend, not necessarily across different backends.
+
+With `finite_check=False`, ordinary Torch/JAX/CuPy unitary compression keeps
+working norms, fidelity ratios, and cumulative log-fidelity on the backend.
+Autoray handles the scalar arithmetic; diagnostic values are detached from
+autograd, while enabled unitary normalization retains its numerical gradient
+path and the state dtype. Torch/CuPy diagnostics use double-precision scalar
+arithmetic, matching the previous Python ledger, except Torch on Apple Metal
+uses float32 because that device does not support float64. JAX respects its
+configured precision. Native Symmray states benefit when their norm reductions return
+one of these backend scalars.
+
+Optional checks and profiling are disabled by default: `finite_check=False`,
+`fit_overlap_diagnostics=False`, `quality_check_every=False`, `timing=False`,
+and `timing_sync_device=False`. Disabled timing performs no profiling clock
+reads, timing-record allocation, or timing-related accelerator synchronization.
+Norm and infidelity bookkeeping remains active independently of these options.
+
+`norm_events` can contain backend scalars. `get_norm_events()` and
+`norm_diagnostics()` explicitly return Python-valued diagnostics; requesting
+them or displaying progress can synchronize the device. A zero-norm flag is
+accumulated on-device and checked once before ordinary replay returns, rather
+than reading each compression norm. Zero norms still raise from `run()`;
+`finite_check=True` keeps immediate per-step validation. FIT adaptive stopping,
+measurement/branch decisions, nonunitary exponent normalization, and explicit
+synchronized timing retain their necessary host boundaries. This does not
+remove synchronization inside upstream SVD/truncation implementations.
+
 Canonical metadata and observable readout are deliberately separate. Internal
 mid-circuit `measure`, `reset`, and Kraus paths pass the live `info_c` mapping
 through Quimb's canonical routines, so moving the centre during state
@@ -401,6 +437,10 @@ Launch the program with `mpiexec -n 4 ...`; `mpi=True` uses the already-launched
 communicator and does not create MPI processes itself. Each shot is initialized
 from the optimizer's constructor snapshot, so repeated seeded ensembles are
 stable and do not mutate the template optimizer.
+
+`MpsOptimizer.run` also defaults to `collect_diagnostics=False` for MPI shots:
+rank diagnostic records and their profiling clocks are disabled. Set
+`collect_diagnostics=True` explicitly to collect MPI rank summaries and timing.
 
 The practical shot-mode matrix is:
 

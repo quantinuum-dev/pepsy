@@ -733,7 +733,12 @@ def test_mps_optimizer_modes_skip_clocks_when_timing_disabled(
         "_make_backend_synchronizer",
         fail_synchronizer,
     )
-    optimizer.run(progbar=False, timing=False, timing_sync_device=True)
+    monkeypatch.setattr(optimizer, "_mps_data_is_finite", fail_synchronizer)
+    monkeypatch.setattr(optimizer, "_fit_overlap_diagnostics", fail_synchronizer)
+    monkeypatch.setattr(optimizer, "_run_quality_check", fail_synchronizer)
+    # Omit timing/diagnostic flags to guard their public defaults. Even an
+    # explicit sync request must remain inert while timing is disabled.
+    optimizer.run(progbar=False, timing_sync_device=True)
 
     assert optimizer.get_run_timing() is None
 

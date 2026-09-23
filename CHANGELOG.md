@@ -14,6 +14,13 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- `MpsOptimizer` preserves array backend, dtype, device, and physical index
+  names when rebuilding an MPS after exact replay. Dense random FIT guesses
+  use Autoray's backend generator instead of passing a NumPy generator to
+  Torch/JAX. Measurement/reset replay caches fixed control matrices per
+  backend/device/dtype and assembles projectors on that backend, avoiding
+  repeated host uploads after the constants are prepared.
+
 - Tree entropy now extracts Schmidt weights from the orthogonality centre
   at each cut. Reading off-centre isometries previously returned
   `log2(bond_dim)` for nonuniform spectra. `TreeSampler` uses the corrected
@@ -21,6 +28,19 @@ Changes for the next release should be added here before the version is bumped.
   or the live optimizer.
 
 ### Changed
+
+- `MpsOptimizer.run` now defaults MPI `collect_diagnostics` to `False`,
+  matching its opt-in finite checks, overlap diagnostics, quality checks,
+  and timing. Disabled MPI diagnostics skip profiling clock reads in ordinary,
+  streaming, and checkpointed shot execution.
+
+- `MpsOptimizer` retains Torch/JAX/CuPy unitary compression norms and fidelity
+  bookkeeping on-device using Autoray. Diagnostic histories are detached
+  from autograd, and getters retain their Python-valued output. Normal replay
+  reads one accumulated zero-norm flag before returning; `finite_check=True`
+  preserves immediate validation. FIT stopping and physical control decisions
+  retain their existing scalar reads. Complete loss overrides NaN history in
+  either order, and Apple Metal diagnostic scalars use supported float32 precision.
 
 - Roughening benchmark integration defaults now use Torch `complex128` with
   automatic device selection, disable sampled local-energy and XX estimators,

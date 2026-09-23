@@ -418,6 +418,15 @@ _PAULI_1Q = {
     "Z": np.array([[1, 0], [0, -1]], dtype=complex),
 }
 
+_CONTROL_CLIFFORDS = {
+    "H": np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2),
+    "HY": np.array([[1, -1j], [1, 1j]], dtype=complex) / np.sqrt(2),
+    "CX": np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    ),
+}
+
 _SYMBOLIC_ONE_QUBIT_GATES = {
     "h": _gate_primitives.h,
     "hadamard": _gate_primitives.hadamard,
@@ -1567,6 +1576,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Automatic norm-survival records for compressed gates and physical
         projective/Kraus boundaries. Physical branch probabilities are stored
         on their event but are not multiplied into compression infidelity.
+        Accelerator compression records retain detached backend scalars;
+        ``get_norm_events()`` returns independent Python-valued records.
     quality_checks : list[dict]
         Optional finite-data and canonical-gauge health records from
         ``run(quality_check_every=...)``.
@@ -2415,6 +2426,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.norm_events = []
         self._norm_summary_cache = None
         self._norm_log_survival = 0.0
+        self._pending_zero_norm = None
         self.quality_checks = []
         self.last_layout_plan = self._persistent_layout_plan
         self.scheduled_layout_plan = None
@@ -2442,6 +2454,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             and self._is_native_fermionic_product_state(self.p)
         )
         self.measurements = []
+        self._control_operator_cache = None
         self._rng = np.random.default_rng()
         self._unitary_previous_norm = None
         self.backend = None
@@ -3471,6 +3484,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.norm_events = []
         self._norm_summary_cache = None
         self._norm_log_survival = 0.0
+        self._pending_zero_norm = None
         self._dmrg1_one_site_locked = False
         self._dmrg1_native_product_two_site = (
             self._dmrg_mode_alias == "dmrg1"
@@ -3698,6 +3712,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.normalizations = history_copy(self.normalizations)
         copied.norm_events = history_copy(self.norm_events)
         copied._norm_log_survival = self._norm_log_survival
+        copied._pending_zero_norm = self._pending_zero_norm
         copied.quality_checks = deepcopy(self.quality_checks)
         copied.mix_history = deepcopy(self.mix_history)
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
@@ -4275,7 +4290,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Replay this stream as an independent or coalesced shot ensemble."""
@@ -4313,7 +4328,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
         ):
             raise ValueError(
@@ -5198,7 +5213,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
         retain="all",
     ):
@@ -5544,8 +5559,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Number of completed checkpoints retained on disk.
         checkpoint_sync : bool, default=True
             Synchronize checkpoint writes across MPI ranks.
-        collect_diagnostics : bool, default=True
-            Collect bounded-memory diagnostic summaries during reduction.
+        collect_diagnostics : bool, default=False
+            Opt in to bounded-memory MPI diagnostic summaries and rank timing
+            during reduction. Disabled runs skip those profiling clock reads.
         checkpoint_id : str, optional
             Stable identifier used to distinguish checkpoint streams.
             These options require ``mpi=True`` or an explicit MPI communicator.
@@ -6138,7 +6154,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     return result
 
                 return self._run_with_timing(checked_executor, **timing_options)
-            return self._run_with_timing(executor, **timing_options)
+            def deferred_checked_executor():
+                result = executor()
+                self._check_deferred_norm_errors()
+                return result
+
+            return self._run_with_timing(deferred_checked_executor, **timing_options)
         finally:
             self._fit_copy_policy_cache = previous_cache
             self._replay_rank_cache = previous_ranks
@@ -6810,9 +6831,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "are not the standard 1D site-index family."
             )
         dense = p.contract(all, output_inds=ordered, optimize=self.contraction_opt)
-        arr = np.asarray(ar.to_numpy(dense.data if hasattr(dense, "data") else dense))
-        mps = qtn.MatrixProductState.from_dense(arr, [d for d in arr.shape])
+        # Quimb splits backend arrays directly. A NumPy bridge here downloads
+        # the full state and invalidates the already-validated gate backend.
+        arr = dense.data if isinstance(dense, qtn.Tensor) else dense
+        mps = qtn.MatrixProductState.from_dense(
+            arr,
+            ar.shape(arr),
+            site_ind_id=self.ind_id,
+            site_tag_id=getattr(p, "site_tag_id", "I{}"),
+        )
         self.p = self._install_represented_norm(mps)
+        self.backend_info()
         # Freshly rebuilt: mark the centre as unknown so the next control event
         # establishes a tracked orthogonality centre (never via a blind scan).
         self.info_c["cur_orthog"] = None
@@ -7018,6 +7047,30 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         return self._to_state_backend(array)
 
+    def _control_operator(self, name):
+        """Return an owned small control matrix on the current state backend.
+
+        Only fixed Pauli/Clifford constants are cached, for one backend,
+        device and dtype at a time. Copies keep Quimb and trajectory branches
+        from mutating a cached operand. Native arrays still use the existing
+        metadata-aware conversion boundary, which rejects dense promotion.
+        """
+        signature = _array_backend_signature(self._state_backend_like())
+        cache = self._control_operator_cache
+        if cache is None or cache[0] != signature:
+            cache = self._control_operator_cache = (signature, {})
+        operators = cache[1]
+        if name not in operators:
+            source = _PAULI_1Q[name] if name in _PAULI_1Q else _CONTROL_CLIFFORDS[name]
+            operators[name] = self._to_state_backend(source)
+        return ar.do("copy", operators[name])
+
+    def _one_site_projector(self, axis, outcome):
+        """Assemble a Pauli projector without transferring a new host array."""
+        return 0.5 * (
+            self._control_operator("I") + outcome * self._control_operator(axis)
+        )
+
     def _pauli_operator(self, pauli, where):
         """Return the dense Pauli operator (numpy) for ``pauli`` on ``where``."""
         chars = [c for c in str(pauli).upper() if not c.isspace()]
@@ -7061,29 +7114,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         axes_by_site = dict(zip(sites, chars))
         span = tuple(range(min(sites), max(sites) + 1))
-        dtype_name = str(self.backend_dtype).lower()
-        dtype = np.complex64 if "complex64" in dtype_name else np.complex128
-        identity = np.eye(2, dtype=dtype)
+        identity = self._control_operator("I")
+        zero = ar.do("zeros_like", identity)
+        local_operators = {
+            axis: self._control_operator(axis) for axis in set(chars) | {"I"}
+        }
         arrays = []
 
         for position, site in enumerate(span):
-            local = np.asarray(
-                _PAULI_1Q[axes_by_site.get(site, "I")],
-                dtype=dtype,
-            )
+            local = local_operators[axes_by_site.get(site, "I")]
             if position == 0:
-                tensor = np.zeros((2, 2, 2), dtype=dtype)
-                tensor[0] = identity
-                tensor[1] = local
+                tensor = ar.do("stack", (identity, local))
             elif position == len(span) - 1:
-                tensor = np.zeros((2, 2, 2), dtype=dtype)
-                tensor[0] = 0.5 * identity
-                tensor[1] = 0.5 * int(outcome) * local
+                tensor = ar.do("stack", (0.5 * identity, 0.5 * int(outcome) * local))
             else:
-                tensor = np.zeros((2, 2, 2, 2), dtype=dtype)
-                tensor[0, 0] = identity
-                tensor[1, 1] = local
-            arrays.append(self._to_state_backend(tensor))
+                tensor = ar.do("stack", (
+                    ar.do("stack", (identity, zero)),
+                    ar.do("stack", (zero, local)),
+                ))
+            arrays.append(tensor)
 
         submpo = qtn.MatrixProductOperator(
             arrays,
@@ -7276,32 +7325,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.canonize_mps(self.p, anchor)
         if len(sites) == 1:
             tensor = self.p[anchor]
-            operator = _PAULI_1Q[axes[anchor]]
+            measured_axis = axes[anchor]
         else:
             state = self.p.copy()
             state.exponent = 0.0
             info = dict(self.info_c)
-            hadamard = np.array([[1., 1.], [1., -1.]]) / np.sqrt(2.)
             for site in sites:
                 axis = axes[site]
                 if axis == "Z":
                     continue
-                rotation = hadamard if axis == "X" else hadamard @ np.diag([1., -1j])
+                rotation = self._control_operator("H" if axis == "X" else "HY")
                 self._apply_dense_operator(state, rotation, (site,), max_bond=None,
                                            cutoff=0., cutoff_mode="abs", info=info)
             # Reduce along the ordered support rather than repeatedly crossing
             # the full span. The last parity lives at the leftmost site.
             for control, target in zip(reversed(sites[1:]), reversed(sites[:-1])):
-                self._apply_dense_operator(state, quimb.CNOT(), (control, target),
+                self._apply_dense_operator(state, self._control_operator("CX"), (control, target),
                                            max_bond=None, cutoff=0., cutoff_mode="abs", info=info)
             self.canonize_mps(state, anchor, info=info)
             tensor = state[anchor]
-            operator = _PAULI_1Q["Z"]
+            measured_axis = "Z"
         scale = tensor.norm()
         normalized = tensor / scale
         weights = []
         for sign in (1, -1):
-            projector = self._to_state_backend(0.5 * (np.eye(2) + sign * operator))
+            projector = self._one_site_projector(measured_axis, sign)
             projected = normalized.gate(projector, self.p.site_ind(anchor))
             amplitude = self._real_float(ar.do("abs", projected.norm()))
             weights.append(amplitude * amplitude)
@@ -7482,9 +7530,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 projected_norm = self._control_state_norm(include_exponent=False)
         else:
-            op = self._pauli_operator(pauli, where)
-            dim = op.shape[0]
-            projector = 0.5 * (np.eye(dim, dtype=complex) + m * op)
+            if len(where) == 1 and not self._replay_has_symmray_data(self.p):
+                axis = str(pauli).strip().upper()
+                projector = self._one_site_projector(axis, m)
+            else:
+                op = self._pauli_operator(pauli, where)
+                dim = op.shape[0]
+                projector = 0.5 * (np.eye(dim, dtype=complex) + m * op)
             self._apply_dense_operator(
                 self.p,
                 projector,
@@ -7523,7 +7575,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         flip_axis = _RESET_FLIP_AXES[axis]
         self._apply_dense_operator(
             self.p,
-            _PAULI_1Q[flip_axis],
+            self._control_operator(flip_axis),
             (q,),
             max_bond=self.chi,
             cutoff=cutoff,
@@ -7540,9 +7592,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             q = int(site)
             p_plus, p_minus = self._measurement_probabilities(axis, (q,))
             m = 1 if self._rng.random() < p_plus else -1
-            projector = 0.5 * (
-                np.eye(2, dtype=complex) + m * _PAULI_1Q[axis]
-            )
+            if self._replay_has_symmray_data(self.p):
+                projector = 0.5 * (
+                    np.eye(2, dtype=complex) + m * _PAULI_1Q[axis]
+                )
+            else:
+                projector = self._one_site_projector(axis, m)
             # Centre at q, collapse, renormalize, and (if needed) flip |1> -> |0>,
             # keeping the tracked centre at q throughout.
             self.canonize_mps(self.p, q)
@@ -7773,10 +7828,65 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # right edge to a one-site centre and read the raw centre norm instead
         # of contracting the full doubled MPS network once at stream start.
         current_span = self._current_orthog(p)
-        current_norm = self._real_float(
-            self._canonical_span_norm(p, current_span)
-        )
+        current_norm = ar.do("stop_gradient", ar.do(
+            "abs", self._canonical_span_norm(p, current_span)
+        ))
         self._unitary_previous_norm = current_norm
+
+    def _check_deferred_norm_errors(self):
+        """Read one accumulated zero-norm flag at a replay/readout boundary."""
+        pending = self._pending_zero_norm
+        if pending is None:
+            return
+        if bool(self._real_float(pending)):
+            raise FloatingPointError(
+                "Cannot stabilize a unitary FIT state with a zero or non-finite norm."
+            )
+        self._pending_zero_norm = None
+
+    def _accumulate_norm_survival(self, survival):
+        """Accumulate log fidelity without host reads or an autograd history."""
+        # log(0) is valid complete loss. Avoid divide-by-zero warnings on CPU.
+        zero = survival == 0.0
+        log_survival = ar.do("where", zero, -math.inf,
+                            ar.do("log", ar.do("where", zero, 1.0, survival)))
+        previous = self._norm_log_survival
+        backend = ar.infer_backend(log_survival)
+        if backend in {"torch", "jax", "cupy"}:
+            if ar.infer_backend(previous) != backend:
+                previous = ar.do("full_like", log_survival, self._real_float(previous))
+        elif ar.infer_backend(previous) in {"torch", "jax", "cupy"}:
+            log_survival = ar.do("full_like", previous, self._real_float(log_survival))
+        # Complete loss dominates NaNs in either order, matching the scalar
+        # ledger's unconditional survival == 0 branch.
+        complete_loss = ar.do("logical_or", previous == -math.inf, log_survival == -math.inf)
+        self._norm_log_survival = ar.do(
+            "where", complete_loss, -math.inf, previous + log_survival
+        )
+        cumulative = ar.do("exp", self._norm_log_survival)
+        infidelity = -ar.do("expm1", self._norm_log_survival)
+        if ar.infer_backend(self._norm_log_survival) in {"numpy", "builtins"}:
+            # Keep CPU histories directly serializable, without device reads.
+            self._norm_log_survival = self._real_float(self._norm_log_survival)
+            return self._real_float(cumulative), self._real_float(infidelity)
+        return cumulative, infidelity
+
+    def _norm_event_to_host(self, event):
+        """Materialize a diagnostic record only at an explicit host boundary."""
+        result = dict(event)
+        for key, value in result.items():
+            if getattr(value, "shape", None) == ():
+                scalar = self._real_float(value)
+                result[key] = bool(scalar) if key == "valid" else scalar
+        if not result["valid"]:
+            for key in (
+                "expected_norm", "expected_norm_sq", "observed_norm",
+                "observed_norm_sq", "fidelity_raw", "local_fidelity",
+                "local_infidelity", "cumulative_fidelity", "cumulative_infidelity",
+                "cumulative_compression_fidelity", "cumulative_compression_infidelity",
+            ):
+                result[key] = None
+        return result
 
     def _invalidate_unitary_norm_baseline(self):
         """Forget raw-norm scalars after an out-of-stream state rescaling.
@@ -7840,12 +7950,38 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Only the observed/expected norm ratio contributes to the cumulative
         compression survival product.
         """
-        ratio_observed = self._scaled_norm_value(observed_norm, observed_exponent - expected_exponent)
-        raw, survival = self._fidelity_ratio_from_norms(
-            ratio_observed, expected_norm, finite_check=self._finite_check_enabled
+        backend_norms = (
+            kind == "unitary_compression"
+            and not self._finite_check_enabled
+            and expected_exponent == observed_exponent == 0.0
+            and ar.infer_backend(observed_norm) in {"torch", "jax", "cupy"}
         )
-        expected_value = self._scaled_norm_value(expected_norm, expected_exponent)
-        observed_value = self._scaled_norm_value(observed_norm, observed_exponent)
+        if backend_norms:
+            observed_norm = ar.do("stop_gradient", ar.do("abs", observed_norm))
+            if ar.infer_backend(expected_norm) != ar.infer_backend(observed_norm):
+                expected_norm = ar.do("full_like", observed_norm, expected_norm)
+            expected_norm = ar.do("stop_gradient", ar.do("abs", expected_norm))
+            # Match the old Python-double ledger without promoting MPS data.
+            # Metal does not support float64. JAX retains its configured
+            # scalar precision (x64 can be disabled).
+            if ar.infer_backend(observed_norm) in {"torch", "cupy"}:
+                device_type = getattr(getattr(observed_norm, "device", None), "type", None)
+                diagnostic_dtype = "float32" if device_type == "mps" else "float64"
+                observed_norm = ar.astype(observed_norm, diagnostic_dtype)
+                expected_norm = ar.astype(expected_norm, diagnostic_dtype)
+            valid = ar.do("logical_not", expected_norm <= 0.0)
+            safe_expected = ar.do("where", valid, expected_norm, 1.0)
+            raw = (observed_norm / safe_expected) ** 2
+            survival = ar.do("clip", raw, 0.0, 1.0)
+            expected_value, observed_value = expected_norm, observed_norm
+        else:
+            ratio_observed = self._scaled_norm_value(observed_norm, observed_exponent - expected_exponent)
+            raw, survival = self._fidelity_ratio_from_norms(
+                ratio_observed, expected_norm, finite_check=self._finite_check_enabled
+            )
+            valid = raw is not None
+            expected_value = self._scaled_norm_value(expected_norm, expected_exponent)
+            observed_value = self._scaled_norm_value(observed_norm, observed_exponent)
         if (
             self._finite_check_enabled
             and kind == "unitary_compression"
@@ -7862,23 +7998,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         event = {
             "kind": str(kind),
             "where": tuple(int(site) for site in where),
-            "valid": raw is not None,
+            "valid": valid,
             "expected_norm": None if raw is None else expected_value,
             "expected_norm_sq": None if raw is None else expected_value * expected_value,
             "observed_norm": None if raw is None else observed_value,
             "observed_norm_sq": None if raw is None else observed_value * observed_value,
-            "expected_norm_mantissa": float(abs(expected_norm)),
+            "expected_norm_mantissa": expected_norm if backend_norms else float(abs(expected_norm)),
             "expected_norm_exponent": float(expected_exponent),
-            "observed_norm_mantissa": float(abs(observed_norm)),
+            "observed_norm_mantissa": observed_norm if backend_norms else float(abs(observed_norm)),
             "observed_norm_exponent": float(observed_exponent),
-            "fidelity_raw": None if raw is None else float(raw),
+            "fidelity_raw": raw,
             # These are fidelity/infidelity values measured from norms. The
             # metric name intentionally does not repeat its measurement source.
-            "local_fidelity": (
-                None if survival is None else float(survival)
-            ),
+            "local_fidelity": survival,
             "local_infidelity": (
-                None if survival is None else float(1.0 - survival)
+                None if survival is None else 1.0 - survival
             ),
             "branch_probability": (
                 None
@@ -7891,20 +8025,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ),
         }
         if survival is not None:
-            if survival == 0.0:
-                self._norm_log_survival = -np.inf
-            elif self._norm_log_survival != -np.inf:
-                self._norm_log_survival += math.log(survival)
-            cumulative = (
-                0.0
-                if self._norm_log_survival == -np.inf
-                else float(math.exp(self._norm_log_survival))
-            )
-            cumulative_infidelity = (
-                1.0
-                if self._norm_log_survival == -np.inf
-                else float(-math.expm1(self._norm_log_survival))
-            )
+            contribution = ar.do("where", valid, survival, 1.0) if backend_norms else survival
+            cumulative, cumulative_infidelity = self._accumulate_norm_survival(contribution)
             event["cumulative_fidelity"] = cumulative
             event["cumulative_infidelity"] = cumulative_infidelity
             event["cumulative_compression_fidelity"] = cumulative
@@ -7928,6 +8050,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._norm_summary_cache = cache
         summary = cache[2]
         for event in self.norm_events[cache[1]:]:
+            event = self._norm_event_to_host(event)
             if not event.get("valid"):
                 continue
             fidelity = float(event["local_fidelity"])
@@ -7963,8 +8086,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         # Full history output necessarily costs O(events). Summary polling
         # processes only newly appended records and omits historical arrays.
+        self._check_deferred_norm_errors()
         summary = None if include_history else self._compact_norm_summary()
-        valid = [event for event in self.norm_events if event.get("valid")] if include_history else []
+        valid = [event for event in self.get_norm_events() if event.get("valid")] if include_history else []
         physical = [
             event for event in valid if event.get("physical_boundary")
         ]
@@ -7972,12 +8096,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not count:
             survival = None
             infidelity = None
-        elif self._norm_log_survival == -np.inf:
-            survival = 0.0
-            infidelity = 1.0
         else:
-            survival = float(math.exp(self._norm_log_survival))
-            infidelity = float(-math.expm1(self._norm_log_survival))
+            survival = self._real_float(ar.do("exp", self._norm_log_survival))
+            infidelity = self._real_float(-ar.do("expm1", self._norm_log_survival))
         current = (valid[-1] if valid else None) if include_history else summary["last"]
         state_norm = self._control_state_norm()
         event_survivals = [float(event["local_fidelity"]) for event in valid]
@@ -8662,7 +8783,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         xmin, xmax = self._normalize_span(where)
         guess = self._inherit_replay_array_kind(p.copy(deep=True), p)
-        rng = np.random.default_rng(int(seed))
+        like = p[xmin].data
+        try:
+            # Keep the old-Autoray fallback paired with backend_random_array.
+            ar.get_lib_fn(ar.infer_backend(like), "random.array")
+            ar.get_lib_fn(ar.infer_backend(like), "random.default_rng")
+        except (AttributeError, ImportError, KeyError, LookupError):
+            rng = np.random.default_rng(int(seed))
+        else:
+            # Autoray also infers the generator device for Torch from like.
+            # A NumPy Generator cannot be passed to Torch's manual_seed.
+            rng = ar.do("random.default_rng", int(seed), like=like)
         bonds = []
         if expand:
             target_sizes = FIT._active_bond_rank_targets(  # pylint: disable=protected-access
@@ -9123,9 +9254,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         the product of the local squared canonical-centre norm-survival ratios
         accumulated in ``_norm_log_survival``.
         """
-        if self._norm_log_survival == -np.inf:
-            return 0.0
-        return float(math.exp(self._norm_log_survival))
+        return self._real_float(ar.do("exp", self._norm_log_survival))
 
     @staticmethod
     def _collect_dmrg_batch(
@@ -9224,6 +9353,33 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 raise ValueError(
                     f"FIT center {center} is outside active span {span}."
                 )
+        backend_norms = (
+            not self._finite_check_enabled
+            and ar.infer_backend(current_norm) in {"torch", "jax", "cupy"}
+        )
+        if backend_norms:
+            current_value = ar.do("stop_gradient", ar.do("abs", current_norm))
+            if ar.infer_backend(target_norm) != ar.infer_backend(current_value):
+                target_norm = ar.do("full_like", current_value, target_norm)
+            target_value = ar.do("stop_gradient", ar.do("abs", target_norm))
+            zero = ar.do("logical_or", current_value == 0.0, target_value == 0.0)
+            self._pending_zero_norm = (
+                zero if self._pending_zero_norm is None
+                else ar.do("logical_or", self._pending_zero_norm, zero)
+            )
+            self._record_norm_event(
+                "unitary_compression", expected_norm=target_value,
+                observed_norm=current_value, where=span,
+            )
+            if restore:
+                # Keep normalization differentiable; only the diagnostic copy
+                # is detached. Zero states are rejected at the replay boundary.
+                denominator = ar.do("where", current_value == 0.0, 1.0, current_norm)
+                p[center].modify(data=p[center].data * (target_norm / denominator))
+            self._unitary_previous_norm = target_value if restore else current_value
+            self._record_orthog_span(p, (center, center))
+            return
+
         current_float = self._real_float(ar.do("abs", current_norm))
         target_float = self._real_float(ar.do("abs", target_norm))
         if (
@@ -9495,6 +9651,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "info_c": deepcopy(self.info_c),
             "unitary_previous_norm": self._unitary_previous_norm,
             "norm_log_survival": self._norm_log_survival,
+            "pending_zero_norm": self._pending_zero_norm,
             "lengths": {
                 "normalizations": len(self.normalizations),
                 "norm_events": len(self.norm_events),
@@ -9589,6 +9746,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.info_c = snapshot["info_c"]
         self._unitary_previous_norm = snapshot["unitary_previous_norm"]
         self._norm_log_survival = snapshot["norm_log_survival"]
+        self._pending_zero_norm = snapshot["pending_zero_norm"]
         for attr, length in snapshot["lengths"].items():
             del getattr(self, attr)[length:]
         self._norm_summary_cache = None
@@ -12270,5 +12428,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return deepcopy(self.normalizations)
 
     def get_norm_events(self):
-        """Return a defensive copy of automatic norm-survival events."""
-        return deepcopy(self.norm_events)
+        """Return independent norm-survival records with Python scalar values."""
+        self._check_deferred_norm_errors()
+        return deepcopy([self._norm_event_to_host(event) for event in self.norm_events])

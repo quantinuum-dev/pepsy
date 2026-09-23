@@ -1,6 +1,7 @@
 """Focused tests for MPI shot orchestration without requiring mpi4py."""
 
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -129,6 +130,7 @@ def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
 
     assert isinstance(result, pepsy.MPIShotResult)
     assert len(result.local_result.optimizers) == 2
+    assert result.rank_diagnostics == ()
     np.testing.assert_allclose(optimizer.p.to_dense(), initial.to_dense())
 
 
@@ -510,15 +512,35 @@ def test_mpi_preflight_synchronizes_validation_errors():
         runner.run(-1, seed=5)
 
 
-def test_mpi_diagnostics_can_be_disabled():
+@pytest.mark.parametrize("path", ["ordinary", "streaming", "checkpoint"])
+def test_mpi_diagnostics_can_be_disabled(monkeypatch, tmp_path, path):
+    import pepsy.optimizers.mpi as mpi_module
+
     result = _run_probe(_FakeComm(), 2, seed=5)
     assert result.rank_diagnostics
+
+    def forbidden_clock():
+        raise AssertionError("disabled MPI diagnostics must not read the clock")
+
+    monkeypatch.setattr(mpi_module, "time", SimpleNamespace(perf_counter=forbidden_clock))
+    options = {}
+    if path == "streaming":
+        options = dict(retain="none", observable=lambda opt: opt.value, chunk_size=1)
+    elif path == "checkpoint":
+        options = dict(checkpoint_path=tmp_path / "shots", chunk_size=1, retain="final")
     disabled = pepsy.MPIShotRunner(
         _probe_factory,
         [(np.eye(2), 0)],
         comm=_FakeComm(),
-    ).run(2, seed=5, collect_diagnostics=False)
+    ).run(2, seed=5, collect_diagnostics=False, progress=False, **options)
     assert disabled.rank_diagnostics == ()
+
+
+def test_mps_mpi_diagnostics_require_opt_in():
+    optimizer = pepsy.MpsOptimizer(qtn.MPS_computational_state("0"), [], chi=2)
+    result = optimizer.run(shots=2, mpi=_FakeComm(), workers=1, progress=False,
+                           collect_diagnostics=True)
+    assert result.rank_diagnostics[0].elapsed_seconds >= 0.
 
 
 def test_mpi_streaming_checkpoint_resume(tmp_path):

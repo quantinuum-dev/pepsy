@@ -563,8 +563,10 @@ A resumed result exposes `resumed=True`, keeps the prefix in
 `result.checkpoint_path`, and publishes one `MPIRankDiagnostics` record per
 rank through `result.rank_diagnostics` with shot ownership and elapsed time.
 Set `checkpoint_sync=False` only when an external filesystem policy provides
-the required durability; set `collect_diagnostics=False` to skip the final
-diagnostics gather on very large communicators.
+the required durability; set `collect_diagnostics=False` to skip profiling
+clock reads and the final diagnostics gather on very large communicators.
+The `MpsOptimizer.run` facade defaults this option to `False`; enable it
+explicitly to obtain the rank summaries described above.
 After a successful run, call `result.cleanup_checkpoints()` collectively on
 all ranks when the files are no longer needed.
 
