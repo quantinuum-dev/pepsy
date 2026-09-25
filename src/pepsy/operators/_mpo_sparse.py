@@ -46,7 +46,10 @@ def _sum_weights(terms, value):
         power_value = powers.setdefault(int(power), value ** int(power))
         weighted = _multiply_scalar(coefficient, power_value)
         total = weighted if total is None else _add_values(total, weighted)
-    return 0.0 if total is None else total
+    # Keep even an empty polynomial on the active backend.  Returning a host
+    # float here would make the subsequent block multiplication leave the
+    # requested backend for sparse tensors with no contributing terms.
+    return ar.do("zeros_like", value) if total is None else total
 
 
 class SparseVirtualTensor:
@@ -57,21 +60,24 @@ class SparseVirtualTensor:
     virtual rows and columns are transformed.
     """
 
-    __slots__ = ("shape", "blocks")
+    __slots__ = ("shape", "blocks", "_like")
 
-    def __init__(self, shape, blocks=()):
+    def __init__(self, shape, blocks=(), *, like=None):
         shape = tuple(int(size) for size in shape)
         if len(shape) != 4 or shape[0] < 1 or shape[1] < 1:
             raise ValueError("sparse MPO tensors need shape (Dl, Dr, d, d).")
         if shape[2] != shape[3]:
             raise ValueError("MPO physical output and input dimensions must match.")
         self.shape = shape
+        self._like = like
         self.blocks = dict(blocks)
         for (left, right), block in self.blocks.items():
             if not (0 <= int(left) < shape[0] and 0 <= int(right) < shape[1]):
                 raise IndexError("sparse MPO virtual block lies outside its shape.")
             if tuple(int(size) for size in block.shape) != shape[2:]:
                 raise ValueError("sparse MPO physical block has the wrong shape.")
+            if self._like is None:
+                self._like = block
 
     @property
     def ndim(self):
@@ -79,7 +85,11 @@ class SparseVirtualTensor:
 
     @property
     def dtype(self):
-        return getattr(next(iter(self.blocks.values()), None), "dtype", None)
+        return getattr(
+            next(iter(self.blocks.values()), self._like),
+            "dtype",
+            None,
+        )
 
     @property
     def stored_blocks(self):
@@ -87,16 +97,21 @@ class SparseVirtualTensor:
 
     def copy(self):
         """Copy the sparse map while sharing immutable/backend block values."""
-        return type(self)(self.shape, self.blocks)
+        return type(self)(self.shape, self.blocks, like=self._like)
 
     def _add_block(self, key, value):
         previous = self.blocks.get(key)
+        if self._like is None:
+            self._like = value
         self.blocks[key] = value if previous is None else _add_values(previous, value)
 
     @classmethod
     def from_paired_values(cls, shape, rows, columns, values):
         """Construct from unique or repeated paired virtual entries."""
-        result = cls(shape)
+        result = cls(
+            shape,
+            like=values[0] if len(values) else None,
+        )
         for position, (row, column) in enumerate(zip(rows, columns)):
             result._add_block((int(row), int(column)), values[position])
         return result
@@ -122,7 +137,7 @@ class SparseVirtualTensor:
 
         shape = list(self.shape)
         shape[axis] = len(groups)
-        result = type(self)(shape)
+        result = type(self)(shape, like=self._like)
         for (left, right), block in self.blocks.items():
             source = left if axis == 0 else right
             for target, weight in source_map.get(source, ()):
@@ -142,7 +157,7 @@ class SparseVirtualTensor:
 
         shape = list(self.shape)
         shape[axis] = len(groups)
-        result = type(self)(shape)
+        result = type(self)(shape, like=self._like)
         for (left, right), block in self.blocks.items():
             source = left if axis == 0 else right
             for target, terms in source_map.get(source, ()):
@@ -166,7 +181,7 @@ class SparseVirtualTensor:
                 continue
             key = (0, right) if axis == 0 else (left, 0)
             blocks[key] = block
-        return type(self)(shape, blocks)
+        return type(self)(shape, blocks, like=self._like)
 
 
 def _is_product_charge(charge, symmetry):

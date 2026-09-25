@@ -18,17 +18,17 @@ from .samplers import (
     _validate_sample_count,
 )
 
-__all__ = ["MpsStabSampler", "StabilizerMpsSampler"]
+__all__ = ["StabilizerMpsSampler", "MpsStabSampler"]
 
 
 _DEFAULT_SAMPLE_CHUNK_SIZE = 4096
 _BRANCH_PROBABILITY_TOLERANCE = 1.0e-12
 
 
-class MpsStabSampler:
+class StabilizerMpsSampler:
     """Sample the physical STN state ``C|nu>`` without densifying it.
 
-    The sampler accepts either a live :class:`MpsStabOptimizer` or the pair
+    The sampler accepts either a live :class:`StabilizerMpsSimulator` or the pair
     ``(C, nu)`` directly. It uses the tableau frame to map every requested
     local X/Y/Z measurement into a Pauli projector on the coefficient MPS.
     ``strategy="auto"`` currently resolves to this frame-projector path,
@@ -39,7 +39,7 @@ class MpsStabSampler:
 
     Parameters
     ----------
-    state : MpsStabOptimizer or tableau simulator
+    state : StabilizerMpsSimulator or tableau simulator
         A live STN state representing ``C|nu>``, or the tableau ``C`` when
         ``nu`` is supplied as the second positional argument. Evolution can
         continue on a live optimizer and the sampler will observe the updated
@@ -47,7 +47,7 @@ class MpsStabSampler:
     nu : MatrixProductState, optional
         Coefficient MPS ``|nu>`` when ``state`` is a tableau. Any additional
         keyword arguments are forwarded to
-        :meth:`MpsStabOptimizer.from_tableau_and_state` in this form.
+        :meth:`StabilizerMpsSimulator.from_tableau_and_state` in this form.
     one_d_to_two_d : dict[int, tuple[int, int]], optional
         Coordinate map used by the returned ``MpsSampleResult``-compatible
         helpers. By default logical qubit ``q`` maps to ``(q, 0)``.
@@ -75,9 +75,9 @@ class MpsStabSampler:
         Sampling methods accept this per-call to bound temporary branch
         arrays. The final batch still contains all requested shots.
     **optimizer_kwargs
-        Construction options forwarded to ``MpsStabOptimizer`` when ``state``
+        Construction options forwarded to ``StabilizerMpsSimulator`` when ``state``
         is a tableau and ``nu`` is supplied. For example, use
-        ``MpsStabSampler(C, nu, chi=16, mode="dmrg2", disentangle=True)``.
+        ``StabilizerMpsSampler(C, nu, chi=16, mode="dmrg2", disentangle=True)``.
     """
 
     def __init__(
@@ -93,12 +93,12 @@ class MpsStabSampler:
         **optimizer_kwargs,
     ):
         from ..optimizers.stabilizer_tn.mps_stab_optimizer import (
-            MpsStabOptimizer,
+            StabilizerMpsSimulator,
         )
 
-        # Preserve the original ``MpsStabSampler(optimizer, site_map)``
-        # positional form while making ``MpsStabSampler(C, nu)`` natural.
-        if isinstance(state, MpsStabOptimizer):
+        # Preserve the original ``StabilizerMpsSampler(optimizer, site_map)``
+        # positional form while making ``StabilizerMpsSampler(C, nu)`` natural.
+        if isinstance(state, StabilizerMpsSimulator):
             if nu is not None:
                 if one_d_to_two_d is None and isinstance(nu, dict):
                     one_d_to_two_d, nu = nu, None
@@ -111,16 +111,16 @@ class MpsStabSampler:
                 names = ", ".join(sorted(optimizer_kwargs))
                 raise TypeError(
                     "Optimizer construction options cannot be supplied when "
-                    f"passing a live MpsStabOptimizer: {names}."
+                    f"passing a live StabilizerMpsSimulator: {names}."
                 )
             optimizer = state
         else:
             if nu is None:
                 raise TypeError(
-                    "MpsStabSampler needs either an MpsStabOptimizer or "
+                    "StabilizerMpsSampler needs either a StabilizerMpsSimulator or "
                     "(tableau, nu) representing C|nu>."
                 )
-            optimizer = MpsStabOptimizer.from_tableau_and_state(
+            optimizer = StabilizerMpsSimulator.from_tableau_and_state(
                 state,
                 nu,
                 **optimizer_kwargs,
@@ -139,7 +139,7 @@ class MpsStabSampler:
         self.backend = _normalize_mps_sampler_backend(backend)
         if self.backend in {"quimb", "symmray"}:
             raise ValueError(
-                "MpsStabSampler supports backend='auto', 'native', 'numpy', "
+                "StabilizerMpsSampler supports backend='auto', 'native', 'numpy', "
                 "'torch', or 'cupy'; quimb/symmray are not output backends."
             )
         self.resolved_backend = self._resolve_backend()
@@ -159,7 +159,7 @@ class MpsStabSampler:
             return live
         if self.backend in {"torch", "cupy"} and live != self.backend:
             raise ValueError(
-                f"MpsStabSampler backend={self.backend!r} requested, but the "
+                f"StabilizerMpsSampler backend={self.backend!r} requested, but the "
                 f"coefficient MPS uses backend {live!r}; construct the optimizer "
                 "with a matching to_backend converter or use backend='auto'."
             )
@@ -920,7 +920,7 @@ class MpsStabSampler:
         key = str(strategy).strip().lower().replace("-", "_")
         if key not in {"auto", "frame", "frame_pauli"}:
             raise ValueError(
-                "Unknown MpsStabSampler strategy. Expected 'auto' or 'frame'."
+                "Unknown StabilizerMpsSampler strategy. Expected 'auto' or 'frame'."
             )
         return "auto" if key == "auto" else "frame"
 
@@ -967,14 +967,14 @@ class MpsStabSampler:
         if state is None:
             return self
         from ..optimizers.stabilizer_tn.mps_stab_optimizer import (
-            MpsStabOptimizer,
+            StabilizerMpsSimulator,
         )
 
-        if not isinstance(state, MpsStabOptimizer):
-            raise TypeError("state must be an MpsStabOptimizer.")
+        if not isinstance(state, StabilizerMpsSimulator):
+            raise TypeError("state must be a StabilizerMpsSimulator.")
         if state.n != self._L:
             raise ValueError(
-                f"Cannot refresh MpsStabSampler with n={state.n}; expected {self._L}."
+                f"Cannot refresh StabilizerMpsSampler with n={state.n}; expected {self._L}."
             )
         self._optimizer = state
         self.resolved_backend = self._resolve_backend()
@@ -995,10 +995,10 @@ class MpsStabSampler:
     ):
         """Construct a sampler directly from a tableau ``C`` and coefficient ``nu``."""
         from ..optimizers.stabilizer_tn.mps_stab_optimizer import (
-            MpsStabOptimizer,
+            StabilizerMpsSimulator,
         )
 
-        optimizer = MpsStabOptimizer.from_tableau_and_state(
+        optimizer = StabilizerMpsSimulator.from_tableau_and_state(
             sim,
             nu,
             **optimizer_kwargs,
@@ -1044,7 +1044,7 @@ class MpsStabSampler:
         """
         if track_grad:
             raise NotImplementedError(
-                "MpsStabSampler frame-projector sampling does not retain gradients."
+                "StabilizerMpsSampler frame-projector sampling does not retain gradients."
             )
         n_samples = _validate_sample_count(n_samples)
         if n_samples < 1:
@@ -1089,7 +1089,7 @@ class MpsStabSampler:
         """
         if track_grad:
             raise NotImplementedError(
-                "MpsStabSampler frame-projector sampling does not retain gradients."
+                "StabilizerMpsSampler frame-projector sampling does not retain gradients."
             )
         n_samples = _validate_sample_count(n_samples)
         if n_samples < 1:
@@ -1208,4 +1208,4 @@ class MpsStabSampler:
             )
 
 
-StabilizerMpsSampler = MpsStabSampler
+MpsStabSampler = StabilizerMpsSampler

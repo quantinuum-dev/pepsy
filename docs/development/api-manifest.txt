@@ -25,6 +25,7 @@ DeferredInjectionReport
 DeferredProjectionRecord
 FDSolver
 FIT
+bell_to_mps
 Fermion
 FermionConfigurationEncoding
 FermionLatticeSetup
@@ -41,6 +42,7 @@ LeakageRecord
 MeasurementRecord
 MpoChannelEvent
 MpoOptimizer
+GibbsMps
 MpsBatchSampleResult
 MpsDiagonalEstimate
 MpsEnergyOptimizer
@@ -82,6 +84,7 @@ StabilizerMpsSettingsAdvice
 StabilizerMpsSimulator
 StabilizerMpsSampler
 StabilizerTreeRunResult
+StabilizerTreeSimulator
 StimCircuitPlan
 StimDetector
 StimHerald
@@ -112,6 +115,9 @@ TreeBatchSampleResult
 TreeEnergyOptimizer
 TreeLayoutFinder
 TreeMPO
+SubTreeMPO
+TreePEPO
+TreeSubPEPO
 TreeNoisy
 TreeOptimizer
 TreePlan
@@ -148,6 +154,7 @@ build_itf_cluster_expansion_pepo
 build_real_time_cluster_expansion_pepo
 generate_connected_cluster_shapes
 build_mpo_from_gates
+compress_mpo_product
 build_optimizer
 build_pepo_from_gates
 build_tree_operator
@@ -157,6 +164,7 @@ compile_trajectory_stream
 compress_all_gauge
 contract_boundary
 contract_flat
+contract_layered
 contract_hypercompressed_tn
 contract_hypercompressed_tn_batch
 cphase
@@ -213,6 +221,8 @@ internal_inds
 iswap
 make_numpy_array_caster
 measure_obs
+mps_to_ttn
+mps_to_treepeps
 normalize
 one_norm_bp
 optimize_packed_params

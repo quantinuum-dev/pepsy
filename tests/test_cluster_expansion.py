@@ -1124,6 +1124,321 @@ def test_pauli_pepo_basis_keeps_torch_coefficient_and_time_graph():
     assert torch.isfinite(time_gradient)
 
 
+def test_pauli_pepo_basis_promotes_channel_maps_for_complex_torch_coefficients():
+    """Complex Torch slots align the static maps without detaching gradients."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [
+            PauliPEPOTerm(
+                "onsite",
+                "X",
+                coefficient=lambda params: -0.5j * params["theta"],
+            )
+        ],
+        order=1,
+    )
+    theta = torch.tensor(0.17, dtype=torch.float64, requires_grad=True)
+
+    dense = basis.exp(
+        1.0,
+        parameters={"theta": theta},
+        materialize=True,
+    ).to_dense()
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    identity = torch.eye(2, dtype=torch.complex128)
+    hamiltonian = torch.kron(x, identity) + torch.kron(identity, x)
+    expected = torch.matrix_exp(-0.5j * theta * hamiltonian)
+
+    assert torch.allclose(dense, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradient = torch.autograd.grad(dense.real.sum(), theta)[0]
+    assert torch.isfinite(gradient)
+
+
+def test_ordered_pepo_product_promotes_complex_factor_without_value_loss():
+    """A complex product prefactor is promoted, never cast to real zero."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "X", coefficient=MPOParameter("theta"))],
+        order=1,
+    )
+    product = PEPOClusterProductExpansion.from_bases(
+        (basis,),
+        coefficients=(-0.5j,),
+    ).compile_exp()
+    theta = torch.tensor(0.17, dtype=torch.float64, requires_grad=True)
+
+    dense = product.exp(1.0, parameters={"theta": theta}).to_dense()
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    identity = torch.eye(2, dtype=torch.complex128)
+    hamiltonian = torch.kron(x, identity) + torch.kron(identity, x)
+    expected = torch.matrix_exp(-0.5j * theta * hamiltonian)
+
+    assert torch.allclose(dense, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradient = torch.autograd.grad(dense.real.sum(), theta)[0]
+    assert torch.isfinite(gradient)
+
+
+def test_inhomogeneous_pauli_pepo_is_exact_on_one_located_edge():
+    """Explicit site/edge slots use their actual finite-lattice coordinates."""
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [
+            PauliPEPOTerm("onsite", "X", 0.2, where=(0, 0)),
+            PauliPEPOTerm(
+                "edge",
+                "ZY",
+                -0.7,
+                where=((0, 1), (0, 0)),
+            ),
+        ],
+        order=2,
+    )
+    actual = basis.exp(step=-0.03j, materialize=True).to_dense()
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    hamiltonian = 0.2 * np.kron(x, identity) - 0.7 * np.kron(y, z)
+    expected = expm(-0.03j * hamiltonian)
+
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+    assert basis.cache_info["inhomogeneous"]
+
+
+def test_inhomogeneous_ordered_pepo_keeps_torch_values_and_gradients():
+    """The joint local product preserves local slots, order, and autodiff."""
+    torch = pytest.importorskip("torch")
+    left = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "X", where=(0, 1))],
+        order=2,
+    )
+    right = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("edge", "ZZ", where=((0, 0), (0, 1)))],
+        order=2,
+    )
+    uniform = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "Y")],
+        order=2,
+    )
+    coefficients = tuple(
+        torch.tensor(value, dtype=torch.float64, requires_grad=True)
+        for value in (0.2, -0.3)
+    )
+    product = PEPOClusterProductExpansion.from_bases(
+        (left, right, uniform),
+        coefficients=(-0.5j, -0.5j, -0.25j),
+    )
+    sparse = product.exp(
+        1.0,
+        coefficients=((coefficients[0],), (coefficients[1],), (0.11,)),
+        materialize=False,
+    )
+    assert isinstance(sparse, ActivePEPOBlocks)
+    assert max(sparse.bond_dimensions.values()) <= sparse.bond_dim
+    actual = product.exp(
+        1.0,
+        coefficients=((coefficients[0],), (coefficients[1],), (0.11,)),
+    )
+    actual = actual.to_dense()
+
+    identity = torch.eye(2, dtype=torch.complex128)
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    y = torch.tensor([[0.0, -1.0j], [1.0j, 0.0]], dtype=torch.complex128)
+    z = torch.diag(torch.tensor([1.0, -1.0], dtype=torch.complex128))
+    expected = torch.matrix_exp(
+        -0.5j * coefficients[0] * torch.kron(identity, x)
+    ) @ torch.matrix_exp(
+        -0.5j * coefficients[1] * torch.kron(z, z)
+    ) @ torch.matrix_exp(
+        -0.25j * 0.11 * (torch.kron(y, identity) + torch.kron(identity, y))
+    )
+
+    assert torch.allclose(actual, expected, atol=1.0e-12, rtol=1.0e-12)
+    actual_gradient = torch.autograd.grad(actual.real.sum(), coefficients)
+    expected_gradient = torch.autograd.grad(expected.real.sum(), coefficients)
+    assert torch.allclose(
+        torch.stack(actual_gradient),
+        torch.stack(expected_gradient),
+        atol=1.0e-11,
+        rtol=1.0e-11,
+    )
+
+
+def test_inhomogeneous_pauli_pepo_requires_direction_for_parallel_pbc_bonds():
+    """Length-two PBC bond occurrences are never collapsed by endpoints."""
+    ambiguous = PauliPEPOTerm(
+        "edge",
+        "XY",
+        where=((0, 0), (1, 0)),
+    )
+    with pytest.raises(ValueError, match="ambiguous.*direction"):
+        PauliPEPOBasis.compile(2, 2, [ambiguous], order=2, cyclic=True)
+
+    basis = PauliPEPOBasis.compile(
+        2,
+        2,
+        [
+            PauliPEPOTerm(
+                "edge",
+                "XY",
+                0.2,
+                where=((0, 0), (1, 0)),
+                direction="u",
+            ),
+            PauliPEPOTerm(
+                "edge",
+                "YX",
+                -0.3,
+                where=((0, 0), (1, 0)),
+                direction="d",
+            ),
+        ],
+        order=2,
+        cyclic=True,
+    )
+    assert np.count_nonzero(basis._lattice_edge_term_map) == 2
+
+
+def test_inhomogeneous_pauli_pepo_closes_order_three_chain_exactly():
+    """Occurrence-specific three-site residuals close the full chain."""
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    terms = [
+        PauliPEPOTerm("onsite", "X", 0.2, where=(0, 0)),
+        PauliPEPOTerm("onsite", "Y", -0.1, where=(0, 2)),
+        PauliPEPOTerm("edge", "ZZ", 0.7, where=((0, 0), (0, 1))),
+        PauliPEPOTerm("edge", "XY", -0.3, where=((0, 1), (0, 2))),
+    ]
+    hamiltonian = (
+        0.2 * _kron_all((x, identity, identity))
+        - 0.1 * _kron_all((identity, identity, y))
+        + 0.7 * _kron_all((z, z, identity))
+        - 0.3 * _kron_all((identity, x, y))
+    )
+    basis = PauliPEPOBasis.compile(1, 3, terms, order=3)
+    active = basis.exp(step=-0.017j)
+    actual = active.to_pepo().to_dense()
+    uncompact = active.to_pepo(compact_bonds=False).to_dense()
+
+    np.testing.assert_allclose(actual, expm(-0.017j * hamiltonian), atol=1.0e-12)
+    np.testing.assert_allclose(uncompact, actual, atol=1.0e-12)
+    assert basis.cache_info["localized_cluster_counts"] == {1: 3, 2: 2, 3: 1}
+    assert max(active.bond_dimensions.values()) < active.bond_dim
+
+
+def test_inhomogeneous_pauli_pepo_closes_periodic_order_four_exactly():
+    """PBC clusters include every internal bond occurrence and close exactly."""
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    terms = [
+        PauliPEPOTerm("onsite", "X", 0.2, where=(0, 0)),
+        PauliPEPOTerm(
+            "edge",
+            "ZZ",
+            0.7,
+            where=((0, 0), (1, 0)),
+            direction="u",
+        ),
+        PauliPEPOTerm(
+            "edge",
+            "XY",
+            -0.3,
+            where=((1, 0), (0, 0)),
+            direction="u",
+        ),
+        PauliPEPOTerm(
+            "edge",
+            "YX",
+            0.4,
+            where=((0, 0), (0, 1)),
+            direction="r",
+        ),
+    ]
+    hamiltonian = (
+        0.2 * _kron_all((x, identity, identity, identity))
+        + 0.7 * _kron_all((z, identity, z, identity))
+        - 0.3 * _kron_all((y, identity, x, identity))
+        + 0.4 * _kron_all((y, x, identity, identity))
+    )
+    basis = PauliPEPOBasis.compile(
+        2,
+        2,
+        terms,
+        order=4,
+        cyclic=True,
+    )
+    actual = basis.exp(step=-0.017j, materialize=True).to_dense()
+
+    np.testing.assert_allclose(actual, expm(-0.017j * hamiltonian), atol=1.0e-12)
+
+
+def test_inhomogeneous_pauli_pepo_reaches_generic_order_five():
+    """The finite-subset route continues through the generic order range."""
+    identity = np.eye(2, dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    basis = PauliPEPOBasis.compile(
+        1,
+        5,
+        [
+            PauliPEPOTerm("onsite", "X", coefficient=0.2),
+            PauliPEPOTerm("edge", "ZZ", coefficient=1.0),
+            PauliPEPOTerm("onsite", "Z", 0.07, where=(0, 2)),
+        ],
+        order=5,
+    )
+    expected_hamiltonian = _pauli_chain_hamiltonian(5, 0.2, 1.0)
+    expected_hamiltonian += 0.07 * _kron_all(
+        (identity, identity, z, identity, identity)
+    )
+    actual = basis.exp(step=-0.001j, materialize=True).to_dense()
+
+    np.testing.assert_allclose(
+        actual,
+        expm(-0.001j * expected_hamiltonian),
+        atol=1.0e-11,
+    )
+
+
+def test_inhomogeneous_pauli_pepo_rank_cap_keeps_torch_gradient():
+    """The explicit truncated-SVD option remains backend differentiable."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        3,
+        [
+            PauliPEPOTerm("onsite", "X"),
+            PauliPEPOTerm("edge", "ZZ"),
+            PauliPEPOTerm("onsite", "Y", where=(0, 1)),
+        ],
+        order=3,
+        max_tree_rank=2,
+    )
+    coefficients = torch.tensor(
+        [0.21, 0.71, -0.13],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    dense = basis.exp(-0.017j, coefficients=coefficients).to_pepo().to_dense()
+    gradient = torch.autograd.grad(dense.real.sum(), coefficients)[0]
+
+    assert torch.isfinite(gradient).all()
+
+
 def test_pauli_pepo_basis_resolves_mpo_parameter_references_with_autodiff():
     """PEPO coefficient references follow the MPOBasis parameter contract."""
     torch = pytest.importorskip("torch")

@@ -311,6 +311,18 @@ class MPOAutomaton:
         """Virtual dimensions on all internal MPO cuts."""
         return tuple(len(cut_channels) for cut_channels in self._channels)
 
+    @property
+    def block_plan(self):
+        """Return the backend-neutral structural transition plan.
+
+        The plan contains channel identifiers and transition recipes only;
+        local operator arrays remain owned by the automaton.  It is therefore
+        safe to inspect this property before choosing a numerical backend.
+        """
+        from .mpo_block_plan import MPOBlockPlan  # pylint: disable=import-outside-toplevel
+
+        return MPOBlockPlan.from_automaton(self)
+
     def copy(self):
         """Return a structural copy that shares operator array objects.
 

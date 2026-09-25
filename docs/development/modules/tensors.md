@@ -15,6 +15,14 @@ top-level `pepsy` exports rather than old flat modules.
   `tn_fidelity`, and alignment helpers.
 - `maps.py`: facade for `OneDMap`.
 - `observables.py`: facade for observable and MPO expectation helpers.
+- `mps_transfer.py`: repeating-cell and site-selected local transfer actions,
+  dense and bosonic Symmray sector adapters, backend-preserving Arnoldi,
+  transfer gaps, momenta, degeneracy, and correlation lengths. Local windows
+  default to bulk estimates from a private left-canonicalized open-MPS copy,
+  with optional right canonicalization. Supplied-gauge windows require
+  `canonicalize=None, allow_local=True`; caller input is preserved. Small unresolved
+  gaps are distinct from numerical peripheral modes, and Arnoldi can grow
+  its basis within an explicit memory cap.
 - `symmetric.py`: Symmray-backed `SymMPS`, `SymPEPS`, symmetric Hamiltonian,
   gate-stream, charge-sector, and dense-operator conversion helpers.
 - `validation.py`: shared PEPS tag and physical-index validation helpers.
@@ -51,7 +59,9 @@ with `finder=plan` instead of `gate_stream=`.
 
 Constructors create common tensor-network states and operators:
 
-- `ps_to_mps` (bond-one product states), `ps_to_ttn`, `ps_to_peps`, `ps_to_3dpeps`
+- `bell_to_mps` (interleaved physical/ancilla Bell-pair purifications),
+  `ps_to_mps` (bond-one product states), `ps_to_ttn`, `ps_to_peps`,
+  `ps_to_3dpeps`
 - `ps_to_mpo`, `ps_to_pepo`
 - `id_to_mpo`, `id_to_pepo`
 - `haar_random_state`, `random_haar_qubit`

@@ -7,15 +7,32 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 
 ## Layout
 
+- `_stream_events.py`: shared control, conditional, and sub-MPO parsing.
+  Geometry and tree replay use this module directly, without importing MPS
+  replay. Existing parser imports from `mps.optimizer` remain available.
 - `mps/`: MPS gate-stream optimization.
+  - `__init__.py`: lazy public exports; selecting layout helpers does not load
+    replay, Gibbs preparation, or MPO optimization.
   - `optimizer.py`: `MpsOptimizer`.
-  - `compression.py`: extraction target for compression backends.
-  - `normalization.py`: extraction target for non-unitary normalization logic.
-  - `diagnostics.py`: extraction target for fidelity/progress records.
+  - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
+  - `gibbs.py`: purified finite-temperature `GibbsMps` preparation.
+  - `compression.py`, `normalization.py`, `diagnostics.py`: empty reserved
+    import paths. Their proposed extractions have not happened; these
+    responsibilities currently remain on `MpsOptimizer` in `optimizer.py`.
 - `mpo/`: MPO gate-stream optimization.
   - `optimizer.py`: `MpoOptimizer`.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.
   - `compression.py`: extraction target for compression backends.
+- `tree/`: `TreeOptimizer` gate replay and controls, `TreeTensorNetwork` state
+  and canonical metadata, `TreePlan` / `TreeLayoutFinder` geometry and search,
+  and `TreeMPO` operators. Private helpers have explicit state/value inputs:
+  `_policy.py` resolves modes and lists retained configuration settings;
+  `_application.py` validates operator regions and prepares local targets;
+  `_readout.py` computes projected-amplitude Born weights; `_diagnostics.py`
+  constructs records without contracting tensors. `compression.py` owns
+  SRC/SDC environments; variational sweeps use the shared `pepsy.fitting.TreeFIT`.
+  See the [consolidation record](../plans/tree_optimizer_consolidation.md) for
+  ownership, compatibility boundaries, and validation.
 - `peps/`: PEPS/PEPO gate-stream optimization.
   - `optimizer.py`: `PepsOptimizer`.
   - `gates.py`: extraction target for gate routing and target application.
@@ -39,6 +56,10 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   dictionaries, compiled lightcone contractions, schematics, and
   Symmray-native fermion helpers.
 - `global_opt.py`: whole-network variational optimization helpers.
+
+Entries described as extraction targets are proposals, not implemented
+subsystems or instructions to begin a refactor. Inspect their source before
+placing changes; retain existing public paths until a compatibility review.
 
 ## PEPS optimizer stack
 
@@ -84,12 +105,14 @@ to sweep cleanup.
 
 ## MPS gate-stream optimizer
 
-`MpsOptimizer` replays bundled gate streams through the `dmrg`, `mpo`, `swap`,
-`perm`, `svd`, `mix`, or `exact` backends. For repeated evolution on a graph
+`MpsOptimizer` defaults to `direct` compression. Other replay modes include
+`dmrg`, `swap`, `perm`, `svd`, `mix`, and `exact`; `mpo` remains a
+compatibility alias for `direct`. For repeated evolution on a graph
 with a useful one-dimensional layout, call `opt.apply_layout("quality")` once.
 The MPS then stays in the selected physical order across `run()` calls and
 logical readout goes through `opt.logical_order`, `opt.remap_sample(...)`, or
-`opt.to_dense()`.
+`opt.to_dense()`. During `mode="perm"`, `opt.qubits` is the synchronized
+Quimb-compatible view of that same physical-position mapping.
 
 The persistent reorder is free only for a product MPS (`p.max_bond() == 1`).
 For an entangled initial state, the default is to raise; an explicit
@@ -105,6 +128,17 @@ metadata. Exact mode intentionally has no canonical cache; switching back to
 an MPS mode rebuilds and canonicalizes the state.
 
 ## Import style
+
+The `mps`, `mpo`, `peps`, `sweep`, `tree`, `tree_peps`, `energy`, and `qmera`
+entry packages resolve exports lazily. Importing or listing one of these
+namespaces does not load its numerical implementations. Each export still
+comes from its original implementation module; direct child-module imports
+remain available. Accessing an implementation loads its actual dependencies.
+
+Geometry-only callers can import `QMeraGeometry` from `qmera` or `TreePepsPlan`
+from `tree_peps` without initializing NumPy, Quimb, or an optimizer. This does
+not imply that every layout helper is dependency-free: for example, tree
+layout currently uses MPS control parsing and numerical helpers.
 
 Use clean class imports at API boundaries:
 

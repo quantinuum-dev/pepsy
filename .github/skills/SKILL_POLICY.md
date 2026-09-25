@@ -16,6 +16,10 @@ does not replace domain-specific invariants in an individual `SKILL.md`.
   owning skills; it must not copy their invariants and let the copies drift.
 - Optimize for progressive disclosure: concise `SKILL.md` first, one-level
   `references/` only for details needed by a subset of tasks.
+- Select the interpreter and checkout through `AGENTS.md` and applicable
+  local/session instructions. Do not embed developer-machine activation paths
+  in shared skills. Clearly label historical measurements and proposals;
+  neither is a current capability guarantee or an instruction to implement it.
 
 ## Package contract
 
@@ -100,14 +104,16 @@ Use this sequence:
 
 For every skill/catalog change, require:
 
+Activate the environment selected by `AGENTS.md` and the local override.
+Locate `scripts/quick_validate.py` in the available `skill-creator` package
+and run it on each changed skill directory. Then run from the repository root:
+
 ```bash
-source ~/envs/py312/bin/activate
-python /home/reza.haghshenas@quantinuum.com/.codex/skills/.system/skill-creator/scripts/quick_validate.py .github/skills/<name>
 python .github/skills/pepsy-maintainer/scripts/validate_catalog.py
 git diff --check
 ```
 
-For a skill that governs implementation behavior, also run the closest
-focused test and `python -m ruff check src tests`. For cross-cutting changes,
-run the full suite according to `AGENTS.md`, or explicitly report why it was
-not run.
+Check routing with representative tasks and resolve all new local links.
+If implementation behavior also changes, run the closest focused tests and
+Ruff, broadening according to `AGENTS.md`. Reorganizing instructions without
+changing behavior does not require the numerical suite.

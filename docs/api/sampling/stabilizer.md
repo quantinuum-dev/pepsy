@@ -1,13 +1,14 @@
-# `pepsy.MpsStabSampler`
+# `pepsy.StabilizerMpsSampler`
 
-`MpsStabSampler` samples the physical stabilizer-tensor-network state
+`StabilizerMpsSampler` samples the physical stabilizer-tensor-network state
 `|psi> = C|nu>` without constructing a dense statevector. It accepts a live
-`MpsStabOptimizer` or the pair `(C, nu)`, maps requested local X/Y/Z
+`StabilizerMpsSimulator` or the pair `(C, nu)`, maps requested local X/Y/Z
 measurements through the tableau frame, and samples the resulting Pauli
 projectors on the coefficient MPS using shared-prefix branching.
+The historical `MpsStabSampler` name remains available as a deprecated alias.
 
 ```python
-sampler = pepsy.MpsStabSampler(stabilizer_optimizer)
+sampler = pepsy.StabilizerMpsSampler(stabilizer_optimizer)
 
 batch = sampler.sample_batch(4096, basis="random", seed=7, chunk_size=1024)
 configs = batch.configs       # shape (4096, n)
@@ -26,7 +27,7 @@ is inference-only: ``track_grad=True`` is intentionally unsupported and raises
 For direct construction from a tableau and coefficient MPS:
 
 ```python
-sampler = pepsy.MpsStabSampler(C, nu, backend="native")
+sampler = pepsy.StabilizerMpsSampler(C, nu, backend="native")
 configs, probs = sampler.sample_arrays(4096, chunk_size=1024)
 ```
 
@@ -37,7 +38,7 @@ to localize each measured frame Pauli to ``+/- Z_k`` and update the tableau on
 that branch:
 
 ```python
-sampler = pepsy.MpsStabSampler(
+sampler = pepsy.StabilizerMpsSampler(
     C,
     nu,
     chi=16,
@@ -101,5 +102,5 @@ the frame-projector implementation.
 For an explicit tableau `C` and coefficient MPS `nu`:
 
 ```python
-sampler = pepsy.MpsStabSampler.from_tableau_and_state(tableau, nu)
+sampler = pepsy.StabilizerMpsSampler.from_tableau_and_state(tableau, nu)
 ```

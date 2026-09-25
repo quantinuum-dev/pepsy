@@ -1,5 +1,6 @@
 """Basic public API smoke tests for the pepsy package."""
 
+import ast
 import importlib
 import importlib.util
 from pathlib import Path
@@ -24,6 +25,16 @@ def test_package_version_available():
     """Package exposes a non-empty version string."""
     assert isinstance(pepsy.__version__, str)
     assert pepsy.__version__
+
+
+def test_mps_transfer_diagnostics_have_tensor_namespace_exports():
+    from pepsy.tensors import MpsTransferSpectrum, mps_correlation_length, mps_transfer_spectrum
+    from pepsy.tensors import mps_transfer
+
+    assert MpsTransferSpectrum is mps_transfer.MpsTransferSpectrum
+    assert mps_correlation_length is mps_transfer.mps_correlation_length
+    assert mps_transfer_spectrum is mps_transfer.mps_transfer_spectrum
+    assert "mps_correlation_length" not in pepsy.__all__
 
 
 def test_namespace_exports_have_clear_core_and_advanced_groups():
@@ -56,6 +67,73 @@ def test_top_level_compatibility_surface_matches_manifest():
         *manifest,
     }
     assert set(pepsy.__all__) == expected_all
+
+
+def test_root_typing_imports_cover_public_exports():
+    """Static root declarations agree with the lazy public ownership map."""
+    tree = ast.parse(Path(pepsy.__file__).read_text(encoding="utf-8"))
+    declarations = {}
+    for node in tree.body:
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    declarations[alias.asname or alias.name] = (
+                        "." * statement.level + (statement.module or ""),
+                        alias.name,
+                    )
+    expected = {
+        name: (module, name) for name, module in pepsy._SYMBOL_MODULES.items()
+    }
+    expected.update({name: (".", name) for name in pepsy._MODULE_EXPORTS})
+    assert declarations == expected
+
+
+def test_mps_lazy_exports_preserve_implementation_identity():
+    """Existing MPS symbols, module access, and star imports stay compatible."""
+    import pepsy.optimizers.mps as mps
+
+    owners = {
+        "GibbsMps": "gibbs",
+        "MpsGateStreamLayoutFinder": "layout",
+        "MpsGateStreamSchedule": "layout",
+        "MpsOptimizer": "optimizer",
+        "guess": "optimizer",
+        "is_submpo_event": "optimizer",
+        "normalize_submpo_where": "optimizer",
+        "submpo_event_parts": "optimizer",
+        "svd_guess": "optimizer",
+    }
+    for name, owner in owners.items():
+        direct = importlib.import_module(f"{mps.__name__}.{owner}")
+        assert getattr(mps, name) is getattr(direct, name)
+    assert mps.gibbs is importlib.import_module(f"{mps.__name__}.gibbs")
+    exported = {}
+    exec("from pepsy.optimizers.mps import *", exported)
+    assert set(exported) - {"__builtins__"} == set(mps.__all__)
+    with pytest.raises(AttributeError, match="no attribute"):
+        getattr(mps, "unknown_mps_export")
+
+
+@pytest.mark.parametrize("domain", ("mpo", "peps", "sweep", "tree", "tree_peps", "energy", "qmera"))
+def test_optimizer_package_exports_preserve_identity_and_child_access(domain):
+    """Lazy entry points resolve the same objects as their declared owners."""
+    package = importlib.import_module(f"pepsy.optimizers.{domain}")
+    for name, owner in package._SYMBOL_MODULES.items():
+        direct = importlib.import_module(owner, package.__name__)
+        assert getattr(package, name) is getattr(direct, name)
+    for child in package._SUBMODULES:
+        assert getattr(package, child) is importlib.import_module(f"{package.__name__}.{child}")
+    exported = {}
+    exec(f"from {package.__name__} import *", exported)
+    assert set(exported) - {"__builtins__"} == set(package.__all__)
+    with pytest.raises(AttributeError, match="no attribute"):
+        getattr(package, "unknown_optimizer_export")
 
 
 def test_root_aliases_resolve_from_canonical_namespaces():
@@ -119,6 +197,7 @@ def test_deprecated_boundary_aliases_warn(alias_name, canonical_name):
     [
         ("QMeraParametricEnergyOptimizer", "QMeraEnergyOptimizer"),
         ("MpsStabOptimizer", "StabilizerMpsSimulator"),
+        ("TreeStabOptimizer", "StabilizerTreeSimulator"),
     ],
 )
 def test_deprecated_optimizer_aliases_warn(alias_name, canonical_name):
@@ -136,9 +215,9 @@ def test_deprecated_stabilizer_alias_warns():
     import pepsy.optimizers.stabilizer_tn as stabilizer_tn
 
     stabilizer_tn.__dict__.pop("StabilizerMps", None)
-    with pytest.warns(DeprecationWarning, match="MpsStabOptimizer"):
+    with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
         alias = stabilizer_tn.StabilizerMps
-    assert alias is stabilizer_tn.MpsStabOptimizer
+    assert alias is stabilizer_tn.StabilizerMpsSimulator
 
 
 def test_deprecated_mera_alias_warns_and_matches_qmera():
@@ -168,6 +247,8 @@ def test_deprecated_aliases_are_documented():
     assert "`pepsy.boundary.infidelity`" in migration
     assert "`pepsy.optimizers.QMeraParametricEnergyOptimizer`" in migration
     assert "`pepsy.optimizers.MpsStabOptimizer`" in migration
+    assert "`pepsy.optimizers.TreeStabOptimizer`" in migration
+    assert "`pepsy.sampling.MpsStabSampler`" in migration
     assert "`pepsy.optimizers.stabilizer_tn.StabilizerMps`" in migration
     assert "`pepsy.experimental.mera`" in migration
     assert "`pepsy.optimizers.mera`" in migration
@@ -175,12 +256,22 @@ def test_deprecated_aliases_are_documented():
 
 def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
-    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer, TreePlan
-    from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
+    from pepsy.optimizers.tree import TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan
+    from pepsy.optimizers.tree_peps import TreePEPO, TreePepo, TreeSubPEPO, TreeSubPepo
+    from pepsy.optimizers.tree_stabilizer import (
+        StabilizerTreeSimulator,
+        TreeStabOptimizer,
+    )
 
     assert pepsy.TreeLayoutFinder is TreeLayoutFinder
     assert pepsy.TreeOptimizer is TreeOptimizer
     assert pepsy.TreePlan is TreePlan
+    assert pepsy.TreeMPO is TreeMPO
+    assert TreePEPO is TreePepo
+    assert TreeSubPEPO is TreeSubPepo
+    assert pepsy.TreePEPO is TreePepo
+    assert pepsy.TreeSubPEPO is TreeSubPepo
+    assert pepsy.StabilizerTreeSimulator is StabilizerTreeSimulator
     assert pepsy.TreeStabOptimizer is TreeStabOptimizer
 
 
@@ -188,7 +279,7 @@ _EXPECTED_IN_ALL = [
     "backends", "boundary", "experimental", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
     "BdyMPS", "CompBdy", "BoundaryContractResult", "BoundaryFitDiagnostic", "contract_boundary",
-    "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
+    "contract_flat", "contract_layered", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
     "peps_norm", "peps_infidelity", "peps_fidelity", "GlobalOptimizer", "FIT",
     "tns_align", "measure_obs", "build_pepo_from_gates", "build_mpo_from_gates",
     "pauli", "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
@@ -199,13 +290,13 @@ _EXPECTED_IN_ALL = [
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "MpoChannelEvent", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "MpsStabSampler", "StabilizerMpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
-    "MpsStabOptimizer", "STNState", "StabilizerMpsSimulator",
+    "MpsStabOptimizer", "StabilizerMpsSimulator", "STNState",
     "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
-    "TreeMPO", "TreeOptimizer", "build_tree_operator",
+    "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
     "TreePlan",
-    "TreeStabOptimizer",
+    "TreeStabOptimizer", "StabilizerTreeSimulator",
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
@@ -263,7 +354,7 @@ def test_internal_symbols_not_exported():
 
 
 _CALLABLE_EXPORTS = [
-    "contract_boundary", "contract_flat", "build_bra_ket", "normalize", "peps_normalize",
+    "contract_boundary", "contract_flat", "contract_layered", "build_bra_ket", "normalize", "peps_normalize",
     "boundary_norm", "peps_norm", "infidelity", "peps_infidelity", "peps_fidelity",
     "backend_infer", "to_float", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp",
     "GlobalOptimizer", "FIT", "tns_align", "measure_obs",
@@ -281,9 +372,9 @@ _CALLABLE_EXPORTS = [
     "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "NoisyResult", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_mpi_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
-    "TreeMPO", "TreeOptimizer", "build_tree_operator",
+    "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
     "TreePlan",
-    "TreeStabOptimizer",
+    "StabilizerTreeSimulator",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "tn_fidelity", "tn_norm", "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",

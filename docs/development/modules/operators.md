@@ -23,10 +23,10 @@ These are the names to use in new code.
 
 | Area | Canonical names | Owner |
 | --- | --- | --- |
-| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`) |
-| MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
+| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`; structural plan implementation: `operators.mpo_block_plan`) |
+| MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport`, `MPOAdaptiveCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
 | Shared report summary | `OperatorReportInfo` and each concrete report's `.api_info` | `operators.diagnostics` |
-| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct` | `operators.mpo_product` |
+| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct`, `exp_mpo_cluster`, `exp_mpo_cluster_product` | `operators.mpo_product` |
 | PEPO active results | `ActivePEPOBlocks`, `GraphActivePEPOBlocks` | `operators.pepo_cluster` (implementation: `operators.pepo_active`) |
 | Square-lattice PEPO exponential | `PauliPEPOTerm`, `PauliPEPOBasis`, `CompiledPEPOExp` | `operators.pepo_cluster` (implementation: `operators.pepo_basis`) |
 | Dense/graph PEPO clusters | `ClusterExpansionPlan`, `GraphClusterExpansionPlan`, `ClusterExpansionReport`, `ClusterLattice`, `ConnectedClusterShape`, `GraphConnectedClusterShape` | `operators.pepo_cluster` (implementation: `operators.pepo_dense`; planner boundary: `operators.pepo_geometry`) |
@@ -35,6 +35,7 @@ These are the names to use in new code.
 | PEPO composition | `compose_pepo_layers`, `compose_cluster_expansion_pepo` | `operators.pepo_cluster` |
 | Pauli operator algebra | `PauliMPO`, `decompose_pauli`, `PauliCompressionReport`, `PauliBondCompressionReport` | `operators.pauli_mpo` |
 | Exact MPO structural layer | `MPOAutomaton`, `MPOChannel`, `MPOTransition` | `operators.mpo_automaton` |
+| Native tree operators | `TreeMPO`, `TreePEPO`, `TreeSubPEPO`, `ham_tn.to_tree_mpo`, `ham_tn.to_tree_pepo` | `optimizers.tree`, `optimizers.tree_peps`, `operators.hamiltonians` |
 | Elementary gates/builders | gate constructors (`x`, `rx`, `cnot`, etc.), `gate`, `build_mpo_from_gates`, `build_pepo_from_gates` | `operators.gates` |
 
 The API lifecycle is:
@@ -68,6 +69,18 @@ then inserts the residual into one MPO/PEPO topology. It is not a sequence of
 three independently truncated full-lattice layers. The PEPO implementation
 records this invariant as `cache_info["joint_cluster_residual"]`.
 
+`PauliPEPOTerm.where` is the finite-square exception to the homogeneous PEPO
+slot model. Located onsite and nearest-neighbour edge slots dispatch to the
+finite-lattice connected-subset builder for every supported order (one through
+nine) on open or periodic boundaries. On a length-two periodic dimension,
+`PauliPEPOTerm.direction` distinguishes the two physical bonds with identical
+endpoints. Each embedding subtracts the completed lower-order active PEPO and
+stores its correction in a fixed Pauli-history tree; dense materialization
+then compacts those global histories independently on each physical bond.
+Exact localized ranks grow exponentially with cluster size, so inspect the
+active representation or set `max_tree_rank` before materializing larger
+higher-order lattices.
+
 The public facades are:
 
 - `operators.mpo_higher_order` — paper-style higher-order MPOs;
@@ -94,6 +107,8 @@ These names are public and documented, but most users should reach them
 through the higher-level basis or plan objects first:
 
 - `MPOLevelToken`, `MPOLevel`: symbolic higher-order MPO history metadata.
+- `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`: backend-neutral
+  virtual-state/local-block structure and charge validation for compiled MPOs.
 - `MPOAutomaton`, `MPOChannel`, `MPOTransition`: exact channel/path assembly.
 - `ClusterLattice` and connected-cluster shape records: geometry planning
   independent of tensor values.
@@ -123,9 +138,9 @@ new examples:
 | `ClusterExpansionBasis` | `MPOClusterProductExpansion` | Historical class alias |
 | `ClusterExpBasis` | `MPOClusterProductExpansion` | Historical class alias |
 | `MPOClusterExpansion` | `MPOClusterProductExpansion` | Historical class alias |
-| `mode="paper_algorithm4"` | `mode="algorithm4"` | Historical mode spelling |
-| `mode="paper_optimal"` | `mode="optimal"` | Historical mode spelling |
-| `mode="paper_approximate"` | `mode="approximate"` | Historical mode spelling |
+| `mode="algorithm4"` / `mode="paper_algorithm4"` | `mode="folded"` | Historical mode spellings |
+| `mode="optimal"` / `mode="paper_optimal"` | `mode="exact"` | Historical mode spellings |
+| `mode="approximate"` / `mode="paper_approximate"` | `mode="hybrid"` | Historical mode spellings |
 
 `ham_tn` is a stable, older Hamiltonian-builder spelling documented in its
 own API page. It should remain available while a future naming review decides

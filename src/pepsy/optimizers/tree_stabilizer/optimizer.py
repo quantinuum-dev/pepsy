@@ -24,7 +24,8 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ...backends import infer_backend_signature
+from ...backends import infer_backend_signature, to_float
+from ..stabilizer_tn._backend import stabilizer_product_eigenstate
 from ..stabilizer_tn.mps_stab_optimizer import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -49,7 +50,7 @@ from ..stabilizer_tn.dense import (
 )
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
-from ..mps.optimizer import conditional_event_parts, submpo_event_parts
+from .._stream_events import conditional_event_parts, submpo_event_parts
 from ..tree.layout import TreeLayoutFinder, TreePlan, _DEFAULT_TOP_ARITY
 from ..tree.optimizer import (
     TreeOptimizer,
@@ -58,7 +59,11 @@ from ..tree.optimizer import (
 )
 from ..tree.ttn import TreeTensorNetwork
 
-__all__ = ["TreeStabOptimizer", "run_stabilizer_tree_stream"]
+__all__ = [
+    "StabilizerTreeSimulator",
+    "TreeStabOptimizer",
+    "run_stabilizer_tree_stream",
+]
 
 
 _CLIFFORD_NAMES = frozenset(_CLIFFORD_GATES)
@@ -76,12 +81,12 @@ _RESET_FLIP_CLIFFORDS = {"X": "z", "Y": "x", "Z": "x"}
 
 
 def _normalize_tree_stab_mode(mode):
-    """Normalize the TreeStab coefficient-update route.
+    """Normalize the StabilizerTreeSimulator coefficient-update route.
 
-    TreeStab's numerical coefficient updates are naturally represented by a
-    compact TreeMPO on the active tree span.  Keep the older TreeOptimizer
-    names accepted for stream compatibility, but make the two explicit
-    TreeMPO modes the canonical TreeStab interface.
+    StabilizerTreeSimulator's numerical coefficient updates are naturally
+    represented by a compact TreeMPO on the active tree span. Keep the older
+    stabilizer route names accepted for stream compatibility, but make the two
+    explicit TreeMPO modes the canonical interface.
     """
     if mode is None:
         return "tree_mpo_direct"
@@ -102,14 +107,14 @@ def _normalize_tree_stab_mode(mode):
         return requested
     if requested in {"auto", "direct", "mpo", "submpo"}:
         warnings.warn(
-            f"TreeStabOptimizer mode={mode!r} is a legacy compatibility "
+            f"StabilizerTreeSimulator mode={mode!r} is a legacy compatibility "
             "route; use mode='tree_mpo_direct' or mode='tree_mpo_dm'.",
             DeprecationWarning,
             stacklevel=3,
         )
         return requested
     raise ValueError(
-        "TreeStabOptimizer mode must be 'tree_mpo_direct' or "
+        "StabilizerTreeSimulator mode must be 'tree_mpo_direct' or "
         "'tree_mpo_dm' (hyphenated spellings and 'tree_mpo_dem' are "
         f"accepted), got {mode!r}."
     )
@@ -559,7 +564,7 @@ class _TreeStabilizerFrame:
             import stim
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError(
-                "TreeStabOptimizer requires the optional dependency 'stim'."
+                "StabilizerTreeSimulator requires the optional dependency 'stim'."
             ) from exc
         self.n = int(n)
         if self.n < 1:
@@ -704,7 +709,7 @@ class _TreeStabilizerFrame:
         return self._identity_cache
 
 
-class TreeStabOptimizer:
+class StabilizerTreeSimulator:
     # Marker consumed by the shared trajectory runner without importing this
     # module from ``optimizers.noise`` during package initialization.
     _is_tree_stabilizer_trajectory_optimizer = True
@@ -720,7 +725,7 @@ class TreeStabOptimizer:
     evolved by :class:`TreeOptimizer`.
 
     Parameters are intentionally close to ``TreeOptimizer`` and
-    ``MpsStabOptimizer``. ``gates`` are queued at construction and consumed by
+    ``StabilizerMpsSimulator``. ``gates`` are queued at construction and consumed by
     :meth:`run`; :meth:`apply` queues and immediately replays a stream.
     Noisy trajectories use the shared Pepsy shot runner; MPS-specific layout
     APIs remain separate. Dense non-Clifford matrices are supported only up to
@@ -728,8 +733,8 @@ class TreeStabOptimizer:
     ``exact_cooling=False`` to exercise the ordinary multi-site rotation path.
     Coefficient-side numerical updates use the tree-native
     ``tree_mpo_direct`` or ``tree_mpo_dm`` route; ``tree_mpo_dem`` and
-    hyphenated spellings are accepted aliases. Older ``TreeOptimizer`` mode
-    names remain compatibility aliases for existing streams.
+    hyphenated spellings are accepted aliases. Legacy stabilizer route names
+    remain compatibility aliases for existing streams.
     """
 
     def __init__(
@@ -1078,7 +1083,7 @@ class TreeStabOptimizer:
         """
         if "state" in kwargs or "gates" in kwargs:
             raise TypeError(
-                "TreeStabOptimizer.from_stim derives state and gates from the "
+                "StabilizerTreeSimulator.from_stim derives state and gates from the "
                 "Stim circuit; use stream_transform for stream edits."
             )
         if stream_transform is not None and not callable(stream_transform):
@@ -1112,16 +1117,16 @@ class TreeStabOptimizer:
         advisor, so a stream receives identical counts and warnings regardless
         of whether its coefficient backend will be a chain or a tree.
         """
-        from ..stabilizer_tn.mps_stab_optimizer import MpsStabOptimizer
+        from ..stabilizer_tn.mps_stab_optimizer import StabilizerMpsSimulator
 
-        return MpsStabOptimizer.analyze_stream(gates, n_qubits=n_qubits)
+        return StabilizerMpsSimulator.analyze_stream(gates, n_qubits=n_qubits)
 
     @classmethod
     def recommend_magic_strategy(cls, gates, **kwargs):
         """Recommend direct, immediate, or deferred TreeStab execution."""
-        from ..stabilizer_tn.mps_stab_optimizer import MpsStabOptimizer
+        from ..stabilizer_tn.mps_stab_optimizer import StabilizerMpsSimulator
 
-        advice = dict(MpsStabOptimizer.recommend_magic_strategy(gates, **kwargs))
+        advice = dict(StabilizerMpsSimulator.recommend_magic_strategy(gates, **kwargs))
         advice["coefficient_backend"] = "tree"
         return advice
 
@@ -1137,9 +1142,9 @@ class TreeStabOptimizer:
         frontend. The cheap retained-norm flag remains ``track_infidelity``;
         the expensive Tree-only spectrum flag is ``track_truncation``.
         """
-        from ..stabilizer_tn.mps_stab_optimizer import MpsStabOptimizer
+        from ..stabilizer_tn.mps_stab_optimizer import StabilizerMpsSimulator
 
-        mps_advice = MpsStabOptimizer.recommend_settings(gates, **kwargs)
+        mps_advice = StabilizerMpsSimulator.recommend_settings(gates, **kwargs)
         settings = dict(mps_advice.settings)
         settings.pop("layout_report", None)
         # MPS-only stabilization is not a TreeStab constructor option. Tree's
@@ -1199,7 +1204,7 @@ class TreeStabOptimizer:
         """Alias for the class-level stream runner."""
         return cls.run_stream(gates, **kwargs)
 
-    # Backward-compatible alias shared with ``MpsStabOptimizer``.
+    # Backward-compatible alias shared with ``StabilizerMpsSimulator``.
     from_tableau_and_nu = from_tableau_and_state
 
     @classmethod
@@ -1979,7 +1984,7 @@ class TreeStabOptimizer:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Replay the queued stabilizer-tree stream through shot orchestration."""
@@ -1998,7 +2003,7 @@ class TreeStabOptimizer:
             resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
         ):
             raise ValueError(
@@ -2144,12 +2149,12 @@ class TreeStabOptimizer:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Replay queued entries, leaving a failed entry queued for retry.
 
-        ``progbar`` is accepted for parity with ``MpsStabOptimizer``. The
+        ``progbar`` is accepted for parity with ``StabilizerMpsSimulator``. The
         displayed infidelity is the tree truncation proxy, when tracked.
         ``shots`` uses the shared trajectory runner. Local ``strategy='auto'``
         may use exact branch coalescing; MPI ``strategy='auto'`` resolves to
@@ -2250,7 +2255,7 @@ class TreeStabOptimizer:
 
     def _apply_conditional_entry(self, entry):
         """Apply one feed-forward action when its recorded bit is true."""
-        from ..mps.optimizer import _resolve_conditional
+        from .._stream_events import _resolve_conditional
 
         _name, payload, _where = conditional_event_parts(entry)
         index, expected = _resolve_conditional(payload, len(self.measurements))
@@ -2282,7 +2287,7 @@ class TreeStabOptimizer:
             mpo, where = submpo_parts
             # A caller-supplied coefficient MPO has no unitary certificate.
             # Keep its physical norm change out of the compression ledger,
-            # matching MpsStabOptimizer's sub-MPO contract.
+            # matching StabilizerMpsSimulator's sub-MPO contract.
             self._tree.apply_submpo(mpo, where, track_norm=False)
             return
         if isinstance(entry, (tuple, list)) and entry:
@@ -2964,25 +2969,7 @@ class TreeStabOptimizer:
     @staticmethod
     def _stabilizer_product_eigenstate(vector, *, tol=1e-10):
         """Return ``(axis, sign)`` for a one-qubit stabilizer vector."""
-        from ..stabilizer_tn.operators import pauli_matrix
-
-        vector = np.asarray(ar.to_numpy(vector), dtype=complex).reshape(-1)
-        if vector.shape != (2,):
-            return None
-        norm = float(np.linalg.norm(vector))
-        if norm <= tol:
-            return None
-        vector = vector / norm
-        bloch = {
-            axis: float(np.real(np.vdot(vector, pauli_matrix(axis) @ vector)))
-            for axis in ("X", "Y", "Z")
-        }
-        axis = max(bloch, key=lambda key: abs(bloch[key]))
-        if abs(abs(bloch[axis]) - 1.0) > tol:
-            return None
-        if any(abs(bloch[other]) > tol for other in bloch if other != axis):
-            return None
-        return axis, (1 if bloch[axis] >= 0.0 else -1)
+        return stabilizer_product_eigenstate(vector, tol=tol)
 
     def _tree_product_site_vector(self, q, *, tol=1e-10):
         """Extract a local vector when a TTN leaf is rank-one across its edge."""
@@ -2991,22 +2978,22 @@ class TreeStabOptimizer:
             self._tree._move_center(leaf)
             tensor = self.p.node_tensor(leaf)
             physical = self.p.site_ind(int(q))
-            physical_axis = tensor.inds.index(physical)
-            data = ar.to_numpy(tensor.data)
-            data = np.moveaxis(np.asarray(data), physical_axis, 0)
-            matrix = data.reshape(2, -1)
+            data = tensor.transpose(physical, *[ind for ind in tensor.inds if ind != physical]).data
+            matrix = ar.do("reshape", data, (2, -1))
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
         if matrix.shape[1] == 0:
             return None
-        singular_values = np.linalg.svd(matrix, compute_uv=False)
-        scale = float(singular_values[0])
-        if scale <= tol:
+        # One backend SVD supplies both the rank test and candidate vector.
+        # Only the small singular-value decision crosses to the CPU tableau.
+        left, singular_values, _ = ar.do("linalg.svd", matrix, full_matrices=False)
+        scale = singular_values[0]
+        rank_one = scale > tol
+        if len(singular_values) > 1:
+            rank_one = ar.do("logical_and", rank_one, singular_values[1] <= tol * scale)
+        if not bool(to_float(rank_one, real=True)):
             return None
-        if len(singular_values) > 1 and singular_values[1] > tol * scale:
-            return None
-        left = np.linalg.svd(matrix, full_matrices=False)[0][:, 0]
-        return left
+        return left[:, 0]
 
     @staticmethod
     def _exact_cooling_basis_tableau(axis, sign):
@@ -3060,8 +3047,6 @@ class TreeStabOptimizer:
         """Apply the constructive tree cooling identity when a pivot exists."""
         if not self.exact_cooling or len(terms) < 2:
             return False
-        from ..stabilizer_tn.operators import pauli_matrix
-
         support = tuple(sorted(int(q) for q in terms))
         pivots = sorted(
             support,
@@ -3086,9 +3071,9 @@ class TreeStabOptimizer:
                 pivot, pivot_axis, pivot_sign, terms
             )
             local_rotation = (
-                np.cos(float(theta) / 2.0) * np.eye(2, dtype=complex)
+                np.cos(float(theta) / 2.0) * self._tree._control_tensor("I")
                 - 1j * float(sign) * np.sin(float(theta) / 2.0)
-                * pauli_matrix(rotation_axis)
+                * self._tree._control_tensor(rotation_axis)
             )
             self._apply_tree_gate(local_rotation, pivot)
             # The coefficient state received the local rotation. The
@@ -3691,7 +3676,7 @@ class TreeStabOptimizer:
 
         Entries may be ``(coefficient, pauli)`` or
         ``(coefficient, pauli, where)``, matching
-        :meth:`MpsStabOptimizer.expectation_pauli_sum`.
+        :meth:`StabilizerMpsSimulator.expectation_pauli_sum`.
         """
         total = 0.0 + 0.0j
         for term in terms:
@@ -4134,7 +4119,7 @@ class TreeStabOptimizer:
     @staticmethod
     def _resolve_sample_basis(basis, n, rng):
         """Normalize a global, per-site, or random Pauli basis policy."""
-        # Keep the public basis contract shared with MpsStabOptimizer and the
+        # Keep the public basis contract shared with StabilizerMpsSimulator and the
         # standalone stabilizer sampler.  The import is local to avoid making
         # the optimizer module part of the sampling-module import cycle.
         from ...sampling.samplers import _resolve_measurement_basis
@@ -4271,7 +4256,7 @@ class TreeStabOptimizer:
 
         # Rows sharing a measured prefix share the collapsed coefficient TTN.
         # The prefix probability is retained so this internal helper has the
-        # same exact Born-probability contract as MpsStabOptimizer.
+        # same exact Born-probability contract as StabilizerMpsSimulator.
         stack = [(self._sampling_copy(), 0, 0, shots, 1.0)]
         while stack:
             sim, position, lo, hi, prefix_probability = stack.pop()
@@ -4535,7 +4520,7 @@ class TreeStabOptimizer:
         """Return ``<bits|psi>`` for a computational-basis bitstring.
 
         Qubit 0 is the leftmost bit. This is a dense small-state diagnostic,
-        matching :meth:`MpsStabOptimizer.amplitude`.
+        matching :meth:`StabilizerMpsSimulator.amplitude`.
         """
         bits = _validate_bits(bits, expected_length=self.n)
         index = 0
@@ -4548,7 +4533,7 @@ class TreeStabOptimizer:
         amplitude = self.amplitude(bits)
         return float(abs(amplitude) ** 2)
 
-    def cap(self, where, vec, *, absorb="left") -> "TreeStabOptimizer":
+    def cap(self, where, vec, *, absorb="left") -> "StabilizerTreeSimulator":
         """Contract one physical qubit and rebuild an identity-frame tree.
 
         This is a correctness-first physical cap, mirroring the MPS
@@ -4896,13 +4881,16 @@ class TreeStabOptimizer:
 
     def __repr__(self):  # pragma: no cover - cosmetic
         return (
-            f"TreeStabOptimizer(n={self.n}, chi={self._tree.chi}, "
+            f"StabilizerTreeSimulator(n={self.n}, chi={self._tree.chi}, "
             f"mode={self.mode!r}, "
             f"compression_mode={self._tree.compression_mode!r}, "
             f"max_bond={self.p.max_bond()}, "
             f"max_pauli_terms={self.max_pauli_terms}, "
             f"max_dense_cap_qubits={self.max_dense_cap_qubits})"
         )
+
+
+TreeStabOptimizer = StabilizerTreeSimulator
 
 
 def _tree_runner_data_qubits(analysis, n_qubits):
@@ -5009,7 +4997,7 @@ def run_stabilizer_tree_stream(
     n_ancilla=None,
     run_options=None,
     seed=None,
-    optimizer_cls=TreeStabOptimizer,
+    optimizer_cls=StabilizerTreeSimulator,
 ):
     """Run one Pepsy stream on TreeStab and return a typed result record."""
     entries = _as_entries(gates)

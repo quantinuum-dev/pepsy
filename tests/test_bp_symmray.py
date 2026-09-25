@@ -49,7 +49,7 @@ from pepsy.tensors import (  # noqa: E402
 
 
 def test_quimb_safe_inverse_compat_handles_symmray_block_vector():
-    """The old Quimb axis reduction must not break projector compression."""
+    """Symmray vector inversion works on old and fixed Quimb builds."""
     install_quimb_symmray_compat()
     from quimb.tensor.decomp import safe_inverse
 
@@ -1733,6 +1733,43 @@ def test_explicit_edge_loop_series_uses_fermion_safe_gate_path():
     np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
     assert type(rho).__name__ == "U1FermionicArray"
     np.testing.assert_allclose(np.trace(rho.to_dense()), 1.0)
+
+
+def test_fermionic_pair_normalizer_probe_preserves_live_messages(monkeypatch):
+    """Probe privately, preserve the norm, and leave a corrected upstream alone."""
+    from pepsy.bp._symmray import (
+        _normalize_fermionic_message_pairs,
+        align_d2bp_messages,
+        align_message_pair,
+        d2bp_uses_fermionic_operators,
+    )
+    from quimb.tensor.belief_propagation import D2BP
+
+    if not d2bp_uses_fermionic_operators():
+        pytest.skip("Quimb uses the legacy fermionic message convention")
+    state = SymPEPS.random(
+        1, 3, symmetry="U1", bond_dim=3, phys_dim=2,
+        fermionic=True, seed=1931, dtype="complex128",
+    )
+    # Start with upstream directly: two_norm_bp has already run the probe,
+    # which would make the preservation assertion exercise only its no-op path.
+    bp = D2BP(state.tn)
+    assert not getattr(bp, "_pepsy_pair_normalization_checked", False)
+    expected = complex(bp.contract())
+    snapshot = {key: value.copy() for key, value in bp.messages.items()}
+    original = D2BP.normalize_message_pairs
+    align_d2bp_messages(bp)
+    assert D2BP.normalize_message_pairs is original
+    for key, value in snapshot.items():
+        actual, expected_message = align_message_pair(bp.messages[key], value)
+        np.testing.assert_allclose(actual.to_dense(), expected_message.to_dense())
+    bp.normalize_message_pairs()
+    np.testing.assert_allclose(complex(bp.contract()), expected, rtol=1e-10)
+
+    monkeypatch.setattr(D2BP, "normalize_message_pairs", _normalize_fermionic_message_pairs)
+    corrected = D2BP(state.tn)
+    align_d2bp_messages(corrected)
+    assert "normalize_message_pairs" not in vars(corrected)
 
 
 def test_open_scalar_series_uses_native_fermion_projectors_for_long_range_hopping():

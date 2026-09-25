@@ -1,5 +1,16 @@
 # Symmetric Tensor States
 
+The optional symmetry and fermionic workflows require Symmray 0.4.0 or
+newer (`pip install -U 'pepsy[symmetry]'`) and share Pepsy's Python 3.12+
+requirement. Version 0.4.0 fixes pending fermionic phases in
+scalar readout and reductions, and fused charge selection under Torch `vmap`.
+
+For flat-Z2 Torch PEPS, `TorchPEPSAmplitude(..., amplitude_batching="auto")`
+already probes batching and keeps a serial fallback. Explicit `"vmap"` is
+also available. This does not make variable-sector U1/U1U1 contractions or
+all compiled boundary environments batchable. See the
+[compatibility and benchmark record](../../development/notes/symmray_2026_09.md).
+
 ## Choosing sectors and charges
 
 Physical sectors are charge maps: ``{charge: sector_size}``. For example,
@@ -765,7 +776,7 @@ psi = py.SymMPS.for_model("heisenberg", 8, bond_dim=4)
 ham = psi.build_hamiltonian()
 gates = ham.gate_stream(0.01)
 
-psi.time_evolve_mps_optimizer(0.01, hamiltonian=ham, chi=16, mode="mpo")
+psi.time_evolve_mps_optimizer(0.01, hamiltonian=ham, chi=16, mode="direct")
 ```
 
 For direct spinful Fermi-Hubbard dynamics, Pepsy also exposes native fermionic
@@ -916,7 +927,7 @@ pulse = py.fermi_hubbard_u1u1_light_pulse_gate_stream(
     relaxation_steps=2,
 )
 
-opt = py.MpsOptimizer(psi.tn, pulse, chi=64, mode="mpo", inplace=True)
+opt = py.MpsOptimizer(psi.tn, pulse, chi=64, mode="direct", inplace=True)
 psi_t = opt.run(progbar=True, cutoff=1e-10)
 ```
 
@@ -936,7 +947,7 @@ peps.apply_gates(
 For Symmray-backed MPS gate streams, ``mode="swap"``, ``mode="perm"``, and
 ``mode="svd"`` use
 quimb's block-aware auto-swap split path for nonlocal 1D gate streams such as a
-row-major square lattice. ``mode="mpo"`` uses its usual sub-MPO compression for
+row-major square lattice. ``mode="direct"`` uses its usual sub-MPO compression for
 nearest-neighbor gates and falls back to the same Symmray auto-swap path for
 nonlocal gates, because the current quimb/Symmray sub-MPO path mixes in dense
 helper tensors. ``mode="exact"`` is useful as a small-system reference.
@@ -1135,7 +1146,7 @@ At the end of a Symmray ``MpsOptimizer`` notebook, pass the optimized chain
 directly:
 
 ```python
-opt = py.MpsOptimizer(psi.tn.copy(), gates, chi=8, mode="mpo")
+opt = py.MpsOptimizer(psi.tn.copy(), gates, chi=8, mode="direct")
 opt.run(progbar=False)
 
 py.draw_symmray_mps(
@@ -1149,3 +1160,12 @@ py.draw_symmray_mps(
 
 
 > API details are maintained as handwritten Markdown in this page.
+## PEPS measurement compatibility
+
+`SymPEPS.measure` retains Boolean `normalize` and its scalar return value.
+Its default `route="boundary"` adapts to Quimb's compression keyword revision.
+Single-row/column states use exact native contractions and do not require
+`chi`; boundary truncation settings do not apply there. A nonempty precomputed
+2D plaquette cache is not supported on this geometry. Explicit `route="envs"`
+is for single local terms on supporting Quimb builds, with a compatible
+compressor selected through `mode`.

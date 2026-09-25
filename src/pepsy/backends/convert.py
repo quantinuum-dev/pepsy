@@ -18,6 +18,12 @@ _NUMPY_DTYPE_MAP = {
 }
 
 
+def _array_namespace(like):
+    """Use Autoray's cached early dispatch, with a late-dispatch fallback."""
+    factory = getattr(ar, "get_namespace", None)
+    return factory(like=like) if callable(factory) else ar.numpy
+
+
 def _backend_scalar(value):
     """Return a Python scalar from scalar-like backend values."""
     shape = getattr(value, "shape", None)
@@ -26,15 +32,25 @@ def _backend_scalar(value):
         if shape != ():
             raise TypeError(f"Expected a scalar-like value, got shape {shape}.")
 
-    if shape is not None:
+    # Prefer the backend scalar protocol before Autoray's host-array bridge.
+    # For Torch/CuPy device scalars this still synchronizes and returns one
+    # Python value, but it avoids materializing a NumPy scalar array and never
+    # transfers the surrounding tensor data.
+    obj = value
+    item = getattr(value, "item", None)
+    if shape is not None and callable(item):
+        try:
+            obj = item()
+        except (TypeError, ValueError, RuntimeError):
+            obj = value
+
+    if obj is value and shape is not None:
         try:
             obj = ar.to_numpy(value)
         except Exception:
             # Keep supporting duck-typed scalar wrappers with ``item`` but no
             # registered Autoray backend.
             obj = value
-    else:
-        obj = value
 
     item = getattr(obj, "item", None)
     if callable(item) and not isinstance(obj, _SCALAR_TYPES):
@@ -56,8 +72,9 @@ def to_float(value, *, real=True):
     """Convert a scalar-like backend value to a Python ``float``.
 
     The input can be a Python scalar, NumPy scalar or scalar array, or a
-    scalar-like backend tensor. Autoray converts backend scalar arrays to host
-    NumPy before extracting ``.item()``. Non-scalar arrays raise ``TypeError``.
+    scalar-like backend tensor. Backend scalar arrays use ``.item()`` directly
+    when available, avoiding an intermediate host NumPy array; unsupported
+    scalar wrappers fall back to Autoray. Non-scalar arrays raise ``TypeError``.
 
     Parameters
     ----------
@@ -122,6 +139,18 @@ def _is_symmray_array(value):
     )
 
 
+def _array_device_signature(value, backend):
+    """Compare physical placement despite equivalent single-device sharding."""
+    device = getattr(value, "device", None)
+    if backend == "jax" and device is not None:
+        devices = getattr(value, "devices", None)
+        if callable(devices):
+            placement = devices()
+            if len(placement) == 1:
+                device = next(iter(placement))
+    return None if device is None else str(device)
+
+
 def _symmray_block_signatures(value):
     """Return backend signatures for the raw arrays held by a Symmray value."""
     blocks = getattr(value, "blocks", None)
@@ -130,9 +159,9 @@ def _symmray_block_signatures(value):
     signatures = []
     for block in blocks.values():
         backend, dtype = infer_backend_and_dtype(block)
-        device = getattr(block, "device", None)
+        device = _array_device_signature(block, backend)
         signatures.append(
-            (backend, str(dtype), None if device is None else str(device))
+            (backend, str(dtype), device)
         )
     return tuple(signatures)
 
@@ -164,8 +193,7 @@ def infer_backend_signature(sample_data):
                 "Could not infer a backend or dtype from the supplied array."
             ) from exc
         return "builtins", str(dtype), None
-    device = getattr(sample_data, "device", None)
-    device = None if device is None else str(device)
+    device = _array_device_signature(sample_data, backend)
     if backend != "symmray" and not _is_symmray_array(sample_data):
         return backend, str(dtype), device
 

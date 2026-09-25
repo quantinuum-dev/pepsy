@@ -37,7 +37,7 @@ def test_guppy_program_becomes_list_compatible_stream():
     assert stream[0][1] == (0, 1)
     assert math.isclose(stream[1][0][0, 0].real, math.cos(math.pi / 4))
 
-    result = pepsy.MpsStabOptimizer(stream.n_qubits, stream).run()
+    result = pepsy.StabilizerMpsSimulator(stream.n_qubits, stream).run()
     assert len(result.measurements) == 1
 
 

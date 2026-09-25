@@ -20,6 +20,7 @@ place to discover the whole API.
 | Boundary | `pepsy.boundary` | PEPS norm, overlap, boundary states, and sweeps |
 | Solvers | `pepsy.solvers` | Gradient and finite-difference parameter solvers |
 | Fitting | `pepsy.fitting` | Local tensor fitting |
+| Interoperability | `pepsy.interop` | Adapters for external circuit and tensor-network representations |
 | Optimizers | `pepsy.optimizers` | MPS, MPO, PEPS, sweep, and global optimization workflows |
 | Sampling | `pepsy.sampling` | MPS, PEPS, vector, and tree sampling |
 
@@ -34,7 +35,7 @@ from pepsy.tensors import OneDMap, ps_to_mps, ps_to_peps, tn_norm
 ```
 
 For a shared backend contract across tensor-network classes, use
-`pepsy.backend_infer(value)`. It accepts an array or an MPS/TTN and returns
+`pepsy.backends.backend_infer(value)`. It accepts an array or an MPS/TTN and returns
 `backend`, `dtype`, and `device`; Symmray inputs also report the underlying
 `array_backend` used by their charge-sector blocks.
 
@@ -53,9 +54,36 @@ For a shared backend contract across tensor-network classes, use
 Advanced domains can also be discovered through the explicit lazy namespace:
 
 ```python
-from pepsy.experimental import bp, symmetry, stabilizer, tree, vmc
-from pepsy.vmc import TorchVMCDriver
+import pepsy.experimental
+
+dir(pepsy.experimental)  # Lists domain names without loading their implementations.
 ```
+
+Prefer the owning namespaces in the table for actual imports. Optional
+installation and API stability are separate concerns; see the
+[stability policy](../stability.md).
+
+## Lazy namespace discovery
+
+`dir(pepsy)` and `dir()` on its lazy entry namespaces (including `optimizers`,
+`tensors`, `boundary`, and `vmc`) include their advertised exports before
+those objects are loaded. Listing names neither resolves deprecated aliases
+nor imports the corresponding numerical implementations. Accessing a symbol
+still loads its implementation and may require the relevant optional extra.
+
+The optimizer entry packages `mps`, `mpo`, `peps`, `sweep`, `tree`, `tree_peps`,
+`energy`, and `qmera` also defer their implementation imports. This allows
+geometry-only use such as:
+
+```python
+from pepsy.optimizers.qmera import QMeraGeometry
+
+geometry = QMeraGeometry((2, 2))
+```
+
+This geometry construction does not load the numerical stack. Requesting
+`QMeraBuilder` or an optimizer class loads the dependencies needed by that
+implementation. Public names and their defining modules remain unchanged.
 
 ## Top-level convenience aliases
 

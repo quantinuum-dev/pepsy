@@ -1,7 +1,39 @@
 """Test configuration for local src-layout imports."""
 
 from pathlib import Path
+import os
 import sys
+
+import pytest
+
+
+def pytest_runtest_logreport(report):
+    """Expose CI failures as annotations even when raw job logs are unavailable."""
+    if report.failed and os.environ.get("GITHUB_ACTIONS") == "true":
+        message = f"{report.nodeid}\n{report.longreprtext}"[:12000]
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"\n::error title=pytest failure::{message}")
+
+
+@pytest.fixture
+def quimb_trotter():
+    """Require the native scheduler only for tests that exercise it."""
+    import quimb.tensor as qtn
+
+    if not callable(getattr(qtn.LocalHamGen, "get_trotter_gates", None)):
+        pytest.skip("Quimb does not provide the native Trotter scheduler")
+
+
+@pytest.fixture
+def quimb_compressor():
+    """Require an optional upstream compressor for one parameter value."""
+    from pepsy._internal.quimb import quimb_1d_compression_method_available
+
+    def require(method):
+        if not quimb_1d_compression_method_available(method):
+            pytest.skip(f"Quimb does not provide the {method} compressor")
+
+    return require
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -53,6 +85,7 @@ _CORE_MODULES = frozenset(
         "test_ham.py",
         "test_mpo.py",
         "test_mpo_cluster.py",
+        "test_mpo_trotter.py",
         "test_mpo_automaton.py",
         "test_optimize_mpo.py",
         "test_optimize_mps.py",
@@ -115,6 +148,7 @@ _DOMAIN_BY_MODULE = {
     "test_import_boundaries.py": "package",
     "test_mpo.py": "mpo",
     "test_mpo_cluster.py": "mpo",
+    "test_mpo_trotter.py": "mpo",
     "test_mpo_automaton.py": "mpo",
     "test_mpo_benchmarks.py": "benchmarks",
     "test_native_fermion_pepo_2x3.py": "fermions",

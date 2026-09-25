@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pepsy._internal.quimb import call_quimb_2d
 from dataclasses import dataclass
 import math
 from numbers import Integral
@@ -1210,6 +1211,24 @@ class MpsSampler:
             lambda x: ar.to_numpy(x)
         )
         return self
+
+    def entanglement_entropy(self, cut=None, *, method="svd"):
+        """Measure entropy across one bond of the captured source MPS.
+
+        The source state is not mutated. The calculation is delegated to the
+        backend-native tensor observable, so selecting ``backend="quimb"`` for
+        sampling does not force this diagnostic through the sampler's legacy
+        GPU-to-CPU compatibility copy.
+        """
+        from ..tensors.observables import (  # pylint: disable=import-outside-toplevel
+            mps_entanglement_entropy,
+        )
+
+        return mps_entanglement_entropy(
+            self._source_psi,
+            cut=cut,
+            method=method,
+        )
 
     @property
     def physical_code_maps(self):
@@ -5732,7 +5751,8 @@ class PepsBpSampler:
                 "optimize": optimizer,
                 "strip_exponent": True,
             }
-            result = tn_flat.contract_boundary(
+            result = call_quimb_2d(
+                tn_flat.contract_boundary,
                 max_bond=int(chi),
                 mode="mps",
                 final_contract_opts=opts,
@@ -5744,7 +5764,8 @@ class PepsBpSampler:
             )
             if not scaled_is_finite(result):
                 opts["strip_exponent"] = False
-                result = tn_flat.contract_boundary(
+                result = call_quimb_2d(
+                    tn_flat.contract_boundary,
                     max_bond=int(chi),
                     mode="mps",
                     final_contract_opts=opts,
@@ -5761,7 +5782,8 @@ class PepsBpSampler:
                 "optimize": optimizer,
                 "strip_exponent": True,
             }
-            result = tn_flat.contract_ctmrg(
+            result = call_quimb_2d(
+                tn_flat.contract_ctmrg,
                 max_bond=int(chi),
                 final_contract_opts=opts,
                 max_separation=max_separation,
@@ -5772,7 +5794,8 @@ class PepsBpSampler:
             )
             if not scaled_is_finite(result):
                 opts["strip_exponent"] = False
-                result = tn_flat.contract_ctmrg(
+                result = call_quimb_2d(
+                    tn_flat.contract_ctmrg,
                     max_bond=int(chi),
                     final_contract_opts=opts,
                     max_separation=max_separation,

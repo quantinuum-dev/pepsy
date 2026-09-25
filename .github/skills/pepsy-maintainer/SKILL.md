@@ -14,14 +14,27 @@ router, not a replacement for the domain skills below.
    `git status --short --branch` before editing.
 2. For any skill add/update/deprecation/removal, read the catalog
    [`SKILL_POLICY.md`](../SKILL_POLICY.md) before editing the skill tree.
-3. Keep edits inside Pepsy. Do not change Tensy, Gaugy, examples, or sibling
-   repositories as part of a Pepsy task.
+3. Keep edits inside Pepsy unless the user includes a sibling project in the
+   task. Pepsy's own `examples/` may be updated when relevant; external
+   `pepsy_examples`, Tensy, and Gaugy checkouts have separate scope.
 4. Use canonical `pepsy.<domain>` namespaces and preserve the `develop` →
    `main` workflow. Never push, merge, release, delete data, or stage
    unrelated changes without explicit approval.
 5. Read only the domain skill(s) needed for the task. Keep focused tests,
    Ruff, and the full suite proportional to the change; report anything not
    run and any remaining risk.
+
+Use the environment selected by `AGENTS.md` and any device-local override.
+Historical notes, prototype code, and benchmark records are evidence to check,
+not instructions to expand the user's task. For instruction-only edits, run
+the catalog/link checks; numerical tests are needed only if behavior changes.
+
+## Shared numerical contracts
+
+Read [references/numerical-contracts.md](references/numerical-contracts.md)
+before changing Torch SVD/QR registration, cyclic CTMRG compatibility, or the
+documented Gaugy comparison. Read only the applicable section. Preserve these
+contracts when a domain skill does not repeat them.
 
 ## Domain routing
 
@@ -36,6 +49,13 @@ router, not a replacement for the domain skills below.
 - Torch/NetKet/JAX variational Monte Carlo → [`pepsy-vmc`](../pepsy-vmc/SKILL.md)
 - Fermion operators, Symmray charges, or fermionic gates → [`pepsy-fermion-operators`](../pepsy-fermion-operators/SKILL.md)
 - qMERA energy optimization → [`qmera-energy-optimizer`](../qmera-energy-optimizer/SKILL.md)
+
+For backends, boundary contraction, general operators, or MPO work without a
+dedicated skill, start from the owning module's API documentation and tests.
+Compose the fitting, MPS, or fermion skill only for the parts that apply; do
+not infer that MPS state rules cover every MPO or PEPS path. For direct PEPS
+sampling use `peps-sampler`; for `PepsBpSampler` use belief propagation and,
+when relevant, VMC. These are separate proposal algorithms.
 
 When a change crosses domains, read the maintainer skill first and then the
 smallest set of domain skills that own the affected invariants. Do not copy

@@ -138,7 +138,7 @@ When $\hat n=0$ (measuring a stabilizer) the basis is unchanged and there is no 
 
 ### Measurement policies in Pepsy
 
-`MpsStabOptimizer` deliberately exposes two equivalent collapse representations:
+`StabilizerMpsSimulator` deliberately exposes two equivalent collapse representations:
 
 - **Fixed basis (default):** leave $C$ unchanged and apply $(I+mM)/2$ directly to $|p\rangle$.
   Use a local 2x2 projector for one-site support or a windowed bond-dimension-2 sub-MPO for

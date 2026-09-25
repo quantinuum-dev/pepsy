@@ -43,7 +43,7 @@ from ..mps.layout import (
     _normalize_weight_mode,
 )
 from .._layout_orders import normalize_fixed_order
-from ..mps.optimizer import _control_event_parts as _mps_control_event_parts
+from .._stream_events import _control_event_parts as _mps_control_event_parts
 from .._layout_visualization import (
     add_order_colorbar,
     coordinate_lattice_edge_keys,
@@ -791,7 +791,8 @@ class TreePlan:
     """
 
     def __init__(
-        self, root, children, parent, qubit_of_leaf, *, root_qubit=None
+        self, root, children, parent, qubit_of_leaf, *, root_qubit=None,
+        map_mode=None
     ):
         self.root = root
         self.children = dict(children)
@@ -800,6 +801,11 @@ class TreePlan:
         self.leaf_of_qubit = {q: nid for nid, q in self.qubit_of_leaf.items()}
         self.root_qubit = (
             None if root_qubit is None else int(root_qubit)
+        )
+        self._map_mode = (
+            None
+            if map_mode is None
+            else _normalize_layout_order(map_mode)
         )
         if self.root_qubit is not None and self.root in self.qubit_of_leaf:
             raise ValueError(
@@ -821,7 +827,7 @@ class TreePlan:
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
                    dense_max=512, root_qubit=None,
-                   top_arity=_DEFAULT_TOP_ARITY):
+                   top_arity=_DEFAULT_TOP_ARITY, map_mode=None):
         """Build a rooted tree by recursive partition of ``order``.
 
         Parameters
@@ -860,6 +866,10 @@ class TreePlan:
             Maximum subsystem size for dense spectral reordering.
         root_qubit : int, optional
             Qubit label carried by the top tensor rather than a leaf.
+        map_mode : str, optional
+            Canonical geometric label for the leaf order. Tree-native geometry
+            uses ``coarse-*`` names; this is metadata only when an explicit
+            qubit order is supplied.
         top_arity : int or None, optional
             Number of virtual child bonds on the structural root. By default,
             ``max_arity=2`` uses ``top_arity=3`` when there are at least three
@@ -1079,11 +1089,13 @@ class TreePlan:
             parent,
             qubit_of_leaf,
             root_qubit=root_qubit,
+            map_mode=map_mode,
         )
 
     @classmethod
     def from_children(
-        cls, children, qubit_of_leaf, *, root=None, root_qubit=None
+        cls, children, qubit_of_leaf, *, root=None, root_qubit=None,
+        map_mode=None
     ):
         """Build and validate a :class:`TreePlan` from an explicit tree.
 
@@ -1103,6 +1115,8 @@ class TreePlan:
             omitted.
         root_qubit : int, optional
             Qubit label carried by ``root`` rather than by a leaf.
+        map_mode : str, optional
+            Canonical geometric label retained when rebuilding a plan.
         """
         children = {int(k): tuple(int(c) for c in v)
                     for k, v in children.items()}
@@ -1191,6 +1205,7 @@ class TreePlan:
             parent,
             qubit_of_leaf,
             root_qubit=root_qubit,
+            map_mode=map_mode,
         )
 
     #: Fixed number of legs on the top tensor of a :meth:`build_layered` tree.
@@ -1345,6 +1360,12 @@ class TreePlan:
     def leaves(self):
         """Return the leaf node ids."""
         return list(self.qubit_of_leaf.keys())
+
+    @property
+    def map_mode(self):
+        """Canonical geometric label for this tree's leaf layout, if known."""
+
+        return self._map_mode
 
     def mpo_order(self, *, include_root=True):
         """Return the deterministic logical-site order for a tree MPO.
@@ -1620,6 +1641,7 @@ class TreePlan:
             f"TreePlan(n={self.n}, root={self.root}, "
             f"internal_nodes={n_internal}, "
             f"max_arity={self.max_arity()}, top_arity={self.top_arity}"
+            f", map_mode={self.map_mode!r}"
             f"{root_site})"
         )
 
@@ -1701,6 +1723,11 @@ class TreeLayoutFinder:
         `lattice_shape=` and build an exact balanced tree over that traversal.
         Omitted keeps the fast deterministic objective selected by `objective`.
         An explicit site permutation builds a fixed tree without refinement.
+    map_mode : str, optional
+        Alias for a named geometric ``order``. For a tree tensor network use
+        the canonical ``coarse-*`` spelling, for example
+        ``map_mode="coarse-alternate-x"``. It cannot be combined with
+        ``order``.
     lattice_shape : pair or triple of int, optional
         The `(Lx, Ly)` or `(Lx, Ly, Lz)` shape used by named geometric `order`
         presets. The product must equal `n`.
@@ -1768,9 +1795,14 @@ class TreeLayoutFinder:
                  max_operator_qubits=8, hybrid_weights=None, refine=None,
                  refine_budget=None, topology_refine=None, topology_budget=None,
                  search=None, search_budget=128, seed=0,
-                 nevergrad_optimizer="OnePlusOne", order=None, root_qubit=None,
+                 nevergrad_optimizer="OnePlusOne", order=None, map_mode=None,
+                 root_qubit=None,
                  lattice_shape=None, lattice_site=None, coarse_grain=(2, 1),
                  time_decay=None, time_window=None):
+        if map_mode is not None:
+            if order is not None:
+                raise TypeError("map_mode and order cannot both be supplied")
+            order = map_mode
         if (
             _looks_like_tree_tensor_network(gates)
             or _looks_like_tree_tensor_network(supports)
@@ -1903,6 +1935,11 @@ class TreeLayoutFinder:
         self.hybrid_weights = _normalize_hybrid_weights(hybrid_weights)
         self.weight_mode = _normalize_weight_mode(weight_mode)
         self.order = _normalize_layout_order(order)
+        self.map_mode = (
+            self.order
+            if isinstance(self.order, str) and self.order.startswith("coarse-")
+            else None
+        )
         if self.order == "quality":
             # ``order="quality"`` is the explicit high-quality contract. It
             # is intentionally stronger than merely enabling a leaf swap: the
@@ -2057,6 +2094,11 @@ class TreeLayoutFinder:
     def _preset_order(self, mode):
         """Resolve a named geometric preset against this finder's lattice."""
         if self.lattice_shape is None:
+            if isinstance(mode, str) and mode.startswith("coarse-"):
+                # A one-dimensional TreePlan has no transverse lattice axes
+                # to remap. Keep its natural order while retaining the
+                # explicit coarse-* metadata and the same binary tree API.
+                return tuple(self.leaf_qubits)
             raise ValueError(
                 f"order={mode!r} requires lattice_shape=(Lx, Ly) or "
                 "(Lx, Ly, Lz) "
@@ -2238,6 +2280,7 @@ class TreeLayoutFinder:
             qubit_of_leaf,
             root=plan.root,
             root_qubit=plan.root_qubit,
+            map_mode=plan.map_mode,
         )
 
     def _plan_with_leaf_swap(self, plan, left_leaf, right_leaf):
@@ -2252,6 +2295,7 @@ class TreeLayoutFinder:
             qubit_of_leaf,
             root=plan.root,
             root_qubit=plan.root_qubit,
+            map_mode=plan.map_mode,
         )
 
     def _plan_with_nni(self, plan, parent, child, variant):
@@ -2287,6 +2331,7 @@ class TreeLayoutFinder:
             plan.qubit_of_leaf,
             root=plan.root,
             root_qubit=plan.root_qubit,
+            map_mode=plan.map_mode,
         )
 
     @staticmethod
@@ -2396,6 +2441,7 @@ class TreeLayoutFinder:
             qubit_of_leaf,
             root=plan.root,
             root_qubit=plan.root_qubit,
+            map_mode=plan.map_mode,
         )
 
     def _path_score_and_max(self, plan):
@@ -3170,6 +3216,11 @@ class TreeLayoutFinder:
             dense_max=self.dense_max,
             root_qubit=self.root_qubit,
             top_arity=self.top_arity,
+            map_mode=(
+                self.order
+                if isinstance(self.order, str) and self.order.startswith("coarse-")
+                else None
+            ),
         )
         self._plan_cache[key] = (weights, plan)
         return plan
@@ -3573,6 +3624,7 @@ class TreeLayoutFinder:
         else:
             order = _normalize_layout_order(order)
         geometric_order = isinstance(order, str) and order != "quality"
+        map_mode = order if isinstance(order, str) and order.startswith("coarse-") else None
         if geometric_order:
             order = self._preset_order(order)
         if not isinstance(order, str) and order is not None:
@@ -3592,6 +3644,7 @@ class TreeLayoutFinder:
                 max_arity=self.max_arity,
                 root_qubit=self.root_qubit,
                 top_arity=self.top_arity,
+                map_mode=map_mode,
             )
         if order == "quality":
             if self.objective != "full_tree":
@@ -3670,6 +3723,185 @@ class TreeLayoutFinder:
         }
         self._selected_candidate = selected
         return candidates[selected]
+
+    def _pilot_candidate_record(self, plan, *, source=None):
+        """Build the common static record for a pilot candidate."""
+        return {
+            "plan": plan,
+            "objective_key": self._selection_key(plan, self.chi),
+            "path_score": self.score(plan),
+            "tensor_cost": self._tensor_cost_key(plan),
+            "edge_loads": self.edge_loads(plan),
+            **({"source": source} if source is not None else {}),
+        }
+
+    @classmethod
+    def _search_with_pilots(
+        cls, finder_settings, evaluate, *, pilot_candidates, pilot_steps,
+        pilot_workers, include_quality, rounds, topology_budget, refine_budget,
+        search_budget, seed, progbar,
+    ):
+        """Rank static plans with reports supplied by an independent evaluator.
+
+        This owns candidate selection and feedback only. The callback receives
+        a plan and returns a report; the finder never constructs a state or
+        imports an optimizer. Budgets are validated by the calling facade.
+        """
+        previous_plan = None
+        previous_edge_diagnostics = None
+        round_reports = []
+        final_finder = None
+        final_candidates = None
+        final_ranked = None
+        final_selected_name = None
+
+        for round_index in range(rounds):
+            finder = cls(**finder_settings, seed=seed + round_index)
+            quality_kwargs = {
+                "chi": finder_settings["chi"],
+                "include_quality": bool(include_quality),
+            }
+            if topology_budget is not None:
+                quality_kwargs["quality_topology_budget"] = topology_budget
+            if refine_budget is not None:
+                quality_kwargs["quality_refine_budget"] = refine_budget
+            if search_budget is not None:
+                quality_kwargs["quality_search_budget"] = search_budget
+            quality_kwargs["quality_seed"] = seed + round_index
+            candidates = finder.candidate_plans(**quality_kwargs)
+
+            if (
+                previous_plan is not None
+                and previous_edge_diagnostics
+                and rounds > 1
+            ):
+                targeted = finder.targeted_candidates(
+                    previous_plan,
+                    previous_edge_diagnostics,
+                    chi=finder_settings["chi"],
+                    budget=max(2 * pilot_candidates, 8),
+                    seed=seed + round_index,
+                )
+                for proposal_index, plan in enumerate(targeted):
+                    candidates[
+                        f"pilot:round={round_index}:proposal={proposal_index}"
+                    ] = finder._pilot_candidate_record(
+                        plan,
+                        source="pilot_feedback",
+                    )
+
+            ranked_static = sorted(
+                candidates,
+                key=lambda name: candidates[name]["objective_key"],
+            )
+            quality_names = [
+                name for name in ranked_static if name.startswith("quality:")
+            ]
+            feedback_names = [
+                name for name in ranked_static
+                if name.startswith("pilot:")
+            ]
+            ordinary_names = [
+                name for name in ranked_static
+                if not name.startswith(("quality:", "pilot:"))
+            ]
+            if include_quality:
+                ranked = quality_names[:1]
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(feedback_names[:remaining])
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(ordinary_names[:remaining])
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(
+                    name for name in ranked_static
+                    if name not in ranked
+                )
+                ranked = ranked[:pilot_candidates]
+            else:
+                ranked = ranked_static[:pilot_candidates]
+
+            pilot_jobs = [
+                (name, candidates[name]["plan"])
+                for name in ranked
+            ]
+
+            def run_pilot(job):
+                name, plan = job
+                return name, evaluate(
+                    plan,
+                    objective=finder.objective,
+                    pilot_steps=pilot_steps,
+                    progbar=progbar,
+                )
+
+            if pilot_workers > 1 and len(pilot_jobs) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(
+                    max_workers=min(pilot_workers, len(pilot_jobs)),
+                    thread_name_prefix="pepsy-tree-pilot",
+                ) as pool:
+                    pilot_results = list(pool.map(run_pilot, pilot_jobs))
+            else:
+                pilot_results = [run_pilot(job) for job in pilot_jobs]
+
+            reports = {}
+            successful = []
+            for name, report in pilot_results:
+                reports[name] = report
+                if report["status"] != "ok":
+                    continue
+                successful.append((
+                    float(report["infidelity"]),
+                    float(report["total_discarded_weight"]),
+                    float(report["max_discarded_fraction"]),
+                    int(report["truncated_edges"]),
+                    float(report["elapsed_seconds"]),
+                    int(report["final_bond"]),
+                    name,
+                ))
+            if not successful:
+                raise RuntimeError(
+                    "All Tree layout pilot candidates failed. "
+                    f"Diagnostics: {reports!r}"
+                )
+            selected_name = min(successful)[-1]
+            selected_plan = candidates[selected_name]["plan"]
+            selected_report = reports[selected_name]
+            round_reports.append({
+                "round": round_index,
+                "objective": finder.objective,
+                "pilot_candidates": tuple(ranked),
+                "selected_candidate": selected_name,
+                "reports": reports,
+            })
+            previous_plan = selected_plan
+            previous_edge_diagnostics = selected_report.get(
+                "edge_diagnostics", {}
+            )
+            final_finder = finder
+            final_candidates = candidates
+            final_ranked = ranked
+            final_selected_name = selected_name
+
+        selected_plan = final_candidates[final_selected_name]["plan"]
+        final_round = round_reports[-1]
+        result = {
+            "plan": selected_plan,
+            "selected_candidate": final_selected_name,
+            "candidates": final_candidates,
+            "pilot": {
+                "objective": final_finder.objective,
+                "include_quality": bool(include_quality),
+                "pilot_candidates": tuple(final_ranked),
+                "selected_candidate": final_selected_name,
+                "reports": final_round["reports"],
+                "rounds": round_reports,
+                "n_rounds": rounds,
+                "installed": False,
+            },
+        }
+        return result, final_finder
 
     def candidate_plans(
         self,
@@ -4626,6 +4858,11 @@ class TreeLayoutFinder:
             "n_interacting_pairs": n_pairs,
             "objective": self.objective,
             "order": self.order,
+            "map_mode": (
+                self.order
+                if isinstance(self.order, str) and self.order.startswith("coarse-")
+                else None
+            ),
             "lattice_shape": self.lattice_shape,
             "coarse_grain": self.coarse_grain,
             "weight_mode": self.weight_mode,

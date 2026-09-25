@@ -343,6 +343,11 @@ separate from `exp(A + B + C)`, which is a different operator unless the
 factors commute. Contract the returned PEPO with the network contraction
 workflow appropriate for the observable you need.
 
+Pass `materialize=False` to `product.exp(...)` or `compiled.exp(...)` to
+receive `ActivePEPOBlocks` before allocating dense Quimb site tensors. This is
+useful for checking `bond_dimensions` and `dense_nbytes`; `compress=True`
+requires materialization.
+
 The order `p` controls local dimension: for physical dimension `d`, each
 `p`-site target is a `(d**p) x (d**p)` matrix, or `d**(2*p)` coefficients.
 The cost is exponential in `p` but not in the total lattice size `N` at fixed
@@ -392,6 +397,62 @@ such as `("edge", "ZZ", J)`, and `PauliPEPOTerm` values are accepted. Pass
 `beta=1j * tau` explicitly when using the cluster convention
 `exp(-beta * H)` rather than the real-time `tau` shorthand.
 
+For finite colorings or independent coefficients, add an explicit location:
+
+```python
+from pepsy.operators import PauliPEPOBasis, PauliPEPOTerm
+
+basis = PauliPEPOBasis.compile(
+    2,
+    3,
+    [
+        PauliPEPOTerm("onsite", "X", coefficient=h00, where=(0, 0)),
+        PauliPEPOTerm(
+            "edge",
+            "ZZ",
+            coefficient=j01,
+            where=((0, 0), (0, 1)),
+        ),
+    ],
+    order=2,
+)
+```
+
+Unlocated and located slots can be mixed, including across
+`PEPOClusterProductExpansion` factors. The localized builder enumerates each
+connected finite-lattice site subset independently, forms its actual ordered
+local product, and subtracts the completed lower-order PEPO on that support.
+It supports open and periodic square lattices at orders one through nine.
+Translation/C4 orbit reuse remains disabled because independently varying
+coefficients do not share one residual.
+
+On a periodic dimension of length two, two distinct PEPO bonds connect the
+same endpoints. Select one unambiguously with the direction measured from the
+first endpoint:
+
+```python
+wrapped = PauliPEPOTerm(
+    "edge",
+    "XY",
+    coefficient=j_wrap,
+    where=((0, 0), (1, 0)),
+    direction="d",
+)
+```
+
+Endpoint-only locations remain valid when exactly one lattice bond occurrence
+matches. Ambiguous periodic locations raise and require `direction`; they are
+never silently merged. Every bond occurrence internal to a connected site set
+is included in its local Hamiltonian, including parallel length-two PBC bonds.
+
+With `max_tree_rank=None`, each localized residual is represented by an exact,
+coefficient-independent Pauli-history tree. This avoids differentiating
+through an SVD gauge. Setting `max_tree_rank` below the required exact history
+rank opts into the existing fixed-rank backend SVD and is a controlled PEPO
+approximation. Orders four and above can still have large materialized local
+legs. Inspect `active.bond_dimensions` and `active.dense_nbytes` before calling
+`to_pepo()` on a larger lattice.
+
 The Pauli basis is physical and fixed. The PEPO virtual channels are separate
 active history sectors for edge, pair, star, and path clusters. Coefficient
 slots are fused into the 4 onsite and 16 edge Pauli components before local
@@ -404,6 +465,12 @@ the numerical SVD reference, while its stored blocks remain sparse.
 `cache_info` reports the prepared embedding-plan count and fused slot count.
 PEPO–PEPS contraction and expectation-value routines are outside this
 operator-construction API.
+
+`ActivePEPOBlocks.to_pepo()` remaps global history ids separately on each
+physical bond by default, so occurrence-specific channels do not pad every
+leg to the network-wide history count. Pass `compact_bonds=False` only to
+inspect that global labeling. `bond_dimensions` reports the compact dimension
+of every oriented leg; the two maps for opposite ends of one bond agree.
 
 ## Native symmetry blocks
 

@@ -2,16 +2,19 @@
 
 import importlib
 import importlib.metadata
-import tomllib
 from pathlib import Path
 
+import tomllib
+
 import pytest
+from packaging.requirements import Requirement
 import pepsy
 
 from pepsy.boundary import (
     BdyMPS,
     contract_boundary,
     contract_flat,
+    contract_layered,
     peps_fidelity,
     peps_infidelity,
     peps_norm,
@@ -114,6 +117,7 @@ def test_new_namespace_imports_resolve():
     assert BdyMPS is not None
     assert callable(contract_boundary)
     assert callable(contract_flat)
+    assert callable(contract_layered)
     assert callable(peps_norm)
     assert callable(peps_normalize)
     assert callable(peps_infidelity)
@@ -234,6 +238,38 @@ def test_optional_dependency_profiles_are_declared():
         "vmc-torch",
         "viz",
     } <= set(extras)
+
+
+def test_composed_dependency_profiles_preserve_feature_boundaries():
+    """Composite extras are acyclic and retain the intended backend sets."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    extras = project["optional-dependencies"]
+
+    def expand(extra, parents=()):
+        assert extra not in parents, f"cyclic extra: {parents + (extra,)}"
+        dependencies = set()
+        for value in extras[extra]:
+            requirement = Requirement(value)
+            if requirement.name == project["name"]:
+                assert requirement.extras, f"self-reference without extras: {value}"
+                for child in requirement.extras:
+                    dependencies.update(expand(child, parents + (extra,)))
+            else:
+                dependencies.add(str(requirement))
+        return dependencies
+
+    expanded = {extra: expand(extra) for extra in extras}
+    assert expanded["vmc-torch"] == expanded["torch"]
+    assert expanded["vmc"] == expanded["vmc-torch"] | expanded["vmc-netket"]
+    assert expanded["symmetry"] <= expanded["vmc-netket"]
+    assert not {"jax", "netket", "flax", "optax"} & {
+        Requirement(value).name for value in expanded["vmc-torch"]
+    }
+    assert expanded["test-extended"] == set().union(
+        *(expanded[name] for name in ("layout", "solvers", "stabilizer", "symmetry", "torch", "viz"))
+    ) | {"autograd>=1.7"}
 
 
 @pytest.mark.parametrize(

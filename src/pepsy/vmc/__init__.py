@@ -134,6 +134,11 @@ _SYMBOL_MODULES = {
 __all__ = tuple(_SYMBOL_MODULES)
 
 
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
+
+
 def __getattr__(name):
     """Lazily import optional VMC integrations."""
     if name in _SYMBOL_MODULES:

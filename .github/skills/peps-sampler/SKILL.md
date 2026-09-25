@@ -100,11 +100,8 @@ fixed PEPS + conditioned boundary MPS + future environment
    native array updates rather than assuming `isel_` can select per-shot
    values in one ordinary Quimb network.
 6. Run the focused tests, existing sampler tests, public API tests, Ruff, and
-   the repository smoke suite. Activate the Pepsy environment first:
-
-```bash
-source /Users/rezah/envs/genpy/bin/activate
-```
+   the repository smoke suite. First activate the environment selected by
+   `AGENTS.md` and any local override.
 
 ## Non-negotiable checks
 

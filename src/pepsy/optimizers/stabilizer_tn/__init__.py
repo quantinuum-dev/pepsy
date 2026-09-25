@@ -16,7 +16,7 @@ destabilizer generators, tracked with :mod:`stim`) times a **coefficient state**
 
 This module currently provides the state container :class:`STNState`, the
 Clifford update rule (which changes only the basis, leaving ``|nu>``
-unchanged), and :class:`MpsStabOptimizer`, an :class:`pepsy.MpsOptimizer`-style
+unchanged), and :class:`StabilizerMpsSimulator`, an :class:`pepsy.MpsOptimizer`-style
 gate-stream simulator supporting Clifford gates, non-Clifford Pauli rotations,
 explicit gate matrices, sub-MPO events, Pauli measurements (fixed-basis and
 basis-updating), basis-aware mid-circuit reset / measure-reset, guarded physical
@@ -32,10 +32,9 @@ from .mps_stab_optimizer import (
     ImmediateInjectionReport,
     ImmediateProjectionRecord,
     MeasurementRecord,
-    MpsStabOptimizer,
+    StabilizerMpsSimulator,
     NormEventRecord,
     StabilizerMpsSettingsAdvice,
-    StabilizerMpsSimulator,
     StabilizerMpsRunResult,
     StreamAnalysisRecord,
     run_stabilizer_mps_stream,
@@ -45,7 +44,8 @@ from .records import StabilizerTreeRunResult
 from .stn_state import STNState
 
 _DEPRECATED_ALIASES = {
-    "StabilizerMps": "MpsStabOptimizer",
+    "MpsStabOptimizer": "StabilizerMpsSimulator",
+    "StabilizerMps": "StabilizerMpsSimulator",
 }
 
 __all__ = [
@@ -55,12 +55,12 @@ __all__ = [
     "ImmediateInjectionReport",
     "ImmediateProjectionRecord",
     "MeasurementRecord",
+    "StabilizerMpsSimulator",
     "MpsStabOptimizer",
     "NormEventRecord",
     "STNState",
     "StabilizerMpsSettingsAdvice",
     "StabilizerMps",
-    "StabilizerMpsSimulator",
     "StabilizerMpsRunResult",
     "StabilizerTreeRunResult",
     "StreamAnalysisRecord",

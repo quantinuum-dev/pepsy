@@ -31,8 +31,48 @@ different meanings from history `order`. The historical
 | `FirstDegreeMPO.compress_exact` | Remove provably equivalent history channels | Exact scalar gauge elimination only; optional explicit in-place mutation |
 | `FirstDegreeMPO.compress_fixed_rank` | Differentiable numerical compression | Fixed-rank TT-SVD; no value-dependent cutoff, semantic histories are cleared |
 | `FirstDegreeMPO.to_mpo` | Interoperate with Quimb | No compression; returns an open-boundary `MatrixProductOperator`, optionally backed by native Symmray blocks |
-| `FirstDegreeMPO.compress_numerical` | Apply explicit numerical policy | Delegates SVD/QR to Quimb and returns a separate truncation report |
+| `FirstDegreeMPO.validate_charge_flow` | Validate Abelian block structure | Structural virtual-charge validation followed by native Symmray local flow validation |
+| `FirstDegreeMPO.compress_numerical` | Apply explicit numerical policy | Delegates sector-wise SVD/QR to native Quimb/Symmray when available and returns sector diagnostics |
 | `apply_to_mps`, `expectation` | Execute through tensor-network consumers | Delegates to Quimb/Pepsy contraction APIs and does not densify |
+
+## Inspect the structural block plan
+
+`MPOBlockPlan` is the backend-neutral inspection boundary between symbolic
+construction and numerical tensor materialization. It records virtual-state
+labels, local block recipes, optional charge metadata, and block counts, but
+does not retain local numerical arrays:
+
+```python
+from pepsy.operators import MPOBlockPlan
+
+plan = hamiltonian.block_plan
+assert isinstance(plan, MPOBlockPlan)
+print(plan.summary())
+print(plan.internal_bond_dimensions)
+print(plan.block_counts)
+```
+
+For an automaton-built first-degree MPO, the plan lists exact structural
+transitions. For a persistent `history_storage="block_sparse"` higher-order
+result, it lists the blocks surviving Algorithms 1--4. Dense tensors without
+source transition metadata use a conservative all-pairs plan; this is an
+upper bound and is not numerical zero detection. The same plan object can be
+inspected across parameter rebinding and backend execution.
+
+`MPOBlockPlan.validate_charges()` is the value-independent half of the
+symmetry boundary. It normalizes scalar, product, and nested history charges,
+and rejects inconsistent charges assigned to one symbolic virtual state.
+`FirstDegreeMPO.validate_charge_flow()` then calls the existing native
+Symmray compiler, which checks every nonzero local block against
+`(left_virtual, right_virtual, physical_output, physical_input)` charge flow.
+This keeps symbolic validation separate from backend materialization.
+
+`compress_numerical(..., sector_aware="auto")` uses Quimb's public native
+Symmray split/compression path when the materialized tensors are sectorized.
+It does not implement a dense fallback for that request: `sector_aware=True`
+raises if native sectors are unavailable. `MPONumericalCompressionReport`
+records initial and final sector dimensions and per-site native block counts;
+the existing dense Quimb path remains unchanged for ordinary MPOs.
 
 `product(kind=...)` uses `kind` as provenance metadata. In particular,
 `disjoint_product` does not currently prove that supports are disjoint or
@@ -99,10 +139,15 @@ history route for every positive `order`:
 6. Contract the all-one boundary histories only after the rewiring passes.
 
 Named policies map to these passes as follows: `mode="base"` selects
-Algorithms 1--2, `mode="algorithm4"` selects Algorithms 1, 2, and 4,
-`mode="optimal"` selects Algorithms 1--3, and `mode="approximate"` selects
-Algorithms 1--4. The fast `algorithm4` policy intentionally omits Algorithm
-3's selected next-order replay; `mode="approximate"` retains it. The
+Algorithms 1--2, `mode="exact"` selects Algorithms 1--3,
+`mode="folded"` selects Algorithms 1, 2, and 4, and `mode="hybrid"` selects
+Algorithms 1--4. `mode="auto"` estimates Algorithm-3 selected terms
+symbolically before numerical pair-plan materialization, then selects the
+exact policy when the estimate is within `extension_budget` (default 1,024
+selected terms) and the folded policy otherwise. The folded policy intentionally omits
+Algorithm 3's selected next-order replay; `mode="hybrid"` retains it. The
+historical spellings `algorithm4`, `optimal`, and `approximate` remain accepted
+as aliases and are normalized to the canonical names in metadata. The
 `max_bond` guard is checked
 while the temporary history table is generated, before exact compression can
 remove channels; `on_exceed="raise"` is the safe default.
@@ -140,7 +185,7 @@ losing the total Abelian sector. Compilation validates
 `-q_left + q_right + q_upper - q_lower = 0` for every nonzero local block.
 
 The one-site path now evaluates an arbitrary-order local Taylor polynomial.
-With `extend=True` or `mode="optimal"`, it evaluates one additional local
+With `extend=True` or `mode="exact"`, it evaluates one additional local
 Taylor term; there are no non-trivial virtual channels for Algorithm 3 or 4 to
 rewire on a one-site chain.
 

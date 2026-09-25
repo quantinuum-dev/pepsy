@@ -53,6 +53,9 @@ from ._compression_utils import (
     validate_cost_options as _validate_cost_options,
 )
 from ._backend import copy as _copy_array
+from .._internal.quimb import (
+    quimb_process_loop_series_expansion_weights as _process_loop_series_weights,
+)
 from ._symmray import (
     align_d2bp_messages as _align_symmray_d2bp_messages,
     dense_bp_tn as _dense_bp_tn,
@@ -62,6 +65,8 @@ from ._symmray import (
     rank_one_d2_projector as _symmray_rank_one_d2_projector,
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     to_dense as _symmray_to_dense,
+    projector_bra as _symmray_projector_bra,
+    projector_message as _symmray_projector_message,
     uses_symmray as _uses_symmray,
 )
 
@@ -2523,7 +2528,7 @@ def _get_d2_cut_edge_excited(
             bp.index_dual_map.get(index, index): new_index
             for index, new_index in bixmaps[tid].items()
         }
-        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+        local |= _symmray_projector_bra(bp, tid).reindex(bra_reindex)
 
     for index, projector_tids in projector_inds.items():
         tid_left, tid_right = tuple(projector_tids)
@@ -2935,10 +2940,10 @@ def _get_d2_partial_trace_excited(
             bp.index_dual_map.get(index, index): new_index
             for index, new_index in bixmaps[tid].items()
         }
-        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+        local |= _symmray_projector_bra(bp, tid).reindex(bra_reindex)
 
     for index, tid in boundary_inds:
-        data = bp.messages[index, tid]
+        data = _symmray_projector_message(bp.messages[index, tid])
         local |= qtn.Tensor(
             data,
             inds=(bixmaps[tid][index], kixmaps[tid][index]),
@@ -3126,11 +3131,11 @@ def _get_d2_edge_partial_trace_excited(
             bp.index_dual_map.get(index, index): new_index
             for index, new_index in bixmaps[tid].items()
         }
-        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+        local |= _symmray_projector_bra(bp, tid).reindex(bra_reindex)
 
     for index, tid in boundary_inds:
         local |= qtn.Tensor(
-            bp.messages[index, tid],
+            _symmray_projector_message(bp.messages[index, tid]),
             inds=(bixmaps[tid][index], kixmaps[tid][index]),
         )
 
@@ -3556,12 +3561,9 @@ def _partial_trace_loop_series(
             if region != base_region
         }
         if correction_weights:
-            from quimb.tensor.belief_propagation.bp_common import (
-                process_loop_series_expansion_weights,
-            )
-
-            suppression = process_loop_series_expansion_weights(
+            suppression = _process_loop_series_weights(
                 correction_weights,
+                num_tensors=bp.tn.num_tensors,
                 return_all=True,
             )
         else:
@@ -3741,7 +3743,14 @@ def _get_d2_cluster_norm(
             info=None,
             inplace=False,
         )
-    bra = qtn.TensorNetwork(bp.tensor_dual_map[tid] for tid in tids)
+    from ._symmray import d2bp_uses_fermionic_operators
+
+    if ket_base.isfermionic() and d2bp_uses_fermionic_operators():
+        # New D2BP's cached single-site bras phase every leg for local message
+        # updates. A multi-site region instead phases only its outer legs.
+        bra = ket_base.conj().reindex(bp.index_dual_map)
+    else:
+        bra = qtn.TensorNetwork(bp.tensor_dual_map[tid] for tid in tids)
     if partial_trace_map:
         bra.reindex_(partial_trace_map)
     cluster = bra | ket
@@ -3849,12 +3858,9 @@ def _local_expectation_loop_series(
             if region != base_region
         }
         if correction_weights:
-            from quimb.tensor.belief_propagation.bp_common import (
-                process_loop_series_expansion_weights,
-            )
-
-            suppression = process_loop_series_expansion_weights(
+            suppression = _process_loop_series_weights(
                 correction_weights,
+                num_tensors=bp.tn.num_tensors,
                 return_all=True,
             )
         else:
@@ -4572,18 +4578,16 @@ def _diagnose_open_scalar_support(
 def _edge_series_suppression(
     weights,
     *,
+    num_tensors,
     multi_excitation_correct,
     tol_correction,
     maxiter_correction,
 ):
     if not multi_excitation_correct or not weights:
         return {edges: 1.0 for edges in weights}
-    from quimb.tensor.belief_propagation.bp_common import (
-        process_loop_series_expansion_weights,
-    )
-
-    return process_loop_series_expansion_weights(
+    return _process_loop_series_weights(
         weights,
+        num_tensors=num_tensors,
         multi_excitation_correct=True,
         tol_correction=tol_correction,
         maxiter_correction=maxiter_correction,
@@ -4668,6 +4672,7 @@ def _partial_trace_edge_loop_series(
     weights = {edges: _rho_trace(rho) for edges, rho in rho_terms.items()}
     suppression = _edge_series_suppression(
         weights,
+        num_tensors=bp.tn.num_tensors,
         multi_excitation_correct=multi_excitation_correct,
         tol_correction=tol_correction,
         maxiter_correction=maxiter_correction,
@@ -5241,6 +5246,7 @@ def _local_expectation_edge_loop_series(
     ).contract(optimize=optimize, **contract_opts)
     suppression = _edge_series_suppression(
         norm_terms,
+        num_tensors=bp.tn.num_tensors,
         multi_excitation_correct=multi_excitation_correct,
         tol_correction=tol_correction,
         maxiter_correction=maxiter_correction,
@@ -5997,6 +6003,7 @@ def _local_expectation_loop_cluster(
 def _process_weights(
     weights,
     *,
+    num_tensors,
     mantissa,
     exponent,
     multi_excitation_correct,
@@ -6005,12 +6012,9 @@ def _process_weights(
     strip_exponent,
 ):
     """Use Quimb's loop-series resummation with edge-degree keys."""
-    from quimb.tensor.belief_propagation.bp_common import (
-        process_loop_series_expansion_weights,
-    )
-
-    suppression = process_loop_series_expansion_weights(
+    suppression = _process_loop_series_weights(
         weights,
+        num_tensors=num_tensors,
         multi_excitation_correct=multi_excitation_correct,
         tol_correction=tol_correction,
         maxiter_correction=maxiter_correction,
@@ -6019,8 +6023,9 @@ def _process_weights(
     correction = -sum(
         weight * suppression[edges] for edges, weight in weights.items()
     )
-    estimate = process_loop_series_expansion_weights(
+    estimate = _process_loop_series_weights(
         weights,
+        num_tensors=num_tensors,
         mantissa=mantissa,
         exponent=exponent,
         multi_excitation_correct=multi_excitation_correct,
@@ -6073,6 +6078,7 @@ def _contract_loop_series(
             contraction_costs[term.edges] = cost
     estimate, correction, suppression = _process_weights(
         weights,
+        num_tensors=bp.tn.num_tensors,
         mantissa=bp.sign,
         exponent=bp.exponent,
         multi_excitation_correct=multi_excitation_correct,

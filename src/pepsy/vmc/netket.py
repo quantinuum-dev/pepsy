@@ -6,6 +6,7 @@ packages only when the concrete helpers are used.
 
 from __future__ import annotations
 
+from pepsy._internal.quimb import call_quimb_2d
 from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
@@ -2110,7 +2111,8 @@ def _contract_boundary_for_vmc(tn, *, max_bond, cutoff, method_opts):
     global _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED
     kwargs = dict(method_opts)
     try:
-        return tn.contract_boundary(
+        return call_quimb_2d(
+            tn.contract_boundary,
             max_bond=max_bond,
             cutoff=cutoff,
             strip_exponent=True,
@@ -2132,7 +2134,8 @@ def _contract_boundary_for_vmc(tn, *, max_bond, cutoff, method_opts):
                 )
                 _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = True
             kwargs["max_separation"] = 1
-            return tn.contract_boundary(
+            return call_quimb_2d(
+                tn.contract_boundary,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 strip_exponent=True,
@@ -2156,7 +2159,8 @@ def _contract_ctmrg_for_vmc(tn, *, max_bond, cutoff, method_opts):
     kwargs = dict(method_opts)
     with quimb_ctmrg_projector_compat():
         try:
-            return tn.contract_ctmrg(
+            return call_quimb_2d(
+                tn.contract_ctmrg,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 strip_exponent=True,
@@ -2178,7 +2182,8 @@ def _contract_ctmrg_for_vmc(tn, *, max_bond, cutoff, method_opts):
                     )
                     _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = True
                 kwargs["max_separation"] = 1
-                return tn.contract_ctmrg(
+                return call_quimb_2d(
+                    tn.contract_ctmrg,
                     max_bond=max_bond,
                     cutoff=cutoff,
                     strip_exponent=True,

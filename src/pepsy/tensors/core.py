@@ -17,7 +17,11 @@ from .contractions import (
     contract_hypercompressed_tn_batch,
     tn_norm,
 )
-from .observables import measure_obs, tn_fidelity as _tn_fidelity
+from .observables import (
+    measure_obs,
+    mps_entanglement_entropy,
+    tn_fidelity as _tn_fidelity,
+)
 from .constructors import (
     add_cycle,
     expec_mpo,
@@ -134,7 +138,8 @@ __all__ = [
     "get_default_array_backend", "set_default_grad_backend", "get_default_grad_backend",
     "reset_default_backends", "build_contraction", "build_optimizer", "build_compressed_optimizer",
     "contract_hypercompressed_tn", "contract_hypercompressed_tn_batch", "tn_fidelity",
-    "tn_norm", "measure_obs", "tns_align", "expec_mpo", "id_to_mpo", "id_to_pepo",
+    "tn_norm", "measure_obs", "mps_entanglement_entropy", "tns_align",
+    "expec_mpo", "id_to_mpo", "id_to_pepo",
     "ps_to_peps", "ps_to_3dpeps", "ps_to_mps", "ps_to_ttn", "ps_to_pepo", "ps_to_mpo",
     "haar_random_state", "random_haar_qubit", "hrs_to_peps", "hrs_to_mps", "hrs_to_ttn",
     "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn", "add_cycle",

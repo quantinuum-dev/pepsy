@@ -27,8 +27,8 @@ explicit domain APIs and may require optional dependencies.
 The top-level `pepsy` namespace is a frozen compatibility facade. Existing
 root-level names remain available through lazy aliases, but new public names
 should be added to their responsibility-based namespace instead of expanding
-`pepsy.__init__`. Advanced functionality belongs in its explicit domain module
-or under `pepsy.experimental`.
+`pepsy.__init__`. Advanced functionality belongs in its explicit domain module;
+`pepsy.experimental` provides additional discovery paths to those domains.
 
 Any proposed root-level addition requires an API-stability review and a
 regression test. This policy prevents the root namespace from becoming a
@@ -41,13 +41,21 @@ workflows, and VMC integrations are advanced domains. They are available from
 their explicit modules and through `pepsy.experimental`:
 
 ```python
-from pepsy.experimental import bp, symmetry, vmc
-from pepsy.vmc.torch import TorchVMCDriver
+import pepsy.bp as bp
+from pepsy.tensors import SymMPS
+from pepsy.vmc import TorchVMCDriver
 ```
 
 These domains may evolve faster and can have additional dependency or backend
 requirements. Their public entry points are documented, but implementation
 details are not compatibility guarantees.
+
+**Advanced** describes a specialized workflow, **optional** describes an
+installation requirement, and **experimental** describes a stability decision.
+An optional dependency alone does not make an API experimental. The
+`pepsy.experimental` discovery facade routes to existing domain objects; using
+it does not create a different implementation or change that object's documented
+stability. Prefer the owning namespace in new examples and application code.
 
 ## Removed compatibility modules
 

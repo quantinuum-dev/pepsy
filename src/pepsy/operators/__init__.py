@@ -99,10 +99,16 @@ _MPO_EXPORTS = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOAdaptiveCompressionReport",
+    "MPOChargeValidationReport",
+    "MPOBlock",
+    "MPOBlockPlan",
     "FirstDegreeMPO",
     "CompiledMPOExp",
     "MPOBasis",
     "exp_mpo",
+    "TrotterMPOReport",
+    "exp_trotter",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_higher_order" for name in _MPO_EXPORTS})
 _MPO_COMPATIBILITY_EXPORTS = ["CompiledMPOEvolution"]
@@ -116,6 +122,9 @@ _MPO_CLUSTER_EXPORTS = [
     "MPOClusterProductExpansion",
     "MPOGraphClusterProductExpansion",
     "CompiledMPOClusterProduct",
+    "compress_mpo_product",
+    "exp_mpo_cluster",
+    "exp_mpo_cluster_product",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_product" for name in _MPO_CLUSTER_EXPORTS})
 _MPO_CLUSTER_COMPATIBILITY_EXPORTS = [
@@ -144,7 +153,9 @@ _SUBMODULES = (
     "hamiltonians",
     "mpo",
     "mpo_semantic",
+    "mpo_block_plan",
     "mpo_higher_order",
+    "mpo_trotter",
     "mpo_automaton",
     "mpo_cluster",
     "mpo_product",
@@ -179,6 +190,11 @@ __all__ = [
     "PauliBondCompressionReport",
     *_SUBMODULES,
 ]
+
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

@@ -15,6 +15,7 @@ from typing import Any
 
 import autoray as ar
 
+from ..boundary._measurements import compute_peps_local_expectation
 from ._symmray import (
     is_symmray_array as _is_symmray_array,
     uses_symmray as _uses_symmray,
@@ -286,7 +287,9 @@ def compute_boundary_expectation(
     max_bond=None,
     cutoff=1.0e-10,
     canonize=True,
-    mode="mps",
+    mode=None,
+    method=None,
+    route="boundary",
     layer_tags=("KET", "BRA"),
     normalized=True,
     autogroup=True,
@@ -313,12 +316,16 @@ def compute_boundary_expectation(
             "tn must provide Quimb's compute_local_expectation method"
         )
 
-    return tn.compute_local_expectation(
+    if mode is not None and method is not None and mode != method:
+        raise ValueError("Conflicting boundary compression mode and method.")
+    return compute_peps_local_expectation(
+        tn,
         terms,
         max_bond=max_bond,
         cutoff=cutoff,
         canonize=canonize,
-        mode=mode,
+        method=method or mode,
+        route=route,
         layer_tags=layer_tags,
         normalized=normalized,
         autogroup=autogroup,

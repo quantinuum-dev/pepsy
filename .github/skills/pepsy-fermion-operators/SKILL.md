@@ -27,8 +27,8 @@ gate construction explicit internally.
   adoption status, and design/implementation guidance.
 - `tests/test_symmetric_tensors.py`, `tests/test_public_api.py`, and
   `docs/api/tensors/symmetric.md` before changing public behavior.
-- The concrete workflows under
-  `/home/reza.haghshenas@quantinuum.com/pepsy_examples/fermi_hubbard`, starting
+- When the sibling checkout is available, the concrete workflows under
+  `../pepsy_examples/fermi_hubbard`, starting
   with `README.md`, `PLAN.md`, `fh_energy.ipynb`, `fh_mps.ipynb`, and
   `mps/mps_fermions_helpers.py`.
 - The installed/upstream `symmray.fermionic_local_operators` implementation,
@@ -185,7 +185,7 @@ not make it the only way to construct the helper.
 Run focused tests first, then broaden as appropriate:
 
 ```bash
-source ~/envs/py312/bin/activate
+# Activate the environment selected by AGENTS.md and any local override.
 pytest -q tests/test_symmetric_tensors.py
 pytest -q tests/test_public_api.py tests/test_package_layout.py
 ```

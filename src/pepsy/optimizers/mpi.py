@@ -1040,7 +1040,7 @@ class MPIShotRunner:
         numerator = 0.0
         denominator = 0.0
         local_error = None
-        started = time.perf_counter()
+        started = time.perf_counter() if collect_diagnostics else None
         try:
             if checkpoint_file is not None:
                 if resume:
@@ -1174,7 +1174,7 @@ class MPIShotRunner:
         diagnostics = self._collect_rank_diagnostics(
             start=start,
             stop=stop,
-            elapsed_seconds=time.perf_counter() - started,
+            elapsed_seconds=0.0 if started is None else time.perf_counter() - started,
             strategy=strategy,
             retain="none",
             resumed=resume,
@@ -1236,7 +1236,7 @@ class MPIShotRunner:
         accumulated = None
         chunks = []
         local_error = None
-        started = time.perf_counter()
+        started = time.perf_counter() if collect_diagnostics else None
         try:
             if resume:
                 _path, payload = _load_checkpoint(
@@ -1425,7 +1425,7 @@ class MPIShotRunner:
         diagnostics = self._collect_rank_diagnostics(
             start=start,
             stop=stop,
-            elapsed_seconds=time.perf_counter() - started,
+            elapsed_seconds=0.0 if started is None else time.perf_counter() - started,
             strategy=strategy,
             retain=retain,
             resumed=resume,
@@ -1659,7 +1659,7 @@ class MPIShotRunner:
         per rank in addition to the latest checkpoint file.
         Set ``checkpoint_sync=False`` only when filesystem durability is
         managed externally. Set ``collect_diagnostics=False`` to avoid the
-        final rank-diagnostics gather on very large communicators.
+        profiling clock reads and the final rank-diagnostics gather.
         ``checkpoint_id`` is an optional application-defined identity for
         custom factories or observable callbacks whose semantics are not
         discoverable from their Python objects.
@@ -1860,7 +1860,7 @@ class MPIShotRunner:
                 progress_state.close()
 
         start, stop = _partition(shots, self.rank, self.world_size)
-        started = time.perf_counter()
+        started = time.perf_counter() if collect_diagnostics else None
         root_seed = self._broadcast_seed(seed)
         local_error = None
         local_result = None
@@ -1925,7 +1925,7 @@ class MPIShotRunner:
         diagnostics = self._collect_rank_diagnostics(
             start=start,
             stop=stop,
-            elapsed_seconds=time.perf_counter() - started,
+            elapsed_seconds=0.0 if started is None else time.perf_counter() - started,
             strategy=strategy,
             retain=retain,
             collect=collect_diagnostics,

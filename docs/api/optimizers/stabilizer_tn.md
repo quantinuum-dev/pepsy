@@ -16,11 +16,28 @@ remains exact up to the configured cutoff, while a finite `chi` compresses the
 mapped operator with the normal diagnostics. The coefficient-MPS compression
 backend uses the same bare method names as `MpsOptimizer`: `mode="direct"`
 (the default), `"dm"`, `"zipup"`, `"src"`, their `*-first` and
-`*-oversample` variants, and the `fit-*` variants. `"dmrg"`/`"dmrg1"`/
+`*-oversample` variants, `"sdc"` / `"sdc-oversample"`, and the `fit-*`
+variants. `"dmrg"`/`"dmrg1"`/
 `"dmrg2"`/`"dmrg3"`, `"svd"`, `"swap"`, `"perm"`, and `"exact"` remain
 available. Historical `"quimb-*"` and `"mpo-*"` spellings are accepted only
 as deprecated aliases. `mode="exact"` forces `chi=None`; Clifford tableau
 updates remain free in every mode.
+
+`cutoff="auto"` follows the ordinary MPS dtype-aware policy (`1e-12` for
+64-bit, `1e-6` for 32-bit, and `1e-3` for 16-bit data). `cutoff_mode="auto"`
+uses `"rsum2"` for FIT while leaving native MPO methods on Quimb's method
+default. `run()` accepts the ordinary MPS FIT controls, including `n_iter`,
+`fit_min_iter`, `fit_rtol`, `fit_patience`, `fit_block_size`,
+`fit_adaptive_sweeps`, `fit_sweep_sequence`, `finite_check`, and optional
+`fit_overlap_diagnostics`. `fit_rtol="auto"` is dtype-aware; `None` requests
+fixed sweeps. The default FIT warm start is `fit_init_strategy="guess-src"`.
+Optional performance diagnostics are disabled by default: `finite_check=False`,
+`fit_overlap_diagnostics=False`, and `timing=False`. Untimed replay performs no
+profiling clock reads and leaves `get_run_timing()` unset. Per-update STN
+norm-survival tracking remains part of the simulator's fidelity contract and
+is independent of these optional diagnostics.
+MPI shot replay also defaults to `collect_diagnostics=False`; enable it
+explicitly to collect rank timing reports.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
 native-compressed FIT guess before active bonds reach their `chi` ceilings;
@@ -39,7 +56,8 @@ the exact target construction. On dense backends, the exact coefficient
 sub-MPO is retained as a tagged lazy FIT target layer: the active MPS window
 is canonicalized first, then FIT contracts the MPS and sub-MPO tensors without
 absorbing the operator into an intermediate target MPS. Symmray and fermionic
-routes retain the materialized backend-safe target fallback.
+routes retain the materialized backend-safe target fallback. The resulting
+`get_fit_diagnostics()` record includes the selected convergence controls.
 `get_fit_diagnostics()` reports the selected block size, growth/refinement
 sweeps, SRC guess method, target representation, and the DMRG1 one-site latch.
 
@@ -72,11 +90,11 @@ deferred MAST, and the two cooling mechanisms, see the
 [STN magic and cooling how-to](../../howto/stabilizer_tn_magic.md).
 
 Before choosing settings, start with the Pepsy-native stream advisor:
-`MpsStabOptimizer.analyze_stream(gates, n_qubits=...)` returns a typed
+`StabilizerMpsSimulator.analyze_stream(gates, n_qubits=...)` returns a typed
 `StreamAnalysisRecord` with counts for Clifford entries, injectable T-family
 rotations, other non-Clifford rotations, dense matrices, coefficient-frame
 sub-MPOs, measurements, resets, caps, touched qubits, and warnings. Then
-`MpsStabOptimizer.recommend_settings(gates, goal="run" | "validate" |
+`StabilizerMpsSimulator.recommend_settings(gates, goal="run" | "validate" |
 "benchmark", ...)` returns a typed `StabilizerMpsSettingsAdvice` containing
 constructor settings (`chi`, `cutoff`, `exact_cooling`, `stabilize_unitary`),
 an explicit execution method (`apply`, `with_injection`, or
@@ -84,7 +102,7 @@ an explicit execution method (`apply`, `with_injection`, or
 human-readable `message`.
 
 `recommend_settings` calls the narrower
-`MpsStabOptimizer.recommend_magic_strategy(gates, ...)` internally for the
+`StabilizerMpsSimulator.recommend_magic_strategy(gates, ...)` internally for the
 `direct` / `immediate` / `deferred` decision. On an unrun simulator,
 `queued_stream_analysis()` and `queued_recommend_settings()` read its queue,
 including a `from_stim(..., stream_transform=...)` result. All of these APIs are
@@ -105,13 +123,13 @@ injection report, and remaining queue length. On a `from_stim` simulator,
 same runner without mutating the original queued simulator.
 
 You can initialize from an ordinary computational-basis qubit MPS directly:
-`MpsStabOptimizer(p)` or `MpsStabOptimizer.from_mps(p)` wraps `p` with the
+`StabilizerMpsSimulator(p)` or `StabilizerMpsSimulator.from_mps(p)` wraps `p` with the
 identity tableau, so initially `C = I` and `|psi> = |p>`. Use this for an
 already-prepared MPS ground state. Pass `inplace=False` to copy the supplied
 MPS before evolution.
 
 For one sampled Stim trajectory, use
-`MpsStabOptimizer.from_stim(circuit, seed=...)`. It compiles the Stim circuit,
+`StabilizerMpsSimulator.from_stim(circuit, seed=...)`. It compiles the Stim circuit,
 infers its qubit count, samples native Pauli noise once, and queues the resulting
 stream. The seed also deterministically initializes its later measurement sampling.
 The returned simulator retains `.stim_plan` and `.stim_sample`, including
@@ -123,7 +141,7 @@ same `analyze_stream` and `recommend_settings` APIs operate directly on any
 Pepsy stream.
 
 ```python
-sim = pepsy.MpsStabOptimizer.from_stim(circuit, chi=32, seed=7)
+sim = pepsy.StabilizerMpsSimulator.from_stim(circuit, chi=32, seed=7)
 sim.run(progbar=True)
 print(sim.stim_sample.faults)
 ```
@@ -465,8 +483,13 @@ backend, and user gates/MPOs must be prepared with the same converter before
 they are queued, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on that array backend.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
-cached per backend; expectation/fidelity scalars are converted back to Python
-floats.  `to_basis_statevector()` returns the coefficient vector `|nu>` in
+cached per backend/device/dtype. Ordinary compressed unitary replay keeps
+detached norm/log-fidelity scalars on the backend; `get_infidelities()`,
+`get_compression_norm_events()`, and `norm_diagnostics()` materialize Python
+values at readout. `get_infidelities()` retains the historical public list
+identity. Explicit extracted-exponent bookkeeping and
+`stabilize_unitary=True` retain their validated host scale decisions.
+`to_basis_statevector()` returns the coefficient vector `|nu>` in
 tableau-basis order without applying the tableau. `to_statevector()` returns
 the physical computational-basis vector `C|nu>` and applies a tableau circuit
 without constructing a dense `2**n x 2**n` Clifford matrix.
@@ -487,6 +510,22 @@ coefficient state. Stim gate classification still uses a temporary NumPy view,
 while coefficient contractions remain on the inferred backend. Stim and
 trajectory-generated matrices are converted by the library before they enter
 this user-stream boundary.
+
+Named rotations and projectors assemble their changing coefficients on the
+backend. `pauli_combo_submpo(..., like=array)` and
+`pauli_sum_submpo(..., like=array)` construct the complete coefficient MPO
+there; omitting `like` retains their NumPy defaults. FIT random guesses use
+Autoray's backend generator and `random.array`. Available early-dispatch
+namespaces cache the array operations without fixing the simulator to Torch,
+JAX, or CuPy implementations.
+
+Exact cooling stays enabled by default. It reduces a candidate qubit to three
+Bloch values on the backend and reads those small classical decisions for
+Stim. Arbitrary dense physical gates still require CPU classification and
+Pauli decomposition. Measurements, FIT convergence, upstream truncation rank
+selection, explicit diagnostics, and the reporting/injection runner APIs
+retain their existing host decisions or requested reports. These boundaries
+mean the hybrid simulator is not entirely free of CPU/GPU synchronization.
 
 
 > API details are maintained as handwritten Markdown in this page.

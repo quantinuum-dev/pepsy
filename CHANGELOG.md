@@ -10,78 +10,127 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 ## [Unreleased]
 
-Changes for the next release should be added here before the version is bumped.
+This release changes supported environments and several optimizer defaults.
+Read the [migration guide](docs/development/api-migration.md) before upgrading.
+The release version and date have not been selected.
+
+### Changed
+
+- Require Python 3.12 or newer. Core dependency floors are NumPy 1.26,
+  Quimb 1.15, Cotengra 0.8.0, Autoray 0.9, and tqdm 4.65. Optional dependency
+  floors also increase; NetKet VMC requires JAX `>=0.7,<0.11.1` and NetKet
+  3.22 or newer. See [installation](docs/installation.md) and the
+  [dependency audit](docs/development/notes/dependency_minimums_2026_09.md).
+- `MpsOptimizer` now defaults to `mode="direct"`. Request `mode="dmrg"`
+  or a named DMRG schedule explicitly for variational replay. `MpoOptimizer`
+  and `GibbsMps` also use the canonical `direct` spelling; `mpo` remains a
+  compatibility alias.
+- MPS `mix` replay now fits a disposable direct-compressed guess against the
+  exact target during both bond growth and fixed-rank updates. It fixes
+  `fit_block_size=1` and `fit_init_strategy="guess-direct"`; use ordinary
+  DMRG for other block sizes or initializers.
+- FIT schedules now include larger-block warm-up and one-site refinement,
+  with a two-site transition in `dmrg3`. Tree optimizers select path or branch
+  traversal through `fit_traversal="auto"`. Tree compression uses live-rank
+  scheduling; explicit traversal and compression controls remain available.
+  Finite-rank and seeded results can change with the updated algorithms.
+- Hamiltonian `to_mpo`, `to_pepo`, `to_tree_mpo`, and `to_tree_pepo` default
+  to `compress="term"`. Use `compress="auto"` for workload-selected assembly,
+  `compress="automaton"` for shared state diagrams, or `compress=False` to
+  disable numerical compression. Native tree builders can infer a layout
+  from interaction supports.
+- MPS runtime finite checks and MPI diagnostic collection are opt-in.
+  Tree and stabilizer MPI replay likewise default to `collect_diagnostics=False`.
+  Backend-native norm and fidelity bookkeeping defers host scalar conversion
+  until readout where possible. Explicit diagnostic controls remain available.
+- Stabilizer front ends use `StabilizerMpsSimulator`,
+  `StabilizerTreeSimulator`, and `StabilizerMpsSampler`. Previous names remain
+  deprecated aliases. Hamiltonian `build_mpo` / `build_pepo` wrappers remain
+  deprecated aliases for `to_mpo` / `to_pepo`.
+- Public namespaces load exports lazily and expose them through `dir()`.
+  Internal helpers use their owning modules, optimizer event parsing has a
+  shared owner, and VMC/test extras compose existing dependency profiles.
 
 ### Added
 
-- Added opt-in Quimb `sdc` and `sdc-oversample` MPS compression mode names
-  with execution-time capability checks; existing compression defaults and
-  modes are unchanged.
-- Updated randomized MPS compression to use Quimb's explicit `seed` support
-  when available, while retaining a compatibility fallback for older builds.
-- Added opt-in fourth-order Suzuki-Yoshida gate streams to the symmetric
-  Hamiltonian and fermion helpers. Existing first- and second-order streams
-  retain their public behavior, with overlapping hopping terms now arranged in
-  a symmetric edge-colored half-step schedule before the fourth-order lift.
-- Added a narrow Symmray compatibility path for older Quimb projector
-  compression builds whose `safe_inverse` incorrectly passes an axis to a
-  one-dimensional block vector.
+- `GibbsMps` finite-temperature purification, `bell_to_mps`, thermal MPO
+  readout, exponent-aware partition functions, and graph-aware first-, second-,
+  and fourth-order Trotter scheduling. See the
+  [Gibbs-MPS API](docs/api/optimizers/gibbs_mps.md).
+- Tree-native FIT/DMRG, compact `SubTreeMPO` / `TreeSubPEPO` application,
+  zipup and mixed replay, and successive/randomized compression families.
+  `TreePeps` supports coordinate-aware spanning trees, layout selection,
+  canonical-region metadata, and up to four virtual bonds per site. Native
+  symmetry/backend restrictions are explicit in the
+  [tree](docs/api/optimizers/tree.md) and
+  [TreePEPS](docs/api/optimizers/tree_peps.md) APIs.
+- Opt-in SDC, SRC, SDCR, and oversampled compression variants across supported
+  MPS, MPO, tree, and PEPS boundary paths. Intermediate and final compression
+  controls remain independent, with execution-time capability checks and
+  authoritative final bond limits. See
+  [compression options](docs/api/boundary/compression.md).
+- State-aware MPS layout and replay scheduling, including interaction-derived
+  coordinates, site lifetimes, role-aware candidates, and an opt-in
+  `measure-early` schedule that respects control dependencies.
+- `mps_to_ttn` and `mps_to_treepeps` conversions with explicit bond caps;
+  MPS transfer spectra and correlation lengths; MPS and tree entanglement
+  diagnostics; and dense-backend/native-Symmray tree sampling. See
+  [observables](docs/api/tensors/observables.md) and
+  [tree sampling](docs/api/sampling/tree.md).
+- Directional and middle-out flat contractions, layered boundary contraction,
+  additional finite-CTMRG modes, and `preserve_backend=True` scalar returns
+  for differentiable flat contractions. See
+  [boundary metrics](docs/api/boundary/metrics.md).
+- Term-centric and backend-aware Hamiltonian/MPO construction, higher-order
+  exponential policies, structural MPO block inspection, charge-flow
+  validation, bounded/streaming graph-cluster assembly, and ordered products.
+  Inhomogeneous PEPO products support explicit locations and periodic square
+  lattices through order nine. See [operators](docs/api/index.md) and the
+  [exponential API](docs/api/operators/exponentials.md).
+- Fourth-order symmetric Hamiltonian/fermion gate streams, additional BP
+  option forwarding, and capability-gated upstream contraction integrations.
+- Opt-in Torch PEPS export, batching, and compilation for exact amplitudes
+  and reusable rectangular boundary environments, with eager fallbacks for
+  unsupported paths. See [VMC](docs/api/vmc.md).
 
-- Added the initial `TreePepsPlan` and `TreePeps` state API for PEPS-like
-  tensor networks with 2D/3D coordinate tags, stable 1D logical tags, and
-  validated spanning-tree virtual bonds, including PEPS-style `show`, tree
-  canonical-center movement, `info_c` synchronization, and compression hooks.
-- Added a hard three-virtual-bond TreePeps rank invariant, explicit local and
-  maximum tensor-rank diagnostics, a workload-aware `TreePepsLayoutFinder`,
-  and Quimb-style 2D Unicode state schematics that show retained tree bonds.
-- Added `left_inds`-backed isometry metadata to `TreePeps`, with canonical
-  region recovery, path-only center movement, QR-free canonical edge moves,
-  and a center-oriented compression sweep that avoids a redundant full QR.
-- Added tree-native `TreePepo` and `TreeSubPepo` operators with separate
-  input/output legs, support/span metadata, exact dense-factorized gates,
-  term sums, tree-bond fusion on application, expectation values, and
-  optional canonical compression.
-- Added `TreePepsOptimizer` with direct tree-geodesic gate replay and
-  `sub_treepepo` span replay, lossless routing, `left_inds`-aware canonical
-  preparation, localized compression, per-update bond reports, persistent
-  `set_gates`/`add_gates` streams, common one-/two-/multi-site aliases, and
-  validated state replacement.
-- Added TreePeps parity helpers for rooted topology traversal, bond-growth
-  estimates and preflight, batched local expectations, dense state-vector
-  conversion, normalization, optimizer state aliases, and truncation reports.
-- Completed TreePeps optimizer parity for state canonicalization aliases,
-  span-local explicit compression, normalization controls, intermediate-bond
-  preflight, profile and transient-bond diagnostics, layout convenience, and
-  chi convergence sweeps with optional dense-reference fidelity.
-- Added `compression_mode="dm"` to the tree, TreePeps, and TreeStab optimizer
-  families. It applies Quimb's density-matrix-equivalent local `svd:eig`
-  decomposition after the complete state/operator network is fused; the
-  existing direct SVD mode remains the default and native fermionic trees keep
-  their graded direct-compression path.
-- Added explicit `TreeOptimizer` `tree_mpo_direct` and `tree_mpo_dm` modes.
-  These build and route a true TreeMPO over the active Steiner subtree rather
-  than lowering gates to a chain sub-MPO; `auto` now promotes gates wider than
-  four qubits to the TreeMPO route, while bounded dense direct gates fail with
-  an actionable mode recommendation.
-- Updated `TreeStabOptimizer` to use true TreeMPO active-span routing for
-  coefficient-frame gates, Pauli sums, projections, localizers, and exact
-  cooling. Its canonical modes are `tree_mpo_direct` and `tree_mpo_dm`, with
-  `tree-mpo-dm` and `tree_mpo_dem` accepted as aliases.
-- Added `OneDMap` center-out/inside-out traversal aliases and independent
-  `TreePepsPlan.tree_order` seeds. Row-major, Hilbert, diagonal, and
-  center-out orders can now guide legal degree-bounded virtual trees, and
-  `TreePepsLayoutFinder` compares those deterministic seeds with weighted
-  growth and reports the selected seed.
-- Centralized execution-time Quimb capability checks for optional MPS
-  compressors and gate transforms. `gate` and `gate_simple` now forward
-  `dagger`/`transpose` to the user gate while leaving routing SWAPs unchanged.
-- Added `gloop_opts` to the scalar and 2-norm loop-cluster entry points so
-  newer Quimb generalized-loop generator controls can be used without
-  changing existing defaults.
-- Added capability-gated BP constructor/run forwarding, Autoray-native random
-  FIT initialization, Quimb `LatticeBondMap` periodic-bond naming, and an
-  explicit opt-in MPO auto-swap wrapper. These integrations preserve existing
-  defaults and fail locally when an optional Quimb capability is unavailable.
+### Removed
+
+- `MpsOptimizer(mode="su")` and its optimizer-owned gauge state. Use
+  `pepsy.operators.gate_simple` or the dedicated PEPS simple-update APIs.
+- MPS `routing="perm"` and composed `perm-*` / `*-perm` solver modes.
+  `mode="perm"` is now a single lazy swap-and-split SVD route; it retains
+  physical order and exposes the logical mapping. Use an explicit solver
+  with a static layout for compression-aware ordering.
+
+### Fixed
+
+- Released Quimb compatibility for seeded compression, method/route options,
+  optional compressors, and dtype-specific decomposition failures. Narrow
+  fallbacks retain backend, dtype, and requested truncation semantics.
+- Rare MPS/tree measurement branches, conditional and trajectory controls,
+  dynamic caps, represented exponents, and projection-versus-compression norm
+  accounting. Invalid replay settings preserve state and configuration.
+- Tree entropy now uses physical Schmidt spectra from a canonical copy.
+  Tree state invalidation clears stale isometry metadata, and compact operator
+  application preserves exterior scale and identity semantics.
+- Native Symmray MPO dense readout restores computational-basis order;
+  fermionic FIT, BP overlaps, and cluster bra phases preserve graded
+  conventions. Unsupported odd-parity TreeFIT projections fail explicitly.
+- Torch/JAX/CuPy backend, dtype, device, and gradient preservation in replay,
+  fitting, operator construction, and diagnostics. Complex PEPO coefficients
+  and real-term/complex-prefactor MPO products retain correct promotion.
+- Rectangular and single-slice PEPS boundaries, FIT target/guess ownership and
+  cache reuse, JAX SVD options and derivatives, and Torch export/compile
+  log-amplitude evaluation.
+
+### Development
+
+- CI tests the five direct core dependency minimums and a combined extended
+  profile with a 60% coverage gate, plus MPI, packaging, docs, type checks,
+  and agent guidance. Backend imports and test failure annotations improve
+  diagnostics. MPS/tree tests are split by responsibility.
+- See the [release-readiness review](docs/development/notes/release_readiness_2026_09.md)
+  for validation evidence, merge scope, and decisions required before release.
 
 ## [0.4.1] - 2026-08-27
 
@@ -141,7 +190,7 @@ backend, and documentation improvements developed on `develop`.
   tensors, including the Algorithm 3 and 4 policies.
 - MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
   `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
-  and `stabilize_unitary` now covers DMRG, mixed MPO warm-up/fallback, and the
+  and `stabilize_unitary` now covers DMRG, mixed direct/fallback, and the
   standalone MPO/swap/permutation/SVD compression modes.
 - PEPS boundary contractions expose typed per-fit convergence diagnostics,
   opt-in detailed timing, `return_info=True` on scalar norm helpers, and an

@@ -58,10 +58,10 @@ def _basis_probabilities(state, basis):
 
 
 def test_mps_stab_sampler_matches_dense_probabilities_in_x_y_and_mixed_bases():
-    optimizer = pepsy.MpsStabOptimizer(3, chi=None).apply(
+    optimizer = pepsy.StabilizerMpsSimulator(3, chi=None).apply(
         [(H, 0), (np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], complex), (0, 1)), (pepsy.rz(0.37), 2)]
     )
-    sampler = pepsy.MpsStabSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
     configs = np.asarray(list(product((0, 1), repeat=3)), dtype=np.int8)
     physical = optimizer.to_statevector()
 
@@ -74,9 +74,9 @@ def test_mps_stab_sampler_matches_dense_probabilities_in_x_y_and_mixed_bases():
 
 
 def test_mps_stab_sampler_returns_mps_style_batches_without_mutating_state():
-    optimizer = pepsy.MpsStabOptimizer(2, chi=None).apply([("h", 0), ("cnot", 0, 1)])
+    optimizer = pepsy.StabilizerMpsSimulator(2, chi=None).apply([("h", 0), ("cnot", 0, 1)])
     before = optimizer.to_statevector().copy()
-    sampler = pepsy.MpsStabSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
 
     batch = sampler.sample_batch(32, seed=4, basis="random")
 
@@ -93,10 +93,10 @@ def test_mps_stab_sampler_returns_mps_style_batches_without_mutating_state():
 
 
 def test_mps_stab_sampler_uses_frame_projectors_not_dense_readout(monkeypatch):
-    optimizer = pepsy.MpsStabOptimizer(8, chi=None).apply(
+    optimizer = pepsy.StabilizerMpsSimulator(8, chi=None).apply(
         [("h", 0), ("cnot", 0, 7), ("t", 3)]
     )
-    sampler = pepsy.MpsStabSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
 
     def fail_dense_readout(*_args, **_kwargs):
         raise AssertionError("sampling should not reconstruct C|nu> densely")
@@ -108,13 +108,13 @@ def test_mps_stab_sampler_uses_frame_projectors_not_dense_readout(monkeypatch):
 
 
 def test_mps_stab_sampler_owns_branch_engine(monkeypatch):
-    optimizer = pepsy.MpsStabOptimizer(4, chi=None).apply(
+    optimizer = pepsy.StabilizerMpsSimulator(4, chi=None).apply(
         [("h", 0), ("cnot", 0, 3), ("t", 1)]
     )
-    sampler = pepsy.MpsStabSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
 
     def fail_optimizer_sampling(*_args, **_kwargs):
-        raise AssertionError("sampling branches should be owned by MpsStabSampler")
+        raise AssertionError("sampling branches should be owned by StabilizerMpsSampler")
 
     monkeypatch.setattr(optimizer, "sample_bits", fail_optimizer_sampling)
     configs, probs = sampler.sample_arrays(12, seed=12, basis="Y", chunk_size=4)
@@ -130,13 +130,13 @@ def test_mps_stab_sampler_records_projector_local_infidelity_per_branch():
     for q in range(3):
         nu.gate_(H, q, contract=True)  # parity projection creates entanglement
 
-    optimizer = pepsy.MpsStabOptimizer.from_tableau_and_state(
+    optimizer = pepsy.StabilizerMpsSimulator.from_tableau_and_state(
         tableau,
         nu,
         chi=1,
         exact_cooling=False,
     )
-    sampler = pepsy.MpsStabSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
     sampler.sample_batch(
         32,
         seed=4,
@@ -176,7 +176,7 @@ def test_mps_stab_sampler_records_absorbed_localizer_events():
     for q in range(3):
         nu.gate_(H, q, contract=True)
 
-    sampler = pepsy.MpsStabSampler(
+    sampler = pepsy.StabilizerMpsSampler(
         tableau,
         nu,
         chi=1,
@@ -207,8 +207,8 @@ def test_mps_stab_sampler_records_absorbed_localizer_events():
 
 
 def test_mps_stab_sampler_disentangle_alias():
-    optimizer = pepsy.MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
-    sampler = pepsy.MpsStabSampler(optimizer, disentangle=True)
+    optimizer = pepsy.StabilizerMpsSimulator(2).apply([("h", 0), ("cnot", 0, 1)])
+    sampler = pepsy.StabilizerMpsSampler(optimizer, disentangle=True)
 
     assert sampler.disentangle is True
     assert sampler.absorb_basis is True
@@ -218,10 +218,10 @@ def test_mps_stab_sampler_disentangle_alias():
 def test_mps_stab_sampler_absorption_falls_back_if_localizer_zeroes_a_branch():
     # With a deliberately tiny chi, the approximate localizing CNOT can
     # remove a branch that had nonzero pre-localizer Born probability.
-    optimizer = pepsy.MpsStabOptimizer(3, chi=1, exact_cooling=False).apply(
+    optimizer = pepsy.StabilizerMpsSimulator(3, chi=1, exact_cooling=False).apply(
         [("cnot", 0, 1), ("rxx", 0.73, 0, 1)]
     )
-    sampler = pepsy.MpsStabSampler(optimizer, absorb_basis=True)
+    sampler = pepsy.StabilizerMpsSampler(optimizer, absorb_basis=True)
 
     configs, probs = sampler.sample_arrays(
         128,
@@ -256,7 +256,7 @@ def test_mps_stab_sampler_absorption_falls_back_if_localizer_zeroes_a_branch():
 
 
 def test_mps_stab_sampler_absorb_basis_recomputes_branch_frames_and_matches_dense():
-    optimizer = pepsy.MpsStabOptimizer(3, chi=None).apply(
+    optimizer = pepsy.StabilizerMpsSimulator(3, chi=None).apply(
         [
             (H, 0),
             (
@@ -270,7 +270,7 @@ def test_mps_stab_sampler_absorb_basis_recomputes_branch_frames_and_matches_dens
         ]
     )
     before = optimizer.to_statevector().copy()
-    sampler = pepsy.MpsStabSampler(optimizer, absorb_basis=True)
+    sampler = pepsy.StabilizerMpsSampler(optimizer, absorb_basis=True)
     configs = np.asarray(list(product((0, 1), repeat=3)), dtype=np.int8)
 
     for basis in ("Z", "X", "Y", "XYZ"):
@@ -304,7 +304,7 @@ def test_mps_stab_sampler_direct_constructor_forwards_chi_and_mode():
     tableau.cnot(0, 1)
     nu = qtn.MPS_computational_state("000", dtype="complex128")
 
-    sampler = pepsy.MpsStabSampler(
+    sampler = pepsy.StabilizerMpsSampler(
         tableau,
         nu,
         chi=4,
@@ -325,7 +325,7 @@ def test_mps_stab_sampler_accepts_tableau_and_coefficient_mps_directly():
     tableau.h(0)
     nu = qtn.MPS_computational_state("00", dtype="complex128")
 
-    sampler = pepsy.MpsStabSampler(tableau, nu)
+    sampler = pepsy.StabilizerMpsSampler(tableau, nu)
     configs, probs = sampler.sample_arrays(11, seed=9, basis="X", chunk_size=3)
 
     assert sampler.resolved_strategy == "frame_pauli"
@@ -342,7 +342,7 @@ def test_mps_stab_sampler_native_torch_batch_is_chunked_and_convertible():
     nu = qtn.MPS_computational_state("00", dtype="complex128")
     to_torch = pepsy.backend_torch(dtype=torch.complex128, device="cpu")
 
-    sampler = pepsy.MpsStabSampler(
+    sampler = pepsy.StabilizerMpsSampler(
         tableau,
         nu,
         to_backend=to_torch,
@@ -362,8 +362,8 @@ def test_mps_stab_sampler_native_torch_batch_is_chunked_and_convertible():
 
 
 def test_mps_stab_sampler_validates_public_sampling_contract():
-    optimizer = pepsy.MpsStabOptimizer(2, chi=None).apply([("h", 0)])
-    sampler = pepsy.MpsStabSampler(optimizer)
+    optimizer = pepsy.StabilizerMpsSimulator(2, chi=None).apply([("h", 0)])
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
 
     with pytest.raises(ValueError, match="positive integer"):
         sampler.sample_arrays(0)
@@ -378,14 +378,14 @@ def test_mps_stab_sampler_validates_public_sampling_contract():
     with pytest.raises(NotImplementedError, match="does not retain gradients"):
         sampler.sample_batch(2, track_grad=True)
     with pytest.raises(ValueError, match="Expected 'auto' or 'frame'"):
-        pepsy.MpsStabSampler(optimizer, strategy="dense")
+        pepsy.StabilizerMpsSampler(optimizer, strategy="dense")
 
 
 def test_mps_stab_sampler_probabilities_follow_shuffled_batch_configs():
-    optimizer = pepsy.MpsStabOptimizer(3, chi=None).apply(
+    optimizer = pepsy.StabilizerMpsSimulator(3, chi=None).apply(
         [("h", 0), ("cnot", 0, 2), ("t", 1)]
     )
-    sampler = pepsy.MpsStabSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer)
     batch = sampler.sample_batch(64, seed=13, basis="XYZ", shuffle=True)
 
     np.testing.assert_allclose(

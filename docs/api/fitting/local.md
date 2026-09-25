@@ -1,5 +1,15 @@
 # `pepsy.fitting.local`
 
+`FIT.run_gate(finite_check=False)` skips per-sweep active-array finite scans
+and scalar non-finite detection by default. These optional diagnostics are
+not required for normal optimization. Enabling `finite_check=True` (or a
+custom checking callback) emits a warning explaining the extra validation
+work and possible accelerator synchronization. `MpsOptimizer` warns once per
+replay and suppresses duplicate warnings from its owned FIT calls.
+The optional scan is independent of timing and the
+terminal scalar norm used for convergence. `MpsOptimizer.run(finite_check=...)`
+forwards this policy to its FIT calls, including measurements and shot replay.
+
 `FIT(target, p=guess, ...)` variationally fits an open-boundary MPS or MPO
 guess to a target tensor network. There are three sweep entry points:
 
@@ -24,6 +34,91 @@ the circuit-compression algorithm. The FIT implementation follows the same
 high-level order in each path: own and validate the target/state, prepare
 effective environments, update the requested sites, then record optional
 fidelity or timing diagnostics.
+
+Layered targets build tag selections only for sites visited by the solver;
+`run_gate` therefore avoids duplicating unused exterior tag metadata. A later
+`run_eff` or `run` can populate the remaining selections normally. Setup
+classifies dense/native arrays in one pass and rejects layered targets from
+the one-tensor-per-site shortcut by tensor count before scanning site tags.
+Target index separation and native contraction ordering remain unchanged.
+`prepared_target` provides an immutable full structural snapshot when
+explicitly accessed; ordinary local fits do not build that snapshot or scan
+unused chain boundaries.
+
+Cached one-site sweeps retain the optimized site's QR isometry without
+absorbing R into the next tensor, which the next effective update replaces.
+This applies to NumPy, Torch, and JAX arrays with unchanged QR bond size,
+including one-site refinement after larger-block sweeps. Shape-reducing QR
+and native symmetry tensors retain ordinary canonicalization. The completed
+sweep's state, canonical center, and norm have the same semantics as before.
+
+Tree-shaped states use the companion `pepsy.fitting.TreeFIT` class. It keeps
+the same target/guess ownership model and `run`/`run_eff`/`run_gate` vocabulary,
+but caches a directed overlap environment for every tree edge and moves the
+canonical centre along tree geodesics. Connected one-, two-, and three-node
+local blocks are supported; untouched branch messages survive local updates.
+The tree optimizer wrappers select it with `mode="dmrg"`, `"dmrg1"`, `"dmrg2"`,
+or `"dmrg3"`.
+
+```python
+from pepsy.fitting import TreeFIT
+
+fit = TreeFIT(target_tree, guess_tree, max_bond=chi, cutoffs=1e-12)
+fit.run_gate(
+    active_span,
+    n_iter=4,
+    block_size=2,
+    adaptive_block_sweeps=2,
+    sweep_sequence="RL",
+)
+updated = fit.p
+diagnostics = fit.fit_diagnostics(overlap=True)
+```
+
+TreeFIT keeps the target fixed and does not normalize it. After each sweep it
+reads one norm from the terminal canonical-centre tensor, just as MPS FIT does;
+`local_norm_trace` and `sweep_norm_trace` contain those values, while
+`local_norm_stripped_trace` preserves each `(mantissa, exponent)` pair. Its
+`local_fidelity` is the clipped squared ratio of retained centre norm to the
+target norm, and `local_infidelity` is the matching `1 - local_fidelity` value.
+This is a local norm-survival diagnostic, not a directional target overlap.
+`fit_diagnostics(overlap=True)` additionally performs the expensive full
+target contraction and reports its genuine normalized value as
+`target_fidelity`/`target_infidelity` (also available as the MPS-compatible
+`fit_overlap_fidelity`/`fit_overlap_infidelity`); it never replaces
+`local_fidelity`.
+Optimizer-level cumulative compression fidelity remains the canonical
+norm-survival ledger, accumulated in log form so large MPO/TreeMPO scale
+factors do not overflow or get mistaken for discarded weight. `TreeFIT.run()`
+is the FIT-compatible full-tree convenience call and delegates to the cached
+`TreeFIT.run_eff()` engine;
+`run_gate(region, ...)` remains the active-span entry point used by the
+optimizers. TreeFIT accepts fused targets and correctly tagged layered targets.
+Every target tensor must belong to exactly one structural node group; local
+layer bonds stay within a group, while one or more bonds between groups must
+follow the fitted tree edges. Ambiguous or untagged layer tensors are
+rejected. The separate operator-state two-layer target can still use the
+path-only `TreePeps` `sdc`/`src`/`zipup` compressor.
+
+The tree optimizers construct their DMRG/DMRG-alias targets in this layered
+form: the state and operator tree bonds remain separate, with only the
+operator input and output physical legs joined. Fused targets remain accepted
+for callers that already have one, and the direct path compressor retains its
+own two-layer route.
+
+`adaptive_block_sweeps=2` gives the same warm-up/refinement schedule as the
+MPS FIT engine: two- or three-node updates for the warm-up, followed by
+one-node sweeps. `adaptive_until_rank=True` keeps the larger block until the
+active physical rank ceilings are reached. Tree optimizer `dmrg1` and `dmrg2`
+use two-node warm-up blocks, while `dmrg3` uses three-node blocks; each named
+mode then refines with one-node updates.
+
+`retag=True` aligns structural node tags on the copied target with the fitted
+tree while preserving tensor order and physical/site tags. Layered targets use
+the same structural tags to assign every layer tensor to its node group.
+`copy_target=False`
+is available when an optimizer has created a disposable target and can transfer
+ownership safely.
 
 For circuit compression, set `range_int=(xmin, xmax)` and use:
 
@@ -69,27 +164,40 @@ direct-`FIT.run_gate` control. `MpsOptimizer` uses its separate adaptive
 `fit_adaptive_sweeps`/rank-ceiling schedule and does not add this legacy polish
 pass automatically.
 
-For direct gate-window fits, `three_site_sweeps=1` (the default) uses one
-larger three-site warm-up sweep and then switches to one-site refinement for
-any remaining requested sweeps. Set `three_site_sweeps=2` for two directional
-warm-up passes. Supplying `adaptive_block_sweeps=N` instead applies the same
-minimum block warm-up to two- or three-site FIT. With
+Direct `FIT.run_gate()` defaults to `n_iter=8`, `block_size=2`,
+`sweep_sequence="RL"`, `adaptive_block_sweeps=2`, `min_iter=2`,
+`rtol="auto"`, and `patience=2`. Automatic tolerance is `1e-3` for 16-bit,
+`1e-5` for float32/complex64, and `1e-9` for higher precision.
+Split diagnostics default to `False`; callers that need them must enable
+`collect_split_diagnostics=True`. `rtol=None` requests fixed sweeps.
+Standalone FIT does not classify the gate as unitary or non-unitary; unlike
+MpsOptimizer's non-unitary replay policy, it always resolves `rtol="auto"`
+to a numeric tolerance.
+With `block_size=3`, `two_site_transition_sweeps=1` inserts one two-site sweep
+after the three-site phase, before one-site refinement. Set it to zero for
+the previous direct handoff. The transition consumes the same `n_iter` budget.
+The legacy `three_site_sweeps` control applies when `adaptive_block_sweeps=None`.
+With
 `adaptive_until_rank=True`, the block phase continues until all active bonds
 reach their physical ceilings; rank stagnation is deliberately not an early
 exit. Remaining requested sweeps use one-site FIT. One-site refinement
 preserves the bond dimensions opened by the larger block and is cheaper than
 repeating the larger SVD block.
 
-The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and
-`adaptive_until_rank=True` for its rank-growing generic `dmrg` and `dmrg1`
-paths. Before constructing a `dmrg1` fit, the optimizer checks the active
+The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and enables
+`adaptive_until_rank` only for eligible generic `dmrg` windows.
+Before constructing a `dmrg1` fit, the optimizer checks the active
 attainable bond ceilings: an already-capped window starts with one-site FIT,
 while an under-capacity non-adjacent window requires `n_iter >= 3` for two
 two-site growth sweeps and at least one one-site refinement sweep. `dmrg2`
 and `dmrg3` use exactly the configured two- or three-site block warm-up (two
-sweeps by default) and then refine with one-site FIT. The direct FIT
+sweeps by default); `dmrg3` adds one two-site transition sweep. Both then
+refine with one-site FIT. The direct FIT
 diagnostics `adaptive_sweeps_run` and `one_site_sweeps_run` count both
 scheduled block sweeps and any explicit `final_one_site_sweeps` polish passes.
+`adaptive_sweeps_run` includes the two-site transition: a completed default
+DMRG3 warm-up therefore contributes three block sweeps in total. Timing
+records expose each sweep's individual block size when timing is enabled.
 
 For tolerance-controlled `run_gate`, `patience` counts same-phase retained-norm
 samples, not norm differences. Thus `patience=2` needs two comparable
@@ -107,6 +215,11 @@ rtol norm are transferred as one compact vector per sweep. A callable keeps the
 general user-defined state-check behavior. Reusing one `FIT` instance clears
 per-run norm/fidelity traces and split diagnostics before the next invocation;
 `run`, `run_eff`, and `run_gate` all require a positive integer `n_iter`.
+With finite scans disabled, tolerance stopping transfers just the terminal
+norm scalar without allocating a stacked diagnostic vector. It retains the
+same convergence calculations, but non-finite scalar detection is also
+disabled by default. `finite_check=True` enables both tensor and scalar
+checks; reads required for convergence are not deferred during warm-up.
 
 Ordinary dense arrays and native bosonic or fermionic Symmray arrays reuse the
 compatible partial overlap environments produced by the preceding
@@ -118,7 +231,9 @@ the same size. If the next reversed sweep changes to one-site refinement, FIT
 extends that cache through exactly one terminal tensor after a two-site sweep,
 or two terminal tensors after a three-site sweep. Both 2-to-1 and 3-to-1
 transitions therefore avoid a complete fixed-side rebuild without constructing
-unused terminal environments during block warm-up. Fresh sweeps construct only
+unused terminal environments during block warm-up. The 3-to-2 transition
+extends through exactly one terminal tensor and reuses the resulting cache.
+Fresh sweeps construct only
 the fixed boundaries that their active block can query. Explicitly generic or
 mixed-backend bosonic Symmray fits retain the conservative rebuild policy;
 automatic/native Symmray fits use the audited zero-copy cache.

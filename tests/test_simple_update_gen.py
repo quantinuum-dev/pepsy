@@ -44,8 +44,8 @@ def _gauge_all_simple_once(tn, gauges):
     tn.gauge_all_simple_(**opts)
 
 
-def test_simple_update_gen_routes_long_range_gate_where_quimb_fails():
-    """Pepsy's driver should route non-adjacent terms through SWAPs."""
+def test_simple_update_gen_routes_long_range_gate_across_quimb_versions():
+    """Pepsy routes non-adjacent terms even when Quimb also supports them."""
     where = ((0, 0), (0, 2))
     ham = _ham_for_edge(where)
     raw = qtn.SimpleUpdateGen(
@@ -61,8 +61,13 @@ def test_simple_update_gen_routes_long_range_gate_where_quimb_fails():
         progbar=False,
     )
 
-    with pytest.raises(ValueError, match="not enough values to unpack"):
+    try:
         raw.sweep(0.01)
+    except ValueError as exc:
+        # Quimb before its long-range simple-update implementation failed
+        # here. Keep this compatibility assertion for the older versions
+        # supported by Pepsy, while accepting the fixed upstream behavior.
+        assert "not enough values to unpack" in str(exc)
 
     routed = SimpleUpdateGen(
         _dense_peps(seed=2),

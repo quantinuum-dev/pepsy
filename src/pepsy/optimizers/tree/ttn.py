@@ -38,8 +38,10 @@ MPS.
 
 from __future__ import annotations
 
+import heapq
 import re
 import time
+from collections.abc import Mapping
 
 import autoray as ar
 import numpy as np
@@ -48,10 +50,17 @@ from quimb.tensor.decomp import qr_stabilized as _quimb_qr_stabilized
 from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
-from ...backends import to_float
+from ...backends import get_torch_linalg_config, to_float
+from ..._internal.quimb import quimb_safe_split_method
 from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
+
+
+_SUCCESSIVE_COMPRESSION_MODES = frozenset({
+    "src", "src_oversample", "sdc", "sdc_oversample", "sdcr",
+    "sdcr_oversample",
+})
 
 
 def _normalize_compression_mode(mode):
@@ -65,15 +74,45 @@ def _normalize_compression_mode(mode):
         "densitymatrix": "dm",
     }
     mode = aliases.get(mode, mode)
-    if mode not in {"direct", "dm"}:
-        raise ValueError("compression_mode must be 'direct' or 'dm'.")
+    if mode not in {
+        "direct", "dm", "sdc", "sdc_oversample", "sdcr", "sdcr_oversample",
+        "src", "src_oversample",
+    }:
+        raise ValueError(
+            "compression_mode must be 'direct', 'dm', 'sdc', 'sdc-oversample', "
+            "'sdcr', 'sdcr-oversample', 'src', or 'src-oversample'."
+        )
     return mode
+
+
+def _normalize_oversample_options(cutoff, cutoff_mode):
+    """Normalize the intermediate cutoff controls for direct TTN callers."""
+    if cutoff is None:
+        cutoff = 0.0
+    else:
+        cutoff = float(cutoff)
+        if not np.isfinite(cutoff) or cutoff < 0.0:
+            raise ValueError("cutoff_oversample must be finite and non-negative.")
+    if cutoff_mode is None or (
+        isinstance(cutoff_mode, str)
+        and cutoff_mode.strip().lower() == "auto"
+    ):
+        cutoff_mode = "rel"
+    return cutoff, cutoff_mode
 
 
 def _compression_method(mode):
     """Return the dense Quimb split method for a compression mode."""
 
-    return "svd:eig" if _normalize_compression_mode(mode) == "dm" else "svd"
+    mode = _normalize_compression_mode(mode)
+    if mode == "dm":
+        return "svd:eig"
+    if mode in _SUCCESSIVE_COMPRESSION_MODES:
+        raise ValueError(
+            "successive modes require complementary environments, not a "
+            "local split driver"
+        )
+    return "svd"
 
 
 def _native_rank_safe_qr(array, backend):
@@ -248,7 +287,23 @@ def _native_qr_block_scaled(array, **kwargs):
         if left_like:
             x = ar.do("transpose", x, (1, 0))
         try:
-            q, r = ar.do("linalg.qr", x, **qr_kwargs)
+            if (
+                backend == "torch"
+                and getattr(getattr(x, "device", None), "type", "cpu") == "cpu"
+            ):
+                # A previous autodiff run can leave a stabilized real/complex
+                # QR rule in Autoray's process-global Torch namespace. This
+                # helper explicitly requests the native complex64 path, so do
+                # not let an unrelated registration change its forward rule.
+                import torch  # pylint: disable=import-outside-toplevel
+
+                registered_qr = ar.get_lib_fn("torch", "linalg.qr")
+                if registered_qr is not torch.linalg.qr:
+                    q, r = torch.linalg.qr(x, **qr_kwargs)
+                else:
+                    q, r = ar.do("linalg.qr", x, **qr_kwargs)
+            else:
+                q, r = ar.do("linalg.qr", x, **qr_kwargs)
         except Exception:
             if not allow_failure:
                 raise
@@ -454,6 +509,130 @@ def _is_symmray_array(value):
         return ar.infer_backend(value) == "symmray"
     except (AttributeError, TypeError):
         return hasattr(value, "blocks") and hasattr(value, "indices")
+
+
+def _normalize_entropy_method(method):
+    """Normalize the local Schmidt-spectrum method used for tree entropy."""
+    method = str(method).strip().lower().replace("_", ":")
+    if method == "eig":
+        method = "svd:eig"
+    if method not in {"svd", "svd:eig"}:
+        raise ValueError(
+            "tree entropy method must be 'svd', 'eig', or 'svd:eig'."
+        )
+    return method
+
+
+def _tree_bond_singular_values(tensor, bond, *, method="svd"):
+    """Return the Schmidt values across ``bond`` without densifying ``tensor``.
+
+    The tensor must carry the orthogonality centre, with every exterior
+    branch isometric towards it. Dense arrays use
+    Autoray's backend linalg dispatch; native Symmray arrays use their
+    sector-aware SVD directly because Quimb's generic ``array_svals`` route is
+    NumPy-only for this diagnostic.
+    """
+    method = _normalize_entropy_method(method)
+    left_inds = tuple(ind for ind in tensor.inds if ind != bond)
+    transposed = tensor.transpose(*left_inds, bond)
+    nleft = len(left_inds)
+    matrix = ar.do(
+        "fuse",
+        transposed.data,
+        range(nleft),
+        range(nleft, nleft + 1),
+    )
+    if _is_symmray_array(matrix):
+        if method == "svd:eig":
+            return matrix.svd_via_eig(
+                absorb=None,
+                max_bond=-1,
+                cutoff=-1.0,
+            )[1]
+        return matrix.svd(
+            absorb=None,
+            max_bond=-1,
+            cutoff=-1.0,
+        )[1]
+
+    if method == "svd:eig":
+        rows, cols = tuple(matrix.shape)
+        if rows <= cols:
+            gram = ar.do(
+                "matmul",
+                matrix,
+                ar.do("transpose", ar.do("conj", matrix)),
+            )
+        else:
+            gram = ar.do(
+                "matmul",
+                ar.do("transpose", ar.do("conj", matrix)),
+                matrix,
+            )
+        eig_result = ar.do("linalg.eigh", gram)
+        eigenvalues = (
+            eig_result.eigenvalues
+            if hasattr(eig_result, "eigenvalues")
+            else eig_result[0]
+        )
+        eigenvalues = ar.do(
+            "where", eigenvalues > 0.0, eigenvalues, 0.0,
+        )
+        return ar.do("flip", ar.do("sqrt", eigenvalues), axis=0)
+
+    backend = ar.infer_backend(matrix)
+    if backend == "torch":
+        # ``svdvals`` avoids allocating U and Vh while keeping the tree
+        # diagnostic on the tensor device. Honor non-default Pepsy policies
+        # that deliberately select a custom CPU or stabilized SVD wrapper.
+        config = get_torch_linalg_config()
+        use_native_values = config is None or (
+            not config.stabilized and config.cpu_svd == "torch"
+        )
+        if use_native_values:
+            svd_kwargs = {}
+            driver = None if config is None else config.svd_driver
+            if getattr(matrix, "is_cuda", False) and driver not in {None, "auto"}:
+                svd_kwargs["driver"] = driver
+            return ar.do("linalg.svdvals", matrix, **svd_kwargs)
+
+    try:
+        return ar.do(
+            "linalg.svd",
+            matrix,
+            full_matrices=False,
+            compute_uv=False,
+        )
+    except TypeError:
+        svd_result = ar.do("linalg.svd", matrix, full_matrices=False)
+        return svd_result.S if hasattr(svd_result, "S") else svd_result[1]
+
+
+def _entropy_from_singular_values(singular_values):
+    """Return normalized base-2 von Neumann entropy from Schmidt values."""
+    # Symmray singular values are VectorCommon objects. Only their one-
+    # dimensional spectrum is materialized, never the tensor or full state.
+    if hasattr(singular_values, "to_dense"):
+        singular_values = singular_values.to_dense()
+    weights = ar.do("abs", singular_values) ** 2
+    total = ar.do("sum", weights)
+    # Normalize and handle a zero spectrum without reading back ``total``.
+    # The only host synchronization in a scalar entropy query is the final
+    # Python result conversion below.
+    safe_total = ar.do("where", total > 0.0, total, 1.0)
+    probabilities = weights / safe_total
+    # Replacing zero probabilities by one only inside log avoids ``0 * -inf``.
+    safe_probabilities = ar.do(
+        "where", probabilities > 0.0, probabilities, 1.0,
+    )
+    value = -ar.do(
+        "sum",
+        probabilities * ar.do("log2", safe_probabilities),
+    )
+    value = to_float(value, real=True)
+    if not np.isfinite(value):
+        raise ValueError("tree entropy requires a finite state norm and result.")
+    return max(0.0, value)
 
 
 def _native_qr_options_for_tensor(tensor):
@@ -716,8 +895,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         Quimb exposes mutating tensor-network methods and tensors themselves
         can be modified in place. The TTN cannot intercept every such mutation,
         so direct callers should use this method after changing tensor data
-        outside the state-aware wrappers below.
+        outside the state-aware wrappers below. Since the edited nodes are
+        unknown, clear every local isometry proof as well as the region.
+        State-aware mutators retain their independently established proofs.
         """
+        for tensor in self.tensors:
+            tensor.modify(left_inds=None)
         self._canonical_region = None
         self._invalidate_norm_cache()
         return self
@@ -766,6 +949,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def plan(self):
         """The :class:`TreePlan` describing the tree structure."""
         return self._plan
+
+    @property
+    def map_mode(self):
+        """Canonical geometric label for the tree's leaf layout."""
+
+        return self.plan.map_mode
 
     @property
     def top_arity(self):
@@ -1070,6 +1259,109 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                     "count": len(terms),
                     "seconds": time.perf_counter() - profile_started,
                 })
+
+    def tree_edges(self):
+        """Return deterministic ``(parent, child)`` pairs for every tree bond."""
+        return tuple(
+            (int(parent), int(child))
+            for child, parent in sorted(
+                self.plan.parent.items(),
+                key=lambda item: (int(item[0]), int(item[1])),
+            )
+        )
+
+    def entropy(self, edge, *, method="svd"):
+        """Return the normalized base-2 entropy across one tree bond.
+
+        ``edge`` is a pair of adjacent structural node ids. The calculation
+        follows Quimb's MPS entropy pattern: a private copy is canonicalized
+        around one endpoint and the Schmidt values are extracted from that
+        centre tensor. The live state, canonical centre, and
+        backend buffers are not changed.
+
+        Parameters
+        ----------
+        edge : pair of int
+            The two adjacent TreePlan node ids defining the bipartition. The
+            orientation is immaterial.
+        method : {"svd", "eig", "svd:eig"}, optional
+            Singular-spectrum decomposition. ``"svd"`` is the default;
+            ``"eig"`` and ``"svd:eig"`` use the Gram-matrix route.
+        """
+        try:
+            node, neighbor = edge
+        except (TypeError, ValueError) as exc:
+            raise TypeError("entropy needs one tree edge: (node, neighbor).") from exc
+        if (
+            isinstance(node, bool)
+            or isinstance(neighbor, bool)
+            or not isinstance(node, Integral)
+            or not isinstance(neighbor, Integral)
+        ):
+            raise TypeError("tree entropy edge endpoints must be integers.")
+        node, neighbor = int(node), int(neighbor)
+        if node == neighbor or node not in self.plan.children:
+            raise ValueError("entropy requires two distinct tree nodes.")
+        if neighbor not in self.neighbors(node):
+            raise ValueError("entropy requires adjacent tree nodes.")
+        method = _normalize_entropy_method(method)
+
+        work = self.copy()
+        work.canonize_around_node_(node)
+        tensor = work.node_tensor(node)
+        singular_values = _tree_bond_singular_values(
+            tensor,
+            work.bond(node, neighbor),
+            method=method,
+        )
+        return _entropy_from_singular_values(singular_values)
+
+    def tree_edge_entropies(self, *, method="svd", return_edges=False):
+        """Return entropy for every tree bond in one canonicalization sweep.
+
+        A rooted TTN has one bipartition per parent-child bond rather than a
+        single left/right chain cut. This method canonicalizes one private copy
+        around the root, then walks the centre through the tree to compute
+        each spectrum from the tensor carrying the state weights. Its work is
+        linear in the number of tree tensors plus the local SVD costs and it
+        never constructs the full statevector. Set ``return_edges=True`` to
+        receive ``(entropies, edges)`` with matching deterministic order.
+        """
+        method = _normalize_entropy_method(method)
+        edges = self.tree_edges()
+        work = self.copy()
+        work.canonize_around_node_(work.root)
+        values = {}
+        # A depth-first traversal crosses each bond at most twice. Reading an
+        # off-centre isometry instead would incorrectly yield log2(bond_dim).
+        stack = [(work.root, iter(work.children(work.root)))]
+        while stack:
+            parent, children = stack[-1]
+            child = next(children, None)
+            if child is None:
+                stack.pop()
+                if stack:
+                    work.shift_orthogonality_center(stack[-1][0])
+                continue
+            singular_values = _tree_bond_singular_values(
+                work.node_tensor(parent),
+                work.bond(parent, child),
+                method=method,
+            )
+            values[parent, child] = _entropy_from_singular_values(singular_values)
+            work.shift_orthogonality_center(child)
+            stack.append((child, iter(work.children(child))))
+        entropies = np.asarray([values[edge] for edge in edges], dtype=float)
+        if return_edges:
+            return entropies, edges
+        return entropies
+
+    def entanglement_entropy(self, *, method="svd", return_edges=False):
+        """Alias for :meth:`tree_edge_entropies` with an explicit name."""
+        return self.tree_edge_entropies(
+            method=method,
+            return_edges=return_edges,
+        )
 
     def expectation_mpo_exact(
         self, mpo, where, *, normalized=True, optimize="auto",
@@ -2142,6 +2434,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         absorb="right",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
         _reduction_proven=False,
     ):
         """Compress the tree edge ``a -> b`` in place.
@@ -2163,10 +2459,40 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for the two-sided reduced path.
         ``compression_mode="direct"`` uses the standard SVD, while
         ``compression_mode="dm"`` uses Quimb's density-matrix-equivalent
-        ``svd:eig`` decomposition on the local canonical core. The latter is
-        currently available for dense trees only.
+        ``svd:eig`` decomposition on the local canonical core. ``"sdc"``
+        and ``"src"`` construct deterministic or random complementary
+        environments for this two-node region and then apply QR projectors.
+        ``"sdcr"`` uses the same successive environments with Quimb's
+        static randomized-SVD environment factors. The ``*-oversample``
+        variants use a larger intermediate rank, then a direct final rounding
+        sweep to ``max_bond``; ``max_bond_oversample`` and the corresponding
+        cutoff controls select that intermediate pass.
+        Their whole-tree versions are available through :meth:`compress`.
         """
         compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in {
+            "src_oversample", "sdc_oversample", "sdcr", "sdcr_oversample",
+        } and max_bond is None:
+            raise ValueError(
+                f"compression_mode={compression_mode!r} requires max_bond."
+            )
+        if compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
+            cutoff_oversample, cutoff_mode_oversample = (
+                _normalize_oversample_options(
+                    cutoff_oversample, cutoff_mode_oversample
+                )
+            )
+            if absorb not in {"left", "right"}:
+                raise ValueError("successive edge compression requires left or right absorption")
+            hub = b if absorb == "right" else a
+            source = a if absorb == "right" else b
+            return self._compress_successive_region(
+                [(source, hub)], hub, max_bond=max_bond, cutoff=cutoff,
+                cutoff_mode=cutoff_mode, method=compression_mode, seed=compression_seed,
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode_oversample=cutoff_mode_oversample,
+            )
         if compression_mode == "dm" and self.fermionic:
             raise NotImplementedError(
                 "compression_mode='dm' is currently available for dense "
@@ -2205,11 +2531,143 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb=absorb,
                 reduced=reduced,
-                method=_compression_method(compression_mode),
+                method=quimb_safe_split_method(
+                    _compression_method(compression_mode), self.node_tensor(a).data,
+                ),
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
+
+    def _compress_successive_region(
+        self, order, hub, *, max_bond, cutoff, cutoff_mode, method, seed,
+        max_bond_oversample=None, cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
+    ):
+        from .compression import successive_tree_compress
+
+        nodes = {hub, *(u for u, _ in order)}
+        if self.fermionic:
+            raise NotImplementedError(
+                f"tree {method} environments require dense tensors; use direct or zipup"
+            )
+        successive_order = tuple(order)
+        successive_hub = hub
+        sample_bond = None
+        oversampled = method in {
+            "src_oversample", "sdc_oversample", "sdcr_oversample",
+        }
+        base_method = method.removesuffix("_oversample")
+        if oversampled:
+            from .compression import _oversample_bond, _oversample_order
+
+            sample_bond = _oversample_bond(max_bond, max_bond_oversample)
+            successive_order, successive_hub = _oversample_order(
+                successive_order, hub
+            )
+        if base_method in {"src", "sdcr"}:
+            environment_cutoff = 0.0
+            environment_cutoff_mode = "rel" if base_method == "sdcr" else cutoff_mode
+        elif oversampled:
+            environment_cutoff = cutoff_oversample
+            environment_cutoff_mode = cutoff_mode_oversample
+        else:
+            environment_cutoff = cutoff
+            environment_cutoff_mode = cutoff_mode
+        self.canonize_subtree_(nodes)
+        local = {u: [self.tensor_map[self.node_tid(u)].copy()] for u in nodes}
+        result, _ = successive_tree_compress(
+            local,
+            successive_order,
+            successive_hub,
+            method=base_method,
+            max_bond=sample_bond if oversampled else max_bond,
+            cutoff=environment_cutoff,
+            cutoff_mode=environment_cutoff_mode,
+            seed=seed,
+            sample_bond=sample_bond,
+        )
+        for u, tensor in result.items():
+            self.tensor_map[self.node_tid(u)].modify(
+                data=tensor.data, inds=tensor.inds,
+                left_inds=None if u == successive_hub else tensor.left_inds,
+            )
+        self._canonical_region = frozenset({successive_hub})
+        self._invalidate_norm_cache()
+        if oversampled:
+            self._round_successive_region(
+                nodes,
+                successive_hub,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        return self
+
+    def _round_successive_region(self, nodes, hub, *, max_bond, cutoff,
+                                 cutoff_mode, _record=None):
+        """Round an oversampled result, retaining a path's terminal center.
+
+        Branches retain their depth-first cut order and return moves. An
+        endpoint-rooted path needs no return QR after its final cut. ``_record``
+        optionally receives each cut's dimension record for optimizer history.
+        """
+        if max_bond is None:
+            raise ValueError(
+                "oversampled successive compression requires max_bond."
+            )
+        max_bond = int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be positive")
+        self.shift_orthogonality_center(hub)
+        nodes = frozenset(nodes)
+        adjacency = {
+            node: tuple(sorted(v for v in self.neighbors(node) if v in nodes))
+            for node in nodes
+        }
+
+        def compress(node, child):
+            if _record is not None:
+                before = int(self.ind_size(self.bond(child, node)))
+            self.compress_edge_(
+                child,
+                node,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="left",
+                reduced="right",
+                compression_mode="direct",
+            )
+            if _record is not None:
+                bond = self.bond(child, node)
+                _record((child, node, before, int(self.ind_size(bond)), bond))
+
+        if len(adjacency[hub]) <= 1 and all(
+            len(neighbors) <= 2 for neighbors in adjacency.values()
+        ):
+            parent, node = None, hub
+            while True:
+                child = next((v for v in adjacency[node] if v != parent), None)
+                if child is None:
+                    break
+                compress(node, child)
+                parent, node = node, child
+            self._canonical_region = frozenset({node})
+            self._invalidate_norm_cache()
+            return
+
+        def descend(node, parent):
+            for child in adjacency[node]:
+                if child == parent:
+                    continue
+                compress(node, child)
+                descend(child, node)
+                self.canonize_edge_(child, node, absorb="right")
+
+        descend(hub, None)
+        self._canonical_region = frozenset({hub})
+        self._invalidate_norm_cache()
 
     def compress(
         self,
@@ -2220,6 +2678,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         center=None,
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
     ):
         """Compress the complete tree with a centre-oriented SVD sweep.
 
@@ -2251,6 +2713,26 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             when no centre is known.
         reduced : bool, optional
             Use the reduced two-sided edge compression path where available.
+        compression_mode : {"direct", "dm", "sdc", "sdc-oversample", "sdcr", "sdcr-oversample", "src", "src-oversample"}, optional
+            ``direct``/``dm`` use canonical edge compression. ``sdc``/``src``
+            use deterministic/random complementary environments and a
+            successive projector sweep on the original target.
+            ``sdcr`` uses randomized SVDs for the successive environment
+            factors, without oversampling or power iterations.
+            ``*-oversample`` adds a larger successive sketch followed by
+            direct tree rounding to ``max_bond``.
+        compression_seed : int, optional
+            Seed for randomized ``compression_mode="src"``, ``"sdcr"``, or
+            an oversampled variant.
+        max_bond_oversample : int or float, optional
+            Intermediate rank for an oversampled successive mode. Integers
+            are explicit ranks; floats are multipliers of ``max_bond``. If
+            omitted, use Quimb's ``max(round(1.5 * max_bond), max_bond + 10)``.
+        cutoff_oversample : float, optional
+            Intermediate environment cutoff for ``sdc-oversample``.
+            It is ignored by SRC and SDCR oversampling.
+        cutoff_mode_oversample : str, optional
+            Cutoff convention for the intermediate SDC oversampling pass.
 
         Returns
         -------
@@ -2266,13 +2748,38 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             max_bond = int(max_bond)
             if max_bond < 1:
                 raise ValueError("max_bond must be at least one.")
-
         if center is None:
             center = self.orthogonality_center
             if center is None:
                 center = self._plan.root
         if center not in self._plan.children:
             raise ValueError(f"{center!r} is not a node of the tree.")
+
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in {
+            "src_oversample", "sdc_oversample", "sdcr", "sdcr_oversample",
+        } and max_bond is None:
+            raise ValueError(
+                f"compression_mode={compression_mode!r} requires max_bond."
+            )
+        if compression_mode in _SUCCESSIVE_COMPRESSION_MODES:
+            cutoff_oversample, cutoff_mode_oversample = (
+                _normalize_oversample_options(
+                    cutoff_oversample, cutoff_mode_oversample
+                )
+            )
+            order = sorted(
+                ((u, self._plan.node_path(u, center)[1])
+                 for u in self._plan.nodes() if u != center),
+                key=lambda edge: -len(self._plan.node_path(edge[0], center)),
+            )
+            return self._compress_successive_region(
+                order, center, max_bond=max_bond, cutoff=cutoff,
+                cutoff_mode=cutoff_mode, method=compression_mode, seed=compression_seed,
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode_oversample=cutoff_mode_oversample,
+            )
 
         # Establish a known centre once. The subsequent post-order traversal
         # then compresses each edge exactly after all of its outward branches
@@ -2297,6 +2804,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 absorb="right",
                 reduced=reduced,
                 compression_mode=compression_mode,
+                compression_seed=compression_seed,
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode_oversample=cutoff_mode_oversample,
             )
 
         # ``compress_edge_`` conservatively clears the global centre when the
@@ -2335,9 +2846,31 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         node).
 
         ``nodes`` must form a connected subtree; pass ``span=True`` to auto-expand
-        to the minimal connected subtree that spans them.  Returns ``self``.
+        to the minimal connected subtree that spans them. With the default
+        inward absorption, an existing canonical region is peeled locally
+        toward its overlap with the requested region, or along their unique
+        connector. Unknown gauge retains the full-exterior fallback. Call
+        :meth:`invalidate_canonical_form` after unmanaged tensor edits before
+        relying on this metadata. Returns ``self``.
         """
         region = self._validated_region(nodes, span=span)
+        previous = self.canonical_region
+        if previous is not None and absorb == "right":
+            # The exterior of the old region already points inward. Only its
+            # part outside the new region (and a connector if disjoint) needs
+            # gauging; do not revisit every proven exterior tree branch.
+            if not previous.issubset(region):
+                overlap = previous & region
+                if overlap:
+                    self._peel_canonical_region(previous, overlap)
+                else:
+                    path = self._plan.node_path(min(previous), min(region))
+                    entry_index = next(i for i, node in enumerate(path) if node in region)
+                    work = previous.union(path[:entry_index + 1])
+                    self._peel_canonical_region(work, {path[entry_index]})
+            self._canonical_region = region
+            return self
+
         tags = [self.node_tag(n) for n in region]
         canonize_opts = {
             "method": "qr",
@@ -2375,32 +2908,36 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         lossless QR therefore establishes a single centre without touching
         tensors outside the region.
         """
-        region = set(region)
         if target not in region:
             raise ValueError("target centre must lie inside the canonical region.")
+        return self._peel_canonical_region(region, {target}, absorb=absorb)
+
+    def _peel_canonical_region(self, region, keep, *, absorb="right"):
+        """Losslessly peel a known region onto a connected retained subset."""
         if absorb not in {"right", "left"}:
             raise ValueError("absorb must be 'right' or 'left'.")
-
+        region, keep = set(region), frozenset(keep)
+        if not keep or not keep.issubset(region):
+            raise ValueError("retained region must be a nonempty subset of the canonical region.")
         remaining = set(region)
-        while len(remaining) > 1:
-            candidates = [
-                node for node in remaining
-                if node != target
-                and sum(
-                    neighbour in remaining
-                    for neighbour in self.neighbors(node)
-                ) == 1
-            ]
-            if not candidates:
+        adjacency = {
+            node: tuple(v for v in self.neighbors(node) if v in region)
+            for node in region
+        }
+        degree = {node: len(vs) for node, vs in adjacency.items()}
+        leaves = [node for node in region if node not in keep and degree[node] == 1]
+        heapq.heapify(leaves)
+        while len(remaining) > len(keep):
+            if not leaves:
                 raise ValueError(
-                    "canonical region is not a connected tree containing target."
+                    "canonical region is not a connected tree containing the retained region."
                 )
-            # The region is a tree, so any non-target leaf can be peeled.
-            # Sorting keeps the QR sequence deterministic across set order.
-            node = min(candidates)
+            # Preserve the former smallest-leaf order without rescanning the
+            # whole remaining region after every metadata-only or QR move.
+            node = heapq.heappop(leaves)
             neighbour = next(
                 neighbour
-                for neighbour in self.neighbors(node)
+                for neighbour in adjacency[node]
                 if neighbour in remaining
             )
             if absorb == "right":
@@ -2412,11 +2949,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 a, b, absorb=absorb, _isometry_proven=proof,
             )
             remaining.remove(node)
+            degree[neighbour] -= 1
+            if neighbour not in keep and degree[neighbour] == 1:
+                heapq.heappush(leaves, neighbour)
 
-        self._canonical_region = frozenset({target})
+        self._canonical_region = keep
         return self
 
-    def shift_orthogonality_center(self, new, *, absorb="right"):
+    def shift_orthogonality_center(
+        self, new, *, absorb="right", _skip_validate=False,
+    ):
         """Move the tracked orthogonality centre to node ``new`` in place.
 
         The tree analogue of :meth:`quimb.tensor.MatrixProductState.shift_orthogonality_center`:
@@ -2431,7 +2973,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
           once to the O(N) :meth:`canonize_around_node_`.
 
         Returns ``self`` so moves can be chained.
+
+        ``_skip_validate`` is an internal hot-path control for local fitting
+        engines that validate once after a complete sweep. The default keeps
+        the historical validation behavior of this state class.
         """
+        del _skip_validate  # TreeTensorNetwork does not validate per movement.
         if new not in self._plan.children:
             raise ValueError(f"{new!r} is not a node of the tree.")
         cur = self.orthogonality_center
@@ -2508,6 +3055,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             toward = self._toward_region(nid, region)
             t = self.node_tensor(nid)
             bond = next(iter(qtn.bonds(t, self.node_tensor(toward))))
+            data = t.data
             if self.fermionic:
                 # A singleton TensorNetwork.H applies the parity phase flips
                 # on all outer legs. The contraction order must also follow
@@ -2523,16 +3071,42 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 else:
                     output_inds = [bond + "*", bond]
                     prod = qtn.tensor_contract(tc, t, output_inds=output_inds)
+                data = prod.data
+                d = int(prod.shape[0])
+            elif ar.infer_backend(data) == "jax":
+                # JAX's default complex64 contraction precision can lose a
+                # few ulps per reduction and make an actually isometric QR
+                # factor look non-isometric at the 1e-4 diagnostic tolerance.
+                # Request the backend's highest available accumulation
+                # precision for this small scalar diagnostic only; the live
+                # SRC contractions retain their configured performance path.
+                axis = t.inds.index(bond)
+                moved = ar.do("moveaxis", data, axis, -1)
+                shape = tuple(ar.shape(moved))
+                matrix = ar.do(
+                    "reshape",
+                    moved,
+                    (-1, shape[-1]),
+                )
+                prod = ar.do(
+                    "einsum",
+                    "mi,mj->ij",
+                    ar.do("conj", matrix),
+                    matrix,
+                    precision="highest",
+                )
+                data = prod
+                d = int(shape[-1])
             else:
                 tc = t.H.reindex({bond: bond + "*"})
                 output_inds = [bond, bond + "*"]
                 prod = qtn.tensor_contract(t, tc, output_inds=output_inds)
-            d = int(prod.shape[0])
-            data = prod.data
+                d = int(prod.shape[0])
+                data = prod.data
             # Keep the diagnostic on the live backend. In particular,
             # ``ar.to_numpy`` cannot move a CUDA tensor to the host, while a
             # scalar reduction can be transferred safely and cheaply.
-            if hasattr(data, "to_dense"):
+            if ar.infer_backend(data) != "jax" and hasattr(data, "to_dense"):
                 data = data.to_dense()
             identity = ar.do("eye", d, like=data)
             close = ar.do(
@@ -2703,7 +3277,28 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         if order is None:
             order = range(self._plan.n)
         out_inds = [self.site_ind(q) for q in order]
-        return ar.to_numpy(self.to_dense(out_inds)).reshape(-1)
+        if self.fermionic:
+            # Keep physical legs separate through graded contraction. Fusing
+            # them first can discard unavailable total-charge sectors and
+            # packs the remaining entries by charge, not by physical site.
+            physical_indices = []
+            for ind in out_inds:
+                tensor = self.tensor_map[next(iter(self.ind_map[ind]))]
+                index = tensor.data.indices[tensor.inds.index(ind)]
+                if isinstance(self.physical_sectors, Mapping):
+                    # Gauge moves can already have removed empty physical
+                    # sectors. The declared local Hilbert space is unchanged.
+                    index = index.copy_with(chargemap=dict(self.physical_sectors))
+                physical_indices.append(index)
+            # Native contraction can remove empty charge sectors even on
+            # outer legs. Restore each live site's original basis explicitly.
+            contracted = self.contract(
+                all, output_inds=out_inds, preserve_tensor=True,
+            ).data
+            data = contracted.copy_with(indices=tuple(physical_indices)).to_dense()
+        else:
+            data = self.to_dense(out_inds)
+        return ar.to_numpy(data).reshape(-1)
 
     # -- ascii drawing --------------------------------------------------------
 
@@ -3020,7 +3615,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                    max_arity=2, community_frac=0.35, star_frac=0.75,
                    dtype=complex, site_tag_id="I{}", site_ind_id="k{}",
                    node_tag_id="N{}", root_qubit=None,
-                   top_arity=_DEFAULT_TOP_ARITY):
+                   top_arity=_DEFAULT_TOP_ARITY, map_mode=None):
         """Build a product state on a tree partitioned from ``order``.
 
         Convenience wrapper that first builds a :class:`TreePlan` with
@@ -3035,6 +3630,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             max_arity=max_arity, community_frac=community_frac,
             star_frac=star_frac, root_qubit=root_qubit,
             top_arity=top_arity,
+            map_mode=map_mode,
         )
         return cls.from_plan(
             plan,

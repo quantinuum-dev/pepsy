@@ -25,7 +25,7 @@ weighted growth seeds (or an explicitly selected `seed_modes` set), then returns
 ordinary `TreePepsPlan` accepted by all existing TreePeps consumers. The
 shared `OneDMap` now also exposes the center-out ordering for 2D and 3D
 lattices, while the plan turns non-path orderings into legal lattice trees.
-`TreePepsOptimizer` adds direct dense-gate replay and complete `TreeSubPepo`
+`TreePepsOptimizer` adds direct dense-gate replay and compact `TreeSubPepo`
 replay with span-local compression and update reports. Its stream contract is
 MPS-like: `set_gates` replaces a persistent normalized queue, `add_gates`
 extends it, and `run()` replays it without requiring a new iterable. The
@@ -39,9 +39,19 @@ bond-growth preflight, and replay truncation reports. TTN-specific measurement,
 reset, capping, TreeMPO, native symmetry/fermion, and stabilizer paths remain
 separate phases because their physical-space and topology contracts differ.
 
+The current optimizer parity slice also exposes Quimb's successive and
+oversampled path families (`sdc`, `sdcr`, `src`, and `zipup` variants), with
+seeded randomized paths and a fixed-topology local fallback for branching
+plans. Its TreeFIT/DMRG route forwards traversal, environment strategy,
+transition-sweep, single-site fast-path, finite-check, and dtype-aware stopping
+controls. The TreePeps FIT route defaults to the path-aware
+`fit_traversal="auto"` policy for ordinary one- and two-site gates, while
+retaining depth-first traversal for branching regions; it does not add a
+chain-only environment algorithm to a branching topology.
+
 This plan defines a new tree-embedded PEPS family for finite 2D and 3D
 lattices. It deliberately does not change the existing `TreeTensorNetwork`,
-`TreeMPO`, `TreeOptimizer`, or `TreeStabOptimizer` contracts until the shared
+`TreeMPO`, `TreeOptimizer`, or `StabilizerTreeSimulator` contracts until the shared
 tree primitives and representation boundaries are agreed and tested.
 
 ## Executive definition
@@ -348,8 +358,8 @@ channels.
 ### `TreeSubPepo`
 
 `TreeSubPepo` is the optimizer-facing, support-aware form of a local operator.
-It should be a distinct object that wraps an active operator network rather
-than an alias for a full `TreePepo`. It should carry:
+It is a distinct object whose primary `operator` is an active compact network,
+rather than an alias for a full `TreePepo`. It carries:
 
 - the physical support sites;
 - the connected tree span used for routing;
@@ -357,6 +367,11 @@ than an alias for a full `TreePepo`. It should carry:
 - private operator bond labels;
 - an explicit attachment map for every span boundary edge;
 - operator bond estimates and any requested compression policy.
+
+The complete source operator is retained separately as `full_operator` only for
+compatibility dense readout. Application, FIT target construction, and bond
+estimation use the compact `operator`; identity action outside `span` is
+implicit and no exterior operator tensors are allocated on those hot paths.
 
 The support and span are different concepts. A two-site operator may have two
 physical support sites but must include every tree node along the unique path
@@ -380,9 +395,9 @@ expectation(state, *, normalized=True)
 ```
 
 For `apply_to`, the exact route is deliberately two-stage. First, inject or
-fuse the complete operator over its span without truncating intermediate
-tree edges. Second, move the `TreePeps` canonical center to the span and run
-one inward compression sweep over the affected span/boundary edges. This
+fuse the compact operator over its span without truncating intermediate tree
+edges. Second, move the `TreePeps` canonical center to the span and run one
+inward compression sweep over the affected span/boundary edges. This
 ensures every truncation sees the complete multi-site operator and makes the
 result independent of the order in which path edges were visited. The
 existing `left_inds` metadata selects the shortest valid center move and
@@ -461,7 +476,7 @@ stable and independent of tree node ids.
 
 This should share the existing stabilizer frame, measurement, injection,
 trajectory, and diagnostic semantics, but it should not blindly subclass the
-current `TreeStabOptimizer`: that implementation assumes the current
+current `StabilizerTreeSimulator`: that implementation assumes the current
 `TreeTensorNetwork` physical-site and layout contract. A shared frame/stream
 adapter or composition layer is safer than duplicating the tableau rules or
 forcing leaf-only assumptions into the new state.

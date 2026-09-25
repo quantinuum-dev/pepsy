@@ -1,12 +1,112 @@
 """Tests for public backend conversion helpers."""
 
 import warnings
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 import quimb.tensor as qtn
 
 import pepsy
+
+
+@pytest.mark.parametrize("legacy", (False, True))
+def test_namespace_device_compatibility_preserves_creation_device(legacy):
+    """Exercise real namespace injection without leaking global registrations."""
+    script = r'''
+import sys
+import inspect
+import autoray as ar
+import autoray.autoray as core
+import quimb.tensor.decomp as decomp
+from pepsy.backends.config import _patch_unhashable_device_namespace_key
+
+class Device:
+    __hash__ = None
+    id = 7
+
+class Array:
+    device = Device()
+    dtype = "complex64"
+
+ar.register_backend(Array, "pepsy_namespace_test")
+creation = lambda shape, dtype=None, device=None: (tuple(shape), dtype, device)
+if "inject_device" in inspect.signature(ar.register_function).parameters:
+    ar.register_function("pepsy_namespace_test", "zeros", creation,
+                         inject_dtype=True, inject_device=True)
+else:
+    ar.register_function("pepsy_namespace_test", "zeros", creation)
+    core.register_creation_routine("pepsy_namespace_test", "zeros",
+                                   inject_dtype=True, inject_device=True)
+legacy = sys.argv[1] == "True"
+if legacy:
+    def get_namespace(like=None, device=None, dtype=None, submodule=None):
+        if like == "bad_backend":
+            raise TypeError("unrelated error")
+        inferred = device if device is not None else getattr(like, "device", None)
+        hash(inferred)  # reproduce the legacy cache-key failure
+        return core.AutoNamespace(like, device, dtype, submodule)
+    core.get_namespace = ar.get_namespace = decomp.get_namespace = get_namespace
+
+original = (core.get_namespace, ar.get_namespace, decomp.get_namespace)
+try:
+    core.get_namespace("numpy", device=[])
+except TypeError:
+    supports_unhashable = False
+else:
+    supports_unhashable = True
+_patch_unhashable_device_namespace_key()
+if supports_unhashable:
+    assert original == (core.get_namespace, ar.get_namespace, decomp.get_namespace)
+installed = ar.get_namespace
+_patch_unhashable_device_namespace_key()
+assert ar.get_namespace is installed
+
+array = Array()
+override = Device()
+for factory in (ar.get_namespace, core.get_namespace, decomp.get_namespace):
+    assert factory(array).zeros((2,)) == ((2,), "complex64", array.device)
+    assert factory(array, device=override, dtype="float32").zeros((3,)) == (
+        (3,), "float32", override,
+    )
+    assert factory("numpy").zeros((2,)).shape == (2,)
+if legacy:
+    try:
+        ar.get_namespace("bad_backend")
+    except TypeError as exc:
+        assert str(exc) == "unrelated error"
+    else:
+        raise AssertionError("unrelated TypeError was hidden")
+'''
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(legacy)],
+        cwd=root, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_cupy_namespace_creation_on_available_device():
+    """Exercise actual CUDA device injection when CuPy and a GPU are present."""
+    cp = pytest.importorskip("cupy")
+    import autoray as ar
+
+    try:
+        count = cp.cuda.runtime.getDeviceCount()
+    except cp.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CUDA runtime unavailable: {exc}")
+    if not count:
+        pytest.skip("No CUDA devices available")
+    array = pepsy.backend_cupy(device=0, dtype="complex64")([1, 2])
+    result = ar.get_namespace(array).zeros((3,))
+    assert result.dtype == array.dtype
+    assert result.device.id == array.device.id
+    cp.testing.assert_array_equal(result, cp.zeros(3, dtype=array.dtype))
 
 
 def _available_torch_devices():
@@ -81,6 +181,23 @@ def test_torch_float_backend_drops_only_zero_imaginary_part_without_warning():
         out = to_backend(np.array([1.0 + 0.0j, -2.0 + 0.0j]))
     assert out.dtype is torch.float64
     assert not [warning for warning in caught if "discards the imaginary part" in str(warning.message)]
+
+
+def test_torch_backend_preserves_graph_when_dtype_casting_existing_tensor():
+    """The default converter mode keeps graph-bearing tensors connected."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(dtype=torch.complex128, device="cpu")
+    value = torch.tensor([2.0, 3.0], dtype=torch.float64, requires_grad=True)
+
+    converted = to_backend(value)
+    loss = converted.real.square().sum()
+    loss.backward()
+
+    assert converted.dtype is torch.complex128
+    torch.testing.assert_close(
+        value.grad,
+        torch.tensor([4.0, 6.0], dtype=torch.float64),
+    )
 
 
 def test_to_float_handles_backend_scalar_without_numpy_coercion():
@@ -934,10 +1051,58 @@ def test_torch_real_qr_rank_policy_native_is_silent():
         linalg_torch._QR_RANK_TOL_FACTOR = original_factor
 
 
-def test_jax_linalg_registration_aliases_are_idempotent():
+def test_jax_single_device_sharding_has_compatible_backend_metadata():
+    """A named one-device mesh has the same placement as its physical device."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends import backend_infer, infer_backend_signature
+
+    device = jax.devices()[0]
+    mesh = jax.sharding.Mesh(np.array([device]), ("site",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    plain = jax.device_put(jnp.ones((2, 2), dtype=jnp.complex64), device)
+    named = jax.device_put(plain, sharding)
+    assert infer_backend_signature(named) == infer_backend_signature(plain)
+    import quimb.tensor as qtn
+    network = qtn.TensorNetwork([
+        qtn.Tensor(plain, inds=("a", "b")),
+        qtn.Tensor(named, inds=("b", "c")),
+    ])
+    assert backend_infer(network)["device"] == str(device)
+
+    @jax.jit
+    def traced_signature(value):
+        # Abstract tracers have no concrete placement to inspect.
+        assert infer_backend_signature(value) == ("jax", "complex64", None)
+        return value
+
+    np.testing.assert_array_equal(traced_signature(plain), plain)
+
+
+def test_jax_stabilized_svd_accepts_thin_options_and_preserves_gradients():
+    """Explicit thin-SVD options retain the custom VJP under JIT."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends.linalg_jax import svd_jax
+
+    matrix = jnp.asarray([[2., .3], [.1, 1.], [.4, -.2]], dtype=jnp.float32)
+    u, s, vh = svd_jax(matrix, full_matrices=False)
+    np.testing.assert_allclose((u * s) @ vh, matrix, atol=1e-6)
+    actual = jax.jit(jax.grad(lambda a: svd_jax(a, full_matrices=False)[1].sum()))(matrix)
+    expected = jax.grad(lambda a: jnp.linalg.svd(a, full_matrices=False)[1].sum())(matrix)
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+    np.testing.assert_allclose(svd_jax(matrix, compute_uv=False), s, atol=1e-6)
+    assert svd_jax(matrix, full_matrices=True)[0].shape == (3, 3)
+
+
+def test_jax_linalg_registration_aliases_are_idempotent(monkeypatch):
     """JAX real/relative compatibility aliases share one registration."""
     pytest.importorskip("jax")
     from pepsy.backends import linalg_jax
+    import autoray as ar
+
+    calls = []
+    monkeypatch.setattr(ar, "register_function", lambda *args: calls.append(args))
 
     original_registered = linalg_jax._SVD_REGISTERED
     original_function = linalg_jax._SVD_REGISTERED_FUNCTION
@@ -947,6 +1112,7 @@ def test_jax_linalg_registration_aliases_are_idempotent():
         linalg_jax.reg_rel_svd_jax()
         assert linalg_jax._SVD_REGISTERED is True
         linalg_jax.reg_real_svd_jax()
+        assert len(calls) == 1
     finally:
         linalg_jax._SVD_REGISTERED = original_registered
         linalg_jax._SVD_REGISTERED_FUNCTION = original_function
@@ -1054,10 +1220,19 @@ def test_to_float_uses_real_component_by_default():
 
 def test_to_float_handles_torch_scalar_if_available():
     torch = pytest.importorskip("torch")
+    import autoray as ar
 
     value = torch.tensor(3.5 + 1.25j, dtype=torch.complex128, requires_grad=True)
 
-    assert pepsy.to_float(value) == pytest.approx(3.5)
+    def forbidden(_value):
+        raise AssertionError("Torch scalar conversion should use .item() directly.")
+
+    original_to_numpy = ar.to_numpy
+    ar.to_numpy = forbidden
+    try:
+        assert pepsy.to_float(value) == pytest.approx(3.5)
+    finally:
+        ar.to_numpy = original_to_numpy
 
 
 @pytest.mark.parametrize("complex_input", (False, True))

@@ -437,8 +437,9 @@ routes is insufficient.
   scalar D1 paths through the documented dense shadow.
 - Keep `pepsy.bp` out of the lazy top-level namespace (import `pepsy.bp`); do
   **not** edit `src/pepsy/__init__.py` for it.
-- Tests: `tests/test_bp_relay.py` and `tests/test_simple_update_gen.py`. Env: py312
-  (`source ~/envs/py312/bin/activate`, `NUMBA_CACHE_DIR=/tmp/numba_cache`).
+- Tests: `tests/test_bp_relay.py` and `tests/test_simple_update_gen.py`. Use the
+  environment selected by `AGENTS.md`; set `NUMBA_CACHE_DIR=/tmp/numba_cache`
+  only if the default cache location is unavailable.
 
 ## References
 Full annotated list: [`docs/development/references/belief_propagation.md`](../../../docs/development/references/belief_propagation.md).

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import math
 from copy import deepcopy
 from collections.abc import Mapping
@@ -11,23 +13,74 @@ from time import perf_counter
 import autoray as ar
 import numpy as np
 
+from ..._internal.cutoff import dtype_auto_cutoff
 from ...backends import (
     backend_infer,
     backend_signatures_compatible,
     infer_backend_signature,
+)
+from ...fitting import TreeFIT
+from ...fitting.tree import (
+    _build_layered_operator_state_target,
+    _layered_target_bond_sizes,
+    _randomize_tree_guess,
+    _region_path,
 )
 from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
     log_fidelity_from_norms,
 )
-from .operators import TreePepo, TreeSubPepo, plan_signature
+from .operators import (
+    TreePepo,
+    TreeSubPepo,
+    _normalize_compression_layout,
+    plan_signature,
+)
 from .plan import TreePepsPlan
-from .state import TreePeps, _normalize_compression_mode
+from .state import (
+    TreePeps,
+    _normalize_compression_mode,
+    _normalize_oversample_cutoff,
+    _normalize_oversample_cutoff_mode,
+)
 
 __all__ = ["TreePepsOptimizer"]
 
+try:  # threadpoolctl is a NumPy/SciPy transitive dependency; treat as optional.
+    from threadpoolctl import ThreadpoolController as _ThreadpoolController
+
+    # Reuse one controller so each update only changes and restores limits.
+    _THREAD_CONTROLLER = _ThreadpoolController()
+except Exception:  # pragma: no cover - threadpoolctl missing
+    _THREAD_CONTROLLER = None
+
+
+def _thread_limited(method):
+    """Run tensor updates under the optimizer's BLAS/OpenMP policy."""
+
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._thread_ctx():
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 _UNSET = object()
+_COMPRESSION_SHORTHANDS = frozenset(
+    {
+        "dm",
+        "sdc",
+        "sdc_oversample",
+        "sdcr",
+        "sdcr_oversample",
+        "src",
+        "src_oversample",
+        "zipup",
+        "zipup_oversample",
+    }
+)
 
 
 class TreePepsOptimizer:
@@ -42,12 +95,28 @@ class TreePepsOptimizer:
 
     ``"sub_treepepo"``
         Apply an already factorized :class:`TreeSubPepo`.  The complete
-        operator span is fused first and its internal edges are compressed in
-        one leaf-to-center sweep.
+        operator span is compressed either as a Quimb-compatible two-layer
+        path network or through the fused tree-state fallback.
 
-    In both modes, intermediate routing is lossless.  The optimizer owns an
+    ``compression_mode``
+        Selects direct, density-matrix, successive, randomized-successive,
+        or oversampled compression. The ``zipup`` family is restricted to
+        path two-layer updates; branching trees retain their fixed topology
+        and use local edge decompositions for the other families.
+
+    ``compression_layout="auto"`` selects the two-layer path network for
+    Quimb's multi-tensor methods and keeps the fused representation for other
+    ordinary compression cases.  The DMRG/TreeFIT route always builds a
+    layered operator--state target. Use ``"fused"`` or ``"two_layer"`` to
+    select the ordinary compression layout explicitly. The optimizer owns an
     independent state copy by default and mutates that live state when
-    :meth:`apply` or :meth:`apply_gate` is called.
+    :meth:`apply` or :meth:`apply_gate` is called. ``mode="dmrg"``
+    and its ``dmrg1``/``dmrg2``/``dmrg3`` aliases select the cached
+    tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` and
+    ``dmrg2`` use two-node warm-up blocks, ``dmrg3`` uses three-node warm-up
+    blocks, and all named modes refine with one-node sweeps.
+    Small tensor updates are capped at one BLAS/OpenMP thread by default;
+    pass ``threads=None`` to use the process-wide library setting.
     """
 
     _MODE_ALIASES = {
@@ -55,6 +124,19 @@ class TreePepsOptimizer:
         "sub_tree_pepo": "sub_treepepo",
         "subtree_pepo": "sub_treepepo",
         "subtree": "sub_treepepo",
+        # MPS-style compatibility spelling.  The canonical PEPS name is
+        # ``sub_treepepo`` because the operator is a tree PEPO, not a chain
+        # MPO.
+        "sub_treepepsmpo": "sub_treepepo",
+        "sub_tree_peps_mpo": "sub_treepepo",
+        "subtreepepsmpo": "sub_treepepo",
+        "subtree_peps_mpo": "sub_treepepo",
+    }
+    _DMRG_MODE_ALIASES = {"dmrg1": 1, "dmrg2": 2, "dmrg3": 3}
+    _PROGBAR_COLORS = {
+        # Match MpsOptimizer's DMRG and MPO-family colors.
+        "dmrg": "#1f77b4",
+        "mpo": "#2ca02c",
     }
     _STREAM_EVENT_ALIASES = {
         "gate": "gate",
@@ -67,6 +149,16 @@ class TreePepsOptimizer:
         "sub_tree_pepo": "sub_treepepo",
         "subtree_pepo": "sub_treepepo",
         "subtreepepo": "sub_treepepo",
+        "sub_treepepsmpo": "sub_treepepo",
+        "sub_tree_peps_mpo": "sub_treepepo",
+        "subtreepepsmpo": "sub_treepepo",
+        "subtree_peps_mpo": "sub_treepepo",
+        # The normal/full PEPS operator is ``tree_pepo``.  These aliases make
+        # the MPS-style naming available at the stream boundary only.
+        "tree_pepsmpo": "tree_pepo",
+        "tree_peps_mpo": "tree_pepo",
+        "treepepsmpo": "tree_pepo",
+        "treepeps_mpo": "tree_pepo",
     }
 
     def __init__(
@@ -78,9 +170,30 @@ class TreePepsOptimizer:
         layout=None,
         mode="direct",
         compression_mode="direct",
+        compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
+        compression_layout="auto",
+        fit_block_size=2,
+        fit_n_iter=2,
+        fit_adaptive_sweeps=2,
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=1,
+        fit_two_site_transition_sweeps=0,
+        fit_traversal="auto",
+        fit_environment_strategy="default",
+        fit_single_node_fast_path=True,
+        fit_finite_check=False,
+        fit_init_strategy="guess-src",
+        fit_init_rand_strength=0.0,
+        fit_init_seed=0,
+        fit_sweep_sequence="RL",
+        fit_overlap_diagnostics=False,
         chi=64,
         max_bond=None,
-        cutoff=1e-10,
+        cutoff="auto",
         cutoff_mode="rsum2",
         reduced=True,
         inplace=False,
@@ -96,6 +209,7 @@ class TreePepsOptimizer:
         max_intermediate_bond=None,
         profile=False,
         profile_sync=False,
+        threads=1,
         track_bond_diagnostics=False,
     ):
         if state is not None and tn is not None:
@@ -115,20 +229,127 @@ class TreePepsOptimizer:
                 raise ValueError("plan and state must use the same tree plan")
         compression_mode = _normalize_compression_mode(compression_mode)
         raw_mode = str(mode).strip().lower().replace("-", "_")
-        if raw_mode == "dm":
-            if compression_mode not in {"direct", "dm"}:
+        raw_mode = {
+            "zipup_first": "zipup_oversample",
+        }.get(raw_mode, raw_mode)
+        if raw_mode in _COMPRESSION_SHORTHANDS:
+            if compression_mode not in {"direct", raw_mode}:
                 raise ValueError(
-                    "mode='dm' cannot be combined with a different "
+                    f"mode={raw_mode!r} cannot be combined with a different "
                     "compression_mode."
                 )
-            compression_mode = "dm"
+            compression_mode = raw_mode
             raw_mode = "direct"
+        self._dmrg_mode_alias = (
+            raw_mode if raw_mode in self._DMRG_MODE_ALIASES else None
+        )
+        if raw_mode == "fit" or raw_mode in self._DMRG_MODE_ALIASES:
+            raw_mode = "dmrg"
         self.mode = self._normalize_mode(raw_mode)
         self.compression_mode = compression_mode
+        self.compression_layout = _normalize_compression_layout(compression_layout)
+        if (
+            not isinstance(fit_block_size, Integral)
+            or int(fit_block_size) not in {1, 2, 3}
+        ):
+            raise ValueError("fit_block_size must be 1, 2, or 3")
+        self.fit_block_size = int(fit_block_size)
+        if not isinstance(fit_n_iter, Integral) or int(fit_n_iter) < 1:
+            raise ValueError("fit_n_iter must be a positive integer")
+        self.fit_n_iter = int(fit_n_iter)
+        if (
+            not isinstance(fit_adaptive_sweeps, Integral)
+            or int(fit_adaptive_sweeps) < 1
+        ):
+            raise ValueError("fit_adaptive_sweeps must be a positive integer")
+        self.fit_adaptive_sweeps = int(fit_adaptive_sweeps)
+        if fit_min_iter is not None and (
+            isinstance(fit_min_iter, bool)
+            or not isinstance(fit_min_iter, Integral)
+            or int(fit_min_iter) < 1
+        ):
+            raise ValueError("fit_min_iter must be a positive integer or None")
+        self.fit_min_iter = None if fit_min_iter is None else int(fit_min_iter)
+        self._fit_rtol_requested = (
+            fit_rtol.strip().lower() if isinstance(fit_rtol, str) else fit_rtol
+        )
+        if (
+            self._fit_rtol_requested is not None
+            and self._fit_rtol_requested != "auto"
+        ):
+            try:
+                self._fit_rtol_requested = float(self._fit_rtol_requested)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "fit_rtol must be 'auto', a non-negative number, or None"
+                ) from exc
+            if (
+                not np.isfinite(self._fit_rtol_requested)
+                or self._fit_rtol_requested < 0.0
+            ):
+                raise ValueError(
+                    "fit_rtol must be 'auto', a non-negative number, or None"
+                )
+        self.fit_rtol = self._fit_rtol_requested
+        if not isinstance(fit_patience, Integral) or int(fit_patience) < 1:
+            raise ValueError("fit_patience must be a positive integer")
+        self.fit_patience = int(fit_patience)
+        if (
+            isinstance(fit_two_site_transition_sweeps, bool)
+            or not isinstance(fit_two_site_transition_sweeps, Integral)
+            or int(fit_two_site_transition_sweeps) < 0
+        ):
+            raise ValueError(
+                "fit_two_site_transition_sweeps must be a non-negative integer"
+            )
+        self.fit_two_site_transition_sweeps = int(fit_two_site_transition_sweeps)
+        self.fit_traversal = TreeFIT._normalize_traversal(fit_traversal)
+        self.fit_environment_strategy = TreeFIT._normalize_environment_strategy(
+            fit_environment_strategy
+        )
+        self.fit_single_node_fast_path = bool(fit_single_node_fast_path)
+        self.fit_finite_check = bool(fit_finite_check)
+        self._finite_check_enabled = False
+        self.fit_init_strategy = (
+            str(fit_init_strategy).strip().lower().replace("-", "_")
+        )
+        self.fit_init_rand_strength = float(fit_init_rand_strength)
+        if (
+            not np.isfinite(self.fit_init_rand_strength)
+            or self.fit_init_rand_strength < 0.0
+        ):
+            raise ValueError(
+                "fit_init_rand_strength must be finite and non-negative."
+            )
+        if isinstance(fit_init_seed, bool) or not isinstance(fit_init_seed, Integral):
+            raise TypeError("fit_init_seed must be an integer")
+        self.fit_init_seed = int(fit_init_seed)
+        if self.fit_init_seed < 0:
+            raise ValueError("fit_init_seed must be non-negative")
+        self.fit_sweep_sequence = TreeFIT._normalize_sweep_sequence(
+            fit_sweep_sequence
+        )
+        self.fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        if compression_seed is not None:
+            if isinstance(compression_seed, bool) or not isinstance(
+                compression_seed, Integral
+            ):
+                raise TypeError("compression_seed must be an integer or None")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError("compression_seed must be non-negative")
+        self.compression_seed = compression_seed
+        self.max_bond_oversample = self._normalize_max_bond_oversample(
+            max_bond_oversample
+        )
+        self.cutoff_oversample = _normalize_oversample_cutoff(cutoff_oversample)
+        self.cutoff_mode_oversample = _normalize_oversample_cutoff_mode(
+            cutoff_mode_oversample
+        )
         if max_bond is not None:
             chi = max_bond
         self.chi = self._normalize_max_bond(chi)
-        self.cutoff = self._normalize_cutoff(cutoff)
+        self.cutoff = cutoff
         self.cutoff_mode = cutoff_mode
         self.reduced = bool(reduced)
         self.info_c = info_c
@@ -152,6 +373,7 @@ class TreePepsOptimizer:
         self.track_infidelity = bool(track_infidelity)
         self.profile = bool(profile)
         self.profile_sync = bool(profile_sync)
+        self.threads = self._positive_limit(threads, "threads")
         self.track_bond_diagnostics = bool(track_bond_diagnostics)
         self.inplace = bool(inplace)
         self.history = []
@@ -162,9 +384,13 @@ class TreePepsOptimizer:
         self._last_local_infidelity = None
         self.normalizations = []
         self.profile_events = []
+        self.fit_diagnostics = []
+        self._last_fit_diagnostics = None
         self.state = state if self.inplace else state.copy()
         self.state.validate()
         self.backend_info()
+        self.cutoff = self._normalize_cutoff(self.cutoff)
+        self.fit_rtol = self._resolve_fit_rtol()
         self._sync_info()
         self._gate_stream = ()
 
@@ -176,9 +402,18 @@ class TreePepsOptimizer:
     @classmethod
     def _normalize_mode(cls, mode):
         mode = str(mode).strip().lower()
+        mode = {
+            "zipup_first": "zipup_oversample",
+        }.get(mode, mode)
         mode = cls._MODE_ALIASES.get(mode, mode)
-        if mode not in {"direct", "sub_treepepo", "auto"}:
-            raise ValueError("mode must be 'direct', 'sub_treepepo', or 'auto'")
+        if mode == "fit" or mode in cls._DMRG_MODE_ALIASES:
+            return "dmrg"
+        if mode in _COMPRESSION_SHORTHANDS:
+            return "direct"
+        if mode not in {"direct", "sub_treepepo", "dmrg", "auto"}:
+            raise ValueError(
+                "mode must be 'direct', 'sub_treepepo', 'dmrg', or 'auto'"
+            )
         return mode
 
     @staticmethod
@@ -186,7 +421,12 @@ class TreePepsOptimizer:
         """Resolve operator routing and compression modes independently."""
 
         raw_mode = str(mode).strip().lower().replace("-", "_")
+        raw_mode = {
+            "zipup_first": "zipup_oversample",
+        }.get(raw_mode, raw_mode)
         compression_mode = _normalize_compression_mode(compression_mode)
+        if raw_mode == "fit" or raw_mode in TreePepsOptimizer._DMRG_MODE_ALIASES:
+            return "dmrg", compression_mode
         if raw_mode == "dm":
             if compression_mode not in {"direct", "dm"}:
                 raise ValueError(
@@ -194,10 +434,62 @@ class TreePepsOptimizer:
                     "compression_mode."
                 )
             return "direct", "dm"
+        if raw_mode in _COMPRESSION_SHORTHANDS - {"dm"}:
+            if compression_mode not in {"direct", raw_mode}:
+                raise ValueError(
+                    f"mode={raw_mode!r} cannot be combined with a different "
+                    "compression_mode."
+                )
+            return "direct", raw_mode
         return (
             TreePepsOptimizer._normalize_mode(raw_mode),
             compression_mode,
         )
+
+    @classmethod
+    def _resolve_dmrg_mode_alias(cls, mode, *, default=None):
+        """Resolve a named DMRG alias while retaining canonical ``dmrg``."""
+
+        if mode is None:
+            return default
+        raw_mode = str(mode).strip().lower().replace("-", "_")
+        raw_mode = {
+            "zipup_first": "zipup_oversample",
+        }.get(raw_mode, raw_mode)
+        raw_mode = cls._MODE_ALIASES.get(raw_mode, raw_mode)
+        if raw_mode in cls._DMRG_MODE_ALIASES:
+            return raw_mode
+        if raw_mode == "dmrg":
+            return default
+        return None
+
+    def _progress_mode_name(self, mode=None, compression_mode=None):
+        """Return the active short mode name shown by a replay bar."""
+
+        explicit_mode = mode is not None
+        raw_mode = self.mode if mode is None else str(mode)
+        raw_mode = raw_mode.strip().lower().replace("-", "_")
+        raw_mode = {
+            "zipup_first": "zipup_oversample",
+        }.get(raw_mode, raw_mode)
+        raw_mode = self._MODE_ALIASES.get(raw_mode, raw_mode)
+        if raw_mode == "fit":
+            raw_mode = "dmrg"
+        if raw_mode in self._DMRG_MODE_ALIASES:
+            return raw_mode
+        if raw_mode == "dmrg":
+            return self._dmrg_mode_alias or "dmrg"
+        if raw_mode in _COMPRESSION_SHORTHANDS:
+            return raw_mode
+        if raw_mode in {"auto", "direct", "sub_treepepo"}:
+            if compression_mode is not None:
+                selected = _normalize_compression_mode(compression_mode)
+            elif explicit_mode:
+                selected = "direct"
+            else:
+                selected = self.compression_mode
+            return selected
+        return raw_mode
 
     @staticmethod
     def _normalize_max_bond(max_bond):
@@ -211,6 +503,31 @@ class TreePepsOptimizer:
         return max_bond
 
     @staticmethod
+    def _normalize_max_bond_oversample(value):
+        """Validate an integer-rank or floating-point multiplier."""
+
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise TypeError(
+                "max_bond_oversample must be a positive integer, multiplier, or None"
+            )
+        if isinstance(value, Integral):
+            value = int(value)
+            if value < 1:
+                raise ValueError("max_bond_oversample must be positive")
+            return value
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "max_bond_oversample must be a positive integer, multiplier, or None"
+            ) from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError("max_bond_oversample must be positive")
+        return value
+
+    @staticmethod
     def _normalize_limit(value, name):
         if value is None:
             return None
@@ -221,18 +538,30 @@ class TreePepsOptimizer:
             raise ValueError(f"{name} must be a positive integer or None")
         return value
 
-    @staticmethod
-    def _normalize_cutoff(cutoff):
+    def _normalize_cutoff(self, cutoff):
         if cutoff is None:
             return 1e-10
         if isinstance(cutoff, str):
             if cutoff.strip().lower() == "auto":
-                return 1e-10
+                return dtype_auto_cutoff(self.backend_dtype)
             raise ValueError("cutoff must be a non-negative number or 'auto'")
         cutoff = float(cutoff)
         if not np.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("cutoff must be a non-negative number or 'auto'")
         return cutoff
+
+    def _resolve_fit_rtol(self):
+        """Resolve the optional dtype-aware FIT stopping tolerance."""
+
+        value = self._fit_rtol_requested
+        if value == "auto":
+            dtype = str(self.backend_dtype).lower()
+            if "16" in dtype:
+                return 1e-3
+            if "32" in dtype or "complex64" in dtype:
+                return 1e-5
+            return 1e-9
+        return value
 
     @property
     def tn(self):
@@ -279,7 +608,10 @@ class TreePepsOptimizer:
         self._last_local_infidelity = None
         self.normalizations = []
         self.profile_events = []
+        self.fit_diagnostics = []
+        self._last_fit_diagnostics = None
         self.backend_info()
+        self.fit_rtol = self._resolve_fit_rtol()
         self._sync_info()
         return self
 
@@ -515,6 +847,8 @@ class TreePepsOptimizer:
             "root_coordinate": self.plan.coordinate(self.plan.root),
             "order": self.plan.order,
             "tree_order": self.plan.tree_order,
+            "map_mode": self.plan.map_mode,
+            "coarse_grain": self.plan.coarse_grain,
             "topology": self.plan.topology,
             "tree_edges": self.plan.tree_edges,
             "max_virtual_degree": self.plan.max_virtual_degree,
@@ -533,17 +867,19 @@ class TreePepsOptimizer:
         supports=None,
         gates=None,
         terms=None,
-        max_virtual_degree=3,
+        max_virtual_degree=None,
         objective="hybrid",
         seed=0,
         max_iter=64,
         refine=True,
         order=None,
+        map_mode=None,
         tree_order=None,
         seed_modes=None,
         tree_orders=None,
         root=None,
         topology=None,
+        coarse_grain=None,
     ):
         """Return a workload-aware :class:`TreePepsPlan`.
 
@@ -570,11 +906,13 @@ class TreePepsOptimizer:
             seed=seed,
             max_iter=max_iter,
             order=order,
+            map_mode=map_mode,
             tree_order=tree_order,
             seed_modes=seed_modes,
             tree_orders=tree_orders,
             root=root,
             topology=topology,
+            coarse_grain=coarse_grain,
         )
         return finder.run(refine=refine)
 
@@ -957,8 +1295,14 @@ class TreePepsOptimizer:
         return ("sub_treepepo", operator)
 
     pepo_event = tree_pepo_event
+    tree_pepsmpo_event = tree_pepo_event
+    tree_peps_mpo_event = tree_pepo_event
+    treepepsmpo_event = tree_pepo_event
     subtree_pepo_event = sub_treepepo_event
     sub_tree_pepo_event = sub_treepepo_event
+    sub_treepepsmpo_event = sub_treepepo_event
+    sub_tree_peps_mpo_event = sub_treepepo_event
+    subtreepepsmpo_event = sub_treepepo_event
 
     @property
     def gate_stream(self):
@@ -1068,8 +1412,7 @@ class TreePepsOptimizer:
 
     def _prepare_span(self, span):
         span = frozenset(span)
-        if self.state.canonical_region != span or not self.state.is_subtree_canonical_form(span):
-            self.state.canonize_subtree(span, inplace=True, info_c=self.info_c)
+        self.state._prepare_canonical_region(span, info_c=self.info_c)
 
     @staticmethod
     def _format_progress_scalar(value):
@@ -1165,6 +1508,259 @@ class TreePepsOptimizer:
             "cumulative_compression_infidelity": cumulative_infidelity,
         }
 
+    @staticmethod
+    def _normalize_fit_init_strategy(strategy):
+        """Normalize a TreeFIT disposable initial-guess policy."""
+
+        strategy = str(strategy).strip().lower().replace("-", "_")
+        if strategy == "auto":
+            strategy = "guess_src"
+        if strategy in {"direct", "random", "random_expand"}:
+            return strategy
+        if strategy.startswith("guess_"):
+            method = strategy[6:]
+            if method in {
+                "direct",
+                "dm",
+                "sdc",
+                "sdc_oversample",
+                "sdcr",
+                "sdcr_oversample",
+                "src",
+                "src_oversample",
+                "zipup",
+                "zipup_oversample",
+            }:
+                return strategy
+        raise ValueError(
+            "fit_init_strategy must be one of 'auto', 'direct', 'random', "
+            "'random_expand', or 'guess-<method>'"
+        )
+
+    def _fit_block_size(self, dmrg_mode_alias=_UNSET):
+        """Resolve a named DMRG mode to its requested warm-up block size."""
+
+        if dmrg_mode_alias is _UNSET:
+            dmrg_mode_alias = self._dmrg_mode_alias
+        if dmrg_mode_alias is not None:
+            # Match MpsOptimizer: ``dmrg1`` is one-site DMRG with a bounded
+            # two-site growth warm-up, while dmrg2 and dmrg3 select the
+            # corresponding larger warm-up block.
+            return {
+                "dmrg1": 2,
+                "dmrg2": 2,
+                "dmrg3": 3,
+            }[dmrg_mode_alias]
+        return self.fit_block_size
+
+    def _tree_fit_initial_guess(
+        self,
+        operator,
+        span,
+        *,
+        target,
+        max_bond,
+        max_bond_oversample,
+        cutoff,
+        cutoff_oversample,
+        cutoff_mode,
+        cutoff_mode_oversample,
+        compression_layout,
+    ):
+        """Build a disposable TreeFIT guess without changing the live state."""
+
+        strategy = self._normalize_fit_init_strategy(self.fit_init_strategy)
+        if strategy in {"random", "random_expand"}:
+            guess, random_info = _randomize_tree_guess(
+                self.state,
+                span,
+                target=target,
+                max_bond=max_bond,
+                strength=self.fit_init_rand_strength,
+                expand=strategy == "random_expand",
+                seed=self.fit_init_seed,
+            )
+            return guess, strategy, random_info
+        if strategy == "direct":
+            return self.state.copy(), strategy, None
+        method = strategy[6:]
+        if method == "direct":
+            return self.state.copy(), strategy, None
+        if method in {"zipup", "zipup_oversample"} and not self.plan.is_mps_topology:
+            raise NotImplementedError(
+                "fit_init_strategy='guess-zipup' requires a path TreePeps."
+            )
+        guess = operator.apply_to(
+            self.state,
+            compress=True,
+            center=self._region_center(span),
+            max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
+            cutoff=cutoff,
+            cutoff_oversample=cutoff_oversample,
+            cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
+            reduced=self.reduced,
+            compression_mode=method,
+            compression_seed=self.fit_init_seed,
+            compression_layout=compression_layout,
+            _active_sites=span,
+            _prepared_region=span,
+        )
+        return guess, strategy, None
+
+    def _apply_operator_fit(
+        self,
+        operator,
+        span,
+        *,
+        max_bond,
+        max_bond_oversample,
+        cutoff,
+        cutoff_oversample,
+        cutoff_mode,
+        cutoff_mode_oversample,
+        compression_mode,
+        compression_layout,
+        dmrg_mode_alias=_UNSET,
+    ):
+        """Fit an exact disposable PEPO target with the tree-native FIT kernel."""
+
+        if dmrg_mode_alias is _UNSET:
+            dmrg_mode_alias = self._dmrg_mode_alias
+
+        target = _build_layered_operator_state_target(
+            self.state,
+            operator,
+            active_nodes=span,
+        )
+        guess, strategy, random_info = self._tree_fit_initial_guess(
+            operator,
+            span,
+            target=target,
+            max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
+            cutoff=cutoff,
+            cutoff_oversample=cutoff_oversample,
+            cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
+            compression_layout=compression_layout,
+        )
+        split_method = compression_mode
+        if split_method.endswith("_oversample"):
+            split_method = split_method.removesuffix("_oversample")
+        if split_method in {"sdc", "sdcr"}:
+            split_method = "src" if split_method == "sdcr" else "direct"
+        if split_method == "zipup":
+            split_method = "direct"
+        block_size = self._fit_block_size(dmrg_mode_alias)
+        path = (
+            _region_path(self.state, span)
+            if self.fit_traversal == "auto" else None
+        )
+        fit = TreeFIT(
+            target,
+            guess,
+            max_bond=max_bond,
+            cutoffs=cutoff,
+            cutoff_mode=cutoff_mode,
+            split_method=split_method,
+            split_seed=(
+                self.compression_seed
+                if self.compression_seed is not None else self.fit_init_seed
+            ),
+            inplace=True,
+            copy_target=False,
+            traversal=self.fit_traversal,
+            environment_strategy=self.fit_environment_strategy,
+            finite_check=self.fit_finite_check or self._finite_check_enabled,
+        )
+        active_block_size = min(block_size, len(span))
+        if (
+            dmrg_mode_alias == "dmrg1"
+            and block_size == 2
+            and fit._active_bonds_at_rank_targets(span, state=self.state)
+        ):
+            active_block_size = 1
+        if (
+            dmrg_mode_alias == "dmrg1"
+            and active_block_size == 2
+            and len(span) > 2
+            and not fit._active_bonds_at_rank_targets(span, state=self.state)
+            and self.fit_n_iter < 3
+        ):
+            raise ValueError(
+                "mode='dmrg1' requires fit_n_iter >= 3 for an under-capacity "
+                "tree window: two block-growth sweeps and one-site refinement."
+            )
+        adaptive_sweeps = (
+            2 if dmrg_mode_alias == "dmrg1"
+            else self.fit_adaptive_sweeps
+        )
+        fit.run_gate(
+            span,
+            n_iter=self.fit_n_iter,
+            block_size=active_block_size,
+            sweep_sequence=self.fit_sweep_sequence,
+            min_iter=self.fit_min_iter,
+            rtol=self.fit_rtol,
+            patience=self.fit_patience,
+            adaptive_block_sweeps=adaptive_sweeps,
+            two_site_transition_sweeps=(
+                self.fit_two_site_transition_sweeps
+                if dmrg_mode_alias == "dmrg3" else 0
+            ),
+            single_node_fast_path=self.fit_single_node_fast_path,
+            adaptive_until_rank=(
+                dmrg_mode_alias is None
+                and not (
+                    active_block_size in {2, 3}
+                    and len(span) > active_block_size
+                )
+            ),
+            _path_order=path,
+        )
+        diagnostics = fit.fit_diagnostics(
+            overlap=self.fit_overlap_diagnostics,
+        )
+        diagnostics.update(
+            {
+                "backend": "tree_fit",
+                "fit_init_strategy": strategy,
+                "fit_init_strategy_requested": self.fit_init_strategy,
+                "guess_used": strategy != "direct",
+                "guess_method": (
+                    strategy[6:] if strategy.startswith("guess_") else strategy
+                ),
+                "random_initialization": bool(
+                    random_info and random_info["enabled"]
+                ),
+                "random_initialization_info": random_info,
+                "block_size": active_block_size,
+                "requested_block_size": block_size,
+                "adaptive_sweeps": fit.adaptive_sweeps_run,
+                "one_site_refinement_sweeps": fit.one_site_sweeps_run,
+                "block_size_trace": tuple(fit.block_size_trace),
+                "guess_backend": "tree_pepo" if strategy.startswith("guess_") else None,
+                "target_layout": fit.target_layout,
+                "compression_mode": compression_mode,
+                "max_bond_oversample": max_bond_oversample,
+                "cutoff_oversample": cutoff_oversample,
+                "fit_rtol": self.fit_rtol,
+                "fit_rtol_requested": self._fit_rtol_requested,
+                "split_method": fit.split_method,
+                "traversal": fit.traversal,
+                "resolved_traversal": fit.resolved_traversal,
+                "environment_strategy": fit.environment_strategy,
+                "sweep_sequence": fit.sweep_sequence,
+                "finite_check": fit.finite_check,
+            }
+        )
+        self._last_fit_diagnostics = deepcopy(diagnostics)
+        self.fit_diagnostics.append(deepcopy(diagnostics))
+        return fit.p, target, diagnostics
+
+    @_thread_limited
     def _apply_operator(
         self,
         operator,
@@ -1175,14 +1771,21 @@ class TreePepsOptimizer:
         compress=True,
         center=None,
         max_bond=_UNSET,
+        max_bond_oversample=_UNSET,
         cutoff=_UNSET,
+        cutoff_oversample=_UNSET,
         cutoff_mode=None,
+        cutoff_mode_oversample=None,
         compression_mode=None,
+        compression_layout=None,
         renormalize=False,
         track_norm=True,
+        dmrg_mode_alias=_UNSET,
     ):
         if not isinstance(operator, TreePepo):
             raise TypeError("operator must be a TreePepo")
+        if dmrg_mode_alias is _UNSET:
+            dmrg_mode_alias = self._dmrg_mode_alias
         if plan_signature(operator.plan) != plan_signature(self.plan):
             raise ValueError("operator and optimizer must use the same tree plan")
         self._validate_backend_payload(operator, path="operator")
@@ -1193,42 +1796,160 @@ class TreePepsOptimizer:
         operator.validate()
 
         max_bond = self.chi if max_bond is _UNSET else self._normalize_max_bond(max_bond)
+        max_bond_oversample = (
+            self.max_bond_oversample
+            if max_bond_oversample is _UNSET
+            else self._normalize_max_bond_oversample(max_bond_oversample)
+        )
         cutoff = self.cutoff if cutoff is _UNSET else self._normalize_cutoff(cutoff)
+        cutoff_oversample = (
+            self.cutoff_oversample
+            if cutoff_oversample is _UNSET
+            else _normalize_oversample_cutoff(cutoff_oversample)
+        )
         if cutoff_mode is None:
             cutoff_mode = self.cutoff_mode
+        if cutoff_mode_oversample is None:
+            cutoff_mode_oversample = self.cutoff_mode_oversample
+        else:
+            cutoff_mode_oversample = _normalize_oversample_cutoff_mode(
+                cutoff_mode_oversample
+            )
         if compression_mode is None:
             compression_mode = self.compression_mode
         compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_layout is None:
+            compression_layout = self.compression_layout
+        compression_layout = _normalize_compression_layout(compression_layout)
         started = perf_counter() if self.profile else None
         center_before = self.center
         canonical_region_before = self.state.canonical_region
         norm_before = self.norm() if track_norm else None
         edges = self._region_edges(span)
         before_bonds = self._bond_sizes(self.state, edges)
+        fit_diagnostics = None
+        fit_target = None
 
-        # The state is canonical around the active region before the complete
-        # PEPO is fused.  This is a fast metadata-aware move when possible.
-        self._prepare_span(span)
-        result = operator.apply_to(
-            self.state,
-            compress=False,
-            _active_sites=span,
-        )
-        result._canonical_region = frozenset(span)
-        result._set_isometry_metadata_from_region(span)
-        result.validate(check_canonical=True)
-        uncompressed_bonds = self._bond_sizes(result, edges)
-        transient_max_bond = max(uncompressed_bonds.values(), default=1)
+        use_tree_fit = bool(compress and mode == "dmrg")
+        if use_tree_fit:
+            fit_init_strategy = self._normalize_fit_init_strategy(
+                self.fit_init_strategy
+            )
+            # TreeFIT prepares each first local block itself.  Direct and
+            # random guesses therefore do not need a separate live-state QR
+            # sweep; guess-* initializers apply the PEPO through the state and
+            # need the exterior canonical proof supplied above.
+            needs_fit_preparation = fit_init_strategy.startswith("guess_") and (
+                fit_init_strategy != "guess_direct"
+            )
+            if needs_fit_preparation:
+                self._prepare_span(span)
+        else:
+            # The non-FIT compression paths still use the prepared live state
+            # as their local gauge and compression starting point.
+            self._prepare_span(span)
+        if use_tree_fit:
+            result, fit_target, fit_diagnostics = self._apply_operator_fit(
+                operator,
+                span,
+                max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
+                cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
+                compression_mode=compression_mode,
+                compression_layout=compression_layout,
+                dmrg_mode_alias=dmrg_mode_alias,
+            )
+            uncompressed_bonds = _layered_target_bond_sizes(
+                fit_target,
+                self.state,
+                edges,
+            )
+            transient_max_bond = max(uncompressed_bonds.values(), default=1)
+            use_two_layer = False
+        else:
+            use_two_layer = (
+                compress
+                and compression_layout != "fused"
+                and self.plan.is_mps_topology
+                and compression_mode in {
+                    "direct", "dm", "sdc", "sdc_oversample", "sdcr",
+                    "sdcr_oversample", "src", "src_oversample", "zipup",
+                    "zipup_oversample",
+                }
+            )
+        if compression_layout == "two_layer" and not use_two_layer and not use_tree_fit:
+            if not self.plan.is_mps_topology:
+                raise NotImplementedError(
+                    "compression_layout='two_layer' requires a path "
+                    "TreePeps topology."
+                )
+            raise ValueError(
+                "compression_layout='two_layer' requires compress=True and "
+                "a supported compression_mode."
+            )
+        if use_tree_fit:
+            # TreeFIT already produced the bounded-bond result from the exact
+            # disposable target above.
+            pass
+        elif use_two_layer:
+            # Fusing the same operator and state tensors would produce the
+            # transient dimensions used by the diagnostics.  Compute them
+            # without materializing that second network, then let Quimb
+            # compress the original two-layer path directly.
+            uncompressed_bonds = {
+                tuple(edge): self.state.node_tensor(edge[0]).ind_size(
+                    self.state.bond(*edge)
+                ) * operator.node_tensor(edge[0]).ind_size(
+                    operator.bond(*edge)
+                )
+                for edge in edges
+            }
+            result = operator.apply_to(
+                self.state,
+                compress=True,
+                center=self._region_center(span, preferred=center),
+                max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
+                cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
+                reduced=self.reduced,
+                compression_mode=compression_mode,
+                compression_seed=self.compression_seed,
+                compression_layout="two_layer",
+                info_c=self.info_c,
+                _active_sites=span,
+            )
+        else:
+            result = operator.apply_to(
+                self.state,
+                compress=False,
+                _active_sites=span,
+            )
+            result._canonical_region = frozenset(span)
+            result._set_isometry_metadata_from_region(span)
+            result.validate()
+            result.validate_isometry_metadata()
+            uncompressed_bonds = self._bond_sizes(result, edges)
+            transient_max_bond = max(uncompressed_bonds.values(), default=1)
 
-        if compress:
+        if compress and not use_two_layer and not use_tree_fit:
             center = self._region_center(span, preferred=center)
             result.compress_subtree(
                 span,
                 center=center,
                 max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
                 cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
                 cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
                 compression_mode=compression_mode,
+                compression_seed=self.compression_seed,
                 reduced=self.reduced,
                 inplace=True,
                 info_c=self.info_c,
@@ -1272,6 +1993,7 @@ class TreePepsOptimizer:
             "step": len(self.history) + 1,
             "mode": mode,
             "compression_mode": compression_mode,
+            "compression_layout": compression_layout,
             "support": tuple(support),
             "span": tuple(sorted(span)),
             "path": (self.plan.path(support[0], support[1]) if len(support) == 2 else None),
@@ -1281,10 +2003,17 @@ class TreePepsOptimizer:
             "after_bonds": after_bonds,
             "uncompressed_bonds": uncompressed_bonds,
             "max_bond": max_bond,
+            "max_bond_oversample": max_bond_oversample,
             "cutoff": cutoff,
+            "cutoff_oversample": cutoff_oversample,
+            "cutoff_mode": cutoff_mode,
+            "cutoff_mode_oversample": cutoff_mode_oversample,
             "compressed": bool(compress),
             "truncated": truncated,
-            "compression_scope": "span" if compress else "none",
+            "compression_scope": (
+                "fit" if use_tree_fit else "span" if compress else "none"
+            ),
+            "backend": "tree_fit" if use_tree_fit else "compression",
             "touched_edges": tuple(edges),
             "canonical_region_before": canonical_region_before,
             "canonical_region_after": self.state.canonical_region,
@@ -1302,6 +2031,8 @@ class TreePepsOptimizer:
             "track_truncation": bool(self.track_truncation),
             **fidelity_report,
         }
+        if fit_diagnostics is not None:
+            report["fit_diagnostics"] = fit_diagnostics
         if self.track_bond_diagnostics:
             report.update(
                 {
@@ -1349,6 +2080,7 @@ class TreePepsOptimizer:
             self.history.append(report)
         return self
 
+    @_thread_limited
     def apply_gate(
         self,
         gate,
@@ -1357,12 +2089,17 @@ class TreePepsOptimizer:
         compress=True,
         center=None,
         max_bond=_UNSET,
+        max_bond_oversample=_UNSET,
         cutoff=_UNSET,
+        cutoff_oversample=_UNSET,
         cutoff_mode=None,
+        cutoff_mode_oversample=None,
         compression_mode=None,
+        compression_layout=None,
         renormalize=False,
         track_norm=True,
         _mode=None,
+        _dmrg_mode_alias=_UNSET,
     ):
         """Apply a dense one- or multi-site gate in direct tree mode."""
 
@@ -1377,11 +2114,16 @@ class TreePepsOptimizer:
             )
             if compression_mode is None:
                 compression_mode = shorthand_compression
+        if _dmrg_mode_alias is _UNSET:
+            _dmrg_mode_alias = self._resolve_dmrg_mode_alias(
+                _mode,
+                default=self._dmrg_mode_alias,
+            )
         if route_mode == "sub_treepepo":
             raise ValueError("mode='sub_treepepo' requires a TreeSubPepo operator")
         support = self._normalize_support(where)
         self._validate_backend_payload(gate, path="gate")
-        operator = TreePepo.from_operator(
+        suboperator = TreeSubPepo.from_gate(
             self.plan,
             ar.to_numpy(gate),
             support,
@@ -1389,67 +2131,104 @@ class TreePepsOptimizer:
             dtype=self._gate_dtype(gate),
             max_operator_sites=self.max_operator_sites,
         )
-        # Dense TreePepo factorization currently uses host-side NumPy
-        # decompositions. Convert the resulting operator back to the live
-        # state's backend before the strict operator validation boundary.
-        operator = self.to_backend(operator)
-        return self._apply_operator(
-            operator,
-            support,
-            operator.operator_span,
-            mode="direct",
+        # Dense TreeSubPepo factorization uses host-side NumPy decompositions.
+        # Convert only the compact active span back to the live backend before
+        # the strict operator validation boundary.
+        suboperator = self.to_backend(suboperator)
+        return self.apply_sub_treepepo(
+            suboperator,
+            _mode=route_mode,
+            _report_mode=route_mode,
             compress=compress,
             center=center,
             max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
             cutoff=cutoff,
+            cutoff_oversample=cutoff_oversample,
             cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
             compression_mode=(
                 self.compression_mode
                 if compression_mode is None else compression_mode
             ),
+            compression_layout=(
+                self.compression_layout
+                if compression_layout is None else compression_layout
+            ),
             renormalize=renormalize,
             track_norm=track_norm,
+            _dmrg_mode_alias=_dmrg_mode_alias,
         )
 
     def apply_sub_treepepo(
         self,
         operator,
         *,
+        _mode=None,
+        _report_mode=None,
         compress=True,
         center=None,
         max_bond=_UNSET,
+        max_bond_oversample=_UNSET,
         cutoff=_UNSET,
+        cutoff_oversample=_UNSET,
         cutoff_mode=None,
+        cutoff_mode_oversample=None,
         compression_mode=None,
+        compression_layout=None,
         renormalize=False,
         track_norm=True,
+        _dmrg_mode_alias=_UNSET,
     ):
-        """Apply a complete ``TreeSubPepo`` without intermediate truncation."""
+        """Apply a compact ``TreeSubPepo`` without intermediate truncation."""
 
         if not isinstance(operator, TreeSubPepo):
             raise TypeError("apply_sub_treepepo requires a TreeSubPepo")
         if operator.plan_signature != plan_signature(self.plan):
             raise ValueError("operator and optimizer must use the same tree plan")
+        route_mode = self.mode if _mode is None else _mode
+        if _dmrg_mode_alias is _UNSET:
+            _dmrg_mode_alias = self._resolve_dmrg_mode_alias(
+                _mode,
+                default=self._dmrg_mode_alias,
+            )
+        report_mode = (
+            "dmrg" if route_mode == "dmrg"
+            else "sub_treepepo" if _report_mode is None else _report_mode
+        )
         return self._apply_operator(
-            operator.operator,
+            operator.active_operator,
             operator.support,
             operator.span,
-            mode="sub_treepepo",
+            mode=report_mode,
             compress=compress,
             center=center,
             max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
             cutoff=cutoff,
+            cutoff_oversample=cutoff_oversample,
             cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
             compression_mode=(
                 self.compression_mode
                 if compression_mode is None else compression_mode
             ),
+            compression_layout=(
+                self.compression_layout
+                if compression_layout is None else compression_layout
+            ),
             renormalize=renormalize,
             track_norm=track_norm,
+            dmrg_mode_alias=_dmrg_mode_alias,
         )
 
     apply_subtree_pepo = apply_sub_treepepo
     apply_sub_tree_pepo = apply_sub_treepepo
+    # MPS-style compatibility spellings.  These all use the same
+    # support/span-aware TreeSubPepo -> TreePepo application path.
+    apply_sub_treepepsmpo = apply_sub_treepepo
+    apply_sub_tree_peps_mpo = apply_sub_treepepo
+    apply_subtreepepsmpo = apply_sub_treepepo
 
     def apply_subtree_operator(self, operator, where=None, **kwargs):
         """Apply a complete or support-declared TreePePO operator.
@@ -1505,9 +2284,13 @@ class TreePepsOptimizer:
         compress=True,
         center=None,
         max_bond=_UNSET,
+        max_bond_oversample=_UNSET,
         cutoff=_UNSET,
+        cutoff_oversample=_UNSET,
         cutoff_mode=None,
+        cutoff_mode_oversample=None,
         compression_mode=None,
+        compression_layout=None,
         renormalize=False,
         track_norm=True,
     ):
@@ -1517,19 +2300,32 @@ class TreePepsOptimizer:
             self.mode if mode is None else mode,
             self.compression_mode if compression_mode is None else compression_mode,
         )
+        selected_dmrg_alias = self._resolve_dmrg_mode_alias(
+            mode,
+            default=self._dmrg_mode_alias,
+        )
         if isinstance(operator, TreeSubPepo):
             if where is not None:
                 raise TypeError("where cannot be supplied with a TreeSubPepo")
             return self.apply_sub_treepepo(
                 operator,
+                _mode=selected_mode,
                 compress=compress,
                 center=center,
                 max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
                 cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
                 cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
                 compression_mode=selected_compression,
+                compression_layout=(
+                    self.compression_layout
+                    if compression_layout is None else compression_layout
+                ),
                 renormalize=renormalize,
                 track_norm=track_norm,
+                _dmrg_mode_alias=selected_dmrg_alias,
             )
         if isinstance(operator, TreePepo):
             if where is None:
@@ -1540,15 +2336,23 @@ class TreePepsOptimizer:
                 operator,
                 where,
                 operator.operator_span or operator.sites,
-                mode="sub_treepepo",
+                mode=selected_mode,
                 compress=compress,
                 center=center,
                 max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
                 cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
                 cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
                 compression_mode=selected_compression,
+                compression_layout=(
+                    self.compression_layout
+                    if compression_layout is None else compression_layout
+                ),
                 renormalize=renormalize,
                 track_norm=track_norm,
+                dmrg_mode_alias=selected_dmrg_alias,
             )
         if selected_mode == "sub_treepepo":
             raise TypeError("mode='sub_treepepo' requires a TreeSubPepo operator")
@@ -1560,12 +2364,20 @@ class TreePepsOptimizer:
             compress=compress,
             center=center,
             max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
             cutoff=cutoff,
+            cutoff_oversample=cutoff_oversample,
             cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
             compression_mode=selected_compression,
+            compression_layout=(
+                self.compression_layout
+                if compression_layout is None else compression_layout
+            ),
             renormalize=renormalize,
             track_norm=track_norm,
             _mode=selected_mode,
+            _dmrg_mode_alias=selected_dmrg_alias,
         )
 
     def _apply_stream_entry(
@@ -1574,6 +2386,7 @@ class TreePepsOptimizer:
         *,
         mode=None,
         compression_mode=None,
+        compression_layout=None,
         renormalize=False,
         track_norm=True,
     ):
@@ -1584,6 +2397,7 @@ class TreePepsOptimizer:
                 entry[2],
                 _mode=mode,
                 compression_mode=compression_mode,
+                compression_layout=compression_layout,
                 renormalize=renormalize,
                 track_norm=track_norm,
             )
@@ -1592,13 +2406,22 @@ class TreePepsOptimizer:
                 entry[1],
                 mode=mode,
                 compression_mode=compression_mode,
+                compression_layout=compression_layout,
                 renormalize=renormalize,
                 track_norm=track_norm,
             )
         else:
             self.apply_sub_treepepo(
                 entry[1],
+                _mode=(
+                    None if mode is None else self._resolve_modes(
+                        mode,
+                        self.compression_mode
+                        if compression_mode is None else compression_mode,
+                    )[0]
+                ),
                 compression_mode=compression_mode,
+                compression_layout=compression_layout,
                 renormalize=renormalize,
                 track_norm=track_norm,
             )
@@ -1610,10 +2433,16 @@ class TreePepsOptimizer:
         progbar=False,
         mode=None,
         compression_mode=None,
+        compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=None,
+        cutoff_mode_oversample=None,
+        compression_layout=None,
         non_unitary=False,
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
+        finite_check=None,
         track_infidelity=None,
     ):
         """Replay the queued stream, optionally replacing it first.
@@ -1625,6 +2454,10 @@ class TreePepsOptimizer:
         ``normalize_every`` may be ``True`` (after every event) or a positive
         integer interval. ``non_unitary`` disables norm-ledger collection;
         explicit ``normalize_final`` still normalizes the represented state.
+        ``mode`` and ``compression_mode`` overrides are normalized, stored on
+        the optimizer, and used consistently for every queued event;
+        ``dm``/``sdc``/``sdcr``/``src``/``zipup`` and their oversampled
+        spellings are direct-routing compression shorthands.
         ``progbar=True`` shows the active event count, latest local fidelity,
         cumulative retained fidelity, and live maximum bond. The progress bar
         intentionally does not display the live state norm.
@@ -1632,6 +2465,67 @@ class TreePepsOptimizer:
 
         if gates is not None:
             self.set_gates(gates)
+        raw_mode = self.mode if mode is None else str(mode)
+        raw_mode = raw_mode.strip().lower().replace("-", "_")
+        raw_mode = {
+            "zipup_first": "zipup_oversample",
+        }.get(raw_mode, raw_mode)
+        raw_mode = self._MODE_ALIASES.get(raw_mode, raw_mode)
+        # Bare compression names own their compression choice, just as they
+        # do at construction time. In particular, ``run(mode="sdc")`` must
+        # replace a previously selected ``src``/``dm`` mode unless the caller
+        # explicitly supplies a conflicting compression_mode (which is
+        # rejected by _resolve_modes).
+        if mode is not None and raw_mode in _COMPRESSION_SHORTHANDS:
+            mode_compression = (
+                "direct" if compression_mode is None else compression_mode
+            )
+        else:
+            mode_compression = (
+                self.compression_mode
+                if compression_mode is None else compression_mode
+            )
+        selected_mode, selected_compression = self._resolve_modes(
+            raw_mode,
+            mode_compression,
+        )
+        if mode is not None:
+            self._dmrg_mode_alias = (
+                raw_mode if raw_mode in self._DMRG_MODE_ALIASES else None
+            )
+        self.mode = selected_mode
+        self.compression_mode = selected_compression
+        # Pass canonical, resolved values into each event below. This is
+        # important for explicit TreeSubPepo entries: passing the shorthand
+        # alone would normalize the route to ``direct`` and otherwise leave
+        # the old self.compression_mode in effect.
+        mode = selected_mode
+        compression_mode = selected_compression
+        if compression_seed is not None:
+            if isinstance(compression_seed, bool) or not isinstance(
+                compression_seed, Integral
+            ):
+                raise TypeError("compression_seed must be an integer or None")
+            compression_seed = int(compression_seed)
+            if compression_seed < 0:
+                raise ValueError("compression_seed must be non-negative")
+            self.compression_seed = compression_seed
+        if max_bond_oversample is not None:
+            self.max_bond_oversample = self._normalize_max_bond_oversample(
+                max_bond_oversample
+            )
+        if cutoff_oversample is not None:
+            self.cutoff_oversample = _normalize_oversample_cutoff(
+                cutoff_oversample
+            )
+        if cutoff_mode_oversample is not None:
+            self.cutoff_mode_oversample = _normalize_oversample_cutoff_mode(
+                cutoff_mode_oversample
+            )
+        if compression_layout is not None:
+            self.compression_layout = _normalize_compression_layout(
+                compression_layout
+            )
         if self.max_intermediate_bond is not None:
             self.preflight(max_intermediate_bond=self.max_intermediate_bond)
         if isinstance(normalize_every, bool):
@@ -1644,17 +2538,28 @@ class TreePepsOptimizer:
             track_norm = self.track_infidelity and not non_unitary
         else:
             track_norm = bool(track_infidelity) and not non_unitary
+        previous_finite_check = self._finite_check_enabled
+        if finite_check is not None:
+            self._finite_check_enabled = bool(finite_check)
         pbar = None
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
+            progress_mode = self._progress_mode_name(
+                mode=mode,
+                compression_mode=compression_mode,
+            )
             pbar = tqdm(
                 total=len(self._gate_stream),
-                desc=self.mode,
+                desc=progress_mode,
                 leave=True,
                 position=0,
                 ascii=True,
-                colour="GREEN",
+                colour=(
+                    self._PROGBAR_COLORS["dmrg"]
+                    if progress_mode.startswith("dmrg")
+                    else self._PROGBAR_COLORS["mpo"]
+                ),
             )
 
         two_qubit_count = 0
@@ -1667,6 +2572,7 @@ class TreePepsOptimizer:
                     entry,
                     mode=mode,
                     compression_mode=compression_mode,
+                    compression_layout=compression_layout,
                     renormalize=renormalize,
                     track_norm=track_norm,
                 )
@@ -1681,11 +2587,12 @@ class TreePepsOptimizer:
                         support = tuple(
                             operator.operator_support or operator.sites
                         )
-                    if len(support) == 2:
-                        two_qubit_count += 1
-                    elif len(support) > 2:
-                        multi_site_count += 1
-                    if kind != "gate":
+                    if kind == "gate":
+                        if len(support) == 2:
+                            two_qubit_count += 1
+                        elif len(support) > 2:
+                            multi_site_count += 1
+                    else:
                         pepo_count += 1
 
                     postfix = {
@@ -1693,15 +2600,8 @@ class TreePepsOptimizer:
                         "bnd": self.max_bond(),
                     }
                     if track_norm:
-                        postfix.update(
-                            {
-                                "F": self._format_progress_scalar(
-                                    self._last_local_fidelity
-                                ),
-                                "~F": self._format_progress_scalar(
-                                    self._cumulative_fidelity()
-                                ),
-                            }
+                        postfix["~F"] = self._format_progress_scalar(
+                            self._cumulative_fidelity()
                         )
                     if multi_site_count:
                         postfix["kq"] = multi_site_count
@@ -1710,6 +2610,7 @@ class TreePepsOptimizer:
                     pbar.set_postfix(postfix)
                     pbar.update(1)
         finally:
+            self._finite_check_enabled = previous_finite_check
             if pbar is not None:
                 pbar.close()
         if normalize_final:
@@ -1748,9 +2649,14 @@ class TreePepsOptimizer:
         form=None,
         center=None,
         max_bond=_UNSET,
+        max_bond_oversample=_UNSET,
         cutoff=_UNSET,
+        cutoff_oversample=_UNSET,
         cutoff_mode=None,
+        cutoff_mode_oversample=None,
         compression_mode=None,
+        compression_seed=None,
+        order="rank",
     ):
         """Compress the whole tree or only a selected gate-like span.
 
@@ -1758,11 +2664,28 @@ class TreePepsOptimizer:
         used after a gate update. It canonicalizes only the minimal requested
         span when ``span=True`` and leaves exterior virtual bonds untouched.
         With no sites, the complete tree is compressed toward ``center``.
+        ``order="rank"`` uses live tree dimensions to choose the next branch;
+        ``order="depth"`` retains the deterministic farthest-first schedule.
         """
 
         max_bond = self.chi if max_bond is _UNSET else self._normalize_max_bond(max_bond)
+        max_bond_oversample = (
+            self.max_bond_oversample
+            if max_bond_oversample is _UNSET
+            else self._normalize_max_bond_oversample(max_bond_oversample)
+        )
         cutoff = self.cutoff if cutoff is _UNSET else self._normalize_cutoff(cutoff)
+        cutoff_oversample = (
+            self.cutoff_oversample
+            if cutoff_oversample is _UNSET
+            else _normalize_oversample_cutoff(cutoff_oversample)
+        )
         cutoff_mode = self.cutoff_mode if cutoff_mode is None else cutoff_mode
+        cutoff_mode_oversample = (
+            self.cutoff_mode_oversample
+            if cutoff_mode_oversample is None
+            else _normalize_oversample_cutoff_mode(cutoff_mode_oversample)
+        )
         compression_mode = (
             self.compression_mode
             if compression_mode is None
@@ -1775,10 +2698,18 @@ class TreePepsOptimizer:
                 form=form,
                 center=center,
                 max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
                 cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
                 cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
                 reduced=self.reduced,
                 compression_mode=compression_mode,
+                compression_seed=(
+                    self.compression_seed
+                    if compression_seed is None else compression_seed
+                ),
+                order=order,
                 info_c=self.info_c,
             )
         else:
@@ -1789,10 +2720,18 @@ class TreePepsOptimizer:
                 span=span,
                 center=center,
                 max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
                 cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
                 cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
                 reduced=self.reduced,
                 compression_mode=compression_mode,
+                compression_seed=(
+                    self.compression_seed
+                    if compression_seed is None else compression_seed
+                ),
+                order=order,
                 inplace=True,
                 info_c=self.info_c,
             )
@@ -1840,25 +2779,25 @@ class TreePepsOptimizer:
             kind = entry[0]
             if kind == "gate":
                 support = tuple(entry[2])
-                operator = TreePepo.from_operator(
+                operator = TreeSubPepo.from_gate(
                     self.plan,
                     entry[1],
                     support,
                     dims=self._physical_dims(),
                     dtype=self._gate_dtype(entry[1]),
                     max_operator_sites=self.max_operator_sites,
-                )
+                ).operator
             elif kind == "sub_treepepo":
                 operator = entry[1].operator
                 support = tuple(entry[1].support)
             else:
                 operator = entry[1]
-                support = tuple(operator.operator_support or ())
+                support = tuple(operator.operator_support or operator.sites)
             operator.validate()
             operator_bonds = operator.bond_sizes()
             for edge in tuple(edge_bonds):
                 edge_bonds[edge] *= int(operator_bonds.get(edge, 1))
-            span = operator.operator_span or frozenset()
+            span = operator.operator_span or frozenset(operator.active_nodes)
             events.append(
                 {
                     "index": index,
@@ -1881,6 +2820,32 @@ class TreePepsOptimizer:
             ),
             "events": events,
         }
+
+    def _thread_ctx(self):
+        """Cap BLAS/OpenMP threads for the many small tree contractions."""
+
+        @contextlib.contextmanager
+        def managed():
+            depth = getattr(self, "_thread_ctx_depth", 0)
+            if depth:
+                self._thread_ctx_depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._thread_ctx_depth -= 1
+                return
+
+            self._thread_ctx_depth = 1
+            try:
+                if _THREAD_CONTROLLER is not None and self.threads is not None:
+                    with _THREAD_CONTROLLER.limit(limits=self.threads):
+                        yield
+                else:
+                    yield
+            finally:
+                self._thread_ctx_depth = 0
+
+        return managed()
 
     @staticmethod
     def _positive_limit(value, name):
@@ -2260,6 +3225,13 @@ class TreePepsOptimizer:
 
         return deepcopy(self.normalizations)
 
+    def get_fit_diagnostics(self):
+        """Return the latest TreeFIT diagnostic record, if available."""
+
+        return None if self._last_fit_diagnostics is None else deepcopy(
+            self._last_fit_diagnostics
+        )
+
     def norm_diagnostics(self):
         """Return local/cumulative compression fidelity diagnostics.
 
@@ -2457,6 +3429,27 @@ class TreePepsOptimizer:
             tn=None,
             mode=self.mode,
             compression_mode=self.compression_mode,
+            compression_seed=self.compression_seed,
+            max_bond_oversample=self.max_bond_oversample,
+            cutoff_oversample=self.cutoff_oversample,
+            cutoff_mode_oversample=self.cutoff_mode_oversample,
+            compression_layout=self.compression_layout,
+            fit_block_size=self.fit_block_size,
+            fit_n_iter=self.fit_n_iter,
+            fit_adaptive_sweeps=self.fit_adaptive_sweeps,
+            fit_min_iter=self.fit_min_iter,
+            fit_rtol=self._fit_rtol_requested,
+            fit_patience=self.fit_patience,
+            fit_two_site_transition_sweeps=self.fit_two_site_transition_sweeps,
+            fit_traversal=self.fit_traversal,
+            fit_environment_strategy=self.fit_environment_strategy,
+            fit_single_node_fast_path=self.fit_single_node_fast_path,
+            fit_finite_check=self.fit_finite_check,
+            fit_init_strategy=self.fit_init_strategy,
+            fit_init_rand_strength=self.fit_init_rand_strength,
+            fit_init_seed=self.fit_init_seed,
+            fit_sweep_sequence=self.fit_sweep_sequence,
+            fit_overlap_diagnostics=self.fit_overlap_diagnostics,
             chi=self.chi,
             cutoff=self.cutoff,
             cutoff_mode=self.cutoff_mode,
@@ -2471,6 +3464,7 @@ class TreePepsOptimizer:
             record_history=self.record_history,
             track_truncation=self.track_truncation,
             track_infidelity=self.track_infidelity,
+            threads=self.threads,
             profile=self.profile,
             profile_sync=self.profile_sync,
             track_bond_diagnostics=self.track_bond_diagnostics,
@@ -2484,6 +3478,10 @@ class TreePepsOptimizer:
         copied.normalizations = deepcopy(self.normalizations)
         copied.profile_events = deepcopy(self.profile_events)
         copied._gate_stream = tuple(self._gate_stream)
+        copied._dmrg_mode_alias = self._dmrg_mode_alias
+        copied._finite_check_enabled = self._finite_check_enabled
+        copied.fit_diagnostics = deepcopy(self.fit_diagnostics)
+        copied._last_fit_diagnostics = deepcopy(self._last_fit_diagnostics)
         if self.info_c is not None:
             copied.info_c = deepcopy(self.info_c)
             copied._sync_info()
@@ -2493,6 +3491,7 @@ class TreePepsOptimizer:
         return (
             f"TreePepsOptimizer(mode={self.mode!r}, "
             f"compression_mode={self.compression_mode!r}, "
+            f"compression_layout={self.compression_layout!r}, "
             f"shape={self.plan.shape!r}, "
             f"center={self.center!r}, chi={self.chi!r})"
         )

@@ -1,5 +1,18 @@
 # `pepsy.optimizers.tree`
 
+The operator classes have distinct representation contracts:
+
+| Class | Stored region | Labels and physical indices |
+| --- | --- | --- |
+| `TreeMPO` | The whole lattice: every node of the TreePlan, including explicit identity tensors where appropriate. | Full-lattice node tags, site labels, and physical input/output indices. |
+| `SubTreeMPO` | Only a connected active region, normally the gate support's Steiner subtree. No exterior operator tensors. | The same original node IDs, site labels, and configured tag/index formats; never locally renumbered. |
+
+`SubTreeMPO.plan` still refers to the original full-lattice plan.
+`active_nodes` gives the stored region; `sites` gives physical sites present
+there, including any physical routing site. `operator_support` gives the
+gate support. Connecting internal nodes are included without inventing
+physical site legs. Identity action outside the region is implicit.
+
 `TreeOptimizer` simulates a quantum circuit by replaying a canonical bundled
 gate stream `[(gate, where), ...]` on a **rooted tree tensor network**, after
 *Simulating quantum circuits using tree tensor networks* (Seitz, Medina, Cruz,
@@ -45,6 +58,34 @@ only that physical leg, and direct gates, dense subtree operators, and
 structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
+
+## Tree-edge entanglement entropy
+
+A tree has one physical bipartition for every parent-child bond, not one
+left/right middle cut. `TreeTensorNetwork.tree_edge_entropies()` measures the
+base-2 von Neumann entropy across every such bond:
+
+```python
+entropies, edges = opt.tn.tree_edge_entropies(return_edges=True)
+# edges[i] == (parent_node, child_node)
+single_edge_entropy = opt.entropy(edges[0])
+```
+
+The implementation follows Quimb's canonical Schmidt-spectrum approach. It
+canonicalizes one private copy around the root, then walks the centre through
+the tree and performs one SVD per edge on the centre tensor. Off-centre
+isometries alone do not contain the Schmidt weights. The live state and its
+canonical centre are unchanged. Dense
+Torch/CuPy states stay on their original backend through Autoray linalg, and
+native Symmray states use the sector-aware SVD. Only the one-dimensional
+singular spectra are reduced to scalar entropy values, so the full statevector
+is never formed. `method="eig"` (or `"svd:eig"`) selects the Gram-matrix
+variant when that is preferable for the local dimensions.
+
+`TreeOptimizer.entropy(...)`, `TreeOptimizer.tree_edge_entropies(...)`, and
+`TreeOptimizer.entanglement_entropy(...)` are thin state-preserving delegates.
+These values describe tree-edge bipartitions and should not be interpreted as
+an MPS chain-cut profile; each edge is identified by its returned node pair.
 
 ## Layout-aware native MPOs
 
@@ -131,6 +172,33 @@ the bra, and Quimb contracts the complete doubled network. No state-bond
 compression or `to_dense()` lowering occurs. Native Symmray MPOs retain their
 graded contraction and fermionic sign rules.
 
+The optimizer-level `opt.expectation_mpo(...)` retains the configured update
+algorithm for TreeMPO input: direct/DM, SRC/SDC/SDCR, zipup, or FIT. It preserves
+the parent state and sampling RNG, including when a private copy fails.
+Private readout starts with fresh histories and does not copy the queued gate
+stream. Public `copy()` retains independent histories and the queued stream.
+Measurement warnings and returned edge records remain available with
+`record_history=False`; enabling them does not enable expensive singular
+spectrum probes. Multi-node FIT also warns because finite variational sweeps
+can be approximate without producing edge-cut records. Its report includes
+`fit_diagnostics` and `approximation_possible`; `truncated=False` alone does
+not certify exact FIT. Single-node exact FIT is exempt from this warning.
+Use `warn_on_truncation=False` to opt out of approximation warnings.
+Explicit chain-MPO input retains the lower-level chain routing and final
+subtree compression even when the optimizer is configured for DMRG.
+
+Every TreeMPO application mode preserves `operator.exponent`, adding it to the
+state's represented exponent without forming `10**exponent`. Copies,
+conjugation, exact expectation, dense readout, scalar multiplication, addition,
+and composition also preserve this scale. Stored sector networks retain their
+relative exponents; the public operator exponent supplies their common offset.
+
+`TreeOptimizer.to_dense()` / `TreeTensorNetwork.to_statevector()` return numeric
+host vectors for native Symmray trees too. Readout contracts separate physical
+legs and restores the declared `physical_sectors` mapping before densifying,
+so empty charge sectors do not disappear from the output basis after gauge
+moves. Within each local dimension, charges use Symmray's sorted sector order.
+
 `TreePlan.mpo_order()` remains available as the structural leaf-position order
 chosen by the plan; a physical `root_qubit`, when present, is placed first.
 It is useful when a caller deliberately chooses a one-dimensional model-level
@@ -158,6 +226,12 @@ returns a bond-one TTNO that can be applied directly to a native
 `OneDMap` is the shared source of truth for regular 2D/3D coordinate layouts;
 the tree and MPS geometric layout finders consume its row/column, snake,
 alternate-x/y/z, folded-snake, and generalized Hilbert traversals directly.
+For a tree-native layout, the short canonical spelling is
+`map_mode="coarse-alternate-x"` (or another `coarse-*` preset). It describes
+the lattice coarsening/traversal used to label the leaves and is available as
+`map_mode` on the resulting `TreePlan`, `TreeTensorNetwork`, and `TreeMPO`.
+Pass the same plan through state, operator, and optimizer construction so all
+three components share one binary-tree geometry.
 
 `TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, in the same way that
 `TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
@@ -174,6 +248,21 @@ separately with the model-level `to_mpo(...)`; it is not stored on `TreeMPO`.
 checks every stored TTNO network against the
 TreePlan; `validate(check_canonical=True)` also checks the tracked operator
 `left_inds` directions when a canonical region is known.
+
+Dense `TreeMPO` builder outputs run the same exact structural boundary sweep
+over the rooted tree before the native tree SVD. It reduces proportional and
+roundoff-safe linearly dependent edge channels in a leaf-to-root and reverse
+pass, so direct-sum term assembly does not carry redundant states into every
+parent tensor. Native Symmray/fermionic networks are left on their existing
+charge-preserving QR/SVD route.
+
+`ham_tn.to_tree_mpo(...)` defaults to `compress="term"`, so it adds and
+compresses one term at a time. Pass `compress=True` or `compress="auto"` for
+the workload-aware route, or `compress="automaton"` to force full native
+assembly. Pass `progbar=True` for the same MPS-style construction bar. Term
+mode advances once per added term and reports the current `chi` against the
+requested cap; the progress-bar default is `False`.
+
 `add_TreeMPO(..., compress=True)` first builds the tree direct sum and then runs
 the same native tree SVD sweep; its compression options are `max_bond`,
 `cutoff`, and `order`. The default `order="rank"` is a deterministic greedy
@@ -190,6 +279,50 @@ For native Symmray operators, addition uses a charge-aware TreePlan direct
 sum; it does not use Quimb's dense-axis padding. A chain MPO, when needed, is
 constructed separately with the model-level `to_mpo(...)`.
 `add_MPO(...)` remains a compatibility alias for `add_TreeMPO(...)`.
+
+`TreeMPO.ascii_tree()` returns a compact Quimb-inspired native drawing, and
+`TreeMPO.show()` prints only this clean native tree by default, with one bond
+dimension per branch. When a
+`TreeLayoutFinder` with `lattice_shape=` is attached, the operator also keeps
+the physical coordinate map and term supports for display:
+
+```python
+print(tree_operator.ascii_tree())
+tree_operator.show(bond_dims=True)
+tree_operator.show(layout="both")  # physical lattice above native tree
+```
+
+Hamiltonian builders attach this layout metadata automatically when their
+lattice shape is known. For a manually constructed operator, pass the finder
+explicitly:
+
+```python
+finder = TreeLayoutFinder(
+    supports=terms,
+    n=16,
+    lattice_shape=(4, 4),
+)
+tree_operator = TreeMPO.from_terms(
+    plan,
+    terms,
+    layout_finder=finder,
+)
+tree_operator.show(layout="lattice")
+```
+
+`layout="tree"` (the default) keeps the output to the native ASCII tree.
+`layout="auto"` remains an explicit convenience option that shows both
+sections when this metadata is available. `ascii_lattice()` shows
+the physical site array and a compact support list; `plot_layout()` or
+`show(layout="plot")` gives the Matplotlib tent view with the physical lattice,
+tree hierarchy, and term connectivity.
+
+Dense `TreeMPO` objects also provide exact `+`, `-`, scalar multiplication,
+and operator composition with `@` while retaining the native TreePlan
+network. Composition does not lower either operand to a chain MPO; use
+`compress(...)` explicitly to truncate the resulting tree bonds. Composition
+of native graded fermionic operators is intentionally guarded until a graded
+fused-bond kernel is available.
 
 `canonicalize(center=..., info_c=...)` performs lossless tree QR
 canonicalization. The tree-native source of truth is `canonical_region` plus
@@ -208,19 +341,54 @@ lowered to a chain. The same Tree-native factorization is used by the dense
 term path and by the native Hamiltonian builders (with graded Symmray tensors
 on the fermionic path).
 
-For a local gate, use `TreeMPO.from_gate(plan, gate, where)` instead of
-materializing a full-system matrix. `where` always contains logical qubit
-labels, independent of whether the plan was created from row-major, snake,
-folded-snake, or Hilbert order. The constructor factors only the gate over
-the minimal TreePlan Steiner subtree and adds bond-one identity legs elsewhere,
-so the result can be sent directly to `TreeOptimizer.apply_subtreempo` or a
-`subtreempo_event`. Dense gate factorization removes only machine-precision
-null operator-Schmidt sectors; configured TreeMPO compression remains explicit.
-`TreeMPO.from_pauli_sum(plan, weighted_terms)` provides the analogous compact
-TTNO for a weighted sum of product-Pauli branches. It uses one virtual branch
-channel per retained term only on the union of the active Steiner subtrees,
-with bond-one identity legs outside; it never constructs a full-system dense
-matrix or a chain MPO.
+When the term mapping includes a higher-order term, dense factorization and
+direct-sum assembly preserve the input array backend and device. All terms
+must share that backend and device; mixed inputs raise `ValueError`. An
+explicit `dtype=` casts on that backend. Without it, assembly retains the
+first term's dtype, as before. The separate compact one-/two-site Hamiltonian
+automaton remains a host construction path. Upstream SVD rank selection can
+still read scalar decisions during factorization.
+
+Ordinary device norm bookkeeping uses cached Autoray namespaces when
+available, with a dispatch fallback for older Autoray. This reduces Python
+dispatch overhead without changing the existing diagnostic readout boundaries.
+
+For a local gate, use `SubTreeMPO.from_gate(plan, gate, where)`. This compact
+operator stores tensors **only on the connected Steiner subtree**. It retains
+the original logical site labels, node IDs, and configurable tags. Connecting
+internal nodes are included; a physical routing node not acted on by the gate
+has a local identity pair. There are **no exterior operator tensors or dangling
+exterior operator bonds**. Exterior identity action is implicit.
+
+```python
+from pepsy import SubTreeMPO
+
+subop = SubTreeMPO.from_gate(plan, gate, where)
+assert subop.num_tensors == len(subop.active_nodes)
+optimizer.apply_sub_mpotree(subop)
+# Equivalent stream entry:
+event = optimizer.sub_mpotree_event(subop)
+```
+
+`subop.sites` lists physical sites present in the subtree, including any
+physical routing node; `operator_support` names the actual gate support.
+`to_dense()` returns an operator on `subop.sites`, not on every state site.
+Copies, backend conversion, canonicalization, and compression preserve the
+compact region. Ordinary gate replay builds this representation directly;
+it must not construct a full identity-padded operator and strip it afterward.
+Dense factorization removes only machine-precision null operator-Schmidt
+sectors; configured operator compression remains explicit.
+
+`TreeMPO.from_gate` remains the full-tree constructor for callers that need
+a complete operator for general operator algebra. It includes exterior
+bond-one identities and is not the ordinary local gate replay builder.
+`TreeMPO.from_pauli_sum(plan, weighted_terms)` provides a full-tree TTNO for a
+weighted sum of product-Pauli branches. It uses one virtual branch channel per
+retained term only on the union of the active Steiner subtrees, with bond-one
+identity legs outside; it never constructs a full-system dense matrix or a
+chain MPO. `SubTreeMPO.from_pauli_sum(plan, weighted_terms)` provides the
+compact form: it omits those exterior identity tensors and makes identity
+outside the union of the active Steiner subtrees implicit.
 
 The conventional binary TTN with a three-leg top tensor is the default when
 there are at least three leaves and no `root_qubit`. Pass
@@ -237,20 +405,20 @@ node.
 
 Gates are absorbed into the tree according to the selected optimizer mode:
 
-- **`direct` / `dm`** use the bounded dense local route for ordinary gate
-  entries. One- and two-qubit gates use the specialised gate factorization and
-  exact QR threading; three- and four-qubit gates use the recursive dense tree
-  factorization. A direct gate entry wider than four qubits raises an actionable
-  error recommending a `tree_mpo_*` mode. `dm` selects the same route with
-  density-matrix (`svd:eig`) state compression.
-- **`tree_mpo_direct` / `tree_mpo_dm`** build a true `TreeMPO` with
-  `TreeMPO.from_gate`, factorized on the minimal TreePlan Steiner subtree, and
-  apply it with `apply_subtreempo`. The suffix selects direct SVD or
-  density-matrix compression. This route never constructs a chain `sub_mpo`.
-- **`auto`** uses the dense route through four qubits and promotes wider
-  ordinary gates to `tree_mpo_direct`. The direct `apply_subtree_operator`
-  primitive remains available for callers that explicitly want dense tree
-  factorization without a `TreeMPO` object.
+- **ordinary `apply_gate` entries** in `auto`, `direct`, `dm`, `sdc`,
+  `sdc-oversample`, `sdcr`, `sdcr-oversample`, `src`, `src-oversample`, and
+  `mpo` are lowered to `SubTreeMPO` with
+  `SubTreeMPO.from_gate`,
+  factorized on the minimal TreePlan Steiner subtree, and applied with
+  `apply_sub_mpotree`. The compression mode controls the tree-edge state
+  compression, and gate width no longer causes a dense-route cliff.
+- **`tree_mpo_direct` / `tree_mpo_dm`** are explicit names for the same
+  TreeMPO path, with direct SVD or density-matrix compression selected by the
+  suffix. This route never constructs a chain `sub_mpo`.
+- **`submpo`** remains the explicit chain-MPO stream mode. The low-level
+  `apply_1q`/`apply_2q` compatibility methods retain their specialized direct
+  or chain-MPO kernels when called explicitly; this does not change the
+  ordinary `apply_gate` contract.
 - **stream events** -- MPS-compatible `measure`, `cap`, `reset`, and
   `measure_reset` entries can be mixed into the stream. Measurements use Pauli
   eigenvalue outcomes (`+1`/`-1`) and are appended to `measurements`;
@@ -307,11 +475,14 @@ isometry check are also desired.
 Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 `compress_between`, and `canonize_around_` invalidate the tracked canonical
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
-it also invalidates the native fermionic norm cache. The optimizer's
+it clears every tensor's `left_inds` proof as well as the native fermionic
+norm cache, without modifying tensor data. Clearing only the region is not
+sufficient after an in-place array edit: a stale local proof can otherwise
+skip a necessary QR. The optimizer's
 state-aware wrappers do both automatically and restore the centre only for
 operations that prove canonicality is preserved. `TreeOptimizer` also exposes
 `sync_canonicalization(center=None)` to explicitly rebuild a single tracked
-centre before replay continues.
+centre before replay continues; this explicit recovery clears local proofs too.
 
 Native fermionic trees use a separate graded edge path. Centre moves explicitly
 QR-split the Symmray tensor and absorb the native carry into the next node;
@@ -436,6 +607,12 @@ use `profile_report()["update_seconds"]` as the envelope total. The
 CuPy or CUDA work, `profile_sync=True` synchronizes the active device at each
 phase boundary so phase durations represent device execution; this is a
 diagnostic mode and adds synchronization overhead.
+With the default `profile=False`, replay does not read update profiling
+clocks; `update_history` stores `elapsed_seconds=None`.
+Path planning is included in `metadata_path`. For layered direct routing,
+`subtree_hub_merge` with `deferred=True` measures queuing the arriving messages;
+their actual contraction is recorded later as `tensor_absorption` with
+`route="subtreempo_layered"` when that node is ready.
 For native Symmray compression, `profile_report()` also returns
 `native_compression_routes`: counts of `one_sided_left`, `one_sided_right`, and
 `two_sided_reduced` show that the graded reduced-core paths are active, while
@@ -488,10 +665,13 @@ generalisation of the two-qubit gate: a `k`-qubit gate, a multi-site
 **non-unitary / Kraus** operator, or a whole **Trotter block**. It is the tree
 analogue of a sub-MPO applied over the covering range and then compressed (cf.
 Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
-only). The dense operator is first factorized into an exact tree-MPO on the
+only). Every mode first factorizes the operator into a compact `SubTreeMPO` on the
 **minimal connected subtree** (Steiner subtree) spanning the target physical
-nodes.
-Application then proceeds recursively from subtree leaves to a hub: each local
+nodes, then uses `apply_sub_mpotree`, just like ordinary `apply_gate`.
+SRC/SDC/SDCR compute complementary environments from the original
+operator/state layers. Zipup streams truncation and DMRG fits that same exact
+layered target.
+Direct/DM application proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
 for the whole Steiner subtree is formed. Each routed Q tensor, including native
@@ -500,18 +680,26 @@ available, so canonical recovery recognizes that it already points toward the
 hub instead of repeating the same QR. The native predicate additionally
 validates charge-map alignment before skipping. Once all MPO factors have
 arrived, every
-touched edge is compressed once. A bond that remains within its configured
-`max_bond` uses a lossless QR, avoiding repeated cutoff loss of tiny state
-components across successive sub-MPO events; when the MPO expands an edge
-past its cap, the configured Quimb `cutoff` and `cutoff_mode` are applied to
-the truncating SVD. Thus every actual truncation sees the complete operator in
-an isometric environment.
+touched edge is compressed once with the configured cap and cutoff. A
+zero-cutoff bond within its cap uses lossless QR; positive cutoffs are honored
+even below the cap, matching ordinary replay. Each direct/DM truncation sees
+the complete operator in an isometric environment.
+
+A compact one-site unitary is absorbed directly in every mode, preserving
+the incoming canonical center or region and local isometry metadata. The
+current small physical matrix is checked at arithmetic precision, including
+even native operators; nonunitary and odd native operators retain the general
+route. This exact absorption skips FIT and clears its latest diagnostic record.
+Native `compression_mode="dm"` raises before update accounting or state
+changes; use `"direct"` for native graded compression.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
 accepted). It need **not** be unitary; pass `renormalize=True` to renormalise
 afterwards (e.g. after a Kraus/projection operator). `max_bond` / `cutoff`
-default to the optimizer's `chi` / `cutoff`. The native TreeMPO route scales
+default to the optimizer's `chi` / `cutoff`; explicit values apply only to
+this call, including both the initial guess and refinement in DMRG modes.
+They do not change the optimizer's defaults. The native TreeMPO route scales
 with the operator's spread and factor ranks, using recursive edge messages
 rather than one dense state tensor for the whole spanning subtree.
 
@@ -530,25 +718,30 @@ which must produce an operator on the declared support.
 `TreeOptimizer.submpo_event(...)` builds the tuple form.
 
 For a complete operator already represented as a `TreeMPO`, use
-`apply_subtreempo(tree_operator, where=None, ...)` or the aliases
-`apply_sub_tree_mpo` / `apply_subttno`. This contracts the operator's internal
-TTNO bonds directly on the TreePlan, routes the resulting messages by the
-TreePlan geometry, and performs one final configured Tree compression sweep.
+`apply_sub_mpotree(tree_operator, where=None, ...)` or the aliases
+`apply_subtreempo` / `apply_sub_tree_mpo` / `apply_subttno`. All refer to the
+same implementation. Ordinary gates use `gate -> SubTreeMPO -> apply_sub_mpotree`
+in direct, DM, SRC, SDC, zipup, and DMRG modes. Operator bonds follow the
+TreePlan geometry; each mode retains its own compression algorithm.
 It never extracts a contiguous chain MPO. The operator must use the same plan,
 contain one primary network, and either declare all physical sites or declare
 exactly its `operator_support` metadata when that known non-identity support is
-available. Bond-one identity factors outside a term's active support are still
+available. Compact operators also accept their `sites` as the declaration.
+They store only their `active_nodes`; exterior identity is implicit. For a
+full `TreeMPO`, bond-one identity factors outside a term's active support are still
 part of the complete TTNO; the shorter declaration only selects the minimal
 Steiner route. Any omitted boundary operator bond must be bond one, otherwise
 the application raises instead of silently discarding operator information.
-The stream constructor `TreeOptimizer.subtreempo_event(tree_operator)` and
-the matching `TreeStabOptimizer.subtreempo_event(...)` provide the same
-native route; `subttno_event` is an accepted spelling alias. Set
+The stream constructor `TreeOptimizer.sub_mpotree_event(tree_operator)` and
+the matching `StabilizerTreeSimulator.subtreempo_event(...)` provide the same
+native route; `subtreempo_event` and `subttno_event` remain spelling aliases.
+The new helper preserves the established `"subtreempo"` wire marker for shared
+stream consumers; TreeOptimizer also accepts raw `"sub_mpotree"` markers. Set
 `track_norm=False` for a general non-unitary TreeMPO so its physical norm
 change is not recorded as compression loss.
 
-The internal Pauli rotation and Pauli-sum constructors have a separate compact
-support form for Tree evolution. A sparse operator on qubits such as
+The internal Pauli rotation, Pauli-sum, and product-Pauli projector constructors
+use a true compact `SubTreeMPO` for Tree evolution. A sparse operator on qubits such as
 `(q0, q7)` is represented by MPO tensors only at `q0` and `q7`; identity-only
 sites between them are not inserted into a fictitious chain window. The native
 Tree MPO router therefore receives the true active support and computes the
@@ -557,46 +750,578 @@ constructors retain their contiguous-window default for the one-dimensional
 MPS backend, whose compression domain is a chain interval.
 
 The two explicit two-site families preserve native Symmray gates and their
-block-sparse fermionic grading. `direct` splits the rank-four gate locally;
-`tree_mpo_direct` builds the corresponding TreeMPO and contracts its internal
-operator bonds on the TreePlan. Both defer state truncation until the complete
-gate has reached the affected path/span. The legacy `mode="mpo"` remains
-available when Quimb's chain-MPO factorization is specifically desired, and
-`mode="submpo"` remains the explicit chain-MPO stream mode.
+block-sparse fermionic grading. Ordinary `apply_gate` entries in
+`auto`/`direct`/`dm`/`sdc`/`sdc-oversample`/`sdcr`/`sdcr-oversample`/`src`/
+`src-oversample`/`mpo` are lowered to a true compact `SubTreeMPO` (a
+`TreeMPO` subclass) and contracted through `apply_sub_mpotree` on the active
+canonical Steiner region.
+`tree_mpo_direct` and `tree_mpo_dm` are explicit names for that same route,
+selecting direct SVD or density-matrix compression. The `submpo` mode remains
+the explicit chain-MPO stream mode. The low-level `apply_1q`/`apply_2q`
+compatibility methods retain their specialized kernels outside FIT, explicit
+TreeMPO, and oversampled zipup modes.
+DMRG ordinary gates and `apply_subtree_operator` / `apply_sub_mpotree` use FIT;
+an explicit structured `apply_submpo` retains its chain-operator routing and
+final subtree compression even when the configured mode is DMRG.
 
-For an ordinary gate stream, choose `mode="direct"` (or `mode="direct",
-compression_mode="dm"`) for the bounded dense route. Choose
-`mode="tree_mpo_direct"` or `mode="tree_mpo_dm"` when the operator should be
-represented and routed as a true TreeMPO. `mode="tree_mpo"` is an alias for
-`tree_mpo_direct`; hyphenated names are accepted, and `tree_mpo_dem` is kept as
-a compatibility spelling for `tree_mpo_dm`. `mode="auto"` uses direct dense
-factorization for supports up to four qubits and the TreeMPO route for wider
-supports. The combined `tree_mpo_*` names own their compression suffix, so a
-conflicting `compression_mode` is rejected.
+For an ordinary gate stream, any of `mode="direct"`, `mode="dm"`,
+`mode="sdc"`, `mode="sdc-oversample"`, `mode="sdcr"`,
+`mode="sdcr-oversample"`, `mode="src"`, `mode="src-oversample"`, or `mode="mpo"` now
+uses the compact `SubTreeMPO` path;
+`mode="tree_mpo"` is an alias for `tree_mpo_direct`, hyphenated names are
+accepted, and `tree_mpo_dem` is kept as a compatibility spelling for
+`tree_mpo_dm`. The combined `tree_mpo_*` names own their compression suffix,
+so a conflicting `compression_mode` is rejected.
 
-`run(mode=...)` has the same persistent semantics as `MpsOptimizer`: it updates
-the optimizer's selected gate route and compression method for that run, later
-runs, and copies.
+For ordinary replay, `run(mode=...)` updates the optimizer's selection for
+that run, later runs, and copies. Shot replay applies overrides to children.
 The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
 
-For the legacy `auto`, `direct`, and `mpo` routes, the decomposition used for
-truncation can still be selected independently with
-`compression_mode="direct"` (SVD) or `compression_mode="dm"` (Quimb's
-density-matrix-equivalent `svd:eig` decomposition on the local fused
-state/operator compression core). The latter does not form a global dense
-state and is currently restricted to dense tree tensors; native fermionic
-trees retain their graded direct compression path. `mode="dm"` is the
-automatic-routing shorthand for `mode="auto", compression_mode="dm"`.
+Constructor `mode`, deprecated `two_site_mode`, and `run(mode=...)` share
+normalization, aliases, and conflict validation. `dm`, `src`, `sdc`,
+`sdc-oversample`, `sdcr`, `sdcr-oversample`,
+`tree_mpo_direct`, and `tree_mpo_dm` select their named compressor; `zipup`
+and `zipup-oversample` (alias `zipup-first`) select streamed direct splits;
+`mix` selects direct-guess one-node FIT. These names accept the neutral
+`compression_mode="direct"` constructor default or their matching compressor.
+Other route selectors (`auto`, `direct`, `mpo`, `submpo`, and DMRG modes)
+retain the configured compressor when a run override omits it. To explicitly
+switch an existing optimizer to direct compression, use
+`run(mode="direct", compression_mode="direct")`.
+
+| Option entry point | Scope |
+| --- | --- |
+| Constructor `fit_*` controls | Inherited by copies and shot children; unsupported as `run` keywords or inside `run_kwargs` |
+| Ordinary `run(mode=..., compression_mode=..., compression_seed=..., max_bond_oversample=..., cutoff_oversample=..., cutoff_mode_oversample=..., track_infidelity=...)` | Persistent after argument/stream validation succeeds |
+| Operator `max_bond=...`, `cutoff=...` | One call, including its compressed guess and FIT; `None` inherits optimizer settings |
+| Shot top-level replay options | Child overrides; parent state, queue, configuration, and RNG remain unchanged |
+| Shot `run_kwargs` | Explicit child replay settings take precedence over corresponding top-level options |
+
+Integer caps, worker counts, and FIT budgets require actual integers rather
+than booleans or fractional values. Cutoffs must be finite and nonnegative
+(or `"auto"`); cutoff modes accept Quimb's named modes and integer codes 1–6.
+Invalid replay configuration or stream labels are rejected before installing
+replacement options or a replacement queue. Numerical failures after replay
+starts do not promise rollback of preceding events.
+
+For the ordinary TreeMPO route, the decomposition used for state truncation
+can be selected independently with `compression_mode="direct"` (SVD) or
+`compression_mode="dm"` (Quimb's density-matrix-equivalent `svd:eig`
+decomposition on the local fused state/operator compression core).
+The latter does not form a global dense state and is currently restricted to
+dense tree tensors; native fermionic trees retain their graded direct
+compression path. `mode="dm"` is the automatic-routing shorthand for
+`mode="auto", compression_mode="dm"`.
+For NumPy single-precision arrays, Pepsy probes the installed Quimb eigensolver
+once per dtype. If its Numba driver cannot compile, tree edge compression
+warns and uses direct SVD with the same dtype, cutoff mode, and bond limit.
+Other backends and working eigensolver builds retain the requested method.
 The combined `tree_mpo_direct` and `tree_mpo_dm` names select both the true
 TreeMPO route and its compression method, so a conflicting explicit
 `compression_mode` is rejected.
 
+Dense compression enforces `chi` as a hard cap. Native Symmray SVD retains
+its existing global truncation policy: equal singular values at the boundary
+can be kept together, so a degenerate cut can exceed the requested `chi`.
+`max_bond()` reports the actual retained dimension. Path traversal preserves
+this policy; it does not select Symmray's different per-sector eager allocation.
+
+For a path-shaped active subtree, direct and DM prepare the complete operator
+losslessly, then compress each edge once from one endpoint to the other.
+Exact TreeMPO preparation can peel from both ends to keep QR matrices small;
+it then moves the completed center to the compression entry endpoint.
+Before routing, direct/DM and SRC/SDC/SDCR reuse a canonical region already inside
+the active subtree. Otherwise, a known center moves only to the first subtree
+entry. A known multi-node region is peeled only outside its overlap with the
+active region; disjoint regions require only the old region and their unique
+connector. Unaffected exterior branches and the retained overlap are not
+decomposed. A genuinely unknown gauge uses full exterior canonicalization.
+Interior preparation
+QRs are unnecessary because the routing algorithm replaces those tensors.
+They retain the terminal endpoint as the canonical
+center, without a return QR walk. This includes two-qubit gates and few-body
+gates whose sites lie on one geodesic. The retained endpoint is nearest the
+incoming tracked center, with structural node id breaking ties; this routing
+order never changes the gate's logical argument order. Off-path branches
+remain canonical boundaries with their existing virtual dimensions. Explicit
+subtree-operator and sub-MPO paths use the same directional compression.
+Branched regions retain their tree sweep. Finite-cap results can change from
+the previous interior-hub order.
+
+SRC/SDC/SDCR and their oversampled variants likewise use an endpoint hub on paths, building only the complementary
+environments needed for the opposite projection sweep. Zipup uses a directional
+path sweep with immediate truncation. These modes keep their distinct algorithms;
+the tree is not converted to an MPS.
+
+`mode="zipup"` uses the same `apply_sub_mpotree` entry point, but contracts
+one layered operator/state node only when its incoming child messages are
+ready. An SVD immediately caps the outgoing state leg at `chi` before the
+message reaches its parent. This avoids constructing the fully enlarged
+tree before truncation. The unvisited environment is not canonical, so
+zipup's intermediate discarded weights are not global error estimates; its
+accuracy can differ from `direct` at the same `chi`. It uses direct SVD,
+rejects a conflicting `compression_mode`, and leaves a canonical hub.
+Dense NumPy/Torch and native fermionic arrays retain their backend and dtype.
+Provably lossless zero-cutoff messages use the shared QR policy instead of
+SVD. Bond-size history is recorded, but zipup does not report intermediate
+discarded spectra as canonical truncation errors, even with
+`track_truncation=True`; those error fields remain unavailable.
+On a native fermionic tree, an overly small cap can remove every compatible
+charge path. Zipup raises before installing such an empty state; increase
+`chi` or choose `direct`, whose cuts see the complete operator environment.
+
+`mode="zipup-oversample"` (also `"zipup-first"`) first runs streamed zipup
+at an intermediate rank, then directly rounds the active subtree to `chi`
+using the final `cutoff` and `cutoff_mode`. No complete uncompressed target
+tree is materialized. The intermediate rank defaults to `2 * chi`;
+`max_bond_oversample=128` sets an explicit rank, while `2.0` sets a multiplier.
+The final cap must be finite, either from `chi` or the per-call `max_bond`.
+The first pass uses `cutoff_oversample=0.0` and
+`cutoff_mode_oversample="rel"` by default. These controls are independent of
+the final cutoff, whose default convention remains `rsum2`.
+
+```python
+optimizer = TreeOptimizer(
+    gates, state=ttn, chi=64, mode="zipup-oversample",
+    max_bond_oversample=2.0,
+)
+```
+
+Both passes preserve native NumPy/Torch or Symmray arrays and leave the tree
+canonical. Native final cuts retain the shared charge-multiplet policy, so
+a degenerate multiplet may exceed the nominal cap. Truncation history labels
+the intermediate cuts `zipup` and final cuts `zipup_oversample`, including
+each pass's own cap and cutoff convention. As with ordinary zipup,
+intermediate spectral-error estimates are unavailable; the update's norm
+ledger covers the composed operation.
+
+The final round is shared with SRC/SDC/SDCR oversampling. An endpoint-rooted
+path is compressed once toward the opposite endpoint and keeps that endpoint
+as its canonical center, without return QRs. Branches retain depth-first cut
+order and the return moves needed to prepare the next branch. The cuts and
+represented result of an individual round are unchanged up to numerical
+roundoff; later finite-rank gates can change because their routing direction
+depends on the new center. Caps, cutoff conventions, and RNG policy are
+unchanged.
+
+For a full `TreeMPO`, the minimal subtree shortcut requires exterior tensors proven to be unit
+identities by `TreeMPO.from_gate` or `from_pauli_sum`. Copies, scalar scaling
+on the active support, conjugation, and internal backend conversion preserve
+that proof. Operator canonicalization, distributed scaling, or exterior
+tensor replacement can move physical scale into those tensors. Such operators
+use the full tree in every mode, which is conservative and can cost more than
+the original local route. Compact `SubTreeMPO` operators have no exterior
+layer and never need this proof or fallback. For full operators, the check
+compares array references and index metadata without
+contraction or backend transfer. After editing array entries directly in place,
+call `operator.invalidate_canonical_form()` to invalidate the identity proof
+as well as its gauge metadata. A caller-supplied `operator_support` hint alone
+does not establish the builder's identity proof.
+
+`compression_mode="src"` contracts product-noise sketches of complementary
+branches, caching a directed environment on each tree edge. A second sweep
+forms QR projectors using those environments and the original layered target,
+then propagates the projected target toward the hub. `compression_seed=...`
+makes the sketches reproducible. As in Quimb SRC, the sample count is set by
+`chi`; nonzero `cutoff` is ignored with a warning. With `chi=None`, the sample
+count uses the largest original cut dimension to retain the full range.
+The implementation follows the Khatri–Rao sketches, QR range extraction,
+and target projection in [SRC, Algorithm 1](https://arxiv.org/html/2504.06475v2#S3).
+The paper defines a chain algorithm; the tree route extends its QB construction
+to directed branch environments without claiming the paper proves that
+extension. On layered paths, the same seed now matches unmodified Quimb SRC
+in both directions. This changes seeded results relative to the earlier
+per-node seed-offset implementation.
+
+Only required environments and their dependencies are built. Path targets
+therefore use one fixed environment per edge, matching Quimb. Each environment
+is released after its last consumer, and projector QR requests only Q.
+Numerical environments are cached within one compression call and shared by
+its dependent branches. Across calls, a bounded cache (128 plans) reuses only
+immutable tree traversal and dependency information, keyed by edge order and
+hub. Arrays, dimensions, sketches, and consumption counters are always fresh:
+in-place edits, new operators, ranks, seeds, backends, and failed retries cannot
+reuse stale numerical environments.
+Intermediate contractions drop tags; final tensors retain their local tags.
+Only the exterior is canonicalized before SRC/SDC/SDCR; the active tensors are
+replaced by the projector sweep without an initial internal center move.
+
+Torch SDCR requires Quimb's dtype-aware randomized split driver (the API with
+`noise_dist`). Older drivers can mix real noise with complex Torch tensors;
+Pepsy reports that missing capability explicitly. Use SDC/direct compression
+or upgrade Quimb for this backend path.
+
+`compression_mode="src-oversample"`, `"sdc-oversample"`, and
+`"sdcr-oversample"` are accuracy-oriented opt-in variants. Each first uses
+the corresponding successive environment method at an intermediate rank, then
+uses direct SVD compression with the requested final cutoff. The default
+intermediate rank is Quimb's
+`max(round(1.5 * chi), chi + 10)`; set `max_bond_oversample` to an explicit
+rank or to a floating-point multiplier of `chi`. Path-shaped sweeps reverse
+their first direction so the final direct round sees the opposite environment;
+branching regions retain their valid tree peel order. None of these routes
+materializes a dense state. The branched-tree behavior is a Pepsy tree
+extension of Quimb's chain algorithms.
+
+`compression_mode="sdc"` uses the same successive projection structure with
+deterministic low-rank complementary environments. Their factors are computed
+using direct truncated SVD, avoiding squared conditioning and a NumPy
+complex64 JIT failure in the installed Quimb eigendecomposition driver.
+`cutoff`, `cutoff_mode`, and `chi` control those environment factors.
+
+`compression_mode="sdcr"` keeps the same successive environment geometry and
+target projection, but computes each low-rank environment factor with
+Quimb's static randomized SVD driver (`svd:rand`, with no oversampling or
+power iterations by default). `chi` is both the sketch rank and the output
+cap; `cutoff` is ignored by this randomized environment step, matching
+Quimb. `compression_seed` controls reproducibility. Pepsy explicitly sends
+`cutoff=0` and `cutoff_mode="rel"` to randomized environment splits, so
+future Quimb releases that reject cumulative cutoff modes remain compatible;
+the configured final cutoff is still applied by the final direct round.
+`sdc-oversample` instead uses `cutoff_oversample` and
+`cutoff_mode_oversample` for its deterministic intermediate factors. These
+modes are dense-only and should be benchmarked against `sdc` on representative
+branched trees before changing defaults.
+
+These are distinct environment algorithms, not local randomized SVD aliases
+of `direct`. On a path they reproduce Quimb's SRC/SDC/SDCR sweeps (SRC/SDCR
+comparisons use the corresponding randomized seeds). On a branching tree, each retained node incorporates
+its already projected children and a cached complementary environment.
+They never materialize the complete operator-applied tree before compression.
+The final hub is canonical and retains the projected target norm.
+
+All successive environment methods currently require dense arrays. Native symmetry
+trees reject them explicitly; use native `direct` or `zipup`. Edge records
+report dimensions, but do not invent discarded spectra or global error bounds
+from these approximate environments. The existing TreeFIT
+`guess-src`/`guess-sdc` initialization options use their corresponding
+environment algorithms; TreeFIT's subsequent variational refinement uses
+direct SVD. `sdcr` is not a FIT variant. A Cholesky-based compressor is not
+implemented by these modes.
+
+### Tree-native FIT / DMRG
+
+`pepsy.fitting.TreeFIT` is the cached local variational fitting kernel for a
+`TreeTensorNetwork`. It has the same separation of target, disposable initial
+guess, bounded local updates, ownership controls, and diagnostics as
+`pepsy.FIT`, but replaces the chain's left/right environments with one cached
+directed overlap message for each tree edge:
+
+```python
+from pepsy.fitting import TreeFIT
+
+fit = TreeFIT(target, guess, max_bond=32, cutoffs=1e-12)
+fit.run_gate(
+    active_nodes,
+    n_iter=4,
+    block_size=2,       # 1, 2, or 3 connected tree nodes
+    sweep_sequence="inward-outward",
+)
+updated = fit.p
+report = fit.fit_diagnostics(overlap=True)
+```
+
+Before each local solve, the kernel moves the orthogonality centre along the
+unique tree path. Only messages whose branch intersects a changed local block
+or centre path are invalidated, so untouched branches retain their cached
+entanglement environments. Each missing directed message contracts only its
+node's target tensors, fitted bra tensor, and incoming neighbor messages.
+An iterative postorder traversal avoids recursive calls on deep trees.
+Invalidation follows those dependencies outward; there is no table of full
+branch-node sets. Temporary messages carry indices and data without
+accumulating branch-wide tags. Numerical messages belong to one TreeFIT
+instance and are reused across its sweeps; each TreeOptimizer gate creates
+a new fit for its new target. Initial exterior contractions can visit the
+whole state even when the operator itself is compact. Subsequent local
+updates reuse unaffected messages. The cache holds at most one tensor per
+directed tree edge, with tensor sizes determined by the live bond dimensions.
+For dense compact circuit targets, an unchanged canonical exterior component
+can instead be relabelled to its boundary identity without contracting the
+dangling branch; `environment_cache_info()["identity_shortcuts"]` reports
+these uses. Native Symmray and fermionic fits retain the graded message
+contraction.
+
+Standalone callers who directly edit `fit.p` tensor data must invalidate its
+canonical metadata and call `fit.clear_environment_cache()` before resuming.
+Raw external edits are not automatically tracked by the FIT message cache.
+Construct a new TreeFIT when changing target geometry or connectivity.
+
+`dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
+engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
+`dmrg` uses `fit_block_size` (two by default) and its configured adaptive
+warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
+three-node warm-up blocks followed by a two-node transition and one-node
+refinement. The default `fit_n_iter=4` permits eight directional passes and
+reaches refinement: `(2, 2, 1, 1)` for `dmrg2`, `(3, 3, 2, 1)` for `dmrg3`.
+Tree warm-up still counts complete iterations, so this is not an identical
+sequence of local updates to eight MPS sweeps. Explicit smaller budgets
+remain honored. `fit_two_site_transition_sweeps=1` controls the `dmrg3`
+transition within that budget; zero restores its previous three-to-one schedule.
+Every block-size change resets the tolerance history, and tolerance stopping
+cannot skip a pending transition or refinement phase.
+
+`TreeOptimizer(mode="mix")` is a separate preset of the same TreeFIT engine:
+apply and directly compress the operator on a private, chi-capped state,
+then refine that guess against the separate original layered target using
+one-node blocks from the first iteration. It fixes the effective
+`fit_init_strategy="guess-direct"`, `fit_block_size=1`, and direct local
+compression; it has no larger-block growth warm-up. Stored generic FIT
+options are retained for later `run(mode="dmrg")` calls. Conflicting explicit
+`compression_mode` values raise. The usual traversal, iteration, and tolerance
+controls still apply, and exact one-node regions keep their fast path.
+
+```python
+optimizer = TreeOptimizer(gates, state=ttn, chi=64, mode="mix")
+```
+
+Mix supports dense and supported even-parity native fermionic trees; odd-parity
+TreeFIT restrictions remain unchanged. A failed fit propagates its exception
+without committing the temporary guess; unlike MPS mix, this tree preset
+does not silently fall back to a direct result. Mix is a TreeOptimizer replay
+mode, not a new standalone TreeFIT or TreePepsOptimizer mode.
+
+`fit_sweep_sequence="inward-outward"` is the TreeOptimizer default. Use
+`"outward-inward"` to reverse the order. Each iteration includes both passes,
+ordered relative to the active region's medial node for branched regions and
+explicit depth policies. Auto paths use the endpoint convention described
+below. `RL`/`INOUT` and `LR`/`OUTIN` remain compatible aliases
+for the two orders. Standalone TreeFIT uses the same names and default;
+diagnostics report the normalized `sweep_sequence`.
+
+Local gates in `dmrg`, `dmrg1`, `dmrg2`, `dmrg3`, and `mix` build a compact
+`SubTreeMPO`; explicit `apply_sub_mpotree(subtree_operator)` uses the same
+FIT route. The exact target has operator tensors only inside that region,
+with original site labels and physical input/output indices preserved.
+
+FIT reuses each traversal order within a run. Before a block update, it moves
+the canonical center only as far as needed to make the exterior isometric;
+an existing center or canonical region contained inside the block needs no
+preparatory QR. An unknown gauge is canonicalized toward the block without
+collapsing its interior first. Local
+factorization still establishes the requested final center, including explicit
+endpoint centers for three-node `TreeFIT.fit_block` updates.
+
+`fit_traversal="auto"` is the TreeOptimizer default for `dmrg`, `dmrg1`,
+`dmrg2`, `dmrg3`, and `mix`. It inspects the induced active region: paths use
+consecutive one-, two-, or three-node windows between endpoints, and branched
+regions use depth-first updates around their medial hub. Both visit the same
+connected block sets as the explicit `"depth"` and `"depth-first"` policies.
+Those explicit policies retain their previous FIT block ordering. Standalone
+TreeFIT supports `traversal="auto"` but retains its own `"depth"` default.
+
+These are user-selectable traversal policies, separate from `mode`:
+
+```python
+optimizer = TreeOptimizer(
+    gates, n=8, mode="dmrg2", fit_traversal="depth-first",
+)
+optimizer.apply_sub_mpotree(tree_operator)
+# fit_traversal="depth" selects ordering by distance from the active hub.
+```
+
+| `fit_traversal` | Path-shaped support | Branched multi-site support |
+| --- | --- | --- |
+| `"auto"` (default) | Endpoint sweeps, including every two-site geodesic | Depth-first sweeps |
+| `"depth"` | Explicit distance-from-hub order | Explicit distance-from-hub order |
+| `"depth-first"` | Explicit branch-first order | Finish each branch before the next |
+
+The same policies apply to `dmrg1`, `dmrg2`, `dmrg3`, and `mix`, whether the input
+is an ordinary gate or an explicit multi-site `sub_mpotree`. A few-body
+operator whose physical sites lie on one path still benefits from the
+automatic path route. Direct/SRC/SDC/SDCR/zipup keep their own compression sweeps;
+`fit_traversal` controls FIT and does not change those algorithms.
+
+Auto freezes a reference path before constructing the guess, beginning at
+the endpoint nearest the incoming canonical center (node-id ties; node-id
+order if the center is unknown). `inward-outward` visits this path then its
+reverse; `outward-inward` reverses the pass order. Each block is factored with
+its center at the endpoint in the direction of travel. Reversal changes both
+window order and final centers, so adjacent multi-node windows contain the
+previous center. The order stays fixed through the 3→2→1 transitions.
+
+Automatic guesses remain SRC for dense trees and direct for native fermionic
+trees. Compressed guesses finish at the actual first FIT endpoint, including
+when the pass order is reversed. SRC/SDC/SDCR retain the original layered target
+and their per-call environment caches. This changes seeded approximations
+from the previous hub order while remaining reproducible with the same
+state, seed, and options. Finite-bond fidelity and convergence can change;
+extra exterior legs can still make multi-node factorization expensive.
+Diagnostics report requested `traversal`, `resolved_traversal` (`"path"` or
+`"depth-first"` for auto), `path_endpoints`, and the actual final center.
+
+For native Symmray states, `fit_environment_strategy="native-blockwise"`
+uses graded blockwise contractions for FIT messages and effective tensors,
+avoiding repeated charge-block fusion/unfusion. It retains Quimb/Cotengra
+contraction planning, backend/device, and fermionic phases. The default is
+`"default"`; the alternative requires native target/state arrays and checks
+actual upstream API support. No global dispatch is changed. Standalone
+TreeFIT calls this option `environment_strategy`. Performance depends on the
+sector sizes and backend; blockwise is not universally faster.
+
+`fit_single_node_fast_path=True` is automatic for a truly one-node active
+region. It skips the compressed/random guess and performs one local
+projection, preserving the parent RNG sequence. Diagnostics report one
+iteration, `block_size_trace=(1,)`, `guess_used=False`, and
+`convergence_reason="single_node_exact"`. This remains exact for a local
+nonunitary gate and records its resulting norm; it does not depend on
+`fit_rtol` or `fit_min_iter`. Set the flag to `False` to restore repeated
+sweeps. A multi-node region using one-node updates still needs iteration.
+For standalone `TreeFIT.run_gate`, `single_node_fast_path=True` solves the
+local least-squares problem with its exterior held fixed; it does not promise
+global fidelity one for an arbitrary target. Complete-tree `run`/`run_eff`
+retain fixed iteration defaults with `single_node_fast_path=False`.
+
+Small CPU measurements and compatibility probes are recorded in the
+[FIT execution review](../../development/notes/tree_fit_execution.md).
+
+The optimizer options `fit_n_iter`, `fit_adaptive_sweeps`,
+`fit_two_site_transition_sweeps`, `fit_min_iter`, `fit_rtol`,
+`fit_patience`, `fit_sweep_sequence`, `fit_init_strategy`,
+`fit_init_rand_strength`, and `fit_init_seed` are forwarded to TreeFIT.
+Outside the fixed `mix` preset, `fit_init_strategy="auto"` is the default:
+it selects `guess-src` for dense
+trees and `guess-direct` for native fermionic trees, whose randomized SRC
+compression is unsupported. This preserves the previous dense numerical
+policy. Explicit unsupported native `guess-src`/`guess-dm` requests still
+raise; `auto` does not change the requested output compression method.
+`fit_init_strategy="direct"` keeps the current state as the initial guess;
+`"guess-direct"`, `"guess-src"`, `"guess-sdc"`, `"guess-zipup"`, and `"guess-dm"` use a disposable compressed
+warm start; `"random"` perturbs only active tensors and `"random_expand"`
+also grows active bonds towards the exact target rank, capped by `chi`.
+Randomized guesses remain deterministic for a fixed seed. Dense TreeFIT
+updates preserve canonical metadata and the represented exponent; no implicit
+normalization is performed on a non-unitary target.
+`guess-direct` applies the operator to a private copy and compresses it;
+it is distinct from the unchanged current-state `direct` initialization.
+Native even-parity fermionic projections apply the graded metric correction
+on dual open environment legs before local factorization. This preserves an
+already representable state at each local update, including one-node refinement.
+Odd-parity fermionic FIT remains explicitly unsupported.
+
+Disposable compressed guesses copy the state once through the ordinary state
+handoff. They do not clone the parent optimizer's queued gates, replay history,
+or diagnostic records. They retain the previous single child-seed draw from
+the parent RNG, preserving later measurement sequences; randomized
+compression still uses `fit_init_seed`. Public `TreeOptimizer.copy()` preserves independent
+histories, replay configuration, and a derived child RNG; it also preserves the
+configured `fit_adaptive_sweeps`.
+
+`get_fit_diagnostics()` returns an independent record for the latest completed
+FIT update, including its effective `max_bond` and `cutoff`. It returns `None`
+outside FIT or after a completed non-FIT update. `fit_diagnostics` retains
+historical FIT records; replacing the state through `set_tn` / `set_p` clears
+both the history and latest record along with the other update diagnostics.
+The record's `split_method` identifies the actual local factorization:
+`"direct"` or `"dm"`. Explicit direct/DM compression settings are retained;
+SRC/SDC/SDCR settings map to direct local SVD because complementary-environment
+compression is a separate whole-subtree algorithm. `fit_init_strategy`
+independently determines the disposable guess method.
+
+TreeOptimizer defaults to `fit_rtol="auto"` and `fit_min_iter=2`:
+
+| State precision | `cutoff="auto"` | `fit_rtol="auto"` |
+| --- | --- | --- |
+| 16-bit | `1e-3` | `1e-3` |
+| float32 / complex64 | `1e-6` | `1e-5` |
+| float64 / complex128 | `1e-12` | `1e-9` |
+
+The tolerances resolve from the installed state's dtype at construction,
+matching MpsOptimizer's numerical policy. `cutoff_mode="auto"` retains
+`"rsum2"`. Explicit numbers remain unchanged, and `fit_rtol=None` disables
+tolerance stopping. `fit_patience=1` means one stable comparison of two
+same-phase norm samples; the counter resets when the block size changes.
+`fit_n_iter` remains the iteration budget, and rank-growth/warm-up conditions
+still gate early stopping. This criterion measures relative change in the
+retained canonical-center norm, not a bound on the global state error.
+
+As with MpsOptimizer's non-unitary policy, automatic tolerance stopping is
+disabled during `run(non_unitary=True)`. It is also disabled for updates with
+`track_norm=False`, whose target norm is not assumed known. Explicit numeric
+`fit_rtol` remains honored in those cases. Optimizer FIT diagnostics report
+both `fit_rtol_requested` and the effective `fit_rtol` for each update.
+Standalone TreeFIT retains `rtol=None` and its fixed-block defaults. All three
+entry points accept `two_site_transition_sweeps=0`; set this to one with
+`block_size=3, adaptive_block_sweeps=2` to request the new transition explicitly.
+
+TreeFIT accepts `retag=True` for structural node-tag alignment and
+`copy_target=False` for an explicitly disposable target. Its target may be a
+fused tree network or a correctly tagged layered tree network. Every target
+tensor must belong to exactly one structural node group; local layer bonds
+stay inside a group, and one or more inter-group bonds must follow the fitted
+tree edges. Ambiguous or untagged layer tensors are rejected rather than
+dropped. The separate two-layer path compressor remains the `TreePeps`
+`sdc`/`sdcr`/`src`/`zipup` route when that direct Quimb path is desired.
+
+`TreeOptimizer`'s DMRG target is built as a layered operator--state network:
+the state and TreeMPO virtual bonds are not fused, and only corresponding
+physical input/output legs are connected. This keeps the DMRG target aligned
+with the layered FIT representation while leaving the direct TreeMPO route
+unchanged.
+
+All ordinary DMRG gate entries now use `apply_sub_mpotree` too. The optimizer
+transfers ownership of its disposable layered target to TreeFIT with
+`copy_target=False`. `fit_finite_check=False` is the default; enable it to
+check active tensor entries once per iteration. `run(finite_check=True)` also
+checks active FIT tensors and scans the final state in every replay mode,
+including empty streams. This setting is scoped to that replay and inherited
+by shot workers unless `run_kwargs` overrides it. Enabled replay warns once
+about the optional diagnostic cost; nested FIT calls share that warning.
+Standalone TreeFIT uses `finite_check=False` and warns when scans are enabled.
+Scalar convergence, scale bookkeeping, and explicit overlap diagnostics remain
+independent; the existing scale/zero guards retain their semantics.
+Trusted local updates no longer recompute every
+outside isometry after each sweep; explicit `state.validate(check_canonical=True)`
+remains available. The existing `track_infidelity` default is unchanged.
+
+TreeFIT's `local_fidelity` is the clipped squared ratio of the retained
+terminal canonical-centre norm to the fixed target norm, matching MPS FIT's
+local norm diagnostic. `local_norm_trace` contains one such centre readout per
+completed sweep and `local_norm_stripped_trace` preserves its mantissa and
+base-ten exponent. It is distinct from the optimizer's `norm_diagnostics()`
+local and cumulative retained-norm proxy, which is computed from
+canonical-centre norm ratios and stored in logarithmic form to avoid
+underflow. For lazy targets, pass the known exact `target_norm` (a norm or
+mantissa/exponent pair) to obtain this normalized ratio without additional
+target work. TreeOptimizer supplies the pre-update canonical norm when
+`track_norm=True`, the unitary-update contract. For non-unitary updates use
+`track_norm=False`; an unknown lazy target norm yields `local_fidelity=None`
+while the retained norm and convergence trace remain available.
+Routine fitting never contracts `target.norm()` or a doubled target network.
+`fit_diagnostics(overlap=True)` separately requests a genuine directional
+overlap. If the target norm is unknown, this explicit diagnostic uses a
+lossless leaf-to-hub QR pass and one hub norm, never `<target|target>`.
+Its directional overlap is reported as `target_fidelity`,
+with MPS-compatible `fit_overlap_fidelity` aliases, not as `local_fidelity`.
+Thus an MPO/TreeMPO identity normalization scale is not silently treated as
+compression fidelity.
+Each completed local fit also carries the target's stored exponent into the
+fitted state, preserving its represented scale when the guess has a different
+exponent.
+Optional norm or overlap diagnostic failures are reported in
+`fit_overlap_error`; they do not invalidate or prevent installation of a
+successful fit.
+TreeFIT rejects odd-parity fermionic tensors: its local projection does not
+yet preserve their graded signs. Use the native `direct` or `zipup` routes
+for those states. This restriction applies to DMRG modes as well.
+
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
 Tree-edge SVD. Its defaults, `cutoff="auto"` and `cutoff_mode="auto"`, resolve
-once from the live state dtype: `1e-6` for 32-bit data and `1e-12` for 64-bit
-data, with `"rsum2"` as the automatic cutoff mode. `"rel"` remains available
-as a relative largest-singular-value threshold.
+once at construction from the installed state dtype, using the shared MPS
+policy: `1e-3` for 16-bit data, `1e-6` for float32/complex64, and `1e-12` for
+float64/complex128. An explicit numeric cutoff, including zero, is preserved.
+
+`cutoff_mode="auto"` (or the compatibility spelling `None`) selects `"rsum2"`
+for every tree split, including `mode="dm"`, `mode="tree_mpo_dm"`, and
+`compression_mode="dm"`. This matches MPS DM's **numerical criterion**:
+tree DM's `svd:eig` kernel truncates singular values `s`, while MPS MPO DM
+truncates density-matrix eigenvalues `s**2` with its native `"rsum1"` mode.
+Both automatic rules bound the relative discarded squared weight
+`sum(s_discarded**2) / sum(s**2)` when the bond cap does not force more loss.
+Explicit modes pass through unchanged: tree `"rsum1"` instead bounds
+`sum(s_discarded) / sum(s)`, and `"rel"` uses a relative largest-singular-value
+threshold. Copies preserve the resolved cutoff and mode.
+
 The lower-level `TreeTensorNetwork.compress_edge_` API retains explicit
 numeric defaults (`1e-10` and `"rsum2"`); pass its cutoff controls directly
 when using that lower-level interface.
@@ -604,15 +1329,29 @@ when using that lower-level interface.
 ### Performance-oriented defaults and warnings
 
 The default replay configuration is intended for production evolution:
-`mode="auto"` uses dense local factorization through four-qubit supports and
-the true TreeMPO route for wider supports, while `threads=1` avoids
+`mode="auto"` uses the true TreeMPO route on every ordinary gate support,
+while `threads=1` avoids
 oversubscribing the small tree contractions, `subtree_workers=1` keeps the
-serial path allocation-free, `profile=False` avoids timing overhead, and
+serial path free of thread-pool overhead, `profile=False` avoids timing overhead, and
 `track_truncation=False` avoids full-spectrum diagnostic SVDs, while
 `track_bond_diagnostics=False` avoids live-bond scans. `record_history` and
 `track_infidelity` retain the established API defaults; the latter enables the
 cheap canonical-centre norm ledger and its progress-bar readout. It does not
 enable spectrum probes.
+
+`fit_finite_check=False` keeps optional FIT finite scans off. MPI shot replay
+also defaults to `collect_diagnostics=False`; pass
+`True` explicitly to request rank timing diagnostics.
+
+For Torch, JAX, and CuPy, ordinary replay retains detached norm and
+log-fidelity scalars on the array backend. `norm()`, `get_norm_events()`,
+`norm_diagnostics()`, diagnostic reports, and progress display are explicit
+host readout boundaries. A nonzero extracted `tn.exponent` retains Python
+double scale bookkeeping to avoid losing its range on float32-only devices.
+Norm tracking remains enabled by default. FIT convergence/local reports,
+measurement decisions, native QR safety checks, and upstream truncation rank
+selection can still synchronize; disabling optional diagnostics does not
+disable these algorithmic decisions.
 
 Warnings are reserved for an actionable behavior change: enabling
 `track_truncation=True` emits one diagnostic-performance warning, while
@@ -654,7 +1393,14 @@ a root site is contracted directly without changing the tree edges.
 `stable_labels=True` (or `compact_labels=False`) to preserve caller-facing
 logical IDs across the cap while the internal TTN stays compact.
 `TreeOptimizer.qubits`, `logical_order`, `position`, and `logical_site` expose
-that mapping. Native fermionic TTNs support native Symmray gates and MPOs, but
+that mapping. Direct `measure(q, outcome=0|1)` and `reset(q)` use these logical
+labels as well. Computational-basis measurement obtains local projected
+weights, accepts any positive representable branch, and excludes projection
+probability from compression loss. Caps and state replacement synchronize the
+root arity with the installed plan so subsequent copies and shots remain valid.
+Both operations discard cached gate factorizations tied to the old TreePlan,
+including same-size state replacements with a different geometry or site order.
+Native fermionic TTNs support native Symmray gates and MPOs, but
 the qubit Pauli/measurement/reset helpers intentionally reject them; use the
 fermion model's native observable/projector with
 `TreeTensorNetwork.local_expectation` instead of silently treating a graded
@@ -665,27 +1411,36 @@ well. Independent trajectories can sample Pauli mixtures, depolarizing
 channels, and state-dependent Kraus channels; branch probabilities are
 evaluated from copied TTNs and selected branches are normalized before replay
 continues. Coalesced trajectory replay supports exact branching of mid-circuit
-measurement, reset, and measure-reset events through `expectation_pauli`. Use
+measurement, reset, and measure-reset events through the same paired Born
+probabilities used by `measure_pauli`. One-site readout uses local projected
+amplitudes; multi-site readout carries a dimension-two parity index through
+lossless QR messages on the active subtree. Both probabilities are computed
+independently, so a rare branch is not lost by subtracting from one. This
+does not form a dense projector, truncate a probability query, or clone the
+optimizer and its history. Probabilities ignore the represented exponent;
+positive collapsed branches normalize without a fixed probability floor. Use
 matrix-valued gate payloads in tree streams (for example `pepsy.h()`), since
 textual MPS gate aliases are not normalized by the tree gate parser. Native
 fermionic trajectories may use native gates/MPOs, but Pauli/control events
 require a model-native observable or projector.
 
-MPS execution modes such as `svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`, and
-`mix` are chain algorithms and are intentionally not copied into
-`TreeOptimizer`. Tree layout is part of the TTN geometry and is selected with
-`tree=`/`layout=` at construction. `TreeStabOptimizer` uses
+MPS execution modes such as `svd`, `swap`, `perm`, `su`, and `mix` are
+chain algorithms and are intentionally not copied into `TreeOptimizer`.
+The accepted legacy `mpo` name uses the tree-native route described above.
+Tree-native `dmrg`/`dmrg1`/`dmrg2`/`dmrg3` are provided by `TreeFIT` instead.
+Tree layout is part of the TTN geometry and is selected with
+`tree=`/`layout=` at construction. `StabilizerTreeSimulator` uses
 `tree_mpo_direct` or `tree_mpo_dm` for its numerical coefficient updates,
 delegating the active-span TreeMPO contraction to this class while keeping
 tableau state and stabilizer-specific bookkeeping above it. See the
-[TreeStabOptimizer API](tree_stabilizer.md) for the supported fixed-basis,
+[StabilizerTreeSimulator API](tree_stabilizer.md) for the supported fixed-basis,
 basis-updating, immediate, and deferred magic-injection
 Clifford/rotation/measurement paths, bounded dense matrix dispatch, and the
 safe MPS naming-compatibility surface.
 
 `TreeOptimizer.run` also exposes the shared shot and MPI entry point. It
-creates independent copies from the current tree state, so the parent state
-and queued stream remain unchanged:
+creates independent copies from the current tree state, so the parent state,
+queued stream, settings, and RNG remain unchanged:
 
 ```python
 result = optimizer.run(
@@ -699,8 +1454,12 @@ result = optimizer.run(
 ```
 
 The `strategy="independent"` and `strategy="coalesced"` options follow the
-shared runner semantics. `TreeStabOptimizer.run` provides the corresponding
+shared runner semantics. `StabilizerTreeSimulator.run` provides the corresponding
 API and intentionally supports independent shot distribution only.
+`observable`, `chunk_size`, and checkpoint/resume settings require MPI;
+supplying them without MPI raises instead of silently using ordinary replay.
+Configure FIT controls on the optimizer before starting shots. `run_kwargs`
+accepts the child `run` API, not constructor-only `fit_*` arguments.
 
 ## Tree state class
 
@@ -791,6 +1550,11 @@ the Symmray arrays native; they do not materialize dense tensor data.
 `pepsy.TreeSampler(state)` samples every registered physical site, including
 the optional root site. Its cached canonical arrays use parent, physical, then
 child axes, so probabilities and amplitudes retain normal `q0..q(n-1)` order.
+For native Abelian or fermionic Symmray trees, pass
+`backend="symmray"` (or `backend="native"`) to keep sampling,
+amplitudes, probabilities, and edge entropy on block-sparse tensors; inspect
+`sampler.physical_code_maps` when the physical basis has degenerate charge
+sectors.
 
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
 tree analogue of a quimb MPS `show()` -- with the root at the top, structural
@@ -953,6 +1717,14 @@ tree_folded = finder.run(order="folded-snake")
 tree_hilbert = finder.run(order="hilbert")
 tree_coarse = finder.run(order="coarse-alternate-x")
 tree_quality = finder.run(order="quality")
+
+# Equivalent one-string spelling for the tree geometry:
+tree_coarse = TreeLayoutFinder(
+    gates,
+    n=36,
+    lattice_shape=(6, 6),
+    map_mode="coarse-alternate-x",
+).run()
 ```
 
 The supported 2D geometric presets include `"row-major"`, `"snake"`,
@@ -1003,6 +1775,7 @@ tree_plan = TreePlan.from_order(
     structure="balanced",
     max_arity=2,
     top_arity=3,
+    map_mode="coarse-alternate-x",
 )
 
 zigzag3d = TreeLayoutFinder.lattice_order(
@@ -1279,6 +2052,14 @@ NumPy-to-NumPy dtype promotion is compatible. A mismatch raises `TypeError` at c
 tensor work. Prepare a payload explicitly with `opt.to_backend(payload)` (or
 the same converter used to build the state). Internal Pauli/projector tensors
 follow the state backend automatically.
+Fixed control matrices are cached by backend/device/dtype; projectors and
+Pauli-sum operators are assembled on that backend. Public
+`TreeMPO.from_pauli_sum(..., like=array)` and
+`SubTreeMPO.from_pauli_sum(..., like=array)` select the construction backend
+and device explicitly; omitting `like` retains NumPy construction.
+Dense local gate factorization also preserves its input backend. One-site
+unitarity certification performs matrix work there and reads only its final
+Boolean result.
 Mixed-backend initial states fail immediately because there is no unambiguous
 safe execution backend.
 
@@ -1496,14 +2277,13 @@ scale.
 ## Readout
 
 `to_dense()` returns the dense statevector in index order `k0, k1, ..., k(n-1)`.
-`run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit event
-counts, current bond usage, state norm, and a norm-based truncation proxy.
-Both dense and native fermionic replay report
-`1 - (norm / reference_norm)^2`; the reference is established at run start and
-reset after control or explicitly non-unitary events. This is display-only and
-is not a replacement for either the path-level norm ledger or the recorded
-per-edge truncation history. The bar is disabled by default. The norm ledger is
-the canonical `local_fidelity` / `cumulative_fidelity` diagnostic;
+`run(progbar=True)` shows a tqdm replay bar matching the MPS optimizer's core
+compression readout: the active mode, exact two-qubit event count `2q`,
+cumulative retained-norm fidelity `~F`, and current bond usage `bnd`.
+Tree-specific `kq`, `ctrl`, and explicit-operator `mpo` counters are added only
+when those event types occur. The bar is display-only and does not replace the
+path-level norm ledger or recorded per-edge truncation history. The norm ledger
+is the canonical `local_fidelity` / `cumulative_fidelity` diagnostic;
 `track_truncation=True` is the more expensive spectrum-attribution diagnostic.
 For dense two-level qubit TTNs, `measure(q, outcome=None)` projectively
 measures a qubit in the computational basis and returns a bit; `reset(q)`
@@ -1572,6 +2352,12 @@ available through `truncation_report()`, `get_infidelities()`, and
   network derives orientation diagnostics from those tensors; the optimizer
   does not keep a duplicate map. Native fermionic trees keep their separate
   explicit graded QR/SVD path.
+- **Regional recovery traversal.** Recovering a single center from a tracked
+  canonical region uses a smallest-leaf priority queue. It preserves the
+  deterministic QR order while avoiding repeated whole-region scans:
+  traversal bookkeeping is O(E + R log R) for R region nodes and E incident
+  adjacency entries, excluding tensor operations. Existing `left_inds`
+  proofs still turn redundant QR operations into metadata-only moves.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

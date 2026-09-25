@@ -24,6 +24,7 @@ Core namespaces are organized by responsibility:
 - `boundary/`: PEPS boundary states, sweeps, norms, and overlaps
 - `solvers/`: gradient-based and finite-difference solvers
 - `fitting/`: local tensor fitting routines
+- `interop/`: adapters for external circuit and tensor-network representations
 - `optimizers/`: MPS, MPO, PEPS, sweep, and global workflows
 - `sampling/`: MPS, PEPS, vector, and tree samplers
 
@@ -31,7 +32,13 @@ Advanced namespaces are explicit:
 
 - `bp/`: belief propagation, loop corrections, and PNE
 - `vmc/`: optional Torch and NetKet/JAX VMC adapters
-- `experimental/`: lazy entry points for advanced domains
+- `experimental/`: lazy discovery facade for existing advanced domains
+
+Prefer the owning namespaces in new code. Optional dependencies and API
+stability are separate concerns; see the [stability policy](docs/stability.md).
+
+Other repository areas:
+
 - `_internal/`: private formatting and utility helpers
 - `examples/`: lightweight runnable examples kept with the package
 - `../pepsy_examples/`: external notebooks and smoke examples, including direct
@@ -40,32 +47,33 @@ Advanced namespaces are explicit:
 - `tests/`: package tests
 
 ## Install
+
+Requires **Python 3.12 or newer**.
+
 ```bash
-pip install -U -e .
-# Optional backends:
-# pip install -e .[contraction]  # accelerated contraction search
-# pip install -e .[torch]
-# pip install -e .[solvers]
-# pip install -e .[symmetry]
-# pip install -e .[stabilizer]
-# pip install -e .[vmc-torch]
-# pip install -e .[vmc-netket]
-# pip install -e .[layout]
-# pip install -e .[mpi]       # MPI shot ensembles
-# Optional plotting helpers:
-# pip install -e .[viz]
+python -m pip install .                 # from this checkout
+# Or choose a feature profile:
+# python -m pip install ".[vmc-torch]"
+# python -m pip install ".[symmetry]"
 ```
+
+See [installation profiles](docs/installation.md) for all optional features.
+Install `.[vmc]` only when you need both Torch and NetKet/JAX integrations.
+For development, use `python -m pip install -e ".[dev]"`.
 
 ## Quick Usage
 ```python
 import pepsy
 import quimb.tensor as qtn
+from pepsy.boundary import BdyMPS, build_bra_ket, contract_boundary
 
 ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
-ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
+ket_tagged, norm = build_bra_ket(ket=ket)
 
-bdy = pepsy.BdyMPS(tn_flat=ket_tagged, tn_double=norm, chi=32, single_layer=False)
-res = pepsy.contract_boundary(norm=norm, bdy=bdy, direction="y", n_iter=2)
+# ``tn_double`` drives the BRA--KET boundary path. ``tn_flat`` is an optional
+# single-layer reference here; it is the contraction target only with flat=True.
+bdy = BdyMPS(tn_flat=ket_tagged, tn_double=norm, chi=32, single_layer=False)
+res = contract_boundary(norm=norm, bdy=bdy, direction="y", n_iter=2)
 
 print(pepsy.__version__, res.cost)
 ```
@@ -89,13 +97,13 @@ tracked in `docs/development/notes/fermionic_mpo.md` and
 `docs/development/fermi_hubbard_u1u1_mpo_notes.md`.
 
 ```python
-import pepsy as py
+from pepsy.tensors import SymMPS, site_charge_from_occupations
 
-psi = py.SymMPS.for_model(
+psi = SymMPS.for_model(
     "fermi_hubbard_u1u1",
     16,
     bond_dim=4,
-    site_charge=py.site_charge_from_occupations([(1, 0), (0, 1)] * 8),
+    site_charge=site_charge_from_occupations([(1, 0), (0, 1)] * 8),
 )
 
 assert psi.overall_charge() == (8, 8)
@@ -107,11 +115,11 @@ assert ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193
 
 ## Documentation
 Documentation is maintained as Markdown under `docs/`, with an optional
-Sphinx build that adds searchable, generated API pages. Install the docs
-extra and build the site locally with:
+Sphinx build that adds searchable, generated API pages. Use the development
+environment described in [CONTRIBUTING.md](CONTRIBUTING.md), respecting any
+local environment override. Install the docs extra and build locally with:
 
 ```bash
-source ~/envs/py312/bin/activate
 python -m pip install -e ".[docs]"
 python -m sphinx -b html docs docs/_build/html
 ```

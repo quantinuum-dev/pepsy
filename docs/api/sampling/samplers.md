@@ -72,10 +72,10 @@ probs = batch.probs
 ```
 
 For a stabilizer tensor-network state `|psi> = C|nu>`, use
-[`MpsStabSampler`](stabilizer.md). It keeps the same batch/result shape while
+[`StabilizerMpsSampler`](stabilizer.md). It keeps the same batch/result shape while
 using frame-mapped Pauli projectors, so X/Y/Z product-basis sampling remains
 scalable without forming the dense physical statevector. It is a separate
-sampler from `MpsStabOptimizer`: pass an existing optimizer, or pass `(C, nu)`
+sampler from `StabilizerMpsSimulator`: pass an existing optimizer, or pass `(C, nu)`
 with optimizer construction options such as `chi` and `mode`. Set
 `disentangle=True` to use branch-local basis-updating measurements. The legacy
 `absorb_basis=True` keyword remains accepted as an alias.
@@ -89,6 +89,11 @@ The native path builds backend-native right environments once, so it does not
 require quimb to canonicalize Torch or CuPy tensors before sampling.
 It caches those environments for the current MPS tensors: after modifying the
 MPS, call `sampler.refresh()` before sampling again.
+
+`sampler.entanglement_entropy(cut=None)` measures the captured source MPS at
+the requested bond (`None` selects the middle cut). It delegates to
+`pepsy.tensors.mps_entanglement_entropy`, so the entropy diagnostic uses the
+source array backend rather than the legacy Quimb sampling copy.
 
 ### Dense exact-vector sampler
 

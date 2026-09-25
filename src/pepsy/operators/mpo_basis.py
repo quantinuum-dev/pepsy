@@ -24,6 +24,78 @@ from .mpo_automaton import (
 
 __all__ = ["CompiledMPOExp", "CompiledMPOEvolution", "MPOBasis", "exp_mpo"]
 
+
+def _convert_term_to_backend(term, to_backend):
+    """Convert only operator payloads, leaving coefficient graphs untouched."""
+    if isinstance(term, MPOProductTerm):
+        return replace(
+            term,
+            operators=tuple(to_backend(operator) for operator in term.operators),
+            string_operators=(
+                None
+                if term.string_operators is None
+                else tuple(to_backend(operator) for operator in term.string_operators)
+            ),
+        )
+    if isinstance(term, MPOLocalOperatorTerm):
+        return replace(term, operator=to_backend(term.operator))
+    return term
+
+
+def _convert_automaton_to_backend(automaton, to_backend):
+    """Convert all automaton transition blocks to the requested backend."""
+    transitions = tuple(
+        tuple(
+            type(transition)(
+                transition.left_state,
+                transition.right_state,
+                to_backend(transition.operator),
+            )
+            for transition in site_transitions
+        )
+        for site_transitions in automaton.transitions
+    )
+    return MPOAutomaton(
+        automaton.L,
+        channels=automaton.channels,
+        transitions=transitions,
+        start_state=automaton.start_state,
+        done_state=automaton.done_state,
+        phys_dim=automaton.phys_dim,
+    )
+
+
+def _apply_to_backend(tn, to_backend):
+    """Apply a converter to host arrays without detaching backend arrays."""
+    if to_backend is None or not hasattr(tn, "apply_to_arrays"):
+        return tn
+
+    def convert(array):
+        if _backend_name(array) in {"builtins", "numpy"}:
+            return to_backend(array)
+        return array
+
+    # Quimb can expose read-only NumPy views for some boundary tensors.
+    # Make those writable before its in-place ``apply_to_arrays`` traversal.
+    for tensor in tn:
+        data = tensor.data
+        if (
+            isinstance(data, np.ndarray)
+            and not data.flags.writeable
+            and _backend_name(data) in {"builtins", "numpy"}
+        ):
+            tensor.modify(data=np.array(data, copy=True))
+    tn.apply_to_arrays(convert)
+    return tn
+
+
+def _canonical_history_storage(history_storage):
+    """Normalize the compatibility spelling for persistent block storage."""
+    if history_storage == "blocks":
+        return "block_sparse"
+    return history_storage
+
+
 class CompiledMPOExp:
     """Value-only higher-order exponential evaluator for an :class:`MPOBasis`.
 
@@ -42,12 +114,16 @@ class CompiledMPOExp:
 
     _MODE_ALIASES = {
         "base": (False, False, "base"),
-        "algorithm4": (False, True, "algorithm4"),
-        "paper_algorithm4": (False, True, "algorithm4"),
-        "optimal": (True, False, "optimal"),
-        "paper_optimal": (True, False, "optimal"),
-        "approximate": (True, True, "approximate"),
-        "paper_approximate": (True, True, "approximate"),
+        "exact": (True, False, "exact"),
+        "folded": (False, True, "folded"),
+        "hybrid": (True, True, "hybrid"),
+        "auto": (False, False, "auto"),
+        "algorithm4": (False, True, "folded"),
+        "paper_algorithm4": (False, True, "folded"),
+        "optimal": (True, False, "exact"),
+        "paper_optimal": (True, False, "exact"),
+        "approximate": (True, True, "hybrid"),
+        "paper_approximate": (True, True, "hybrid"),
     }
 
     def __init__(
@@ -61,39 +137,56 @@ class CompiledMPOExp:
         max_bond=None,
         on_exceed="raise",
         history_storage="auto",
+        extension_budget=None,
     ):
         if not isinstance(basis, MPOBasis):
             raise TypeError("basis must be an MPOBasis.")
         if mode is not None:
             if not isinstance(mode, str):
                 raise TypeError("mode must be a string or None.")
-            try:
-                mode_extend, mode_approximate, canonical_mode = (
-                    self._MODE_ALIASES[mode]
-                )
-            except KeyError as exc:
-                allowed = ", ".join(sorted(self._MODE_ALIASES))
-                raise ValueError(
-                    f"unknown mode {mode!r}; expected one of {allowed}."
-                ) from exc
-            if extend or approximate:
-                raise ValueError(
-                    "mode cannot be combined with extend or approximate flags."
-                )
-            extend = mode_extend
-            approximate = mode_approximate
+            if mode == "auto":
+                if extend or approximate:
+                    raise ValueError(
+                        "mode='auto' cannot be combined with extend or "
+                        "approximate flags."
+                    )
+                canonical_mode = "auto"
+            else:
+                try:
+                    mode_extend, mode_approximate, canonical_mode = (
+                        self._MODE_ALIASES[mode]
+                    )
+                except KeyError as exc:
+                    allowed = ", ".join(
+                        ["base", "exact", "folded", "hybrid", "auto"]
+                        + sorted(
+                            name for name in self._MODE_ALIASES
+                            if name not in {"base", "exact", "folded", "hybrid", "auto"}
+                        )
+                    )
+                    raise ValueError(
+                        f"unknown mode {mode!r}; expected one of {allowed}."
+                    ) from exc
+                if extend or approximate:
+                    raise ValueError(
+                        "mode cannot be combined with extend or approximate flags."
+                    )
+                extend = mode_extend
+                approximate = mode_approximate
         else:
             canonical_mode = (
-                "approximate" if approximate and extend
-                else "optimal" if extend
-                else "algorithm4" if approximate
+                "hybrid" if approximate and extend
+                else "exact" if extend
+                else "folded" if approximate
                 else "base"
             )
 
+        history_storage = _canonical_history_storage(history_storage)
         if history_storage == "streaming":
             raise ValueError(
                 "compiled evolution requires cached history; use "
-                "history_storage='auto', 'sparse', or 'dense'."
+                "history_storage='auto', 'sparse', 'block_sparse', or "
+                "'reduced'."
             )
 
         self.basis = basis
@@ -104,6 +197,7 @@ class CompiledMPOExp:
         self.max_bond = max_bond
         self.on_exceed = on_exceed
         self.history_storage = history_storage
+        self.extension_budget = extension_budget
 
         # This validates the complete option set and fills every symbolic
         # history/tensor plan once.  The unit-coefficient numerical result is
@@ -116,6 +210,7 @@ class CompiledMPOExp:
             on_exceed=on_exceed,
             cache_history=True,
             history_storage=history_storage,
+            extension_budget=extension_budget,
         )
 
         self._base_arrays = tuple(basis._template.arrays)  # pylint: disable=protected-access
@@ -419,11 +514,12 @@ class CompiledMPOExp:
             on_exceed=self.on_exceed,
             cache_history=True,
             history_storage=self.history_storage,
+            extension_budget=self.extension_budget,
         ).arrays
 
-    def evaluate(self, dt, parameters=None, *, coefficients=None):
+    def evaluate(self, dt, parameters=None, *, coefficients=None, **kwargs):
         """Compatibility wrapper for :meth:`exp`."""
-        return self.exp(dt, parameters, coefficients=coefficients)
+        return self.exp(dt, parameters, coefficients=coefficients, **kwargs)
 
     def exp(
         self,
@@ -432,16 +528,29 @@ class CompiledMPOExp:
         *,
         coefficients=None,
         dt=None,
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
+        progress=False,
     ):
-        """Evaluate ``exp(step * H)`` as a semantic :class:`FirstDegreeMPO`.
+        """Evaluate ``exp(step * H)`` with optional final compression.
 
         Use this form when downstream code needs MPO metadata or methods such
         as ``to_mpo()``. Use :meth:`exp_arrays` when it only needs raw tensors.
+        ``chi`` is applied after the higher-order construction; additional
+        Quimb compression keywords are supplied with ``compress_opts``.
         """
         step = _resolve_exp_step(step, dt)
         arrays = self._assemble_arrays(step, parameters, coefficients)
         bound = self.basis._template._bind_arrays(arrays)  # pylint: disable=protected-access
-        result = bound.extensive_exponential(
+        result = bound.exp(
             step,
             order=self.order,
             mode=self.mode,
@@ -449,11 +558,31 @@ class CompiledMPOExp:
             on_exceed=self.on_exceed,
             cache_history=True,
             history_storage=self.history_storage,
+            extension_budget=self.extension_budget,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
+            progress=progress,
         )
-        result.metadata["compiled_exp"] = True
-        # Retain the historical metadata key for callers that inspect it.
-        result.metadata["compiled_evolution"] = True
-        return result
+        if return_report:
+            semantic_result, report = result
+        else:
+            semantic_result, report = result, None
+        if isinstance(semantic_result, FirstDegreeMPO):
+            semantic_result.metadata["compiled_exp"] = True
+            # Retain the historical metadata key for callers that inspect it.
+            semantic_result.metadata["compiled_evolution"] = True
+        else:
+            semantic_result.pepsy_exp_metadata["compiled_exp"] = True
+            semantic_result.pepsy_exp_metadata["compiled_evolution"] = True
+        return (semantic_result, report) if return_report else semantic_result
 
     def time_evolution_arrays(self, dt, parameters=None, *, coefficients=None):
         """Evaluate ``exp(-1j * dt * H)`` as backend-native tensors."""
@@ -463,12 +592,40 @@ class CompiledMPOExp:
             coefficients=coefficients,
         )
 
-    def time_evolution(self, dt, parameters=None, *, coefficients=None):
+    def time_evolution(
+        self,
+        dt,
+        parameters=None,
+        *,
+        coefficients=None,
+        chi=None,
+        cutoff=1.0e-10,
+        cutoff_mode="rel",
+        compression=None,
+        differentiable=False,
+        return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
+        progress=False,
+    ):
         """Evaluate real-time evolution and return a semantic MPO."""
-        return self.evaluate(
+        return self.exp(
             -1j * dt,
             parameters,
             coefficients=coefficients,
+            chi=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            compression=compression,
+            differentiable=differentiable,
+            return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
+            progress=progress,
         )
 
     __call__ = exp_arrays
@@ -522,6 +679,11 @@ class MPOBasis:
     fermionic : bool, default=False
         Reserved for a future sign-preserving graded history backend. The
         current higher-order block-sparse compiler rejects ``True``.
+    to_backend : callable, optional
+        Array converter used for compiled local operator blocks and
+        coefficient assembly, for example ``pepsy.backend_torch(...)`` or
+        ``pepsy.backend_jax(...)``. This is applied before higher-order
+        contractions so final Quimb compression uses the same backend.
     """
 
     def __init__(
@@ -534,6 +696,7 @@ class MPOBasis:
         physical_charges=None,
         fermionic=False,
         physical_space=None,
+        to_backend=None,
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         site_tag_id="I{}",
@@ -543,6 +706,13 @@ class MPOBasis:
         L = int(L)
         if L < 1:
             raise ValueError("L must be >= 1.")
+        if to_backend is not None and not callable(to_backend):
+            raise TypeError("to_backend must be callable or None.")
+        if to_backend is not None and symmetry is not None:
+            raise ValueError(
+                "to_backend cannot be combined with symmetry; native Symmray "
+                "MPO blocks currently require NumPy arrays."
+            )
         terms = tuple(_term_from_input(term) for term in terms)
         if not terms:
             raise ValueError("terms must contain at least one product term.")
@@ -596,9 +766,27 @@ class MPOBasis:
                 for term, (site, transition_index) in zip(terms, slots)
             )
 
+        if to_backend is not None:
+            # Keep structural sharing and fingerprinting on host arrays, then
+            # move the completed automaton and all coefficient-slot operators
+            # to the requested backend before any higher-order contractions.
+            terms = tuple(
+                _convert_term_to_backend(term, to_backend)
+                for term in terms
+            )
+            automaton = _convert_automaton_to_backend(automaton, to_backend)
+            term_slots = tuple(
+                tuple(
+                    (site, transition_index, to_backend(operator))
+                    for site, transition_index, operator in slots
+                )
+                for slots in term_slots
+            )
+
         self.L = L
         self.phys_dim = int(phys_dim)
         self._terms = terms
+        self.to_backend = to_backend
         self._slots = tuple(
             tuple((site, transition_index) for site, transition_index, _ in slots)
             for slots in term_slots
@@ -649,6 +837,8 @@ class MPOBasis:
         self._lattice_mapper = None
         self._lattice_to_chain = None
         self._chain_to_lattice = None
+        self._location_mode = "chain"
+        self._shape_inferred = False
         self._build_count = 0
         self._compiled_evolution_cache = {}
         self._cluster_expansion_cache = {}
@@ -670,15 +860,24 @@ class MPOBasis:
         inputs. A term may be written as
         ``{"operator": "ZZ", "location": (0, 1), "coefficient": value}``
         or with the existing plural ``operators``/``locations`` aliases.
+        Tuple terms may use ``(location, paulis, coefficient)`` or
+        ``((paulis, coefficient), location)`` in addition to the explicit
+        ``(operators, locations[, coefficient])`` form.
         Pepsy's compact Pauli mapping is also accepted: ``{"XX": (2, 3)}``
         or ``{"XX": ((2, 3), coefficient)}``. A word key with a nested
         coordinate support follows the same convention, for example
         ``{"xyz": (((0, 0), (1, 0), (0, 1)), coefficient)}``.
         ``shape`` may be an integer chain length or a 2D/3D lattice shape. If
         it is omitted, the smallest shape containing all term locations is
-        inferred. Common supports are canonicalized before the shared MPO
-        automaton is built, while each coefficient remains an independent
-        slot for autodiff.
+        inferred. Integer locations are already-mapped chain positions and
+        need no mapper. Coordinate locations are mapped with ``mapper`` or,
+        when it is omitted, an internally constructed ``OneDMap`` using
+        ``map_mode``. A single 1D site should be written as a bare integer;
+        a tuple such as ``(x, y)`` is a coordinate when one local operator is
+        supplied. Do not mix chain indices and coordinates in one call.
+        Common supports are canonicalized before the shared MPO automaton is
+        built, while each coefficient remains an independent slot for
+        autodiff.
         """
         length, normalized_terms, metadata = _compile_generic_terms(
             terms,
@@ -692,6 +891,8 @@ class MPOBasis:
             basis._lattice_mapper = metadata["mapper"]
             basis._lattice_to_chain = metadata["lattice_to_chain"]
             basis._chain_to_lattice = metadata["chain_to_lattice"]
+        basis._location_mode = metadata["location_mode"]
+        basis._shape_inferred = metadata["shape_inferred"]
         return basis
 
     @classmethod
@@ -771,6 +972,8 @@ class MPOBasis:
         basis._lattice_mapper = mapper
         basis._lattice_to_chain = dict(lattice_to_chain)
         basis._chain_to_lattice = dict(chain_to_lattice)
+        basis._location_mode = "lattice"
+        basis._shape_inferred = False
         return basis
 
     @property
@@ -782,6 +985,11 @@ class MPOBasis:
     def lattice_shape(self):
         """Return the compiled ``(lx, ly)`` shape, or ``None`` for chain input."""
         return self._lattice_shape
+
+    @property
+    def location_mode(self):
+        """Return ``"chain"`` or ``"lattice"`` for the parsed locations."""
+        return self._location_mode
 
     @property
     def lattice_to_chain(self):
@@ -823,6 +1031,8 @@ class MPOBasis:
             "topology_bond_dimensions": self.bond_dimensions,
             "vectorized_slot_groups": len(self._vectorized_slot_groups),
             "lattice_shape": self._lattice_shape,
+            "location_mode": self._location_mode,
+            "shape_inferred": getattr(self, "_shape_inferred", False),
             "lattice_mode": (
                 None if self._lattice_mapper is None else self._lattice_mapper.mode
             ),
@@ -850,6 +1060,10 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Build a local exact cluster expansion from this term basis.
 
@@ -868,6 +1082,10 @@ class MPOBasis:
             int(cluster_size),
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
+            symmetry,
+            repr(physical_charges),
+            bool(fermionic),
+            repr(physical_space),
         )
         expansion = self._cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -876,6 +1094,10 @@ class MPOBasis:
                 cluster_size=cluster_size,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                symmetry=symmetry,
+                physical_charges=physical_charges,
+                fermionic=fermionic,
+                physical_space=physical_space,
             )
             self._cluster_expansion_cache[cache_key] = expansion
         return expansion.exp(step, parameters=parameters)
@@ -886,6 +1108,10 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Return a reusable compiled evaluator for local cluster products."""
 
@@ -897,6 +1123,10 @@ class MPOBasis:
             int(cluster_size),
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
+            symmetry,
+            repr(physical_charges),
+            bool(fermionic),
+            repr(physical_space),
         )
         expansion = self._cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -905,6 +1135,10 @@ class MPOBasis:
                 cluster_size=cluster_size,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                symmetry=symmetry,
+                physical_charges=physical_charges,
+                fermionic=fermionic,
+                physical_space=physical_space,
             )
             self._cluster_expansion_cache[cache_key] = expansion
         return expansion.compile_exp()
@@ -918,6 +1152,19 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        graph_assembly="auto",
+        max_collection_order=None,
+        collection_budget=128,
+        assembly="direct",
+        assembly_chi=None,
+        assembly_batch_size="auto",
+        assembly_cutoff=None,
+        assembly_cutoff_mode="auto",
+        assembly_form="left",
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
         """Build a graph-aware cluster expansion with MPO output.
 
@@ -930,13 +1177,34 @@ class MPOBasis:
         ``cluster_size`` counts graph sites, not the span in MPO chain
         positions. A long-range two-site graph edge is therefore a genuine
         two-site cluster even when its MPO representation crosses many chain
-        sites.
+        sites. ``graph_assembly`` controls products of disjoint graph
+        residuals whose chain spans cross or nest; ``"auto"`` first uses a
+        cutwidth-aware frontier planner and falls back to a bounded
+        one-cluster approximation when its finite budget or planner work
+        limit is exceeded. ``assembly="streaming"`` builds local residual
+        cores, inserts bounded batches directly into the accumulator, and
+        applies a semantic fixed-rank SVD after each batch;
+        ``assembly_chi`` and ``assembly_batch_size`` control that working
+        boundary.
         """
         compiled = self.compile_graph_cluster_expansion(
             graph=graph,
             cluster_size=cluster_size,
             cutoff=cutoff,
             max_bond=max_bond,
+            graph_assembly=graph_assembly,
+            max_collection_order=max_collection_order,
+            collection_budget=collection_budget,
+            assembly=assembly,
+            assembly_chi=assembly_chi,
+            assembly_batch_size=assembly_batch_size,
+            assembly_cutoff=assembly_cutoff,
+            assembly_cutoff_mode=assembly_cutoff_mode,
+            assembly_form=assembly_form,
+            symmetry=symmetry,
+            physical_charges=physical_charges,
+            fermionic=fermionic,
+            physical_space=physical_space,
         )
         return compiled.exp(step, parameters=parameters)
 
@@ -947,13 +1215,59 @@ class MPOBasis:
         cluster_size=2,
         cutoff=1.0e-12,
         max_bond=None,
+        graph_assembly="auto",
+        max_collection_order=None,
+        collection_budget=128,
+        assembly="direct",
+        assembly_chi=None,
+        assembly_batch_size="auto",
+        assembly_cutoff=None,
+        assembly_cutoff_mode="auto",
+        assembly_form="left",
+        symmetry=None,
+        physical_charges=None,
+        fermionic=False,
+        physical_space=None,
     ):
-        """Compile a reusable graph-aware ordered cluster evaluator."""
+        """Compile a reusable graph-aware ordered cluster evaluator.
+
+        ``graph_assembly="exact"`` retains every compatible graph-cluster
+        collection up to ``collection_budget``. Use
+        ``graph_assembly="bounded"`` and ``max_collection_order`` for an
+        explicit approximation on wide MPO orderings. ``assembly="streaming"``
+        is a separate working-memory control that inserts graph-path cores
+        directly into the accumulator in batches, without temporary path or
+        batch MPOs.
+        """
         from .mpo_product import (  # pylint: disable=import-outside-toplevel
             MPOGraphClusterProductExpansion,
             _graph_lattice_for_basis,
+            _normalize_graph_assembly,
+            _normalize_mpo_assembly,
+            _validate_assembly_batch_size,
+            _validate_assembly_chi,
+            _normalize_assembly_cutoff_mode,
+            _normalize_assembly_form,
+            _validate_assembly_cutoff,
+            _validate_graph_collection_budget,
+            _validate_graph_collection_order,
         )
 
+        graph_assembly = _normalize_graph_assembly(graph_assembly)
+        assembly = _normalize_mpo_assembly(assembly)
+        assembly_chi = _validate_assembly_chi(assembly_chi)
+        assembly_batch_size = _validate_assembly_batch_size(
+            assembly_batch_size
+        )
+        assembly_cutoff = _validate_assembly_cutoff(assembly_cutoff)
+        assembly_cutoff_mode = _normalize_assembly_cutoff_mode(
+            assembly_cutoff_mode
+        )
+        assembly_form = _normalize_assembly_form(assembly_form)
+        max_collection_order = _validate_graph_collection_order(
+            max_collection_order
+        )
+        collection_budget = _validate_graph_collection_budget(collection_budget)
         normalized_graph = _graph_lattice_for_basis(graph, self)
         cache_key = (
             tuple(normalized_graph.sites),
@@ -961,6 +1275,19 @@ class MPOBasis:
             int(cluster_size),
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
+            graph_assembly,
+            None if max_collection_order is None else int(max_collection_order),
+            None if collection_budget is None else int(collection_budget),
+            assembly,
+            None if assembly_chi is None else int(assembly_chi),
+            assembly_batch_size,
+            assembly_cutoff,
+            assembly_cutoff_mode,
+            assembly_form,
+            symmetry,
+            repr(physical_charges),
+            bool(fermionic),
+            repr(physical_space),
         )
         expansion = self._graph_cluster_expansion_cache.get(cache_key)
         if expansion is None:
@@ -970,6 +1297,19 @@ class MPOBasis:
                 cluster_size=cluster_size,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                graph_assembly=graph_assembly,
+                max_collection_order=max_collection_order,
+                collection_budget=collection_budget,
+                assembly=assembly,
+                assembly_chi=assembly_chi,
+                assembly_batch_size=assembly_batch_size,
+                assembly_cutoff=assembly_cutoff,
+                assembly_cutoff_mode=assembly_cutoff_mode,
+                assembly_form=assembly_form,
+                symmetry=symmetry,
+                physical_charges=physical_charges,
+                fermionic=fermionic,
+                physical_space=physical_space,
             )
             self._graph_cluster_expansion_cache[cache_key] = expansion
         return expansion.compile_exp()
@@ -984,6 +1324,7 @@ class MPOBasis:
         max_bond=None,
         on_exceed="raise",
         history_storage="auto",
+        extension_budget=None,
     ):
         """Compatibility wrapper for :meth:`compile_exp`.
 
@@ -991,6 +1332,7 @@ class MPOBasis:
         available for existing programs and returns the same cached
         :class:`CompiledMPOExp` object.
         """
+        history_storage = _canonical_history_storage(history_storage)
         key = (
             order,
             mode,
@@ -999,6 +1341,7 @@ class MPOBasis:
             max_bond,
             on_exceed,
             history_storage,
+            extension_budget,
         )
         try:
             compiled = self._compiled_evolution_cache.get(key)
@@ -1014,6 +1357,7 @@ class MPOBasis:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 history_storage=history_storage,
+                extension_budget=extension_budget,
             )
             try:
                 self._compiled_evolution_cache[key] = compiled
@@ -1048,6 +1392,15 @@ class MPOBasis:
         _check_scalar(coefficient, name="MPO coefficient")
         return coefficient
 
+    def _convert_value_to_backend(self, value):
+        """Convert host scalar values while preserving existing graph values."""
+        if self.to_backend is not None and _backend_name(value) in {
+            "builtins",
+            "numpy",
+        }:
+            return self.to_backend(value)
+        return value
+
     @staticmethod
     def _local_operator(term, site):
         """Return the local factor carried by ``term`` at ``site``."""
@@ -1072,6 +1425,7 @@ class MPOBasis:
             self._resolve_coefficient(term.coefficient, parameters)
             for term in self._terms
         )
+        values = tuple(self._convert_value_to_backend(value) for value in values)
         reference = _backend_reference(values)
         values = tuple(_as_backend(value, like=reference) for value in values)
         return ar.do("stack", values, axis=0)
@@ -1116,6 +1470,7 @@ class MPOBasis:
                 )
         for index, value in enumerate(values):
             _check_scalar(value, name=f"coefficients[{index}]")
+        values = tuple(self._convert_value_to_backend(value) for value in values)
         reference = _backend_reference(values)
         return tuple(_as_backend(value, like=reference) for value in values)
 
@@ -1238,6 +1593,8 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
     ):
         """Build ``exp(dt * H(parameters))`` with the higher-order MPO path."""
         return self.build(
@@ -1253,6 +1610,8 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
+            progress=progress,
         )
 
     def exp(
@@ -1270,12 +1629,18 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
         chi=None,
         cutoff=1.0e-10,
         cutoff_mode="rel",
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
     ):
         """Build ``exp(step * H(parameters))`` with optional compression.
 
@@ -1283,6 +1648,7 @@ class MPOBasis:
         real-time evolution, pass ``step=-1j * tau``; ``dt=...`` remains a
         compatibility keyword. ``chi`` is the final MPO bond cap, while
         ``max_bond`` only guards the temporary higher-order history.
+        ``progress=True`` displays stage timings and current/final bond sizes.
         """
         step = _resolve_exp_step(step, dt)
         return self.build(parameters, coefficients=coefficients).exp(
@@ -1295,12 +1661,18 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
+            progress=progress,
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             compression=compression,
             differentiable=differentiable,
             return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
         )
 
     def time_evolution(
@@ -1317,12 +1689,18 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
         chi=None,
         cutoff=1.0e-10,
         cutoff_mode="rel",
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
     ):
         """Build the real-time MPO ``exp(-1j * dt * H(parameters))``."""
         return self.build(parameters, coefficients=coefficients).time_evolution(
@@ -1335,12 +1713,18 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
+            progress=progress,
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             compression=compression,
             differentiable=differentiable,
             return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
         )
 
     def exp_arrays(
@@ -1358,6 +1742,7 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        extension_budget=None,
     ):
         """Evaluate ``exp(step * H)`` as backend-native tensor tuples.
 
@@ -1376,6 +1761,7 @@ class MPOBasis:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 history_storage=history_storage,
+                extension_budget=extension_budget,
             ).exp_arrays(
                 step,
                 parameters,
@@ -1394,6 +1780,7 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
         )
 
     def time_evolution_arrays(
@@ -1410,6 +1797,7 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        extension_budget=None,
     ):
         """Evaluate real-time evolution as backend-native tensor tuples."""
         if cache_history:
@@ -1421,6 +1809,7 @@ class MPOBasis:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 history_storage=history_storage,
+                extension_budget=extension_budget,
             ).time_evolution_arrays(
                 dt,
                 parameters,
@@ -1439,6 +1828,7 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
         )
 
     def exp_batch(
@@ -1455,6 +1845,7 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        extension_budget=None,
     ):
         """Evaluate ``exp(step * H)`` for a batch of coefficient vectors.
 
@@ -1485,6 +1876,7 @@ class MPOBasis:
             "on_exceed": on_exceed,
             "cache_history": cache_history,
             "history_storage": history_storage,
+            "extension_budget": extension_budget,
         }
         if cache_history:
             compiled = self.compile_exp(
@@ -1495,6 +1887,7 @@ class MPOBasis:
                 max_bond=max_bond,
                 on_exceed=on_exceed,
                 history_storage=history_storage,
+                extension_budget=extension_budget,
             )
             if _backend_name(coefficients) == "jax":
                 import jax  # pylint: disable=import-outside-toplevel
@@ -1592,12 +1985,18 @@ class MPOBasis:
         on_exceed="raise",
         cache_history=True,
         history_storage="auto",
+        progress=False,
+        extension_budget=None,
         chi=None,
         cutoff=1.0e-10,
         cutoff_mode="rel",
         compression=None,
         differentiable=False,
         return_report=False,
+        sector_aware="auto",
+        form=None,
+        create_bond=False,
+        compress_opts=None,
     ):
         """Build ``exp(-1j * dt * H(parameters))`` with optional compression.
 
@@ -1621,12 +2020,18 @@ class MPOBasis:
             on_exceed=on_exceed,
             cache_history=cache_history,
             history_storage=history_storage,
+            extension_budget=extension_budget,
+            progress=progress,
             chi=chi,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             compression=compression,
             differentiable=differentiable,
             return_report=return_report,
+            sector_aware=sector_aware,
+            form=form,
+            create_bond=create_bond,
+            compress_opts=compress_opts,
         )
 
 
@@ -1649,23 +2054,33 @@ def exp_mpo(
     on_exceed="raise",
     cache_history=True,
     history_storage="auto",
+    extension_budget=None,
     chi=None,
     cutoff=1.0e-10,
     cutoff_mode="rel",
     compression=None,
     differentiable=False,
+    sector_aware="auto",
     symmetry=None,
     physical_charges=None,
     fermionic=False,
     physical_space=None,
+    to_backend=None,
     return_semantic=False,
     return_report=False,
+    form=None,
+    create_bond=False,
+    compress_opts=None,
+    progress=False,
 ):
     """Build an exponential MPO directly from local operator terms.
 
     The usual term form is ``{"operator": "ZZ", "location": (0, 1),
     "coefficient": value}``. The compact Pepsy mapping form
     ``{"XX": (2, 3)}`` or ``{"XX": ((2, 3), coefficient)}`` is equivalent.
+    Tuple terms may also use ``(location, paulis, coefficient)`` or
+    ``((paulis, coefficient), location)``. The latter forms are shared with
+    :meth:`ham_tn.build_mpo`.
     ``operator`` may also be a local matrix or a sequence of local matrices,
     and locations may be integer chain sites or 2D/3D coordinates. The lattice
     shape is inferred when possible, or can be supplied as
@@ -1673,10 +2088,22 @@ def exp_mpo(
     compiled through one shared automaton, so onsite contributions are
     combined at their transition while coefficient slots remain independent.
 
+    ``to_backend`` converts the compiled local operator blocks and coefficient
+    values before the higher-order contraction path runs. The final Quimb MPO
+    is also checked at the boundary with ``apply_to_arrays`` so contractions
+    and numerical compression remain on the requested backend.
+
     By default this convenience function returns a compiled Quimb MPO. Set
     ``return_semantic=True`` when the higher-order history object and its
-    ``to_mpo()`` boundary are needed. Pass ``symmetry`` and
+    ``to_mpo()`` boundary are needed. When ``chi`` is supplied, the terms are
+    first compiled into the higher-order MPO and the resulting final MPO is
+    then compressed to that bond cap. Pass ``form``/``create_bond`` for direct
+    Quimb controls and use ``compress_opts`` for additional compression
+    keywords such as ``method``, ``absorb``, ``renorm``, or ``info``. Pass
+    ``symmetry`` and
     ``physical_charges`` to select the native bosonic block-sparse compiler.
+    Pass ``progress=True`` to display stage timings, current bond sizes, and
+    the final ``chi`` compression.
     """
     if (
         return_semantic
@@ -1698,6 +2125,7 @@ def exp_mpo(
         physical_charges=physical_charges,
         fermionic=fermionic,
         physical_space=physical_space,
+        to_backend=to_backend,
     )
     result = basis.exp(
         step,
@@ -1712,12 +2140,18 @@ def exp_mpo(
         on_exceed=on_exceed,
         cache_history=cache_history,
         history_storage=history_storage,
+        extension_budget=extension_budget,
         chi=chi,
         cutoff=cutoff,
         cutoff_mode=cutoff_mode,
         compression=compression,
         differentiable=differentiable,
+        sector_aware=sector_aware,
         return_report=return_report,
+        form=form,
+        create_bond=create_bond,
+        compress_opts=compress_opts,
+        progress=progress,
     )
     if return_report:
         semantic_result, report = result
@@ -1730,6 +2164,12 @@ def exp_mpo(
         output = semantic_result.to_mpo()
     else:
         output = semantic_result
+    if not return_semantic:
+        _apply_to_backend(output, to_backend)
+        if progress and not hasattr(output, "pepsy_exp_metadata"):
+            semantic = getattr(output, "pepsy_first_degree", None)
+            if semantic is not None:
+                output.pepsy_exp_metadata = dict(semantic.metadata)
     return (output, report) if return_report else output
 
 
@@ -1740,6 +2180,7 @@ from .mpo_semantic import (  # noqa: E402
     FirstDegreeMPO,
     MPOLocalOperatorTerm,
     MPOParameter,
+    MPOProductTerm,
     _MAX_FUSED_SLOT_BANK_ELEMENTS,
     _align_tensordot_dtypes,
     _check_scalar,

@@ -1,8 +1,11 @@
 """Tests for the finite MPO cluster-basis expansion."""
 
+import warnings
+
 import numpy as np
 import pytest
 
+from pepsy.tensors import OneDMap
 from pepsy.operators import (
     ClusterLattice,
     ClusterBasisExpansion,
@@ -12,8 +15,12 @@ from pepsy.operators import (
     MPOClusterFactor,
     MPOGraphClusterBasisExpansion,
     MPOParameter,
+    MPOPhysicalSpace,
     MPOProductTerm,
+    exp_mpo_cluster,
+    exp_mpo_cluster_product,
 )
+from pepsy.operators.mpo_semantic import FirstDegreeMPO
 
 
 scipy_linalg = pytest.importorskip("scipy.linalg")
@@ -255,6 +262,33 @@ def test_graph_cluster_expansion_maps_square_coordinates_and_preserves_factor_or
     assert expansion.last_report.cluster_mode == "graph"
 
 
+def test_graph_cluster_expansion_accepts_mapped_chain_locations_with_shape():
+    """A OneDMap accepts terms already expressed in MPO-chain positions."""
+    x, z = _paulis()
+    mapper = OneDMap(2, 2, mode="snake")
+    terms = [
+        (("zz", 0.7), (0, 1)),
+        (("x", -0.2), (2,)),
+    ]
+    result = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=(2, 2),
+        mapper=mapper,
+        graph="square",
+        cyclic=True,
+        cluster_size=2,
+    )
+    generator = 0.7 * _kron_all((z, z, np.eye(2), np.eye(2)))
+    generator += -0.2 * _kron_all((np.eye(2), np.eye(2), x, np.eye(2)))
+    assert result.L == 4
+    np.testing.assert_allclose(
+        result.to_dense(),
+        scipy_linalg.expm(0.01 * generator),
+        atol=1.0e-11,
+    )
+
+
 def test_graph_cluster_expansion_keeps_products_of_crossing_long_range_clusters():
     """Disjoint long-range clusters may nest in the MPO chain ordering."""
     x, _z = _paulis()
@@ -324,6 +358,46 @@ def test_three_ordered_factors_keep_all_torch_autodiff_graphs_finite():
     assert all(torch.isfinite(gradient) for gradient in gradients)
 
 
+@pytest.mark.parametrize("graph", (None, ((0, 1), ((0, 1),))))
+def test_complex_ordered_factor_prefactors_promote_product_identity(graph):
+    """Real Torch slots and complex prefactors use a complex product dtype."""
+    torch = pytest.importorskip("torch")
+    x, z = (
+        torch.as_tensor(matrix, dtype=torch.complex128)
+        for matrix in _paulis()
+    )
+    first = MPOBasis.from_local_terms(
+        2,
+        [MPOProductTerm((0,), (x,), MPOParameter("x"))],
+    )
+    second = MPOBasis.from_local_terms(
+        2,
+        [MPOProductTerm((1,), (z,), MPOParameter("z"))],
+    )
+    options = {} if graph is None else {"graph": graph}
+    expansion = MPOClusterBasisExpansion.from_mpo_bases(
+        (first, second),
+        coefficients=(-0.5j, -0.25j),
+        cluster_size=2,
+        **options,
+    )
+    coefficients = {
+        "x": torch.tensor(0.2, dtype=torch.float64, requires_grad=True),
+        "z": torch.tensor(-0.3, dtype=torch.float64, requires_grad=True),
+    }
+    actual = expansion.exp(1.0, parameters=coefficients).to_mpo().to_dense()
+    identity = torch.eye(2, dtype=torch.complex128)
+    expected = torch.matrix_exp(
+        -0.5j * coefficients["x"] * torch.kron(x, identity)
+    ) @ torch.matrix_exp(
+        -0.25j * coefficients["z"] * torch.kron(identity, z)
+    )
+
+    assert torch.allclose(actual, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradients = torch.autograd.grad(actual.real.sum(), tuple(coefficients.values()))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+
 def test_three_ordered_factors_keep_jax_autodiff_graph_finite():
     """The JAX path uses a static, trace-safe local factorization."""
     jax = pytest.importorskip("jax")
@@ -345,3 +419,681 @@ def test_three_ordered_factors_keep_jax_autodiff_graph_finite():
 
     gradients = jax.grad(loss)(jnp.array([0.2, -0.3, 0.4, 0.01]))
     assert np.all(np.isfinite(np.asarray(gradients)))
+
+
+def test_exp_mpo_cluster_matches_term_centric_exp_mpo_surface():
+    """The cluster facade parses compact terms and returns a Quimb MPO."""
+    x, z = _paulis()
+    result, report = exp_mpo_cluster(
+        [((0, 1), "XX", 1.0), ((1, 2), "ZZ", -0.2)],
+        0.03,
+        shape=3,
+        cluster_size=3,
+        cutoff=0.0,
+        return_report=True,
+    )
+    hamiltonian = _kron_all((x, x, np.eye(2))) - 0.2 * _kron_all(
+        (np.eye(2), z, z)
+    )
+    np.testing.assert_allclose(
+        result.to_dense(),
+        scipy_linalg.expm(0.03 * hamiltonian),
+        atol=1.0e-12,
+    )
+    assert report.cluster_size == 3
+    assert result.pepsy_cluster_report is report
+    assert result.pepsy_cluster_metadata["cluster_mode"] == "interval"
+
+
+def test_exp_mpo_cluster_infers_chain_or_coordinate_terms_and_mapper():
+    """The facade maps coordinates internally while preserving 1D terms."""
+    coordinate_terms = [
+        (("zz", 0.7), ((0, 0), (1, 0))),
+        (("x", -0.2), (1, 1)),
+    ]
+    common = {
+        "step": 0.01,
+        "shape": (2, 2),
+        "graph": "square",
+        "cyclic": False,
+        "cluster_size": 2,
+        "cutoff": 0.0,
+        "graph_assembly": "bounded",
+        "max_collection_order": 1,
+    }
+    inferred = exp_mpo_cluster(coordinate_terms, **common)
+    inferred_shape = exp_mpo_cluster(
+        coordinate_terms,
+        **{key: value for key, value in common.items() if key != "shape"},
+    )
+    mapper = OneDMap(2, 2, mode="snake")
+    _chain_to_lattice, lattice_to_chain = mapper.build()
+    mapped_terms = [
+        (("zz", 0.7), (lattice_to_chain[(0, 0)], lattice_to_chain[(1, 0)])),
+        (("x", -0.2), lattice_to_chain[(1, 1)]),
+    ]
+    explicit_mapper = exp_mpo_cluster(
+        mapped_terms,
+        mapper=mapper,
+        **common,
+    )
+
+    np.testing.assert_allclose(
+        inferred.to_dense(),
+        inferred_shape.to_dense(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        inferred.to_dense(),
+        explicit_mapper.to_dense(),
+        atol=1.0e-12,
+    )
+
+    chain = exp_mpo_cluster(
+        [(("zz", 0.7), (0, 1)), (("x", -0.2), 2)],
+        0.01,
+        shape=3,
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    assert chain.L == 3
+    assert chain.pepsy_cluster_metadata["cluster_mode"] == "interval"
+
+
+def test_exp_mpo_cluster_preserves_requested_backend_and_coefficients():
+    """The term facade applies ``to_backend`` before local cluster work."""
+    torch = pytest.importorskip("torch")
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    converted = []
+
+    def to_backend(value):
+        converted.append(value)
+        return torch.as_tensor(value, dtype=torch.float64)
+
+    semantic = exp_mpo_cluster(
+        [((0, 1), (x, x), coefficient)],
+        step,
+        shape=3,
+        cluster_size=2,
+        cutoff=0.0,
+        to_backend=to_backend,
+        return_semantic=True,
+    )
+    assert all(isinstance(array, torch.Tensor) for array in semantic.arrays)
+    assert all(
+        isinstance(tensor.data, torch.Tensor)
+        for tensor in semantic.to_mpo().tensors
+    )
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+    exp_mpo_cluster(
+        [((0, 1), (x, x), 0.7)],
+        0.01,
+        shape=3,
+        cluster_size=2,
+        cutoff=0.0,
+        to_backend=to_backend,
+        return_semantic=True,
+    )
+    assert any(np.ndim(value) == 0 for value in converted)
+
+
+def test_exp_mpo_cluster_maps_coordinate_graphs_and_supports_ordered_factors():
+    """The high-level facade maps graph coordinates before MPO assembly."""
+    x, z = _paulis()
+    graph = ClusterLattice.from_edges(
+        ((0, 0), (0, 1), (1, 0), (1, 1)),
+        [
+            ((0, 0), (0, 1)),
+            ((0, 0), (1, 0)),
+            ((0, 1), (1, 1)),
+            ((1, 0), (1, 1)),
+            ((0, 0), (1, 1)),
+        ],
+    )
+    result = exp_mpo_cluster(
+        step=0.05,
+        shape=(2, 2),
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        factors=[
+            [
+                {
+                    "operator": "XX",
+                    "location": ((0, 0), (1, 1)),
+                    "coefficient": 0.2,
+                }
+            ],
+            [
+                {
+                    "operator": "ZZ",
+                    "location": ((0, 0), (1, 1)),
+                    "coefficient": -0.3,
+                }
+            ],
+        ],
+    )
+    mapping = MPOBasis.from_square_lattice(
+        2,
+        2,
+        [{"locations": ((0, 0), (1, 1)), "paulis": "XX"}],
+    ).lattice_to_chain
+    xx = _kron_all((x, np.eye(2), x, np.eye(2)))
+    zz = _kron_all((z, np.eye(2), z, np.eye(2)))
+    expected = scipy_linalg.expm(0.01 * xx) @ scipy_linalg.expm(-0.015 * zz)
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-11)
+    assert result.pepsy_cluster_metadata["cluster_mode"] == "graph"
+    assert result.pepsy_cluster_metadata["factor_count"] == 2
+    assert mapping[(1, 1)] == 2
+
+
+def test_exp_mpo_cluster_product_is_the_one_shot_three_factor_surface():
+    """The product-named facade builds the ordered A-B-C cluster target."""
+    x, z = _paulis()
+    factors = (
+        MPOClusterFactor([((0, 1), (x, x))], coefficient=0.2),
+        MPOClusterFactor([((1, 2), (z, z))], coefficient=-0.3),
+        MPOClusterFactor([((0, 1), (z, x))], coefficient=0.4),
+    )
+    result, report = exp_mpo_cluster_product(
+        factors,
+        dt=0.05,
+        shape=3,
+        cluster_size=3,
+        cutoff=0.0,
+        return_report=True,
+    )
+    identity = np.eye(2)
+    operator_a = _kron_all((x, x, identity))
+    operator_b = _kron_all((identity, z, z))
+    operator_c = _kron_all((z, x, identity))
+    expected = (
+        scipy_linalg.expm(0.05 * 0.2 * operator_a)
+        @ scipy_linalg.expm(0.05 * -0.3 * operator_b)
+        @ scipy_linalg.expm(0.05 * 0.4 * operator_c)
+    )
+
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
+    assert report.factor_count == 3
+    assert result.pepsy_cluster_metadata["factor_count"] == 3
+
+
+def test_exp_mpo_cluster_accepts_square_graph_shorthand_and_cyclic_edges():
+    """Shape plus a compact graph name is enough for periodic square graphs."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    term = {
+        "operator": "XX",
+        "location": ((0, 1), (2, 1)),
+        "coefficient": 0.3,
+    }
+    result = exp_mpo_cluster(
+        [term],
+        0.05,
+        shape=(3, 2),
+        graph="square",
+        cyclic=True,
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    mapping = MPOBasis.from_terms([term], shape=(3, 2)).lattice_to_chain
+    sites = sorted((mapping[(0, 1)], mapping[(2, 1)]))
+    factors = [np.eye(2) for _ in range(6)]
+    factors[sites[0]] = x
+    factors[sites[1]] = x
+    hamiltonian = factors[0]
+    for factor in factors[1:]:
+        hamiltonian = np.kron(hamiltonian, factor)
+    expected = scipy_linalg.expm(0.015 * hamiltonian)
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
+
+
+def test_exp_mpo_cluster_auto_graph_follows_term_location_mode():
+    """The compact auto graph selects chain or square from parsed terms."""
+    lattice_terms = [
+        (("XX", 0.2), ((0, 0), (1, 0))),
+        (("X", -0.1), (0, 1)),
+    ]
+    lattice, lattice_report = exp_mpo_cluster(
+        lattice_terms,
+        0.01,
+        shape=(2, 2),
+        graph="auto",
+        cluster_size=2,
+        cutoff=0.0,
+        return_report=True,
+    )
+    assert lattice_report.cluster_mode == "graph"
+    assert lattice.pepsy_cluster_metadata["graph_inferred"] == "square"
+
+    chain, chain_report = exp_mpo_cluster(
+        [(("XX", 0.2), (0, 1)), (("X", -0.1), 0)],
+        0.01,
+        shape=2,
+        graph="auto",
+        cluster_size=2,
+        cutoff=0.0,
+        return_report=True,
+    )
+    assert chain_report.cluster_mode == "graph"
+    assert chain.pepsy_cluster_metadata["graph_inferred"] == "chain"
+
+
+def test_interval_cluster_expansion_keeps_explicit_string_operators():
+    """Term-centric cluster construction retains fermionic gap operators."""
+    x, z = _paulis()
+    term = MPOProductTerm((0, 2), (x, x), string_operators=(z,))
+    result = exp_mpo_cluster(
+        [term],
+        0.1,
+        shape=3,
+        cluster_size=3,
+        cutoff=0.0,
+    )
+    expected = scipy_linalg.expm(0.1 * _kron_all((x, z, x)))
+    np.testing.assert_allclose(result.to_dense(), expected, atol=1.0e-12)
+
+
+def test_auto_graph_assembly_bounds_wide_mpo_collection_plans():
+    """Wide graph orderings fall back before materializing all collections."""
+    lattice = ClusterLattice.square(3, 3)
+    terms = [
+        {
+            "operator": "ZZ",
+            "location": (source, target),
+            "coefficient": 0.7,
+        }
+        for source, target in lattice.edges
+    ]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result, report = exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=(3, 3),
+            graph=lattice,
+            cluster_size=2,
+            cutoff=0.0,
+            return_semantic=True,
+            return_report=True,
+        )
+
+    assert any(
+        "bounded one-cluster approximation" in str(item.message)
+        for item in caught
+    )
+    assert report.graph_assembly == "bounded"
+    assert report.graph_collection_order == 1
+    assert report.graph_collection_count == 0
+    assert report.graph_collection_truncated
+    assert report.graph_frontier_width > 0
+    assert result.metadata["cluster_report"] is report
+
+
+def test_exact_graph_assembly_rejects_a_collection_budget_overflow():
+    """Exact graph assembly fails before entering an unsafe large plan."""
+    z = np.diag([1.0, -1.0])
+    lattice = ClusterLattice.square(3, 3)
+    terms = [
+        ((source, target), (z, z), 0.7)
+        for source, target in lattice.edges
+    ]
+
+    with pytest.raises(ValueError, match="exceeds collection_budget"):
+        exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=(3, 3),
+            graph=lattice,
+            cluster_size=2,
+            cutoff=0.0,
+            graph_assembly="exact",
+            collection_budget=10,
+            return_semantic=True,
+        )
+
+
+def test_bounded_graph_assembly_reports_requested_collection_order():
+    """The bounded policy exposes its approximation axis in diagnostics."""
+    x, _z = _paulis()
+    lattice = ClusterLattice.square(2, 2)
+    terms = [
+        ((source, target), (x, x), 0.7)
+        for source, target in lattice.edges
+    ]
+    result, report = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=(2, 2),
+        graph=lattice,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="bounded",
+        max_collection_order=1,
+        return_semantic=True,
+        return_report=True,
+    )
+
+    assert report.graph_assembly == "bounded"
+    assert report.graph_collection_order == 1
+    assert report.graph_collection_truncated
+    assert result.pepsy_cluster_metadata["selected_graph_assembly"] == "bounded"
+
+
+def test_streaming_graph_assembly_compresses_between_path_batches():
+    """Streaming path accumulation stays bounded and preserves a lossless case."""
+    x, z = _paulis()
+    terms = [
+        ((0, 1), (x, x), 0.7),
+        ((1, 2), (z, z), -0.3),
+    ]
+    direct = exp_mpo_cluster(
+        terms,
+        0.04,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    streamed, report = exp_mpo_cluster(
+        terms,
+        0.04,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=64,
+        assembly_batch_size=1,
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        direct.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.assembly == "streaming"
+    assert report.assembly_chi == 64
+    assert report.assembly_batch_size == 1
+    assert report.assembly_compression_count == 2
+    assert report.assembly_peak_bond_dimensions
+    assert max(report.initial_bond_dimensions) <= 64
+    assert streamed.pepsy_cluster_metadata["assembly"] == "streaming"
+
+
+def test_streaming_graph_assembly_resolves_auto_batch_size():
+    """The default streaming batch policy is adaptive and observable."""
+    x, z = _paulis()
+    result, report = exp_mpo_cluster(
+        [
+            ((0, 1), (x, x), 0.7),
+            ((1, 2), (z, z), -0.3),
+        ],
+        0.04,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=64,
+        return_report=True,
+    )
+
+    assert report.assembly_batch_size == "auto"
+    assert report.assembly_resolved_batch_size == 2
+    assert (
+        result.pepsy_cluster_metadata["assembly_resolved_batch_size"] == 2
+    )
+
+
+def test_streaming_graph_assembly_handles_collection_paths():
+    """Streaming also batches exact graph-collection paths on small graphs."""
+    x, _z = _paulis()
+    graph = ClusterLattice.from_edges(
+        range(4),
+        ((0, 1), (1, 2), (2, 3), (3, 0)),
+        name="cycle",
+    )
+    terms = [
+        ((0, 1), (x, x), 0.7),
+        ((1, 2), (x, x), -0.3),
+        ((2, 3), (x, x), 0.2),
+        ((3, 0), (x, x), 0.1),
+    ]
+    direct = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=4,
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="exact",
+        collection_budget=64,
+    )
+    streamed, report = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=4,
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="exact",
+        collection_budget=64,
+        assembly="streaming",
+        assembly_chi=64,
+        assembly_batch_size=2,
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        direct.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.graph_collection_count > 0
+    assert report.graph_planner == "frontier_dp"
+    assert report.graph_planner_state_count > 0
+    assert report.assembly_compression_count > 0
+
+
+def test_frontier_planner_counts_cycle_collections_without_materializing_them():
+    """The cutwidth-aware count agrees with the small explicit inventory."""
+    x, _z = _paulis()
+    graph = ClusterLattice.from_edges(
+        range(4),
+        ((0, 1), (1, 2), (2, 3), (3, 0)),
+        name="cycle",
+    )
+    expansion = MPOGraphClusterBasisExpansion.from_local_terms(
+        4,
+        [((source, target), (x, x), 0.7) for source, target in graph.edges],
+        graph=graph,
+        cluster_size=2,
+        cutoff=0.0,
+        graph_assembly="exact",
+        collection_budget=64,
+    )
+
+    planning = expansion._graph_collection_frontier_plan(budget=64)
+    collections, truncated = expansion._bounded_graph_cluster_collections(
+        budget=64,
+    )
+
+    assert not planning["overflow"]
+    assert planning["collection_count"] == len(collections)
+    assert not truncated
+    assert planning["state_count"] > 0
+
+
+def test_batched_path_insertion_matches_repeated_exact_mpo_addition():
+    """Direct batched insertion preserves the additive MPO semantics."""
+    x, z = _paulis()
+    identity = np.eye(2)
+    rail = FirstDegreeMPO(
+        [identity.reshape(1, 1, 2, 2)] * 3,
+        degree=2,
+    )
+    paths = [
+        tuple(operator.reshape(1, 1, 2, 2) for operator in (x, identity, z)),
+        tuple(operator.reshape(1, 1, 2, 2) for operator in (identity, z, x)),
+    ]
+    batched = rail._add_path_cores_batch(paths)
+    repeated = rail
+    for path in paths:
+        repeated = repeated.add(FirstDegreeMPO(path, degree=2))
+
+    np.testing.assert_allclose(
+        batched.to_mpo().to_dense(),
+        repeated.to_mpo().to_dense(),
+        atol=1.0e-12,
+    )
+
+
+def test_streaming_graph_assembly_validates_working_cap_options():
+    """Streaming options have an explicit, non-overlapping API contract."""
+    x, _z = _paulis()
+    terms = [((0, 1), (x, x), 0.7)]
+    with pytest.raises(ValueError, match="requires a positive assembly_chi"):
+        exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=2,
+            graph="chain",
+            cluster_size=2,
+            assembly="streaming",
+        )
+    with pytest.raises(ValueError, match="require assembly='streaming'"):
+        exp_mpo_cluster(
+            terms,
+            0.01,
+            shape=2,
+            graph="chain",
+            cluster_size=2,
+            assembly_chi=8,
+        )
+
+
+def test_streaming_graph_assembly_preserves_backend_autodiff():
+    """Intermediate streaming SVDs remain on the requested backend."""
+    torch = pytest.importorskip("torch")
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    coefficient = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    step = torch.tensor(0.01, dtype=torch.float64, requires_grad=True)
+    semantic = exp_mpo_cluster(
+        [((0, 1), (x, x), coefficient)],
+        step,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=8,
+        assembly_batch_size=1,
+        to_backend=lambda value: torch.as_tensor(value, dtype=torch.float64),
+        return_semantic=True,
+    )
+
+    assert all(isinstance(array, torch.Tensor) for array in semantic.arrays)
+    loss = sum(array.real.sum() for array in semantic.arrays)
+    gradients = torch.autograd.grad(loss, (coefficient, step))
+    assert all(torch.isfinite(gradient) for gradient in gradients)
+
+
+def test_cluster_direct_assembly_compiles_native_symmetry_blocks():
+    """Cluster MPOs retain native Symmray blocks for neutral terms."""
+    pytest.importorskip("symmray")
+    _x, z = _paulis()
+    terms = [
+        ((0,), (z,), 0.2),
+        ((0, 1), (z, z), -0.3),
+    ]
+    ordinary = exp_mpo_cluster(
+        terms,
+        0.02,
+        shape=3,
+        cluster_size=2,
+    )
+    native, report = exp_mpo_cluster(
+        terms,
+        0.02,
+        shape=3,
+        cluster_size=2,
+        symmetry="U1",
+        physical_charges=(0, 1),
+        return_report=True,
+    )
+
+    np.testing.assert_allclose(
+        native.to_dense(),
+        ordinary.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.symmetry == "U1"
+    assert report.physical_charges == (0, 1)
+    assert report.native_block_sparse
+    assert native.pepsy_mpo_symmetry == "U1"
+    assert native.pepsy_first_degree.is_block_sparse
+    assert all(hasattr(tensor.data, "blocks") for tensor in native)
+
+
+def test_cluster_native_physical_space_and_adaptive_streaming_api():
+    """Physical-space metadata and cutoff-aware streaming share one API."""
+    pytest.importorskip("symmray")
+    _x, z = _paulis()
+    terms = [
+        ((0, 1), (z, z), 0.7),
+        ((1, 2), (z, z), -0.3),
+    ]
+    native = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        physical_space=MPOPhysicalSpace(
+            2,
+            symmetry="U1",
+            physical_charges=(0, 1),
+        ),
+    )
+    assert native.pepsy_mpo_symmetry == "U1"
+
+    direct = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+    )
+    streamed, report = exp_mpo_cluster(
+        terms,
+        0.01,
+        shape=3,
+        graph="chain",
+        cluster_size=2,
+        cutoff=0.0,
+        assembly="streaming",
+        assembly_chi=32,
+        assembly_batch_size=1,
+        assembly_cutoff=1.0e-12,
+        assembly_cutoff_mode="auto",
+        assembly_form="right",
+        return_report=True,
+    )
+    np.testing.assert_allclose(
+        streamed.to_dense(),
+        direct.to_dense(),
+        atol=1.0e-12,
+    )
+    assert report.assembly_cutoff == 1.0e-12
+    assert report.assembly_cutoff_mode == "rsum2"
+    assert report.assembly_form == "right"
+    assert report.assembly_compression_count == 2
+    assert len(report.assembly_discarded_weights) > 0

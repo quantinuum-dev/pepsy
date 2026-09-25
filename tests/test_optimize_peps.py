@@ -3,8 +3,10 @@
 import numpy as np
 import pytest
 import quimb.tensor as qtn
+from types import SimpleNamespace
 
 from pepsy.backends import TorchLinalgConfig
+from pepsy.fitting.local import FIT
 import pepsy.optimizers.peps.optimizer as peps_mod
 import pepsy.optimizers.sweep.optimizer as sweep_mod
 from pepsy.optimizers.peps import PepsOptimizer
@@ -137,7 +139,9 @@ def test_peps_optimizer_routes_two_site_boundary_policy(monkeypatch):
 
     monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
     policy = {
-        "fit_mode": "two-site",
+        "fit_mode": "dmrg2",
+        "fit_init_strategy": "guess-src",
+        "fit_init_seed": 13,
         "fit_max_bond": 7,
         "fit_sweep_sequence": "RL",
         "fit_cutoff_mode": "rsum2",
@@ -162,6 +166,28 @@ def test_peps_optimizer_routes_two_site_boundary_policy(monkeypatch):
         assert calls[-1][1][key] == value
         assert infidelity_calls[-1][key] == value
         assert init_kwargs[key] == value
+
+
+def test_peps_optimizer_accepts_direct_fit_controls(monkeypatch):
+    """Direct fit controls override the compatibility boundary mapping."""
+    calls = _install_fake_normalize(monkeypatch)
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs={"fit_mode": "eff", "fit_patience": 1},
+        fit_mode="dmrg2",
+        fit_patience=4,
+        fit_timing=True,
+        normalize_initial=False,
+    )
+
+    opt.normalize()
+
+    assert opt.boundary_kwargs["fit_mode"] == "dmrg2"
+    assert opt.boundary_kwargs["fit_patience"] == 4
+    assert opt.boundary_kwargs["fit_timing"] is True
+    assert calls[-1][1]["fit_mode"] == "dmrg2"
 
 
 def test_peps_optimizer_routes_adaptive_eff_boundary_policy(monkeypatch):
@@ -199,6 +225,245 @@ def test_peps_optimizer_routes_adaptive_eff_boundary_policy(monkeypatch):
         assert calls[-1][1][key] == value
         assert infidelity_calls[-1][key] == value
         assert init_kwargs[key] == value
+
+
+def test_peps_optimizer_routes_layered_boundary_policy(monkeypatch):
+    """Layer and timing policies reach all three PEPS boundary entry points."""
+    calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def _fake_infidelity(_state, _target, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+    policy = {
+        "fit_mode": "direct",
+        "fit_layer_mode": "sequential",
+        "layer_tags": ("KET", "BRA"),
+        "fit_timing": True,
+        "fit_timing_sync_device": True,
+    }
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs=policy,
+        normalize_initial=False,
+    )
+
+    opt.normalize()
+    opt.estimate_infidelity(DummyState(), DummyState())
+    init_kwargs, _, _ = opt._sweep_boundary_kwargs(progress=False)
+
+    for key, value in policy.items():
+        assert calls[-1][1][key] == value
+        assert infidelity_calls[-1][key] == value
+        assert init_kwargs[key] == value
+
+
+def test_peps_optimizer_filters_metric_only_boundary_kwargs_from_sweep_init():
+    """Metric-only boundary keywords must not leak into SweepOptimizer init."""
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs={
+            "method": "mps",
+            "mode_": "mps",
+            "sequence": "RL",
+            "equalize_norms": True,
+            "balance_bonds": False,
+            "fit_mode": "eff",
+        },
+        normalize_initial=False,
+    )
+
+    init_kwargs, _, _ = opt._sweep_boundary_kwargs(progress=False)
+
+    for key in ("method", "mode_", "sequence", "equalize_norms", "balance_bonds"):
+        assert key not in init_kwargs
+    assert init_kwargs["fit_mode"] == "eff"
+
+
+def test_peps_optimizer_rejects_sequential_quimb_boundary_policy(monkeypatch):
+    """Sequential layered FIT must fail before a Quimb sweep is constructed."""
+    monkeypatch.setattr(
+        peps_mod,
+        "normalize_boundary_engine",
+        lambda *_args, **_kwargs: "quimb-mps",
+    )
+
+    with pytest.raises(ValueError, match="Quimb MPS"):
+        PepsOptimizer(
+            DummyState(bond=1),
+            [],
+            chi=3,
+            boundary_engine="auto",
+            boundary_kwargs={
+                "fit_mode": "direct",
+                "fit_layer_mode": "sequential",
+                "layer_tags": ("BRA", "KET"),
+            },
+            normalize_initial=False,
+        )
+
+
+def test_peps_optimizer_collects_fit_diagnostics(monkeypatch):
+    """Timing-enabled metric calls remain observable at the PEPS level."""
+    diagnostic_norm = SimpleNamespace(fit_diagnostics=("norm-fit",))
+    diagnostic_infidelity = SimpleNamespace(fit_diagnostics=("overlap-fit",))
+
+    def _fake_normalize(_state, **kwargs):
+        assert kwargs["return_info"] is True
+        return SimpleNamespace(cost=1.25, fit_diagnostics=("norm-fit",))
+
+    def _fake_infidelity(_state, _target, **_kwargs):
+        return {
+            "infidelity": 0.125,
+            "norm_result": diagnostic_norm,
+            "overlap_result": diagnostic_infidelity,
+        }
+
+    monkeypatch.setattr(peps_mod, "boundary_normalize", _fake_normalize)
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs={"fit_timing": True},
+        normalize_initial=False,
+    )
+
+    assert opt.normalize() == 1.25
+    assert opt.estimate_infidelity(DummyState(), DummyState()) == 0.125
+    assert opt.get_fit_diagnostics() == [
+        "norm-fit",
+        "norm-fit",
+        "overlap-fit",
+    ]
+
+
+def test_sweep_optimizer_forwards_per_call_boundary_fit_options(monkeypatch):
+    """Sweep metric calls can override the stored layer and timing policy."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=6)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=3,
+        fit_mode="eff",
+        simplify=False,
+        renormalize_state=False,
+    )
+    normalize_calls = []
+    infidelity_calls = []
+
+    def _fake_normalize(_state, **kwargs):
+        normalize_calls.append(dict(kwargs))
+        return 1.0
+
+    def _fake_infidelity(_state, _target, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(sweep_mod, "peps_normalize", _fake_normalize)
+    monkeypatch.setattr(sweep_mod, "boundary_infidelity", _fake_infidelity)
+
+    sweep.normalize(
+        fit_mode="direct",
+        fit_layer_mode="sequential",
+        layer_tags=("KET", "BRA"),
+        fit_timing=True,
+        fit_timing_sync_device=True,
+    )
+    sweep.infidelity(
+        fit_mode="direct",
+        fit_layer_mode="sequential",
+        layer_tags=("KET", "BRA"),
+        fit_timing=True,
+        fit_timing_sync_device=True,
+    )
+
+    for calls in (normalize_calls, infidelity_calls):
+        assert calls[-1]["fit_mode"] == "direct"
+        assert calls[-1]["fit_layer_mode"] == "sequential"
+        assert calls[-1]["layer_tags"] == ("KET", "BRA")
+        assert calls[-1]["fit_timing"] is True
+        assert calls[-1]["fit_timing_sync_device"] is True
+
+
+def test_sweep_optimizer_boundary_normalization_is_explicit_opt_in(monkeypatch):
+    """Boundary-store normalization is disabled unless explicitly requested."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=601)
+    target = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=602)
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=2,
+        simplify=False,
+        renormalize_state=False,
+    )
+    calls = {"count": 0}
+
+    def count_normalize(_self):
+        calls["count"] += 1
+
+    monkeypatch.setattr(type(sweep.bdy), "normalize", count_normalize)
+    monkeypatch.setattr(sweep_mod.SweepOptimizer, "_refresh_right_boundaries_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sweep_mod.SweepOptimizer, "_run_axis_half_sweep", lambda *args, **kwargs: [])
+
+    assert sweep.normalize_boundaries is False
+    sweep.optimize_axis("y", n_round_trips=0, renormalize=False)
+    assert calls["count"] == 0
+
+    sweep.optimize_axis(
+        "y",
+        n_round_trips=0,
+        renormalize=False,
+        normalize_boundaries=True,
+    )
+    assert calls["count"] == 2
+
+
+def test_fit_keeps_immutable_prepared_target_metadata():
+    """FIT prepares routing metadata once without caching mutable tensor data."""
+    state = qtn.MPS_rand_state(4, bond_dim=2, dtype="complex128", seed=603)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    fit = FIT(target, p=state, site_tag_id="I{}")
+
+    prepared = fit.prepared_target
+    assert len(prepared.site_order) == state.L
+    assert len(prepared.site_tensor_ids) == state.L
+    assert len(prepared.boundary_bond_map) == state.L - 1
+    assert prepared.reindexing_map
+    with pytest.raises(AttributeError):
+        prepared.site_order = ()
+
+
+def test_sweep_optimizer_retains_fit_diagnostics_in_run_result():
+    """Higher-level sweep results keep the CompBdy FIT diagnostics."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="float64", seed=7)
+    target = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="float64", seed=8)
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=2,
+        fit_mode="dmrg2",
+        fit_timing=True,
+        simplify=False,
+        renormalize_state=False,
+    )
+    sweep.set_optimize_kwargs(axes=("y",), n_cycles=0)
+
+    result = sweep.run(progress=False, renormalize=False)
+
+    assert result["fit_diagnostics"]
+    assert tuple(sweep.fit_diagnostics) == result["fit_diagnostics"]
 
 
 def test_sweep_optimizer_builds_two_site_cached_boundary_pair():
@@ -1553,6 +1818,83 @@ def test_peps_optimizer_explicit_quimb_boundary_engine_forwards_options(monkeypa
     assert captured["kwargs"]["normalize_kwargs"]["method"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["mode_"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["balance_bonds"] is False
+
+
+def test_quimb_boundary_store_resolves_auto_cutoffs_and_preserves_sweep_state():
+    """Quimb options should use the shared dtype policy without leaking API keywords."""
+    from pepsy.boundary.metrics import build_bra_ket
+    from pepsy.optimizers.sweep.environments import QuimbMpsBoundaryStore
+
+    ket = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        seed=304,
+        dtype="float32",
+    )
+    _, norm = build_bra_ket(ket=ket)
+    store = QuimbMpsBoundaryStore(
+        chi=4,
+        cutoff="auto",
+        cutoff_mode="auto",
+    )
+    envs_ref = store.envs
+    mps_b_ref = store.mps_b
+
+    store.update_axis(norm, "Y")
+
+    assert store.envs is envs_ref
+    assert store.mps_b is mps_b_ref
+    assert store._resolved_cutoff == pytest.approx(1.0e-6)
+    opts = store._compute_kwargs(tn=norm)
+    assert opts["cutoff"] == pytest.approx(1.0e-6)
+    assert opts["compress_opts"]["cutoff_mode"] == "rsum2"
+    assert "cutoff_mode" not in opts
+
+    store.start_sweep(norm, "Y", "left", reuse_static=True)
+    assert store.envs is envs_ref
+    assert store.mps_b is mps_b_ref
+    assert store._compute_kwargs()["cutoff"] == pytest.approx(1.0e-6)
+    copied = store.copy()
+    assert copied._sweep_axis == "y"
+    assert copied._sweep_update_side == "left"
+    assert copied.cutoff_mode == "rsum2"
+
+    store.clear("Y")
+    assert store.envs is envs_ref
+    assert store.mps_b is mps_b_ref
+    assert not store.envs
+    assert not store.mps_b
+
+
+def test_quimb_boundary_store_reuses_complete_static_side_without_recompute():
+    """Alternating half-sweeps should reuse the side built by the prior sweep."""
+    from pepsy.optimizers.sweep.environments import QuimbMpsBoundaryStore
+
+    class _FakeTN:
+        Lx = 2
+        Ly = 3
+
+        def compute_y_environments(self, **_kwargs):
+            return {
+                (side, index): object()
+                for side in ("ymin", "ymax")
+                for index in range(self.Ly)
+            }
+
+        def compute_ymax_environments(self, **_kwargs):
+            raise AssertionError("complete static side should have been reused")
+
+    tn = _FakeTN()
+    store = QuimbMpsBoundaryStore(chi=4)
+    store.update_axis(tn, "y")
+    store.start_sweep(tn, "y", "left", reuse_static=True)
+
+    assert set(store.envs) == {
+        ("ymax", 0),
+        ("ymax", 1),
+        ("ymax", 2),
+    }
 
 
 def test_peps_optimizer_explicit_dmrg_boundary_engine_overrides_symmray_auto(monkeypatch):

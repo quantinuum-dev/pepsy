@@ -35,6 +35,11 @@ _CORE_MODULES = (
     "pepsy.tensors",
 )
 
+_LAZY_OPTIMIZER_MODULES = tuple(
+    f"pepsy.optimizers.{name}"
+    for name in ("mpo", "peps", "sweep", "tree", "tree_peps", "energy", "qmera")
+)
+
 
 def _run_clean_import(script: str) -> set[str]:
     """Run an import probe with only Pepsy's source tree added."""
@@ -86,6 +91,172 @@ print(*sorted(
     name for name in sys.modules
     if any(name == root or name.startswith(root + '.') for root in roots)
 ))
+"""
+    )
+    assert not loaded
+
+
+def test_lazy_namespace_discovery_does_not_resolve_exports():
+    """Completion lists fresh exports without imports, warnings, or caching."""
+    modules = (
+        "pepsy", *_CORE_MODULES, "pepsy.experimental", "pepsy.vmc",
+        *_LAZY_OPTIMIZER_MODULES,
+    )
+    loaded = _run_clean_import(
+        f"""
+import importlib
+import sys
+import warnings
+
+for module_name in {modules!r}:
+    module = importlib.import_module(module_name)
+    before_modules = set(sys.modules)
+    before_attributes = set(vars(module))
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        names = dir(module)
+        assert set(module.__all__) <= set(names), module_name
+        assert before_attributes <= set(names), module_name
+        assert names == sorted(set(names)), module_name
+        assert set(sys.modules) == before_modules, module_name
+        assert set(vars(module)) == before_attributes, module_name
+
+roots = {(*_OPTIONAL_ROOTS, 'numpy', 'quimb', 'autoray', 'cotengra')!r}
+print(*sorted(
+    name for name in sys.modules
+    if any(name == root or name.startswith(root + '.') for root in roots)
+))
+"""
+    )
+    assert not loaded
+
+
+def test_mps_namespace_and_placeholders_do_not_import_numerical_stack():
+    """Browsing MPS entry points must not initialize replay or Gibbs code."""
+    loaded = _run_clean_import(
+        """
+import sys
+import pepsy.optimizers.mps as mps
+
+assert set(mps.__all__) | {'gibbs'} <= set(dir(mps))
+assert 'MpsOptimizer' not in vars(mps)
+assert 'GibbsMps' not in vars(mps)
+from pepsy.optimizers.mps import compression, diagnostics, normalization
+assert compression.__all__ == diagnostics.__all__ == normalization.__all__ == []
+roots = ('numpy', 'quimb', 'autoray', 'cotengra', 'torch', 'jax', 'symmray')
+print(*sorted(
+    name for name in sys.modules
+    if any(name == root or name.startswith(root + '.') for root in roots)
+    or name in {'pepsy.optimizers.mps.optimizer', 'pepsy.optimizers.mps.gibbs'}
+))
+"""
+    )
+    assert not loaded
+
+
+def test_mps_layout_import_does_not_initialize_replay_or_gibbs():
+    """Layout data remains usable independently of the simulation engines."""
+    loaded = _run_clean_import(
+        """
+import pickle
+import sys
+from pepsy.optimizers.mps import MpsGateStreamSchedule
+from pepsy.optimizers.mps.layout import MpsGateStreamSchedule as direct
+
+assert MpsGateStreamSchedule is direct
+schedule = MpsGateStreamSchedule(stream=(), site_order=(0, 1))
+assert pickle.loads(pickle.dumps(schedule)) == schedule
+print(*sorted(
+    name for name in sys.modules
+    if name in {
+        'pepsy.optimizers.mps.optimizer',
+        'pepsy.optimizers.mps.gibbs',
+        'pepsy.optimizers.mpo.optimizer',
+        'pepsy.fitting.local',
+    }
+))
+"""
+    )
+    assert not loaded
+
+
+def test_tree_layout_and_stream_parsers_do_not_import_replay_engines():
+    """Shared stream syntax must not make geometry load MPS replay or FIT."""
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.optimizers.tree import TreePlan
+from pepsy.optimizers._stream_events import conditional_event_parts
+
+assert TreePlan.from_order(range(4)).n == 4
+name, payload, where = conditional_event_parts(('if', -1, 1, ('x', 2)))
+assert (name, where) == ('conditional', (2,))
+assert payload['record'] == -1
+print(*sorted(
+    name for name in sys.modules
+    if name in {
+        'pepsy.optimizers.mps.optimizer', 'pepsy.optimizers.mpo.optimizer',
+        'pepsy.optimizers.tree.optimizer', 'pepsy.fitting.local',
+    }
+))
+"""
+    )
+    assert not loaded
+
+
+def test_geometry_exports_work_without_numerical_dependencies():
+    """Geometry objects can be constructed and serialized without engines."""
+    loaded = _run_clean_import(
+        """
+import pickle
+import sys
+from pepsy.optimizers.qmera import QMeraGeometry
+from pepsy.optimizers.tree_peps import TreePepsPlan
+
+geometry = QMeraGeometry((2, 2))
+assert pickle.loads(pickle.dumps(geometry)) == geometry
+assert TreePepsPlan.__module__ == 'pepsy.optimizers.tree_peps.plan'
+roots = ('numpy', 'quimb', 'autoray', 'cotengra', 'torch', 'jax', 'symmray')
+print(*sorted(
+    name for name in sys.modules
+    if any(name == root or name.startswith(root + '.') for root in roots)
+))
+"""
+    )
+    assert not loaded
+
+
+def test_basic_operator_and_boundary_imports_bypass_compatibility_aggregator():
+    """Direct ownership avoids loading the old core and unrelated observables."""
+    for module_name in (
+        "pepsy.operators.gates", "pepsy.operators.hamiltonians", "pepsy.boundary.states",
+    ):
+        loaded = _run_clean_import(
+            f"""
+import importlib
+import sys
+importlib.import_module({module_name!r})
+print(*sorted(
+    name for name in sys.modules
+    if name in {{'pepsy.tensors.core', 'pepsy.tensors.observables'}}
+))
+"""
+        )
+        assert not loaded, (module_name, loaded)
+
+
+def test_symmetric_mapping_does_not_load_core_compatibility_module():
+    """Mapping symmetric chains needs maps, not the compatibility aggregator."""
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.tensors.maps import OneDMap
+from pepsy.tensors.symmetric import _resolve_chain_mapper, _resolve_mpo_mapping
+
+mapper = OneDMap(2, 2)
+assert _resolve_chain_mapper(mapper, {'num_sites': 4}) == mapper.build()[0]
+assert _resolve_mpo_mapping(mapper=mapper)[:2] == mapper.build()
+print(*sorted(name for name in sys.modules if name == 'pepsy.tensors.core'))
 """
     )
     assert not loaded

@@ -69,11 +69,9 @@ def test_open_rho_series_keeps_the_long_range_path_and_is_exact_on_a_tree():
         dtype="complex128",
     )
     where = ((0, 0), (0, 3))
-    exact = state.partial_trace(
+    exact = state.partial_trace_exact(
         where,
-        max_bond=64,
         optimize="auto-hq",
-        flatten=True,
         normalized=True,
     )
     info = {}
@@ -963,11 +961,9 @@ def test_open_rho_series_is_exact_for_a_tree_with_a_multi_site_support():
         dtype="complex128",
     )
     where = ((0, 0), (0, 1), (0, 3))
-    exact = state.partial_trace(
+    exact = state.partial_trace_exact(
         where,
-        max_bond=64,
         optimize="auto-hq",
-        flatten=True,
         normalized=True,
     )
     info = {}

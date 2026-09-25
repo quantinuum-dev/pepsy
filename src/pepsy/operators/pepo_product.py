@@ -50,11 +50,14 @@ def _resolve_pepo_factor_value(value, parameters):
 
 
 def _as_backend_dtype(value, *, like):
-    """Convert a scalar to a backend and dtype compatible with ``like``."""
-    value = _as_backend(value, like=like)
-    target_dtype = getattr(like, "dtype", None)
+    """Convert a scalar to ``like``'s backend without losing its dtype."""
+    target_dtype = ar.do("result_type", like, value)
+    value = _as_backend(value, like=like, dtype=target_dtype)
     if target_dtype is not None and getattr(value, "dtype", None) != target_dtype:
-        value = ar.do("astype", value, target_dtype)
+        if hasattr(value, "astype"):
+            value = ar.do("astype", value, target_dtype)
+        else:
+            value = ar.do("array", value, like=like, dtype=target_dtype)
     return value
 
 
@@ -93,14 +96,20 @@ class CompiledPEPOClusterProduct:
         parameters=None,
         *,
         coefficients=None,
+        materialize=True,
         compress=False,
         **compress_opts,
     ):
-        """Evaluate the ordered product ``exp(A) exp(B) ...``."""
+        """Evaluate the ordered product ``exp(A) exp(B) ...``.
+
+        Set ``materialize=False`` to return the sparse active blocks before
+        allocating Quimb PEPO site tensors.
+        """
         return self.expansion.exp(
             step,
             parameters,
             coefficients=coefficients,
+            materialize=materialize,
             compress=compress,
             **compress_opts,
         )
@@ -239,6 +248,7 @@ class PEPOClusterProductExpansion:
         parameters=None,
         *,
         coefficients=None,
+        materialize=True,
         compress=False,
         **compress_opts,
     ):
@@ -246,10 +256,13 @@ class PEPOClusterProductExpansion:
 
         The exponentials are multiplied only on each small connected cluster.
         Their connected residuals are combined into a single PEPO topology;
-        independent full-lattice factor PEPOs are never materialized.
+        independent full-lattice factor PEPOs are never materialized. Set
+        ``materialize=False`` to return those active blocks directly;
+        compression requires a materialized Quimb PEPO.
         """
         factor_coefficients = self._factor_coefficients(coefficients)
         factor_data = []
+        factor_sources = []
         for factor, term_coefficients in zip(self.factors, factor_coefficients):
             coefficient = _resolve_pepo_factor_value(
                 factor.coefficient,
@@ -283,12 +296,23 @@ class PEPOClusterProductExpansion:
                     edge_components,
                 )
             )
+            factor_sources.append((factor.basis, factor_beta, values))
 
-        active = self.factors[0].basis._build_active(
-            None,
-            None,
-            factor_data=factor_data,
-        )
+        if any(factor.basis.inhomogeneous for factor in self.factors):
+            active = self.factors[0].basis._build_inhomogeneous_active(
+                factor_sources
+            )
+        else:
+            active = self.factors[0].basis._build_active(
+                None,
+                None,
+                factor_data=factor_data,
+            )
+        if compress and not materialize:
+            raise ValueError("compress=True requires materialize=True.")
+        if not materialize:
+            self._build_count += 1
+            return active
         result = active.to_pepo()
         if compress:
             result.compress(**compress_opts)

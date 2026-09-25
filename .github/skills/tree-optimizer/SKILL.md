@@ -26,9 +26,9 @@ Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted TTN (internal
 nodes of **any arity**; binary is the default, see *Non-binary trees* below)
 whose leaves carry physical qubit indices. An optional ``root_qubit`` is instead
 carried by the top tensor; all other physical sites remain leaves. A bundled gate stream
-`[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
-(2q); supports with `len(where) >= 3` route through
-`apply_subtree_operator` (see *Multi-qubit / sub-MPO application*).
+`[(gate, where), ...]` is replayed. `where` is an integer or distinct integer
+support. All ordinary gates lower to compact SubTreeMPO and `apply_sub_mpotree`;
+`apply_subtree_operator` uses that same compact boundary in every mode.
 
 Preferred public handoff:
 
@@ -222,12 +222,39 @@ one-node case.
 - `TreeOptimizer` mirrors all of this: `canonical_region` property,
   `canonize_subtree(nodes, span=...)`, `canonize_around_qubits(qubits)`,
   `is_subtree_canonical_form(nodes)` — all thin delegates to the state.
+## Ordinary gate routing and local FIT
 
+Ordinary gate streams in `auto`, `direct`, `dm`, `sdc`, `src`, `zipup`,
+`mpo`, and DMRG modes build a SubTreeMPO and use `apply_sub_mpotree`. Explicit
+`submpo` still declares chain-MPO entries. Keep the target and disposable
+FIT guess separate; `guess-zipup` is an opt-in tree warm start.
+TreeFIT rejects odd-parity fermionic tensors because their graded local
+projection is unsupported; use native `direct` or `zipup` for those states.
 
-## Two-qubit gate = exact threading + one compression sweep
+- Local gates use `SubTreeMPO.from_gate` on the Steiner subtree only.
+  Preserve original tags; never allocate exterior identities, even temporarily.
+  See `references/operators-trajectories.md` for the compact operator contract.
+- `direct` QR-routes the complete operator before canonical SVD compression.
+  `dm` changes the local split to `svd:eig`. Dense `src` contracts product-noise
+  complementary environments; `sdc` builds deterministic low-rank environments.
+  Both construct nested QR projectors from the original layered target. Never
+  replace these algorithms with local randomized SVD or a `direct` alias.
+  Build only required directed environments, release them after last use,
+  and request Q-only QR. Check seeded layered paths against unmodified Quimb SRC.
+  Cache only bounded immutable geometry across calls; keep numerical messages local.
+- `zipup` contracts node layers with arriving child messages and truncates
+  each outgoing message immediately. Do not add a full-target materialization
+  or canonical precompression. Its intermediate cuts have noncanonical
+  unvisited environments, so discarded weights are not global error bounds.
+- TreeFIT uses incremental neighboring messages and `inward-outward` passes.
+  TreeOptimizer's `fit_rtol="auto"` follows the state dtype; `None` disables
+  tolerance stopping. Keep finite scans and exact overlap diagnostics opt-in.
+  Read [`references/fit-environments.md`](references/fit-environments.md)
+  before changing environment reuse, guess ownership, or stopping policy.
+
+## Low-level two-qubit gate = exact threading + one compression sweep
 
 This is the paper's accuracy point (Figs. 3-6) -- do not regress it.
-
 1. SVD-split the gate into left/right factors joined by a virtual bond
    (`cutoff=0.0`, exact rank `k <= 4`).
 2. Move the centre to physical node `a`, absorb the left factor into `a`.
@@ -274,41 +301,39 @@ parent blob -- this is exact up to the truncation.
 `apply_subtree_operator(op, where, *, max_bond=None, cutoff=None,
 renormalize=False)` applies a general operator on `k >= 1` qubits in one shot --
 a `k`-qubit gate, a multi-site **non-unitary / Kraus** operator, or a whole
-**Trotter block**. It extends the two-factor path-thread kernel to the whole
-spanning subtree: the tree analogue of a sub-MPO applied over a
-covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductState`
--only; the tree base `TensorNetworkGenVector` has no such method).
+**Trotter block**. Every mode lowers to SubTreeMPO and `apply_sub_mpotree`.
+SRC/SDC use the original operator/state layers, never an already-routed
+enlarged state. The following canonical sweep describes direct/DM only.
 
 1. `snodes = _steiner_nodes(site_nodes)` -- minimal connected subtree spanning
    the target physical nodes.
-2. Move the centre onto a target physical node
-   (`_move_center(site_nodes[0])`, incremental)
-   so the **whole exterior is isometric toward the subtree**.
-3. Factor `op` into an exact tree-MPO on the same Steiner tree by packing each
-   `(output,input)` physical pair into a dimension-four leg and applying
-   leaf-to-hub SVDs.
-4. Absorb the tree-MPO into copied local state tensors. For each
-   `_peel_order(snodes)` edge, QR-split the child message while retaining all
-   physical and exterior state legs, then contract its new state bond into the
-   parent together with the old state/operator bonds. No dense state tensor for
-   the whole Steiner subtree is formed; the last node is the hub.
+2. Prepare only the exterior; reuse a contained canonical region or stop
+   an incoming center at the first entry into the subtree.
+3. Factor `op` into a compact SubTreeMPO using exact leaf-to-hub SVDs.
+4. QR-route child messages into parents, retaining physical and exterior
+   state legs. No dense state for the entire subtree is formed.
 5. Install every routed Q factor with its ``left_inds`` isometry metadata.
    Dense trees and charge-aligned native Symmray trees can then recover the
    hub centre through the normal canonical state machine without repeating
    those QRs; missing or malformed native proofs use explicit graded QR.
-   Finally make one depth-first canonical SVD sweep: every affected tree edge
+   Finally compress once along a path, or depth-first on branches: every edge
    is truncated once, after the complete operator has arrived. Dense path and
    subtree sweeps select one-sided ``reduced="left"`` compression only when
    the destination tensor's live ``left_inds`` proves the required isometry;
-   native graded compression keeps its explicit block-SVD semantics.
+   native graded SVD keeps Symmray's multiplet policy (chi may be exceeded).
    `renormalize=True` renormalises afterwards (for Kraus/projection).
+
+Native DM must reject before update accounting or tensor changes. Compact
+one-site unitaries are certified from their current physical matrix and
+absorbed without moving the canonical region or losing `left_inds` proofs;
+native odd operators retain the general graded route. Never infer unitarity
+from `track_norm`, a gate name, or a stale cached operator flag.
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator
-bonds are private to the temporary tree-MPO. `apply_gate` routes
-`len(where) >= 3` here; `k == 1`/`k == 2` still take the optimised
-leaf-absorb / threading paths (but `k == 1` non-unitary and `k == 2` Kraus
-can be sent here explicitly).
+bonds are private to the temporary tree-MPO. Ordinary `apply_gate` uses the
+primary `apply_sub_mpotree` route at every arity. Explicit one-/two-site
+compatibility methods retain specialized kernels outside DMRG/zipup.
 
 ### Native streamed sub-MPOs
 
@@ -402,8 +427,8 @@ canonicalization/compression, or independent/coalesced trajectory replay.
 
 ## Performance and layout
 
-The public performance defaults are ``mode="auto"`` (direct two-site
-threading), ``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
+The public performance defaults are ``mode="auto"`` (TreeMPO routing),
+``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
 oversubscription), ``profile=False``, and ``track_truncation=False`` (no
 diagnostic spectrum SVDs). The low-level
 ``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
@@ -415,25 +440,25 @@ selectors are the other actionable warning class.
 Dense and native trees share the direct one-edge contraction, immutable path
 cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the
 thread cap, self-healing tensor-id cache, copy semantics, and
-TreeLayoutFinder objective plumbing intact. The detailed performance and
-non-binary layout contract is in
+TreeLayoutFinder objective plumbing intact. The native QR safeguard, detailed
+performance rules, and non-binary layout contract are in
 [`references/performance-layout.md`](references/performance-layout.md); read
-it before changing those paths.
+it before changing native QR, canonicalization, performance, or layout paths.
 
 ## Gotchas / teaching notes
-
 - `convergence_sweep` observable `max_drift` can show a **false plateau**: a
   garbage low-`chi` state can have small drift while fidelity is ~0.01. Trust
   fidelity (small `n`) or push `chi`; drift alone lies.
-- Do not truncate while threading -- it breaks the "each truncation sees the
-  whole gate" accuracy property.
+- Do not truncate while threading in the direct route -- it breaks the
+  "each truncation sees the whole gate" accuracy property. The explicit
+  `zipup` route deliberately makes its approximation during message routing.
 - Do not pass `canonize=` to `compress_between`.
 - 2q gate reshape order is `(out_a, out_b, in_a, in_b)`.
 
 ## Roadmap / not yet implemented
-
-- Chain-only MPS execution modes (`svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`,
-  and `mix`) are not meaningful on arbitrary tree geometry. Native structured
+- Chain-only MPS execution modes (`svd`, `swap`, `perm`, `su`, and `mix`)
+  are not exposed on arbitrary tree geometry. `dmrg` uses native TreeFIT;
+  `mpo` and `zipup` have tree-specific routes described above. Native structured
   sub-MPO payloads are routed through the Quimb MPO site interface; only
   payloads that do not expose that interface use the guarded dense fallback.
   Pauli and computational-basis measurement helpers are dense two-level qubit
@@ -445,7 +470,7 @@ it before changing those paths.
 Activate the shared environment and use temp caches:
 
 ```bash
-source ~/envs/py312/bin/activate
+# Activate the environment selected by AGENTS.md and any local override.
 NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig \
   PYTHONPYCACHEPREFIX=/tmp pytest -q tests/test_optimize_tree.py
 ```
@@ -464,8 +489,7 @@ The safety-net tests are `test_tree_matches_statevector` (untruncated fidelity
 must stay exactly 1.0), the multi-site / sibling / measurement regressions, and
 the state-handoff/backend cases: exact product TTN/MPS mounting, rejected
 entangled relayouts, native Torch controls/readout, and mixed-backend rejection.
-Add a regression test for every new behaviour and prefer `structure="balanced"`
-plans when a test needs deterministic sibling relationships.
+Add regressions for new behaviour; use `structure="balanced"` for deterministic siblings.
 
 For noisy trajectory changes, also run:
 

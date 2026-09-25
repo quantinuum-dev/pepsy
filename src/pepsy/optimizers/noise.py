@@ -4,7 +4,7 @@ Pepsy's native design is stream-local: users can place stochastic instructions
 such as ``("depolarize1", p, q)`` or ``("amplitude_damping", gamma, q)`` exactly
 where the hardware schedule says the channel acts. The trajectory runners
 sample a *concrete* branch for each shot and replay the resulting ordinary gate
-stream with either :class:`MpsOptimizer` or :class:`MpsStabOptimizer`. The older
+stream with either :class:`MpsOptimizer` or :class:`StabilizerMpsSimulator`. The older
 ``PauliErrorModel`` helpers remain convenience macros for inserting uniform
 post-gate Pauli faults into a clean deterministic stream.
 """
@@ -18,9 +18,12 @@ from numbers import Integral
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
+import autoray as ar
 import numpy as np
 
-from .mps.optimizer import MpsOptimizer, _resolve_conditional
+from ..backends import to_float as _backend_to_float
+from .mps.optimizer import MpsOptimizer
+from ._stream_events import _resolve_conditional
 from .tree.optimizer import TreeOptimizer
 
 __all__ = [
@@ -1239,11 +1242,23 @@ class CoalescedSampleResult:
     :class:`CoalescedTrajectoryLeaf` produced ``configs[row]``. ``probs`` is
     available for ordinary MPS leaves and is ``None`` for STN leaves, whose
     scalable ``sample_bits`` path intentionally returns configurations only.
+    ``lengths[row]`` gives the number of surviving sites. When conditional
+    caps produce different lengths, shorter rows are padded on the right
+    with ``-1``; only ``configs[row, :lengths[row]]`` contains measured bits.
     """
 
     configs: np.ndarray
     leaf_indices: np.ndarray
     probs: np.ndarray | None = None
+    lengths: np.ndarray | None = None
+
+    def __post_init__(self):
+        # Keep the existing three-argument constructor useful for uniform
+        # batches. Sampling supplies explicit lengths for a ragged register.
+        if self.lengths is None:
+            object.__setattr__(self, "lengths", np.full(
+                self.configs.shape[0], self.configs.shape[1], dtype=np.int64
+            ))
 
     @property
     def shots(self) -> int:
@@ -1439,13 +1454,11 @@ def _is_unitary_matrix(matrix: np.ndarray, *, atol: float = 1e-10) -> bool:
 
 def _trajectory_real_scalar(value, *, label: str) -> float:
     """Convert a backend scalar expected to be real into a Python float."""
-    item = getattr(value, "item", None)
-    if callable(item):
-        value = item()
-    value = complex(value)
-    if abs(value.imag) > 1e-9:
+    real_value = _backend_to_float(ar.do("real", value), real=False)
+    imag_value = _backend_to_float(ar.do("imag", value), real=False)
+    if abs(imag_value) > 1e-9:
         raise ValueError(f"{label} must be real, got {value!r}.")
-    return float(value.real)
+    return real_value
 
 
 def _as_entries(gates) -> list[object]:
@@ -2389,10 +2402,10 @@ def run_noisy_shots(
     """Build and replay independent noisy trajectories with either MPS optimizer.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
-    :class:`MpsStabOptimizer` for each trajectory. For example::
+    :class:`StabilizerMpsSimulator` for each trajectory. For example::
 
         result = run_noisy_shots(
-            lambda: pepsy.MpsStabOptimizer(8, chi=32), gates,
+            lambda: pepsy.StabilizerMpsSimulator(8, chi=32), gates,
             PauliErrorModel.depolarizing(1e-3), shots=1_000, seed=7,
         )
 
@@ -2982,7 +2995,7 @@ def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
-    """Recognize TreeStabOptimizer through its lightweight protocol marker."""
+    """Recognize StabilizerTreeSimulator through its lightweight protocol marker."""
     return bool(getattr(optimizer, "_is_tree_stabilizer_trajectory_optimizer", False))
 
 
@@ -3005,7 +3018,10 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
 def _trajectory_norm_squared(optimizer) -> float:
     """Read the represented state norm through the optimizer's public API."""
     norm = getattr(optimizer, "norm", None)
-    if callable(norm):
+    if isinstance(optimizer, MpsOptimizer):
+        # A common represented exponent cancels from every Born ratio.
+        value = optimizer._control_state_norm(include_exponent=False)
+    elif callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
     else:
         p = getattr(optimizer, "p", None)
@@ -3020,18 +3036,41 @@ def _trajectory_norm_squared(optimizer) -> float:
 def _mps_local_kraus_norm_squared(optimizer, matrix, where):
     """Evaluate ``<psi|K^dagger K|psi>`` without copying the MPS.
 
-    Quimb's environment contraction works for canonical and non-canonical open
-    MPS states and returns the normalized local expectation directly. Returning
-    ``None`` keeps the conservative copied-state path available for custom MPS
-    lookalikes and backends that cannot contract the generated dense operator.
+    Canonical MPS replay reuses and updates the live center metadata. Quimb's
+    environment contraction remains available for noncanonical MPS lookalikes;
+    returning ``None`` retains the conservative copied-state fallback.
     """
     p = getattr(optimizer, "p", None)
     compute = getattr(p, "compute_local_expectation", None)
     if not callable(compute):
         return None
     try:
+        if (isinstance(optimizer, MpsOptimizer)
+                and optimizer.mode not in {"exact", "su"}
+                and len(where) == 1 and not optimizer._replay_has_symmray_data(p)):
+            site = int(where[0])
+            optimizer.canonize_mps(p, site)
+            tensor = p[site]
+            normalized = tensor / tensor.norm()
+            projected = normalized.gate(matrix, p.site_ind(site))
+            amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
+            return amplitude * amplitude
         gram = matrix.conj().T @ matrix
         support = tuple(int(site) for site in where)
+        canonical = getattr(p, "local_expectation_canonical", None)
+        if (
+            isinstance(optimizer, MpsOptimizer)
+            and optimizer.mode not in {"exact", "su"}
+            and callable(canonical)
+        ):
+            value = canonical(
+                gram, support, normalized=True, info=optimizer.info_c,
+                optimize=optimizer.contraction_opt,
+            )
+            value = _trajectory_real_scalar(value, label="local Kraus probability")
+            if not np.isfinite(value) or value < -1e-10:
+                raise ValueError("local Kraus contraction produced an invalid probability.")
+            return max(0.0, value)
         # Quimb's environment helper has a known length-one edge case. The
         # represented state is only a two-component vector there, so evaluate
         # the local Gram form directly instead of copying/applying a candidate
@@ -3079,7 +3118,7 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
     remap = getattr(optimizer, "_logical_to_physical_where", None)
     if p is None or not callable(apply_gate) or not callable(remap):
         raise TypeError(
-            "State-dependent trajectory channels require MpsOptimizer or MpsStabOptimizer."
+            "State-dependent trajectory channels require MpsOptimizer or StabilizerMpsSimulator."
         )
     matrix = _to_trajectory_backend(matrix, optimizer)
     physical_where = tuple(remap(where))
@@ -3095,6 +3134,8 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
         physical_where[0] if len(physical_where) == 1 else physical_where,
         contract=True,
     )
+    if isinstance(optimizer, MpsOptimizer):
+        candidate.exponent = 0.0
     value = _trajectory_real_scalar(candidate.norm(), label="Kraus branch norm")
     if not np.isfinite(value) or value < 0.0:
         raise ValueError("Kraus branch produced an invalid MPS norm.")
@@ -3326,7 +3367,7 @@ def _new_magic_context(optimizer, ancillas, *, recycle=True, reset_ancillas=True
     validate = getattr(optimizer, "_validate_magic_ancilla_pool", None)
     if not callable(validate):
         raise TypeError(
-            "magic injection requires MpsStabOptimizer or TreeStabOptimizer "
+            "magic injection requires StabilizerMpsSimulator or StabilizerTreeSimulator "
             "with a validated ancilla pool."
         )
     try:
@@ -3410,11 +3451,13 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         )
     if isinstance(norm_event, dict) and "input_norm" in norm_event:
         probability = float(norm_event["branch_probability"])
-        projected_norm = optimizer._real_float(optimizer.p.norm())
+        projected_norm = optimizer._control_state_norm(include_exponent=False)
         optimizer._record_norm_event(
             "trajectory_kraus",
             expected_norm=float(norm_event["input_norm"]) * np.sqrt(probability),
             observed_norm=projected_norm,
+            expected_exponent=norm_event.get("input_exponent", 0.0),
+            observed_exponent=optimizer._real_float(optimizer.p.exponent),
             where=_trajectory_where(where),
             branch_probability=probability,
             physical_boundary=True,
@@ -3435,6 +3478,36 @@ class _LeakageState:
 
     leaked: set[int] = field(default_factory=set)
     leak2depolar: bool = False
+
+
+def _resolve_trajectory_conditional(optimizer, entry):
+    """Return the selected concrete action, or None for a false predicate."""
+    while True:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if parts is None or parts[0] != "conditional":
+            return entry
+        _name, payload, _where = parts
+        record_index, expected = _resolve_conditional(
+            payload, len(getattr(optimizer, "measurements", ()))
+        )
+        record = optimizer.measurements[record_index]
+        outcome = int(getattr(record, "outcome", record[2]))
+        if int(outcome < 0) != expected:
+            return None
+        entry = payload["action"]
+
+
+def _apply_trajectory_cap(optimizer, entry, where, state, run_kwargs, shot_stream):
+    """Commit a structural cap before remapping classical leakage labels."""
+    _run_trajectory_entries(optimizer, (entry,), run_kwargs)
+    # Site labels after a cap refer to the shortened logical chain, including
+    # in perm mode. A cap removes even a leaked site's placeholder tensor.
+    # Update only after successful replay; failed caps retain the old labels.
+    (removed,) = where
+    state.leaked = {
+        site - (site > removed) for site in state.leaked if site != removed
+    }
+    shot_stream.append(entry)
 
 
 def _single_leakage_site(where) -> int:
@@ -3738,7 +3811,8 @@ def _apply_trajectory_event(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(probability),
-            "input_norm": optimizer._real_float(optimizer.p.norm()),
+            "input_norm": optimizer._control_state_norm(include_exponent=False),
+            "input_exponent": optimizer._real_float(optimizer.p.exponent),
         }
     else:
         norm_event = None
@@ -3786,7 +3860,7 @@ def _check_coalesced_optimizer(optimizer):
     if not callable(getattr(optimizer, "copy", None)):
         raise TypeError(
             "coalesced trajectory replay requires an optimizer with copy(); "
-            "use MpsOptimizer, TreeOptimizer, or MpsStabOptimizer."
+            "use MpsOptimizer, TreeOptimizer, or StabilizerMpsSimulator."
         )
 
 
@@ -3849,6 +3923,11 @@ def _coalesced_probabilities(probabilities, *, context):
     return probabilities / total
 
 
+def _remaining_coalesced_budget(limit, *reserved):
+    """Reserve slots for retained leaves and parents not yet processed."""
+    return None if limit is None else limit - sum(reserved)
+
+
 def _split_coalesced_nodes(
     nodes,
     outcomes,
@@ -3867,14 +3946,15 @@ def _split_coalesced_nodes(
     if len(outcomes) != len(probabilities):
         raise ValueError(f"{context} has mismatched outcomes and probabilities.")
     split = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         counts = rng.multinomial(node.count, probabilities)
         nonempty = [
             (outcome, float(probability), int(count))
             for outcome, probability, count in zip(outcomes, probabilities, counts)
             if int(count) > 0
         ]
-        if max_branches is not None and len(split) + len(nonempty) > max_branches:
+        live_count = len(split) + len(nonempty) + len(nodes) - index - 1
+        if max_branches is not None and live_count > max_branches:
             raise _CoalescedBranchCapExceeded(
                 f"coalesced trajectory branch cap ({max_branches}) exceeded "
                 f"while splitting {context}."
@@ -3962,23 +4042,38 @@ def _run_coalesced_entries(
         parts = MpsOptimizer.control_event_parts(entry)
         if parts is not None and parts[0] == "conditional":
             flush()
-            _name, payload, _where = parts
+            selected = []
+            for index, node in enumerate(nodes):
+                action = _resolve_trajectory_conditional(node.optimizer, entry)
+                if action is None:
+                    selected.append(node)
+                else:
+                    # Selected controls use the same branching/cap/leakage
+                    # path as unconditional controls. Retain the concrete
+                    # stream once, not both the action and its wrapper.
+                    selected.extend(_run_coalesced_entries(
+                        [node], [(event_index, action)], run_kwargs, rng,
+                        max_branches=_remaining_coalesced_budget(
+                            max_branches, len(selected), len(nodes) - index - 1,
+                        ),
+                        max_branch_factor=max_branch_factor,
+                        parallel_workers=parallel_workers,
+                        parallel_backend=parallel_backend,
+                    ))
+                if max_branches is not None and len(selected) > max_branches:
+                    raise _CoalescedBranchCapExceeded(
+                        f"coalesced trajectory branch cap ({max_branches}) exceeded "
+                        "during conditional replay."
+                    )
+            nodes = selected
+            continue
+        if parts is not None and parts[0] == "cap":
+            flush()
             for node in nodes:
-                record_index, expected = _resolve_conditional(
-                    payload, len(getattr(node.optimizer, "measurements", ()))
+                _apply_trajectory_cap(
+                    node.optimizer, entry, parts[2], node.leakage_state,
+                    run_kwargs, node.gate_stream,
                 )
-                record = node.optimizer.measurements[record_index]
-                outcome = int(getattr(record, "outcome", record[2]))
-                if (
-                    int(outcome < 0) == expected
-                    and not _entry_touches_leaked_qubit(
-                        payload["action"], node.leakage_state
-                    )
-                ):
-                    _run_trajectory_entries(
-                        node.optimizer, (payload["action"],), run_kwargs
-                    )
-                node.gate_stream.append(entry)
             continue
         if parts is None or parts[0] not in {"measure", "reset", "measure_reset"}:
             pending.append((event_index, entry))
@@ -4031,7 +4126,7 @@ def _coalesced_leakage_measure_leaked(
 ):
     """Replay ``measure_leaked`` while preserving count-bearing branches."""
     result = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         state = node.leakage_state
         if site in state.leaked:
             node.leakage_records.append(
@@ -4048,7 +4143,7 @@ def _coalesced_leakage_measure_leaked(
             result.append(node)
             continue
 
-        p_plus = _coalesced_measurement_probability(node.optimizer, "Z", (site,))
+        probabilities = _coalesced_measurement_probabilities(node.optimizer, "Z", (site,))
 
         def apply(child, outcome, probability):
             outcome = int(outcome)
@@ -4081,11 +4176,13 @@ def _coalesced_leakage_measure_leaked(
             _split_coalesced_nodes(
                 [node],
                 (+1, -1),
-                (p_plus, 1.0 - p_plus),
+                probabilities,
                 apply,
                 rng,
                 context="leakage measurement",
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(
+                    max_branches, len(result), len(nodes) - index - 1,
+                ),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4136,7 +4233,7 @@ def _coalesced_leakage_event(
         )
 
     result = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         initially_leaked = site in node.leakage_state.leaked
         probability = float(payload["probability"])
         if kind == "leakage":
@@ -4170,12 +4267,8 @@ def _coalesced_leakage_event(
                     if initially_leaked:
                         branch = "already_leaked"
                     else:
-                        _run_leakage_entries(
-                            child.optimizer,
-                            (_reset_zero_entry(site),),
-                            run_kwargs,
-                            child.gate_stream,
-                        )
+                        # Reset after the classical split, where its hidden
+                        # measurement can create separate count-bearing leaves.
                         child.leakage_state.leaked.add(site)
                         branch = "leaked"
                 child.leakage_records.append(
@@ -4237,21 +4330,47 @@ def _coalesced_leakage_event(
         else:  # pragma: no cover - parser guards the event names
             raise AssertionError(f"Unhandled leakage event kind {kind!r}.")
 
-        result.extend(
-            _split_coalesced_nodes(
-                [node],
-                labels,
-                probabilities,
-                apply,
-                rng,
-                context=f"leakage {kind}",
-                max_branches=max_branches,
-                max_branch_factor=max_branch_factor,
+        budget = _remaining_coalesced_budget(
+            max_branches, len(result), len(nodes) - index - 1,
+        )
+        children = _split_coalesced_nodes(
+            [node], labels, probabilities, apply, rng,
+            context=f"leakage {kind}", max_branches=budget,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers, parallel_backend=parallel_backend,
+        )
+        resetting = []
+        retained = []
+        for child in children:
+            needs_reset = kind == "leakage" and child.leakage_records[-1].branch == "leaked"
+            (resetting if needs_reset else retained).append(child)
+        if resetting:
+            entry = _reset_zero_entry(site)
+            resetting = _coalesced_control_event(
+                resetting, event_index, MpsOptimizer.control_event_parts(entry),
+                run_kwargs, rng, entry=entry,
+                max_branches=_remaining_coalesced_budget(budget, len(retained)),
+                max_branch_factor=_remaining_coalesced_budget(max_branch_factor, len(retained)),
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
             )
-        )
+            for child in resetting:
+                child.leakage_state.leaked.add(site)
+        result.extend(retained + resetting)
     return result
+
+
+def _coalesced_measurement_probabilities(optimizer, pauli, where):
+    """Use both backend Born weights without subtractive cancellation."""
+    if isinstance(optimizer, MpsOptimizer):
+        return optimizer._measurement_probabilities(
+            pauli, optimizer._logical_to_physical_where(where),
+        )
+    probabilities = getattr(optimizer, "_measurement_probabilities", None)
+    if callable(probabilities):
+        return probabilities(pauli, where)
+    p_plus = _coalesced_measurement_probability(optimizer, pauli, where)
+    return p_plus, 1.0 - p_plus
 
 
 def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
@@ -4272,7 +4391,7 @@ def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
         if not callable(mapped) or not callable(state_expectation):
             raise TypeError(
                 "coalesced measurement branching requires MpsOptimizer, "
-                "MpsStabOptimizer, or TreeOptimizer expectation support."
+                "StabilizerMpsSimulator, or TreeOptimizer expectation support."
             )
         value = state_expectation(pauli, mapped(where))
     return min(max(0.5 * (1.0 + float(value)), 0.0), 1.0)
@@ -4292,12 +4411,30 @@ def _coalesced_reset_needs_branch(optimizer, where) -> bool:
         return True
     site = where[0]
     try:
+        if isinstance(optimizer, MpsOptimizer):
+            # Only a structural product certificate may discard hidden
+            # outcomes. A purity tolerance can erase rare but physical
+            # branches, and three Pauli contractions cost more than these
+            # two bond lookups. Nonminimal product MPS safely take the
+            # branching path (deterministic outcomes still create one leaf).
+            (physical_site,) = optimizer._logical_to_physical_where((site,))
+            p = optimizer.p
+            length = int(p.L)
+            if getattr(p, "cyclic", False):
+                return True
+            return any(
+                p.bond_size(physical_site, neighbor) != 1
+                for neighbor in (physical_site - 1, physical_site + 1)
+                if 0 <= neighbor < length
+            )
         values = []
         state_expectation = getattr(optimizer, "_state_expectation", None)
         expectation = getattr(optimizer, "expectation", None)
         for axis in ("X", "Y", "Z"):
             if callable(state_expectation):
-                value = state_expectation(axis, (site,))
+                remap = getattr(optimizer, "_logical_to_physical_where", None)
+                support = remap((site,)) if callable(remap) else (site,)
+                value = state_expectation(axis, support)
             elif callable(expectation):
                 value = expectation(axis, site)
             else:
@@ -4364,8 +4501,8 @@ def _apply_coalesced_measurement(
         # recorded value is still the Born probability before that collapse.
         checked = []
         for node in nodes:
-            p_plus = _coalesced_measurement_probability(node.optimizer, pauli, where)
-            checked.append(p_plus if outcome > 0 else 1.0 - p_plus)
+            probabilities = _coalesced_measurement_probabilities(node.optimizer, pauli, where)
+            checked.append(probabilities[0 if outcome > 0 else 1])
         result = []
         for node, branch_probability in zip(nodes, checked):
             apply(node, outcome, branch_probability)
@@ -4375,17 +4512,19 @@ def _apply_coalesced_measurement(
     # The state can differ between nodes, so each node gets its own binomial
     # draw. This is exactly the result of independent per-shot Born draws.
     result = []
-    for node in nodes:
-        p_plus = _coalesced_measurement_probability(node.optimizer, pauli, where)
+    for index, node in enumerate(nodes):
+        probabilities = _coalesced_measurement_probabilities(node.optimizer, pauli, where)
         result.extend(
             _split_coalesced_nodes(
                 [node],
                 (+1, -1),
-                (p_plus, 1.0 - p_plus),
+                probabilities,
                 apply,
                 rng,
                 context="measurement",
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(
+                    max_branches, len(result), len(nodes) - index - 1,
+                ),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4454,7 +4593,7 @@ def _coalesced_control_event(
                     absorb_basis=absorb_basis,
                     run_kwargs=run_kwargs,
                     rng=rng,
-                    max_branches=max_branches,
+                    max_branches=_remaining_coalesced_budget(max_branches, len(direct)),
                     max_branch_factor=max_branch_factor,
                     parallel_workers=parallel_workers,
                     parallel_backend=parallel_backend,
@@ -4526,9 +4665,10 @@ def _coalesced_control_event(
                 event_index,
                 parts,
                 run_kwargs,
+                rng,
                 entry=entry,
                 absorb_basis=absorb_basis,
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(max_branches, len(leaked_nodes)),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4592,6 +4732,10 @@ def _coalesced_result(nodes, *, plan=None, retain="all") -> CoalescedTrajectoryR
             shot_count=shot_count,
             diagnostics=diagnostics,
         )
+    for node in nodes:
+        detach_histories = getattr(node.optimizer, "_detach_branch_histories", None)
+        if callable(detach_histories):
+            detach_histories()
     return CoalescedTrajectoryResult(
         tuple(
             CoalescedTrajectoryLeaf(
@@ -4626,7 +4770,7 @@ def sample_coalesced_bits(
 
     Ordinary MPS leaves use :class:`pepsy.sampling.MpsSampler`'s batched native
     path, preserving device-local sampling until the final compact NumPy
-    result. STN leaves use :meth:`MpsStabOptimizer.sample_bits`, which is
+    result. STN leaves use :meth:`StabilizerMpsSimulator.sample_bits`, which is
     already a count-coalesced measurement tree. The function never materializes
     one optimizer per trajectory.
 
@@ -4670,6 +4814,7 @@ def sample_coalesced_bits(
     configs = []
     probs = []
     leaf_indices = []
+    lengths = []
     all_have_probs = True
     for leaf_index, (leaf, child_seed) in enumerate(zip(leaves, child_seeds)):
         count = int(leaf.count)
@@ -4699,17 +4844,33 @@ def sample_coalesced_bits(
             probs.append(np.asarray(batch.probs, dtype=float))
         configs.append(batch_configs)
         leaf_indices.append(np.full(count, leaf_index, dtype=np.int64))
+        lengths.append(np.full(count, batch_configs.shape[1], dtype=np.int64))
 
-    configs = np.concatenate(configs, axis=0)
+    max_length = max(batch.shape[1] for batch in configs)
+    if all(batch.shape[1] == max_length for batch in configs):
+        configs = np.concatenate(configs, axis=0)
+    else:
+        # Rectangular output remains convenient without inventing measured
+        # zeros for removed sites. Avoid padded copies of each leaf batch.
+        padded = np.full((sum(batch.shape[0] for batch in configs), max_length),
+                         -1, dtype=np.int8)
+        offset = 0
+        for batch in configs:
+            stop = offset + batch.shape[0]
+            padded[offset:stop, :batch.shape[1]] = batch
+            offset = stop
+        configs = padded
     leaf_indices = np.concatenate(leaf_indices, axis=0)
+    lengths = np.concatenate(lengths, axis=0)
     probabilities = np.concatenate(probs, axis=0) if all_have_probs else None
     if shuffle and len(configs) > 1:
         permutation = np.random.default_rng(seed).permutation(len(configs))
         configs = configs[permutation]
         leaf_indices = leaf_indices[permutation]
+        lengths = lengths[permutation]
         if probabilities is not None:
             probabilities = probabilities[permutation]
-    return CoalescedSampleResult(configs, leaf_indices, probabilities)
+    return CoalescedSampleResult(configs, leaf_indices, probabilities, lengths)
 
 
 def run_trajectory_shots(
@@ -4745,8 +4906,8 @@ def run_trajectory_shots(
     ``("amplitude_damping", gamma, q)`` without forming a density matrix.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer`,
-    :class:`TreeOptimizer`, :class:`MpsStabOptimizer`, or
-    :class:`TreeStabOptimizer` per shot. Gate segments
+    :class:`TreeOptimizer`, :class:`StabilizerMpsSimulator`, or
+    :class:`StabilizerTreeSimulator` per shot. Gate segments
     between channel events are batched, so a trajectory does not rebuild an
     optimizer for every gate.
     Set ``strategy="coalesced"`` to share deterministic prefixes and retain one
@@ -5022,7 +5183,23 @@ def run_trajectory_shots(
                     )
                     continue
                 control_parts = MpsOptimizer.control_event_parts(entry)
+                if control_parts is not None and control_parts[0] == "conditional":
+                    # Resolve after the preceding measurement is committed.
+                    # The concrete action then follows ordinary control and
+                    # leakage dispatch, including nested conditional caps.
+                    flush_pending()
+                    entry = _resolve_trajectory_conditional(optimizer, entry)
+                    if entry is None:
+                        continue
+                    control_parts = MpsOptimizer.control_event_parts(entry)
                 if control_parts is not None:
+                    if control_parts[0] == "cap":
+                        flush_pending()
+                        _apply_trajectory_cap(
+                            optimizer, entry, control_parts[2], leakage_state,
+                            run_kwargs, shot_stream,
+                        )
+                        continue
                     if control_parts[0] == "reset":
                         flush_pending()
                         _apply_leakage_reset_control(
@@ -5273,7 +5450,8 @@ def _apply_coalesced_trajectory_outcome(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(target_probability),
-            "input_norm": node.optimizer._real_float(node.optimizer.p.norm()),
+            "input_norm": node.optimizer._control_state_norm(include_exponent=False),
+            "input_exponent": node.optimizer._real_float(node.optimizer.p.exponent),
         }
     else:
         norm_event = None
@@ -5403,7 +5581,7 @@ def run_coalesced_trajectory_shots(
             )
         else:
             split = []
-            for node in nodes:
+            for index, node in enumerate(nodes):
                 probabilities = _kraus_probabilities(
                     node.optimizer, entry.channel, entry.where
                 )
@@ -5440,7 +5618,9 @@ def run_coalesced_trajectory_shots(
                         apply,
                         rng,
                         context="trajectory Kraus channel",
-                        max_branches=max_branches,
+                        max_branches=_remaining_coalesced_budget(
+                            max_branches, len(split), len(nodes) - index - 1,
+                        ),
                         max_branch_factor=max_branch_factor,
                         parallel_workers=parallel_workers,
                         parallel_backend=parallel_backend,

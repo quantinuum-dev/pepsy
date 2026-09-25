@@ -232,7 +232,7 @@ class StabilizerMpsRunResult(_TypedRecord):
 
 @dataclass
 class StabilizerTreeRunResult(_TypedRecord):
-    """Result record for one explicit TreeStab stream replay."""
+    """Result record for one explicit StabilizerTreeSimulator stream replay."""
 
     simulator: object
     mode: str

@@ -11,13 +11,21 @@ from dataclasses import dataclass, replace
 
 import autoray as ar
 
+from .._internal.quimb import quimb_2d_options, quimb_compression_options
+from .._internal.quimb import (
+    require_quimb_1d_callable_compression,
+    require_quimb_ctmrg_mode,
+    require_quimb_ctmrg_projector_canonize,
+)
 from ..tensors.validation import _PHYS_OUTER, validate_tensor_network_tags
 from .states import BdyMPS
-from .sweeps import (
-    BoundaryFitDiagnostic,
-    CompBdy,
+from ._fit_policy import (
+    _FIT_QUIMB_MODES,
+    _canonical_fit_layer_mode,
+    _canonical_fit_layer_order,
     _canonical_fit_mode_selector,
 )
+from .sweeps import BoundaryFitDiagnostic, CompBdy
 
 __all__ = [
     "build_bra_ket",
@@ -25,6 +33,7 @@ __all__ = [
     "BoundaryFitDiagnostic",
     "contract_boundary",
     "contract_flat",
+    "contract_layered",
     "quimb_ctmrg_projector_compat",
     "peps_normalize",
     "normalize",
@@ -45,6 +54,349 @@ _DEFAULT_BOUNDARY_SEQUENCE_3D = (
     "zmin",
     "zmax",
 )
+_FLAT_BOUNDARY_DIRECTION_PRESETS = {
+    "bottom-up": ("xmin",),
+    "top-down": ("xmax",),
+    "top-bottom": ("xmax", "xmin"),
+    "bottom-top": ("xmin", "xmax"),
+    "left-to-right": ("ymin",),
+    "right-to-left": ("ymax",),
+    "left-right": ("ymin", "ymax"),
+    "right-left": ("ymax", "ymin"),
+    "four-sided": _DEFAULT_BOUNDARY_SEQUENCE,
+}
+_CTMRG_MODES = frozenset({"projector", "projector2d", "l2bp"})
+
+
+def _canonical_flat_boundary_direction(value, *, direction):
+    """Resolve a readable flat-contraction direction preset.
+
+    The returned ``middle_axis`` is non-``None`` only when opposing outer
+    boundaries should be absorbed towards a selected central slab. All other
+    presets map directly to an unconstrained Quimb boundary sequence.
+    """
+    if value is None:
+        return None, None
+
+    key = str(value).strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "auto": "auto",
+        "bottom": "bottom-up",
+        "top": "top-down",
+        "left": "left-to-right",
+        "right": "right-to-left",
+        "all": "four-sided",
+    }
+    key = aliases.get(key, key)
+    if key == "auto":
+        return None, None
+    if key == "middle-out":
+        axis = str(direction).strip().lower()[:1]
+        if axis not in {"x", "y"}:
+            raise ValueError(
+                "direction must begin with 'x' or 'y' when "
+                "boundary_direction='middle-out'."
+            )
+        return None, axis
+    if key in {"middle-out-x", "middle-out-y"}:
+        return None, key[-1]
+    try:
+        return _FLAT_BOUNDARY_DIRECTION_PRESETS[key], None
+    except KeyError as exc:
+        choices = ", ".join(
+            repr(name)
+            for name in (
+                *_FLAT_BOUNDARY_DIRECTION_PRESETS,
+                "middle-out-x",
+                "middle-out-y",
+            )
+        )
+        raise ValueError(
+            f"Unknown flat boundary_direction {value!r}. "
+            f"Expected one of {choices}."
+        ) from exc
+
+
+def _canonical_middle_slices(middle_slices, *, length):
+    """Resolve and validate the contiguous target slab for middle-out."""
+    if middle_slices is None:
+        midpoint = length // 2
+        return (midpoint,) if length % 2 else (midpoint - 1, midpoint)
+    if isinstance(middle_slices, bool):
+        raise TypeError("middle_slices must contain integer slice indices.")
+    if isinstance(middle_slices, int):
+        slices = (middle_slices,)
+    else:
+        try:
+            slices = tuple(middle_slices)
+        except TypeError as exc:
+            raise TypeError(
+                "middle_slices must be an integer or a sequence of integers."
+            ) from exc
+    if not slices or any(
+        isinstance(index, bool) or not isinstance(index, int)
+        for index in slices
+    ):
+        raise TypeError("middle_slices must contain integer slice indices.")
+    slices = tuple(sorted(set(slices)))
+    if slices[0] < 0 or slices[-1] >= length:
+        raise ValueError(
+            f"middle_slices must lie in [0, {length - 1}]; got {slices!r}."
+        )
+    if slices != tuple(range(slices[0], slices[-1] + 1)):
+        raise ValueError(
+            "middle_slices must select one contiguous central slab; "
+            f"got {slices!r}."
+        )
+    return slices
+
+
+def _flat_middle_around(tn, *, axis, middle_slices):
+    """Build Quimb ``around`` coordinates for an inward target slab."""
+    axis = str(axis).lower()
+    length = getattr(tn, f"L{axis}", None)
+    other_axis = "y" if axis == "x" else "x"
+    other_length = getattr(tn, f"L{other_axis}", None)
+    if not (
+        isinstance(length, int)
+        and length >= 1
+        and isinstance(other_length, int)
+        and other_length >= 1
+    ):
+        raise TypeError(
+            "middle-out contraction requires a 2D Quimb lattice network "
+            "with integer Lx and Ly."
+        )
+    is_cyclic = getattr(tn, f"is_cyclic_{axis}", None)
+    if callable(is_cyclic) and is_cyclic():
+        raise ValueError(
+            f"middle-out-{axis} requires two open {axis} boundaries; "
+            f"choose the other axis or explicitly cut the cyclic {axis} bond."
+        )
+
+    middle_slices = _canonical_middle_slices(middle_slices, length=length)
+    if axis == "x":
+        around = tuple(
+            (middle, other)
+            for middle in middle_slices
+            for other in range(other_length)
+        )
+    else:
+        around = tuple(
+            (other, middle)
+            for middle in middle_slices
+            for other in range(other_length)
+        )
+    return around
+
+
+def _canonical_ctmrg_mode(mode):
+    """Normalize the finite-CTMRG boundary compression selector."""
+    key = str(mode).strip().lower().replace("_", "-")
+    if key == "projector-2d":
+        key = "projector2d"
+    if key not in _CTMRG_MODES:
+        choices = ", ".join(repr(name) for name in sorted(_CTMRG_MODES))
+        raise ValueError(f"ctmrg_mode must be one of {choices}; got {mode!r}.")
+    return key
+
+
+def _canonical_ctmrg_canonize(canonize, *, mode):
+    """Resolve mode-aware CTMRG canonicalization without ignored choices."""
+    if canonize is None:
+        return mode != "projector2d"
+    if isinstance(canonize, bool):
+        if mode == "projector2d" and canonize:
+            raise ValueError(
+                "ctmrg_canonize is not used by ctmrg_mode='projector2d'; "
+                "leave it as None or set it to False."
+            )
+        return canonize
+    if isinstance(canonize, str):
+        key = canonize.strip().lower().replace("_", "-")
+        if key in {"layered", "bp"} and mode == "projector":
+            return key
+    raise ValueError(
+        "ctmrg_canonize must be None or a bool; ctmrg_mode='projector' "
+        "also accepts 'layered' and 'bp'."
+    )
+
+
+def _canonical_ctmrg_projector_region(region, *, mode):
+    """Normalize the local CTMRG projector environment shape."""
+    if region is None:
+        return None
+    if isinstance(region, str):
+        key = region.strip().lower().replace(" ", "").replace("×", "x")
+        if key in {"2x2", "2*2"}:
+            region = (2, 2)
+        elif key in {"2x3", "2*3"}:
+            region = (2, 3)
+    try:
+        region = tuple(int(size) for size in region)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "ctmrg_projector_region must be None, (2, 2), or (2, 3)."
+        ) from exc
+    if region not in {(2, 2), (2, 3)}:
+        raise ValueError(
+            "ctmrg_projector_region must be None, (2, 2), or (2, 3); "
+            f"got {region!r}."
+        )
+    if mode == "l2bp":
+        raise ValueError(
+            "ctmrg_projector_region applies only to projector CTMRG modes, "
+            "not ctmrg_mode='l2bp'."
+        )
+    if mode == "projector2d" and region != (2, 2):
+        raise ValueError(
+            "ctmrg_mode='projector2d' supports only its native (2, 2) "
+            "projector region; use ctmrg_mode='projector' for (2, 3)."
+        )
+    return region
+
+
+def _copy_ctmrg_mapping(value, *, name):
+    """Copy an optional CTMRG option mapping with a precise API error."""
+    if value is None:
+        return {}
+    try:
+        return dict(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a mapping or None.") from exc
+
+
+def _parsed_quimb_site_tag(site, index):
+    """Predict Quimb's tag for one parsed 1D site or grouped site."""
+    if isinstance(site, str):
+        return site
+    site = tuple(site)
+    if len(site) == 1 and isinstance(site[0], str):
+        return site[0]
+    return f"__GST{index}__"
+
+
+@contextmanager
+def _quimb_projector_region_2x3(site_tags):
+    """Expand each local 1D projector environment to three sites.
+
+    Quimb's generic projector compressor inserts projectors across pairs of
+    neighboring effective sites. This scoped adapter adds one adjacent site
+    to alternating sides of those environments, preserving the central cut
+    and all tags attached to the inserted projectors.
+    """
+    try:
+        from quimb.tensor import tensor_core as qtc
+    except ImportError:  # pragma: no cover - Quimb is an optional dependency
+        yield
+        return
+
+    tensor_network = getattr(qtc, "TensorNetwork", None)
+    original = getattr(tensor_network, "insert_compressor_between_regions", None)
+    original_inplace = getattr(
+        tensor_network,
+        "insert_compressor_between_regions_",
+        None,
+    )
+    if tensor_network is None or original is None:
+        yield
+        return
+
+    ordered_tags = tuple(
+        _parsed_quimb_site_tag(site, index)
+        for index, site in enumerate(site_tags)
+    )
+    positions = {tag: index for index, tag in enumerate(ordered_tags)}
+    stats = {"seen": 0, "expanded": 0}
+
+    @wraps(original)
+    def insert_regional_projector(self, ltags, rtags, *args, **kwargs):
+        stats["seen"] += 1
+        ltags = [ltags] if isinstance(ltags, str) else list(ltags)
+        rtags = [rtags] if isinstance(rtags, str) else list(rtags)
+
+        if len(ltags) == len(rtags) == 1:
+            lpos = positions.get(ltags[0])
+            rpos = positions.get(rtags[0])
+            if lpos is not None and rpos is not None and abs(lpos - rpos) == 1:
+                lower = min(lpos, rpos)
+                upper = max(lpos, rpos)
+                # Alternate which side supplies the third site, avoiding a
+                # systematic left/right bias and falling back at boundaries.
+                candidates = (upper + 1, lower - 1)
+                if lower % 2:
+                    candidates = tuple(reversed(candidates))
+                extra = next(
+                    (pos for pos in candidates if 0 <= pos < len(ordered_tags)),
+                    None,
+                )
+                if extra is not None:
+                    if extra < lower:
+                        target = ltags if lpos == lower else rtags
+                    else:
+                        target = ltags if lpos == upper else rtags
+                    target.append(ordered_tags[extra])
+                    stats["expanded"] += 1
+
+        return original(self, ltags, rtags, *args, **kwargs)
+
+    @wraps(original_inplace or original)
+    def insert_regional_projector_inplace(self, ltags, rtags, *args, **kwargs):
+        kwargs.setdefault("inplace", True)
+        return insert_regional_projector(self, ltags, rtags, *args, **kwargs)
+
+    tensor_network.insert_compressor_between_regions = insert_regional_projector
+    if original_inplace is not None:
+        tensor_network.insert_compressor_between_regions_ = (
+            insert_regional_projector_inplace
+        )
+    try:
+        yield
+        if stats["seen"] and not stats["expanded"] and len(ordered_tags) >= 3:
+            raise RuntimeError(
+                "Quimb's projector topology did not expose a neighboring "
+                "three-site region for ctmrg_projector_region=(2, 3)."
+            )
+    finally:
+        tensor_network.insert_compressor_between_regions = original
+        if original_inplace is not None:
+            tensor_network.insert_compressor_between_regions_ = original_inplace
+
+
+def _ctmrg_regional_projector_compressor(
+    tn,
+    *,
+    max_bond=None,
+    cutoff=1.0e-10,
+    site_tags=None,
+    canonize=True,
+    permute_arrays=True,
+    optimize="auto-hq",
+    sweep_reverse=False,
+    equalize_norms=False,
+    inplace=False,
+    **kwargs,
+):
+    """Run Quimb's projector compressor with a local 2x3 environment."""
+    import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+    if site_tags is None:
+        site_tags = tn.site_tags
+    with _quimb_projector_region_2x3(site_tags):
+        return qtn.tensor_network_1d_compress(
+            tn,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            method="projector",
+            site_tags=site_tags,
+            canonize=canonize,
+            permute_arrays=permute_arrays,
+            optimize=optimize,
+            sweep_reverse=sweep_reverse,
+            equalize_norms=equalize_norms,
+            inplace=inplace,
+            **kwargs,
+        )
 
 
 @contextmanager
@@ -287,6 +639,74 @@ def quimb_ctmrg_projector_compat():
             qtc.compute_oblique_projectors = original_oblique
         if callable(original_reduced_factor):
             qtc.squared_op_to_reduced_factor = original_reduced_factor
+
+
+@contextmanager
+def _quimb_ctmrg_mode_forwarding_compat(mode):
+    """Filter Quimb CTMRG keywords that do not belong to a submode.
+
+    Some Quimb releases route every top-level ``contract_ctmrg`` option into
+    every boundary compressor. ``projector2d`` and ``l2bp`` then receive
+    projector-only keywords and fail before doing any work. Keep the adapter
+    scoped to the call and preserve all options each concrete mode supports.
+    """
+    try:
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+    except ImportError:  # pragma: no cover - Quimb is an optional dependency
+        yield
+        return
+
+    owner = getattr(qtn, "TensorNetwork2D", None)
+    if owner is None:
+        yield
+        return
+
+    if mode == "projector2d":
+        name = "_contract_boundary_projector"
+        original = getattr(owner, name, None)
+        if not callable(original):
+            yield
+            return
+
+        @wraps(original)
+        def call_projector2d(self, *args, **kwargs):
+            kwargs.pop("canonize_opts", None)
+            return original(self, *args, **kwargs)
+
+        replacement = call_projector2d
+    elif mode == "l2bp":
+        name = "_contract_boundary_core_via_1d"
+        original = getattr(owner, name, None)
+        if not callable(original):
+            yield
+            return
+
+        @wraps(original)
+        def call_l2bp(self, *args, **kwargs):
+            selected = kwargs.get("method")
+            if selected is None and len(args) > 5:
+                selected = args[5]
+            if selected == "l2bp":
+                kwargs = dict(kwargs)
+                for key in (
+                    "canonize_opts",
+                    "contract_opts",
+                    "lazy",
+                    "reduce_opts",
+                ):
+                    kwargs.pop(key, None)
+            return original(self, *args, **kwargs)
+
+        replacement = call_l2bp
+    else:
+        yield
+        return
+
+    setattr(owner, name, replacement)
+    try:
+        yield
+    finally:
+        setattr(owner, name, original)
 
 
 @dataclass(frozen=True)
@@ -558,6 +978,8 @@ def _normalize_flat_contraction_method(method, tn):
 
 def _call_with_accepted_kwargs(fn, **kwargs):
     """Call ``fn`` with only the keyword arguments it accepts."""
+    if getattr(fn, "__name__", "") in {"contract_boundary", "contract_ctmrg"}:
+        kwargs = quimb_2d_options(fn, kwargs)
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -570,11 +992,43 @@ def _call_with_accepted_kwargs(fn, **kwargs):
     return fn(**accepted)
 
 
+def _finish_quimb_around_contraction(reduced, *, final_contract_opts, method):
+    """Exactly contract a network reduced around a protected middle slab."""
+    contract_fn = getattr(reduced, "contract", None)
+    if not callable(contract_fn):
+        raise TypeError(
+            f"method={method!r} did not return a tensor network when "
+            "contracting around the middle slab."
+        )
+    return contract_fn(all, **final_contract_opts)
+
+
+def _require_quimb_around_support(contract_fn, *, method):
+    """Require the opt-in Quimb protected-region contraction API."""
+    try:
+        parameters = inspect.signature(contract_fn).parameters.values()
+    except (TypeError, ValueError):
+        return
+    if any(parameter.name == "around" for parameter in parameters):
+        return
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        return
+    raise NotImplementedError(
+        f"The installed Quimb build does not support around=... for "
+        f"method={method!r}; upgrade Quimb to use middle-out contraction."
+    )
+
+
 def _ctmrg_stabilization_kwargs(
     norm,
     *,
     reduce_opts=None,
     gauge_smudge=None,
+    canonize_opts=None,
+    projector_gauges=True,
 ):
     """Prepare numerically safer CTMRG projector options.
 
@@ -584,31 +1038,34 @@ def _ctmrg_stabilization_kwargs(
     factorization and a small gauge smudge by default.  Dense networks retain
     Quimb's existing defaults unless the caller explicitly supplies options.
     """
-    if reduce_opts is None:
-        reduce_opts = {}
-    else:
-        try:
-            reduce_opts = dict(reduce_opts)
-        except (TypeError, ValueError) as exc:
-            raise TypeError("ctmrg_reduce_opts must be a mapping or None.") from exc
+    reduce_opts = _copy_ctmrg_mapping(
+        reduce_opts,
+        name="ctmrg_reduce_opts",
+    )
+    canonize_opts = _copy_ctmrg_mapping(
+        canonize_opts,
+        name="ctmrg_canonize_opts",
+    )
 
     symmray = _uses_symmray_arrays(norm)
     if symmray:
         reduce_opts.setdefault("method", "eigh")
         reduce_opts.setdefault("shift", 1.0e-12)
-        if gauge_smudge is None:
+        if projector_gauges and gauge_smudge is None:
             gauge_smudge = 1.0e-10
 
     kwargs = {}
     if reduce_opts:
         kwargs["reduce_opts"] = reduce_opts
-    if gauge_smudge is not None:
+    if projector_gauges and gauge_smudge is not None:
         kwargs["gauge_smudge"] = gauge_smudge
-    if symmray and gauge_smudge is not None:
+    if symmray and projector_gauges and gauge_smudge is not None:
         # ``gauge_smudge`` only reaches projector construction in Quimb. The
         # native fermionic path also needs the same floor during the preceding
         # simple-gauge normalization, before any reduced-factor decomposition.
-        kwargs["canonize_opts"] = {"smudge": gauge_smudge}
+        canonize_opts.setdefault("smudge", gauge_smudge)
+    if canonize_opts:
+        kwargs["canonize_opts"] = canonize_opts
     return kwargs
 
 
@@ -713,7 +1170,7 @@ def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
     obj.expand_bnd(chi, inplace=True)
 
 
-def _contract_quimb_double_layer(  # pylint: disable=too-many-arguments
+def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
     norm,
     *,
     method,
@@ -724,9 +1181,15 @@ def _contract_quimb_double_layer(  # pylint: disable=too-many-arguments
     strip_exponent,
     mode_,
     sequence,
+    around=None,
     cutoff,
     equalize_norms,
     layer_tags,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
 ):
@@ -750,53 +1213,181 @@ def _contract_quimb_double_layer(  # pylint: disable=too-many-arguments
         contract_fn = getattr(norm, "contract_boundary", None)
         if not callable(contract_fn):
             raise TypeError("method='mps' requires a network with contract_boundary().")
+        if around is not None:
+            _require_quimb_around_support(contract_fn, method=method)
         sequence = _default_quimb_sequence(norm, method) if sequence is None else sequence
         kwargs = dict(
             max_bond=chi,
             sequence=sequence,
             final_contract_opts=final_contract_opts,
             cutoff=cutoff,
+            canonize=True,
             progbar=progress,
             max_separation=max_separation,
             equalize_norms=equalize_norms,
             inplace=False,
         )
+        if around is not None:
+            kwargs["around"] = around
+            kwargs["final_contract"] = False
         if mode_ is not None:
             kwargs["mode"] = mode_
         if layer_tags is not None:
             kwargs["layer_tags"] = list(layer_tags)
-        return _call_with_accepted_kwargs(contract_fn, **kwargs)
+        contracted = _call_with_accepted_kwargs(contract_fn, **kwargs)
+        if around is not None:
+            return _finish_quimb_around_contraction(
+                contracted,
+                final_contract_opts=final_contract_opts,
+                method=method,
+            )
+        return contracted
 
     if method == "ctmrg":
         contract_fn = getattr(norm, "contract_ctmrg", None)
         if not callable(contract_fn):
             raise TypeError("method='ctmrg' requires a network with contract_ctmrg().")
+        if around is not None:
+            _require_quimb_around_support(contract_fn, method=method)
+        ctmrg_mode = _canonical_ctmrg_mode(ctmrg_mode)
+        if ctmrg_mode != "projector":
+            require_quimb_ctmrg_mode(ctmrg_mode)
+        ctmrg_canonize = _canonical_ctmrg_canonize(
+            ctmrg_canonize,
+            mode=ctmrg_mode,
+        )
+        ctmrg_projector_region = _canonical_ctmrg_projector_region(
+            ctmrg_projector_region,
+            mode=ctmrg_mode,
+        )
+        if isinstance(ctmrg_canonize, str):
+            require_quimb_ctmrg_projector_canonize(ctmrg_canonize)
+        ctmrg_canonize_opts = _copy_ctmrg_mapping(
+            ctmrg_canonize_opts,
+            name="ctmrg_canonize_opts",
+        )
+        ctmrg_compress_opts = _copy_ctmrg_mapping(
+            ctmrg_compress_opts,
+            name="ctmrg_compress_opts",
+        )
+
+        if ctmrg_projector_region == (2, 3):
+            require_quimb_ctmrg_mode("projector")
+            require_quimb_1d_callable_compression()
+            if _infer_lattice_ndim(norm) == 3:
+                raise NotImplementedError(
+                    "ctmrg_projector_region=(2, 3) currently supports only "
+                    "finite 2D tensor networks."
+                )
+            for axis in ("x", "y"):
+                is_cyclic = getattr(norm, f"is_cyclic_{axis}", None)
+                if callable(is_cyclic) and is_cyclic():
+                    raise NotImplementedError(
+                        "ctmrg_projector_region=(2, 3) currently supports "
+                        "only open boundary conditions."
+                    )
+
+        if _uses_symmray_arrays(norm) and not (
+            ctmrg_mode == "projector"
+            and ctmrg_canonize in {True, "layered"}
+            and ctmrg_projector_region != (2, 3)
+        ):
+            raise NotImplementedError(
+                "Native Symmray CTMRG currently supports only "
+                "ctmrg_mode='projector' with ctmrg_canonize=True or "
+                "'layered' and the native projector region; projector2d, "
+                "l2bp, BP gauging, the 2x3 region, and disabled gauging are "
+                "dense-only."
+            )
+
+        if ctmrg_mode == "l2bp":
+            reduce_opts = _copy_ctmrg_mapping(
+                ctmrg_reduce_opts,
+                name="ctmrg_reduce_opts",
+            )
+            if reduce_opts or ctmrg_gauge_smudge is not None:
+                raise ValueError(
+                    "ctmrg_reduce_opts and ctmrg_gauge_smudge apply only to "
+                    "projector CTMRG modes, not ctmrg_mode='l2bp'."
+                )
+            if ctmrg_canonize_opts:
+                raise ValueError(
+                    "ctmrg_canonize_opts applies only to "
+                    "ctmrg_mode='projector'; configure l2bp through "
+                    "ctmrg_compress_opts."
+                )
+            stabilization = {}
+        elif ctmrg_mode == "projector2d":
+            if ctmrg_canonize_opts:
+                raise ValueError(
+                    "ctmrg_canonize_opts is not used by "
+                    "ctmrg_mode='projector2d'."
+                )
+            if ctmrg_gauge_smudge is not None:
+                raise ValueError(
+                    "ctmrg_gauge_smudge is not used by "
+                    "ctmrg_mode='projector2d'."
+                )
+            stabilization = _ctmrg_stabilization_kwargs(
+                norm,
+                reduce_opts=ctmrg_reduce_opts,
+                projector_gauges=False,
+            )
+        else:
+            if ctmrg_canonize is False and ctmrg_canonize_opts:
+                raise ValueError(
+                    "ctmrg_canonize_opts is not used when "
+                    "ctmrg_canonize=False."
+                )
+            stabilization = _ctmrg_stabilization_kwargs(
+                norm,
+                reduce_opts=ctmrg_reduce_opts,
+                gauge_smudge=ctmrg_gauge_smudge,
+                canonize_opts=ctmrg_canonize_opts,
+            )
+
         sequence = _default_quimb_sequence(norm, method) if sequence is None else sequence
+        quimb_ctmrg_mode = ctmrg_mode
+        if ctmrg_projector_region == (2, 3):
+            quimb_ctmrg_mode = _ctmrg_regional_projector_compressor
         kwargs = dict(
             max_bond=chi,
             cutoff=cutoff,
-            canonize=True,
-            mode="projector",
+            canonize=ctmrg_canonize,
+            mode=quimb_ctmrg_mode,
             sequence=sequence,
             max_separation=max_separation,
             equalize_norms=equalize_norms,
             optimize=contraction_opt,
-            final_contract=True,
+            final_contract=around is None,
             final_contract_opts=final_contract_opts,
             progbar=progress,
             inplace=False,
         )
-        kwargs.update(
-            _ctmrg_stabilization_kwargs(
-                norm,
-                reduce_opts=ctmrg_reduce_opts,
-                gauge_smudge=ctmrg_gauge_smudge,
-            )
-        )
+        if around is not None:
+            kwargs["around"] = around
+        kwargs.update(stabilization)
+        if ctmrg_compress_opts:
+            kwargs["compress_opts"] = ctmrg_compress_opts
         if layer_tags is not None:
             kwargs["layer_tags"] = list(layer_tags)
-        with quimb_ctmrg_projector_compat():
-            return _call_with_accepted_kwargs(contract_fn, **kwargs)
+
+        def contract_ctmrg():
+            with _quimb_ctmrg_mode_forwarding_compat(ctmrg_mode):
+                return _call_with_accepted_kwargs(contract_fn, **kwargs)
+
+        if ctmrg_mode in {"projector", "projector2d"}:
+            with quimb_ctmrg_projector_compat():
+                contracted = contract_ctmrg()
+        else:
+            contracted = contract_ctmrg()
+        if around is not None:
+            return _finish_quimb_around_contraction(
+                contracted,
+                final_contract_opts=final_contract_opts,
+                method=method,
+            )
+        return contracted
 
     if method == "hotrg":
         contract_fn = getattr(norm, "contract_hotrg", None)
@@ -833,11 +1424,16 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -848,53 +1444,87 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     strip_exponent=False,
     mode_="mps",
     sequence=None,
+    around=None,
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
     bdy_name="bdy",
     flat=False,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
 ):
     """Contract a double-layer PEPS norm/overlap network by the selected method."""
     method = _normalize_contraction_method(method)
+    if fit_compression_opts and method != "dmrg":
+        raise ValueError("fit_compression_opts requires method='dmrg' with a Quimb fit_mode.")
+    fit_compression_opts = quimb_compression_options(
+        _canonical_fit_mode_selector(fit_mode), fit_compression_opts
+    )
     chi = _validate_chi(chi)
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
+    if (
+        fit_layer_mode == "sequential"
+        and fit_layer_order == "auto"
+        and layer_tags is None
+    ):
+        raise ValueError(
+            "fit_layer_order='auto' requires explicit layer_tags; the "
+            "default BRA/KET order is semantically significant."
+        )
     if layer_tags is None and not flat:
         layer_tags = _DEFAULT_LAYER_TAGS
+    elif isinstance(layer_tags, str):
+        layer_tags = (layer_tags,)
     elif layer_tags is not None:
         layer_tags = tuple(layer_tags)
+    if fit_layer_mode == "sequential" and method != "dmrg":
+        raise ValueError(
+            "fit_layer_mode='sequential' requires method='dmrg'; "
+            "method='mps' uses Quimb's native layer_tags handling."
+        )
 
     if method == "dmrg":
         fit_mode = _canonical_fit_mode_selector(fit_mode)
         bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
-        block_fit = fit_mode == "two-site" or (
+        direct_compression = fit_mode in _FIT_QUIMB_MODES
+        block_fit = fit_mode in {"two-site", "dmrg2"} or (
             fit_mode == "eff" and fit_block_size in {2, 3}
         )
+        low_rank_start = direct_compression or block_fit
         _retune_bdy_to_chi(
             bdy_obj,
             chi,
             bdy_name,
-            expand_growth=not block_fit,
+            expand_growth=not low_rank_start,
         )
         if bdy_obj is None:
             if chi is None:
                 raise ValueError(f"Provide chi when {bdy_name} is not supplied.")
-            # A two-site SVD can discover rank as it sweeps. Starting from a
-            # product boundary avoids allocating and canonicalizing chi-wide
-            # random bonds that may be immediately truncated away.
-            initial_chi = 1 if block_fit else chi
+            # Block-SVD fits discover rank as they sweep, while direct Quimb
+            # modes replace each boundary without consuming an initial guess.
+            # A product boundary avoids allocating and canonicalizing random
+            # chi-wide bonds in either case.
+            initial_chi = 1 if low_rank_start else chi
             if flat:
                 bdy_obj = BdyMPS(
                     tn_flat=norm,
                     chi=initial_chi,
                     flat=True,
                     single_layer=single_layer,
+                    lazy=True,
                 )
             else:
                 bdy_obj = BdyMPS(
                     tn_double=norm,
                     chi=initial_chi,
                     single_layer=single_layer,
+                    lazy=True,
                 )
             if bdy_holder is not None:
                 bdy_holder["bdy"] = bdy_obj
@@ -904,12 +1534,17 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             bdy=bdy_obj,
             contraction_opt=contraction_opt,
             fit_mode=fit_mode,
+            fit_layer_mode=fit_layer_mode,
+            fit_layer_order=fit_layer_order,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_seed=fit_init_seed,
             fit_block_size=fit_block_size,
             fit_adaptive_sweeps=fit_adaptive_sweeps,
             fit_max_bond=chi if fit_max_bond is None else fit_max_bond,
             fit_sweep_sequence=fit_sweep_sequence,
             fit_cutoff=cutoff,
             fit_cutoff_mode=fit_cutoff_mode,
+            fit_compression_opts=fit_compression_opts,
             fit_min_iter=fit_min_iter,
             fit_rtol=fit_rtol,
             fit_patience=fit_patience,
@@ -920,6 +1555,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             direction=direction,
             max_separation=max_separation,
             track_boundary_fidelity=track_boundary_fidelity,
+            layer_tags=layer_tags,
             visualize=visualize,
             strip_exponent=strip_exponent,
             equalize_norms=equalize_norms,
@@ -937,9 +1573,15 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         strip_exponent=strip_exponent,
         mode_=mode_,
         sequence=sequence,
+        around=around,
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
@@ -965,11 +1607,15 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -978,21 +1624,38 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     visualize=False,
     strip_exponent=False,
     return_info=False,
+    preserve_backend=False,
     mode_=None,
+    compression_mode=None,
     sequence=None,
+    boundary_direction=None,
+    middle_slices=None,
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
 ):
-    """Contract an already-flat PEPS-like tensor network.
+    """Contract one already-flattened effective PEPS-like layer.
 
-    This helper is for networks that have already been flattened into a scalar
-    tensor network, so it does not call :func:`build_bra_ket`. With
-    ``method="auto"`` it uses the PEPSY DMRG/FIT boundary path for 2D networks
-    and quimb's ``contract_boundary`` path for 3D networks. Explicit methods
-    are ``"dmrg"``, ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and ``"exact"``.
+    This helper is for a single lattice layer whose local bra/ket or operator
+    contractions have already been performed. It does not call
+    :func:`build_bra_ket`, and ``flat=True`` selects the direct first-slice
+    boundary initialization in :class:`~pepsy.boundary.states.BdyMPS`.
+    ``tn`` may still have ordinary lattice boundary indices, but it must not be
+    interpreted as a stack of separately tagged ``BRA``/``PEPO``/``KET``
+    layers. Use :func:`contract_boundary` with ``flat=False`` and a
+    ``BdyMPS(tn_double=...)`` for an explicitly layered target.
+
+    With ``method="auto"`` this uses the PEPSY DMRG/FIT boundary path for 2D
+    networks and Quimb's ``contract_boundary`` path for 3D networks. Explicit
+    methods are ``"dmrg"``, ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and
+    ``"exact"``.
 
     Parameters
     ----------
@@ -1008,11 +1671,74 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         Contraction backend. ``"dmrg"`` is only supported for 2D flat
         PEPS-like networks; quimb methods are used for 2D and 3D when the
         input network exposes the corresponding method.
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Quimb also accepts the supported
+        ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
+        ``srcmps``. The direct modes compress each
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Must remain ``"joint"`` for this single-effective-layer API.
+        Sequential layer absorption belongs to the multilayer
+        :func:`contract_boundary` path.
+    layer_tags : sequence[str] | None, default=None
+        Optional layer tags forwarded to Quimb's native contraction methods.
+        They do not turn this single-layer API into a multilayer contraction.
+    ctmrg_mode : {"projector", "projector2d", "l2bp"}, default="projector"
+        Quimb boundary compressor used by ``method="ctmrg"``. ``"projector"``
+        preserves Pepsy's existing locally computed projector route;
+        ``"projector2d"`` inserts explicit plaquette projectors, and
+        ``"l2bp"`` uses lazy 2-norm belief-propagation compression.
+    ctmrg_canonize : bool | {"layered", "bp"} | None, default=None
+        Projector preconditioning. ``None`` preserves the existing
+        ``True`` default for ``"projector"`` and enables local gauging for
+        ``"l2bp"``. ``"layered"`` and ``"bp"`` apply only to
+        ``ctmrg_mode="projector"``. ``"projector2d"`` does not use this
+        option.
+    ctmrg_projector_region : {(2, 2), (2, 3)} | str | None, default=None
+        Local projector environment. ``None`` or ``(2, 2)`` preserves the
+        native two-site route. ``(2, 3)`` expands each projector calculation
+        to three neighboring boundary sites and is available for dense,
+        open-boundary 2D networks with ``ctmrg_mode="projector"``.
+    ctmrg_canonize_opts : mapping | None, default=None
+        Options for ``ctmrg_mode="projector"`` canonicalization. With
+        ``ctmrg_canonize="bp"`` these configure Quimb's dense D2BP solve.
+    ctmrg_compress_opts : mapping | None, default=None
+        Options for the selected Quimb CTMRG boundary compressor.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     strip_exponent : bool, default=False
         If ``True``, return ``(mantissa, exponent)``.
     return_info : bool, default=False
         Return :class:`BoundaryContractResult` instead of only its ``cost``.
         The result includes per-boundary convergence diagnostics for DMRG.
+    preserve_backend : bool, default=False
+        Return the raw backend scalar (or raw ``(mantissa, exponent)`` pair)
+        without converting it to Python numbers. Enable this for Torch/JAX
+        autodiff through a flat contraction. The default preserves the
+        reporting-oriented scalar API.
+    compression_mode : str | None, default=None
+        Compression kernel for ``method="mps"``, such as ``"direct"``,
+        ``"dm"``, or ``"sdc"``. This is the readable spelling of the
+        compatibility argument ``mode_``; do not supply both.
+    boundary_direction : str | None, default=None
+        Readable contraction schedule. One-sided choices are ``"bottom-up"``,
+        ``"top-down"``, ``"left-to-right"``, and ``"right-to-left"``;
+        two-/four-sided choices are ``"top-bottom"``, ``"bottom-top"``,
+        ``"left-right"``, ``"right-left"``, and ``"four-sided"``. These
+        map to Quimb boundary sequences for ``method="mps"`` or ``"ctmrg"``.
+        ``"middle-out-x"`` and ``"middle-out-y"`` absorb the two opposing
+        outer boundaries inward towards a protected central row or column.
+        They support ``method="mps"`` (with direct compression by default) and
+        ``method="ctmrg"``. ``"middle-out"`` takes its axis from ``direction``.
+    middle_slices : int | sequence[int] | None, default=None
+        Contiguous target row(s) or column(s) protected while the two outer
+        boundaries are absorbed inward. The default is the central row for odd
+        lengths and the central pair for even lengths. An interface can be
+        targeted explicitly with ``middle_slices=(u_last, v_first)``.
     ctmrg_reduce_opts : mapping | None, default=None
         Optional options forwarded to Quimb's squared-environment
         factorization for ``method="ctmrg"``. Symmray networks receive
@@ -1030,11 +1756,73 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     if tn is None:
         raise ValueError("tn must not be None.")
 
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    if fit_layer_mode != "joint":
+        raise ValueError(
+            "contract_flat handles one already-flattened effective layer and "
+            "requires fit_layer_mode='joint'; use contract_boundary with "
+            "flat=False for multilayer sequential compression."
+        )
+
     method = _normalize_flat_contraction_method(method, tn)
     if method == "dmrg" and _infer_lattice_ndim(tn) == 3:
         raise ValueError(
             "method='dmrg' is only supported for 2D flat tensor networks; "
             "use method='mps', 'ctmrg', 'hotrg', or 'exact' for 3D networks."
+        )
+
+    if compression_mode is not None:
+        if mode_ is not None:
+            raise ValueError("Supply only one of compression_mode and mode_.")
+        if method != "mps":
+            raise ValueError("compression_mode applies only to method='mps'.")
+        mode_ = compression_mode
+
+    if boundary_direction is not None and sequence is not None:
+        raise ValueError("Supply only one of boundary_direction and sequence.")
+    resolved_sequence, middle_axis = _canonical_flat_boundary_direction(
+        boundary_direction,
+        direction=direction,
+    )
+    if resolved_sequence is not None:
+        if method not in {"mps", "ctmrg"}:
+            raise ValueError(
+                "boundary_direction presets require method='mps' or "
+                "method='ctmrg'."
+            )
+        sequence = resolved_sequence
+    if middle_slices is not None and middle_axis is None:
+        raise ValueError(
+            "middle_slices is used only with boundary_direction='middle-out', "
+            "'middle-out-x', or 'middle-out-y'."
+        )
+
+    around = None
+    if middle_axis is not None:
+        if method not in {"mps", "ctmrg"}:
+            raise ValueError(
+                "middle-out contraction requires method='mps' or "
+                "method='ctmrg'."
+            )
+        if _infer_lattice_ndim(tn) != 2:
+            raise ValueError(
+                "middle-out contraction currently supports only 2D networks."
+            )
+        if method == "mps":
+            middle_mode = (
+                "direct" if mode_ is None else str(mode_).strip().lower()
+            )
+            if middle_mode != "direct":
+                raise ValueError(
+                    "middle-out MPS contraction currently requires "
+                    "compression_mode='direct'."
+                )
+            mode_ = "direct"
+        sequence = (f"{middle_axis}min", f"{middle_axis}max")
+        around = _flat_middle_around(
+            tn,
+            axis=middle_axis,
+            middle_slices=middle_slices,
         )
 
     result, _ = _contract_peps_double_layer(
@@ -1049,11 +1837,15 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -1064,13 +1856,196 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         strip_exponent=strip_exponent,
         mode_=mode_,
         sequence=sequence,
+        around=around,
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
         bdy_name="bdy",
         flat=True,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
+    )
+    if middle_axis is not None:
+        result = replace(result, direction=f"middle-out-{middle_axis}")
+    cost = (
+        result.cost
+        if preserve_backend
+        else _format_scaled_output(
+            result.cost,
+            strip_exponent=strip_exponent,
+        )
+    )
+    if return_info:
+        return replace(result, cost=cost)
+    return cost
+
+
+def _validate_layer_tags(layer_tags, tn):
+    """Validate and canonicalize the explicit tags for ``contract_layered``."""
+    if isinstance(layer_tags, str):
+        tags = (layer_tags,)
+    else:
+        try:
+            tags = tuple(str(tag) for tag in layer_tags)
+        except TypeError as exc:
+            raise TypeError(
+                "layer_tags must be a string or sequence of strings."
+            ) from exc
+
+    if len(tags) < 2:
+        raise ValueError(
+            "contract_layered requires at least two distinct layer_tags."
+        )
+    if any(not tag for tag in tags):
+        raise ValueError("layer_tags must contain only non-empty tags.")
+    if len(set(tags)) != len(tags):
+        raise ValueError("layer_tags must not contain duplicates.")
+
+    network_tags = set(getattr(tn, "tags", ()))
+    missing = tuple(tag for tag in tags if tag not in network_tags)
+    if missing:
+        missing_text = ", ".join(repr(tag) for tag in missing)
+        raise ValueError(
+            "contract_layered could not find layer tag(s) "
+            f"{missing_text} in the supplied tensor network."
+        )
+    return tags
+
+
+def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    tn,
+    *,
+    layer_tags,
+    chi=None,
+    bdy=None,
+    method="dmrg",
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
+    fit_block_size=1,
+    fit_adaptive_sweeps=None,
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
+    visualize=False,
+    strip_exponent=False,
+    return_info=False,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+):
+    """Contract an explicitly tagged multilayer boundary network.
+
+    This is the multilayer counterpart to :func:`contract_flat`. ``tn`` is
+    expected to contain two or more distinct layer tags, supplied in the
+    desired absorption order. The network is passed directly to the shared
+    :class:`~pepsy.boundary.sweeps.CompBdy` engine with ``flat=False``; no
+    giant flattened BRA--PEPO--KET tensor network is formed.
+
+    Parameters
+    ----------
+    tn : qtn.TensorNetwork
+        Preassembled, tagged multilayer tensor network.
+    layer_tags : sequence[str]
+        Distinct layer tags in absorption order, for example
+        ``("BRA", "PEPO", "KET")``.
+    chi : int | None, default=None
+        Boundary bond dimension. Required when ``bdy`` is not supplied.
+    bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
+        Optional reusable boundary handle.
+    method : {"dmrg"}, default="dmrg"
+        Layered networks use the Pepsy ``CompBdy`` engine. Native Quimb
+        ``method="mps"`` remains available through :func:`contract_boundary`
+        or the scalar metric helpers.
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Quimb also accepts the supported
+        ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
+        ``srcmps``. Direct Quimb modes can be combined with
+        ``fit_layer_mode="sequential"``; FIT modes use a joint target.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Whether to compress all tagged layers jointly or absorb them one at a
+        time in ``layer_tags`` order. Sequential mode is intended for the
+        direct Quimb fit modes.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and is only appropriate
+        when the explicitly tagged layers are mathematically interchangeable.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess used by FIT modes.
+    strip_exponent : bool, default=False
+        If ``True``, return the scalar as ``(mantissa, exponent)``.
+    return_info : bool, default=False
+        If ``True``, return :class:`BoundaryContractResult` with diagnostics.
+
+    Other parameters match :func:`contract_flat` and
+    :func:`contract_boundary` where applicable.
+    """
+    if tn is None:
+        raise ValueError("tn must not be None.")
+
+    method = _normalize_contraction_method(method)
+    if method != "dmrg":
+        raise ValueError(
+            "contract_layered uses method='dmrg' and the CompBdy engine; "
+            "use contract_boundary for native Quimb method='mps'."
+        )
+    layer_tags = _validate_layer_tags(layer_tags, tn)
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
+
+    result, _ = _contract_peps_double_layer(
+        tn,
+        method="dmrg",
+        chi=chi,
+        bdy=bdy,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
+        fit_block_size=fit_block_size,
+        fit_adaptive_sweeps=fit_adaptive_sweeps,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
+        single_layer=False,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+        bdy_name="bdy",
+        flat=False,
     )
     cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
     if return_info:
@@ -1154,10 +2129,15 @@ def contract_boundary(
     contraction_opt="auto-hq",
     flat=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff=1.0e-12,
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1175,14 +2155,16 @@ def contract_boundary(
     strip_exponent=False,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
+    layer_tags=None,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     """Approximate a scalar contraction using boundary-MPS sweeps.
 
     Parameters
     ----------
     norm : qtn.TensorNetwork
-        Prebuilt double-layer network, usually from
-        :func:`build_bra_ket`.
+        Prebuilt 2D contraction network, usually the BRA--KET double layer
+        returned by :func:`build_bra_ket`. Explicitly layered targets such as
+        BRA--PEPO--KET may also be supplied here with ``flat=False``.
     bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
         Boundary handle:
 
@@ -1191,26 +2173,51 @@ def contract_boundary(
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer passed through to :class:`pepsy.boundary.sweeps.CompBdy`.
     flat : bool, default=False
-        Forwarded to sweep backend.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Fit backend mode. ``"two-site"`` performs native-SVD pair updates
-        while preserving the cached left/right environment sweep.
+        Use the single-effective-layer initialization shortcut. Keep this
+        ``False`` for a multi-layer target; use ``BdyMPS(tn_double=...)`` for
+        the corresponding boundary object.
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Quimb also accepts the supported
+        ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
+        ``srcmps``. The direct modes compress each
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``. Only direct Quimb fit modes support the
+        sequential policy.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
     fit_adaptive_sweeps : int | None, default=None
         For ``fit_mode="eff"`` and block size 2 or 3, number of initial
         block-SVD sweeps before one-site refinement. ``None`` keeps fixed
         block-size sweeps.
+    layer_tags : sequence[str] | None, default=None
+        Layer tags used for sequential direct compression, in absorption
+        order. The standard two-layer order defaults to ``("KET", "BRA")``;
+        supply tags such as ``("BRA", "PEPO", "KET")`` for three layers.
     fit_max_bond : int | None, default=None
         Two-site SVD cap. If omitted, use the boundary object's current bond.
         Higher-level PEPS helpers pass their requested ``chi`` explicitly.
     fit_sweep_sequence : str, default="RL"
         Repeating local-fit sweep directions. ``"RL"`` runs left-to-right
         and then right-to-left.
-    fit_cutoff : float, default=1e-12
-        Two-site SVD truncation cutoff.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used by the two-site split.
+    fit_cutoff : float | {"auto"}, default=1e-12
+        Boundary compression cutoff. ``"auto"`` selects the shared
+        dtype-aware cutoff policy.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum completed sweeps before adaptive stopping. ``FIT.run_eff``
         requires at least two when ``fit_rtol`` is enabled.
@@ -1256,6 +2263,13 @@ def contract_boundary(
         raise ValueError("norm must not be None.")
     if bdy is None:
         raise ValueError("Provide bdy.")
+    fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
+    if flat and fit_layer_mode != "joint":
+        raise ValueError(
+            "flat=True handles one already-flattened effective layer and "
+            "requires fit_layer_mode='joint'; use contract_layered or "
+            "contract_boundary(..., flat=False) for multilayer compression."
+        )
     if hasattr(bdy, "mps_b"):
         bdy_obj = bdy
         mps_boundaries = bdy.mps_b
@@ -1281,17 +2295,23 @@ def contract_boundary(
         mps_boundaries,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff=fit_cutoff,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
         fit_timing=fit_timing,
         fit_timing_sync_device=fit_timing_sync_device,
+        layer_tags=layer_tags,
     )
 
     cost = comp_bdy.run(
@@ -1331,11 +2351,16 @@ def _contract_state_norm(
     progress,
     track_boundary_fidelity,
     fit_mode,
+    fit_layer_mode,
+    fit_layer_order,
+    fit_init_strategy,
+    fit_init_seed,
     fit_block_size,
     fit_adaptive_sweeps,
     fit_max_bond,
     fit_sweep_sequence,
     fit_cutoff_mode,
+    fit_compression_opts,
     fit_min_iter,
     fit_rtol,
     fit_patience,
@@ -1349,6 +2374,13 @@ def _contract_state_norm(
     cutoff,
     equalize_norms,
     layer_tags,
+    ctmrg_mode,
+    ctmrg_canonize,
+    ctmrg_projector_region,
+    ctmrg_canonize_opts,
+    ctmrg_compress_opts,
+    ctmrg_reduce_opts,
+    ctmrg_gauge_smudge,
 ):
     """Build ``<p|p>``, set up the boundary, and contract it.
 
@@ -1375,11 +2407,16 @@ def _contract_state_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -1393,6 +2430,13 @@ def _contract_state_norm(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
         bdy_name="bdy",
     )
     return result, ket_tagged, bdy_obj
@@ -1411,11 +2455,16 @@ def peps_normalize(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1429,6 +2478,13 @@ def peps_normalize(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
     balance_bonds=True,
     return_info=False,
 ):
@@ -1472,9 +2528,45 @@ def peps_normalize(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Boundary fitting backend mode. ``"two-site"`` can grow useful bond
-        subspaces up to ``fit_max_bond`` through native SVD pair updates.
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Quimb also accepts the supported
+        ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
+        ``srcmps``. The direct modes compress each
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
+    layer_tags : sequence[str] | None, default=None
+        Layer tags used for sequential direct compression, in absorption
+        order. Use e.g. ``("BRA", "PEPO", "KET")`` for three layers.
+    ctmrg_mode : {"projector", "projector2d", "l2bp"}, default="projector"
+        Quimb boundary compressor used by ``method="ctmrg"``. The default
+        preserves Pepsy's existing projector contraction.
+    ctmrg_canonize : bool | {"layered", "bp"} | None, default=None
+        CTMRG projector preconditioning. ``None`` preserves the current
+        projector default of ``True``. The string choices apply only to
+        ``ctmrg_mode="projector"``.
+    ctmrg_projector_region : {(2, 2), (2, 3)} | str | None, default=None
+        Optional local projector environment. The opt-in ``(2, 3)`` route is
+        dense, 2D, and open-boundary only.
+    ctmrg_canonize_opts, ctmrg_compress_opts : mapping | None, default=None
+        Options for projector canonicalization and the selected CTMRG
+        compressor, respectively.
+    ctmrg_reduce_opts : mapping | None, default=None
+        Squared-environment factorization options for projector modes.
+    ctmrg_gauge_smudge : float | None, default=None
+        Gauge regularization for ``ctmrg_mode="projector"``.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
         Sizes 2 and 3 enable native block-SVD growth.
@@ -1486,8 +2578,9 @@ def peps_normalize(
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum two-site sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -1537,11 +2630,16 @@ def peps_normalize(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -1554,6 +2652,13 @@ def peps_normalize(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
     try:
         result, ket_tagged, _ = _contract_state_norm(
@@ -1602,11 +2707,16 @@ def boundary_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1620,6 +2730,13 @@ def boundary_norm(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
     return_info=False,
 ):
     """Compute ``<p|p>`` via boundary contraction without rescaling ``p``.
@@ -1651,9 +2768,25 @@ def boundary_norm(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Boundary fitting backend mode. ``"two-site"`` uses cached pair
-        environments and native SVD truncation.
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Quimb also accepts the supported
+        ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
+        ``srcmps``. The direct modes compress each
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
         Sizes 2 and 3 enable native block-SVD growth.
@@ -1665,8 +2798,9 @@ def boundary_norm(
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum two-site sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -1683,6 +2817,19 @@ def boundary_norm(
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     strip_exponent : bool, default=False
         If ``True``, return ``(mantissa, exponent)`` for the norm estimate.
+    ctmrg_mode : {"projector", "projector2d", "l2bp"}, default="projector"
+        Quimb boundary compressor used by ``method="ctmrg"``.
+    ctmrg_canonize : bool | {"layered", "bp"} | None, default=None
+        Mode-aware CTMRG projector preconditioning.
+    ctmrg_projector_region : {(2, 2), (2, 3)} | str | None, default=None
+        Optional local projector environment. The opt-in ``(2, 3)`` route is
+        dense, 2D, and open-boundary only.
+    ctmrg_canonize_opts, ctmrg_compress_opts : mapping | None, default=None
+        Canonicalization and selected-compressor options, respectively.
+    ctmrg_reduce_opts : mapping | None, default=None
+        Squared-environment factorization options for projector modes.
+    ctmrg_gauge_smudge : float | None, default=None
+        Gauge regularization for ``ctmrg_mode="projector"``.
     return_info : bool, default=False
         Return :class:`BoundaryContractResult` instead of only its ``cost``.
 
@@ -1708,11 +2855,16 @@ def boundary_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -1726,6 +2878,13 @@ def boundary_norm(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
     cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
     if return_info:
@@ -1746,11 +2905,16 @@ def peps_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1764,6 +2928,13 @@ def peps_norm(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
     return_info=False,
 ):
     """Compute the PEPS norm ``<p|p>`` without modifying ``p``.
@@ -1774,6 +2945,15 @@ def peps_norm(
 
     ``fit_block_size`` and ``fit_adaptive_sweeps`` are forwarded to the
     ``fit_mode="eff"`` boundary solver.
+
+    For direct ``fit_mode`` values, ``fit_layer_mode="sequential"`` absorbs
+    layers one at a time in the order given by ``layer_tags``. The default is
+    ``fit_layer_mode="joint"``; use e.g. ``("BRA", "PEPO", "KET")`` for a
+    tagged three-layer target.
+
+    For ``method="ctmrg"``, ``ctmrg_mode`` selects ``"projector"`` (the
+    compatibility default), ``"projector2d"``, or ``"l2bp"``. The remaining
+    ``ctmrg_*`` arguments match :func:`contract_flat`.
 
     Returns
     -------
@@ -1794,11 +2974,16 @@ def peps_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -1812,6 +2997,13 @@ def peps_norm(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
         return_info=return_info,
     )
 
@@ -1834,11 +3026,16 @@ def peps_infidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1852,6 +3049,13 @@ def peps_infidelity(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     r"""Compute the infidelity between two PEPS states via boundary contraction.
 
@@ -1918,8 +3122,25 @@ def peps_infidelity(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track per-step fidelity during boundary contraction.
-    fit_mode : {"eff", "two-site", "global"}, default="eff"
-        Boundary fitting backend mode.
+    fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
+        Boundary compression mode. Quimb also accepts the supported
+        ``*-first``/``*-oversample`` variants and ``src-mps`` aliases
+        ``srcmps``. The direct modes compress each
+        boundary target; ``"dmrg"`` and ``"dmrg1"`` alias ``"eff"``, while
+        ``"dmrg2"`` uses two-site warm-up followed by one-site refinement.
+    fit_layer_mode : {"joint", "sequential"}, default="joint"
+        Direct-mode layer policy. ``"joint"`` compresses all tagged layers
+        together; ``"sequential"`` compresses them one at a time in the
+        order given by ``layer_tags``.
+    fit_layer_order : {"input", "auto"}, default="input"
+        Sequential absorption order. ``"input"`` preserves ``layer_tags``;
+        ``"auto"`` estimates dense intermediate sizes and requires explicit,
+        mathematically interchangeable layer tags.
+    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+        Disposable initial boundary guess. ``"guess-src"`` applies Quimb
+        SRC to a copy of each exact boundary target before FIT.
+    fit_init_seed : int | None, default=0
+        Seed forwarded to the disposable SRC guess.
     fit_block_size : {1, 2, 3}, default=1
         Block size used by ``FIT.run_eff`` when ``fit_mode="eff"``.
     fit_adaptive_sweeps : int | None, default=None
@@ -1929,8 +3150,9 @@ def peps_infidelity(
         Two-site SVD cap. Defaults to the requested boundary ``chi``.
     fit_sweep_sequence : str, default="RL"
         Repeating two-site sweep directions.
-    fit_cutoff_mode : str, default="rsum2"
-        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_cutoff_mode : str | None | {"auto"}, default="auto"
+        Quimb cutoff convention. ``"auto"`` and ``None`` resolve to
+        ``"rsum2"``.
     fit_min_iter : int | None, default=None
         Minimum two-site sweeps before adaptive stopping.
     fit_rtol : float | None, default=None
@@ -1949,6 +3171,19 @@ def peps_infidelity(
         If ``True``, keep norm and overlap contractions as
         ``(mantissa, exponent)`` pairs and compute the fidelity ratio without
         reconstructing large or tiny scalars.
+    ctmrg_mode : {"projector", "projector2d", "l2bp"}, default="projector"
+        Quimb boundary compressor used by ``method="ctmrg"``.
+    ctmrg_canonize : bool | {"layered", "bp"} | None, default=None
+        Mode-aware CTMRG projector preconditioning.
+    ctmrg_projector_region : {(2, 2), (2, 3)} | str | None, default=None
+        Optional local projector environment. The opt-in ``(2, 3)`` route is
+        dense, 2D, and open-boundary only.
+    ctmrg_canonize_opts, ctmrg_compress_opts : mapping | None, default=None
+        Canonicalization and selected-compressor options, respectively.
+    ctmrg_reduce_opts : mapping | None, default=None
+        Squared-environment factorization options for projector modes.
+    ctmrg_gauge_smudge : float | None, default=None
+        Gauge regularization for ``ctmrg_mode="projector"``.
     Returns
     -------
     dict[str, object]
@@ -1979,11 +3214,16 @@ def peps_infidelity(
         chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2001,6 +3241,13 @@ def peps_infidelity(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
 
     # -- <p|p> --
@@ -2089,11 +3336,16 @@ def peps_fidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_layer_mode="joint",
+    fit_layer_order="input",
+    fit_init_strategy="direct",
+    fit_init_seed=0,
     fit_block_size=1,
     fit_adaptive_sweeps=None,
     fit_max_bond=None,
     fit_sweep_sequence="RL",
-    fit_cutoff_mode="rsum2",
+    fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2107,6 +3359,13 @@ def peps_fidelity(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_mode="projector",
+    ctmrg_canonize=None,
+    ctmrg_projector_region=None,
+    ctmrg_canonize_opts=None,
+    ctmrg_compress_opts=None,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
     return_info=False,
 ):
     """Compute boundary-estimated PEPS fidelity.
@@ -2141,11 +3400,16 @@ def peps_fidelity(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_layer_mode=fit_layer_mode,
+        fit_layer_order=fit_layer_order,
+        fit_init_strategy=fit_init_strategy,
+        fit_init_seed=fit_init_seed,
         fit_block_size=fit_block_size,
         fit_adaptive_sweeps=fit_adaptive_sweeps,
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2159,6 +3423,13 @@ def peps_fidelity(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_mode=ctmrg_mode,
+        ctmrg_canonize=ctmrg_canonize,
+        ctmrg_projector_region=ctmrg_projector_region,
+        ctmrg_canonize_opts=ctmrg_canonize_opts,
+        ctmrg_compress_opts=ctmrg_compress_opts,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
     fidelity = 1 - result["infidelity"]
     if return_info:

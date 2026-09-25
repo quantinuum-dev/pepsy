@@ -13,14 +13,16 @@ signatures, members, and source links.
 | Build an MPS or PEPS from a product state | `pepsy.tensors` constructors | [Tensor constructors](tensors/constructors.md) |
 | Prepare and contract a PEPS norm | `pepsy.boundary` | [Boundary metrics](boundary/metrics.md), [boundary states](boundary/states.md) |
 | Apply gates and build operators | `pepsy.operators` | [Gates](operators/gates.md), [Hamiltonians](operators/hamiltonians.md) |
-| Evolve an MPS circuit | `pepsy.optimizers.mps` | [MPS optimization](optimizers/mps.md) |
-| Evolve or clean up a PEPS | `pepsy.optimizers.peps` | [PEPS optimization](optimizers/peps.md) |
-| Run boundary sweeps | `pepsy.optimizers.sweep` | [Sweep optimization](optimizers/sweep.md) |
-| Replay a circuit on a tree | `pepsy.optimizers.tree` | [Tree optimization](optimizers/tree.md) |
+| Evolve an MPS circuit | `pepsy.optimizers.MpsOptimizer` | [MPS optimization](optimizers/mps.md) |
+| Prepare a Gibbs state with MPS purification | `pepsy.optimizers.GibbsMps` | [GibbsMps](optimizers/gibbs_mps.md) |
+| Evolve or clean up a PEPS | `pepsy.optimizers.PepsOptimizer` | [PEPS optimization](optimizers/peps.md) |
+| Run boundary sweeps | `pepsy.optimizers.SweepOptimizer` | [Sweep optimization](optimizers/sweep.md) |
+| Replay a circuit on a tree | `pepsy.optimizers.TreeOptimizer` | [Tree optimization](optimizers/tree.md) |
 | Sample MPS, PEPS, vector, or tree states | `pepsy.sampling` | [Sampling](sampling/samplers.md) |
-| Use symmetry-aware or fermionic tensors | `pepsy.tensors.symmetric` | [Symmetric tensors](tensors/symmetric.md) |
+| Use symmetry-aware or fermionic tensors | `pepsy.tensors.SymMPS`, `pepsy.tensors.SymPEPS` | [Symmetric tensors](tensors/symmetric.md) |
 | Run belief propagation | `pepsy.bp` | [Belief propagation](bp.md) |
 | Run variational Monte Carlo | `pepsy.vmc` | [VMC](vmc.md) |
+| Adapt external circuit representations | `pepsy.interop` | [Package API map](package.md) |
 
 ## Key classes and functions
 
@@ -42,6 +44,9 @@ signatures, members, and source links.
 - {py:class}`MpsOptimizer <pepsy.optimizers.mps.optimizer.MpsOptimizer>` replays
   one-dimensional gate streams with exact, MPO, FIT,
   DMRG, and mixed modes. See [MPS optimization](optimizers/mps.md).
+- {py:class}`GibbsMps <pepsy.optimizers.mps.gibbs.GibbsMps>` prepares a
+  finite-temperature purification from Hamiltonian terms and traces ancillas
+  to an MPO. See [GibbsMps](optimizers/gibbs_mps.md).
 - {py:class}`PepsOptimizer <pepsy.optimizers.peps.optimizer.PepsOptimizer>`
   applies gates to PEPS and optionally performs boundary or
   global cleanup. See [PEPS optimization](optimizers/peps.md).
@@ -69,6 +74,21 @@ signatures, members, and source links.
   SVD/QR policy. See the [MPS](optimizers/mps.md) and [PEPS](optimizers/peps.md)
   guides for usage in optimization workflows.
 
+## Backend compatibility
+
+`pepsy.backends.backend_cupy(...)` uses upstream Autoray namespace handling
+when it supports unhashable device objects. On affected older versions,
+Pepsy bypasses the failing namespace cache while keeping the original device
+object for array creation. No dependency upgrade is required for this fix.
+
+Random FIT initialization inherits the template's backend, device, and dtype
+unless a dtype is explicitly supplied. Complex normal samples use total
+variance `scale**2`, with half in each of the real and imaginary components,
+including the older-Autoray fallback. This corrects that fallback's previous
+factor-of-two variance; existing seeded complex fallback samples therefore
+change in magnitude. Seeds are reproducible within a route, but do not
+promise identical samples across backends or dependency versions.
+
 ## Canonical import rule
 
 Prefer responsibility-based namespace imports in application code:
@@ -83,6 +103,9 @@ from pepsy.tensors import ps_to_mps, ps_to_peps
 The top-level `pepsy` module keeps useful convenience aliases, but the owning
 namespace is the stable place to discover and import a feature. See the
 [package API map](package.md) for the complete namespace ownership table.
+Use `dir(pepsy.optimizers)` or `dir(pepsy.tensors)` to list advertised names
+without loading their implementations. Optional dependencies do not determine
+API stability; see the [stability policy](../stability.md).
 
 ## Optional integrations
 

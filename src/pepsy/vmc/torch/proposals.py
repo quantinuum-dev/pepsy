@@ -1012,13 +1012,39 @@ def metropolis_exchange_sweep(
             ratio = _safe_metropolis_ratio(proposed_amps, current)
         else:
             try:
-                proposed_phase, proposed_log_abs_values = (
-                    _call_log_amplitude_fn(
-                        log_amplitude_fn,
-                        proposed[flags],
-                        chunk_size=chunk_size,
-                    )
+                proposal_log_amplitude_fn = getattr(
+                    amplitude_fn,
+                    "proposal_log_amplitudes",
+                    None,
                 )
+                default_log_amplitude_fn = getattr(
+                    amplitude_fn,
+                    "forward_log",
+                    None,
+                )
+                uses_model_log_path = (
+                    callable(default_log_amplitude_fn)
+                    and getattr(log_amplitude_fn, "__self__", None)
+                    is amplitude_fn
+                    and getattr(log_amplitude_fn, "__func__", None)
+                    is getattr(default_log_amplitude_fn, "__func__", None)
+                )
+                if callable(proposal_log_amplitude_fn) and uses_model_log_path:
+                    proposed_phase, proposed_log_abs_values = (
+                        proposal_log_amplitude_fn(
+                            configs[flags],
+                            proposed[flags],
+                            chunk_size=chunk_size,
+                        )
+                    )
+                else:
+                    proposed_phase, proposed_log_abs_values = (
+                        _call_log_amplitude_fn(
+                            log_amplitude_fn,
+                            proposed[flags],
+                            chunk_size=chunk_size,
+                        )
+                    )
                 proposed_log_abs = current_log_abs.clone()
                 proposed_log_abs[flags] = proposed_log_abs_values
                 proposed_nonzero = current_nonzero.clone()

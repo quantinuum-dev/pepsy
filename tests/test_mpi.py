@@ -1,5 +1,9 @@
 """Focused tests for MPI shot orchestration without requiring mpi4py."""
 
+from copy import deepcopy
+from importlib.util import find_spec
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -104,7 +108,7 @@ def test_run_mpi_shots_convenience_entry_point():
 
 @pytest.mark.parametrize(
     "mode",
-    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "fit", "mix", "mpo", "svd", "swap", "perm", "exact", "su"),
+    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "fit", "mix", "mpo", "svd", "swap", "perm", "exact"),
 )
 def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
     initial = qtn.MPS_computational_state("0", dtype="complex128")
@@ -127,11 +131,13 @@ def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
 
     assert isinstance(result, pepsy.MPIShotResult)
     assert len(result.local_result.optimizers) == 2
+    assert result.rank_diagnostics == ()
     np.testing.assert_allclose(optimizer.p.to_dense(), initial.to_dense())
 
 
 def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
-    optimizer = pepsy.MpsStabOptimizer(1, gates=[("x", 0)])
+    pytest.importorskip("stim")
+    optimizer = pepsy.StabilizerMpsSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=3,
         seed=42,
@@ -144,6 +150,7 @@ def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
     assert isinstance(result, pepsy.MPIShotResult)
     assert len(result.local_result.optimizers) == 3
     assert optimizer.measurements == []
+    assert result.rank_diagnostics == ()
 
 
 def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
@@ -152,8 +159,13 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
         [(flip, 0)],
         n=1,
         chi=4,
+        mode="dmrg2",
+        fit_n_iter=3,
+        seed=46,
         run=False,
     )
+    before = optimizer.to_dense().copy()
+    rng_state = deepcopy(optimizer.rng.bit_generator.state)
     result = optimizer.run(
         shots=3,
         seed=47,
@@ -161,16 +173,32 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
         workers=1,
         progress=False,
         retain="final",
+        mode="direct",
+        compression_mode="dm",
+        compression_seed=19,
+        track_infidelity=False,
     )
 
     assert isinstance(result, pepsy.MPIShotResult)
     assert result.local_shots == 3
     assert len(result.local_result.optimizers) == 3
     assert len(optimizer.G) == 1
+    assert optimizer._dmrg_mode_alias == "dmrg2"
+    assert result.rank_diagnostics == ()
+    assert optimizer.compression_mode == "direct"
+    assert optimizer.compression_seed is None and optimizer.track_infidelity
+    assert optimizer.rng.bit_generator.state == rng_state
+    np.testing.assert_array_equal(optimizer.to_dense(), before)
+    for child in result.local_result.optimizers:
+        assert child.mode == "direct" and child.compression_mode == "dm"
+        assert child.compression_seed == 19 and not child.track_infidelity
+        assert child.fit_n_iter == 3
+        np.testing.assert_allclose(child.to_dense().reshape(-1), [0., 1.], atol=1e-12)
 
 
 def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
-    optimizer = pepsy.TreeStabOptimizer(1, gates=[("x", 0)])
+    pytest.importorskip("stim")
+    optimizer = pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=3,
         seed=48,
@@ -184,6 +212,7 @@ def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
     assert result.local_shots == 3
     assert len(result.local_result.optimizers) == 3
     assert len(optimizer._queue) == 1
+    assert result.rank_diagnostics == ()
 
 
 @pytest.mark.parametrize("shots", [True, 1.0])
@@ -196,7 +225,8 @@ def test_tree_optimizer_run_validates_non_integral_shots(shots):
 
 @pytest.mark.parametrize("shots", [True, 1.0])
 def test_tree_stabilizer_run_validates_non_integral_shots(shots):
-    optimizer = pepsy.TreeStabOptimizer(1)
+    pytest.importorskip("stim")
+    optimizer = pepsy.StabilizerTreeSimulator(1)
 
     with pytest.raises(ValueError, match="shots must be a nonnegative integer"):
         optimizer.run(shots=shots, progress=False)
@@ -215,7 +245,8 @@ def test_tree_run_auto_fault_threshold_dispatches_shots():
 
 
 def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
-    optimizer = pepsy.TreeStabOptimizer(1)
+    pytest.importorskip("stim")
+    optimizer = pepsy.StabilizerTreeSimulator(1)
 
     result = optimizer.run(
         auto_max_expected_faults=0.2,
@@ -233,7 +264,10 @@ def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
         chi=4,
         run=False,
     ),
-    lambda: pepsy.TreeStabOptimizer(1, gates=[("x", 0)]),
+    pytest.param(
+        lambda: pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)]),
+        marks=pytest.mark.skipif(find_spec("stim") is None, reason="requires stim"),
+    ),
 ])
 def test_tree_run_local_progress_is_aggregate(monkeypatch, optimizer_factory):
     import importlib
@@ -489,15 +523,35 @@ def test_mpi_preflight_synchronizes_validation_errors():
         runner.run(-1, seed=5)
 
 
-def test_mpi_diagnostics_can_be_disabled():
+@pytest.mark.parametrize("path", ["ordinary", "streaming", "checkpoint"])
+def test_mpi_diagnostics_can_be_disabled(monkeypatch, tmp_path, path):
+    import pepsy.optimizers.mpi as mpi_module
+
     result = _run_probe(_FakeComm(), 2, seed=5)
     assert result.rank_diagnostics
+
+    def forbidden_clock():
+        raise AssertionError("disabled MPI diagnostics must not read the clock")
+
+    monkeypatch.setattr(mpi_module, "time", SimpleNamespace(perf_counter=forbidden_clock))
+    options = {}
+    if path == "streaming":
+        options = dict(retain="none", observable=lambda opt: opt.value, chunk_size=1)
+    elif path == "checkpoint":
+        options = dict(checkpoint_path=tmp_path / "shots", chunk_size=1, retain="final")
     disabled = pepsy.MPIShotRunner(
         _probe_factory,
         [(np.eye(2), 0)],
         comm=_FakeComm(),
-    ).run(2, seed=5, collect_diagnostics=False)
+    ).run(2, seed=5, collect_diagnostics=False, progress=False, **options)
     assert disabled.rank_diagnostics == ()
+
+
+def test_mps_mpi_diagnostics_require_opt_in():
+    optimizer = pepsy.MpsOptimizer(qtn.MPS_computational_state("0"), [], chi=2)
+    result = optimizer.run(shots=2, mpi=_FakeComm(), workers=1, progress=False,
+                           collect_diagnostics=True)
+    assert result.rank_diagnostics[0].elapsed_seconds >= 0.
 
 
 def test_mpi_streaming_checkpoint_resume(tmp_path):
@@ -710,8 +764,9 @@ def test_mpi_runner_can_use_existing_local_thread_backend():
 
 
 def test_mpi_runner_supports_rank_local_coalesced_batches():
+    pytest.importorskip("stim")
     result = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
         comm=_FakeComm(),
     ).run(
@@ -729,6 +784,7 @@ def test_mpi_runner_supports_rank_local_coalesced_batches():
 
 @pytest.mark.parametrize("strategy", ["independent", "coalesced"])
 def test_mpi_importance_reduction_matches_unbiased_result_estimate(strategy):
+    pytest.importorskip("stim")
     identity = np.eye(2)
     flip = np.asarray([[0.0, 1.0], [1.0, 0.0]])
     channel = pepsy.TrajectoryChannel.mixture(
@@ -736,7 +792,7 @@ def test_mpi_importance_reduction_matches_unbiased_result_estimate(strategy):
     )
     policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
     result = pepsy.MPIShotRunner(
-        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [pepsy.TrajectoryEvent(channel, 0)],
         comm=_FakeComm(),
     ).run(
@@ -816,9 +872,9 @@ def test_mpi_failure_is_surfaced_as_one_error():
             pepsy.MpsOptimizer,
         ),
         (
-            lambda: pepsy.MpsStabOptimizer(1, chi=4),
+            lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
             {},
-            pepsy.MpsStabOptimizer,
+            pepsy.StabilizerMpsSimulator,
         ),
         (
             lambda: pepsy.TreeOptimizer(None, n=1, chi=4, run=False),
@@ -826,15 +882,17 @@ def test_mpi_failure_is_surfaced_as_one_error():
             pepsy.TreeOptimizer,
         ),
         (
-            lambda: pepsy.TreeStabOptimizer(1),
+            lambda: pepsy.StabilizerTreeSimulator(1),
             {},
-            pepsy.TreeStabOptimizer,
+            pepsy.StabilizerTreeSimulator,
         ),
     ],
 )
 def test_mpi_runner_uses_the_common_factory_contract(
     factory, run_kwargs, expected_type
 ):
+    if expected_type in (pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator):
+        pytest.importorskip("stim")
     gate = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
     result = pepsy.MPIShotRunner(
         factory,

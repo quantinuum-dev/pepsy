@@ -5,6 +5,7 @@ import pytest
 import quimb.tensor as qtn
 
 import pepsy
+from pepsy._internal.quimb import quimb_ctmrg_projector_canonize_available
 from pepsy.optimizers import sym_dmrg as sym_dmrg_mod
 from pepsy.operators import gate, gate_simple
 from pepsy.optimizers.sym_dmrg import (
@@ -2290,6 +2291,17 @@ def test_symmetric_as_scalar_handles_backend_scalars_before_numpy_conversion():
     assert symmetric_mod._as_scalar(vector) is vector
 
 
+def test_fermionic_scalar_readout_preserves_pending_global_phase():
+    """The optional Symmray stack must agree on all scalar readout routes."""
+    scalar = sr.Z2FermionicArray(
+        indices=(), charge=0, blocks={(): np.asarray(2.0)},
+    ).phase_global()
+    assert scalar.to_dense() == -2.0
+    assert scalar.item() == -2.0
+    assert scalar.sum() == -2.0
+    assert symmetric_mod._as_scalar(scalar) == -2.0
+
+
 def test_symmetric_to_backend_copy_preserves_original_blocks():
     """to_backend(..., inplace=False) should convert a copied wrapper only."""
     torch = pytest.importorskip("torch")
@@ -2730,37 +2742,6 @@ def test_symmps_heisenberg_builds_energy_and_imaginary_step():
     assert state.norm() == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("model", ["heisenberg", "fermi_hubbard"])
-def test_symmps_mps_optimizer_simple_update_preserves_symmray_data(model):
-    """Simple update should preserve Symmray tensor data under default settings."""
-    state = SymMPS.for_model(
-        model,
-        3,
-        bond_dim=2,
-        seed=18,
-        dtype="complex128",
-    )
-    if model == "fermi_hubbard":
-        hamiltonian = state.build_hamiltonian(t=1.0, U=2.0, mu=0.1)
-    else:
-        hamiltonian = state.build_hamiltonian()
-    gates = hamiltonian.gate_stream(0.001, imaginary=True)
-
-    optimizer = pepsy.MpsOptimizer(
-        state.tn.copy(),
-        gates,
-        chi=4,
-        mode="su",
-    )
-    out = optimizer.run(progbar=False, cutoff=1.0e-10)
-
-    assert _all_tensor_data_symmray(out)
-    assert out.max_bond() <= 4
-    assert len(optimizer.gauges) == out.L - 1
-    assert optimizer.p_ungauged is not None
-    assert np.isfinite(np.real(optimizer.p_ungauged.norm()))
-
-
 def test_symmps_measures_dense_generic_observables():
     """SymMPS.measure should convert dense local operators to Symmray arrays."""
     state = SymMPS.for_model(
@@ -2968,7 +2949,7 @@ def test_fermi_hubbard_u1u1_streams_run_mps_optimizer_and_direct_gate():
 
     assert len(interaction) == 3
     assert len(hopping) == 2
-    assert len(stream) == 3 + 2 + 3
+    assert len(stream) == 2 * len(interaction) + 2 * len(hopping)
     assert direct.tn.L == 3
     assert out.L == 3
     assert out.max_bond() <= 4
@@ -3988,9 +3969,15 @@ def test_u1u1_fermionic_mps_optimizer_two_site_fit_stays_native():
         progbar=False,
         n_iter=2,
         cutoff=1.0e-10,
+        cutoff_mode="rsum2",
         fit_block_size=2,
         fit_sweep_sequence="RL",
     )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["guess_backend"] == "symmray-svd"
+    assert not diagnostics["native_randomized_guess_used"]
+    assert diagnostics["random_initialization"]["fallback_reason"] == "cumulative_cutoff"
 
     assert all(
         type(tensor.data).__name__ == "U1U1FermionicArray"
@@ -4316,7 +4303,7 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
     [
         ("dmrg1", [1, 1, 1]),
         ("dmrg2", [2, 2, 1]),
-        ("dmrg3", [3, 3, 1]),
+        ("dmrg3", [3, 3, 2]),
     ],
 )
 def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
@@ -4537,8 +4524,17 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
     assert ctmrg_norm == pytest.approx(exact_norm)
 
 
-def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer():
-    """Native fermionic CTMRG should remain finite on a small U1U1 PEPS."""
+@pytest.mark.parametrize("ctmrg_canonize", [None, "layered"])
+def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer(
+    ctmrg_canonize,
+):
+    """Validated native CTMRG gauging should match a small exact U1U1 PEPS."""
+    if isinstance(ctmrg_canonize, str) and not (
+        quimb_ctmrg_projector_canonize_available(ctmrg_canonize)
+    ):
+        pytest.skip(
+            f"installed Quimb does not provide {ctmrg_canonize!r} gauging"
+        )
     site_charge = site_charge_from_occupations(
         {
             (0, 0): (1, 0),
@@ -4568,6 +4564,7 @@ def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer():
         method="ctmrg",
         progress=False,
         cutoff=1.0e-10,
+        ctmrg_canonize=ctmrg_canonize,
     )
 
     assert np.isfinite(ctmrg)

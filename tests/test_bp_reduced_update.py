@@ -122,6 +122,7 @@ def test_reduced_update_preserves_torch_backend_for_all_als_paths():
 
 
 def test_reduced_update_exposes_native_quimb_autodiff_solver():
+    pytest.importorskip("autograd")
     peps = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, dtype="float64", seed=73)
     pair = prepare_reduced_bond_pair(
         peps,

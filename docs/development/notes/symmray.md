@@ -21,8 +21,8 @@ documentation](https://symmray.readthedocs.io/en/latest/index.html), the
 and the installed package. Record what was checked here so a future agent can
 tell verified behavior from a proposed design.
 
-Audit date: **2026-08-24**. The shared Python 3.12 environment reports
-`symmray 0.2.2.dev36+g7d1aa0c69`. This is a development build, so a documented
+Audit date: **2026-08-31**. The shared Python 3.12 environment reports
+`symmray 0.3.2.dev6+ga17699db6`. This is a development build, so a documented
 feature still needs an installed-API probe and a focused regression before it
 becomes a Pepsy dependency or changes a native execution path.
 
@@ -78,8 +78,42 @@ At the beginning of future Symmray-native work:
 5. Re-check MPS, PEPS/PEPO, and SymDMRG2 separately when the change touches
    contraction ordering, QR/SVD, backend conversion, or debosonization.
 
+The 2026-08-31 MPO audit also confirmed that native Quimb contraction fuses
+Symmray physical legs into packed charge sectors. Pepsy's MPO boundary now
+passes explicit physical `index_maps` to Symmray when converting the fused
+result to dense, restoring computational-basis order without changing the
+native block representation. This adopts the installed public API and is
+covered by an interior-support MPO regression.
+
 This gives the agent a repeatable upgrade path while keeping design intent
 readable for a human maintainer.
+
+## 2026-09-01 paper and GPU VMC audit
+
+The paper identifies static tensor shapes as the key requirement for GPU VMC.
+Its flat finite-cyclic representation, branchless fermionic phase tables,
+export-vmap-compile pipeline, and cached boundary-MPS reuse are implemented
+in the authors' vmc_torch repository. General variable-sector U1 arrays are
+explicitly outside the same flat GPU path.
+
+Pepsy already uses flat Symmray Z2 arrays for the JAX-jitted NetKet fermionic
+path, while U1, Z2Z2, and U1U1 retain sparse non-jitted fallbacks. Pepsy's
+Torch path now adopts the compatible execution design through the opt-in
+TorchPEPSAmplitude.export_and_compile method. It compiles exact amplitudes
+and stable log amplitudes for a fixed walker batch, and pads changing
+Metropolis proposal subsets to that batch before discarding auxiliary rows.
+
+The intentional boundaries are: fixed-shape compilation is adopted for exact
+dense and flat-Z2 Torch amplitudes; compiled boundary-MPS environment and
+one-/two-row or one-/two-column geometry-class reuse is now an opt-in dense
+Torch prototype; ordinary eager/vmap/serial paths remain the default; and
+general U1/U1U1 flattening is deferred. The compiled boundary path uses
+Quimb's `full-bond` environment mode because the current MPS compression
+route exposes data-dependent SVD shape guards to `torch.export`; it therefore
+needs numerical benchmarks before becoming a default.
+The Python 3.12 audit environment reports Torch 2.6.0, Symmray 0.3.1, and
+NetKet 3.22.3. Upstream APIs were probed and the design was adapted to
+Pepsy's basis ordering, parameter pytree, and contraction fallbacks.
 
 ## Core objects
 

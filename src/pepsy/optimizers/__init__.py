@@ -31,6 +31,7 @@ _SYMBOL_MODULES = {
     "load_qmera_prototype_layout": ".qmera",
     "MpoOptimizer": ".mpo",
     "MpoChannelEvent": ".mpo",
+    "GibbsMps": ".mps",
     "MpsOptimizer": ".mps",
     "MPIRankDiagnostics": ".mpi",
     "MPIShotError": ".mpi",
@@ -47,6 +48,7 @@ _SYMBOL_MODULES = {
     "SweepOptimizer": ".sweep",
     "TreeLayoutFinder": ".tree",
     "TreeMPO": ".tree",
+    "SubTreeMPO": ".tree",
     "TreeOptimizer": ".tree",
     "TreePlan": ".tree",
     "build_tree_operator": ".tree",
@@ -55,9 +57,12 @@ _SYMBOL_MODULES = {
     "TreePepsPlan": ".tree_peps",
     "TreePepsGeometry": ".tree_peps",
     "TreePepsLayoutFinder": ".tree_peps",
+    "TreePEPO": ".tree_peps",
+    "TreeSubPEPO": ".tree_peps",
     "TreePepo": ".tree_peps",
     "TreeSubPepo": ".tree_peps",
     "TreePepsOptimizer": ".tree_peps",
+    "StabilizerTreeSimulator": ".tree_stabilizer",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",
     "CoalescedMeasurementRecord": ".noise",
@@ -112,11 +117,11 @@ _SYMBOL_MODULES = {
     "ImmediateInjectionReport": ".stabilizer_tn",
     "ImmediateProjectionRecord": ".stabilizer_tn",
     "MeasurementRecord": ".stabilizer_tn",
+    "StabilizerMpsSimulator": ".stabilizer_tn",
     "MpsStabOptimizer": ".stabilizer_tn",
     "NormEventRecord": ".stabilizer_tn",
     "STNState": ".stabilizer_tn",
     "StabilizerMpsSettingsAdvice": ".stabilizer_tn",
-    "StabilizerMpsSimulator": ".stabilizer_tn",
     "StabilizerMpsRunResult": ".stabilizer_tn",
     "StabilizerTreeRunResult": ".stabilizer_tn",
     "StreamAnalysisRecord": ".stabilizer_tn",
@@ -148,7 +153,13 @@ __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 _DEPRECATED_ALIASES = {
     "QMeraParametricEnergyOptimizer": "QMeraEnergyOptimizer",
     "MpsStabOptimizer": "StabilizerMpsSimulator",
+    "TreeStabOptimizer": "StabilizerTreeSimulator",
 }
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
+
 
 def __getattr__(name):
     module_name = _SYMBOL_MODULES.get(name)
@@ -161,7 +172,10 @@ def __getattr__(name):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        value = getattr(import_module(module_name, __name__), name)
+        # Resolve deprecated names through the canonical package export so a
+        # root/optimizers import emits one deprecation warning rather than
+        # cascading into the nested stabilizer package's alias resolver.
+        value = getattr(import_module(module_name, __name__), canonical or name)
         globals()[name] = value
         return value
     if name in _SUBMODULES:

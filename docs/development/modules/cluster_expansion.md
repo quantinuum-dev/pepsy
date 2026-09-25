@@ -117,6 +117,19 @@ small-system boundary. Use `basis.exp(step, ...)` for one-off calls or
 plaquette-loop orders 1–4; PEPO–PEPS contractions remain outside this
 operator-construction API.
 
+Located Pauli slots take a separate finite-lattice route. It enumerates
+connected site subsets through the requested order and retains all internal
+oriented bond occurrences, including parallel bonds on a length-two torus.
+Each occurrence gets its own residual because translation reuse is invalid
+for independent coefficients. The exact default factorizes a residual with
+fixed Pauli-history selectors rooted at a centroid of a deterministic
+spanning tree; only the root tensor carries coefficient-dependent values.
+This avoids coefficient-dependent SVD gauges for orders one through nine.
+An explicit `max_tree_rank` below the exact history rank switches that cluster
+to the backend SVD truncation path. Global history ids are compacted per
+physical bond only when materializing the Quimb PEPO, keeping the active
+representation and autodiff topology stable.
+
 `PEPOClusterProductExpansion` is the joint ordered-residual path. It retains
 the supplied `A`, `B`, `C`, ... objects as local Hamiltonian sources, and for
 each connected spatial cluster `S` forms

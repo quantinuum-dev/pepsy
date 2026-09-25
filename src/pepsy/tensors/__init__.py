@@ -64,6 +64,7 @@ _register(
 _register(
     ".constructors",
     "add_cycle",
+    "bell_to_mps",
     "expec_mpo",
     "haar_random_state",
     "hrs_to_mps",
@@ -92,7 +93,14 @@ _register(
     "contract_hypercompressed_tn_batch",
     "tn_norm",
 )
-_register(".observables", "measure_obs", "tn_fidelity")
+_register(
+    ".observables",
+    "measure_obs",
+    "mps_entanglement_entropy",
+    "tn_fidelity",
+)
+_register(".mps_transfer", "MpsTransferSpectrum", "mps_transfer_spectrum", "mps_correlation_length")
+_register(".conversions", "mps_to_ttn", "mps_to_treepeps")
 _register(".validation", "validate_tensor_network_tags")
 _register(
     "..backends.config",
@@ -127,9 +135,11 @@ _register(
 
 _SUBMODULES = (
     "constructors",
+    "conversions",
     "contractions",
     "maps",
     "observables",
+    "mps_transfer",
     "symmetric",
     "symm_fermions",
     "validation",
@@ -166,6 +176,11 @@ _DEPRECATED_ALIASES = {
 }
 
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
+
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

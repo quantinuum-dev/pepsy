@@ -28,7 +28,7 @@ and contraction from scratch.
 | BP gauge | quimb BP gauging helpers (`gauge_all`-family) | doubles as simple-update gauge / initializer |
 | BP environments / RDMs | quimb message → local env contraction | may need a thin pepsy adapter |
 | Sub-network contraction | `cotengra` via pepsy `build_optimizer` | do **not** add seed kwargs (tests assert absence) |
-| Generalized loops | `TensorNetwork.gen_gloops(**gloop_opts)` | forwarded by scalar and 2-norm loop-cluster APIs |
+| Generalized loops | `TensorNetwork.gen_gloops(**gloop_opts)` | capability-checked and forwarded by scalar and 2-norm loop-cluster APIs |
 | Periodic lattice bonds | `qtn.LatticeBondMap` | keeps length-two periodic directions' wrap bonds distinct |
 | Long-range MPO gate | `MatrixProductOperator.gate_sandwich_with_auto_swap` | explicit opt-in `pepsy.gate_mpo_auto_swap`; no dense fallback |
 | Backend-native random data | `autoray.random.array` | used for FIT warm starts with a NumPy fallback for older Autoray |
@@ -68,3 +68,175 @@ to the user gate, never to internal routing SWAPs.
 - quimb docs: https://quimb.readthedocs.io/ (tensor + belief propagation).
 - cotengra: https://cotengra.readthedocs.io/.
 - autoray: https://github.com/jcmgray/autoray.
+
+## 2026-08-31 compatibility audit
+
+- Installed development stack: Quimb `1.15.1.dev37+gdf03dbe79`
+  (`df03dbe7989fe19eeb78ca78ea19a87b44da631a`), Autoray
+  `0.11.1.dev1+gc56f64427` (`c56f644279f560e93d884ddfb2d7b0b60032382f`),
+  Cotengra `0.8.3.dev6+g08fe1a3a1` (`08fe1a3a1398feb4ef667cf7009dc7a47bcdbb81`),
+  and Symmray `0.3.1` (`1eaa48c9bdc2d128abed936dbe06a131105ab2e0`).
+- Probes confirmed the current Quimb surfaces for SDC compression, seeded
+  SRC/FIT, gate transforms, BP constructor/run options, generalized-loop
+  options, `LatticeBondMap`, and MPO auto-swap. The upstream `safe_inverse`
+  now handles a one-dimensional Symmray `BlockVector` directly.
+- The `SimpleUpdateGen` regression now accepts Quimb's fixed long-range gate
+  behavior while retaining an exact compatibility assertion for older Quimb
+  releases. The safe-inverse workaround is installed only when a behavior
+  probe shows that the installed Quimb build needs it.
+- Loop-series resummation now forwards Quimb's newer required `num_tensors`
+  argument while ignoring it on older Quimb builds. Cluster BP option probes
+  use the concrete `d1bp`/`d2bp` method names rather than Pepsy's `1norm`/
+  `2norm` labels.
+- Tree energy optimizers now initialize their Torch linalg policy, and native
+  CPU complex64 QR bypasses unrelated process-global Autoray registrations
+  when an earlier autodiff run installed a stabilized rule.
+- Focused validation: the pre-fix compatibility run was 141 passed, 1 skipped,
+  and 1 stale expectation; after the fixes, the focused compatibility set was
+  164 passed and 1 skipped, with Ruff clean. Generalized-loop options are now
+  capability-checked with a focused error on older Quimb signatures. The full
+  headless suite passed with 3100 passed and 39 skipped.
+
+## 2026-09-02 tree SDC/SRC audit
+
+- The installed Quimb build is `1.15.1.dev39+g369d09b9d`. Its concrete 1D
+  compressors expose both `sdc` and seeded `src`, while the arbitrary-geometry
+  compressor does not expose either environment algorithm.
+- `TreePeps` path operator application now adapts the separate PEPO and state
+  layers into a plain temporary `TensorNetwork` with shared site tags, then
+  reinstalls Quimb's one-tensor-per-site result into the geometry-owning
+  wrapper. `compression_layout="fused"` retains the earlier fused path.
+  Branching `TreePeps` and `TreeOptimizer` retain their native tree sweep;
+  `src` uses only the local dense `svd:rand` split there.
+- This is an API/dispatch integration, not a generalized implementation of
+  the paper's CBC algorithm. CBC needs projected Cholesky environments and a
+  distinct leaves-to-root / root-to-leaves precomputation, so it remains an
+  explicit future compression method rather than an alias.
+
+## 2026-09-02 TreeFIT environment-cache audit
+
+- Installed versions probed in the active Pepsy environment: Quimb
+  `1.15.1.dev39+g369d09b9d`, Autoray `0.11.1.dev1+gc56f64427`, Cotengra
+  `0.8.3.dev6+g08fe1a3a1`, and Symmray `0.3.2.dev6+ga17699db6`.
+- API probes confirmed `TensorNetwork.contract(..., output_inds=...,
+  strip_exponent=...)`, `TensorNetwork.norm(..., strip_exponent=...)`, and
+  `tensor_split(..., method=..., cutoff_mode=..., bond_ind=...)` are available.
+  The installed `quimb.tensor.tn1d.compress` exposes concrete `sdc`, `src`,
+  `fit`, and `zipup` functions with explicit `seed` support where applicable.
+- Decision: adopt Quimb's stripped-exponent and concrete 1D compressor surfaces
+  for their existing MPS/TreePeps path integrations; defer applying a 1D
+  compressor to arbitrary trees. TreeFIT keeps its own directed branch
+  messages because a branching tree has no single 1D sweep boundary.
+- TreeFIT was checked against fresh direct contractions for one-, two-, and
+  three-node effective blocks and every directed message. Cache invalidation
+  was checked after both local tensor updates and orthogonality-centre path
+  movement, including effective blocks that depend on a changed exterior
+  branch message. Fused and correctly tagged layered targets were checked,
+  including multiple target bonds across one tree edge and stripped exponents.
+- Focused validation after the cache fix: `499 passed, 4 skipped` across the
+  Tree/TreePeps suites; `217 passed` public API/MPS FIT checks; Ruff,
+  compilation, and `git diff --check` clean. A full-suite attempt remains
+  subject to the repository's known macOS Matplotlib `_macosx` abort in an
+  unrelated Hamiltonian drawing test; the isolated headless test passes.
+
+## 2026-09-03 tree operator conversion and display audit
+
+- The active environment reports Quimb `1.15.1.dev39+g369d09b9d`. The concrete
+  `MatrixProductOperator.show` signature is `show(max_width=None)` and renders
+  the chain's bond dimensions together with its canonical-direction markers.
+  Quimb's generic operator surface does not provide a branched equivalent.
+- Decision: adopt the same plain-text visual vocabulary for Pepsy's native
+  `TreeMPO` and `TreePEPO` surfaces, with root-first branches, physical-site
+  labels, and live bond dimensions. `ascii_tree()` returns the drawing and
+  `.show()` prints it. `TreePEPO.show()` defaults to a Quimb-like coordinate
+  schematic that leaves removed lattice edges as gaps; `layout="tree"` keeps
+  the explicit root-first topology view. Coloring is opt-in so the returned
+  drawing stays copy/paste-friendly.
+- `ham_tn.to_mpo`, `to_tree_mpo`, and `to_tree_pepo` now share builder-level
+  dtype, cutoff, and bond defaults while accepting per-conversion `map_mode`
+  overrides. Native tree conversion is direct and does not create an
+  intermediate chain MPO. The native tree compressors remain SVD-based and
+  expose their geometry-specific options (`order` for `TreeMPO`, `form` /
+  `center` / `reduced` for `TreePEPO`) rather than pretending arbitrary-geometry
+  Quimb networks support the 1D `sdc`/`src` algorithms.
+- The conversion strategy is explicit across the `to_*` builder surface:
+  chain `to_mpo`/`to_pepo` retain `term`, `automaton`, and `auto`, with
+  `analytic` as an automaton alias; native tree conversions support
+  `mode="term"` for per-term compression and `mode="analytic"` for one final
+  compression after native direct-sum assembly.
+- Focused validation: 213 headless tests passed across Hamiltonian conversion,
+  TreeMPO, TreePEPS, and public API suites; the updated `tn_stab.ipynb` also
+  executes end to end. Documentation build was not completed because the
+  active environment is missing the optional `autoapi` Sphinx extension.
+
+## 2026-09-04 TreePeps / TreePEPO compression audit
+
+- The active environment reports Quimb `1.15.1.dev39+g369d09b9d`, Autoray
+  `0.11.1.dev1+gc56f64427`, Cotengra `0.8.3.dev6+g08fe1a3a1`, and Symmray
+  `0.3.2.dev6+ga17699db6`. Probes reconfirmed that generic arbitrary-geometry
+  compression exposes local `compress_between`/`canonize_between` only; the
+  environment compressors remain a path-only integration.
+- Native `TreePeps` and `TreePEPO` compression now use a fixed-topology,
+  live-rank leaf schedule by default. The scheduler scores current physical
+  and virtual dimensions after each legal leaf reduction, with a deterministic
+  `order="depth"` compatibility schedule. This is layout-aware through the
+  retained `TreePepsPlan` paths and never relayouts an entangled state.
+- Full TreePeps sweeps now defer the expensive whole-network validation until
+  the final canonicality check, matching the already-batched TreePEPO path;
+  standalone edge operations still validate by default. The public TreePEPO
+  application, composition, Hamiltonian builder, and TreePeps optimizer
+  surfaces forward the order selection.
+- Focused validation after the change: the TreePeps state/optimizer suite
+  passed `90` tests with one existing Quimb warning; Python compilation was
+  clean. The implementation remains SVD-based on arbitrary trees; Quimb's
+  path-only SDC/SRC/ZipUp and the paper's projected-Cholesky CBC algorithm are
+  unchanged.
+
+## 2026-09-14 TreePeps advanced compression and FIT audit
+
+- The active Pepsy environment reports Quimb `1.15.1.dev51+g2e99c793e`,
+  Autoray `0.11.1.dev3+g1b476b305`, Cotengra `0.8.3.dev7+g1d7fd333f`, and
+  Symmray `0.3.2.dev8+g6c6dd34b5`. The audit checked the installed callable
+  signatures and private 1D compression dispatch table, in addition to the
+  upstream [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+  [Autoray repository](https://github.com/jcmgray/autoray),
+  [Cotengra documentation](https://cotengra.readthedocs.io/en/latest/), and
+  [Symmray repository](https://github.com/jcmgray/symmray).
+- The installed Quimb dispatch table provides `sdc`, `sdc-oversample`,
+  `sdcr`, `sdcr-oversample`, `src`, `src-oversample`, `zipup`, and
+  `zipup-oversample`. `TreePeps` adopts these methods on path topologies and
+  keeps a fixed-topology local SVD fallback for branching trees. Integer or
+  multiplier oversampling, seeded SRC/SDCR paths, and final direct rounding
+  are covered by the TreePeps adapter and focused regression tests.
+- The installed oversampled Quimb callables expose one `cutoff_mode` for both
+  intermediate and final passes, not a separate `cutoff_mode_oversample`.
+  Pepsy therefore accepts and records the separate control for its branching
+  two-pass edge implementation, while path calls use the supported Quimb
+  argument. This is classified as a narrow **compatibility shim**, not a
+  global patch.
+- TreeFIT's installed signatures expose `traversal`,
+  `environment_strategy`, `finite_check`, `single_node_fast_path`, and
+  `two_site_transition_sweeps`. TreePeps adopts those controls while keeping
+  its existing default block/sweep schedule; the PEPS-specific DMRG mode
+  mapping of successive compression families to TreeFIT's supported local
+  `direct`/`src` split methods is classified as **adopt**.
+- Focused validation: `112` TreePeps state/optimizer tests passed, including
+  path and branching advanced modes, DMRG diagnostics, canonicality, and
+  seeded SDCR replay. Broad validation and documentation build remain
+  deferred to the normal Pepsy release gate.
+- The compact TreeSubPepo/FIT implementation uses the audited
+  `TensorNetworkGenVector.canonize_between`, `compress_between`, and
+  `TreeFIT.run_gate` contracts only. Its active target retains state-only
+  exterior groups, and its path adapter consumes the installed Quimb
+  `site_tags`/`canonize` interface; this is classified as **adopt**. No
+  installed Quimb, Autoray, Cotengra, or Symmray source is patched. The FIT
+  cache reports identity exterior services as hits and keeps their separate
+  `identity_shortcuts` counter.
+- Callable probes recorded for this route were
+  `canonize_between(self, tags1, tags2, absorb='right', **canonize_opts)`,
+  `compress_between(self, tags1, tags2, max_bond=None, cutoff=1e-10, ...)`,
+  `TreeFIT.run_gate(..., block_size=2, sweep_sequence='inward-outward',
+  ..., single_node_fast_path=True, _path_order=None)`, and
+  `AbelianArray.tensordot(..., mode='auto', preserve_array=False)`. The
+  inspected `TensorNetworkGenVector` 1D methods are the adopted zero-copy
+  boundary; no private Quimb signature is required by the compact route.

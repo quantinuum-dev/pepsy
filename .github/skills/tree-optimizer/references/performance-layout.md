@@ -3,7 +3,51 @@
 This reference contains the lower-frequency details moved out of the main
 Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
 
+## Native fermionic tree QR policy
+
+The native `TreeTensorNetwork` QR policy is centralized in
+`TreeTensorNetwork._native_qr_split` and `_native_qr_options`:
+
+- Every lossless QR split on native Symmray tree tensors must use
+  `_native_qr_split`; do not add a direct `tensor.split(method="qr")` call to a
+  native tree route.
+- The helper sets `stabilized=False` only for Symmray block-sparse tensors.
+  Symmray's stabilized QR phase-normalizes each diagonal of `R`; an exact
+  structural-zero diagonal makes that phase `0 / |0|`, which can become NaN in
+  `complex64`. Dense tensors retain Quimb's normal stabilized-QR default.
+- Network-level canonicalization, which does not expose one tensor at a time,
+  obtains the same option from `_native_qr_options()` when the tree is
+  fermionic. Keep this policy aligned if another native canonicalization route
+  is added.
+- Skipping the phase convention is lossless: `Q @ R` is unchanged, and the
+  resulting `left_inds` isometry metadata remains valid. Native truncating
+  compression still uses the explicit graded SVD and its configured cutoff.
+- This safeguard is scoped to `TreeTensorNetwork` / `TreeOptimizer`. It does
+  not change the separate `MpsOptimizer` QR implementation or globally patch
+  Quimb/Symmray.
+
 ## Performance and stability
+
+- Native Symmray SVD uses its existing global truncation policy: equal values
+  at a cut can be retained together beyond the requested `chi`. Report actual
+  bond dimensions; do not silently switch to eager per-sector allocation or
+  split a multiplet to make a hard-cap assertion pass. Dense caps remain hard.
+
+- TreeOptimizer defaults to `fit_traversal="auto"` for endpoint FIT sweeps on
+  paths and depth-first updates on branches. Direct/DM use lossless path
+  preparation (peeling from both ends can reduce QR sizes), followed by one
+  endpoint-to-endpoint compression pass; keep the terminal
+  center without return QR. SRC/SDC and zipup also use endpoint path orders.
+  Direct/DM and SRC/SDC need only exterior canonicalization before routing:
+  reuse a contained canonical region, move a known exterior center only to
+  the first entry, and recover an unknown gauge conservatively. Zipup retains
+  its initial center because its intermediate truncations depend on that gauge.
+  Native `fit_environment_strategy="native-blockwise"` remains
+  opt-in for local contractions without charge-block fusion.
+  The traversal can change truncated results and blockwise speed depends on
+  sector structure. A truly one-node FIT region automatically uses one exact
+  local projection. See `fit-environments.md` for the execution contract and
+  `docs/development/notes/tree_fit_execution.md` for measured tradeoffs.
 
 - **BLAS thread cap is the biggest performance lever.** Tree tensors are
   moderate-rank (set by local arity and an optional root physical leg, with
@@ -66,7 +110,11 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   messages landing at one hub use one multi-tensor contraction instead of
   rebuilding that hub once per child. Dense message waves reuse one worker
   pool; native fermionic waves remain serial, but use the same grouped merge
-  without changing graded block semantics.
+  without changing graded block semantics. Track incoming message counts and
+  ready edge indices once, preserving serial order and grouped parallel waves;
+  do not repeatedly scan/copy the remaining edges. Construct physical-index
+  maps only for active nodes. Layered merge profiling marks message queuing
+  as deferred; actual fusion is a later tensor-absorption event.
 - **Two-site routing prefactors.** The immutable geodesic for a repeated
   qubit support is cached and reversed when the current centre chooses the
   opposite endpoint as the source, so the cache never assumes a gauge
@@ -74,8 +122,10 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   operator absorption use a direct backend ``tensordot``; Symmray retains its
   graded fermionic contraction semantics and unsupported hyperedges fall back
   to Quimb's general contraction path.
-- **Public performance defaults.** ``mode="auto"`` selects the direct
-  two-site kernel, ``threads=1`` and ``subtree_workers=1`` avoid oversubscription
+- **Public performance defaults.** Ordinary ``mode="auto"`` gates use the
+  TreeMPO active-subtree route and deterministic compression. The dedicated
+  two-site kernel remains available through the lower-level explicit APIs.
+  ``threads=1`` and ``subtree_workers=1`` avoid oversubscription
   on small tree tensors, ``profile=False`` avoids timing overhead, and
   ``track_truncation=False`` avoids diagnostic spectrum probes. The low-level
   ``TreeTensorNetwork.compress_edge_`` API uses the same ``rsum2`` cutoff-mode
@@ -107,6 +157,21 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   bonds, this is an accuracy diagnostic rather than an exact-gauge check.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
+- FIT prepares only the exterior of each active block: retain a center already
+  inside the block, otherwise move it only to the first node on the entering
+  geodesic. Factorization establishes the requested final block center. Do not
+  add interior QR moves before replacing all active tensors.
+- Reuse immutable FIT block traversal orders within a run. Preserve the order
+  and scope the cache to its fixed region; geometry-based reordering changes
+  the variational schedule and needs an explicit numerical comparison.
+- Compression-hook signature capabilities are cached for the current hook
+  function, with one entry per optimizer. Replacing a legacy/custom hook must
+  trigger fresh inspection; never retain bound-method owners in a global cache.
+- CPU profiles and mode/accuracy comparisons are recorded in
+  `docs/development/notes/tree_modes_review.md`. At small chi, FIT environment
+  contractions and center movement dominate local SVDs; direct routes spend
+  substantial time in QR/compression and TreeMPO construction. Do not infer
+  GPU or high-chi performance from those small CPU measurements.
 
 ## Layout (`TreeLayoutFinder` / `TreePlan`)
 

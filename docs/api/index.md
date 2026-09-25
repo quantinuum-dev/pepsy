@@ -46,6 +46,7 @@ reference when you need every method, property, overload, or source location.
 
 - [Belief propagation](bp.md)
 - [MPS optimization](optimizers/mps.md)
+- [Gibbs purified MPS](optimizers/gibbs_mps.md)
 - [MPO optimization](optimizers/mpo.md)
 - [PEPS optimization](optimizers/peps.md)
 - [Sweep optimization](optimizers/sweep.md)
@@ -92,6 +93,7 @@ sampling/stabilizer
 sampling/tree
 bp
 optimizers/mps
+optimizers/gibbs_mps
 optimizers/mpo
 optimizers/peps
 optimizers/sweep
