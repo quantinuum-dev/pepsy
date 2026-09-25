@@ -2916,10 +2916,10 @@ class MpsGateStreamLayoutFinder:
                 "installed; create a fresh optimizer copy."
             )
         mode = getattr(optimizer, "mode", None)
-        if mode in {"exact", "perm"}:
+        if mode in {"exact", "exact-batch", "perm"}:
             raise ValueError(
                 "objective='replay' requires a fixed-layout MPS compression "
-                "mode, not mode='exact' or mode='perm'."
+                "mode, not mode='exact', mode='exact-batch', or mode='perm'."
             )
 
         stream = tuple(self._replay_stream)
@@ -2951,7 +2951,7 @@ class MpsGateStreamLayoutFinder:
         replay_mode = run_kwargs.get("mode", mode)
         if replay_mode is None:
             replay_mode = mode
-        if str(replay_mode).strip().lower() in {"exact", "perm"}:
+        if str(replay_mode).strip().lower() in {"exact", "exact-batch", "perm"}:
             raise ValueError(
                 "objective='replay' requires a fixed-layout MPS compression "
                 "mode in replay_kwargs."

@@ -97,6 +97,7 @@ from ...operators.gates import (
     gate as apply_gate,
 )
 from ...operators import primitives as _gate_primitives
+from ._exact_batch import iter_exact_batches, supports_batch
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
@@ -116,6 +117,7 @@ __all__ = [
 
 
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
+_EXACT_MODES = frozenset({"exact", "exact-batch"})
 _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
 _SHOT_DEFAULT_MAX_BRANCHES = 128
@@ -1546,6 +1548,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         both while bonds are growing and after they reach ``chi``.
         ``mode="perm"`` routes non-local two-site gates with Quimb's
         swap-and-split SVD path and keeps the resulting physical ordering.
+        ``"exact"`` contracts the full state without truncation.
+        ``"exact-batch"`` is an opt-in dense replay path that automatically
+        fuses single-/two-qubit gates and broadcasts compact diagonal blocks.
+        Neither exact mode tracks MPS canonical metadata.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -1621,6 +1627,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "perm",
             "svd",
             "exact",
+            "exact-batch",
         }
         | _MPO_COMPRESSION_METHODS
         | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
@@ -1636,6 +1643,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         "perm": "#8c564b",
         "svd": "#d62728",
         "exact": "#9467bd",
+        "exact-batch": "#9467bd",
     }
 
     @classmethod
@@ -2192,10 +2200,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         workflows. ``pilot_steps`` limits the replay prefix while preserving
         the original optimizer and gate queue.
         """
-        if self.mode == "exact":
+        if self.mode in _EXACT_MODES:
             raise ValueError(
                 "compression layout pilots require an MPS compression mode, "
-                "not mode='exact'."
+                "not mode='exact' or mode='exact-batch'."
             )
         if self._persistent_layout_plan is not None:
             raise ValueError(
@@ -2248,10 +2256,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "compression layout pilots require a fixed-layout compression "
                 "mode; mode='perm' changes the order during replay."
             )
-        if self._normalize_mode(pilot_mode) == "exact":
+        if self._normalize_mode(pilot_mode) in _EXACT_MODES:
             raise ValueError(
                 "compression layout pilots require an MPS compression mode, "
-                "not mode='exact'."
+                "not mode='exact' or mode='exact-batch'."
             )
 
         kwargs = dict(layout_kwargs or {})
@@ -3295,7 +3303,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _init_canonicalization(self):
         """Initialize canonical form and orthogonality center."""
-        if self.mode == "exact":
+        if self.mode in _EXACT_MODES:
             # Exact evolution does not use canonical metadata.
             self.info_c = {}
             return
@@ -3315,7 +3323,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``info_c`` and one-center norms must enforce the same boundary contract.
         Exact mode does not consume canonical metadata.
         """
-        if mode != "exact" and bool(getattr(p, "cyclic", False)):
+        if mode not in _EXACT_MODES and bool(getattr(p, "cyclic", False)):
             raise ValueError(
                 "MpsOptimizer canonical modes require an open-boundary MPS; "
                 "cyclic MPS data do not have an exact one-tensor canonical norm."
@@ -3535,7 +3543,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         tuple[int, int]
             The synchronized one-site canonical span.
         """
-        if self.mode == "exact":
+        if self.mode in _EXACT_MODES:
             raise ValueError(
                 "sync_canonicalization requires a canonical MPS mode; "
                 f"mode={self.mode!r} does not track info_c."
@@ -3583,7 +3591,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``self.p.norm()`` continues to report the represented norm while
             the raw data norm becomes one.
         """
-        track_canonical_center = self.mode != "exact"
+        track_canonical_center = self.mode not in _EXACT_MODES
         if track_canonical_center:
             previous_span = self._current_orthog(self.p)
             if insert is None:
@@ -3658,7 +3666,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _copy_impl(self, *, capture_initial):
         """Copy optimizer state, optionally retaining a shot-replay template."""
         history_copy = deepcopy if capture_initial else list
-        trusted = not capture_initial and self.mode != "exact" and self._fit_window_copy_supported(self.p)
+        trusted = not capture_initial and self.mode not in _EXACT_MODES and self._fit_window_copy_supported(self.p)
         if trusted:
             # Owned arrays preserve the existing isometries; no constructor,
             # recanonicalization, or discovery scan is required for this clone.
@@ -3687,7 +3695,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # here. Overwriting it with the source cache can claim that site 0 is
         # canonical while the copied tensors are centered at site ``L // 2``;
         # a subsequent projective replay can then lose the branch norm.
-        if not trusted and copied.mode != "exact":
+        if not trusted and copied.mode not in _EXACT_MODES:
             copied.info_c["cur_orthog"] = tuple(
                 int(site) for site in copied.p.calc_current_orthog_center()
             )
@@ -3787,9 +3795,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         new_dmrg_block_size = self._dmrg_alias_block_size(mode_name)
         new_mode = self._normalize_mode(mode_name)
-        if new_mode == "exact" and self._persistent_layout_plan is not None:
+        if new_mode in _EXACT_MODES and self._persistent_layout_plan is not None:
             raise ValueError(
-                "cannot switch a persistent-layout optimizer to mode='exact'; "
+                f"cannot switch a persistent-layout optimizer to mode={new_mode!r}; "
                 "read out the logical state or create a new optimizer."
             )
         self._validate_canonical_boundary(self.p, new_mode)
@@ -3806,14 +3814,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "cannot switch a persistent layout into mode='perm'; "
                     "use the persistent layout mapping for replay instead."
                 )
-            if old_mode == "exact":
+            if old_mode in _EXACT_MODES:
                 # Exact replay stores a contracted TensorNetwork rather than
                 # an MPS, so it has no physical length from which to seed the
                 # logical-to-physical permutation. Rebuild it before creating
                 # the permutation bookkeeping below.
                 self._ensure_mps_state()
             self._set_site_order(range(int(getattr(self.p, "L", 0))))
-        if new_mode == "exact":
+        if new_mode in _EXACT_MODES:
             # Exact contractions do not consume canonical metadata. Discard
             # the MPS-only cache so it cannot be mistaken for the contracted
             # TensorNetwork's state.
@@ -3829,7 +3837,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
             self._dmrg1_one_site_locked = False
-        if old_mode == "exact" and self.mode != "exact":
+        if old_mode in _EXACT_MODES and self.mode not in _EXACT_MODES:
             # Exact mode stores a fully contracted TensorNetwork, so rebuild an
             # MPS before recreating canonical metadata for an MPS mode.
             self._ensure_mps_state()
@@ -4601,7 +4609,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.last_layout_plan = None
         if not self._layout_request_enabled(layout):
             return None, None
-        if self.mode == "exact":
+        if self.mode in _EXACT_MODES:
             raise ValueError("layout-aware replay requires an MPS mode, not exact.")
 
         if isinstance(layout, Mapping):
@@ -4773,7 +4781,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         reorder the MPS back to logical order. Use :meth:`to_dense` or
         :meth:`remap_sample` for logical-order readout.
         """
-        if self.mode == "exact":
+        if self.mode in _EXACT_MODES:
             raise ValueError("persistent layouts require an MPS execution mode, not exact.")
         if self.mode == "perm":
             raise ValueError(
@@ -5991,7 +5999,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "mode='mix' requires the initial MPS max bond to be <= chi; "
                     "compress the state first or increase chi."
                 )
-        if self.mode == "exact" and (
+        if self.mode in _EXACT_MODES and (
             normalize_every is not None or normalize_final
         ):
             raise ValueError(
@@ -6579,6 +6587,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             return self.p
 
+        if self.mode == "exact-batch":
+            self._timed_call(
+                "exact-batch.replay",
+                self._run_exact_batch,
+                G_seq,
+                where_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+            return self.p
+
         if self.mode == "exact":
             self._timed_call(
                 "exact.replay",
@@ -6834,7 +6854,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _ensure_mps_state(self):
         """Ensure ``self.p`` is a :class:`qtn.MatrixProductState`.
 
-        ``mode="exact"`` fully contracts the state into a single dense tensor;
+        The exact modes fully contract the state into a single dense tensor;
         control events operate on MPS structure, so rebuild an MPS from the
         physical indices (in ``self.ind_id`` order) when needed.
         """
@@ -7394,7 +7414,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _control_state_norm(self, *, include_exponent=True):
         """Read the represented control-state norm from its tracked center."""
-        if self.mode == "exact":
+        if self.mode in _EXACT_MODES:
             raw_state = self.p.copy()
             raw_state.exponent = 0.0
             norm = self._real_float(ar.do("abs", raw_state.norm()))
@@ -12338,6 +12358,47 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             last_normalized_step = idx
 
         self.p = self._install_represented_norm(p)
+
+    def _run_exact_batch(
+        self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rsum2"
+    ):
+        """Replay bounded fused gates while retaining dense state semantics."""
+        if not supports_batch(self.p):
+            return self._run_exact(
+                G_seq, where_seq, progbar=progbar,
+                cutoff=cutoff, cutoff_mode=cutoff_mode,
+            )
+        # A single-tensor network is already contracted. Copy its metadata,
+        # not its exponentially large array; each batch produces a new array.
+        if self.p.num_tensors == 1:
+            self.p = self._install_represented_norm(self.p.copy())
+        else:
+            tensor = self.p.contract(all, optimize=self.contraction_opt)
+            self.p = self._install_represented_norm(qtn.TensorNetwork([tensor]))
+        self.info_c = {}
+        tensor = self.p.tensors[0]
+        pbar = None
+        if progbar:
+            from tqdm import tqdm
+
+            pbar = tqdm(
+                total=len(G_seq), desc="exact-batch", ascii=True,
+                colour=self._PROGBAR_COLORS["exact-batch"],
+            )
+        try:
+            for batch in iter_exact_batches(
+                G_seq, where_seq, self._format_ind,
+                backend=ar.infer_backend(tensor.data),
+                state_size=int(np.prod(tensor.data.shape)),
+            ):
+                batch.apply(tensor)
+                for where in batch.locations:
+                    self._record_effective_event(where, event_type="gate")
+                if pbar is not None:
+                    pbar.update(len(batch.locations))
+        finally:
+            if pbar is not None:
+                pbar.close()
 
     def _run_exact(  # pylint: disable=too-many-locals
         self,

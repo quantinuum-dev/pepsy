@@ -95,15 +95,21 @@ than hiding policy in a mode-specific helper.
   needed for compressed MPS scale bookkeeping and is accepted in exact
   trajectory paths for compatibility. Automatic normalization remains an MPS
   canonicalization feature.
+- `exact-batch`: opt-in fully contracted replay that fuses bounded one-/two-site
+  gates, compact diagonal blocks, equal-value ZZ layers, and consecutive
+  parity-preserving gates on one pair where the array backend supports them.
+  It retains exact-mode restrictions and falls back to the reference kernel
+  for unsupported arrays. See the [exact-batch audit](../../../docs/development/notes/mps_exact_batch.md).
 
 Simple-update evolution is not an `MpsOptimizer` mode. Use the dedicated
 `pepsy.gate_simple` or PEPS simple-update APIs when that gauge-based algorithm
 is required.
 
-Keep `exact` separate from MPS code. When switching from exact to an MPS mode,
-rebuild an MPS from the explicit physical indices and canonicalize it. Do not
-switch a persistent-layout optimizer into exact mode because that would lose
-the physical/logical layout contract.
+Keep both exact modes separate from MPS code. When switching from either
+exact mode to an MPS mode, rebuild an MPS from the explicit physical indices
+on the same array backend and canonicalize it. Do not switch a
+persistent-layout optimizer into an exact mode because that would lose the
+physical/logical layout contract.
 
 ## Persistent layouts
 

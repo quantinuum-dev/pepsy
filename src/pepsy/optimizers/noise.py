@@ -3045,7 +3045,7 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
         return None
     try:
         if (isinstance(optimizer, MpsOptimizer)
-                and optimizer.mode not in {"exact", "su"}
+                and optimizer.mode not in {"exact", "exact-batch", "su"}
                 and len(where) == 1 and not optimizer._replay_has_symmray_data(p)):
             site = int(where[0])
             optimizer.canonize_mps(p, site)
@@ -3059,7 +3059,7 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
         canonical = getattr(p, "local_expectation_canonical", None)
         if (
             isinstance(optimizer, MpsOptimizer)
-            and optimizer.mode not in {"exact", "su"}
+            and optimizer.mode not in {"exact", "exact-batch", "su"}
             and callable(canonical)
         ):
             value = canonical(

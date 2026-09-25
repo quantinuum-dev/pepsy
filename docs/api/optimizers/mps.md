@@ -275,15 +275,69 @@ Quimb compression family these events are applied with `gate_with_submpo_` and
 compressed to `chi`. DMRG also accepts multi-site sub-MPO events: it
 canonicalizes the active region, aligns the MPO site tags, and keeps the
 operator as a layered FIT target while using the DMRG SRC warm-up guess.
-`svd`, `swap`, `perm`, and `exact` reject sub-MPO stream events; `mix`
+`svd`, `swap`, `perm`, `exact`, and `exact-batch` reject sub-MPO stream events; `mix`
 retains its existing gate-oriented unitary path.
 
 Modes that use canonical MPS metadata require an open-boundary MPS. A cyclic
 MPS has a nontrivial loop environment, so no single tensor norm can equal its
 global norm under the open-chain mixed-canonical identity. Such inputs are
-rejected before optimizer state is mutated. `mode="exact"` does not consume
+rejected before optimizer state is mutated. The `exact` modes do not consume
 canonical metadata and can first contract a cyclic input; switching its
 contracted result back to an MPS mode rebuilds an open MPS.
+
+### Batched exact replay
+
+Use `mode="exact-batch"` for opt-in gate fusion on a fully contracted state:
+
+```python
+from pepsy.optimizers import MpsOptimizer
+
+optimizer = MpsOptimizer(state, gates, chi=256, mode="exact-batch")
+optimizer.run()
+vector = optimizer.to_dense()  # physical/logical site order, not storage order
+```
+
+This remains dense statevector evolution, not MPS truncation: `chi` and
+`cutoff` do not truncate ordinary gate replay. It automatically includes
+single-qubit gates in consecutive dense blocks with at most four qubits, and
+combines consecutive diagonal gates into broadcast factors with at most twelve
+qubits. A diagonal factor has at most 4096 entries, not a full-system diagonal
+matrix. On large NumPy or CuPy qubit states, equal-value ZZ-like two-qubit
+diagonal runs can instead use one graph-phase pass across any number of
+sites. Consecutive parity-preserving gates on the same pair (including
+RXX/RYY/RZZ) can use one two-sector update. The planner keeps the ordinary
+bounded blocks when these patterns are absent or a backend lacks the optional
+kernel. Gates are not reordered across each other or across measurements,
+resets, caps, feed-forward, or trajectory boundaries. `k_2q_batch` continues
+to configure DMRG only; no batching option is needed here.
+
+Each block produces a new state array without modifying aliased input arrays.
+Dense contractions retain their natural tensor-index order instead of adding
+a full-state transpose back after every gate. An already-contracted state
+is not contracted again on the next replay. This reduces passes and avoidable
+copies; it does **not** eliminate output allocation or internal contraction
+packing, nor change the exponential statevector memory requirement.
+
+Fusion is enabled for ordinary qubit arrays on NumPy, Torch, and CuPy, preserving
+backend, dtype rules, and device. Other backends, native Symmray/fermionic states,
+and qudits use the existing `exact` kernel without densifying or coercing them.
+Only tiny gate matrices are inspected on the host for exact structural zeros;
+small nonzero entries are never dropped. The structured CPU kernels use
+optional Numba; without it, NumPy uses the original fused blocks. CuPy uses
+small compiled kernels, while Torch stays on differentiable dense fusion.
+Torch matrices requiring gradients use dense fusion even when currently
+diagonal, preserving off-diagonal derivatives. RZZ runs without a
+sufficiently long equal-value segment keep the existing diagonal blocks
+because the measured general-angle one-pass prototype was slower. Operators
+are rebuilt on each replay so changed gate payloads and autograd graphs do
+not become stale.
+
+Floating-point associativity changes, so compare results within dtype-appropriate
+tolerances rather than bitwise. Measurement/control handling uses the existing
+MPS rebuild boundary, which preserves backend and site indices in both exact modes.
+Like `exact`, this mode does not track canonical metadata, accept persistent
+layouts, or provide automatic canonical normalization. The default mode and
+the original `exact` gate kernel are unchanged.
 
 `MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
 from every live MPS tensor; the same values are also available as the
@@ -431,7 +485,7 @@ observables afterward. `dmrg2` is the normal variational production backend;
 DMRG schedules retain multi-site sub-MPOs as layered FIT targets. `svd`, `swap`,
 and the other DMRG schedules use the same
 trajectory contract and should be benchmarked for the workload. `mix` remains a
-gate-oriented/unitary mode, while `exact` also supports state-dependent
+gate-oriented/unitary mode, while the exact modes also support state-dependent
 Kraus branches by evaluating copied dense TensorNetwork leaves. Shot
 replay uses a frozen persistent-layout template when one is installed, but
 still requires a fresh identity-order optimizer for an already-permuted `perm`
@@ -473,7 +527,7 @@ The practical shot-mode matrix is:
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
 | `dmrg`, `dmrg1/2/3` | opt-in variational compressed replay with the selected FIT schedule |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
-| `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
+| `exact`, `exact-batch` | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
 Bare Quimb method names and their `quimb-<method>` qualified forms are passed
@@ -1013,7 +1067,7 @@ use a compatibility overlap contraction instead.
 
 Normalization uses the same canonical-center contract as gate application. For a non-unitary run with `normalize_every` enabled, the optimizer reuses an authoritative one-site center inside the active span, normalizes that tensor, and stores the removed scale in `p.exponent`. Only a genuinely broad tracked center is collapsed to one site. Thus `p.norm()` restores the represented norm, while a copy with `exponent=0` exposes the normalized working data. For DMRG, a multi-gate batch is one replay step for this purpose. Non-unitary DMRG keeps the adaptive `fit_rtol="auto"` policy; the exact target norm need not be one because convergence is measured relatively.
 
-Use `get_normalizations()` for scale events, `get_quality_checks()` for optional finite/canonical health records, and `get_fit_diagnostics()` for the latest DMRG/FIT convergence record. `mode="exact"` deliberately skips canonical metadata; switching back to an MPS mode rebuilds and canonicalizes the contracted state. Exact replay preserves operator scale directly, while automatic normalization options remain unavailable in exact mode.
+Use `get_normalizations()` for scale events, `get_quality_checks()` for optional finite/canonical health records, and `get_fit_diagnostics()` for the latest DMRG/FIT convergence record. Both exact modes deliberately skip canonical metadata; switching back to an MPS mode rebuilds and canonicalizes the contracted state. Exact replay preserves operator scale directly, while automatic normalization options remain unavailable in exact modes.
 
 For a logical gate stream whose site order has not been chosen yet,
 `MpsOptimizer.LayoutFinder(gates, L=...)` or

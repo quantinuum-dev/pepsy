@@ -11,6 +11,8 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `__init__.py`: lazy public exports; selecting layout helpers does not load
     replay, Gibbs preparation, or MPO optimization.
   - `optimizer.py`: `MpsOptimizer`.
+  - `_exact_batch.py`, `_exact_structured.py`: bounded dense gate fusion and
+    structured exact replay on supported arrays.
   - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
   - `gibbs.py`: purified finite-temperature `GibbsMps` preparation.
   - `compression.py`, `normalization.py`, `diagnostics.py`: empty reserved
@@ -103,7 +105,7 @@ to sweep cleanup.
 ## MPS gate-stream optimizer
 
 `MpsOptimizer` defaults to `direct` compression. Other replay modes include
-`dmrg`, `swap`, `perm`, `svd`, `mix`, and `exact`; `mpo` remains a
+`dmrg`, `swap`, `perm`, `svd`, `mix`, `exact`, and `exact-batch`; `mpo` remains a
 compatibility alias for `direct`. For repeated evolution on a graph
 with a useful one-dimensional layout, call `opt.apply_layout("quality")` once.
 The MPS then stays in the selected physical order across `run()` calls and
@@ -123,6 +125,14 @@ Local expectation and norm diagnostics should move from this tracked range,
 not rescan or contract the full MPS. Any target MPS copy needs isolated
 metadata. Exact mode intentionally has no canonical cache; switching back to
 an MPS mode rebuilds and canonicalizes the state.
+
+`exact-batch` is opt-in fully contracted replay with automatic one-/two-qubit
+fusion and compact diagonal broadcasting. Large equal-value ZZ layers and
+same-pair parity-preserving gates have bounded-memory NumPy/Numba and CuPy
+kernels; other gate streams retain the original fusion. It shares exact-mode
+restrictions, does not restore full-state storage order between gates, and
+falls back to the reference kernel for unsupported array/state types. See the
+[implementation and upstream audit](../notes/mps_exact_batch.md).
 
 ## Import style
 
