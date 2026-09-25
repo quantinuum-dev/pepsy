@@ -29,8 +29,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+      - name: Cache pip downloads for this job
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py312-${{ github.job }}-${{ hashFiles('pyproject.toml', '.github/workflows/nightly.yml') }}
       - name: Install extended package profile
         run: |
           python -m pip install --upgrade pip
@@ -58,8 +61,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+      - name: Cache pip downloads for this job
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py312-${{ github.job }}-${{ hashFiles('pyproject.toml', '.github/workflows/nightly.yml') }}
       - name: Install MPI runtime and test profile
         run: |
           sudo apt-get update

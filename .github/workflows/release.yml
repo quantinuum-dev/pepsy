@@ -17,6 +17,7 @@ jobs:
   build_dist:
     name: Build + Validate Artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@v4

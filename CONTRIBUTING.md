@@ -67,12 +67,13 @@ requests, using Python 3.12 on Linux:
 | Job | Coverage |
 | --- | --- |
 | Core checks | Smoke and core tests without optional/slow cases, Ruff, focused type checks, and agent guidance. The five direct core dependencies use minimums read from `pyproject.toml`. |
-| Package | Build and validate distributions; test wheel imports and a small numerical example in clean installations. |
+| Package | Build a source archive and a wheel from that archive; validate metadata, imports, and a small numerical example in clean installations. |
 | Docs | Build documentation with warnings treated as errors. |
 
-Pip downloads are cached, superseded runs on the same ref are cancelled, and
-each job has a ten-minute timeout. Tools and transitive dependencies resolve
-normally. Routine CI does not install Torch, JAX, NetKet, or MPI.
+Pip downloads are cached separately per job. Superseded runs on the same ref
+are cancelled, and each job has a ten-minute timeout. Tools and transitive
+dependencies resolve normally. Routine CI does not install Torch, JAX,
+NetKet, or MPI.
 
 The [nightly workflow](.github/workflows/nightly.yml) runs the full collection
 with `.[test-extended,contraction,vmc]` and a **60% whole-package coverage gate**.
