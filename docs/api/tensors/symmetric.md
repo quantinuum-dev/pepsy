@@ -1,7 +1,12 @@
 # Symmetric Tensor States
 
+Jump to [charges](#choosing-sectors-and-charges),
+[fermion models](#unified-native-fermion-helper),
+[MPOs](#symmetric-mpo-mapping), [time evolution](#time-evolution), or
+[observables](#measuring-observables).
+
 The optional symmetry and fermionic workflows require Symmray 0.4.0 or
-newer (`pip install -U 'pepsy[symmetry]'`) and share Pepsy's Python 3.12+
+newer (`python -m pip install ".[symmetry]"` from the checkout) and share Pepsy's Python 3.12+
 requirement. Version 0.4.0 fixes pending fermionic phases in
 scalar readout and reductions, and fused charge selection under Torch `vmap`.
 

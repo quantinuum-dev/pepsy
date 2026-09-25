@@ -5,6 +5,11 @@ where the hardware schedule says the channel acts, then choose trajectory
 sampling settings (`shots`, `seed`, independent/coalesced replay, and
 `run_kwargs`) at the runner.
 
+Jump to [MPS shots](#shot-aware-mpsoptimizer-api),
+[coalesced ensembles](#exact-coalesced-ensembles-for-rare-noise),
+[MPI](#mpi-shot-ensembles), or
+[custom channels](#user-defined-quantum-trajectories).
+
 ```python
 stream = [
     ("h", 0),
@@ -36,7 +41,7 @@ result = pepsy.run_trajectory_shots(
 )
 ```
 
-Supported first-cut stochastic entries are:
+Supported stochastic entries are:
 
 - `("x_error", p, q)`, `("y_error", p, q)`, `("z_error", p, q)`
 - `("depolarize1", p, q)`, `("depolarize2", p, q0, q1)`

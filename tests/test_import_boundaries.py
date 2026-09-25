@@ -131,8 +131,8 @@ print(*sorted(
     assert not loaded
 
 
-def test_mps_namespace_and_placeholders_do_not_import_numerical_stack():
-    """Browsing MPS entry points must not initialize replay or Gibbs code."""
+def test_mps_namespace_and_support_modules_do_not_import_numerical_stack():
+    """MPS discovery and reporting helpers must not initialize numerical code."""
     loaded = _run_clean_import(
         """
 import sys
@@ -143,6 +143,8 @@ assert 'MpsOptimizer' not in vars(mps)
 assert 'GibbsMps' not in vars(mps)
 from pepsy.optimizers.mps import compression, diagnostics, normalization
 assert compression.__all__ == diagnostics.__all__ == normalization.__all__ == []
+assert diagnostics._summarize_fit_timing([])["calls"] == 0
+assert diagnostics._layout_report_text({}) is None
 roots = ('numpy', 'quimb', 'autoray', 'cotengra', 'torch', 'jax', 'symmray')
 print(*sorted(
     name for name in sys.modules

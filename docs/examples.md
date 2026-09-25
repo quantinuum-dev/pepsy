@@ -1,41 +1,30 @@
 # Examples
 
-## Primary walkthrough
+Start with a tutorial, then use the repository scripts for larger examples.
 
-- [Tutorial: Contract a PEPS Norm](tutorials/contract_norm.md)
-- [Tutorial: Simple-update Initialization and Relay-BP](tutorials/bp_simple_update_relay.md)
+## Walkthroughs
 
-This is the recommended first end-to-end walkthrough for interactive usage.
+| Task | Guide |
+| --- | --- |
+| Prepare and contract a PEPS norm | [First contraction](tutorials/contract_norm.md) |
+| Interpret contraction diagnostics | [Fidelity diagnostics](tutorials/fidelity_diagnostics.md) |
+| Combine simple update and belief propagation | [Simple update and Relay-BP](tutorials/bp_simple_update_relay.md) |
+| Set bond dimensions and sweep counts | [Choose parameters](howto/choose_parameters.md) |
+| Configure an optimization solver | [Tune sweep solvers](howto/solver_tuning.md) |
 
-It demonstrates:
+## Repository scripts
 
-- preparing `ket` and `norm` with `build_bra_ket`
-- initializing boundaries with `BdyMPS`
-- running `contract_boundary(...)`
-- inspecting `BoundaryContractResult.cost` and `.fidel`
+The [examples directory](https://github.com/quantinuum-dev/pepsy/tree/develop/examples)
+contains runnable scripts. See the
+[operator examples](https://github.com/quantinuum-dev/pepsy/blob/develop/examples/operators/README.md)
+for MPO/PEPO construction and ordered products.
 
-## Additional walkthroughs
+Other examples in this checkout:
 
-- [Tutorial: Fidelity Diagnostics](tutorials/fidelity_diagnostics.md)
-- [How-To: Choose Parameters](howto/choose_parameters.md)
-- [How-To: Tune Sweep Solvers](howto/solver_tuning.md)
+- [Pauli MPO and flat PEPS contraction](https://github.com/quantinuum-dev/pepsy/blob/develop/examples/pauli_mpo_trace_flat_peps.py).
+- [MPS magnetization notebook](https://github.com/quantinuum-dev/pepsy/blob/develop/examples/MpsMagnetization/mps_simulator.ipynb).
 
-## qMERA examples
+For qMERA workflows, use the examples in the [qMERA API guide](api/optimizers/qmera.md).
 
-- `examples/qmera_scale_plan_6x6.py` — generic heterogeneous 6x6 PBC RG
-  schedule with scale-specific blocks.
-- `examples/qmera_fermion_hubbard_2d.py` — native `U1U1` 2D multimode
-  Fermi--Hubbard schedule, grouped cones, and direct-state validation.
-- `examples/qmera_fermion_hubbard_4x4_pbc.py` — explicit 4x4 PBC square
-  disentangler/isometry RG schedule.
-- `examples/qmera_majorana_2d.py` — native `Z2` Majorana and pairing gates.
-
-## Extended examples
-
-The package repository keeps lightweight runnable examples under `examples/`.
-Larger runnable workflows and experiment scripts are maintained
-in the separate `pepsy_examples` repository. The tests in this repository keep
-the deleted Relay-BP examples' numerical coverage without depending on local
-example files.
-
-For a cleaner, docs-first narrative, start from [tutorials](tutorials/index.md).
+Larger workflows and experiment scripts are maintained separately in
+`pepsy_examples`.

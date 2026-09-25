@@ -1,49 +1,30 @@
 # PePsY documentation
 
-PePsY is a tensor-network library for contraction, simulation, optimization,
-sampling, symmetric tensors, and variational Monte Carlo workflows.
+PePsY is a tensor-network library for simulation, contraction, optimization,
+sampling, and variational Monte Carlo. The Python package is `pepsy`.
 
-**PePsY** is a stylized shorthand for “PEPS in Python.” The public project
-name uses `PePsY`; the Python package and import name remain `pepsy`.
+## Start here
 
-The documentation is organized around complete workflows first and API
-discovery second. If you already know the class or function you need, start
-with the [API starting points](api/start_here.md); if you are learning PePsY,
-follow one of the paths below.
+1. [Install from GitHub](installation.md).
+2. [Run your first contraction](getting_started.md), or copy the
+   [complete quickstart](quickstart.md).
+3. Choose your next workflow from the [API starting points](api/start_here.md).
 
-## Start with a working result
+## Find a guide
 
-- [Installation](installation.md)
-- [Getting started](getting_started.md)
-- [Quickstart](quickstart.md)
+| Need | Read |
+| --- | --- |
+| A complete worked example | [Tutorials](tutorials/index.md) |
+| A specific task or error | [How-to guides](howto/index.md) |
+| Runnable scripts | [Examples](examples.md) |
+| Classes, functions, and options | [API reference](api/index.md) |
+| Namespace and import guidance | [Package map](api/package.md) |
+| Upgrade from 0.4.1 | [Migration guide](development/api-migration.md) |
+| Compatibility guarantees | [API stability](stability.md) |
+| Source ownership and design records | [Development documentation](development/README.md) |
 
-## Choose a workflow
-
-| I want to... | Start here | Main API |
-| --- | --- | --- |
-| Contract a PEPS norm or overlap | [Contract a PEPS norm](tutorials/contract_norm.md) | `build_bra_ket`, `BdyMPS`, `contract_boundary` |
-| Evolve or fit an MPS | [MPS API guide](api/optimizers/mps.md) | `MpsOptimizer` |
-| Evolve or optimize a PEPS | [PEPS API guide](api/optimizers/peps.md) | `PepsOptimizer` |
-| Optimize PEPS boundaries and sweeps | [Sweep API guide](api/optimizers/sweep.md) | `SweepOptimizer` |
-| Replay a circuit on a tree | [Tree API guide](api/optimizers/tree.md) | `TreeOptimizer`, `TreeTensorNetwork` |
-| Sample tensor-network states | [Sampling API guide](api/sampling/samplers.md) | `MpsSampler`, `PepsSampler` |
-| Work with fermionic or symmetric tensors | [Symmetric tensor API](api/tensors/symmetric.md) | `Fermion` |
-| Run variational Monte Carlo | [VMC API guide](api/vmc.md) | `pepsy.vmc` |
-
-## User guides
-
-- [Tutorials](tutorials/index.md)
-- [How-to guides](howto/index.md)
-- [Examples](examples.md)
-
-## Reference
-
-- [API starting points](api/start_here.md)
-- [API reference and namespace map](api/index.md)
-- [API stability policy](stability.md)
-- [Package layout](development/package_layout.md)
-- [Development notes and plans](development/README.md)
-- [Fermi-Hubbard notes](development/fermi_hubbard_u1u1_mpo_notes.md)
+The API guides cover MPS, PEPS, tree networks, operators, sampling, symmetry,
+belief propagation, and VMC. Optional features list their installation extras.
 
 ```{toctree}
 :hidden:

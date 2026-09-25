@@ -1,5 +1,9 @@
 # Implementation plans
 
+These documents record proposed work and implementation progress. Some are
+historical or deferred; check each plan's status against the current code and
+tests. For supported behavior, use the [API guides](../../api/index.md).
+
 - [Project roadmap](project.md)
 - [Operator and exponential API plan](operator_api.md)
 - [Lightweight package plan](lightweight-package.md)

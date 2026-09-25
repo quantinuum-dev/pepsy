@@ -1,5 +1,10 @@
 # `pepsy.optimizers.mps.optimizer`
 
+Use `MpsOptimizer` to replay gate streams on an MPS. Jump to
+[imports](#imports-and-ownership), [replay options](#replay-options),
+[Torch SVD policy](#torch-svd-policy), or
+[permutation replay](#lazy-permutation-swap-and-split).
+
 ## Imports and ownership
 
 Import the optimizer from `pepsy.optimizers` and specialized layout helpers

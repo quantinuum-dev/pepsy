@@ -1,14 +1,8 @@
 # Package API map
 
-PePsY has two layers:
-
-- **Core namespaces** are the normal application API.
-- **Advanced namespaces** contain optional backends, research workflows, and
-  domain-specific optimizers.
-
-Use the namespace import as the canonical path. The top-level `pepsy` module
-retains many convenience aliases for compatibility, but it is not the best
-place to discover the whole API.
+Import from the namespace that owns a feature. The top-level `pepsy` aliases
+remain available for compatibility. Advanced domains have their own APIs;
+optional dependencies alone do not determine their stability.
 
 ## Core namespaces
 
@@ -84,6 +78,25 @@ geometry = QMeraGeometry((2, 2))
 This geometry construction does not load the numerical stack. Requesting
 `QMeraBuilder` or an optimizer class loads the dependencies needed by that
 implementation. Public names and their defining modules remain unchanged.
+
+## Backend compatibility
+
+Use `pepsy.backends.TorchLinalgConfig` to configure Torch SVD/QR policy.
+See the [MPS](optimizers/mps.md) and [PEPS](optimizers/peps.md) guides for
+optimizer-specific usage.
+
+`pepsy.backends.backend_cupy(...)` uses upstream Autoray namespace handling
+when it supports unhashable device objects. On affected older versions,
+Pepsy bypasses the failing namespace cache while keeping the original device
+object for array creation. No dependency upgrade is required for this fix.
+
+Random FIT initialization inherits the template's backend, device, and dtype
+unless a dtype is explicitly supplied. Complex normal samples use total
+variance `scale**2`, with half in each of the real and imaginary components,
+including the older-Autoray fallback. This corrects that fallback's previous
+factor-of-two variance; existing seeded complex fallback samples therefore
+change in magnitude. Seeds are reproducible within a route, but do not
+promise identical samples across backends or dependency versions.
 
 ## Top-level convenience aliases
 

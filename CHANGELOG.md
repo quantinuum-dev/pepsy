@@ -12,6 +12,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Development
+
+- Keep release automation limited to GitHub build artifacts; remove unused
+  PyPI/TestPyPI publishing jobs and their token permission.
+- Move MPS layout report formatting and FIT timing summaries into the private
+  diagnostics module, preserving report output, lazy imports, and replay behavior.
+
 ## [0.5.0] - 2026-09-25
 
 This release changes supported environments and several optimizer defaults.

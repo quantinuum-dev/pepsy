@@ -1,6 +1,16 @@
 # Installation
 
 Pepsy requires **Python 3.12 or newer** for the base package and every extra.
+Install it from the GitHub repository; it is not published on PyPI.
+
+## Install from a checkout
+
+Clone the tagged release if you do not already have a checkout:
+
+```bash
+git clone --branch v0.5.0 https://github.com/quantinuum-dev/pepsy.git
+cd pepsy
+```
 
 From a Pepsy checkout, install the base package in your selected environment:
 
@@ -13,17 +23,12 @@ python -m pip install .
 For development, use `python -m pip install -e ".[dev]"` instead. Respect any
 existing local environment override when working in a maintained checkout.
 
-The base package declares NumPy, Quimb, Cotengra, Autoray, and tqdm. Its
-numerical dependencies can bring additional packages transitively; a lazy
-import does not imply a dependency-free installation.
+The base dependencies are NumPy, Quimb, Cotengra, Autoray, and tqdm; these
+may install further dependencies. See the
+[dependency audit](development/notes/dependency_minimums_2026_09.md) for
+minimum versions and tested combinations.
 
-Core dependency minimums are tested together on Python 3.12 in CI. The
-extended job tests current compatible releases with optional features.
-Minimums account for required APIs, Python support, and interoperability;
-they do not promise every combination of historical optional-library versions.
-Newer upstream features can still require a newer release and are checked
-when requested. See the [dependency audit](development/notes/dependency_minimums_2026_09.md)
-for the evidence behind the current bounds and validation limits.
+## Optional features
 
 Install only the features you use. These commands are alternatives, not a
 sequence to run in full:
@@ -46,8 +51,6 @@ sequence to run in full:
 `vmc-torch` reuses `torch`; `vmc-netket` includes `symmetry`; `vmc` combines
 both VMC profiles. `test-extended` combines optional test dependencies and is
 intended for contributors, including Autograd for its explicit autodiff tests.
-Composed profiles preserve dependency requirements
-while avoiding duplicate definitions in `pyproject.toml`.
 
 The NetKet profile currently requires JAX below 0.11.1: released NetKet 3.22.x
 fails during import with the newer `ArrayLike` type annotation. This bound
@@ -60,8 +63,10 @@ Combine extras when needed, and add `-e` for an editable development install:
 python -m pip install -e ".[torch,symmetry]"
 ```
 
-Documentation sources are plain Markdown under `docs/`. The generated API
-reference is optional and is built with Sphinx:
+## Build the documentation
+
+Read the Markdown in `docs/` directly, or build a searchable HTML site with
+generated API pages:
 
 ```bash
 python -m pip install -e ".[docs]"

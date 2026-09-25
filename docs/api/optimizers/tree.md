@@ -1,5 +1,10 @@
 # `pepsy.optimizers.tree`
 
+Use this guide for tree circuit replay, state layout, operators, and readout.
+Jump to [tree structure](#tree-structure), [state API](#tree-state-class),
+[operator application](#multi-qubit--sub-mpo-application),
+[diagnostics](#diagnostics), or [readout](#readout).
+
 The operator classes have distinct representation contracts:
 
 | Class | Stored region | Labels and physical indices |
@@ -1899,7 +1904,8 @@ at multiple scales without optional dependencies. For the highest-quality
 budget between topology annealing and Nevergrad leaf refinement. Quality mode
 selects this hybrid automatically when Nevergrad is installed and falls back
 to annealing otherwise. None of these stages allocates or replays a TTN.
-Install the optional dependency with `pip install pepsy[layout]`:
+Install the optional dependency from the checkout with
+`python -m pip install ".[layout]"`:
 
 ```python
 choice = finder.recommend_layered(

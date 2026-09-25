@@ -1,12 +1,9 @@
 # Design and research notes
 
-Conceptual documentation for Pepsy workstreams. These notes explain the ideas
-and intended implementation — the "why" behind the code — so contributors and
-agents share a mental model. They are not auto-generated API docs (those live
-in `docs/api/`).
-
-Keep these in sync as the design firms up; when something is finalized and
-user-facing, promote it into `docs/` (tutorials / how-to).
+These notes record design decisions, compatibility checks, and measurements.
+Read dates and validation limits before applying a finding to current code.
+Document supported public behavior in the [API guides](../../api/index.md)
+and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
@@ -40,11 +37,11 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 
 ## Relationship to other docs
 
-- [`../plans/project.md`](../plans/project.md) — the project roadmap.
+- [Project roadmap](../plans/project.md) — historical progress and proposals.
 - [`../modules/`](../modules/README.md) — concise implementation maps.
 - [Session journal](https://github.com/quantinuum-dev/pepsy/blob/develop/history/README.md) — dated handoffs and validation
   records. Historical findings and proposed next steps are not active policy.
-- `docs/` — the finished, published documentation.
+- [User documentation](../../index.md) — installation, workflows, and APIs.
 
 ```{toctree}
 :hidden:

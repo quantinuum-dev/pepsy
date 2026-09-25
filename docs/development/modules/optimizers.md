@@ -16,9 +16,10 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `optimizer.py`: `MpsOptimizer`.
   - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
   - `gibbs.py`: purified finite-temperature `GibbsMps` preparation.
-  - `compression.py`, `normalization.py`, `diagnostics.py`: empty reserved
-    import paths. Their proposed extractions have not happened; these
-    responsibilities currently remain on `MpsOptimizer` in `optimizer.py`.
+  - `diagnostics.py`: private, dependency-free layout formatting and FIT timing
+    summaries. Timing collection and numerical diagnostics remain on the optimizer.
+  - `compression.py`, `normalization.py`: empty reserved import paths;
+    these responsibilities remain on `MpsOptimizer` in `optimizer.py`.
 - `mpo/`: MPO gate-stream optimization.
   - `optimizer.py`: `MpoOptimizer`.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.

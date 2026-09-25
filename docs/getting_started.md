@@ -1,18 +1,12 @@
 # Getting Started
 
-This page gives the shortest path from install to a first contraction run.
+Build a small PEPS, contract its norm, and inspect the result. For the complete
+example in one code block, see [Quickstart](quickstart.md).
 
 ## 1. Install
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install .
-```
-
-Run these commands from the checkout. For development, use an editable install
-with `python -m pip install -e ".[dev]"`. Add only the optional
-[installation profiles](installation.md) required by your workflow.
+Follow the [installation guide](installation.md) using Python 3.12 or newer.
+This example needs only the base package. Run the Python blocks below in order.
 
 ## 2. Build a small test network
 

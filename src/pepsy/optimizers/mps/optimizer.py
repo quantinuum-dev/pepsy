@@ -133,6 +133,13 @@ from ...operators.gates import (
     gate as apply_gate,
 )
 from ...operators import primitives as _gate_primitives
+from .diagnostics import (
+    _FIT_TIMING_PHASES,  # noqa: F401 -- retain the existing private import path
+    _format_layout_reduction,
+    _format_layout_value,
+    _layout_report_text,
+    _summarize_fit_timing,
+)
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
@@ -212,21 +219,6 @@ _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
     | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
 )
-# This export-oriented list intentionally contains compatibility totals and
-# their named subsets. It is not an additive partition of elapsed FIT time.
-_FIT_TIMING_PHASES = (
-    "canonicalization_seconds",
-    "sweep_preparation_canonicalization_seconds",
-    "moving_canonicalization_seconds",
-    "fixed_environment_seconds",
-    "effective_seconds",
-    "svd_seconds",
-    "writeback_seconds",
-    "environment_seconds",
-    "moving_environment_seconds",
-    "non_site_elapsed_seconds",
-    "sweep_overhead_seconds",
-)
 
 
 @dataclass(frozen=True)
@@ -269,31 +261,6 @@ class _MpsStreamPlan:
             converted = factory()
             self._backend_cache[key] = (source, converted)
             return converted
-
-
-def _summarize_fit_timing(records):
-    """Summarize detailed FIT sweep timing without discarding raw records."""
-    records = tuple(records)
-    fit_indices = {
-        int(record["fit_index"])
-        for record in records
-        if "fit_index" in record
-    }
-    return {
-        "calls": len(fit_indices),
-        "sweeps": len(records),
-        "site_updates": sum(
-            int(record.get("site_count", len(record.get("site_timings", ()))))
-            for record in records
-        ),
-        "elapsed_seconds": sum(
-            float(record.get("elapsed_seconds", 0.0)) for record in records
-        ),
-        **{
-            phase: sum(float(record.get(phase, 0.0)) for record in records)
-            for phase in _FIT_TIMING_PHASES
-        },
-    }
 
 
 class _DeprecatedOptionDefault:
@@ -4520,125 +4487,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
         return mapped_G, mapped_where
 
-    @staticmethod
-    def _format_layout_value(value):
-        """Format one layout diagnostic value compactly."""
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return str(value)
-        if value.is_integer():
-            return str(int(value))
-        return f"{value:.6g}"
+    _format_layout_value = staticmethod(_format_layout_value)
 
     @classmethod
     def _format_layout_reduction(cls, before, after):
-        """Format ``before -> after`` with a percent decrease when meaningful."""
-        before = float(before or 0.0)
-        after = float(after or 0.0)
-        text = f"{cls._format_layout_value(before)} -> {cls._format_layout_value(after)}"
-        if before > 0.0:
-            reduction = 100.0 * (before - after) / before
-            text += f" ({reduction:.1f}% lower)"
-        return text
+        """Format a reduction using this class's value formatter."""
+        return _format_layout_reduction(
+            before, after, format_value=cls._format_layout_value
+        )
 
     @classmethod
     def _layout_report_text(cls, plan):
-        """Return a concise human-readable layout improvement report."""
-        stats = plan.get("stats", {})
-        input_stats = plan.get("input_stats", {})
-        if not input_stats:
-            return None
-        selected = plan.get("selected_order", "<unknown>")
-        site_order = plan.get("site_order", plan.get("qubit_inds", ()))
-        weight_mode = plan.get("weight_mode", "count")
-        objective = plan.get("objective", "locality")
-        score_before = input_stats.get("loss", input_stats.get("score", 0.0))
-        score_after = stats.get("loss", stats.get("score", 0.0))
-        score_label = "score"
-        if objective == "replay":
-            # Replay selection replaces the primary score with a large,
-            # lexicographically scalarized bond objective. Keep this report
-            # line about the comparable static graph proxy instead.
-            score_before = input_stats.get(
-                "loss", input_stats.get("score", 0.0)
-            )
-            score_after = stats.get(
-                "static_loss", stats.get("path_loss", stats.get("loss", 0.0))
-            )
-            score_label = "graph proxy score"
-        lines = [
-            (
-                "MpsOptimizer layout finder: "
-                f"order={selected}, sites={len(site_order)}, "
-                f"events={stats.get('num_events', input_stats.get('num_events', 0))}, "
-                f"weight_mode={weight_mode}, objective={objective}"
-            ),
-            (
-                "  long-range events: "
-                + cls._format_layout_reduction(
-                    input_stats.get("long_range_events", 0),
-                    stats.get("long_range_events", 0),
-                )
-                + " | weighted: "
-                + cls._format_layout_reduction(
-                    input_stats.get("weighted_long_range_events", 0.0),
-                    stats.get("weighted_long_range_events", 0.0),
-                )
-            ),
-            (
-                "  event span max/mean: "
-                + cls._format_layout_value(input_stats.get("max_event_span", 0))
-                + "/"
-                + cls._format_layout_value(input_stats.get("weighted_mean_event_span", 0.0))
-                + " -> "
-                + cls._format_layout_value(stats.get("max_event_span", 0))
-                + "/"
-                + cls._format_layout_value(stats.get("weighted_mean_event_span", 0.0))
-            ),
-            (
-                f"  {score_label}: "
-                + cls._format_layout_reduction(
-                    score_before,
-                    score_after,
-                )
-                + " | graph span: "
-                + cls._format_layout_reduction(
-                    input_stats.get("weighted_total_span", input_stats.get("total_span", 0.0)),
-                    stats.get("weighted_total_span", stats.get("total_span", 0.0)),
-                )
-                + " | cut L2: "
-                + cls._format_layout_reduction(
-                    input_stats.get("weighted_cut_congestion_l2", 0.0),
-                    stats.get("weighted_cut_congestion_l2", 0.0),
-                )
-            ),
-        ]
-        if objective == "compression":
-            lines.append(
-                "  operator cut load max/total: "
-                + cls._format_layout_value(
-                    stats.get("max_operator_cut_load", 0.0)
-                )
-                + "/"
-                + cls._format_layout_value(
-                    stats.get("total_operator_cut_load", 0.0)
-                )
-                + " | bounded cut probes: "
-                + cls._format_layout_value(stats.get("rank_bounded_cuts", 0))
-            )
-        elif objective == "replay":
-            replay = stats.get("replay", {})
-            if replay.get("status") == "ok":
-                lines.append(
-                    "  replay peak bond/log2: "
-                    + cls._format_layout_value(replay.get("peak_bond", 0))
-                    + "/"
-                    + cls._format_layout_value(replay.get("peak_log2_bond", 0.0))
-                    + " | profiled events: "
-                    + cls._format_layout_value(len(replay.get("profile", ())))
-                )
-        return "\n".join(lines)
+        """Format a layout report while preserving subclass formatters."""
+        return _layout_report_text(
+            plan,
+            format_value=cls._format_layout_value,
+            format_reduction=cls._format_layout_reduction,
+        )
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
