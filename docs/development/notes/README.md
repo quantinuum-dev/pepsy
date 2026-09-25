@@ -42,7 +42,7 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 
 - [`../plans/project.md`](../plans/project.md) — the project roadmap.
 - [`../modules/`](../modules/README.md) — concise implementation maps.
-- [Session journal](../../../history/README.md) — dated handoffs and validation
+- [Session journal](https://github.com/quantinuum-dev/pepsy/blob/develop/history/README.md) — dated handoffs and validation
   records. Historical findings and proposed next steps are not active policy.
 - `docs/` — the finished, published documentation.
 
@@ -52,6 +52,7 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 release_readiness_2026_09
 package_simplicity_2026_09
 dependency_minimums_2026_09
+ci_compatibility_2026_09
 belief_propagation
 quimb
 quimb_symmray_opportunities_2026_09
@@ -62,4 +63,38 @@ symmray_2026_09
 fermionic_mpo
 higher_order_mpo_benchmarks
 mpo_cluster_graph_assembly
+2026-09-15-inhomogeneous-pepo-slots
+2026-09-15-sparse-hessian-trust-region
+boundary_quimb_compression_modes
+contract_flat_backend_scalars
+fit_one_site_qr
+gibbs_mps
+mpo_mps_alignment
+mps_dynamic_controls
+mps_entropy_backend
+mps_final_audit
+mps_fit_copy_validation
+mps_gpu_backend_audit
+mps_layout_scheduler
+mps_quimb_compression_audit
+mps_stab_modes_fit
+mps_to_ttn
+mps_transfer
+pepo_backend_dtype
+stabilizer_gpu_backend_audit
+torch_export_compile_compatibility
+tree_api_consistency
+tree_auto_cutoff
+tree_compact_operators
+tree_entropy
+tree_fit_execution
+tree_fit_incremental
+tree_fit_large_benchmarks
+tree_gpu_backend_audit
+tree_modes_review
+tree_mps_fit_parity
+tree_path_execution
+tree_sampler_symmray
+tree_successive_environments
+tree_zipup_fit
 ```

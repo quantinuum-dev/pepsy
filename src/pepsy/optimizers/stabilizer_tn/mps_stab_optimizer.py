@@ -674,11 +674,13 @@ class StabilizerMpsSimulator:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
-    mode : {"direct", "dm", "zipup", "src", "sdc", "fit-*", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "swap", "perm", "exact"}
+    mode : str
         Compression backend for coefficient-MPS updates. Native compression
         names are used directly, for example ``"direct"``, ``"zipup"``, or
-        ``"src"``; the ``"*-first"`` and ``"*-oversample"`` variants are
-        available as well. The DMRG modes use local FIT on the coefficient
+        ``"src"``; ``"dm"``, ``"sdc"``, ``"fit-*"``, and the
+        ``"*-first"`` / ``"*-oversample"`` variants are available as well.
+        The ``"dmrg"``, ``"dmrg1"``, ``"dmrg2"``, and ``"dmrg3"``
+        modes use local FIT on the coefficient
         target; ``fit_init_strategy`` controls their disposable initial guess.
         On dense backends, DMRG retains the exact coefficient sub-MPO as a
         tagged lazy FIT target layer after canonicalizing the active MPS window;
@@ -3924,10 +3926,11 @@ class StabilizerMpsSimulator:
 
         Parameters
         ----------
-        mode : {"exact", "direct", "zipup", "src", "fit-*", "dmrg"}, default="exact"
+        mode : str, default="exact"
             ``"exact"`` applies the tableau circuit with unlimited bond and
             zero cutoff. Native MPS compression methods use their bare names,
-            matching the ordinary MPS optimizer; ``"dmrg"`` uses its
+            matching the ordinary MPS optimizer, including ``"direct"``,
+            ``"zipup"``, ``"src"``, and ``"fit-*"``; ``"dmrg"`` uses its
             variational replay path. Approximate modes require ``chi``.
             Historical ``"quimb-*"`` and ``"mpo-*"`` forms remain accepted as
             deprecated aliases.

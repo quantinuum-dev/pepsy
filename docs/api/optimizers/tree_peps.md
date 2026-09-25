@@ -357,7 +357,7 @@ results reproducible. The paper's full projected Cholesky (CBC) tree
 compressor is not represented by these aliases and remains a separate future
 method.
 
-### TreePEPS FIT / DMRG
+## TreePEPS FIT / DMRG
 
 `TreePepsOptimizer` also exposes the tree-native `TreeFIT` engine through
 `mode="dmrg"` and the `dmrg1`/`dmrg2`/`dmrg3` aliases. The exact layered

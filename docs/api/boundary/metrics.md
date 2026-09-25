@@ -32,7 +32,7 @@ effective layer and uses `flat=True` boundary initialization. It requires
 PEPS/PEPO layers. For that case, provide the tagged network and
 `BdyMPS(tn_double=network, flat=False)` to `contract_boundary`.
 
-### Flat directional and middle-out compression
+## Flat directional and middle-out compression
 
 For Quimb boundary contraction, `contract_flat` accepts readable
 `boundary_direction` presets in addition to the lower-level `sequence`

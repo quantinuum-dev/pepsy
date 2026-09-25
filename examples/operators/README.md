@@ -2,11 +2,11 @@
 
 These examples demonstrate the canonical construction families from the
 [operator inventory](../../docs/development/modules/operators.md). Run them
-from the Pepsy repository root after activating the shared Python 3.12
-environment:
+from the Pepsy repository root after activating the Python 3.12+ environment
+selected by [the contribution guide](../../CONTRIBUTING.md) and any local
+environment override:
 
 ```bash
-source ~/envs/py312/bin/activate
 python examples/operators/higher_order_mpo.py
 python examples/operators/fixed_channel_pepo.py
 python examples/operators/dense_cluster_pepo.py

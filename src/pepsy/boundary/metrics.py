@@ -1995,6 +1995,8 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
     return_info : bool, default=False
         If ``True``, return :class:`BoundaryContractResult` with diagnostics.
 
+    Notes
+    -----
     Other parameters match :func:`contract_flat` and
     :func:`contract_boundary` where applicable.
     """

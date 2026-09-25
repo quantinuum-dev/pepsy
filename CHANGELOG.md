@@ -125,6 +125,9 @@ The release version and date have not been selected.
 
 ### Development
 
+- Documentation builds now fail on warnings in CI and Read the Docs. Fixed
+  API parameter formatting, heading levels, navigation coverage, and links
+  to repository history so the strict HTML build completes cleanly.
 - CI tests the five direct core dependency minimums and a combined extended
   profile with a 60% coverage gate, plus MPI, packaging, docs, type checks,
   and agent guidance. Backend imports and test failure annotations improve

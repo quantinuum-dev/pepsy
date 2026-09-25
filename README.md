@@ -121,7 +121,7 @@ local environment override. Install the docs extra and build locally with:
 
 ```bash
 python -m pip install -e ".[docs]"
-python -m sphinx -b html docs docs/_build/html
+python -m sphinx -W --keep-going -b html docs docs/_build/html
 ```
 
 The generated API pages include signatures, parameter descriptions, class

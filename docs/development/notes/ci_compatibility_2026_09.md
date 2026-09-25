@@ -7,7 +7,7 @@ on `9d6d7ef` failed in core tests, MPI, and mypy. Reproducing the declared core
 dependencies under the selected Python 3.12 interpreter, isolated with `-S`
 and a temporary dependency directory, exposed **158 failures**. The first
 repaired full core run passed **2858 tests**, with **1037 optional/capability
-skips**. See the [session handoff](../../../history/2026-09-24-ci-dependency-profiles.md)
+skips**. See the [session handoff](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-24-ci-dependency-profiles.md)
 for final validation and publication status.
 
 | Package | Installed development environment | Isolated released dependencies |

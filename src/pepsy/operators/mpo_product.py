@@ -3500,8 +3500,7 @@ def exp_mpo_cluster(
         ``"rsum2"``.
     assembly_form : {"left", "right"}, default="left"
         Direction of the intermediate semantic TT-SVD sweep.
-    chi, cutoff_mode, compression, differentiable, sector_aware, form,
-    create_bond, compress_opts : optional
+    chi, cutoff_mode, compression, differentiable, sector_aware, form, create_bond, compress_opts : optional
         Optional final numerical MPO compression, using the same semantic
         boundary as :func:`exp_mpo`. ``chi`` is separate from ``max_bond``.
         With ``return_semantic=True``, use ``compression="fixed_rank"`` or

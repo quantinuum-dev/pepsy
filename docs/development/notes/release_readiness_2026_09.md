@@ -54,10 +54,11 @@ the domain API pages, and dated session records.
   [session handoff](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-25-release-readiness.md).
   The review changes documentation only; numerical code, requirements, tests,
   workflows, and package version are unchanged.
-- Local HTML builds completed with no new diagnostics relative to the
-  baseline. Existing documentation warnings and a generated `mpo_product`
-  API formatting error remain; the current non-strict build exits 0. A green
-  documentation job therefore does not establish warning-free rendering.
+- The initial local HTML builds retained baseline warnings and a generated
+  `mpo_product` API formatting error under the non-strict build. The subsequent
+  [documentation cleanup](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-25-documentation-cleanup.md)
+  resolved all 48 diagnostics and verified a fresh strict HTML build with no
+  warnings or errors. CI and Read the Docs now fail on documentation warnings.
 
 ## Decisions before merging or publishing
 

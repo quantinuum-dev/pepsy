@@ -7,6 +7,8 @@
 - [SymDMRG2 matvec fanout-GEMM plan](symdmrg_matvec_fanout.md)
 - [PEPS optimizer plan](peps_optimizer.md)
 - [TreePeps and tree-embedded PEPS plan](tree_peps.md)
+- [Tree FIT path traversal plan](tree_fit_path_traversal.md)
+- [Tree optimizer consolidation plan](tree_optimizer_consolidation.md)
 - [PEPS direct sampler plan](peps_sampler.md)
 - [BP-guided regional CTMRG/RG plan](regional_ctmrg_rg.md)
 - [Sweep optimizer plan](sweep_optimizer.md)
@@ -22,6 +24,8 @@ optimizers
 symdmrg_matvec_fanout
 peps_optimizer
 tree_peps
+tree_fit_path_traversal
+tree_optimizer_consolidation
 peps_sampler
 regional_ctmrg_rg
 sweep_optimizer
