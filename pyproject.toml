@@ -11,10 +11,10 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-  "numpy>=1.24",
-  "quimb>=1.8",
+  "numpy>=1.26",
+  "quimb>=1.15",
   "cotengra>=0.8.0",
-  "autoray>=0.6",
+  "autoray>=0.9",
   "tqdm>=4.65",
 ]
 
@@ -25,14 +25,14 @@ Issues = "https://github.com/quantinuum-dev/pepsy/issues"
 
 [project.optional-dependencies]
 contraction = ["cotengrust>=0.1", "cmaes>=0.10"]
-torch = ["torch>=2.0"]
-solvers = ["scipy>=1.10", "nlopt>=2.7"]
-viz = ["matplotlib>=3.7"]
-layout = ["nevergrad>=1.0"]
-mpi = ["mpi4py>=3"]
+torch = ["torch>=2.4"]
+solvers = ["scipy>=1.16", "nlopt>=2.9"]
+viz = ["matplotlib>=3.9"]
+layout = ["nevergrad>=1.0.3"]
+mpi = ["mpi4py>=3.1.5"]
 guppy = ["guppylang>=1.0,<2"]
 symmetry = ["symmray>=0.4.0"]
-stabilizer = ["stim>=1.12"]
+stabilizer = ["stim>=1.13"]
 dev = [
   "pytest>=8",
   "pytest-cov>=5",
@@ -50,17 +50,17 @@ docs = [
 ]
 test-extended = [
   "pepsy[layout,solvers,stabilizer,symmetry,torch,viz]",
-  "autograd>=1.6",
+  "autograd>=1.7",
 ]
 # Compose feature profiles so each dependency constraint has one owner.
 vmc-torch = ["pepsy[torch]"]
 vmc-netket = [
   # NetKet 3.22.x cannot import with JAX's ArrayLike union from 0.11.1 onward.
   # Recheck this bound when NetKet fixes its online_statistics annotations.
-  "jax>=0.4,<0.11.1",
-  "flax>=0.8",
-  "optax>=0.2",
-  "netket>=3.10",
+  "jax>=0.7,<0.11.1",
+  "flax>=0.10.6",
+  "optax>=0.2.2",
+  "netket>=3.22",
   "pepsy[symmetry]",
 ]
 vmc = ["pepsy[vmc-torch,vmc-netket]"]

@@ -17,6 +17,14 @@ The base package declares NumPy, Quimb, Cotengra, Autoray, and tqdm. Its
 numerical dependencies can bring additional packages transitively; a lazy
 import does not imply a dependency-free installation.
 
+Core dependency minimums are tested together on Python 3.12 in CI. The
+extended job tests current compatible releases with optional features.
+Minimums account for required APIs, Python support, and interoperability;
+they do not promise every combination of historical optional-library versions.
+Newer upstream features can still require a newer release and are checked
+when requested. See the [dependency audit](development/notes/dependency_minimums_2026_09.md)
+for the evidence behind the current bounds and validation limits.
+
 Install only the features you use. These commands are alternatives, not a
 sequence to run in full:
 

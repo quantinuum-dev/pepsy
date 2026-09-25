@@ -10,6 +10,8 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 
 ## Contents
 
+- [`dependency_minimums_2026_09.md`](dependency_minimums_2026_09.md) — Required
+  upstream APIs, tested lower bounds, and optional-backend validation limits.
 - [`ci_compatibility_2026_09.md`](ci_compatibility_2026_09.md) — Released versus
   development dependency failures, seed handling, and CI profile corrections.
 - [`package_simplicity_2026_09.md`](package_simplicity_2026_09.md) — Package,
@@ -46,6 +48,7 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 :hidden:
 
 package_simplicity_2026_09
+dependency_minimums_2026_09
 belief_propagation
 quimb
 quimb_symmray_opportunities_2026_09

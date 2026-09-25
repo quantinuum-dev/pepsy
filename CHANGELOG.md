@@ -14,6 +14,11 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Dependency minimums now match the APIs and compatibility contracts Pepsy
+  uses, including Quimb 1.15, Autoray 0.9, and NetKet 3.22. Python 3.12 and
+  NumPy 2 compatibility are reflected in the optional backend requirements.
+  Existing core CI tests now pin direct runtime dependencies to their
+  declared minimums; extended CI continues to resolve current releases.
 - Pepsy now requires Python 3.12 or newer. Python 3.10/3.11 support and the
   development-only TOML backport are removed. CI, release builds, and static
   analysis use the Python 3.12 baseline.

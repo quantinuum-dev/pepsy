@@ -58,8 +58,12 @@ Small shared reference builders live in `_mps_test_helpers.py` and
 `_tree_test_helpers.py`; keep setup used by only one suite in that suite.
 
 CI runs `-m "smoke or (core and not optional and not slow)"` on Python 3.12
-with the development dependencies, covering the smoke and core contracts.
-One extended job installs `.[dev,test-extended,contraction,vmc]` and runs the
+with the five direct core dependencies pinned to their declared minimums.
+Constraints are generated from `pyproject.toml`; development tools and
+transitive dependencies resolve normally. This checks the actual lower-bound
+contract without maintaining a second version list.
+One extended job installs current compatible releases through
+`.[dev,test-extended,contraction,vmc]` and runs the
 complete collection with a 60% whole-package coverage gate. Combining optional
 profiles keeps JAX coverage in MPS, tree, and operator tests as well as VMC,
 without a second full-suite VMC job. Optional tests skip only when their
