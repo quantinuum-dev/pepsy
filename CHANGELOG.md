@@ -18,6 +18,8 @@ releases remain backwards-compatible. From 1.0 onward:
   PyPI/TestPyPI publishing jobs and their token permission.
 - Move MPS layout report formatting and FIT timing summaries into the private
   diagnostics module, preserving report output, lazy imports, and replay behavior.
+- Split the tree API guide into layout, state, operator, replay, fitting, and
+  readout pages while preserving the original section links.
 
 ## [0.5.0] - 2026-09-25
 
