@@ -87,7 +87,7 @@ class ExactBatch:
 
 @dataclass(frozen=True)
 class ExactStructuredBatch:
-    """A long ZZ layer or same-pair parity block with a safe fallback."""
+    """A long diagonal stream or same-pair parity block with a safe fallback."""
 
     kind: str
     operator: object
@@ -107,20 +107,31 @@ class ExactStructuredBatch:
         if n > 63:
             result = None
         elif self.kind == "phase":
-            edges, same, different = self.operator
+            supports, same, different = self.operator
             pairs = tuple(dict.fromkeys(zip(same, different)))
             groups = {}
             counts = [0] * len(pairs)
-            for (a, b), values in zip(edges, zip(same, different)):
-                bit_a = n - 1 - tensor.inds.index(a)
-                bit_b = n - 1 - tensor.inds.index(b)
-                low, high = sorted((bit_a, bit_b))
+            for where, values in zip(supports, zip(same, different)):
                 kind = pairs.index(values)
                 counts[kind] += 1
-                key = (kind, high - low)
+                if len(where) == 1:
+                    low = n - 1 - tensor.inds.index(where[0])
+                    # All basis indices are below 2**63, so this shift
+                    # contributes zero and leaves the vertex bit unchanged.
+                    offset = 63
+                else:
+                    bit_a, bit_b = (
+                        n - 1 - tensor.inds.index(ix) for ix in where
+                    )
+                    low, high = sorted((bit_a, bit_b))
+                    offset = high - low
+                key = (kind, offset)
                 groups[key] = groups.get(key, 0) | (1 << low)
-            offsets = np.asarray(tuple(key[1] for key in groups), dtype=np.int32)
-            masks = np.asarray(tuple(groups.values()), dtype=np.uint64)
+            # The two-class kernel reads one contiguous group range per
+            # class, even when the original stream interleaves those classes.
+            ordered = sorted(groups)
+            offsets = np.asarray(tuple(key[1] for key in ordered), dtype=np.int32)
+            masks = np.asarray(tuple(groups[key] for key in ordered), dtype=np.uint64)
             tables = tuple(
                 np.asarray(
                     [values[0] ** (count - k) * values[1] ** k
@@ -132,7 +143,7 @@ class ExactStructuredBatch:
             if len(tables) == 1:
                 result = apply_grouped_phase(tensor.data, offsets, masks, tables[0])
             else:
-                split = sum(key[0] == 0 for key in groups)
+                split = sum(key[0] == 0 for key in ordered)
                 result = apply_grouped_phase_two(
                     tensor.data, offsets, masks, tables[0], tables[1], split
                 )
@@ -180,11 +191,11 @@ def _iter_basic_batches(gate_entries, matrices=None):
             matrix = None if matrices is None else matrices[index]
             if matrix is None:
                 diagonals[id(gate)] = _diagonal(gate)
-            elif np.any(matrix[~np.eye(4, dtype=bool)] != 0):
+            elif np.any(matrix[~np.eye(matrix.shape[0], dtype=bool)] != 0):
                 diagonals[id(gate)] = None
             else:
                 diagonals[id(gate)] = ar.do(
-                    "diagonal", ar.do("reshape", gate, (4, 4))
+                    "diagonal", ar.do("reshape", gate, matrix.shape)
                 )
         values = diagonals[id(gate)]
         is_diagonal = values is not None
@@ -201,21 +212,44 @@ def _iter_basic_batches(gate_entries, matrices=None):
 
 
 def _structured_matrix(gate):
-    """Inspect only a fixed two-qubit matrix; preserve trainable gradients."""
-    if getattr(gate, "requires_grad", False) or int(np.prod(gate.shape)) != 16:
+    """Inspect a tiny fixed matrix while preserving trainable gradients."""
+    if getattr(gate, "requires_grad", False):
         return None
-    matrix = ar.do("reshape", gate, (4, 4))
+    elements = int(np.prod(gate.shape))
+    if elements not in (4, 16):
+        return None
+    side = isqrt(elements)
+    matrix = ar.do("reshape", gate, (side, side))
     host = np.asarray(ar.to_numpy(matrix))
     return host if np.all(np.isfinite(host)) else None
 
 
-def _zz_values(matrix):
-    if matrix is None or np.any(matrix[~np.eye(4, dtype=bool)] != 0):
+def _phase_values(matrix):
+    """Return bit-zero/bit-one values for diagonal Z or ZZ structure."""
+    if matrix is None or np.any(
+        matrix[~np.eye(matrix.shape[0], dtype=bool)] != 0
+    ):
         return None
     diagonal = np.diag(matrix)
+    if len(diagonal) == 2:
+        return diagonal[0], diagonal[1]
     if diagonal[0] != diagonal[3] or diagonal[1] != diagonal[2]:
         return None
     return diagonal[0], diagonal[1]
+
+
+def _compact_phase(entries, values):
+    """Combine repeated diagonal supports without touching state-sized data."""
+    factors = {}
+    for (_gate, where, _location), pair in zip(entries, values):
+        key = frozenset(where)
+        if key in factors:
+            original, same, different = factors[key]
+            factors[key] = (original, same * pair[0], different * pair[1])
+        else:
+            factors[key] = (where, pair[0], pair[1])
+    supports, same, different = zip(*factors.values())
+    return supports, np.asarray(same), np.asarray(different)
 
 
 def _parity_matrix(matrix):
@@ -227,15 +261,12 @@ def _parity_matrix(matrix):
     )
 
 
-def _structured_batch(kind, entries, matrices, zz_values):
+def _structured_batch(kind, entries, matrices, *, phase_operator=None):
     fallback = tuple(entries)
     locations = tuple(entry[2] for entry in entries)
     if kind == "phase":
-        edges = tuple(entry[1] for entry in entries)
-        same = np.asarray([pair[0] for pair in zz_values])
-        different = np.asarray([pair[1] for pair in zz_values])
-        inds = tuple(dict.fromkeys(ix for edge in edges for ix in edge))
-        operator = (edges, same, different)
+        operator = phase_operator
+        inds = tuple(dict.fromkeys(ix for support in operator[0] for ix in support))
         diagonal = True
     else:
         inds = entries[0][1]
@@ -292,41 +323,45 @@ def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size
 
     inspected = {}
     matrices = []
-    for gate, where, _ in entries:
-        if len(where) != 2:
-            matrices.append(None)
-        else:
-            key = id(gate)
-            if key not in inspected:
-                inspected[key] = _structured_matrix(gate)
-            matrices.append(inspected[key])
-    zz = [_zz_values(matrix) for matrix in matrices]
+    for gate, _where, _ in entries:
+        key = id(gate)
+        if key not in inspected:
+            inspected[key] = _structured_matrix(gate)
+        matrices.append(inspected[key])
+    phase_values = [_phase_values(matrix) for matrix in matrices]
     basic_start = 0
     i = 0
     while i < len(entries):
         j = i
         sites = set()
-        while j < len(entries) and zz[j] is not None:
+        while j < len(entries) and phase_values[j] is not None:
             sites.update(entries[j][1])
             j += 1
-        value_classes = set(zz[i:j])
-        unique_edges = {
-            frozenset(entries[k][1]) for k in range(i, j)
-        }
-        phase_candidate = (
-            len(sites) > _DIAGONAL_QUBITS and len(unique_edges) == j - i
-        )
-        if phase_candidate and (
-            len(value_classes) == 1
-            or (
-                len(value_classes) == 2
+        if len(sites) > _DIAGONAL_QUBITS:
+            compacted = _compact_phase(entries[i:j], phase_values[i:j])
+            value_classes = set(zip(compacted[1], compacted[2]))
+            has_vertex = any(len(entry[1]) == 1 for entry in entries[i:j])
+            profitable = (
+                len(value_classes) == 1
+                and (backend != "cupy" or not has_vertex)
+            ) or (
+                len(value_classes) in (1, 2)
                 and _two_class_worthwhile(entries[i:j], backend, state_size)
             )
-        ):
-            yield from _iter_basic_batches(entries[basic_start:i], matrices[basic_start:i])
-            yield _structured_batch("phase", entries[i:j], matrices[i:j], zz[i:j])
-            i = basic_start = j
-            continue
+            if (
+                profitable
+                and np.all(np.isfinite(compacted[1]))
+                and np.all(np.isfinite(compacted[2]))
+            ):
+                yield from _iter_basic_batches(
+                    entries[basic_start:i], matrices[basic_start:i]
+                )
+                yield _structured_batch(
+                    "phase", entries[i:j], matrices[i:j],
+                    phase_operator=compacted,
+                )
+                i = basic_start = j
+                continue
 
         pair = set(entries[i][1])
         j = i
@@ -336,9 +371,9 @@ def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size
             and _parity_matrix(matrices[j])
         ):
             j += 1
-        if j - i >= 2 and (any(zz[i:j]) or j - i >= 3 or state_size >= 1 << 18):
+        if j - i >= 2 and (any(phase_values[i:j]) or j - i >= 3 or state_size >= 1 << 18):
             yield from _iter_basic_batches(entries[basic_start:i], matrices[basic_start:i])
-            yield _structured_batch("parity", entries[i:j], matrices[i:j], zz[i:j])
+            yield _structured_batch("parity", entries[i:j], matrices[i:j])
             i = basic_start = j
             continue
         i += 1

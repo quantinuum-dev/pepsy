@@ -6,7 +6,7 @@ import pytest
 import quimb as qu
 import quimb.tensor as qtn
 
-from pepsy import MpsOptimizer, backend_torch, rx, rxx, ryy, rzz
+from pepsy import MpsOptimizer, backend_torch, rx, rxx, ryy, rz, rzz
 from pepsy.optimizers.mps import _exact_batch as batch_module
 
 
@@ -355,8 +355,8 @@ def test_exact_batch_equal_zz_layer_uses_one_phase_pass(backend):
     assert all(not isinstance(block, batch_module.ExactStructuredBatch)
                for block in blocks)
 
-    # Repeated edges contribute multiplicity; the grouped bit mask cannot
-    # count them twice, so the planner must keep the ordinary diagonal path.
+    # A repeated edge can form a second value class or split the phase run.
+    # Replay must still count every original gate.
     repeated = gates + gates[:1]
     blocks = list(batch_module.iter_exact_batches(
         [value for value, _ in repeated],
@@ -366,11 +366,6 @@ def test_exact_batch_equal_zz_layer_uses_one_phase_pass(backend):
         state_size=2**n,
     ))
     assert sum(len(block.locations) for block in blocks) == len(repeated)
-    assert all(
-        len({frozenset(where) for where in block.locations})
-        == len(block.locations)
-        for block in blocks if getattr(block, "kind", None) == "phase"
-    )
     reference = MpsOptimizer(state, repeated, chi=1, mode="exact")
     optimized = MpsOptimizer(state, repeated, chi=1, mode="exact-batch")
     reference.run()
@@ -461,6 +456,103 @@ def test_exact_batch_two_value_zz_layer_uses_one_phase_pass(backend):
     ]
     assert all(getattr(block, "kind", None) != "phase"
                for block in planned(three_classes, 2**n))
+
+
+@pytest.mark.parametrize("backend", ("numpy", "cupy"))
+def test_exact_batch_compacts_interleaved_z_stream_and_replans_mutations(backend):
+    if backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if not cp.cuda.runtime.getDeviceCount():
+                pytest.skip("CUDA is unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA is unavailable")
+    else:
+        pytest.importorskip("numba")
+        cp = None
+
+    nx, ny = 4, 5
+    active = nx * ny
+    n = active + (2 if cp is not None else 0)
+    state = qtn.MPS_product_state([
+        np.array([1.0, 0.06 + 0.005j * i], dtype=np.complex64)
+        for i in range(n)
+    ])
+    edges = (
+        [(x * ny + y, (x + 1) * ny + y)
+         for x in range(nx - 1) for y in range(ny)]
+        + [(x * ny + y, x * ny + y + 1)
+           for x in range(nx) for y in range(ny - 1)]
+    )
+    two = np.asarray(rzz(0.17), dtype=np.complex64)
+    one = np.asarray(rz(0.09), dtype=np.complex64)
+    if cp is not None:
+        state.apply_to_arrays(cp.asarray)
+        two, one = cp.asarray(two), cp.asarray(one)
+    gates = []
+    for i in range(len(edges)):
+        gates.append((two, edges[i]))
+        if i < active:
+            gates.append((one, (i,)))
+        gates.append((two, edges[i][::-1]))
+        if i < active:
+            gates.append((one, (i,)))
+
+    def planned(stream):
+        return list(batch_module.iter_exact_batches(
+            [gate for gate, _ in stream],
+            [where for _, where in stream],
+            "k{}".format,
+            backend=backend,
+            state_size=2**n,
+        ))
+
+    blocks = planned(gates)
+    assert len(blocks) == 1 and blocks[0].kind == "phase"
+    assert len(blocks[0].locations) == len(gates)
+    assert len(blocks[0].operator[0]) == len(edges) + active
+    assert len({frozenset(where) for where in blocks[0].operator[0]}) == (
+        len(edges) + active
+    )
+    barrier = planned(gates + [(rx(0.11), (0,))] + gates)
+    assert [block.kind for block in barrier
+            if isinstance(block, batch_module.ExactStructuredBatch)] == [
+                "phase", "phase",
+            ]
+
+    before = ar.to_numpy(state.to_dense()).copy()
+    reference = MpsOptimizer(state, gates, chi=1, mode="exact")
+    optimized = MpsOptimizer(state, gates, chi=1, mode="exact-batch")
+    for replay in range(2):
+        if replay:
+            one[1, 1] *= 1.03
+            assert not np.array_equal(
+                blocks[0].operator[2], planned(gates)[0].operator[2]
+            )
+        reference.run()
+        optimized.run()
+        np.testing.assert_allclose(
+            ar.to_numpy(optimized.to_dense()),
+            ar.to_numpy(reference.to_dense()),
+            atol=3e-5,
+            rtol=3e-5,
+        )
+        assert ar.infer_backend(optimized.p.tensors[0].data) == backend
+    np.testing.assert_array_equal(ar.to_numpy(state.to_dense()), before)
+
+
+def test_exact_batch_pure_z_gpu_plan_avoids_short_phase_pass():
+    gate = np.asarray(rz(0.09), dtype=np.complex64)
+    n = 22
+    blocks = list(batch_module.iter_exact_batches(
+        [gate] * n,
+        [(i,) for i in range(n)],
+        "k{}".format,
+        backend="cupy",
+        state_size=2**n,
+    ))
+    assert len(blocks) == 2
+    assert all(getattr(block, "kind", None) != "phase" for block in blocks)
 
 
 @pytest.mark.parametrize("backend", ("numpy", "cupy"))

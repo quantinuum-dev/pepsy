@@ -302,15 +302,19 @@ This remains dense statevector evolution, not MPS truncation: `chi` and
 single-qubit gates in consecutive dense blocks with at most four qubits, and
 combines consecutive diagonal gates into broadcast factors with at most twelve
 qubits. A diagonal factor has at most 4096 entries, not a full-system diagonal
-matrix. On large NumPy or CuPy qubit states, long ZZ-like two-qubit
-diagonal runs with one or two distinct value pairs can use one graph-phase
-pass across any number of sites. The two-value route is selected only when
-the state size and avoided state passes justify its setup cost.
+matrix. On large NumPy or CuPy qubit states, long diagonal runs can compact
+repeated ZZ edges (including reversed endpoints) and diagonal one-qubit gates
+such as RZ by multiplying their tiny gate coefficients per support. If the
+compacted stream has one or two distinct value pairs, one graph-phase pass
+can cover any number of sites. Two-value runs and GPU runs containing
+one-qubit factors are selected only when the state size and avoided state
+passes justify their setup cost.
 Consecutive parity-preserving gates on the same pair (including RXX/RYY/RZZ)
 can use one two-sector update. The planner keeps the ordinary
 bounded blocks when these patterns are absent or a backend lacks the optional
-kernel. Gates are not reordered across each other or across measurements,
-resets, caps, feed-forward, or trajectory boundaries. `k_2q_batch` continues
+kernel. Commuting diagonal factors can be combined within an uninterrupted
+diagonal run; nothing moves across a non-diagonal gate, measurement, reset,
+cap, feed-forward, or trajectory boundary. `k_2q_batch` continues
 to configure DMRG only; no batching option is needed here.
 
 Each block produces a new state array without modifying aliased input arrays.

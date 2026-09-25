@@ -96,9 +96,12 @@ than hiding policy in a mode-specific helper.
   trajectory paths for compatibility. Automatic normalization remains an MPS
   canonicalization feature.
 - `exact-batch`: opt-in fully contracted replay that fuses bounded one-/two-site
-  gates, compact diagonal blocks, one- or two-value ZZ layers, and
-  consecutive parity-preserving gates on one pair where the array backend
-  supports them. Two-value layers require enough saved full-state passes.
+  gates, compact diagonal blocks, repeated-support Z/ZZ diagonal runs with
+  one or two value pairs after compaction, and consecutive parity-preserving
+  gates on one pair where the array backend supports them. A mixed Z/ZZ run
+  must group two-class masks by class even if the gates interleave. Two-value
+  layers and GPU runs with one-qubit factors require enough saved full-state
+  passes.
   It retains exact-mode restrictions and falls back to the reference kernel
   for unsupported arrays. See the [exact-batch audit](../../../docs/development/notes/mps_exact_batch.md).
 

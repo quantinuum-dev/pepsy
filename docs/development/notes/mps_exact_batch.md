@@ -364,9 +364,10 @@ vertical RZZ couplings differ. For each class, it counts disagreeing edges
 with grouped XOR/popcount masks and reads a small power table. The two class
 factors multiply each amplitude in one state-output pass. It preserves
 nonunitary scale, reversed endpoints, original gate order, and input ownership.
-A phase block never contains repeated edges, whose multiplicity an OR mask
-would lose; the planner splits or falls back. Three or more value classes
-retain the existing bounded blocks.
+At this stage, a phase block did not contain repeated edges, whose
+multiplicity an OR mask would lose; the planner split or fell back. The
+stream-compaction follow-up below handles repeated supports explicitly.
+Three or more value classes retain the existing bounded blocks.
 No gate matrix or full-state diagonal is cached.
 
 The planner estimates the number of ordinary twelve-site diagonal passes.
@@ -414,3 +415,78 @@ qubits. Adjacent MPS/control/Quimb/API/package tests had 130 passes and the
 known JAX complex64 direct-mode Kraus-probability precision failure, already
 reproduced on the remote baseline. Ruff, the MPS skill validators, and
 whitespace checks passed. See the [follow-up handoff](../../../history/2026-09-24-mps-two-value-phase.md).
+
+## Mixed Z/ZZ stream compaction (2026-09-24)
+
+The diagonal planner now inspects fixed one-qubit gates as well as ZZ-like
+pair gates. Within each uninterrupted diagonal run it multiplies coefficients
+for repeated supports, including reversed ZZ endpoints. The resulting unique
+supports enter the existing grouped population-count kernel. A single-site
+support uses an offset of 63: for the supported state widths, shifting a basis
+index by 63 yields zero, so the same mask logic counts set bits on that site.
+The original locations remain attached for event accounting and fallback.
+No state-sized diagonal or persistent gate cache is constructed; each replay
+reinspects mutable gates. Trainable Torch matrices remain on differentiable
+dense fusion, and native Symmray and unsupported arrays remain on the exact
+reference route. Nonfinite compacted coefficients fall back to bounded blocks.
+
+The new interleaved RZ/RZZ regression exposed a pre-existing two-class ordering
+assumption: masks were assembled in stream order, while the two-class kernel
+consumed a contiguous range for each class. Sorting the tiny mask groups by
+class fixes this for arbitrary interleaving. The regression checks repeated
+and reversed edges, one-qubit factors, a non-diagonal barrier, mutable gate
+payloads across two replays, backend and input ownership, and agreement with
+reference exact replay on NumPy and CuPy.
+
+Short local complex64 spot checks used a 4x5 grid with each of 31 RZZ edges
+and 20 RZ sites applied twice, interleaved (102 gates). The CPU state used 20
+qubits and the A5000 GPU state used 22 qubits, including two idle sites. The
+compacted plan used one phase pass; ordinary bounded fusion used five blocks.
+The figures are warm medians over five applications, with no first-use JIT
+cost. Planning plus application also favored compaction in the same local run.
+
+| Backend | Bounded application | Compacted application | Bounded planning + application | Compacted planning + application |
+| --- | ---: | ---: | ---: | ---: |
+| NumPy/Numba, 20 qubits | 15.2 ms | 5.0 ms | 9.9 ms | 6.6 ms |
+| CuPy, 22 qubits | 0.523 ms | 0.307 ms | 2.66 ms | 1.47 ms |
+
+The short CPU measurements varied across runs (another warm application run
+measured 16.5 versus 2.3 ms); these are workload-specific observations, not
+portable guarantees. A separate pure-RZ layer exposed a GPU regression for
+short, two-block runs: at 17, 20, and 22 qubits, ordinary broadcast measured
+0.059, 0.089, and 0.227 ms versus 0.141, 0.162, and 0.239 ms for the
+grouped pass. The planner therefore applies the existing state-size and
+avoided-pass cost check to GPU phase runs containing one-qubit gates, including
+single-value runs. NumPy pure-RZ layers benefited in the same spot check.
+Peak algorithmic state storage remains the input plus
+one output array and small host/device masks and tables. The grouped kernel
+still performs multiple population counts per amplitude, so these data do
+not establish a hardware bandwidth limit or global speed optimum.
+
+Upstream audit on 2026-09-24 revisited the [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Autoray repository](https://github.com/jcmgray/autoray),
+[Cotengra documentation](https://cotengra.readthedocs.io/en/latest/) and
+[changelog](https://cotengra.readthedocs.io/en/latest/changelog.html), and the
+[Symmray repository](https://github.com/jcmgray/symmray). The
+[Symmray Abelian-array page](https://symmray.readthedocs.io/en/latest/abelian_arrays.html)
+was unavailable; the installed package and repository were used instead.
+Installed versions remain Quimb 1.15.1.dev66+ge927f06e1, Autoray
+0.11.1.dev3+g1b476b305, Cotengra 0.8.3.dev7+g1d7fd333f, Symmray
+0.4.1.dev7+g83fb22865, NumPy 2.5.2, Numba 0.67.0, and CuPy 14.1.1.
+Installed probes covered TensorNetwork.copy(virtual=False, deep=False),
+TensorNetwork.contract(tags, output_inds, optimize, get, max_bond,
+strip_exponent, preserve_tensor, backend, inplace, **kwargs), Tensor.modify,
+MPS.from_dense, Autoray NumPy tensordot/diagonal/reshape/transpose dispatch,
+and the CuPy RawKernel constructor and launch. No changed upstream signature
+required a compatibility shim. **Adopt:** local diagonal support compaction
+and correctly ordered two-class masks behind the existing backend and size
+capability gates. **Defer:** arbitrary value-class phase kernels, commuting
+RXX/RYY basis transforms, immutable plan caching, in-place state mutation,
+and cuStateVec integration until their speed, memory, and ownership tradeoffs
+are established. The affected Pepsy path is pepsy.optimizers.mps._exact_batch;
+the exact reference mode is unchanged.
+
+Focused validation: tests/test_mps_exact_batch.py passed 27 tests, with
+NumPy/CuPy reference comparisons and existing Torch gradient/native Symmray
+fallback checks. See the new session handoff for adjacent validation and
+known baseline failures.

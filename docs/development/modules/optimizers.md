@@ -127,10 +127,11 @@ metadata. Exact mode intentionally has no canonical cache; switching back to
 an MPS mode rebuilds and canonicalizes the state.
 
 `exact-batch` is opt-in fully contracted replay with automatic one-/two-qubit
-fusion and compact diagonal broadcasting. Large ZZ layers with one or
-two distinct value pairs and same-pair parity-preserving gates have
-bounded-memory NumPy/Numba and CuPy kernels; a pass-count and state-size
-check limits the two-value route. Other gate streams retain the original
+fusion and compact diagonal broadcasting. Large mixed Z/ZZ diagonal runs
+compact repeated supports before a one- or two-value graph-phase pass.
+Same-pair parity-preserving gates have separate bounded-memory NumPy/Numba
+and CuPy kernels; a pass-count and state-size check limits two-value runs
+and GPU runs containing one-qubit factors. Other gate streams retain the original
 fusion. It shares exact-mode restrictions, does not restore full-state
 storage order between gates, and
 falls back to the reference kernel for unsupported array/state types. See the
