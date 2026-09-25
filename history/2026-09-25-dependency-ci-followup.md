@@ -3,8 +3,9 @@
 - Scope: finish checking the latest dependency-minimum changes and repair
   failures found in hosted CI.
 - Branch / baseline: `develop` / `af28262`.
-- Commit status: test correction and this handoff accompany the repair commit;
-  the user approved committing and pushing it to `develop`.
+- Commit status: repair committed and pushed to `develop` as `d55e10c` with
+  user approval. This final hosted-result update accompanies a documentation
+  follow-up commit.
 
 ## Hosted result and diagnosis
 
@@ -35,7 +36,12 @@
 - Checks used the required local Python 3.12 environment. No dependency
   installation or full numerical rerun was needed for this test-only change.
 
-## Remaining work
+## Hosted verification after repair
 
-- Verify the new hosted core and extended results after publication. The
-  corrected tree has not yet been tested by GitHub Actions.
+- [Run 36149515229](https://github.com/quantinuum-dev/pepsy/actions/runs/36149515229)
+  tested `d55e10c6c31693e18efc5c35b9559eafb73cd54f` and completed successfully.
+- All eight jobs passed: minimum-version core tests, extended tests with the
+  60% coverage gate, docs, package, type checks, agent guidance, and both MPI
+  configurations.
+- The pending hosted verification is complete. This final handoff update is
+  documentation only; it does not alter the tested implementation or tests.
