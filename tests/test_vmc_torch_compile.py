@@ -3,6 +3,16 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def native_torch_splits():
+    """Batching checks use native splits, independent of earlier AD policies."""
+    pytest.importorskip("torch")
+    from pepsy.backends import TorchLinalgConfig
+
+    with TorchLinalgConfig().activated():
+        yield
+
+
 @pytest.mark.integration
 def test_flat_z2_truncated_boundary_vmap_preserves_values_and_gradients():
     """Batched flat-array truncation must execute vmap and preserve gradients."""

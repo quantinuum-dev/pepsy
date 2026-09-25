@@ -11,7 +11,7 @@ _SVD_REGISTERED_FUNCTION = None
 
 
 @custom_vjp
-def svd_jax(A):
+def _svd_jax(A):
     """Thin JAX SVD with a Quimb-truncation-safe backward rule.
 
     Quimb's ``svd_truncated`` can pass cotangents only for the singular-vector
@@ -87,7 +87,21 @@ def jaxsvd_bwd(residual, tangents):
     return pullback(cotangent_tree)
 
 
-svd_jax.defvjp(jaxsvd_fwd, jaxsvd_bwd)
+_svd_jax.defvjp(jaxsvd_fwd, jaxsvd_bwd)
+
+
+def svd_jax(A, full_matrices=False, compute_uv=True, hermitian=False):
+    """Truncation-safe thin SVD with standard JAX decomposition options.
+
+    Options outside the thin, general-matrix rule use JAX's native SVD.
+    Explicit ``full_matrices=False`` follows the same custom VJP as omission.
+    """
+    if full_matrices or not compute_uv or hermitian:
+        return jnp.linalg.svd(
+            A, full_matrices=full_matrices, compute_uv=compute_uv,
+            hermitian=hermitian,
+        )
+    return _svd_jax(A)
 
 
 def _native_svd_jax(A, *args, **kwargs):

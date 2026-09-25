@@ -390,5 +390,7 @@ def test_tree_pepo_compress_validates_once_after_the_full_sweep(monkeypatch):
     operator.compress(max_bond=2, cutoff=1e-12)
 
     assert len(calls) == 1
-    assert all(call.get("check_canonical") for call in calls)
-    assert operator.validate()
+    # The normal sweep validates structure/metadata without a second numerical
+    # isometry scan. Check the actual canonical result explicitly here.
+    assert not calls[0].get("check_canonical", False)
+    assert operator.validate(check_canonical=True)

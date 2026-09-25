@@ -491,55 +491,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             {tensor_id: order for order, tensor_id in enumerate(self.tn.tensor_map)}
             if self._target_site_tensors is None else {}
         )
-        # Prepare all structural routing metadata once. A gate fit visits only
-        # a small active interval, but the target's tag map and chain bonds do
-        # not change during a FIT run, so rebuilding them per update is wasted
-        # work. The immutable plan stores ids and index names, not tensor data.
-        self._target_tag_tensor_ids = {
-            self.site_tag_id.format(site): tuple(
-                self.tn.tag_map.get(self.site_tag_id.format(site), ())
-            )
-            for site in range(self.L)
-        }
+        # Gate fits cache only visited sites and boundary bonds. The optional
+        # full structural snapshot is built only when explicitly requested.
+        self._target_tag_tensor_ids = {}
         # Layered targets can carry several tensors per site, so their chain
         # bond is not available through ``TensorNetwork.bond``. The target
         # graph is immutable during FIT: resolve each boundary locally once
         # and retain only its index name, never tensor data.
         self._target_bond_cache = {}
-        boundary_bond_map = []
-        for left_site in range(self.L - 1):
-            right_site = left_site + 1
-            try:
-                bond = self._target_bond(left_site, right_site)
-            except (KeyError, ValueError):
-                # Preserve the historical failure point for malformed active
-                # gate targets: construction succeeds, but use raises a
-                # precise error from ``_target_bond``.
-                bond = None
-            boundary_bond_map.append((left_site, right_site, bond))
-        site_tags = tuple(self.site_tag_id.format(site) for site in range(self.L))
-        self.prepared_target = _PreparedTarget(
-            site_order=site_tags,
-            site_tensor_ids=tuple(
-                self._target_tag_tensor_ids[site_tag]
-                for site_tag in site_tags
-            ),
-            boundary_bond_map=tuple(boundary_bond_map),
-            layer_tags=tuple(
-                sorted(tag for tag in self.tn.tags if tag not in site_tags)
-            ),
-            reindexing_map=tuple(sorted(target_reindexing.items())),
-            contraction_metadata=(
-                ("site_tag_id", str(self.site_tag_id)),
-                ("target_tensor_count", str(len(self.tn.tensor_map))),
-                (
-                    "one_tensor_per_site",
-                    str(self._target_site_tensors is not None),
-                ),
-                ("target_fermionic", str(bool(self.tn.isfermionic()))),
-                ("fitted_type", type(self.p).__name__),
-            ),
-        )
+        self._target_reindexing = tuple(sorted(target_reindexing.items()))
         # One metadata pass supplies all routing decisions, including mixed
         # dense/native inputs. No tensor values or device scalars are read.
         array_kinds = {
@@ -1581,6 +1541,34 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             )
             self.info["adaptive_bond_caps"][str(bond)] = int(new)
 
+    @functools.cached_property
+    def prepared_target(self):
+        """Immutable full routing snapshot, materialized only on request."""
+        boundary_bond_map = []
+        for left in range(self.L - 1):
+            try:
+                bond = self._target_bond(left, left + 1)
+            except (KeyError, ValueError):
+                bond = None
+            boundary_bond_map.append((left, left + 1, bond))
+        site_tags = tuple(self.site_tag_id.format(site) for site in range(self.L))
+        return _PreparedTarget(
+            site_order=site_tags,
+            site_tensor_ids=tuple(
+                tuple(self.tn.tag_map.get(tag, ())) for tag in site_tags
+            ),
+            boundary_bond_map=tuple(boundary_bond_map),
+            layer_tags=tuple(sorted(set(self.tn.tags).difference(site_tags))),
+            reindexing_map=self._target_reindexing,
+            contraction_metadata=(
+                ("site_tag_id", str(self.site_tag_id)),
+                ("target_tensor_count", str(len(self.tn.tensor_map))),
+                ("one_tensor_per_site", str(self._target_site_tensors is not None)),
+                ("target_fermionic", str(bool(self.tn.isfermionic()))),
+                ("fitted_type", type(self.p).__name__),
+            ),
+        )
+
     def _target_components(self, sites, *, reindex=None):
         """Return target tensors for ``sites`` without changing the target.
 
@@ -1595,6 +1583,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             tensor_ids = set()
             for site in sites:
                 tag = self.site_tag_id.format(site)
+                if tag not in self._target_tag_tensor_ids:
+                    self._target_tag_tensor_ids[tag] = tuple(self.tn.tag_map[tag])
                 tensor_ids.update(self._target_tag_tensor_ids[tag])
             components = [
                 self.tn.tensor_map[tensor_id]
@@ -1650,11 +1640,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             return self.tn.bond(left_site, right_site)
 
         key = (int(left_site), int(right_site))
-        prepared_target = getattr(self, "prepared_target", None)
-        if prepared_target is not None:
-            for left, right, bond in prepared_target.boundary_bond_map:
-                if (left, right) == key and bond is not None:
-                    return bond
         try:
             return self._target_bond_cache[key]
         except KeyError:

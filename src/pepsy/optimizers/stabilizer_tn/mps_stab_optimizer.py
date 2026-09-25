@@ -92,6 +92,8 @@ from ..mps.optimizer import (
     _MPO_METHODS_USE_SEED,
     _apply_submpo_with_interior_workaround,
     _run_seeded_quimb,
+)
+from .._stream_events import (
     _resolve_conditional,
     conditional_event_parts,
     is_submpo_event,

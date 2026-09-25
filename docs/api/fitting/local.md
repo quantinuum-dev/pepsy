@@ -41,6 +41,9 @@ Layered targets build tag selections only for sites visited by the solver;
 classifies dense/native arrays in one pass and rejects layered targets from
 the one-tensor-per-site shortcut by tensor count before scanning site tags.
 Target index separation and native contraction ordering remain unchanged.
+`prepared_target` provides an immutable full structural snapshot when
+explicitly accessed; ordinary local fits do not build that snapshot or scan
+unused chain boundaries.
 
 Cached one-site sweeps retain the optimized site's QR isometry without
 absorbing R into the next tensor, which the next effective update replaces.

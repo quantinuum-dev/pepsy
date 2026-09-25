@@ -71,7 +71,7 @@ from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
 )
-from ..mps.optimizer import (
+from .._stream_events import (
     _control_event_parts as _mps_control_event_parts,
     _resolve_conditional,
     normalize_submpo_where,

@@ -229,7 +229,8 @@ the analytical history Algorithms 1--4.
 The DMRG methods first create a disposable rank-`chi` guess, then refine the
 exact lazy product target with `FIT.run_eff`. The latter reuses its left/right
 environments across full-chain sweeps. The default `guess_method="auto"`
-selects deterministic SDC; dense products can opt into an SRC warm start:
+selects deterministic SDC for dense arrays and direct SVD for native Symmray
+arrays, including zero charge blocks. Dense products can opt into an SRC warm start:
 
 ```python
 AB = compress_mpo_product(
@@ -243,7 +244,7 @@ AB = compress_mpo_product(
 ```
 
 SRC warm starts are currently dense-only. Native Symmray products retain
-charge-sector structure and should use the default SDC or an explicit
+charge-sector structure and use direct SVD by default, equivalent to
 `guess_method="direct"` until a sector-aware randomized SRC path is
 available. The result metadata records `guess_method`, `guess_seed`, and
 `fit_solver="FIT.run_eff"`.

@@ -14,6 +14,15 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- FIT gate windows again cache only visited target tags and boundary bonds;
+  the optional immutable target snapshot is built on demand. Native Symmray
+  MPO-product DMRG uses a direct-SVD automatic warm start, avoiding SDC's
+  division by zero on zero charge blocks.
+- JAX backend checks recognize equivalent single-device shardings. The
+  truncation-safe SVD accepts explicit thin-SVD options and preserves its VJP.
+  Regression tests isolate Torch batching policy and check current mixed-mode,
+  canonical-validation, and MPI diagnostic contracts.
+
 - Lazy public entry namespaces expose advertised names through `dir()` without
   loading numerical implementations or resolving deprecated aliases. Root
   typing imports cover the existing compatibility exports. Introductory guides
@@ -84,6 +93,10 @@ Changes for the next release should be added here before the version is bumped.
   or the live optimizer.
 
 ### Changed
+
+- Shared optimizer event parsing now lives outside the MPS replay module.
+  Tree layout can import it without initializing MPS replay or FIT, while
+  existing parser import paths remain available.
 
 - Optional VMC and extended-test profiles compose existing extras instead of
   repeating dependency constraints. Feature names and resolved requirements

@@ -7,6 +7,9 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 
 ## Layout
 
+- `_stream_events.py`: shared control, conditional, and sub-MPO parsing.
+  Geometry and tree replay use this module directly, without importing MPS
+  replay. Existing parser imports from `mps.optimizer` remain available.
 - `mps/`: MPS gate-stream optimization.
   - `__init__.py`: lazy public exports; selecting layout helpers does not load
     replay, Gibbs preparation, or MPO optimization.
