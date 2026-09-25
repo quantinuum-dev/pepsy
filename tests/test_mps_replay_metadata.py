@@ -149,7 +149,9 @@ def test_mixed_maximum_is_refreshed_after_quality_repair(monkeypatch):
     opt.run()
     assert opt.mix_history[0]["end_bond"] == 4
     assert opt.mix_history[1]["start_bond"] == 1
-    assert opt.mix_history[1]["backend"] == "mpo"
+    # Mixed replay remains transactional one-site FIT after a rank repair;
+    # the changed rank must refresh diagnostics, not select a different mode.
+    assert opt.mix_history[1]["backend"] == "dmrg"
 
 
 @pytest.mark.parametrize("kind", ["gate", "batch", "submpo", "measurement"])

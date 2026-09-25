@@ -22,7 +22,8 @@ import autoray as ar
 import numpy as np
 
 from ..backends import to_float as _backend_to_float
-from .mps.optimizer import MpsOptimizer, _resolve_conditional
+from .mps.optimizer import MpsOptimizer
+from ._stream_events import _resolve_conditional
 from .tree.optimizer import TreeOptimizer
 
 __all__ = [

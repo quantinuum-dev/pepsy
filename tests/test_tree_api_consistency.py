@@ -360,7 +360,7 @@ def test_invalid_configuration_is_rejected_at_construction(options):
 
 @pytest.mark.parametrize("options", [
     {"resume": True}, {"chunk_size": 4}, {"checkpoint_keep": 3},
-    {"checkpoint_sync": False}, {"collect_diagnostics": False}, {"checkpoint_id": "id"},
+    {"checkpoint_sync": False}, {"collect_diagnostics": True}, {"checkpoint_id": "id"},
 ])
 def test_mpi_only_options_cannot_be_silently_ignored(options):
     opt = TreeOptimizer(None, n=2, run=False)

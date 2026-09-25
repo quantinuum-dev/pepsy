@@ -490,3 +490,17 @@ Focused validation: tests/test_mps_exact_batch.py passed 27 tests, with
 NumPy/CuPy reference comparisons and existing Torch gradient/native Symmray
 fallback checks. See the new session handoff for adjacent validation and
 known baseline failures.
+
+### Integration with Pepsy develop 69a85b0
+
+After the remote Pepsy commit moved shared stream parsing into
+pepsy.optimizers._stream_events, the exact-batch mode set remained in the MPS
+optimizer while the parser sentinel and sub-MPO names came from their new
+shared owner. The only textual merge conflict was this constant block. The
+installed Quimb, Autoray, Cotengra, Symmray, Numba, and CuPy versions and the
+TensorNetwork copy/contract, Tensor.modify, MPS.from_dense, and Autoray NumPy
+dispatch probes remained unchanged. This is an **adopt** of the upstream Pepsy
+parser move, with no numerical compatibility shim. The merged exact-batch,
+dynamic-control, Quimb, public API, package-layout, and import-boundary
+selection had 145 passes and one JAX complex64 direct-mode
+Kraus-probability precision failure, already present before this merge.

@@ -1051,10 +1051,58 @@ def test_torch_real_qr_rank_policy_native_is_silent():
         linalg_torch._QR_RANK_TOL_FACTOR = original_factor
 
 
-def test_jax_linalg_registration_aliases_are_idempotent():
+def test_jax_single_device_sharding_has_compatible_backend_metadata():
+    """A named one-device mesh has the same placement as its physical device."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends import backend_infer, infer_backend_signature
+
+    device = jax.devices()[0]
+    mesh = jax.sharding.Mesh(np.array([device]), ("site",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    plain = jax.device_put(jnp.ones((2, 2), dtype=jnp.complex64), device)
+    named = jax.device_put(plain, sharding)
+    assert infer_backend_signature(named) == infer_backend_signature(plain)
+    import quimb.tensor as qtn
+    network = qtn.TensorNetwork([
+        qtn.Tensor(plain, inds=("a", "b")),
+        qtn.Tensor(named, inds=("b", "c")),
+    ])
+    assert backend_infer(network)["device"] == str(device)
+
+    @jax.jit
+    def traced_signature(value):
+        # Abstract tracers have no concrete placement to inspect.
+        assert infer_backend_signature(value) == ("jax", "complex64", None)
+        return value
+
+    np.testing.assert_array_equal(traced_signature(plain), plain)
+
+
+def test_jax_stabilized_svd_accepts_thin_options_and_preserves_gradients():
+    """Explicit thin-SVD options retain the custom VJP under JIT."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends.linalg_jax import svd_jax
+
+    matrix = jnp.asarray([[2., .3], [.1, 1.], [.4, -.2]], dtype=jnp.float32)
+    u, s, vh = svd_jax(matrix, full_matrices=False)
+    np.testing.assert_allclose((u * s) @ vh, matrix, atol=1e-6)
+    actual = jax.jit(jax.grad(lambda a: svd_jax(a, full_matrices=False)[1].sum()))(matrix)
+    expected = jax.grad(lambda a: jnp.linalg.svd(a, full_matrices=False)[1].sum())(matrix)
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+    np.testing.assert_allclose(svd_jax(matrix, compute_uv=False), s, atol=1e-6)
+    assert svd_jax(matrix, full_matrices=True)[0].shape == (3, 3)
+
+
+def test_jax_linalg_registration_aliases_are_idempotent(monkeypatch):
     """JAX real/relative compatibility aliases share one registration."""
     pytest.importorskip("jax")
     from pepsy.backends import linalg_jax
+    import autoray as ar
+
+    calls = []
+    monkeypatch.setattr(ar, "register_function", lambda *args: calls.append(args))
 
     original_registered = linalg_jax._SVD_REGISTERED
     original_function = linalg_jax._SVD_REGISTERED_FUNCTION
@@ -1064,6 +1112,7 @@ def test_jax_linalg_registration_aliases_are_idempotent():
         linalg_jax.reg_rel_svd_jax()
         assert linalg_jax._SVD_REGISTERED is True
         linalg_jax.reg_real_svd_jax()
+        assert len(calls) == 1
     finally:
         linalg_jax._SVD_REGISTERED = original_registered
         linalg_jax._SVD_REGISTERED_FUNCTION = original_function

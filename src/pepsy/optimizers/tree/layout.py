@@ -43,7 +43,7 @@ from ..mps.layout import (
     _normalize_weight_mode,
 )
 from .._layout_orders import normalize_fixed_order
-from ..mps.optimizer import _control_event_parts as _mps_control_event_parts
+from .._stream_events import _control_event_parts as _mps_control_event_parts
 from .._layout_visualization import (
     add_order_colorbar,
     coordinate_lattice_edge_keys,

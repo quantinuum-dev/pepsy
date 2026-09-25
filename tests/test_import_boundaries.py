@@ -180,6 +180,30 @@ print(*sorted(
     assert not loaded
 
 
+def test_tree_layout_and_stream_parsers_do_not_import_replay_engines():
+    """Shared stream syntax must not make geometry load MPS replay or FIT."""
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.optimizers.tree import TreePlan
+from pepsy.optimizers._stream_events import conditional_event_parts
+
+assert TreePlan.from_order(range(4)).n == 4
+name, payload, where = conditional_event_parts(('if', -1, 1, ('x', 2)))
+assert (name, where) == ('conditional', (2,))
+assert payload['record'] == -1
+print(*sorted(
+    name for name in sys.modules
+    if name in {
+        'pepsy.optimizers.mps.optimizer', 'pepsy.optimizers.mpo.optimizer',
+        'pepsy.optimizers.tree.optimizer', 'pepsy.fitting.local',
+    }
+))
+"""
+    )
+    assert not loaded
+
+
 def test_geometry_exports_work_without_numerical_dependencies():
     """Geometry objects can be constructed and serialized without engines."""
     loaded = _run_clean_import(

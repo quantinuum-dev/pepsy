@@ -139,6 +139,18 @@ def _is_symmray_array(value):
     )
 
 
+def _array_device_signature(value, backend):
+    """Compare physical placement despite equivalent single-device sharding."""
+    device = getattr(value, "device", None)
+    if backend == "jax" and device is not None:
+        devices = getattr(value, "devices", None)
+        if callable(devices):
+            placement = devices()
+            if len(placement) == 1:
+                device = next(iter(placement))
+    return None if device is None else str(device)
+
+
 def _symmray_block_signatures(value):
     """Return backend signatures for the raw arrays held by a Symmray value."""
     blocks = getattr(value, "blocks", None)
@@ -147,9 +159,9 @@ def _symmray_block_signatures(value):
     signatures = []
     for block in blocks.values():
         backend, dtype = infer_backend_and_dtype(block)
-        device = getattr(block, "device", None)
+        device = _array_device_signature(block, backend)
         signatures.append(
-            (backend, str(dtype), None if device is None else str(device))
+            (backend, str(dtype), device)
         )
     return tuple(signatures)
 
@@ -181,8 +193,7 @@ def infer_backend_signature(sample_data):
                 "Could not infer a backend or dtype from the supplied array."
             ) from exc
         return "builtins", str(dtype), None
-    device = getattr(sample_data, "device", None)
-    device = None if device is None else str(device)
+    device = _array_device_signature(sample_data, backend)
     if backend != "symmray" and not _is_symmray_array(sample_data):
         return backend, str(dtype), device
 

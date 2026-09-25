@@ -220,7 +220,10 @@ def test_higher_order_term_sum_stays_on_backend(convert, compress, monkeypatch):
     for tensor in operator.tensors:
         assert ar.infer_backend(tensor.data) == ar.infer_backend(sample)
         assert tensor.data.dtype == sample.dtype
-        assert getattr(tensor.data, "device", None) == getattr(sample, "device", None)
+        if ar.infer_backend(sample) == "jax":
+            assert tensor.data.devices() == sample.devices()
+        else:
+            assert getattr(tensor.data, "device", None) == getattr(sample, "device", None)
     np.testing.assert_allclose(ar.to_numpy(operator.to_dense()), expected, atol=2e-5)
 
 

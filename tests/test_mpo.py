@@ -1548,6 +1548,10 @@ def test_compress_mpo_product_native_dmrg_restores_mpo_boundary():
     assert isinstance(dense, np.ndarray)
     assert dense.shape == (16, 16)
     assert result.pepsy_mpo_product_metadata["fit_solver"] == "FIT.run_eff"
+    assert result.pepsy_mpo_product_metadata["guess_method"] == "direct"
+    np.testing.assert_allclose(
+        dense, A.to_mpo().to_dense() @ B.to_mpo().to_dense(), atol=1e-12,
+    )
 
 
 def test_compress_mpo_product_rejects_native_src_warm_start():

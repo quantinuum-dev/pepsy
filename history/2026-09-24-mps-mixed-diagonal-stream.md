@@ -22,3 +22,9 @@
 - Stream compaction is opt-in through exact-batch and adds no state-sized diagonal or persistent plan cache. The grouped kernel still needs one output state array.
 - General diagonal two-qubit gates, many phase value classes, commuting RXX/RYY basis transforms, immutable plan reuse, in-place state mutation, and cuStateVec integration remain deferred pending workload-specific speed, memory, and ownership evidence. No claim of global optimality is made.
 - Preserved the separate uncommitted tree-layout files and their changelog entry outside the MPS commit.
+
+## Integration update
+
+- Fetched and merged remote develop commit 69a85b0 after the initial local MPS commit. It moved control/sub-MPO parsing to a shared module; the only conflict was the MPS constants block. Exact-batch retains its mode set and imports the other constants from the new shared owner.
+- Post-merge exact-batch, dynamic controls, Quimb compatibility, public API, package layout, and import-boundary checks: 145 passed, one inherited JAX complex64 direct-mode Kraus-probability precision failure. Ruff passed. Installed numerical versions and inspected API signatures stayed unchanged.
+- The pre-existing tree-layout edits were temporarily stashed with a backup under /tmp for the merge and restored afterward. No tree-layout edit is included in the MPS commit.

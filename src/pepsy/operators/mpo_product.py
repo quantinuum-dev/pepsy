@@ -267,8 +267,8 @@ def compress_mpo_product(
         back to ordinary compression.
     guess_method : {"auto", "direct", "dm", "sdc", "sdc-oversample", "src", "src-oversample"}, default="auto"
         Initial rank-``chi`` approximation for the DMRG/FIT methods. ``auto``
-        selects deterministic SDC, which is compatible with native Symmray
-        sectors. ``src`` and ``src-oversample`` are opt-in randomized warm
+        selects deterministic SDC for dense arrays and direct SVD for native
+        Symmray sectors. ``src`` and ``src-oversample`` are opt-in randomized warm
         starts for dense MPOs only.
     guess_seed : optional
         Random seed forwarded to an SRC warm start. It has no effect for
@@ -412,9 +412,13 @@ def compress_mpo_product(
             "dmrg2": 2,
             "dmrg3": 3,
         }[resolved_method]
-        resolved_guess_method = (
-            "sdc" if guess_method == "auto" else guess_method
-        )
+        resolved_guess_method = guess_method
+        if guess_method == "auto":
+            # Native charge blocks can be identically zero. Direct SVD avoids
+            # the inverse singular values used by SDC's Gram decomposition.
+            resolved_guess_method = (
+                "direct" if target_sector_summary is not None else "sdc"
+            )
         if (
             target_sector_summary is not None
             and resolved_guess_method.startswith("src")

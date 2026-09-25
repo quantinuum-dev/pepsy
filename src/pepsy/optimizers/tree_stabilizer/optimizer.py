@@ -50,7 +50,7 @@ from ..stabilizer_tn.dense import (
 )
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
-from ..mps.optimizer import conditional_event_parts, submpo_event_parts
+from .._stream_events import conditional_event_parts, submpo_event_parts
 from ..tree.layout import TreeLayoutFinder, TreePlan, _DEFAULT_TOP_ARITY
 from ..tree.optimizer import (
     TreeOptimizer,
@@ -2255,7 +2255,7 @@ class StabilizerTreeSimulator:
 
     def _apply_conditional_entry(self, entry):
         """Apply one feed-forward action when its recorded bit is true."""
-        from ..mps.optimizer import _resolve_conditional
+        from .._stream_events import _resolve_conditional
 
         _name, payload, _where = conditional_event_parts(entry)
         index, expected = _resolve_conditional(payload, len(self.measurements))
