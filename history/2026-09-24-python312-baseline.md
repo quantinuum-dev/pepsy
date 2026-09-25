@@ -4,7 +4,7 @@
   requested aligned packaging, CI, and documentation.
 - Branch / baseline: `develop` / `0b63985`.
 - Commit status: Python baseline committed and pushed as `ff77274`; the
-  dependency repair below is a follow-up on `develop`.
+  dependency repair was committed and pushed as `07f15f9` on `develop`.
 
 ## Changes and evidence
 
@@ -37,10 +37,11 @@
 
 ## Remaining work
 
-- Hosted validation of the dependency repair remains pending. The Python
-  baseline run passed every other job. Do not infer hosted success from
-  local checks or remove upstream numerical compatibility guards solely
-  because the Python minimum changed.
+- Hosted extended-suite completion for [run 36088818562](https://github.com/quantinuum-dev/pepsy/actions/runs/36088818562)
+  remains pending. Its backend import check passed, confirming the original
+  failure is repaired on Linux; every other job passed. Do not infer full
+  hosted success from local checks or remove upstream numerical guards
+  solely because the Python minimum changed.
 
 ## Extended-suite diagnosis and repair
 
@@ -77,5 +78,9 @@
   (**58 passed**); Ruff and whitespace checks passed.
 - Wheel/sdist builds and `twine check` passed; wheel metadata retains
   `Requires-Python: >=3.12` and excludes JAX 0.11.1/0.11.2 for NetKet VMC.
-  A broader local released-dependency run is in progress; it is not yet a
-  passing full-suite result.
+- Full local suite with that released-dependency overlay: **4517 passed,
+  200 skipped**, **73.00% coverage** against the 60% gate, in 596 seconds.
+  This used NetKet 3.22.4, JAX 0.11.0, Flax 0.12.8, Optax 0.2.8 and the
+  released tensor stack above, while retaining the shared Torch 2.9.1.
+  Hosted CI resolves its own Linux dependency stack; these local results
+  do not claim an exact copy of that environment.
