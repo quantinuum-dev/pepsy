@@ -5,11 +5,11 @@ compatibility window. This does not imply that every optimizer mode, default,
 or supported Python version is unchanged. New code should use owning
 namespaces and the canonical imports below.
 
-## Upgrading from 0.4.1 to the unreleased development version
+## Upgrading from 0.4.1 to 0.5.0
 
-The next release version is not yet selected. These changes are implemented
-on `develop` and should be reviewed before upgrading an existing environment
-or reproducing numerical results.
+Version 0.5.0 includes incompatible changes under the
+[pre-1.0 stability policy](../stability.md). Review these changes before
+upgrading an existing environment or reproducing numerical results.
 
 ### Environment
 

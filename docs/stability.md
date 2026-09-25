@@ -17,6 +17,13 @@ The stable core is intended for normal application code:
 Stable APIs follow semantic versioning, include regression tests, and receive
 deprecation warnings before removal whenever practical.
 
+During the pre-1.0 series, minor releases may include incompatible changes
+documented in the changelog and migration guide. Patch releases remain
+backwards-compatible. Starting with 1.0, incompatible stable API changes
+require a major version increment. The named deprecated import aliases in the
+[migration guide](development/api-migration.md) retain their documented 0.x
+compatibility window.
+
 `pepsy.interop` and the high-level `pepsy.optimizers` namespace are stable
 orchestration surfaces. Their advanced subdomains—such as QMERA, tree and
 stabilizer tensor networks, noisy trajectories, and Symmray workflows—remain

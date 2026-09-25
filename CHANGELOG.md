@@ -2,7 +2,9 @@
 
 All notable PePsY changes are documented here.
 
-PePsY follows [Semantic Versioning](https://semver.org/):
+PePsY follows [Semantic Versioning](https://semver.org/). During the 0.x
+series, minor releases may include documented incompatible changes; patch
+releases remain backwards-compatible. From 1.0 onward:
 
 - **MAJOR** versions may contain incompatible public API changes.
 - **MINOR** versions add backwards-compatible public functionality.
@@ -10,9 +12,10 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-25
+
 This release changes supported environments and several optimizer defaults.
 Read the [migration guide](docs/development/api-migration.md) before upgrading.
-The release version and date have not been selected.
 
 ### Changed
 
