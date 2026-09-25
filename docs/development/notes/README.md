@@ -10,6 +10,8 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 
 ## Contents
 
+- [`release_readiness_2026_09.md`](release_readiness_2026_09.md) — Release
+  compatibility review, migration actions, merge scope, and validation evidence.
 - [`dependency_minimums_2026_09.md`](dependency_minimums_2026_09.md) — Required
   upstream APIs, tested lower bounds, and optional-backend validation limits.
 - [`ci_compatibility_2026_09.md`](ci_compatibility_2026_09.md) — Released versus
@@ -47,6 +49,7 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 ```{toctree}
 :hidden:
 
+release_readiness_2026_09
 package_simplicity_2026_09
 dependency_minimums_2026_09
 belief_propagation
