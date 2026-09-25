@@ -7,6 +7,9 @@ _SYMBOL_MODULES = {
     "QMeraAnsatz": ".builders",
     "QMeraBuilder": ".builders",
     "QMeraContractionPathCache": ".cache",
+    "QMeraConeCost": ".cost",
+    "QMeraContractionReport": ".cost",
+    "estimate_qmera_contraction_cost": ".cost",
     "build_qmera_contraction_optimizer": ".cache",
     "QMeraCompiledLightconeChunk": ".compiled",
     "compile_qmera_parametric_lightcone": ".compiled",
@@ -75,6 +78,7 @@ _SUBMODULES = (
     "builders",
     "cache",
     "compiled",
+    "cost",
     "fermions",
     "gates",
     "geometry",
@@ -95,7 +99,9 @@ __all__ = [
     "QMeraBlockSpec",
     "QMeraBuilder",
     "QMeraCompiledLightconeChunk",
+    "QMeraConeCost",
     "QMeraContractionPathCache",
+    "QMeraContractionReport",
     "QMeraDisentanglerSpec",
     "QMeraEnergyOptimizer",
     "QMeraGatePlacement",
@@ -130,6 +136,7 @@ __all__ = [
     "contract_qmera_lightcone_group",
     "default_gate_registry",
     "draw_qmera_schedule",
+    "estimate_qmera_contraction_cost",
     "get_qmera_pair_ansatz",
     "group_qmera_parametric_lightcone_chunks",
     "local_qmera_compiled_lightcone_expectation",
@@ -181,6 +188,11 @@ if TYPE_CHECKING:
         compile_qmera_parametric_lightcones,
         local_qmera_compiled_lightcone_expectation,
         qmera_compiled_parametric_energy,
+    )
+    from .cost import (  # noqa: F401
+        QMeraConeCost,
+        QMeraContractionReport,
+        estimate_qmera_contraction_cost,
     )
     from .fermions import (  # noqa: F401
         QMeraSymmrayFermionBackend,

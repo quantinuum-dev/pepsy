@@ -231,6 +231,7 @@ class QMeraBuilder:
         bond_qubits: int = 2,
         retention: str = "right",
         retained_registers=None,
+        hierarchy: str | None = None,
         initial_state: str | None = None,
         initial_hadamards: bool | None = None,
         seed: int | None = None,
@@ -302,13 +303,28 @@ class QMeraBuilder:
                 raise ValueError("Choose pair_ansatz or the legacy ansatz keyword, not both.")
             ansatz = pair_ansatz
         spin_1d = self.geometry.ndim == 1 and not self.geometry.has_explicit_modes
+        self.hierarchy = hierarchy if hierarchy is not None else (
+            "retained" if spin_1d else "site"
+        )
+        if self.hierarchy not in {"site", "retained"}:
+            raise ValueError("hierarchy must be 'site' or 'retained'.")
+        if spin_1d and self.hierarchy != "retained":
+            raise ValueError("unmoded spin 1D uses the retained hierarchy.")
+        retained_spin = self.hierarchy == "retained" and (
+            spin_1d or (
+                self.geometry.ndim == 2
+                and not self.geometry.has_explicit_modes
+            )
+        )
+        if self.hierarchy == "retained" and not retained_spin:
+            raise ValueError("retained hierarchy requires unmoded spin 1D or 2D geometry.")
         requested_symmetry = (
             None if spin_symmetry is None else _normalize_spin_symmetry(spin_symmetry)
         )
         self._explicit_pair_ansatz = ansatz is not None or requested_symmetry is not None
         if self._explicit_pair_ansatz:
-            if not spin_1d:
-                raise ValueError("spin_symmetry and pair_ansatz/ansatz require an unmoded spin 1D geometry.")
+            if not retained_spin:
+                raise ValueError("spin_symmetry and pair_ansatz/ansatz require unmoded spin 1D or a retained spin 2D hierarchy.")
             if gate_family is not None or isometry_gate_family is not None:
                 raise ValueError(
                     "Choose spin_symmetry/pair_ansatz/ansatz or gate_family overrides, not both."
@@ -320,7 +336,7 @@ class QMeraBuilder:
             )
         self._default_pair_ansatz = (
             get_qmera_pair_ansatz("z2_zz_yy_rx" if selected_ansatz is None else selected_ansatz)
-            if spin_1d and (selected_ansatz is not None or gate_family is None)
+            if retained_spin and (selected_ansatz is not None or gate_family is None)
             else None
         )
         if (
@@ -432,7 +448,7 @@ class QMeraBuilder:
 
     @property
     def spin_symmetry(self):
-        """Declared symmetry class of the complete spin 1D gate circuit."""
+        """Declared symmetry class of the complete retained spin circuit."""
         pair_ansatz = self._resolved_pair_ansatz(self.build_schedule())
         return None if pair_ansatz is None else pair_ansatz.symmetry
 
@@ -483,6 +499,7 @@ class QMeraBuilder:
             retention=self.retention,
             retained_registers=self.retained_registers,
             initial_hadamards=self.initial_hadamards,
+            hierarchy=self.hierarchy,
         )
         for scale in schedule.scale_specs:
             self._validate_unitary_spec(scale.disentangler)
@@ -492,7 +509,7 @@ class QMeraBuilder:
             != _normalize_gate_token(self._pair_gate_name)
             for placement in schedule.placements
         ):
-            raise ValueError("pair_ansatz/ansatz must control every 1D pair gate in the scale plan.")
+            raise ValueError("pair_ansatz/ansatz must control every 1D pair gate or retained 2D pair gate in the scale plan.")
         return schedule
 
     def schematic_blocks(self, *, layer=None, rg_step=None):
@@ -519,6 +536,39 @@ class QMeraBuilder:
         from .cache import QMeraContractionPathCache
 
         return QMeraContractionPathCache(optimizer_options=kwargs)
+
+    def estimate_contraction_cost(
+        self,
+        hamiltonian=None,
+        schedule=None,
+        *,
+        chunks=None,
+        array_backend=None,
+        convert_terms=True,
+        contraction_opt="auto-hq",
+        path_cache=None,
+        normalized=False,
+        element_bytes=16,
+    ):
+        """Estimate local-cone work and prime paths before optimization."""
+        from .cost import estimate_qmera_contraction_cost
+
+        schedule = self.build_schedule() if schedule is None else schedule
+        backend = self.array_backend if array_backend is None else array_backend
+        return estimate_qmera_contraction_cost(
+            schedule,
+            hamiltonian,
+            chunks=chunks,
+            gate_registry=self.gate_registry,
+            array_backend=backend,
+            convert_terms=convert_terms,
+            physical_dim=self.physical_dim,
+            optimize=contraction_opt,
+            path_cache=path_cache,
+            normalized=normalized,
+            element_bytes=element_bytes,
+            product_state_factory=self.product_state_factory,
+        )
 
     def parametric_lightcone_chunks(
         self,
@@ -960,10 +1010,56 @@ class QMeraBuilder:
         *,
         chunks=None,
         compiled_chunks=None,
+        torch_fullgraph=False,
         **loss_kwargs,
     ):
-        """Return ``loss(params)`` using precompiled qMERA local cones."""
+        """Return ``loss(params)`` using precompiled qMERA local cones.
+
+        Set ``torch_fullgraph=True`` to freeze Cotengra paths and construct a
+        Torch-only callable suitable for ``torch.compile(fullgraph=True)``.
+        This dense spin path needs gate families with Pauli-rotation metadata.
+        """
         schedule = self.build_schedule() if schedule is None else schedule
+        if torch_fullgraph:
+            supported = {
+                "array_backend", "gate_array_backend", "convert_terms", "normalized",
+                "energy_per_site", "real", "contraction_opt", "expression_opts",
+                "path_cache",
+            }
+            unknown = set(loss_kwargs) - supported
+            if unknown:
+                raise TypeError(f"Unsupported torch_fullgraph loss options: {sorted(unknown)!r}.")
+            if loss_kwargs.get("gate_array_backend") is not None:
+                raise ValueError("torch_fullgraph does not accept gate_array_backend.")
+            if loss_kwargs.get("expression_opts"):
+                raise ValueError("torch_fullgraph plans do not use expression_opts.")
+            backend = loss_kwargs.get("array_backend")
+            if backend is None:
+                backend = self.array_backend
+            if compiled_chunks is None:
+                compiled_chunks = self.compile_parametric_lightcones(
+                    hamiltonian,
+                    schedule,
+                    chunks=chunks,
+                    array_backend=backend,
+                    convert_terms=loss_kwargs.get("convert_terms", True),
+                    contraction_opt=loss_kwargs.get("contraction_opt", "auto-hq"),
+                    expression_opts=loss_kwargs.get("expression_opts"),
+                    path_cache=loss_kwargs.get("path_cache"),
+                )
+            from .torch_compiled import build_torch_fullgraph_loss
+
+            return build_torch_fullgraph_loss(
+                schedule,
+                compiled_chunks,
+                gate_registry=self.gate_registry,
+                array_backend=backend,
+                physical_dim=self.physical_dim,
+                product_state_factory=self.product_state_factory,
+                normalized=loss_kwargs.get("normalized", True),
+                energy_per_site=loss_kwargs.get("energy_per_site", True),
+                real=loss_kwargs.get("real", True),
+            )
 
         def _loss(parameters):
             return self.compiled_parametric_loss(
@@ -1122,6 +1218,7 @@ class QMeraBuilder:
             "initial_hadamards": self.initial_hadamards,
             "bond_qubits": schedule.bond_qubits,
             "retention": schedule.retention,
+            "hierarchy": schedule.hierarchy,
             "pair_ansatz": None if pair_ansatz is None else pair_ansatz.name,
             "spin_circuit_symmetry": (
                 None if pair_ansatz is None else pair_ansatz.symmetry

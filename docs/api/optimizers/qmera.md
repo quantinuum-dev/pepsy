@@ -1,8 +1,8 @@
 # `pepsy.optimizers.qmera`
 
-Pepsy's optimizer surface is qMERA-only: parameterized gate families are
-placed by a static RG schedule, and local Hamiltonian terms are evaluated by
-rebuilding only their reverse lightcones.
+Pepsy's qMERA API places parameterized gate families on a static RG
+schedule. It evaluates local Hamiltonian terms through their reverse
+lightcones, without building the full state for each energy call.
 
 ## 1D spin qMERA
 
@@ -169,9 +169,9 @@ alias for the plus input, and a `product_state_factory` can supply another
 input state.
 
 Explicit-mode fermion geometries keep their native Symmray gate and state
-conventions; the retained-register spin layout and initial Hadamards do not
-apply to them. The current 2D layout remains the existing block and face
-schedule while its retained-register extension is developed.
+conventions; retained-register spin layouts and initial Hadamards do not
+apply to them. The default 2D layout remains the existing site-retention
+schedule. An opt-in 2D spin hierarchy is described below.
 
 ```python
 import numpy as np
@@ -200,21 +200,59 @@ energy = builder.parametric_loss(
 )
 ```
 
-For repeated optimization, compile static qMERA local-cone contractions once and
-reuse them from NumPy, Torch, or JAX-compatible parameter dictionaries:
+For repeated optimization, estimate the forward cost before running and
+reuse its searched paths with a matching backend and optimizer:
 
 ```python
+report = builder.estimate_contraction_cost(
+    schedule=schedule, chunks=chunks,
+    contraction_opt=optimize, normalized=False, element_bytes=16,
+)
+print(report.summary())
 compiled = builder.compile_parametric_lightcones(
-    schedule=schedule,
-    chunks=chunks,
-    contraction_opt=optimize,
+    schedule=schedule, chunks=chunks,
+    contraction_opt=report.contraction_opt, path_cache=report.path_cache,
 )
 loss_fn = builder.compiled_parametric_loss_fn(
-    schedule=schedule,
-    compiled_chunks=compiled,
+    schedule=schedule, compiled_chunks=compiled, normalized=False,
 )
 energy = loss_fn(params)
 ```
+
+`report.log10_flops` is the base-10 logarithm of complex-arithmetic
+work summed over the evaluated local cones. `report.log2_peak_bytes` is the largest estimated live tensor size in
+one cone, using `element_bytes` per element. These forward estimates exclude
+autodiff and optimizer storage. Only evaluated paths are planned: denominator contractions are included when
+`normalized=True`. Unsliced Cotengra paths are primed for compilation; native
+Symmray block costs need a separate estimator.
+
+For dense spin gates, `torch_fullgraph=True` freezes Cotengra paths and uses
+Torch operations to build each scheduled gate once per energy evaluation. Pass
+Torch parameters; use `array_backend=backend_torch(dtype=torch.complex128)`
+when preparing the cones. The built-in qMERA pair ansatzes and `rxx`, `ryy`,
+`rzz` carry the required `GateSpec.torch_pauli_words` metadata:
+
+```python
+import torch
+from pepsy.backends import backend_torch
+
+torch_array = backend_torch(dtype=torch.complex128)
+torch_params = builder.cast_params(params, backend="torch", dtype=torch.float64)
+torch_cones = builder.compile_parametric_lightcones(
+    {(0, 1): h2}, schedule=schedule, array_backend=torch_array,
+)
+torch_loss = builder.compiled_parametric_loss_fn(
+    schedule=schedule, compiled_chunks=torch_cones,
+    array_backend=torch_array, torch_fullgraph=True, normalized=False,
+)
+fullgraph_loss = torch.compile(torch_loss, backend="aot_eager", fullgraph=True)
+energy = fullgraph_loss(torch_params)
+```
+
+The returned callable is also a faster eager Torch loss for repeated local
+terms. Native Symmray arrays and gate families without Pauli-rotation metadata
+continue to use the standard compiled path. AOT eager checks complete graph
+capture; Inductor performance depends on the local compiler installation.
 
 Native Symmray qMERA uses the same compiled API, but the builder must receive
 the graded product-state factory. The compiled object then reports
@@ -271,31 +309,55 @@ param_opt = builder.parametric_optimizer(
 result = param_opt.run(solver="torch-adam", n_steps=10, compiled=True)
 ```
 
+For dense spin gates, the same optimizer exposes the Torch-only cost through
+`param_opt.compiled_loss_fn(torch_fullgraph=True)`. Its
+`run(solver="torch-adam", compiled=True, torch_fullgraph=True)` path uses that
+cost for training. The callable can also be passed to
+`torch.compile(..., backend="aot_eager", fullgraph=True)`.
+
 ## qMERA schematics
 
 `QMeraSchedule.draw_schematic()` uses Quimb's manual `schematic.Drawing`
-primitives. The default `style="clean"` view separates the input sites,
-disentangler (`D`), isometry (`W`), and coarse-output stages, with colored
-patches and arrows for the RG flow:
+primitives. The default `style="clean"` follows the schedule's gate direction.
+Retained-register circuits read **coarse → W → D → fine**; site-retention
+schedules read **fine → D → W → coarse**. `rg_step=0` selects the finest RG
+interface even when all retained layers are drawn in preparation order:
 
 ```python
 drawing = schedule.draw_schematic(
-    rg_step=0,                # inspect one bottom-to-top RG step
-    style="clean",             # or "register" for the low-level wiring view
-    figsize=(16, 5),
+    rg_step=0,
+    style="clean",            # or "register" for the older wiring view
+    figsize=(10, 8),
     label_sites=True,
     label_blocks=True,
     scale_figsize=False,
 )
 ```
 
-The clean view is ordered as input → disjoint disentangler subrounds →
-covering isometry subrounds → coarse output. Disentangler windows overlap the
-neighboring isometry blocks by design, but blocks in the same executable
-subround are disjoint. Set `rg_step=1` (or another valid scale) to inspect a
-later step; use `rg_step=None` to draw all steps. The older `layer=` selector
-remains an alias. `schedule.schematic_blocks()` remains the machine-readable
-placement audit.
+In 1D, green brackets show covering isometry blocks; colored patches show
+actual pair-gate positions in each round. A long periodic seam gate is drawn
+as an arc, so it does not appear to cover the wires between its endpoints.
+Green coarse wires are retained from the preceding scale; gray wires enter in
+the product state. In 2D, colored windows show covering blocks, and dark links show the exact
+scheduled pair gates in each round. Long pairs, including periodic seams,
+curve around intervening sites. The coarse panel groups retained wires by
+parent register (`R0`, `R1`, …); arrows point in the schedule's gate direction.
+The drawings show structure and support, while `schedule.placements` gives the
+exact gate sequence. The older `style="register"` view is a structural
+fine-to-coarse wiring view, including for preparation schedules. Omit
+`rg_step` to draw all scales. `layer=` remains an alias, and
+`schedule.schematic_blocks()` remains the machine-readable block audit.
+
+For an odd 2D retained hierarchy, the same API shows boundary disentanglers,
+covering isometry cells, and retained parent registers:
+
+```python
+odd_grid = QMeraBuilder(
+    shape=(3, 4), hierarchy="retained", bond_qubits=2,
+    isometry={"block_size": (2, 2)},
+)
+odd_grid.draw_schematic(rg_step=0, style="clean", figsize=(16, 5))
+```
 
 ## qMERA layout search and prototype comparison
 
@@ -391,6 +453,56 @@ above for that conversion.
 For a larger native Torch workflow, use the corresponding examples maintained
 in the separate `pepsy_examples` repository; the package API is demonstrated
 by the builder flow above.
+
+## 2D spin retained hierarchy
+
+Set `hierarchy="retained"` for an unmoded spin lattice. Each scale tiles the
+current *coarse grid*, applies two-qubit gates within each covering isometry
+block, and retains up to `bond_qubits` physical wires as the next cell's
+register. Boundary disentanglers pair matching register wires across both x
+and y block faces. With odd dimensions, a final one-cell tail joins the
+preceding block along that axis: a length 5 axis blocked by 2 becomes
+`2 + 3`; length 7 blocked by 3 becomes `3 + 4`.
+
+```python
+from pepsy.optimizers.qmera import QMeraBuilder
+
+builder = QMeraBuilder(
+    shape=(5, 7),
+    hierarchy="retained",
+    isometry={"block_size": (2, 3), "circuit_depth": 1},
+    disentangler={"block_size": 2, "circuit_depth": 1},
+    bond_qubits=2,
+    retention="balanced",
+    pair_ansatz="z2_zz_yy_rx",
+)
+schedule = builder.build_schedule()
+assert [(layer.input_grid_shape, layer.output_grid_shape)
+        for layer in schedule.layers] == [
+    ((5, 7), (2, 2)), ((2, 2), (1, 1)),
+]
+assert len(schedule.top_sites) == 2
+```
+
+`(3, 3)` and `(4, 4)` covering blocks use the same grid rule.
+`layer.isometry_cell_blocks` records child-cell coordinates at that scale;
+`layer.isometry_blocks` records their physical wire indices; and
+`layer.retained_registers` records the selected parent wires. The
+`"balanced"` policy spreads retained wires across each block's ordered child
+registers; explicit retention uses the same `(scale, block)` keys as 1D.
+State preparation runs
+coarse to fine, applying each block's unitary-completion circuit before the
+boundary disentanglers. Its adjoint gives the fine-to-coarse disentangler,
+then isometry, order. The compiled local-energy, Torch, and JAX paths use the
+same schedule.
+
+This option currently supports spin qubits, brickwall isometry circuits, and
+`placement="boundary-faces"` with `disentangler.block_size=2` on both
+axes. A covering
+block is a circuit of local two-qubit gates, not a dense multi-qubit unitary.
+The default `hierarchy="site"` 2D path and explicit-mode fermion schedules
+also absorb odd one-cell tails, while preserving their one-site-per-block
+retention.
 
 ## 2D multimode RG schedules
 

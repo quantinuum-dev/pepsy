@@ -164,6 +164,8 @@ class QMeraEnergyOptimizer:
         """Evaluate loss with precompiled local-cone contraction expressions."""
         params = self.parameters if parameters is None else parameters
         opts = self._merge_opts(self.loss_kwargs, kwargs)
+        if opts.get("torch_fullgraph", False):
+            return self.compiled_loss_fn(**opts)(params)
         compiled_chunks = opts.pop("compiled_chunks", self.compiled_chunks)
         if compiled_chunks is None:
             compiled_chunks = self.compile(
@@ -185,6 +187,27 @@ class QMeraEnergyOptimizer:
 
     def compiled_loss_fn(self, **kwargs):
         """Return a pure compiled ``loss(params) -> scalar`` callable."""
+        opts = self._merge_opts(self.loss_kwargs, kwargs)
+        if opts.pop("torch_fullgraph", False):
+            chunks = opts.pop("chunks", self.chunks)
+            compiled_chunks = opts.pop("compiled_chunks", self.compiled_chunks)
+            if compiled_chunks is None:
+                compiled_chunks = self.compile(
+                    chunks=chunks,
+                    array_backend=opts.get("array_backend"),
+                    convert_terms=opts.get("convert_terms", True),
+                    contraction_opt=opts.get("contraction_opt", "auto-hq"),
+                    expression_opts=opts.get("expression_opts"),
+                    path_cache=opts.get("path_cache"),
+                )
+            return self.builder.compiled_parametric_loss_fn(
+                self.hamiltonian,
+                schedule=self.schedule,
+                chunks=chunks,
+                compiled_chunks=compiled_chunks,
+                torch_fullgraph=True,
+                **opts,
+            )
 
         def _loss(parameters):
             return self.compiled_loss(parameters, **kwargs)
@@ -213,6 +236,11 @@ class QMeraEnergyOptimizer:
     ):
         """Optimize parameters with :class:`pepsy.solvers.GradientOptimizer`."""
         backend = _solver_backend(solver) if backend is None else backend
+        opts = self._merge_opts(self.loss_kwargs, loss_kwargs)
+        if opts.get("torch_fullgraph") and not compiled:
+            raise ValueError("torch_fullgraph requires compiled=True in QMeraEnergyOptimizer.run.")
+        if opts.get("torch_fullgraph") and str(solver).lower().startswith("jax-"):
+            raise ValueError("torch_fullgraph requires a Torch solver, not a JAX solver.")
         array_backend = (
             _array_backend_for_train_backend(backend, dtype=array_dtype, device=device)
             if array_backend is None
@@ -226,7 +254,6 @@ class QMeraEnergyOptimizer:
             dtype=dtype,
             device=device,
         )
-        opts = self._merge_opts(self.loss_kwargs, loss_kwargs)
         opts["array_backend"] = array_backend
         chunks = self._chunks_for_backend(
             array_backend=array_backend,

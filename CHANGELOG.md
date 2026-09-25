@@ -14,6 +14,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `QMeraBuilder.estimate_contraction_cost(...)` reports pre-run complex FLOPs
+  and peak forward contraction bytes for dense qMERA local cones, with log10
+  and log2 summaries. Its cache reuses unsliced Cotengra paths at compilation.
+
+- `QMeraBuilder.compiled_parametric_loss_fn(torch_fullgraph=True)` now returns
+  a Torch-only dense-spin energy callable with frozen Cotengra paths. It
+  reuses each scheduled gate across local terms and supports
+  `torch.compile(..., fullgraph=True)` with AOT eager. The
+  `QMeraEnergyOptimizer` compiled loss and Torch solver can use the same mode.
+
+- Opt-in `QMeraBuilder(hierarchy="retained")` builds a 2D spin qMERA
+  hierarchy with retained qubit registers, x/y boundary disentanglers,
+  inspectable coarse-grid blocks, and coarse-to-fine preparation order.
+  Rectangular and square covering blocks absorb odd one-cell edge tails.
+
 - Added opt-in `MpsOptimizer(mode="exact-batch")` (`batch-exact` is an alias).
   It fuses bounded one- and two-qubit gate runs, compacts repeated Z/ZZ
   supports, and applies one- or two-value diagonal phases in grouped passes.
@@ -22,6 +37,17 @@ releases remain backwards-compatible. From 1.0 onward:
   states use the reference path. Numba acceleration is optional.
 
 ### Changed
+
+- The qMERA `draw_schematic(style="clean")` view now follows actual gate
+  direction: retained circuits show coarse-to-fine W then D, while site
+  schedules show fine-to-coarse D then W. It marks 1D periodic seams,
+  isometry blocks, retained/product wires, and 2D parent registers. The 2D
+  panels now mark each scheduled pair gate within its covering block;
+  `style="register"` remains available.
+
+- Existing 2D site-retention qMERA schedules now absorb a trailing one-cell
+  axis segment into the previous covering block when a lattice dimension is
+  odd; the default 2D hierarchy remains site retention.
 
 - The main spin 1D `QMeraBuilder` uses retained-register blocks, ternary odd
   tails, boundary disentanglers, and coarse-to-fine gate execution. It accepts

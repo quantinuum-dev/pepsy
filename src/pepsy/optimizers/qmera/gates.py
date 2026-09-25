@@ -96,6 +96,7 @@ class GateSpec:
     mode_order: str | None = None
     contextual_generator: Callable[..., Any] | None = None
     symmetry: str | None = None
+    torch_pauli_words: tuple[str, ...] | None = None
 
     def __post_init__(self):
         arity = int(self.arity)
@@ -123,6 +124,14 @@ class GateSpec:
             "symmetry",
             None if self.symmetry is None else str(self.symmetry),
         )
+        if self.torch_pauli_words is not None:
+            words = tuple(self.torch_pauli_words)
+            if self.arity != 2 or len(words) != num_params or any(
+                len(word) != 2 or any(letter not in "IXYZ" for letter in word)
+                for word in words
+            ):
+                raise ValueError("torch_pauli_words must match a two-qubit Pauli gate.")
+            object.__setattr__(self, "torch_pauli_words", words)
 
     @property
     def is_fermionic(self):
@@ -447,6 +456,7 @@ def qmera_pair_gate_spec(spec, *, name=None):
         default_tags=("QMERA_PAIR",),
         preserves_parity=spec.preserves_global_x,
         symmetry=spec.symmetry if spec.preserves_global_x else None,
+        torch_pauli_words=spec.generators * spec.repetitions,
     )
 
 
@@ -458,9 +468,9 @@ def default_gate_registry():
                 qmera_pair_gate_spec(get_qmera_pair_ansatz(name))
                 for name in (*_QMERA_PAIR_PRESETS, *_QMERA_PAIR_ALIASES)
             ),
-            GateSpec("rxx", 2, 1, _one_param(rxx), default_tags=("RXX",)),
-            GateSpec("ryy", 2, 1, _one_param(ryy), default_tags=("RYY",)),
-            GateSpec("rzz", 2, 1, _one_param(rzz), default_tags=("RZZ",)),
+            GateSpec("rxx", 2, 1, _one_param(rxx), default_tags=("RXX",), torch_pauli_words=("XX",)),
+            GateSpec("ryy", 2, 1, _one_param(ryy), default_tags=("RYY",), torch_pauli_words=("YY",)),
+            GateSpec("rzz", 2, 1, _one_param(rzz), default_tags=("RZZ",), torch_pauli_words=("ZZ",)),
             GateSpec("cphase", 2, 1, _one_param(cphase), default_tags=("CPHASE",)),
             GateSpec("crx", 2, 1, _one_param(crx), default_tags=("CRX",)),
             GateSpec("cry", 2, 1, _one_param(cry), default_tags=("CRY",)),

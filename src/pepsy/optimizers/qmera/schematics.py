@@ -144,10 +144,11 @@ def _site_grid_positions(geometry, active_sites, *, x0, y0):
     return positions, coords, len(xs), len(ys)
 
 
-def _draw_site_row(drawing, active_sites, y, *, label_sites):
+def _draw_site_row(drawing, active_sites, y, *, label_sites, site_presets=None):
     for pos, site in enumerate(active_sites):
         coo = (float(pos), y)
-        drawing.circle(coo, radius=0.09, preset="site")
+        preset = "site" if site_presets is None else site_presets.get(site, "site")
+        drawing.circle(coo, radius=0.09, preset=preset)
         if label_sites:
             drawing.text((float(pos), y + 0.22), str(site), preset="site_label")
         if pos + 1 < len(active_sites):
@@ -235,16 +236,17 @@ def _draw_clean_stage(
     blocks,
     stage,
     *,
+    round_index,
     x0,
     y0,
     label_sites,
     label_blocks,
 ):
-    """Draw one clean input, gate, or coarse-output stage."""
+    """Draw one fine, gate-round, or retained coarse panel."""
     geometry = schedule.geometry
     register_sites = (
         layer_spec.output_sites
-        if stage == "output"
+        if stage in {"output", "coarse"}
         else layer_spec.input_sites
     )
     sites = _unique_physical_sites(geometry, register_sites)
@@ -260,9 +262,38 @@ def _draw_clean_stage(
         b = positions[right]
         drawing.line(a, b, preset="wire")
 
+    if stage == "coarse":
+        # A parent cell can retain several wires. Group them so a flattened
+        # physical-site row is not mistaken for the virtual coarse grid.
+        for block_index, registers in enumerate(layer_spec.retained_registers):
+            group_sites = _unique_physical_sites(geometry, registers)
+            coos = [positions[site] for site in group_sites if site in positions]
+            if not coos:
+                continue
+            if len(coos) == 1:
+                drawing.circle(coos[0], radius=0.22, preset="retained_group")
+            elif len(coos) == 2:
+                drawing.patch_around_circles(
+                    coos[0], 0.14, coos[1], 0.14,
+                    padding=0.08, preset="retained_group",
+                )
+            else:
+                drawing.patch_around(
+                    coos, radius=0.20, preset="retained_group",
+                )
+            if label_blocks:
+                drawing.text(
+                    (sum(coo[0] for coo in coos) / len(coos),
+                     min(coo[1] for coo in coos) - 0.33),
+                    f"R{block_index}", preset="block_label",
+                )
+
     for site, coo in positions.items():
-        drawing.circle(coo, radius=0.12, preset="site")
-        if label_sites and stage in {"input", "output"}:
+        drawing.circle(
+            coo, radius=0.12,
+            preset="retained" if stage in {"output", "coarse"} else "site",
+        )
+        if label_sites and stage in {"input", "output", "coarse", "fine"}:
             drawing.text(
                 (coo[0], coo[1] + 0.23),
                 str(site),
@@ -280,12 +311,42 @@ def _draw_clean_stage(
         _patch_block(drawing, coos, block=block, label_blocks=False)
         if label_blocks:
             x = sum(coo[0] for coo in coos) / len(coos)
-            y = sum(coo[1] for coo in coos) / len(coos)
             drawing.text(
-                (x, y),
+                (x, min(coo[1] for coo in coos) - 0.34),
                 f"{block.stage_label}{block.block}",
                 preset="block_label",
             )
+
+    # Colored windows show covering blocks; links show the pair gates in this
+    # round. Multiple mode registers can also occupy one physical site.
+    placements = (
+        layer_spec.disentanglers
+        if stage == "disentangler"
+        else layer_spec.isometries
+    )
+    for placement in placements:
+        if placement.round != round_index:
+            continue
+        support = _unique_physical_sites(geometry, placement.where)
+        coos = [positions[site] for site in support if site in positions]
+        if len(coos) == 2:
+            a, b = coos
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            if max(abs(dx), abs(dy)) > 1.01:
+                # Bend a periodic seam or other long pair around intervening
+                # site markers; the endpoints remain the scheduled support.
+                bend = (0.0, 0.42) if abs(dx) >= abs(dy) else (0.42, 0.0)
+                drawing.bezier(
+                    (a, (a[0] + bend[0], a[1] + bend[1]),
+                     (b[0] + bend[0], b[1] + bend[1]), b),
+                    preset="pair_link",
+                )
+            else:
+                drawing.line(a, b, preset="pair_link")
+        elif len(coos) == 1:
+            drawing.circle(coos[0], radius=0.18, preset="local_gate")
+        elif len(coos) > 2:
+            drawing.patch_around(coos, radius=0.15, preset="local_gate")
 
 
 def _draw_clean_2d(
@@ -297,14 +358,18 @@ def _draw_clean_2d(
     label_sites,
     label_blocks,
 ):
-    """Draw 2D layers as separated quimb-style input/D/W/output panels."""
+    """Draw 2D gate stages in schedule order as separate Quimb panels."""
     height, width = schedule.geometry.shape
     panel_extent = float(max(width, height) - 1)
     panel_width = panel_extent + 1.2
     panel_gap = 1.1
     row_gap = panel_extent + 3.0
 
-    for row, layer_index in enumerate(layer_indices):
+    drawn_layers = (
+        tuple(reversed(layer_indices)) if schedule.preparation_order
+        else layer_indices
+    )
+    for row, layer_index in enumerate(drawn_layers):
         layer = schedule.layers[layer_index]
         # Each RG scale is its own readable horizontal strip. Keeping the
         # origin fixed prevents later scales from drifting to the right.
@@ -320,14 +385,20 @@ def _draw_clean_2d(
             for block in blocks_by_layer.get(layer_index, ())
             if block.stage == "isometry"
         )
-        stages = [("input", "input", None)]
-        if disentanglers:
-            for round_index in sorted({block.round for block in disentanglers}):
-                stages.append(("disentangler", f"D[r{round_index}]", round_index))
-        if isometries:
-            for round_index in sorted({block.round for block in isometries}):
-                stages.append(("isometry", f"W[r{round_index}]", round_index))
-        stages.append(("output", "coarse", None))
+        if schedule.preparation_order:
+            stages = [("coarse", "coarse", None)]
+            stage_order = (("isometry", "W", isometries),
+                           ("disentangler", "D", disentanglers))
+            final_stage = ("fine", "fine", None)
+        else:
+            stages = [("input", "input", None)]
+            stage_order = (("disentangler", "D", disentanglers),
+                           ("isometry", "W", isometries))
+            final_stage = ("output", "coarse", None)
+        for stage, short, blocks in stage_order:
+            for round_index in sorted({block.round for block in blocks}):
+                stages.append((stage, f"{short}[r{round_index}]", round_index))
+        stages.append(final_stage)
 
         layer_start = cursor_x
         previous_right = None
@@ -348,6 +419,7 @@ def _draw_clean_2d(
                 layer,
                 blocks,
                 stage,
+                round_index=round_index,
                 x0=x0,
                 y0=y0,
                 label_sites=label_sites,
@@ -378,9 +450,26 @@ def _draw_clean_2d(
             preset="layer_label",
         )
 
+    flow = (
+        "arrows = preparation, coarse to fine (W then D); "
+        "other fine wires start in the product state"
+        if schedule.preparation_order
+        else "arrows = schedule, fine to coarse (D then W)"
+    )
     drawing.text(
         (0.5 * panel_extent, -row_gap * len(layer_indices) + 0.9),
-        "D = boundary disentangler     W = isometry     arrows = coarse-graining",
+        "D = boundary disentangler   W = isometry   "
+        "green = retained wires   R = parent register",
+        preset="legend",
+    )
+    drawing.text(
+        (0.5 * panel_extent, -row_gap * len(layer_indices) + 0.55),
+        "colored window = block   dark link = pair gate   curved link = long pair",
+        preset="legend",
+    )
+    drawing.text(
+        (0.5 * panel_extent, -row_gap * len(layer_indices) + 0.20),
+        flow,
         preset="legend",
     )
 
@@ -441,6 +530,165 @@ def _draw_2d_layers(
                 drawing.line(mid, target, preset="wire")
 
 
+def _draw_clean_1d(
+    drawing,
+    schedule,
+    layer_indices,
+    *,
+    label_sites,
+    label_blocks,
+):
+    """Show scheduled pair rounds and retained wires at each 1D RG step."""
+    cursor_y = 0.0
+    row_gap = 1.5
+    drawn_layers = (
+        tuple(reversed(layer_indices)) if schedule.preparation_order
+        else layer_indices
+    )
+    for layer_index in drawn_layers:
+        layer = schedule.layers[layer_index]
+        active = layer.input_sites
+        x_by_site = _site_x(active)
+        if schedule.preparation_order:
+            retained_sites = set(layer.output_sites)
+            presets = {
+                site: "retained" if site in retained_sites else "fresh"
+                for site in active
+            }
+            first_label = "coarse"
+        else:
+            presets = None
+            first_label = "input"
+        drawing.text(
+            (-1.15, cursor_y), f"L{layer_index} {first_label}",
+            preset="layer_label",
+        )
+        _draw_site_row(
+            drawing, active, cursor_y,
+            label_sites=label_sites, site_presets=presets,
+        )
+
+        # The pale brackets show the covering isometry windows; the filled
+        # patches below show the pair gates actually executed in each round.
+        for block_index, block in enumerate(layer.isometry_blocks):
+            xs = [x_by_site[site] for site in block if site in x_by_site]
+            if not xs:
+                continue
+            left, right = min(xs), max(xs)
+            bracket_y = cursor_y - 0.32
+            drawing.line((left, bracket_y), (right, bracket_y), preset="block_outline")
+            drawing.line((left, bracket_y), (left, bracket_y + 0.10), preset="block_outline")
+            drawing.line((right, bracket_y), (right, bracket_y + 0.10), preset="block_outline")
+            if label_blocks:
+                drawing.text(
+                    ((left + right) / 2, bracket_y - 0.14),
+                    f"W{block_index}", preset="block_label",
+                )
+
+        stages = []
+        stage_order = (
+            (("isometry", layer.isometries),
+             ("disentangler", layer.disentanglers))
+            if schedule.preparation_order else
+            (("disentangler", layer.disentanglers),
+             ("isometry", layer.isometries))
+        )
+        for stage, placements in stage_order:
+            for round_index in sorted({placement.round for placement in placements}):
+                stages.append((stage, round_index, tuple(
+                    placement for placement in placements
+                    if placement.round == round_index
+                )))
+
+        previous_y = cursor_y
+        for stage_index, (stage, round_index, placements) in enumerate(stages, 1):
+            y = cursor_y - row_gap * stage_index
+            for x in x_by_site.values():
+                drawing.line((x, previous_y - 0.10), (x, y + 0.10), preset="wire")
+            _draw_site_row(drawing, active, y, label_sites=False)
+            stage_label = "D" if stage == "disentangler" else "W"
+            drawing.text(
+                (-1.15, y), f"{stage_label}[r{round_index}]", preset="stage_label",
+            )
+            for placement in placements:
+                xs = [x_by_site[site] for site in placement.where if site in x_by_site]
+                if not xs:
+                    continue
+                left, right = min(xs), max(xs)
+                gate_label = f"{stage_label}{placement.block}"
+                if len(xs) == 2 and right - left > 1.01:
+                    # A periodic seam or a closing ladder pair must not look
+                    # like a gate covering every intervening wire.
+                    arch_y = y + 0.38
+                    drawing.line((left, y + 0.11), (left, arch_y), preset=f"{stage}_line")
+                    drawing.line((left, arch_y), (right, arch_y), preset=f"{stage}_line")
+                    drawing.line((right, arch_y), (right, y + 0.11), preset=f"{stage}_line")
+                    if label_blocks:
+                        drawing.text(
+                            ((left + right) / 2, arch_y + 0.12),
+                            gate_label, preset="block_label",
+                        )
+                    continue
+                coos = [(x, y) for x in xs]
+                if len(coos) == 1:
+                    drawing.circle(coos[0], radius=0.20, preset=stage)
+                elif len(coos) == 2:
+                    drawing.patch_around_circles(
+                        coos[0], 0.12, coos[1], 0.12,
+                        padding=0.11, preset=stage,
+                    )
+                else:
+                    drawing.patch_around(coos, radius=0.17, preset=stage)
+                if label_blocks:
+                    drawing.text(
+                        ((left + right) / 2, y - 0.27), gate_label,
+                        preset="block_label",
+                    )
+            previous_y = y
+
+        output_y = cursor_y - row_gap * (len(stages) + 1)
+        if schedule.preparation_order:
+            output_sites = active
+            output_label = "fine"
+        else:
+            kept = set(layer.output_sites)
+            output_sites = tuple(site for site in active if site in kept)
+            output_label = "coarse"
+        for site in output_sites:
+            x = x_by_site[site]
+            drawing.line((x, previous_y - 0.10), (x, output_y + 0.10), preset="wire")
+        for left, right in zip(output_sites, output_sites[1:]):
+            drawing.line(
+                (x_by_site[left] + 0.10, output_y),
+                (x_by_site[right] - 0.10, output_y),
+                preset="wire",
+            )
+        for site in output_sites:
+            x = x_by_site[site]
+            drawing.circle(
+                (x, output_y), radius=0.12,
+                preset="site" if schedule.preparation_order else "retained",
+            )
+            if label_sites:
+                drawing.text((x, output_y + 0.25), str(site), preset="site_label")
+        drawing.text((-1.15, output_y), output_label, preset="stage_label")
+        cursor_y = output_y - 1.7
+
+    drawing.text(
+        (0.0, cursor_y + 0.85),
+        "D = boundary disentangler    W = isometry pair gate",
+        preset="legend",
+    )
+    if schedule.preparation_order:
+        detail = "brackets = isometry blocks    green = retained    gray = product wires"
+        direction = "Circuit preparation runs down: coarse to fine, W then D"
+    else:
+        detail = "brackets = isometry blocks    green = retained coarse wires"
+        direction = "Schedule runs down: fine to coarse, D then W"
+    drawing.text((0.0, cursor_y + 0.50), detail, preset="legend")
+    drawing.text((0.0, cursor_y + 0.15), direction, preset="legend")
+
+
 def draw_qmera_schedule(
     schedule,
     *,
@@ -465,9 +713,11 @@ def draw_qmera_schedule(
         preferred descriptive name for selecting one RG step; ``layer`` is a
         backwards-compatible alias. ``None`` draws all steps.
     style : {"clean", "register"}, default="clean"
-        ``"clean"`` separates 2D input, disentangler, isometry, and coarse
-        output panels. ``"register"`` keeps the lower-level register wiring
-        view.
+        ``"clean"`` follows gate execution: retained-register preparation
+        runs coarse to fine (W then D), while site schedules run fine to
+        coarse (D then W). In 2D, dark links mark scheduled pairs within
+        colored blocks; long pairs curve around intervening sites.
+        ``"register"`` keeps the lower-level wiring view.
     figsize
         Optional matplotlib figure size forwarded to ``schematic.Drawing``.
     label_sites, label_blocks
@@ -498,6 +748,34 @@ def draw_qmera_schedule(
             "linewidth": 1.0,
         },
         "site_label": {"fontsize": 8, "color": neutral_dark},
+        "fresh": {
+            "color": (0.83, 0.85, 0.87, 1.0),
+            "edgecolor": neutral,
+            "linewidth": 1.0,
+        },
+        "retained": {
+            "color": schematic.get_color("green"),
+            "edgecolor": schematic.get_color("green"),
+            "linewidth": 1.0,
+        },
+        "retained_group": {
+            "facecolor": schematic.get_color("green", alpha=0.08),
+            "edgecolor": schematic.get_color("green"),
+            "linewidth": 1.2,
+            "linestyle": "--",
+        },
+        "block_outline": {
+            "linewidth": 1.4,
+            "color": schematic.get_color("green"),
+        },
+        "disentangler_line": {
+            "linewidth": 1.8,
+            "color": schematic.get_color("orange"),
+        },
+        "isometry_line": {
+            "linewidth": 1.8,
+            "color": schematic.get_color("green"),
+        },
         "disentangler": {
             "facecolor": schematic.get_color("orange", alpha=0.18),
             "edgecolor": schematic.get_color("orange"),
@@ -522,6 +800,12 @@ def draw_qmera_schedule(
             "horizontalalignment": "center",
         },
         "flow": {"linewidth": 1.5, "color": neutral},
+        "pair_link": {"linewidth": 3.0, "color": neutral_dark, "zorder": 3},
+        "local_gate": {
+            "facecolor": (0.0, 0.0, 0.0, 0.0),
+            "edgecolor": neutral_dark,
+            "linewidth": 2.2,
+        },
         "legend": {"fontsize": 9, "color": neutral_dark},
     }
     if presets is not None:
@@ -562,6 +846,18 @@ def draw_qmera_schedule(
                 label_sites=label_sites,
                 label_blocks=label_blocks,
             )
+        if scale_figsize:
+            drawing.scale_figsize(1.0)
+        return drawing
+
+    if style == "clean":
+        _draw_clean_1d(
+            drawing,
+            schedule,
+            layer_indices,
+            label_sites=label_sites,
+            label_blocks=label_blocks,
+        )
         if scale_figsize:
             drawing.scale_figsize(1.0)
         return drawing

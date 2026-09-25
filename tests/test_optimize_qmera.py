@@ -53,6 +53,7 @@ from pepsy.optimizers.qmera import (
     symmray_majorana_gate_registry,
 )
 from pepsy.tensors import Fermion
+from pepsy.operators import x as _x_term
 
 
 def _zz_term():
@@ -811,6 +812,213 @@ def test_qmera_initial_hadamards_select_sector_not_gate_symmetry():
         assert np.vdot(vector, global_x @ vector).real == pytest.approx(
             expected_parity
         )
+
+
+@pytest.mark.parametrize(
+    ("shape", "block_shape", "first_block_sizes"),
+    (
+        ((5, 7), (2, 3), (6, 8, 9, 12)),
+        ((7, 5), (3, 3), (6, 8, 9, 12)),
+        ((9, 9), (4, 4), (16, 20, 20, 25)),
+    ),
+)
+def test_qmera_2d_retained_hierarchy_absorbs_odd_edges(
+    shape, block_shape, first_block_sizes,
+):
+    """Every odd edge joins a neighboring block and every level coarse-grains."""
+    schedule = QMeraBuilder(
+        shape=shape,
+        hierarchy="retained",
+        bond_qubits=2,
+        isometry={"block_size": block_shape},
+    ).build_schedule()
+    first, second = schedule.layers
+
+    assert schedule.hierarchy == "retained"
+    assert schedule.preparation_order
+    assert first.input_grid_shape == shape
+    assert first.output_grid_shape == (2, 2)
+    assert second.input_grid_shape == (2, 2)
+    assert second.output_grid_shape == (1, 1)
+    assert tuple(map(len, first.isometry_cell_blocks)) == tuple(
+        map(len, first.isometry_blocks)
+    )
+    assert sorted(map(len, first.isometry_blocks)) == list(first_block_sizes)
+    assert sorted(site for block in first.isometry_blocks for site in block) == list(
+        range(shape[0] * shape[1])
+    )
+    assert len(first.retained_registers) == len(first.isometry_blocks) == 4
+    assert all(len(register) == 2 for register in first.retained_registers)
+    assert len(second.isometry_blocks) == 1
+    assert len(schedule.top_sites) == 2
+    assert {gate.axis for gate in first.disentanglers} == {"x", "y"}
+    assert [gate.round for gate in first.disentanglers] == sorted(
+        gate.round for gate in first.disentanglers
+    )
+    assert all(
+        schedule.placements.index(gate) < schedule.placements.index(
+            first.disentanglers[0]
+        )
+        for gate in first.isometries
+    )
+
+
+def test_qmera_2d_retained_odd_grid_local_energy_matches_direct_and_compiled():
+    """Local and compiled energies agree with the direct 2D circuit."""
+    builder = QMeraBuilder(
+        shape=(3, 4),
+        hierarchy="retained",
+        bond_qubits=2,
+        isometry={"block_size": (2, 2)},
+        pair_ansatz="z2_zz_yy_rx",
+        seed=3,
+        param_scale=0.02,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    hamiltonian = {((1, 1), (1, 2)): _zz_term()}
+    lightcone = builder.parametric_loss(
+        params, hamiltonian, schedule=schedule, energy_per_site=False,
+    )
+    direct = builder.direct_parametric_loss(
+        params, hamiltonian, schedule=schedule, energy_per_site=False,
+    )
+    compiled = builder.compile_parametric_lightcones(
+        hamiltonian, schedule=schedule,
+    )
+    frozen = builder.compiled_parametric_loss(
+        params, hamiltonian, schedule=schedule, compiled_chunks=compiled,
+        energy_per_site=False,
+    )
+
+    assert schedule.layers[0].retained_registers
+    assert schedule.layers[0].disentanglers
+    assert float(lightcone) == pytest.approx(float(direct), abs=1.0e-10)
+    assert float(frozen) == pytest.approx(float(direct), abs=1.0e-10)
+
+
+def test_qmera_2d_retained_compiled_torch_gradient():
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    builder = QMeraBuilder(
+        shape=(1, 5), hierarchy="retained",
+        isometry={"block_size": (2, 2)},
+        parameter_backend=backend_torch(dtype=torch.float64),
+        array_backend=backend_torch(dtype=torch.complex128),
+        seed=2, param_scale=0.03,
+    )
+    schedule = builder.build_schedule()
+    params = {
+        key: value.detach().clone().requires_grad_()
+        for key, value in builder.initialize_parameters(schedule).items()
+    }
+    compiled = builder.compile_parametric_lightcones(
+        {((0, 1), (0, 2)): _zz_term()}, schedule,
+    )
+    value = builder.compiled_parametric_loss(
+        params, schedule=schedule, compiled_chunks=compiled,
+        energy_per_site=False,
+    )
+    gradients = torch.autograd.grad(
+        value, tuple(params.values()), allow_unused=True,
+    )
+
+    assert torch.isfinite(value)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients
+               if gradient is not None)
+    assert any(torch.any(gradient != 0) for gradient in gradients
+               if gradient is not None)
+
+
+def test_qmera_2d_retained_compiled_jax_jit_gradient():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends import backend_jax
+
+    jax.config.update("jax_enable_x64", True)
+    builder = QMeraBuilder(
+        shape=(1, 5), hierarchy="retained",
+        isometry={"block_size": (2, 2)},
+        parameter_backend=backend_jax(dtype=jnp.float64),
+        array_backend=backend_jax(dtype=jnp.complex128),
+        seed=2, param_scale=0.03,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    compiled = builder.compile_parametric_lightcones(
+        {((0, 1), (0, 2)): _zz_term()}, schedule,
+    )
+    loss = builder.compiled_parametric_loss_fn(
+        schedule=schedule, compiled_chunks=compiled,
+        energy_per_site=False,
+    )
+    value, gradients = jax.jit(jax.value_and_grad(loss))(params)
+
+    assert np.isfinite(float(value))
+    assert all(np.all(np.isfinite(np.asarray(gradient)))
+               for gradient in gradients.values())
+    assert any(np.any(np.asarray(gradient) != 0)
+               for gradient in gradients.values())
+
+
+def test_qmera_2d_retained_odd_periodic_seams_and_balanced_registers():
+    schedule = QMeraBuilder(
+        shape=(5, 5), boundary="periodic", hierarchy="retained",
+        retention="balanced", isometry={"block_size": (2, 2)},
+    ).build_schedule()
+    first = schedule.layers[0]
+
+    assert first.retained_registers[0] == (0, 6)
+    assert any(
+        gate.axis == "x"
+        and {schedule.geometry.to_site(wire)[0] for wire in gate.where} == {0, 4}
+        for gate in first.disentanglers
+    )
+    assert any(
+        gate.axis == "y"
+        and {schedule.geometry.to_site(wire)[1] for wire in gate.where} == {0, 4}
+        for gate in first.disentanglers
+    )
+
+
+def test_qmera_2d_site_hierarchy_also_absorbs_odd_edge_cells():
+    schedule = QMeraBuilder(
+        shape=(5, 7), isometry={"block_size": (2, 3)},
+    ).build_schedule()
+    assert schedule.hierarchy == "site"
+    assert sorted(map(len, schedule.layers[0].isometry_blocks)) == [6, 8, 9, 12]
+    assert [len(layer.output_sites) for layer in schedule.layers] == [4, 1]
+
+
+
+def test_qmera_2d_retained_explicit_parent_register():
+    schedule = QMeraBuilder(
+        shape=(2, 2), hierarchy="retained", bond_qubits=1,
+        retention="explicit", retained_registers={(0, 0): (3,)},
+    ).build_schedule()
+    assert schedule.layers[0].retained_registers == ((3,),)
+    assert schedule.top_sites == (3,)
+
+
+def test_qmera_2d_retained_hierarchy_rejects_nonreducing_blocks():
+    with pytest.raises(ValueError, match="hierarchy must be"):
+        QMeraBuilder(shape=(3, 3), hierarchy="unknown")
+    with pytest.raises(ValueError, match="does not reduce"):
+        QMeraBuilder(
+            shape=(3, 3), hierarchy="retained",
+            isometry={"block_size": (1, 1)},
+        ).build_schedule()
+    with pytest.raises(ValueError, match="block_size=2 on both axes"):
+        QMeraBuilder(
+            shape=(3, 3), hierarchy="retained",
+            disentangler={"block_size": (2, 3)},
+        ).build_schedule()
+    with pytest.raises(ValueError, match="unmoded spin"):
+        QMeraBuilder(
+            shape=(3, 3), site_modes=("up", "down"),
+            hierarchy="retained",
+        ).build_schedule()
 
 
 def test_qmera_2d_schedule_uses_rg_blocks_and_face_disentanglers():
@@ -2762,6 +2970,167 @@ def test_qmera_draw_schematic_builds_quimb_drawing():
     )
 
 
+def test_qmera_clean_schematic_shows_periodic_gate_rounds_and_retained_wires():
+    """A seam gate should be an arc, not a patch across unrelated sites."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    from matplotlib.patches import Circle
+    from matplotlib.colors import to_rgba
+    from quimb import schematic
+
+    builder = QMeraBuilder(shape=7, boundary="periodic", bond_qubits=2)
+    schedule = builder.build_schedule()
+    layer = schedule.layers[0]
+    drawing = schedule.draw_schematic(rg_step=0, scale_figsize=False)
+    labels = {item.get_text() for item in drawing.ax.texts}
+    assert {"D[r0]", "W[r0]", "W[r1]", "fine"} <= labels
+    by_label = {item.get_text(): item.get_position() for item in drawing.ax.texts}
+    assert by_label["W[r0]"][1] > by_label["W[r1]"][1] > by_label["D[r0]"][1]
+
+    # The periodic (0, 1) disentangler is drawn above the stage row.
+    assert any(
+        tuple(line.get_xdata()) == (0.0, 6.0)
+        and len(set(line.get_ydata())) == 1
+        for line in drawing.ax.lines
+    )
+    circles = [patch for patch in drawing.ax.patches if isinstance(patch, Circle)]
+    coarse_y = max(circle.center[1] for circle in circles)
+    coarse = [circle for circle in circles if circle.center[1] == coarse_y]
+    x_by_site = {site: pos for pos, site in enumerate(layer.input_sites)}
+    assert {circle.center[0] for circle in coarse} == set(x_by_site.values())
+    green = to_rgba(schematic.get_color("green"))
+    assert {circle.center[0] for circle in coarse if circle.get_facecolor() == green} == {
+        x_by_site[site] for site in layer.output_sites
+    }
+    all_steps = schedule.draw_schematic(scale_figsize=False)
+    step_labels = {item.get_text(): item.get_position()[1] for item in all_steps.ax.texts}
+    assert step_labels["L1 coarse"] > step_labels["L0 coarse"]
+
+
+def test_qmera_clean_2d_schematic_marks_odd_grid_retained_sites():
+    """The coarse panel highlights only the physical sites kept by the RG step."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    from matplotlib.patches import Circle
+    from matplotlib.colors import to_rgba
+    from quimb import schematic
+
+    builder = QMeraBuilder(
+        shape=(3, 4), hierarchy="retained", bond_qubits=2,
+        isometry={"block_size": (2, 2)},
+    )
+    schedule = builder.build_schedule()
+    drawing = schedule.draw_schematic(rg_step=0, scale_figsize=False)
+    green = to_rgba(schematic.get_color("green"))
+    retained = [
+        patch for patch in drawing.ax.patches
+        if isinstance(patch, Circle) and patch.get_facecolor() == green
+    ]
+    expected = {
+        schedule.geometry.to_site(site) for site in schedule.layers[0].output_sites
+    }
+    assert len(retained) == len(expected)
+    labels = {item.get_text(): item.get_position()[0] for item in drawing.ax.texts}
+    assert {"R0", "R1"} <= labels.keys()
+    w_x = min(x for label, x in labels.items() if label.startswith("W[r"))
+    d_x = min(x for label, x in labels.items() if label.startswith("D[r"))
+    assert labels["coarse"] < w_x < d_x < labels["fine"]
+    all_steps = schedule.draw_schematic(scale_figsize=False)
+    layer_y = {
+        text.get_text(): text.get_position()[1]
+        for text in all_steps.ax.texts if text.get_text() in {"L0", "L1"}
+    }
+    assert layer_y["L1"] > layer_y["L0"]
+
+
+def test_qmera_clean_2d_pair_links_match_scheduled_supports():
+    """Each dark link must join precisely the sites in one scheduled gate."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+
+    schedule = QMeraBuilder(
+        shape=(3, 4), hierarchy="retained", bond_qubits=2,
+        isometry={"block_size": (2, 2)},
+    ).build_schedule()
+    drawing = schedule.draw_schematic(rg_step=0, scale_figsize=False)
+    panel_extent = max(schedule.geometry.shape) - 1
+    panel_x = {
+        label.split(" (")[0]: text.get_position()[0] - panel_extent / 2
+        for text in drawing.ax.texts
+        if (label := text.get_text()).startswith(("W[r", "D[r"))
+    }
+
+    def segment(points):
+        return tuple(sorted((round(float(x), 6), round(float(y), 6)) for x, y in points))
+
+    expected = set()
+    for placement in schedule.layers[0].placements:
+        prefix = "W" if placement.stage == "isometry" else "D"
+        x0 = panel_x[f"{prefix}[r{placement.round}]"]
+        sites = [schedule.geometry.to_site(site) for site in placement.where]
+        assert len(sites) == 2 and len(set(sites)) == 2
+        expected.add(segment((x0 + col, -row) for row, col in sites))
+
+    pair_lines = [
+        line for line in drawing.ax.lines
+        if line.get_color() == (0.14, 0.15, 0.16, 1.0)
+        and line.get_linewidth() == 3.0
+    ]
+    actual = {
+        segment(zip(line.get_xdata(), line.get_ydata()))
+        for line in pair_lines
+    }
+    assert len(pair_lines) == len(schedule.layers[0].placements)
+    assert actual == expected
+
+
+def test_qmera_clean_2d_periodic_seams_curve_around_sites():
+    """Periodic pair links should keep their endpoints and clear middle sites."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    from matplotlib.patches import PathPatch
+
+    schedule = QMeraBuilder(
+        shape=(3, 4), boundary="periodic", hierarchy="retained",
+        bond_qubits=2, isometry={"block_size": (2, 2)},
+    ).build_schedule()
+    drawing = schedule.draw_schematic(rg_step=0, scale_figsize=False)
+    arcs = [
+        patch for patch in drawing.ax.patches
+        if isinstance(patch, PathPatch)
+        and patch.get_linewidth() == 3.0
+        and patch.get_edgecolor() == (0.14, 0.15, 0.16, 1.0)
+    ]
+    seam_pairs = [
+        placement for placement in schedule.layers[0].placements
+        if abs(schedule.geometry.to_site(placement.where[0])[1]
+               - schedule.geometry.to_site(placement.where[1])[1]) > 1
+    ]
+    assert len(arcs) == len(seam_pairs) == 3
+    d_label = next(
+        text for text in drawing.ax.texts
+        if text.get_text().startswith("D[r0]")
+    )
+    x0 = d_label.get_position()[0] - (max(schedule.geometry.shape) - 1) / 2
+    endpoints = {
+        frozenset(tuple(round(float(value), 6) for value in vertex)
+                  for vertex in (arc.get_path().vertices[0],
+                                 arc.get_path().vertices[-1]))
+        for arc in arcs
+    }
+    expected = {
+        frozenset((round(x0 + col, 6), float(-row))
+                  for row, col in (schedule.geometry.to_site(site)
+                                   for site in placement.where))
+        for placement in seam_pairs
+    }
+    assert endpoints == expected
+    assert all(
+        arc.get_path().vertices[1, 1] > arc.get_path().vertices[0, 1]
+        for arc in arcs
+    )
+
+
 def test_qmera_2d_draw_schematic_builds_quimb_drawing():
     """The schematic wrapper should handle 2D RG blocking."""
     matplotlib = pytest.importorskip("matplotlib")
@@ -2832,3 +3201,269 @@ def test_qmera_2d_draw_schematic_builds_quimb_drawing():
         builder.draw_schematic(layer=0, rg_step=0)
     with pytest.raises(ValueError, match="style"):
         builder.draw_schematic(layer=0, style="unknown")
+
+
+@pytest.mark.parametrize("ansatz", ("minimal", "unrestricted"))
+@pytest.mark.parametrize("normalized", (False, True))
+def test_qmera_torch_fullgraph_energy_matches_compiled_gradient(ansatz, normalized):
+    """Odd-size multi-term energy keeps exact values and parameter gradients."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    builder = QMeraBuilder(
+        shape=3, ansatz=ansatz, seed=17, param_scale=0.12,
+        parameter_backend=backend_torch(dtype=torch.float64),
+        array_backend=backend_torch(dtype=torch.complex128),
+    )
+    schedule = builder.build_schedule()
+    params = {
+        key: value.detach().clone().requires_grad_()
+        for key, value in builder.initialize_parameters(schedule).items()
+    }
+    terms = [
+        LocalTerm((i, (i + 1) % 3), _zz_term(), weight=-1.0)
+        for i in range(3)
+    ]
+    terms += [LocalTerm((i,), _x_term(), weight=-0.5) for i in range(3)]
+    compiled = builder.compile_parametric_lightcones(terms, schedule)
+    kwargs = dict(schedule=schedule, compiled_chunks=compiled, normalized=normalized)
+    reference = builder.compiled_parametric_loss_fn(**kwargs)
+    native = builder.compiled_parametric_loss_fn(
+        terms, schedule=schedule, torch_fullgraph=True, normalized=normalized,
+    )
+    expected = reference(params)
+    actual = native(params)
+    expected_grad = torch.autograd.grad(expected, tuple(params.values()))
+    actual_grad = torch.autograd.grad(actual, tuple(params.values()))
+
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+    for got, want in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-10, rtol=1e-10)
+
+
+def test_qmera_torch_fullgraph_aot_energy_and_gradients():
+    """AOT captures a complete graph for the multi-term Torch qMERA loss."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    builder = QMeraBuilder(
+        shape=4, seed=11, param_scale=0.1,
+        parameter_backend=backend_torch(dtype=torch.float64),
+        array_backend=backend_torch(dtype=torch.complex128),
+    )
+    schedule = builder.build_schedule()
+    params = {
+        key: value.detach().clone().requires_grad_()
+        for key, value in builder.initialize_parameters(schedule).items()
+    }
+    terms = [
+        LocalTerm((i, (i + 1) % 4), _zz_term(), weight=-1.0)
+        for i in range(4)
+    ]
+    terms += [LocalTerm((i,), _x_term(), weight=-1.0) for i in range(4)]
+    compiled = builder.compile_parametric_lightcones(terms, schedule)
+    native = builder.compiled_parametric_loss_fn(
+        schedule=schedule, compiled_chunks=compiled, torch_fullgraph=True,
+        normalized=False, energy_per_site=False,
+    )
+    captured = torch.compile(native, backend="aot_eager", fullgraph=True)
+    expected = native(params)
+    actual = captured(params)
+    expected_grad = torch.autograd.grad(expected, tuple(params.values()))
+    actual_grad = torch.autograd.grad(actual, tuple(params.values()))
+
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+    for got, want in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-10, rtol=1e-10)
+
+
+def test_qmera_torch_fullgraph_rejects_unmarked_gate_family():
+    """An unsupported gate never silently changes the configured family."""
+    pytest.importorskip("torch")
+    builder = QMeraBuilder(
+        shape=3, gate_family="cphase", isometry_gate_family="cphase",
+    )
+    with pytest.raises(ValueError, match="Pauli-rotation metadata"):
+        builder.compiled_parametric_loss_fn(
+            {(0, 1): _zz_term()}, torch_fullgraph=True,
+        )
+
+
+def test_qmera_2d_retained_torch_fullgraph_odd_grid():
+    """Frozen Torch paths also preserve a reshaped odd 2D hierarchy."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    builder = QMeraBuilder(
+        shape=(1, 5), hierarchy="retained", isometry={"block_size": (2, 2)},
+        parameter_backend=backend_torch(dtype=torch.float64),
+        array_backend=backend_torch(dtype=torch.complex128),
+        seed=2, param_scale=0.03,
+    )
+    schedule = builder.build_schedule()
+    params = {
+        key: value.detach().clone().requires_grad_()
+        for key, value in builder.initialize_parameters(schedule).items()
+    }
+    compiled = builder.compile_parametric_lightcones(
+        {((0, 1), (0, 2)): _zz_term()}, schedule,
+    )
+    kwargs = dict(schedule=schedule, compiled_chunks=compiled, energy_per_site=False)
+    reference = builder.compiled_parametric_loss_fn(**kwargs)(params)
+    fullgraph = builder.compiled_parametric_loss_fn(**kwargs, torch_fullgraph=True)(params)
+    torch.testing.assert_close(fullgraph, reference, atol=1e-10, rtol=1e-10)
+
+
+def test_qmera_tfim_jax_jit_compiled_energy_and_gradient_match_eager():
+    """XLA compiles the full TFIM local-term loss and its parameter gradient."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends import backend_jax
+
+    jax.config.update("jax_enable_x64", True)
+    builder = QMeraBuilder(
+        shape=4, seed=11, param_scale=0.1,
+        parameter_backend=backend_jax(dtype=jnp.float64),
+        array_backend=backend_jax(dtype=jnp.complex128),
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    terms = [
+        LocalTerm((i, (i + 1) % 4), _zz_term(), weight=-1.0)
+        for i in range(4)
+    ]
+    terms += [LocalTerm((i,), _x_term(), weight=-1.0) for i in range(4)]
+    compiled_cones = builder.compile_parametric_lightcones(terms, schedule)
+    loss = builder.compiled_parametric_loss_fn(
+        schedule=schedule, compiled_chunks=compiled_cones,
+        normalized=False, energy_per_site=False,
+    )
+    eager_value, eager_grad = jax.value_and_grad(loss)(params)
+    xla = jax.jit(jax.value_and_grad(loss)).lower(params).compile()
+    jit_value, jit_grad = xla(params)
+    direct_value = builder.parametric_loss(
+        params, terms, schedule=schedule, normalized=False,
+        energy_per_site=False,
+    )
+
+    assert float(jit_value) == pytest.approx(float(eager_value), abs=1e-10)
+    assert float(jit_value) == pytest.approx(float(direct_value), abs=1e-10)
+    assert set(jit_grad) == set(params)
+    for key in params:
+        np.testing.assert_allclose(jit_grad[key], eager_grad[key], atol=1e-10)
+    assert any(np.any(np.asarray(gradient) != 0) for gradient in jit_grad.values())
+
+
+def test_qmera_optimizer_torch_fullgraph_loss_and_run():
+    """The qMERA optimizer exposes and trains with the Torch full-graph cost."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    builder = QMeraBuilder(
+        shape=3, seed=13, param_scale=0.1,
+        parameter_backend=backend_torch(dtype=torch.float64),
+        array_backend=backend_torch(dtype=torch.complex128),
+    )
+    terms = [
+        LocalTerm((0, 1), _zz_term(), weight=-1.0),
+        LocalTerm((1,), _x_term(), weight=-0.5),
+    ]
+    optimizer = builder.parametric_optimizer(terms, energy_per_site=False)
+    params = {
+        key: value.detach().clone().requires_grad_()
+        for key, value in optimizer.parameters.items()
+    }
+    native = optimizer.compiled_loss_fn(torch_fullgraph=True)
+    aot = torch.compile(native, backend="aot_eager", fullgraph=True)
+    expected = optimizer.compiled_loss(params)
+    actual = aot(params)
+    direct = optimizer.compiled_loss(params, torch_fullgraph=True)
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(direct, expected, atol=1e-10, rtol=1e-10)
+    expected_grad = torch.autograd.grad(expected, tuple(params.values()))
+    actual_grad = torch.autograd.grad(actual, tuple(params.values()))
+    for got, want in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-10, rtol=1e-10)
+
+    result = optimizer.run(
+        params_init=params, solver="torch-adam", options={"lr": 0.02},
+        n_steps=2, compiled=True, torch_fullgraph=True,
+    )
+    assert result.n_steps == 2
+    assert torch.isfinite(native(result.params))
+    with pytest.raises(ValueError, match="compiled=True"):
+        optimizer.run(solver="torch-adam", torch_fullgraph=True)
+    with pytest.raises(ValueError, match="Torch solver"):
+        optimizer.run(solver="jax-adam", compiled=True, torch_fullgraph=True)
+
+
+def test_qmera_optimizer_torch_fullgraph_casts_default_parameters():
+    """Torch solver converts the default NumPy qMERA parameters and cones."""
+    torch = pytest.importorskip("torch")
+    builder = QMeraBuilder(shape=3, seed=4, param_scale=0.1)
+    optimizer = builder.parametric_optimizer(
+        {(0, 1): _zz_term()}, energy_per_site=False,
+    )
+
+    result = optimizer.run(
+        solver="torch-adam", options={"lr": 0.02}, n_steps=2,
+        compiled=True, torch_fullgraph=True,
+    )
+
+    assert result.n_steps == 2
+    assert all(isinstance(value, torch.Tensor) for value in result.params.values())
+    assert torch.isfinite(optimizer.compiled_loss(result.params, torch_fullgraph=True))
+
+
+def test_qmera_cost_preflight_reports_and_reuses_compiled_paths(monkeypatch):
+    """Preflight metrics use the same unsliced paths as the compiled loss."""
+    from pepsy.optimizers.qmera import QMeraContractionReport
+    from pepsy.operators import x
+
+    builder = QMeraBuilder(shape=3, seed=7, param_scale=0.1)
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    terms = [
+        LocalTerm((0, 1), _zz_term(), weight=-1.0),
+        LocalTerm((1,), x(), weight=-0.5),
+    ]
+    path_cache = builder.contraction_path_cache(
+        max_repeats=4, parallel=False, optlib="random", directory=False,
+    )
+    report = builder.estimate_contraction_cost(
+        terms, schedule=schedule, path_cache=path_cache,
+        normalized=False, element_bytes=16,
+    )
+    assert report.unique_topologies == path_cache.num_primed_paths > 0
+    normalized = builder.estimate_contraction_cost(
+        terms, schedule=schedule, path_cache=path_cache, normalized=True,
+    )
+
+    assert isinstance(report, QMeraContractionReport)
+    assert len(report.cones) == len(terms)
+    assert all(cone.denominator_flops == 0 for cone in report.cones)
+    assert report.total_flops == sum(cone.numerator_flops for cone in report.cones)
+    assert normalized.total_flops > report.total_flops
+    assert report.log10_flops == pytest.approx(np.log10(report.total_flops))
+    assert report.log2_peak_bytes == pytest.approx(
+        np.log2(report.peak_elements * report.element_bytes)
+    )
+    assert "log10(FLOPs)" in report.summary()
+    assert "log2(peak bytes)" in report.summary()
+
+    def unexpected_search(_key):
+        raise AssertionError("preflight did not cache this topology")
+
+    monkeypatch.setattr(path_cache, "optimizer_for", unexpected_search)
+    compiled = builder.compile_parametric_lightcones(
+        terms, schedule, path_cache=report.path_cache,
+    )
+    actual = builder.compiled_parametric_loss(
+        params, schedule=schedule, compiled_chunks=compiled,
+        normalized=False, energy_per_site=False,
+    )
+    direct = builder.parametric_loss(
+        params, terms, schedule=schedule, normalized=False,
+        energy_per_site=False,
+    )
+    assert float(actual) == pytest.approx(float(direct), abs=1e-10)
