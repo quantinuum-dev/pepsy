@@ -20,17 +20,21 @@ from pepsy.optimizers.qmera import (
     QMeraSchematicBlock,
     QMeraParametricEnergyOptimizer,
     QMeraParametricLightconeChunk,
+    QMeraPairSpec,
     QMeraPrototypeLayout,
     QMeraSymmrayFermionBackend,
     QMeraScaleSpec,
     QMeraUnitarySpec,
     UserGateFamily,
+    available_qmera_pair_ansatzes,
+    available_qmera_pair_ansatze,
     build_qmera_contraction_optimizer,
     build_qmera_parametric_lightcone_chunks,
     compile_qmera_parametric_lightcones,
     contract_qmera_lightcone_tn,
     group_qmera_parametric_lightcone_chunks,
     default_gate_registry,
+    get_qmera_pair_ansatz,
     draw_qmera_schedule,
     local_qmera_compiled_lightcone_expectation,
     local_qmera_parametric_lightcone_expectation,
@@ -39,6 +43,7 @@ from pepsy.optimizers.qmera import (
     qmera_compiled_parametric_energy,
     qmera_direct_parametric_energy,
     qmera_parametric_energy,
+    qmera_pair_gate_spec,
     qmera_parametric_lightcone_state,
     qmera_parametric_lightcone_tn,
     qmera_schematic_blocks,
@@ -287,6 +292,33 @@ def test_qmera_geometry_tracks_modes_and_register_order():
     assert mode_major.to_register((1, "down")) == 4
 
 
+@pytest.mark.parametrize("boundary", ("open", "periodic"))
+def test_qmera_system_size_names_1d_site_count(boundary):
+    """A scalar system size gives the same 1D layout as the older shape form."""
+    builder = QMeraBuilder(system_size=7, boundary=boundary)
+    legacy = QMeraBuilder(shape=7, boundary=boundary)
+    schedule = builder.build_schedule()
+    old_schedule = legacy.build_schedule()
+
+    assert builder.geometry.shape == (7,)
+    assert builder.geometry.num_sites == 7
+    assert schedule.layers == old_schedule.layers
+    assert schedule.placements == old_schedule.placements
+    assert schedule.top_sites == old_schedule.top_sites
+    assert QMeraBuilder(system_size=3, site_modes=("up", "down")).geometry.num_sites == 3
+
+    with pytest.raises(TypeError, match="system_size or shape/geometry"):
+        QMeraBuilder(system_size=7, shape=7)
+    with pytest.raises(TypeError, match="system_size or shape/geometry"):
+        QMeraBuilder(system_size=7, geometry=QMeraGeometry(shape=7))
+    with pytest.raises(TypeError, match="system_size must be a positive integer"):
+        QMeraBuilder(system_size=(2, 2))
+    with pytest.raises(TypeError, match="system_size must be a positive integer"):
+        QMeraBuilder(system_size=True)
+    with pytest.raises(ValueError, match="system_size must be a positive integer"):
+        QMeraBuilder(system_size=0)
+
+
 def test_qmera_schedule_has_disentangler_and_isometry_blocks():
     """Builder schedules should expose block stages before gate tensors."""
     builder = QMeraBuilder(
@@ -300,7 +332,8 @@ def test_qmera_schedule_has_disentangler_and_isometry_blocks():
 
     assert isinstance(schedule.disentangler, QMeraBlockSpec)
     assert first.input_sites == tuple(range(8))
-    assert first.output_sites == (0, 2, 4, 6)
+    assert first.output_sites == tuple(range(8))
+    assert first.retained_registers == ((0, 1), (2, 3), (4, 5), (6, 7))
     assert first.isometry_blocks == ((0, 1), (2, 3), (4, 5), (6, 7))
     assert first.disentangler_blocks == ((1, 2), (3, 4), (5, 6))
     assert first.disentanglers
@@ -313,7 +346,7 @@ def test_qmera_schedule_has_disentangler_and_isometry_blocks():
     assert first.isometries[0].gate_family == "rzz"
     assert "DISENTANGLER" in first.disentanglers[0].tags
     assert "ISOMETRY" in first.isometries[0].tags
-    assert schedule.top_sites == (0,)
+    assert schedule.top_sites == (6, 7)
     assert schedule.num_scales == 3
 
 
@@ -328,8 +361,456 @@ def test_qmera_periodic_schedule_wraps_boundary_disentangler():
 
     first = builder.build_schedule().layers[0]
 
-    assert first.disentangler_blocks[-1] == (7, 0)
-    assert first.disentanglers[-1].where == (7, 0)
+    assert first.isometry_blocks[-1] == (7, 0)
+    assert first.disentangler_blocks[0] == (0, 1)
+    assert first.disentangler_blocks[-1] == (6, 7)
+    assert first.disentanglers[0].where == (0, 1)
+
+
+
+def test_qmera_1d_odd_blocks_retain_wires_and_repeat_boundary_gates():
+    """An odd chain has a ternary tail and a reproducible preparation order."""
+    schedule = QMeraBuilder(shape=7, boundary="periodic").build_schedule()
+
+    assert schedule.preparation_order
+    assert schedule.bond_qubits == 2
+    assert schedule.top_sites == (6, 0)
+    assert schedule.layers[0].isometry_blocks == (
+        (1, 2), (3, 4), (5, 6, 0)
+    )
+    assert schedule.layers[0].retained_registers == (
+        (1, 2), (3, 4), (6, 0)
+    )
+    assert schedule.layers[0].disentangler_blocks == (
+        (0, 1), (2, 3), (4, 5)
+    )
+    assert [(p.scale, p.stage, p.where) for p in schedule.placements] == [
+        (1, "isometry", (1, 2)),
+        (1, "isometry", (3, 4)),
+        (1, "isometry", (6, 0)),
+        (1, "isometry", (2, 3)),
+        (1, "isometry", (4, 6)),
+        (1, "disentangler", (6, 0)),
+        (1, "disentangler", (1, 2)),
+        (1, "disentangler", (0, 1)),
+        (0, "isometry", (1, 2)),
+        (0, "isometry", (3, 4)),
+        (0, "isometry", (5, 6)),
+        (0, "isometry", (6, 0)),
+        (0, "disentangler", (0, 1)),
+        (0, "disentangler", (2, 3)),
+        (0, "disentangler", (4, 5)),
+    ]
+
+
+
+def test_qmera_1d_explicit_retention_chooses_parent_wire():
+    """Explicit retention selects a child wire at a named RG block."""
+    builder = QMeraBuilder(
+        shape=3,
+        bond_qubits=1,
+        retention="explicit",
+        retained_registers={(0, 0): (1,)},
+    )
+    schedule = builder.build_schedule()
+
+    assert schedule.layers[0].isometry_blocks == ((0, 1, 2),)
+    assert schedule.layers[0].retained_registers == ((1,),)
+    assert schedule.top_sites == (1,)
+    with pytest.raises(ValueError, match="Missing retained register"):
+        QMeraBuilder(
+            shape=3, bond_qubits=1, retention="explicit", retained_registers={}
+        ).build_schedule()
+
+
+def test_qmera_1d_ladder_closes_each_block_and_repeats_by_depth():
+    """A ladder sweep walks adjacent wires, closes the ring, then repeats."""
+    builder = QMeraBuilder(
+        system_size=3,
+        isometry={"structure": "ladder", "circuit_depth": 2},
+        disentangler={"circuit_depth": 0},
+    )
+    placements = builder.build_schedule().layers[0].isometries
+    assert [(p.where, p.round) for p in placements] == [
+        ((0, 1), 0), ((1, 2), 1), ((2, 0), 2),
+        ((0, 1), 3), ((1, 2), 4), ((2, 0), 5),
+    ]
+    assert len({p.param_key for p in placements}) == 6
+
+    brickwall = QMeraBuilder(
+        system_size=3,
+        isometry={"structure": "brickwall", "circuit_depth": 2},
+        disentangler={"circuit_depth": 0},
+    ).build_schedule()
+    assert [p.where for p in brickwall.layers[0].isometries] == [
+        (0, 1), (1, 2), (0, 1), (1, 2),
+    ]
+    two_wires = QMeraBuilder(
+        system_size=2,
+        isometry={"structure": "ladder", "circuit_depth": 2},
+        disentangler={"circuit_depth": 0},
+    ).build_schedule()
+    assert [p.where for p in two_wires.placements] == [(0, 1), (0, 1)]
+    four_wires = QMeraBuilder(
+        system_size=4,
+        isometry={"block_size": 4, "structure": "ladder"},
+        disentangler={"circuit_depth": 0},
+    ).build_schedule()
+    assert [p.where for p in four_wires.placements] == [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+    ]
+
+
+def test_qmera_1d_ladder_can_select_boundary_disentanglers():
+    """The same cyclic structure works on a wider boundary window."""
+    schedule = QMeraBuilder(
+        system_size=4,
+        isometry={"circuit_depth": 0},
+        disentangler={"block_size": 3, "structure": "ladder", "circuit_depth": 2},
+    ).build_schedule()
+    assert [p.where for p in schedule.layers[0].disentanglers] == [
+        (1, 2), (2, 3), (3, 1), (1, 2), (2, 3), (3, 1),
+    ]
+
+    with pytest.raises(ValueError, match="structure must be"):
+        QMeraBlockSpec(kind="isometry", structure="diagonal")
+    with pytest.raises(NotImplementedError, match="unmoded spin 1D"):
+        QMeraBuilder(
+            shape=(2, 2), isometry={"structure": "ladder"}
+        ).build_schedule()
+    with pytest.raises(NotImplementedError, match="unmoded spin 1D"):
+        QMeraBuilder(
+            system_size=4, site_modes=("up", "down"),
+            disentangler={"structure": "ladder"},
+        ).build_schedule()
+
+
+def test_qmera_1d_ladder_local_energies_match_direct():
+    """The closing pair remains correct in eager and compiled lightcones."""
+    builder = QMeraBuilder(
+        system_size=3,
+        isometry={"structure": "ladder", "circuit_depth": 2},
+        disentangler={"circuit_depth": 0},
+        seed=4,
+        param_scale=0.1,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    terms = {(0, 1): _zz_term()}
+    direct = builder.direct_parametric_loss(
+        params, terms, schedule=schedule, energy_per_site=False
+    )
+    local = builder.parametric_loss(
+        params, terms, schedule=schedule, energy_per_site=False
+    )
+    compiled = builder.compile_parametric_lightcones(terms, schedule=schedule)
+    fast = builder.compiled_parametric_loss(
+        params, schedule=schedule, compiled_chunks=compiled, energy_per_site=False
+    )
+    np.testing.assert_allclose((local, fast), direct, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "ansatz, words",
+    (
+        ("minimal", ("ZZ", "YY", "XI", "IX")),
+        ("extended", ("XI", "IX", "ZZ", "YY", "XX", "XI", "IX")),
+    ),
+)
+@pytest.mark.parametrize("structure", ("brickwall", "ladder"))
+def test_qmera_1d_state_matches_independent_pauli_circuit(ansatz, words, structure):
+    """Composite pair gates and placement order must match dense rotations."""
+    builder = QMeraBuilder(
+        system_size=3, boundary="periodic", initial_hadamards=True,
+        pair_ansatz=ansatz,
+        isometry={"structure": structure},
+        disentangler={"structure": structure},
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    for index, key in enumerate(params):
+        params[key] = np.array([0.03 * (index + j + 1) for j in range(len(words))])
+    state, _ = builder.build_state(params, schedule)
+
+    paulis = {
+        "I": np.eye(2),
+        "X": np.array([[0, 1], [1, 0]]),
+        "Y": np.array([[0, -1j], [1j, 0]]),
+        "Z": np.diag([1, -1]),
+    }
+    expected = np.full(8, 1 / np.sqrt(8), dtype=complex)
+    for placement in schedule.placements:
+        for word, angle in zip(words, params[placement.param_key]):
+            pair = np.kron(paulis[word[0]], paulis[word[1]])
+            rotation = np.cos(angle / 2) * np.eye(4) - 1j * np.sin(angle / 2) * pair
+            where = placement.where
+            order = (*where, *(site for site in range(3) if site not in where))
+            shaped = np.transpose(expected.reshape(2, 2, 2), order).reshape(4, -1)
+            expected = np.transpose(
+                (rotation @ shaped).reshape(2, 2, 2), np.argsort(order)
+            ).reshape(-1)
+    np.testing.assert_allclose(np.asarray(state.to_dense()).reshape(-1), expected)
+
+    zero_builder = QMeraBuilder(shape=3)
+    assert not zero_builder.build_schedule().initial_hadamards
+    zero_state, _ = zero_builder.build_state(
+        zero_builder.initialize_parameters(), zero_builder.build_schedule()
+    )
+    np.testing.assert_allclose(
+        np.asarray(zero_state.to_dense()).reshape(-1),
+        np.array([1, 0, 0, 0, 0, 0, 0, 0]),
+    )
+
+
+def test_qmera_pair_spec_supports_repeated_custom_generators():
+    """A pair family keeps one independent parameter per ordered rotation."""
+    pair = QMeraPairSpec(("ZZ", "XI"), repetitions=2, name="custom-test")
+    gate = qmera_pair_gate_spec(pair)
+    matrix = np.asarray(gate.matrix(np.array([0.1, 0.2, 0.3, 0.4]))).reshape(4, 4)
+
+    assert gate.name == "qmera-custom-test"
+    assert gate.num_params == 4
+    np.testing.assert_allclose(matrix.conj().T @ matrix, np.eye(4), atol=1e-14)
+    with pytest.raises(ValueError, match="preserve global-X"):
+        QMeraPairSpec(("XZ",))
+
+
+def test_qmera_pair_rotation_sequence_is_explicit():
+    """Public pair descriptions show chronological gates and angle order."""
+    expected = {
+        "minimal": (("RZZ", (0, 1)), ("RYY", (0, 1)), ("RX", (0,)), ("RX", (1,))),
+        "extended": (
+            ("RX", (0,)), ("RX", (1,)), ("RZZ", (0, 1)),
+            ("RYY", (0, 1)), ("RXX", (0, 1)), ("RX", (0,)), ("RX", (1,)),
+        ),
+        "ising": (("RZZ", (0, 1)), ("RX", (0,)), ("RX", (1,))),
+        "real_z2": (("RYZ", (0, 1)), ("RZY", (0, 1))),
+        "pauli_z2": (
+            ("RX", (0,)), ("RX", (1,)), ("RXX", (0, 1)),
+            ("RYY", (0, 1)), ("RYZ", (0, 1)), ("RZY", (0, 1)),
+            ("RZZ", (0, 1)),
+        ),
+        "unrestricted": (
+            ("RX", (0,)), ("RX", (1,)), ("RY", (0,)), ("RY", (1,)),
+            ("RZ", (0,)), ("RZ", (1,)), ("RXX", (0, 1)),
+            ("RXY", (0, 1)), ("RXZ", (0, 1)), ("RYX", (0, 1)),
+            ("RYY", (0, 1)), ("RYZ", (0, 1)), ("RZX", (0, 1)),
+            ("RZY", (0, 1)), ("RZZ", (0, 1)),
+        ),
+    }
+    for name, sequence in expected.items():
+        pair = get_qmera_pair_ansatz(name)
+        assert pair.rotation_sequence == sequence
+        assert pair.num_params == len(sequence)
+
+    repeated = get_qmera_pair_ansatz("extended", repetitions=2)
+    assert repeated.rotation_sequence == expected["extended"] * 2
+    custom = QMeraPairSpec(("ZI", "IX", "XZ"), symmetry="unrestricted")
+    assert custom.rotation_sequence == (
+        ("RZ", (0,)), ("RX", (1,)), ("RXZ", (0, 1)),
+    )
+
+
+@pytest.mark.parametrize(
+    "preferred, legacy",
+    (
+        ("z2_zz_yy_rx", "minimal"),
+        ("z2_rx_zz_yy_xx_rx", "extended"),
+        ("z2_zz_rx", "ising"),
+        ("z2_yz_zy", "real_z2"),
+        ("z2_all_paulis", "pauli_z2"),
+        ("all_paulis", "unrestricted"),
+    ),
+)
+def test_qmera_preferred_pair_names_keep_legacy_gate_families(preferred, legacy):
+    """Renamed templates generate the same rotations without breaking old IDs."""
+    named = get_qmera_pair_ansatz(preferred)
+    old = get_qmera_pair_ansatz(legacy)
+    assert named.generators == old.generators
+    assert named.symmetry == old.symmetry
+    assert named.initialization == old.initialization
+    assert named.rotation_sequence == old.rotation_sequence
+    angles = np.linspace(0.03, 0.17, named.num_params)
+    np.testing.assert_allclose(
+        qmera_pair_gate_spec(named).matrix(angles),
+        qmera_pair_gate_spec(old).matrix(angles),
+    )
+
+    new_builder = QMeraBuilder(shape=3, pair_ansatz=preferred)
+    old_builder = QMeraBuilder(shape=3, ansatz=legacy)
+    assert new_builder.pair_ansatz == named
+    assert old_builder.pair_ansatz == old
+    assert new_builder.build_schedule().placements[0].gate_family == f"qmera-{preferred}"
+    assert old_builder.build_schedule().placements[0].gate_family == f"qmera-{old.name}"
+
+
+def test_qmera_1d_ansatz_selector_exposes_circuit_symmetry():
+    """Named templates specify the pair circuit independently of its input."""
+    choices = available_qmera_pair_ansatzes()
+    assert choices == (
+        "z2_zz_yy_rx", "z2_rx_zz_yy_xx_rx", "z2_zz_rx",
+        "z2_yz_zy", "z2_all_paulis", "all_paulis",
+    )
+    assert available_qmera_pair_ansatze() == (
+        "minimal", "extended", "ising", "real_z2", "pauli_z2", "unrestricted",
+    )
+    assert available_qmera_pair_ansatzes(include_aliases=True)[6:] == (
+        "minimal", "extended", "ising", "real_z2", "pauli_z2", "unrestricted",
+    )
+    x = np.array([[0, 1], [1, 0]])
+    xx = np.kron(x, x)
+    for name in choices:
+        pair = get_qmera_pair_ansatz(name)
+        builder = QMeraBuilder(shape=4, ansatz=name)
+        schedule = builder.build_schedule()
+        gate = builder.gate_registry.get(schedule.placements[0].gate_family)
+        angles = np.linspace(0.03, 0.17, gate.num_params)
+        matrix = np.asarray(gate.matrix(angles)).reshape(4, 4)
+
+        assert builder.pair_ansatz == pair
+        assert gate.num_params == pair.num_params
+        assert {placement.gate_family for placement in schedule.placements} == {
+            gate.name
+        }
+        assert builder.build(build_state=False).metadata["spin_circuit_symmetry"] == pair.symmetry
+        np.testing.assert_allclose(matrix.conj().T @ matrix, np.eye(4), atol=1e-14)
+        if name != "all_paulis":
+            assert pair.preserves_global_x
+            np.testing.assert_allclose(matrix @ xx, xx @ matrix, atol=1e-14)
+        else:
+            assert not pair.preserves_global_x
+            broken = np.zeros(gate.num_params)
+            broken[pair.generators.index("ZI")] = 0.23
+            breaking_gate = np.asarray(gate.matrix(broken)).reshape(4, 4)
+            assert not np.allclose(breaking_gate @ xx, xx @ breaking_gate)
+
+    assert get_qmera_pair_ansatz("extended", repetitions=2).num_params == 14
+    assert get_qmera_pair_ansatz("extended").num_params == 7
+    assert get_qmera_pair_ansatz("minimal").initialization == "shared"
+    assert get_qmera_pair_ansatz("extended").initialization == "independent"
+    minimal_builder = QMeraBuilder(shape=3, ansatz="minimal", seed=7, param_scale=0.2)
+    minimal_values = next(iter(minimal_builder.initialize_parameters().values()))
+    assert len(set(minimal_values)) == 1
+    extended_builder = QMeraBuilder(shape=3, ansatz="extended", seed=7, param_scale=0.2)
+    extended_values = next(iter(extended_builder.initialize_parameters().values()))
+    assert len(set(extended_values)) == 7
+    with pytest.raises(ValueError, match="Unknown qMERA pair ansatz"):
+        QMeraBuilder(shape=4, ansatz="unknown")
+    with pytest.raises(ValueError, match="ansatz or gate_family"):
+        QMeraBuilder(shape=4, ansatz="minimal", gate_family="rxx")
+    with pytest.raises(ValueError, match="unmoded spin 1D"):
+        QMeraBuilder(shape=(2, 2), ansatz="minimal")
+
+
+def test_qmera_1d_symmetry_choice_selects_and_checks_pair_ansatz():
+    """The high-level symmetry choice cannot silently change the pair circuit."""
+    z2 = QMeraBuilder(shape=4, spin_symmetry="z2")
+    unrestricted = QMeraBuilder(shape=4, spin_symmetry="unrestricted")
+    extended = QMeraBuilder(shape=4, spin_symmetry="global-X-Z2", ansatz="extended")
+
+    assert QMeraBuilder(shape=4).pair_ansatz.name == "z2_zz_yy_rx"
+    assert get_qmera_pair_ansatz().name == "minimal"
+    assert z2.pair_ansatz.name == "z2_zz_yy_rx"
+    assert z2.spin_symmetry == "global-X-Z2"
+    assert unrestricted.pair_ansatz.name == "all_paulis"
+    assert unrestricted.spin_symmetry == "unrestricted"
+    assert extended.spin_symmetry == "global-X-Z2"
+    assert z2.build(build_state=False).metadata["spin_circuit_symmetry"] == "global-X-Z2"
+    assert unrestricted.build(build_state=False).metadata["spin_circuit_symmetry"] == "unrestricted"
+
+    with pytest.raises(ValueError, match="pair_ansatz or the legacy ansatz"):
+        QMeraBuilder(shape=4, pair_ansatz="z2_zz_yy_rx", ansatz="minimal")
+    with pytest.raises(ValueError, match="does not match spin_symmetry"):
+        QMeraBuilder(shape=4, spin_symmetry="z2", pair_ansatz="all_paulis")
+    with pytest.raises(ValueError, match="does not match spin_symmetry"):
+        QMeraBuilder(shape=4, spin_symmetry="unrestricted", ansatz="minimal")
+    with pytest.raises(ValueError, match="spin_symmetry must be"):
+        QMeraBuilder(shape=4, spin_symmetry="U1")
+    with pytest.raises(ValueError, match="gate_family overrides"):
+        QMeraBuilder(shape=4, spin_symmetry="z2", gate_family="rxx")
+    normalized = QMeraBuilder(
+        shape=4, ansatz="minimal", isometry={"gate_family": "qmera_minimal"}
+    )
+    assert normalized.spin_symmetry == "global-X-Z2"
+    with pytest.raises(ValueError, match="every 1D pair gate"):
+        QMeraBuilder(
+            shape=4,
+            spin_symmetry="z2",
+            scales=({"isometry": {"gate_family": "rzz"}},),
+            max_layers=1,
+            top_size=2,
+        ).build_schedule()
+    with pytest.raises(ValueError, match="unmoded spin 1D"):
+        QMeraBuilder(shape=(2, 2), spin_symmetry="z2")
+
+    mixed = QMeraBuilder(shape=4, isometry_gate_family="rzz")
+    assert mixed.pair_ansatz is None
+    assert mixed.spin_symmetry is None
+    assert mixed.build(build_state=False).metadata["spin_circuit_symmetry"] is None
+
+
+def test_qmera_initial_state_is_separate_from_spin_symmetry():
+    """The public input-state choice and legacy Hadamard flag agree."""
+    zero = QMeraBuilder(shape=3, spin_symmetry="z2", initial_state="zero")
+    plus = QMeraBuilder(shape=3, spin_symmetry="z2", initial_state="plus")
+    legacy_plus = QMeraBuilder(shape=3, ansatz="minimal", initial_hadamards=True)
+
+    assert zero.initial_state == "zero"
+    assert not zero.build_schedule().initial_hadamards
+    assert plus.initial_state == "plus"
+    assert plus.build_schedule().initial_hadamards
+    assert legacy_plus.initial_state == "plus"
+    assert zero.spin_symmetry == plus.spin_symmetry == "global-X-Z2"
+    assert plus.build(build_state=False).metadata["initial_state"] == "plus"
+
+    with pytest.raises(ValueError, match="initial_state or initial_hadamards"):
+        QMeraBuilder(shape=3, initial_state="zero", initial_hadamards=False)
+    with pytest.raises(ValueError, match="initial_state must be"):
+        QMeraBuilder(shape=3, initial_state="mixed")
+    with pytest.raises(ValueError, match="plus input state"):
+        QMeraBuilder(shape=3, site_modes=("mode",), initial_state="plus")
+    with pytest.raises(ValueError, match="product_state_factory or an initial state"):
+        QMeraBuilder(
+            shape=3,
+            initial_state="plus",
+            product_state_factory=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_qmera_1d_custom_ansatz_checks_symmetry_contract():
+    """Custom Pauli words require an explicit unrestricted declaration."""
+    with pytest.raises(ValueError, match="preserve global-X"):
+        QMeraPairSpec(("ZI", "XX"))
+    assert QMeraPairSpec(("ZZ",), symmetry="z2").symmetry == "global-X-Z2"
+    pair = QMeraPairSpec(("ZI", "XX"), symmetry="unrestricted", name="custom")
+    builder = QMeraBuilder(shape=4, ansatz=pair)
+    assert builder.pair_ansatz.symmetry == "unrestricted"
+    assert builder.build_schedule().placements[0].gate_family == "qmera-custom"
+    with pytest.raises(ValueError, match="both 1D isometry and disentangler"):
+        QMeraBuilder(
+            shape=4,
+            ansatz="minimal",
+            isometry={"gate_family": "rzz"},
+        )
+
+
+def test_qmera_initial_hadamards_select_sector_not_gate_symmetry():
+    """A Z2 circuit can start in or outside a definite global-X sector."""
+    x = np.array([[0, 1], [1, 0]])
+    global_x = np.kron(np.kron(x, x), x)
+    for hadamards, expected_parity in ((False, 0.0), (True, 1.0)):
+        builder = QMeraBuilder(
+            shape=3,
+            spin_symmetry="z2",
+            initial_state="plus" if hadamards else "zero",
+        )
+        schedule = builder.build_schedule()
+        state, _ = builder.build_state(builder.initialize_parameters(schedule), schedule)
+        vector = np.asarray(state.to_dense()).reshape(-1)
+        assert builder.pair_ansatz.preserves_global_x
+        assert np.vdot(vector, global_x @ vector).real == pytest.approx(
+            expected_parity
+        )
 
 
 def test_qmera_2d_schedule_uses_rg_blocks_and_face_disentanglers():
@@ -2086,6 +2567,53 @@ def test_qmera_parametric_optimizer_runs_compiled_torch_solver():
     assert opt.compiled_chunks
     assert opt.losses == result.history
     assert set(result.params) == set(params)
+
+
+
+@pytest.mark.parametrize("ansatz", ("minimal", "unrestricted"))
+def test_qmera_default_1d_compiled_torch_energy_and_gradient(ansatz):
+    """Both Z2 and unrestricted pair gates retain compiled Torch gradients."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    builder = QMeraBuilder(
+        shape=4,
+        ansatz=ansatz,
+        seed=11,
+        param_scale=0.1,
+        parameter_backend=backend_torch(dtype=torch.float64),
+        array_backend=backend_torch(dtype=torch.complex128),
+    )
+    schedule = builder.build_schedule()
+    params = {
+        key: value.detach().clone().requires_grad_()
+        for key, value in builder.initialize_parameters(schedule).items()
+    }
+    compiled = builder.compile_parametric_lightcones(
+        {(0, 1): _zz_term()}, schedule
+    )
+    value = builder.compiled_parametric_loss(
+        params,
+        schedule=schedule,
+        compiled_chunks=compiled,
+        energy_per_site=False,
+    )
+    direct = builder.parametric_loss(
+        params,
+        {(0, 1): _zz_term()},
+        schedule=schedule,
+        energy_per_site=False,
+    )
+    gradients = torch.autograd.grad(value, tuple(params.values()))
+
+    assert schedule.placements[0].gate_family == f"qmera-{ansatz}"
+    assert all(
+        parameter.numel() == builder.pair_ansatz.num_params
+        for parameter in params.values()
+    )
+    assert float(value) == pytest.approx(float(direct))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(torch.any(gradient != 0) for gradient in gradients)
 
 
 def test_qmera_compiled_parametric_loss_jax_jit_smoke():

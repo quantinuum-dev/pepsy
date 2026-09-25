@@ -40,8 +40,8 @@ def _normalize_stage(stage):
 
 def _normalize_structure(structure):
     key = str(structure).strip().lower().replace("_", "-")
-    if key != "brickwall":
-        raise NotImplementedError("only brickwall qMERA schedules are implemented.")
+    if key not in {"brickwall", "ladder"}:
+        raise ValueError("structure must be 'brickwall' or 'ladder'.")
     return key
 
 
@@ -404,6 +404,7 @@ class QMeraLayerSpec:
     isometries: tuple[QMeraGatePlacement, ...]
     disentangler_spec: QMeraBlockSpec | None = None
     isometry_spec: QMeraBlockSpec | None = None
+    retained_registers: tuple[tuple[int, ...], ...] = ()
 
     @property
     def placements(self):
@@ -421,10 +422,20 @@ class QMeraSchedule:
     isometry: QMeraBlockSpec
     top_sites: tuple[int, ...]
     scale_specs: tuple[QMeraScaleSpec, ...] = ()
+    preparation_order: bool = False
+    bond_qubits: int | None = None
+    retention: str | None = None
+    initial_hadamards: bool = False
 
     @property
     def placements(self):
         """All gate placements in execution order."""
+        if self.preparation_order:
+            return tuple(
+                placement
+                for layer in reversed(self.layers)
+                for placement in (*layer.isometries, *layer.disentanglers)
+            )
         return tuple(placement for layer in self.layers for placement in layer.placements)
 
     @property
@@ -1158,6 +1169,194 @@ def _boundary_blocks_2d(
     return tuple(blocks), tuple(pairs_by_block), tuple(axes)
 
 
+def _retain_1d_registers(registers, count, policy, choices, *, scale, block):
+    """Select parent wires from the ordered child registers."""
+    pool = tuple(site for register in registers for site in register)
+    if policy == "explicit":
+        try:
+            retained = tuple(choices.pop((scale, block)))
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"Missing retained register for scale {scale} block {block}.") from exc
+    elif policy == "right":
+        retained = pool[-count:]
+    elif policy == "left":
+        retained = pool[:count]
+    else:
+        quotas = [0] * len(registers)
+        while sum(quotas) < count:
+            for index, register in enumerate(registers):
+                if quotas[index] < len(register) and sum(quotas) < count:
+                    quotas[index] += 1
+        retained = tuple(
+            register[(2 * index + 1) * len(register) // (2 * quota)]
+            for register, quota in zip(registers, quotas)
+            for index in range(quota)
+        )
+    if (
+        len(retained) != count
+        or any(not isinstance(site, int) or isinstance(site, bool) for site in retained)
+        or len(set(retained)) != count
+        or tuple(site for site in pool if site in retained) != retained
+    ):
+        raise ValueError(
+            f"Scale {scale} block {block} must retain {count} unique child "
+            f"wires in order from {pool!r}."
+        )
+    return retained
+
+
+def _child_groups_1d(clusters, block_size):
+    """Cover a frontier without a singleton: binary odd tails become triples."""
+    groups = []
+    start = 0
+    while start < len(clusters):
+        remaining = len(clusters) - start
+        width = block_size + 1 if remaining == block_size + 1 else min(block_size, remaining)
+        groups.append(tuple(clusters[start : start + width]))
+        start += width
+    return tuple(groups)
+
+
+def _preparation_placements_1d(blocks, *, scale, spec, counter_start):
+    """Emit one block-major pair sequence per circuit-depth repetition."""
+    placements = []
+    counter = counter_start
+    short = "ISO" if spec.kind == "isometry" else "DIS"
+    for block_index, wires in enumerate(blocks):
+        if spec.structure == "ladder":
+            pairs = tuple(zip(wires, wires[1:]))
+            if len(wires) > 2:
+                pairs += ((wires[-1], wires[0]),)
+            # Consecutive ladder gates overlap, so each is its own subround.
+            rounds = tuple((pair,) for pair in pairs)
+        else:
+            first = tuple(zip(wires[0::2], wires[1::2]))
+            second = tuple(zip(wires[1::2], wires[2::2]))
+            rounds = (first, second) if scale > 0 or len(wires) > 2 else (first,)
+        for depth in range(spec.circuit_depth):
+            for local_round, pairs in enumerate(rounds):
+                round_index = depth * len(rounds) + local_round
+                for pair in pairs:
+                    gate_id = f"L{scale}_{short}_{counter:04d}"
+                    placements.append(
+                        QMeraGatePlacement(
+                            gate_id=gate_id,
+                            param_key=_parameter_key(
+                                gate_id, scale=scale, block=block_index,
+                                stage_spec=spec, axis=None,
+                            ),
+                            where=tuple(pair),
+                            scale=scale,
+                            stage=spec.kind,
+                            round=round_index,
+                            block=block_index,
+                            gate_family=spec.gate_family,
+                            tags=_placement_tags(
+                                gate_id, scale=scale, stage=spec.kind,
+                                round_index=round_index, block=block_index,
+                                gate_family=spec.gate_family,
+                            ),
+                        )
+                    )
+                    counter += 1
+    return tuple(placements), counter
+
+
+def _build_preparation_schedule_1d(
+    geometry, *, disentangler, isometry, scale_specs, max_layers,
+    top_size, bond_qubits, retention, retained_registers,
+):
+    """Build the retained-register 1D circuit from fine RG blocks.
+
+    Layers describe fine-to-coarse interfaces. Their gate placements execute
+    in reverse layer order, isometry first and boundary disentangler second.
+    """
+    if not isinstance(bond_qubits, int) or isinstance(bond_qubits, bool) or bond_qubits < 1:
+        raise ValueError("bond_qubits must be a positive integer.")
+    if retention not in {"right", "left", "balanced", "explicit"}:
+        raise ValueError("retention must be right, left, balanced or explicit.")
+    if (retention == "explicit") != (retained_registers is not None):
+        raise ValueError("retained_registers is required only for explicit retention.")
+    choices = dict(retained_registers or {})
+    sites = geometry.register_sites
+    if geometry.boundary == "periodic":
+        sites = (*sites[1:], sites[0])
+    clusters = [((site,), 1) for site in sites]
+    layers = []
+    counter = 0
+    while len(clusters) > top_size and (max_layers is None or len(layers) < max_layers):
+        scale = len(layers)
+        if scale_specs is None:
+            scale_dis, scale_iso = disentangler, isometry
+        elif scale >= len(scale_specs):
+            raise ValueError("qMERA scale plan ended before reaching top_size.")
+        else:
+            scale_dis, scale_iso = scale_specs[scale]
+        if scale_dis.placement != "boundary-faces":
+            raise ValueError("1D preparation disentanglers must act on block boundaries.")
+        boundary_width = _block_shape(scale_dis.block_size, 1)[0]
+        if boundary_width < 2:
+            raise ValueError("1D boundary disentangler width must be at least 2.")
+        width = _block_shape(scale_iso.block_size, 1)[0]
+        if width < 2:
+            raise ValueError("1D isometry block length must be at least 2.")
+        groups = _child_groups_1d(clusters, width)
+        parents = []
+        t_blocks = []
+        retained_by_block = []
+        for block_index, group in enumerate(groups):
+            registers = tuple(child[0] for child in group)
+            wires = tuple(site for register in registers for site in register)
+            count = min(bond_qubits, sum(child[1] for child in group))
+            retained = _retain_1d_registers(
+                registers, count, retention, choices, scale=scale, block=block_index,
+            )
+            parents.append((retained, sum(child[1] for child in group)))
+            t_blocks.append(wires)
+            retained_by_block.append(retained)
+        u_blocks = []
+        if geometry.boundary == "periodic" and scale_dis.periodic_wrap:
+            boundaries = range(len(groups))
+        else:
+            boundaries = range(1, len(groups))
+        for index in boundaries:
+            before = groups[index - 1]
+            after = groups[index]
+            if before is after:
+                left_count = right_count = 1
+            else:
+                left_count = min(len(before), max(1, boundary_width // 2))
+                right_count = min(len(after), max(1, boundary_width - left_count))
+            previous = tuple(site for child in before[-left_count:] for site in child[0])
+            following = tuple(site for child in after[:right_count] for site in child[0])
+            u_blocks.append((*previous, *following))
+        iso, counter = _preparation_placements_1d(
+            t_blocks, scale=scale, spec=scale_iso, counter_start=counter,
+        )
+        dis, counter = _preparation_placements_1d(
+            u_blocks, scale=scale, spec=scale_dis, counter_start=counter,
+        )
+        layers.append(
+            QMeraLayerSpec(
+                scale=scale,
+                input_sites=tuple(site for cluster in clusters for site in cluster[0]),
+                output_sites=tuple(site for parent in parents for site in parent[0]),
+                disentangler_blocks=tuple(u_blocks),
+                isometry_blocks=tuple(t_blocks),
+                disentanglers=dis,
+                isometries=iso,
+                disentangler_spec=scale_dis,
+                isometry_spec=scale_iso,
+                retained_registers=tuple(retained_by_block),
+            )
+        )
+        clusters = parents
+    if choices:
+        raise ValueError(f"Unknown explicit retained-register keys: {tuple(choices)!r}.")
+    top_sites = tuple(site for cluster in clusters for site in cluster[0])
+    return layers, top_sites, counter
+
+
 def _build_qmera_schedule_1d(
     geometry,
     *,
@@ -1424,8 +1623,12 @@ def build_qmera_schedule(
     scales=None,
     max_layers=None,
     top_size=1,
+    bond_qubits=2,
+    retention="right",
+    retained_registers=None,
+    initial_hadamards=False,
 ):
-    """Build a deterministic brickwall qMERA schedule."""
+    """Build a deterministic qMERA schedule."""
     geometry = geometry if isinstance(geometry, QMeraGeometry) else QMeraGeometry(geometry)
     disentangler = _coerce_schedule_block(
         disentangler,
@@ -1480,7 +1683,29 @@ def build_qmera_schedule(
     if max_layers is not None and max_layers < 0:
         raise ValueError("max_layers must be >= 0.")
 
-    if geometry.ndim == 1:
+    spin_1d = geometry.ndim == 1 and not geometry.has_explicit_modes
+    active_specs = scale_pairs if scale_pairs is not None else ((disentangler, isometry),)
+    if not spin_1d and any(
+        spec.structure == "ladder" for pair in active_specs for spec in pair
+    ):
+        raise NotImplementedError("ladder qMERA blocks currently require unmoded spin 1D geometry.")
+    if initial_hadamards and geometry.has_explicit_modes:
+        raise ValueError("Hadamard initialization is for spin/qubit geometries only.")
+    if spin_1d:
+        layers, top_sites, _ = _build_preparation_schedule_1d(
+            geometry,
+            disentangler=disentangler,
+            isometry=isometry,
+            scale_specs=scale_pairs,
+            max_layers=max_layers,
+            top_size=top_size,
+            bond_qubits=bond_qubits,
+            retention=retention,
+            retained_registers=retained_registers,
+        )
+    elif geometry.ndim == 1:
+        if bond_qubits != 2 or retention != "right" or retained_registers is not None:
+            raise ValueError("retained-register options require a one-mode 1D geometry.")
         layers, top_sites, _ = _build_qmera_schedule_1d(
             geometry,
             disentangler=disentangler,
@@ -1490,6 +1715,8 @@ def build_qmera_schedule(
             top_size=top_size,
         )
     elif geometry.ndim == 2:
+        if bond_qubits != 2 or retention != "right" or retained_registers is not None:
+            raise ValueError("retained-register options currently require 1D geometry.")
         layers, top_sites, _ = _build_qmera_schedule_2d(
             geometry,
             disentangler=disentangler,
@@ -1518,4 +1745,8 @@ def build_qmera_schedule(
         scale_specs=()
         if normalized_scales is None
         else normalized_scales,
+        preparation_order=spin_1d,
+        bond_qubits=bond_qubits if spin_1d else None,
+        retention=retention if spin_1d else None,
+        initial_hadamards=bool(initial_hadamards),
     )

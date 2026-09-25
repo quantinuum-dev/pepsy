@@ -94,6 +94,21 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- The main spin 1D `QMeraBuilder` now uses retained-register qMERA blocks,
+  ternary odd tails, boundary disentanglers, coarse-to-fine gate execution,
+  and a selectable spin pair ansatz. Five ml4mb templates preserve global-X
+  Z₂; an unrestricted 15-angle Pauli template permits symmetry breaking.
+  The spin-only `spin_symmetry` contract and separate `initial_state` option
+  make those choices explicit. `pair_ansatz=` and names such as
+  `z2_zz_yy_rx` and `z2_rx_zz_yy_xx_rx` identify the gate templates; the old
+  names remain accepted. `QMeraPairSpec.rotation_sequence` shows the ordered
+  logical rotations and their pair wires. `system_size=N` names the 1D
+  site count; `shape=N` remains accepted. Spin 1D isometry and boundary
+  blocks now accept `structure="ladder"`, which closes each block and repeats
+  its full pair sequence with `circuit_depth`. It accepts bond width and
+  retention policy; the 2D and explicit-mode fermion schedules retain their
+  existing behavior.
+
 - Shared optimizer event parsing now lives outside the MPS replay module.
   Tree layout can import it without initializing MPS replay or FIT, while
   existing parser import paths remain available.

@@ -56,7 +56,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   chi-scaled work proxies.
 - `qmera/`: schedule-first qMERA local-energy objectives, parameter
   dictionaries, compiled lightcone contractions, schematics, and
-  Symmray-native fermion helpers.
+  Symmray-native fermion helpers. The main spin 1D builder uses retained
+  registers, boundary disentanglers, brickwall or cyclic ladder pair rounds,
+  and explicit Z₂ or unrestricted Pauli pair templates selected by
+  `pair_ansatz=`. `system_size=N` names the 1D
+  site count; 2D and explicit-mode fermions retain their existing schedules.
 - `global_opt.py`: whole-network variational optimization helpers.
 
 Entries described as extraction targets are proposals, not implemented

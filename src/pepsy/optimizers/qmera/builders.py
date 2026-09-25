@@ -21,7 +21,14 @@ from .compiled import (
     qmera_compiled_parametric_energy,
 )
 from .cache import build_qmera_contraction_optimizer
-from .gates import GateRegistry, default_gate_registry, resolve_gate_spec
+from .gates import (
+    GateRegistry,
+    QMeraPairSpec,
+    default_gate_registry,
+    get_qmera_pair_ansatz,
+    qmera_pair_gate_spec,
+    resolve_gate_spec,
+)
 from .geometry import QMeraGeometry
 from .lightcones import (
     build_qmera_parametric_lightcone_chunks,
@@ -185,6 +192,16 @@ def _normalize_gate_token(value):
     return {"fermionic": "fermion", "qubit": "spin"}.get(key, key)
 
 
+def _normalize_spin_symmetry(value):
+    """Normalize the public 1D spin circuit symmetry choice."""
+    key = str(value).strip().lower().replace("_", "-")
+    if key in {"z2", "global-x-z2"}:
+        return "global-X-Z2"
+    if key == "unrestricted":
+        return "unrestricted"
+    raise ValueError("spin_symmetry must be 'z2' or 'unrestricted'.")
+
+
 class QMeraBuilder:
     """Build a schedule-first qMERA ansatz from explicit Pepsy objects."""
 
@@ -193,6 +210,7 @@ class QMeraBuilder:
         *,
         geometry=None,
         shape=None,
+        system_size: int | None = None,
         boundary="open",
         mapper=None,
         site_modes=None,
@@ -202,17 +220,33 @@ class QMeraBuilder:
         disentangler=None,
         isometry=None,
         scales=None,
-        gate_family: str = "rxx",
+        spin_symmetry: str | None = None,
+        ansatz: str | QMeraPairSpec | None = None,
+        pair_ansatz: str | QMeraPairSpec | None = None,
+        gate_family: str | None = None,
         isometry_gate_family: str | None = None,
         gate_registry: GateRegistry | None = None,
         max_layers: int | None = None,
         top_size: int = 1,
+        bond_qubits: int = 2,
+        retention: str = "right",
+        retained_registers=None,
+        initial_state: str | None = None,
+        initial_hadamards: bool | None = None,
         seed: int | None = None,
         param_scale: float = 0.0,
         array_backend=None,
         parameter_backend=None,
         product_state_factory=None,
     ):
+        if system_size is not None:
+            if geometry is not None or shape is not None:
+                raise TypeError("Provide system_size or shape/geometry, not both.")
+            if isinstance(system_size, bool) or not isinstance(system_size, (int, np.integer)):
+                raise TypeError("system_size must be a positive integer for 1D.")
+            if system_size < 1:
+                raise ValueError("system_size must be a positive integer for 1D.")
+            shape = int(system_size)
         self.fermion = fermion
         if fermion is not None and not callable(
             getattr(fermion, "local_terms", None)
@@ -263,6 +297,69 @@ class QMeraBuilder:
                     f"helper: expected {expected_modes!r}, got {actual_modes!r}."
                 )
         self.physical_dim = int(physical_dim)
+        if pair_ansatz is not None:
+            if ansatz is not None:
+                raise ValueError("Choose pair_ansatz or the legacy ansatz keyword, not both.")
+            ansatz = pair_ansatz
+        spin_1d = self.geometry.ndim == 1 and not self.geometry.has_explicit_modes
+        requested_symmetry = (
+            None if spin_symmetry is None else _normalize_spin_symmetry(spin_symmetry)
+        )
+        self._explicit_pair_ansatz = ansatz is not None or requested_symmetry is not None
+        if self._explicit_pair_ansatz:
+            if not spin_1d:
+                raise ValueError("spin_symmetry and pair_ansatz/ansatz require an unmoded spin 1D geometry.")
+            if gate_family is not None or isometry_gate_family is not None:
+                raise ValueError(
+                    "Choose spin_symmetry/pair_ansatz/ansatz or gate_family overrides, not both."
+                )
+        selected_ansatz = ansatz
+        if selected_ansatz is None and requested_symmetry is not None:
+            selected_ansatz = (
+                "z2_zz_yy_rx" if requested_symmetry == "global-X-Z2" else "all_paulis"
+            )
+        self._default_pair_ansatz = (
+            get_qmera_pair_ansatz("z2_zz_yy_rx" if selected_ansatz is None else selected_ansatz)
+            if spin_1d and (selected_ansatz is not None or gate_family is None)
+            else None
+        )
+        if (
+            requested_symmetry is not None
+            and self._default_pair_ansatz.symmetry != requested_symmetry
+        ):
+            raise ValueError(
+                f"ansatz {self._default_pair_ansatz.name!r} does not match "
+                f"spin_symmetry={requested_symmetry!r}."
+            )
+        self._pair_gate_name = (
+            qmera_pair_gate_spec(self._default_pair_ansatz).name
+            if self._default_pair_ansatz is not None
+            else None
+        )
+        if gate_family is None:
+            gate_family = self._pair_gate_name or "rxx"
+        if initial_state is not None and initial_hadamards is not None:
+            raise ValueError("Choose initial_state or initial_hadamards, not both.")
+        if product_state_factory is not None:
+            if initial_state is not None or initial_hadamards:
+                raise ValueError(
+                    "Choose product_state_factory or an initial state option, not both."
+                )
+            self.initial_state = "custom"
+        else:
+            if initial_state is None:
+                initial_state = "plus" if initial_hadamards else "zero"
+            if initial_state not in {"zero", "plus"}:
+                raise ValueError("initial_state must be 'zero' or 'plus'.")
+            if initial_state == "plus" and self.geometry.has_explicit_modes:
+                raise ValueError("The plus input state is for spin/qubit geometries only.")
+            self.initial_state = initial_state
+        self.initial_hadamards = self.initial_state == "plus"
+        self.bond_qubits = bond_qubits
+        self.retention = retention
+        self.retained_registers = (
+            None if retained_registers is None else dict(retained_registers)
+        )
         if self.physical_dim != 2:
             raise NotImplementedError("QMeraBuilder currently supports qubits only.")
         self.gate_registry = (
@@ -270,6 +367,8 @@ class QMeraBuilder:
             if gate_registry is None
             else gate_registry.copy()
         )
+        if self._default_pair_ansatz is not None:
+            self.gate_registry.register(qmera_pair_gate_spec(self._default_pair_ansatz))
         self.disentangler = _coerce_block_spec(
             disentangler,
             kind="disentangler",
@@ -282,6 +381,13 @@ class QMeraBuilder:
         )
         self._validate_unitary_spec(self.disentangler)
         self._validate_unitary_spec(self.isometry)
+        if self._explicit_pair_ansatz and (
+            _normalize_gate_token(self.disentangler.gate_family)
+            != _normalize_gate_token(self._pair_gate_name)
+            or _normalize_gate_token(self.isometry.gate_family)
+            != _normalize_gate_token(self._pair_gate_name)
+        ):
+            raise ValueError("pair_ansatz/ansatz must control both 1D isometry and disentangler gates.")
         if scales is not None:
             self.scales = tuple(scales)
             for scale in self.scales:
@@ -291,6 +397,19 @@ class QMeraBuilder:
                     )
         else:
             self.scales = None
+        self.pair_ansatz = (
+            self._default_pair_ansatz
+            if self._explicit_pair_ansatz
+            or (
+                self._default_pair_ansatz is not None
+                and self.scales is None
+                and _normalize_gate_token(self.disentangler.gate_family)
+                == _normalize_gate_token(self._pair_gate_name)
+                and _normalize_gate_token(self.isometry.gate_family)
+                == _normalize_gate_token(self._pair_gate_name)
+            )
+            else None
+        )
         self.max_layers = max_layers
         self.top_size = top_size
         self.seed = seed
@@ -298,6 +417,24 @@ class QMeraBuilder:
         self.array_backend = array_backend
         self.parameter_backend = parameter_backend
         self.product_state_factory = product_state_factory
+
+    def _resolved_pair_ansatz(self, schedule):
+        """Return the pair contract only when every scheduled gate uses it."""
+        if self._default_pair_ansatz is None or not schedule.placements:
+            return self.pair_ansatz
+        if all(
+            _normalize_gate_token(placement.gate_family)
+            == _normalize_gate_token(self._pair_gate_name)
+            for placement in schedule.placements
+        ):
+            return self._default_pair_ansatz
+        return None
+
+    @property
+    def spin_symmetry(self):
+        """Declared symmetry class of the complete spin 1D gate circuit."""
+        pair_ansatz = self._resolved_pair_ansatz(self.build_schedule())
+        return None if pair_ansatz is None else pair_ansatz.symmetry
 
     def _validate_unitary_spec(self, block_spec):
         """Validate explicit unitary metadata against the selected registry."""
@@ -342,10 +479,20 @@ class QMeraBuilder:
             scales=self.scales,
             max_layers=self.max_layers,
             top_size=self.top_size,
+            bond_qubits=self.bond_qubits,
+            retention=self.retention,
+            retained_registers=self.retained_registers,
+            initial_hadamards=self.initial_hadamards,
         )
         for scale in schedule.scale_specs:
             self._validate_unitary_spec(scale.disentangler)
             self._validate_unitary_spec(scale.isometry)
+        if self._explicit_pair_ansatz and any(
+            _normalize_gate_token(placement.gate_family)
+            != _normalize_gate_token(self._pair_gate_name)
+            for placement in schedule.placements
+        ):
+            raise ValueError("pair_ansatz/ansatz must control every 1D pair gate in the scale plan.")
         return schedule
 
     def schematic_blocks(self, *, layer=None, rg_step=None):
@@ -633,6 +780,15 @@ class QMeraBuilder:
                 values = np.empty((0,), dtype=np.float64)
             elif scale == 0.0:
                 values = np.zeros((spec.num_params,), dtype=np.float64)
+            elif (
+                self._default_pair_ansatz is not None
+                and _normalize_gate_token(placement.gate_family)
+                == _normalize_gate_token(self._pair_gate_name)
+                and self._default_pair_ansatz.initialization == "shared"
+            ):
+                values = np.full(
+                    (spec.num_params,), rng.normal(scale=scale), dtype=np.float64
+                )
             else:
                 values = rng.normal(scale=scale, size=(spec.num_params,))
             params[placement.param_key] = values if converter is None else converter(values)
@@ -879,20 +1035,32 @@ class QMeraBuilder:
             )
         return tensors
 
-    def _initial_state(self):
-        binary = "0" * self.geometry.num_modes
-        return qtn.MPS_computational_state(
-            binary,
-            site_ind_id="k{}",
-            site_tag_id="I{}",
-        )
-
     def build_state(self, parameters, schedule=None, *, contract=False):
         """Build a quimb tensor network by directly applying scheduled gates."""
         schedule = self.build_schedule() if schedule is None else schedule
         tensors = self.gate_tensors(parameters, schedule)
         if self.product_state_factory is None:
-            state = self._initial_state()
+            if not schedule.initial_hadamards and self.array_backend is None:
+                state = qtn.MPS_computational_state(
+                    "0" * schedule.geometry.num_modes,
+                    site_ind_id="k{}",
+                    site_tag_id="I{}",
+                )
+            else:
+                base = np.zeros((self.physical_dim,), dtype=np.complex128)
+                if schedule.initial_hadamards:
+                    if self.physical_dim != 2:
+                        raise ValueError("Hadamard initialization requires qubits.")
+                    base[:] = 1.0 / np.sqrt(2.0)
+                else:
+                    base[0] = 1.0
+                arrays = [
+                    base if self.array_backend is None else self.array_backend(base)
+                    for _ in schedule.geometry.register_sites
+                ]
+                state = qtn.MPS_product_state(
+                    arrays, site_ind_id="k{}", site_tag_id="I{}"
+                )
         else:
             state = self.product_state_factory(
                 schedule,
@@ -934,6 +1102,7 @@ class QMeraBuilder:
             state = None
             tensors = self.gate_tensors(parameters, schedule)
 
+        pair_ansatz = self._resolved_pair_ansatz(schedule)
         metadata = {
             "shape": self.geometry.shape,
             "boundary": self.geometry.boundary,
@@ -949,6 +1118,14 @@ class QMeraBuilder:
                 sorted({placement.gate_family for placement in schedule.placements})
             ),
             "state_kind": "direct-gate-tn" if build_state else "schedule-only",
+            "initial_state": self.initial_state,
+            "initial_hadamards": self.initial_hadamards,
+            "bond_qubits": schedule.bond_qubits,
+            "retention": schedule.retention,
+            "pair_ansatz": None if pair_ansatz is None else pair_ansatz.name,
+            "spin_circuit_symmetry": (
+                None if pair_ansatz is None else pair_ansatz.symmetry
+            ),
         }
         return QMeraAnsatz(
             state=state,

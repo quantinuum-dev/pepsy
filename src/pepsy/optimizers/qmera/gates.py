@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
+import autoray as ar
 import numpy as np
 
 from ...backends import get_default_array_backend
@@ -13,6 +14,11 @@ from ...operators import cphase, crx, cry, crz, fsim, fsimg, rxx, ryy, rzz, su4
 __all__ = [
     "GateRegistry",
     "GateSpec",
+    "QMeraPairSpec",
+    "available_qmera_pair_ansatzes",
+    "available_qmera_pair_ansatze",
+    "get_qmera_pair_ansatz",
+    "qmera_pair_gate_spec",
     "UserGateFamily",
     "default_gate_registry",
     "resolve_gate_spec",
@@ -252,10 +258,206 @@ def _identity_2q(_params):
     return np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
 
 
+_QMERA_PAULIS = {
+    "I": np.eye(2, dtype=np.complex128),
+    "X": np.array([[0, 1], [1, 0]], dtype=np.complex128),
+    "Y": np.array([[0, -1j], [1j, 0]], dtype=np.complex128),
+    "Z": np.diag([1, -1]).astype(np.complex128),
+}
+_QMERA_Z2_WORDS = frozenset(("XI", "IX", "XX", "YY", "YZ", "ZY", "ZZ"))
+_QMERA_ALL_WORDS = frozenset(
+    first + second
+    for first in "IXYZ"
+    for second in "IXYZ"
+    if first + second != "II"
+)
+_QMERA_PAIR_PRESETS = {
+    "z2_zz_yy_rx": ("ZZ", "YY", "XI", "IX"),
+    "z2_rx_zz_yy_xx_rx": ("XI", "IX", "ZZ", "YY", "XX", "XI", "IX"),
+    "z2_zz_rx": ("ZZ", "XI", "IX"),
+    "z2_yz_zy": ("YZ", "ZY"),
+    "z2_all_paulis": ("XI", "IX", "XX", "YY", "YZ", "ZY", "ZZ"),
+    "all_paulis": (
+        "XI", "IX", "YI", "IY", "ZI", "IZ", "XX", "XY", "XZ",
+        "YX", "YY", "YZ", "ZX", "ZY", "ZZ",
+    ),
+}
+_QMERA_PAIR_ALIASES = {
+    "minimal": "z2_zz_yy_rx",
+    "extended": "z2_rx_zz_yy_xx_rx",
+    "ising": "z2_zz_rx",
+    "real_z2": "z2_yz_zy",
+    "pauli_z2": "z2_all_paulis",
+    "unrestricted": "all_paulis",
+}
+
+
+@dataclass(frozen=True)
+class QMeraPairSpec:
+    """Ordered two-qubit Pauli rotations with an explicit symmetry contract.
+
+    Each listed word has its own angle, including every repetition. The first
+    letter acts on the first scheduled wire. ``global-X-Z2`` rejects words
+    that do not commute with X tensor X; ``unrestricted`` allows all 15
+    nonidentity Pauli words. Native fermion modes use their own registry.
+    """
+
+    generators: tuple[str, ...]
+    repetitions: int = 1
+    name: str = "custom"
+    symmetry: str = "global-X-Z2"
+    initialization: str = "independent"
+
+    def __post_init__(self):
+        if isinstance(self.generators, str):
+            raise ValueError("generators must be a sequence of two-qubit Pauli words.")
+        try:
+            words = tuple(self.generators)
+        except TypeError as exc:
+            raise ValueError("generators must be a nonempty sequence of Pauli words.") from exc
+        symmetry = str(self.symmetry).strip().lower().replace("_", "-")
+        if symmetry == "z2":
+            symmetry = "global-x-z2"
+        if symmetry not in {"global-x-z2", "unrestricted"}:
+            raise ValueError("symmetry must be 'global-X-Z2' or 'unrestricted'.")
+        allowed = _QMERA_Z2_WORDS if symmetry == "global-x-z2" else _QMERA_ALL_WORDS
+        if not words or any(
+            not isinstance(word, str) or word not in allowed
+            for word in words
+        ):
+            if symmetry == "global-x-z2":
+                raise ValueError("qMERA pair generators must preserve global-X parity.")
+            raise ValueError("Unrestricted qMERA generators must be nonidentity Pauli words.")
+        if (
+            not isinstance(self.repetitions, int)
+            or isinstance(self.repetitions, bool)
+            or self.repetitions < 1
+        ):
+            raise ValueError("repetitions must be a positive integer.")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("name must be a nonempty string.")
+        if self.initialization not in {"independent", "shared"}:
+            raise ValueError("initialization must be 'independent' or 'shared'.")
+        object.__setattr__(self, "generators", words)
+        object.__setattr__(
+            self, "symmetry",
+            "global-X-Z2" if symmetry == "global-x-z2" else "unrestricted",
+        )
+
+    @property
+    def preserves_global_x(self):
+        """Whether every allowed angle commutes with global X parity."""
+        return self.symmetry == "global-X-Z2"
+
+    @property
+    def num_params(self):
+        """Number of independent angles per scheduled pair placement."""
+        return len(self.generators) * self.repetitions
+
+    @property
+    def rotation_sequence(self):
+        """Chronological logical rotations as ``(gate, pair-wire-indices)``.
+
+        Indices 0 and 1 refer to the first and second scheduled pair wires.
+        Each entry consumes one independent angle. Pepsy contracts the whole
+        sequence into one differentiable pair tensor for each placement.
+        """
+        rotations = []
+        for word in self.generators * self.repetitions:
+            if word[1] == "I":
+                rotations.append(("R" + word[0], (0,)))
+            elif word[0] == "I":
+                rotations.append(("R" + word[1], (1,)))
+            else:
+                rotations.append(("R" + word, (0, 1)))
+        return tuple(rotations)
+
+
+def available_qmera_pair_ansatzes(*, include_aliases=False):
+    """Return descriptive built-in names, optionally including old aliases."""
+    names = tuple(_QMERA_PAIR_PRESETS)
+    return names + tuple(_QMERA_PAIR_ALIASES) if include_aliases else names
+
+
+def available_qmera_pair_ansatze(*, include_aliases=False):
+    """Return the old family names; use ``ansatzes`` for preferred names."""
+    aliases = tuple(_QMERA_PAIR_ALIASES)
+    return aliases + tuple(_QMERA_PAIR_PRESETS) if include_aliases else aliases
+
+
+def get_qmera_pair_ansatz(ansatz="minimal", *, repetitions=None):
+    """Resolve a named or custom pair ansatz, optionally repeating it."""
+    if isinstance(ansatz, str):
+        name = ansatz.strip().lower().replace("-", "_")
+        canonical = _QMERA_PAIR_ALIASES.get(name, name)
+        try:
+            words = _QMERA_PAIR_PRESETS[canonical]
+        except KeyError as exc:
+            choices = ", ".join(available_qmera_pair_ansatzes())
+            raise ValueError(
+                f"Unknown qMERA pair ansatz {ansatz!r}; choose {choices} "
+                "or supply a QMeraPairSpec. Old names remain aliases."
+            ) from exc
+        resolved = QMeraPairSpec(
+            words,
+            name=name.replace("_", "-") if name in _QMERA_PAIR_ALIASES else canonical,
+            symmetry="unrestricted" if canonical == "all_paulis" else "global-X-Z2",
+            initialization="shared" if canonical == "z2_zz_yy_rx" else "independent",
+        )
+    elif isinstance(ansatz, QMeraPairSpec):
+        resolved = ansatz
+    else:
+        raise TypeError("ansatz must be a preset name or a QMeraPairSpec.")
+    return resolved if repetitions is None else replace(resolved, repetitions=repetitions)
+
+
+def _qmera_pair_matrix(spec, params):
+    """Compose chronological Pauli rotations on the parameter backend."""
+    params = tuple(params)
+    if len(params) != spec.num_params:
+        raise ValueError(f"expected {spec.num_params} qMERA pair angles.")
+    identity = ar.do("array", np.eye(4, dtype=np.complex128), like=params[0])
+    result = identity
+    for word, angle in zip(spec.generators * spec.repetitions, params):
+        pauli = ar.do(
+            "array",
+            np.kron(_QMERA_PAULIS[word[0]], _QMERA_PAULIS[word[1]]),
+            like=angle,
+        )
+        rotation = (
+            ar.do("cos", angle / 2) * identity
+            - 1j * ar.do("sin", angle / 2) * pauli
+        )
+        result = ar.do("matmul", rotation, result)
+    return ar.do("reshape", result, (2, 2, 2, 2))
+
+
+def qmera_pair_gate_spec(spec, *, name=None):
+    """Create a backend-differentiable gate family for one qMERA pair spec."""
+    if not isinstance(spec, QMeraPairSpec):
+        raise TypeError("spec must be a QMeraPairSpec.")
+    gate_name = f"qmera-{spec.name}" if name is None else str(name)
+    return GateSpec(
+        gate_name,
+        2,
+        spec.num_params,
+        lambda params: _qmera_pair_matrix(spec, params),
+        family="spin",
+        convention=f"{spec.symmetry.lower()}-pauli",
+        default_tags=("QMERA_PAIR",),
+        preserves_parity=spec.preserves_global_x,
+        symmetry=spec.symmetry if spec.preserves_global_x else None,
+    )
+
+
 def default_gate_registry():
     """Return the default parametrized spin-gate registry."""
     return GateRegistry(
         (
+            *(
+                qmera_pair_gate_spec(get_qmera_pair_ansatz(name))
+                for name in (*_QMERA_PAIR_PRESETS, *_QMERA_PAIR_ALIASES)
+            ),
             GateSpec("rxx", 2, 1, _one_param(rxx), default_tags=("RXX",)),
             GateSpec("ryy", 2, 1, _one_param(ryy), default_tags=("RYY",)),
             GateSpec("rzz", 2, 1, _one_param(rzz), default_tags=("RZZ",)),
