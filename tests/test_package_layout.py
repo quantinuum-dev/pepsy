@@ -269,7 +269,7 @@ def test_composed_dependency_profiles_preserve_feature_boundaries():
     }
     assert expanded["test-extended"] == set().union(
         *(expanded[name] for name in ("layout", "solvers", "stabilizer", "symmetry", "torch", "viz"))
-    ) | {"autograd>=1.6"}
+    ) | {"autograd>=1.7"}
 
 
 @pytest.mark.parametrize(
