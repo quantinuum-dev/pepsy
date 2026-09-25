@@ -1,9 +1,8 @@
 # Symmetric Tensor States
 
 The optional symmetry and fermionic workflows require Symmray 0.4.0 or
-newer (`pip install -U 'pepsy[symmetry]'`). These extras require Python 3.11
-or newer because of Symmray's Python requirement; Pepsy's core remains
-available on Python 3.10. Version 0.4.0 fixes pending fermionic phases in
+newer (`pip install -U 'pepsy[symmetry]'`) and share Pepsy's Python 3.12+
+requirement. Version 0.4.0 fixes pending fermionic phases in
 scalar readout and reductions, and fused charge selection under Torch `vmap`.
 
 For flat-Z2 Torch PEPS, `TorchPEPSAmplitude(..., amplitude_batching="auto")`

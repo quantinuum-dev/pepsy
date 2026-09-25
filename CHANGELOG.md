@@ -2,7 +2,9 @@
 
 All notable PePsY changes are documented here.
 
-PePsY follows [Semantic Versioning](https://semver.org/):
+PePsY follows [Semantic Versioning](https://semver.org/). During the 0.x
+series, minor releases may include documented incompatible changes; patch
+releases remain backwards-compatible. From 1.0 onward:
 
 - **MAJOR** versions may contain incompatible public API changes.
 - **MINOR** versions add backwards-compatible public functionality.
@@ -10,1023 +12,156 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 ## [Unreleased]
 
-Changes for the next release should be added here before the version is bumped.
+### Added
 
-### Fixed
-
-- FIT gate windows again cache only visited target tags and boundary bonds;
-  the optional immutable target snapshot is built on demand. Native Symmray
-  MPO-product DMRG uses a direct-SVD automatic warm start, avoiding SDC's
-  division by zero on zero charge blocks.
-- JAX backend checks recognize equivalent single-device shardings. The
-  truncation-safe SVD accepts explicit thin-SVD options and preserves its VJP.
-  Regression tests isolate Torch batching policy and check current mixed-mode,
-  canonical-validation, and MPI diagnostic contracts.
-
-- Lazy public entry namespaces expose advertised names through `dir()` without
-  loading numerical implementations or resolving deprecated aliases. Root
-  typing imports cover the existing compatibility exports. Introductory guides
-  use owning namespaces and distinguish optional installation from API stability.
-
-- PEPS measurements and boundary calls adapt to Quimb's `method`/`route` API.
-  Single-row/column measurements use exact contractions with backend gradients
-  and native fermionic arrays. Boundary measurement dictionaries consistently
-  return normalized/raw scalars, or explicit numerator/norm pairs with
-  `normalized="return"`, across supported Quimb revisions.
-- MPS/MPO Quimb replay and PEPS boundary sweeps expose independent intermediate
-  and final compression options, gated by installed capabilities. Final bond
-  limits remain authoritative; SDCR cumulative-to-relative cutoff adaptation
-  now emits a warning.
-
-- Symmetry extras require Symmray 0.4.0 or newer for correct fermionic scalar
-  phases and fused-charge Torch batching (Python 3.11+ for these extras).
-  Scalar readout uses Symmray's native `item()` instead of returning an
-  unchanged wrapper through a NumPy object array.
-- Native MPS randomized FIT guesses use deterministic SVD for active
-  cumulative-error cutoffs, preserving the requested truncation policy and
-  reporting the fallback in diagnostics.
-- BP-to-SU conversion handles Quimb's positive fermionic message convention.
-  Native BP pair normalization checks the graded overlap and repairs only
-  affected solver instances, leaving the upstream installation untouched.
-  Graded cluster bras are conjugated jointly, and reduced-update warm gauges
-  use the union of endpoint charge sectors. Explicit loop projectors convert
-  messages and bra conjugation together to preserve their graded contractions.
-
-- CuPy backend setup leaves modern Autoray namespace handling intact. The
-  capability-gated legacy workaround preserves actual device objects and
-  bypasses only the failing namespace cache.
-- Random FIT initialization uses the same complex-normal variance on old
-  and new Autoray versions. Omitted dtypes inherit the template dtype;
-  explicit dtype overrides also survive the legacy conversion path.
-
-- Require Cotengra 0.8.0 or newer, matching the built-in `sbplx` optimizer
-  used when the optional CMA-ES acceleration dependency is unavailable.
-
-- Higher-order dense `TreeMPO.from_terms` assembly uses Quimb's
-  Autoray-backed tensor direct products, preserving the input backend and
-  device instead of downloading every term to NumPy. MPS and tree norm
-  ledgers use cached Autoray namespaces when available.
-
-- `StabilizerMpsSimulator` and `StabilizerTreeSimulator` keep generated Pauli
-  operators and exact-cooling tensor calculations on the coefficient backend.
-  Tree cooling uses one backend SVD instead of downloading its leaf matrix
-  and running two NumPy SVDs. MPS stabilizer random FIT guesses use an Autoray
-  backend generator, and ordinary unitary norm/fidelity bookkeeping stays
-  detached on-device until diagnostic readout.
-
-- `TreeOptimizer` keeps ordinary gate factorization and retained-norm
-  bookkeeping on the array backend. One-site unitarity checks transfer only
-  their Boolean result, fixed control tensors are cached per device/dtype,
-  and random FIT initialization uses an Autoray backend generator.
-
-- `MpsOptimizer` preserves array backend, dtype, device, and physical index
-  names when rebuilding an MPS after exact replay. Dense random FIT guesses
-  use Autoray's backend generator instead of passing a NumPy generator to
-  Torch/JAX. Measurement/reset replay caches fixed control matrices per
-  backend/device/dtype and assembles projectors on that backend, avoiding
-  repeated host uploads after the constants are prepared.
-
-- Tree entropy now extracts Schmidt weights from the orthogonality centre
-  at each cut. Reading off-centre isometries previously returned
-  `log2(bond_dim)` for nonuniform spectra. `TreeSampler` uses the corrected
-  diagnostic on its captured state without changing cached sampling arrays
-  or the live optimizer.
+- Added opt-in `MpsOptimizer(mode="exact-batch")` (`batch-exact` is an alias).
+  It fuses bounded one- and two-qubit gate runs, compacts repeated Z/ZZ
+  supports, and applies one- or two-value diagonal phases in grouped passes.
+  Supported NumPy/CuPy states also fuse consecutive same-pair parity-preserving
+  gates. Dense replay preserves backend, device, and operator scale; unsupported
+  states use the reference path. Numba acceleration is optional.
 
 ### Changed
 
-- The main spin 1D `QMeraBuilder` now uses retained-register qMERA blocks,
-  ternary odd tails, boundary disentanglers, coarse-to-fine gate execution,
-  and a selectable spin pair ansatz. Five ml4mb templates preserve global-X
-  Z₂; an unrestricted 15-angle Pauli template permits symmetry breaking.
-  The spin-only `spin_symmetry` contract and separate `initial_state` option
-  make those choices explicit. `pair_ansatz=` and names such as
-  `z2_zz_yy_rx` and `z2_rx_zz_yy_xx_rx` identify the gate templates; the old
-  names remain accepted. `QMeraPairSpec.rotation_sequence` shows the ordered
-  logical rotations and their pair wires. `system_size=N` names the 1D
-  site count; `shape=N` remains accepted. Spin 1D isometry and boundary
-  blocks now accept `structure="ladder"`, which closes each block and repeats
-  its full pair sequence with `circuit_depth`. It accepts bond width and
-  retention policy; the 2D and explicit-mode fermion schedules retain their
+- The main spin 1D `QMeraBuilder` uses retained-register blocks, ternary odd
+  tails, boundary disentanglers, and coarse-to-fine gate execution. It accepts
+  bond width and retention policy, with `system_size=N` as the 1D site count
+  (`shape=N` remains accepted). `structure="ladder"` closes each isometry or
+  disentangler block and repeats the complete pair sequence at each
+  `circuit_depth`. The 2D and explicit-mode fermion schedules retain their
   existing behavior.
+- Spin 1D qMERA exposes `pair_ansatz` with five global-X Z₂-preserving
+  templates and an unrestricted Pauli template. `spin_symmetry` declares the
+  symmetry contract separately from `initial_state`; descriptive ansatz names
+  such as `z2_zz_yy_rx` and `z2_rx_zz_yy_xx_rx` identify gate order, while
+  old names remain accepted. `QMeraPairSpec.rotation_sequence` reports the
+  ordered rotations and pair wires.
 
-- Shared optimizer event parsing now lives outside the MPS replay module.
-  Tree layout can import it without initializing MPS replay or FIT, while
-  existing parser import paths remain available.
+## [0.5.0] - 2026-09-25
 
-- Optional VMC and extended-test profiles compose existing extras instead of
-  repeating dependency constraints. Feature names and resolved requirements
-  are preserved. Installation guidance separates base, development, and
-  optional profiles; base-wheel CI also exercises a small numerical operation.
+This release changes supported environments and several optimizer defaults.
+Read the [migration guide](docs/development/api-migration.md) before upgrading.
 
-- MPO, PEPS, sweep, tree, tree-PEPS, energy, and qMERA entry packages now load
-  exports on demand, preserving public names and direct module paths. qMERA
-  geometry and tree-PEPS plans can be imported without the numerical stack.
-  Gate, Hamiltonian, and boundary-state helpers import direct owning modules
-  instead of the `tensors.core` compatibility aggregator; its contraction and
-  fidelity patch hooks remain unchanged.
+### Changed
 
-- MPS package exports load on demand. Importing its namespace or reserved
-  modules no longer initializes the numerical stack; importing layout helpers
-  no longer pulls in replay, Gibbs preparation, or MPO optimization. Existing
-  export names and implementation objects are preserved.
-
-- Stabilizer MPS/tree MPI replay defaults `collect_diagnostics` to `False`.
-  `pauli_combo_submpo` and `pauli_sum_submpo` accept `like=` for direct
-  construction on a selected array backend/device/dtype.
-
-- `TreeOptimizer` skips update clock reads with the default `profile=False`;
-  untimed update records contain `elapsed_seconds=None`. MPI
-  `collect_diagnostics` now defaults to `False`. Norm/infidelity tracking
-  remains enabled, with scalar conversion deferred to diagnostic readout
-  except for explicit extracted-exponent bookkeeping.
-- `TreeMPO.from_pauli_sum` and `SubTreeMPO.from_pauli_sum` accept `like=`
-  to construct their tensors on a selected array backend/device.
-
-- `MpsOptimizer.run` now defaults MPI `collect_diagnostics` to `False`,
-  matching its opt-in finite checks, overlap diagnostics, quality checks,
-  and timing. Disabled MPI diagnostics skip profiling clock reads in ordinary,
-  streaming, and checkpointed shot execution.
-
-- `MpsOptimizer` retains Torch/JAX/CuPy unitary compression norms and fidelity
-  bookkeeping on-device using Autoray. Diagnostic histories are detached
-  from autograd, and getters retain their Python-valued output. Normal replay
-  reads one accumulated zero-norm flag before returning; `finite_check=True`
-  preserves immediate validation. FIT stopping and physical control decisions
-  retain their existing scalar reads. Complete loss overrides NaN history in
-  either order, and Apple Metal diagnostic scalars use supported float32 precision.
-
-- Roughening benchmark integration defaults now use Torch `complex128` with
-  automatic device selection, disable sampled local-energy and XX estimators,
-  and make `memory_report=False` fully inert. Backend scalar norm reads use
-  Pepsy's shared Autoray conversion helper, and benchmark quality diagnostics
-  are collected once per depth.
-
-- `TreeSampler` now has an explicit `backend="symmray"` / `backend="native"`
-  path for ordinary Abelian and fermionic Symmray trees. Sampling,
-  amplitudes, probabilities, and edge entropies retain native block-sparse
-  tensors, and `physical_code_maps` exposes source charge-sector metadata.
-  The default `backend="auto"` keeps its existing dense batched compatibility
-  behavior for Symmray states.
-
-- TreeSampler now preserves dense NumPy, Torch, and CuPy tree backends for
-  cached tensors, sampling, amplitudes, probabilities, and batch results.
-  `backend="native"`/`"auto"` select the live state backend,
-  `backend="numpy"` and `to_numpy=True` provide explicit host copies, and
-  explicit Torch/CuPy requests reject mismatched live trees. `to_backend(...)`
-  remains the preparation point for gate and operator payloads.
-
-- Added `TreeTensorNetwork.tree_edge_entropies()` and matching
-  `TreeOptimizer` delegates for normalized base-2 von Neumann entropy on
-  every TreePlan bond. The diagnostic canonicalizes a private copy once and
-  uses backend-native dense or Symmray sector SVDs without forming a full
-  statevector; `return_edges=True` provides deterministic parent-child labels.
-
-- `TreeSubPepo` now has a genuine compact operator core. Its public
-  `operator`/`active_operator` contains only the connected compression span;
-  exterior identity action is implicit, while `full_operator` is retained only
-  for compatibility dense readout. TreePEPS fused, path, and TreeFIT/DMRG
-  updates all consume the compact view, so inactive operator layers and bonds
-  are not materialized in the hot update target. Compact construction reuses
-  its single active network, full-view reconstruction requires complete
-  physical-dimension metadata, and `validate(full=True)` provides explicit
-  compatibility-view validation.
-
-- TreePEPS canonical-region preparation now follows cached `left_inds`: a
-  contained region is adopted without checking every tensor, and disjoint
-  regions move only along their connector path. Local path compression keeps
-  the resulting metadata and recovers the requested center without a redundant
-  full-tree QR sweep; subtree compression leaves exterior state bonds alone.
-
-- Matured `TreePepsOptimizer` compression and FIT/DMRG parity. It now
-  exposes Quimb's `sdc`/`sdcr`/`src` oversampled families and
-  `zipup-oversample`, including seeded path routing, fixed-topology branching
-  fallbacks, intermediate bond controls, and explicit mode diagnostics.
-  TreeFIT updates now accept traversal, environment-strategy, transition,
-  single-site fast-path, finite-check, and dtype-aware `fit_rtol` controls;
-  topology boundaries remain unchanged.
-
-- `TreePepsOptimizer` now defaults TreeFIT to `fit_traversal="auto"`, using
-  path-local environment reuse for ordinary one- and two-site gate spans and
-  depth-first traversal for branching multi-site spans. `fit_sweep_sequence`
-  continues to default to the RL-compatible inward-outward schedule.
-
-- TreePeps DMRG updates no longer perform a redundant outer canonical sweep
-  for direct or random disposable guesses. Warm-start `guess-*` policies reuse
-  the one active-region canonical proof during their operator application;
-  `dmrg1`/`dmrg2`/`dmrg3` sweep schedules and numerical behavior are unchanged.
-
-- Added explicit `mps_to_treepeps` conversion for site-complete `TreePeps`
-  plans. Uncapped conversion is lossless up to floating-point roundoff;
-  finite-`chi` projection remains caller-controlled and reports no implicit
-  normalization or relayout.
-
-- Dense tree Pauli sums, rotations, and product-Pauli projectors now build a
-  true compact `SubTreeMPO` on their active Steiner region. The full
-  `TreeMPO.from_pauli_sum` constructor remains available for callers that
-  require explicit exterior identity tensors; explicit chain `submpo` and
-  low-level `apply_1q`/`apply_2q` compatibility paths retain their existing
-  specialized behavior.
-
-- Extended `PauliPEPOTerm` with explicit site/edge locations and optional
-  directed bond occurrences. Inhomogeneous ordered PEPO products now support
-  open and periodic square lattices through order nine, using per-embedding
-  connected residuals and fixed Pauli histories by default. Dense Quimb
-  materialization compacts global history labels independently on each bond.
-  The fixed-channel open-boundary order-one/two builder remains available, and
-  homogeneous translated-cluster construction is unchanged.
-- Fixed ordered MPO cluster products with real Torch term slots and complex
-  factor prefactors by initializing products from their first exponential,
-  avoiding a real identity/complex matrix dtype mismatch in interval and graph
-  modes.
-
-- Fixed complex Torch coefficient slots in `PauliPEPOBasis` by promoting the
-  static fixed-channel maps before fused contractions, preserving autodiff for
-  complex generators in single and ordered-product PEPO builds.
-
-- Extended `contract_flat(...)` with readable bottom/top/left/right and
-  four-sided boundary schedules shared by Quimb MPS and CTMRG contraction,
-  plus a middle-out target that absorbs opposing boundaries towards a
-  configurable central row, column, or contiguous interface before exactly
-  contracting the reduced core. The new `compression_mode` spelling exposes
-  Quimb's 1D compressor without changing the existing `mode_` compatibility
-  argument or default behavior.
-
-- Added opt-in finite-CTMRG boundary modes to PEPS norm, normalization,
-  fidelity, infidelity, and flat-contraction APIs. The existing Quimb
-  `projector` plus simple-gauging default is unchanged; callers can now select
-  `projector2d`, direct `l2bp`, layered projector gauging, or dense
-  D2BP-assisted projector gauging with copied, mode-specific option mappings
-  and execution-time capability checks. Dense finite 2D contractions can also
-  combine `ctmrg_canonize="bp"` with
-  `ctmrg_projector_region=(2, 3)` for a BP-dressed three-boundary-site
-  projector window; the native two-site behavior remains the default.
-- Tree state invalidation and explicit optimizer synchronization now clear
-  stale tensor-local isometry proofs after raw array edits. Canonical-region
-  preparation reuses known exterior isometries, peeling only the old region
-  outside its overlap or the connector to a disjoint region. Oversampled tree
-  rounding keeps a path's terminal center without a return QR sweep; branch
-  cut order and return moves are unchanged. Subsequent finite-rank replay can
-  differ because endpoint-based routing observes the new center.
-
-- Added opt-in TreeOptimizer `zipup-oversample` (alias `zipup-first`) and
-  `mix` replay modes. Oversampled zipup streams at `2 * chi` by default and
-  directly rounds the active tree to the final cap. Mix refines a disposable
-  chi-capped direct guess with one-node TreeFIT against the original layered
-  target; failed fits do not commit the guess. Existing defaults are unchanged.
-
-- Direct Quimb PEPS boundary compression no longer initializes, globally
-  expands, or copies an unused random boundary-MPS guess. Direct sweeps derive
-  their output length from the lattice axis perpendicular to the sweep,
-  including on rectangular PEPS, while preserving the existing bond cap,
-  diagnostics, and dense-only backend policy.
-
-- Boundary contraction with `max_separation=1` now handles a sweep axis of
-  length one by contracting the sole center slice without requesting a
-  nonexistent boundary fit.
-
-- `contract_flat(..., preserve_backend=True)` now returns the raw NumPy,
-  Torch, or JAX scalar instead of converting it to a Python number, preserving
-  autodiff graphs for downstream flat-network optimization. The default
-  reporting-oriented return behavior is unchanged.
-
-- Added `fit_layer_order` to the public `contract_layered` façade and aligned
-  boundary documentation with the accepted `dmrg1` alias and complete direct
-  Quimb compression family.
-
-- Extended PEPS boundary `fit_mode` selection with Quimb's oversampled and
-  randomized direct compressors: `src-oversample`, `srcmps` (also the
-  readable `src-mps` alias), `srcmps-oversample`, `sdc-oversample`,
-  `zipup-oversample`, and `sdcr` variants. These remain opt-in direct
-  compression paths and do not alter the FIT/DMRG defaults.
-
-- MPS gate-stream layout search now accepts arbitrary logical-site coordinates,
-  infers deterministic pseudo-coordinates from interaction graphs when none
-  are supplied, consumes raw measurement/reset events in the layout-only API,
-  and automatically adds role-interleaved and lifetime candidates when
-  data/ancilla information is available. The new ``objective="smart"`` alias
-  performs bounded replay against private copies of the initial MPS.
-
-- MPS gate-stream layout finders can now expose per-site use windows and
-  measure/reset-separated lifetimes. An explicit ``order="lifetime"`` seed,
-  ``order="role-grouped"` candidate, or ``role_order`` together with
-  ``qubit_roles``, gives the locality,
-  compression, and replay objectives a general QEC-oriented candidate without
-  forcing data and ancilla sites into contiguous blocks.
-
-- Changed `MpsOptimizer(mode="mix")` to use the same transactional algorithm
-  in both bond-growth and fixed-`chi` phases: each eligible multi-site gate
-  builds a disposable chi-capped `guess-direct` state, then runs one-site FIT
-  against a separate exact target. Mixed mode now fixes `fit_block_size=1` and
-  `fit_init_strategy="guess-direct"`; one-site gates and failed FIT fallbacks
-  retain the direct compression path.
-
-- Renamed the stabilizer tensor-network front ends to the descriptive
-  `StabilizerMpsSimulator`, `StabilizerTreeSimulator`, and
-  `StabilizerMpsSampler` names. The former `MpsStabOptimizer`,
-  `TreeStabOptimizer`, and `MpsStabSampler` names remain available as
-  deprecation-warning compatibility aliases.
-
-- Simplified `MpsOptimizer(mode="perm")` to one Quimb-style lazy
-  swap-and-split SVD path using `swap_back=False`. Removed the separate
-  `routing="perm"` axis and the misleading `perm-*` / `*-perm` compositions
-  with DMRG, SRC, or other compressors.
-
-- Removed the obsolete MPS simple-update mode from mode dispatch. Simple
-  update remains available through its dedicated gate and PEPS APIs.
-
-- Explicit `apply_subtree_operator` now shares compact `SubTreeMPO`
-  application with ordinary gates in every mode, including original-layer
-  SRC/SDC and consistent per-call caps/cutoffs. Certified one-site unitaries
-  preserve the canonical center and isometry metadata. Unsupported native
-  DM rejects before update accounting or state changes.
-
-- Tree SRC now has an opt-in `src-oversample` mode. It uses Quimb's default
-  larger sampling rank and a final direct tree sweep at the requested `chi`,
-  while the existing fixed-rank `src` mode remains seeded and Quimb-parity
-  compatible. JAX complex64 SRC diagnostics use scoped high-precision
-  accumulation; no global backend setting is changed. FIT variants remain
-  separate from TreeFIT/DMRG.
-
-- Added dense-only tree `sdcr` compression and opt-in `sdc-oversample` /
-  `sdcr-oversample` variants. Oversampled modes use Quimb's intermediate-rank
-  policy followed by a direct tree round; `max_bond_oversample`,
-  `cutoff_oversample`, and `cutoff_mode_oversample` expose the intermediate
-  controls. SDCR environment splits use a rank-only relative cutoff contract
-  so they remain compatible with Quimb releases that reject cumulative cutoff
-  modes for randomized SVD. `srcmps` remains MPS-only and is not added to
-  `TreeOptimizer`.
-
-- TreeFIT now reuses a canonical region contained inside its next local
-  block, preserving exterior environments without an isometry rescan or
-  interior QR. Unknown-gauge preparation also leaves the block interior for
-  the local solve. Compact DMRG path and depth-first branch sweeps have
-  explicit end-to-end regression coverage.
-
-- Local tree gate replay now builds `SubTreeMPO` directly on its connected
-  Steiner subtree, with original node/site tags and implicit exterior
-  identity action. No full-tree identity layer is allocated or inspected.
-  Direct/DM, SRC/SDC, zipup, and FIT share this compact application boundary;
-  full `TreeMPO` operators retain their separate validation and semantics.
-
-- Tree canonical-region recovery now uses a smallest-leaf priority queue
-  instead of repeatedly scanning the remaining region. The traversal order,
-  native charge checks, and `left_inds` QR skips are preserved. SRC/SDC
-  environment reuse and release are covered for both algorithms.
-
-- Consolidated TreeOptimizer mode resolution, copy configuration, operator
-  preparation, Born-probability kernels, and diagnostic record construction
-  into focused private helpers. Updates now share one aggregation lifecycle;
-  direct/DM, SRC/SDC, zipup, and FIT retain their algorithms and defaults.
-  Layout pilot selection belongs to the layout finder, with replay supplied
-  by a callback. Private MPO readout no longer copies accumulated histories
-  or queued gates; public optimizer copies retain them. Installing a selected
-  layout now invalidates gate factors tied to the previous tree.
-
-### Documentation
-
-- Clarified that native Symmray's existing global SVD policy may retain a
-  degenerate boundary beyond the requested tree bond cap. Native zipup checks
-  now verify any such excess against the singular spectrum and exercise empty
-  charge rejection independently of roundoff-dependent tie choices.
-
-- Clarified TreeOptimizer's automatic cutoff parity with MpsOptimizer and
-  added numerical regressions for DM aliases, installed-state precision,
-  explicit overrides, and copies. Tree DM keeps `rsum2` on singular values,
-  equivalent to MPS MPO DM's `rsum1` on density-matrix eigenvalues; existing
-  truncation behavior is preserved.
+- Require Python 3.12 or newer. Core dependency floors are NumPy 1.26,
+  Quimb 1.15, Cotengra 0.8.0, Autoray 0.9, and tqdm 4.65. Optional dependency
+  floors also increase; NetKet VMC requires JAX `>=0.7,<0.11.1` and NetKet
+  3.22 or newer. See [installation](docs/installation.md) and the
+  [dependency audit](docs/development/notes/dependency_minimums_2026_09.md).
+- `MpsOptimizer` now defaults to `mode="direct"`. Request `mode="dmrg"`
+  or a named DMRG schedule explicitly for variational replay. `MpoOptimizer`
+  and `GibbsMps` also use the canonical `direct` spelling; `mpo` remains a
+  compatibility alias.
+- MPS `mix` replay now fits a disposable direct-compressed guess against the
+  exact target during both bond growth and fixed-rank updates. It fixes
+  `fit_block_size=1` and `fit_init_strategy="guess-direct"`; use ordinary
+  DMRG for other block sizes or initializers.
+- FIT schedules now include larger-block warm-up and one-site refinement,
+  with a two-site transition in `dmrg3`. Tree optimizers select path or branch
+  traversal through `fit_traversal="auto"`. Tree compression uses live-rank
+  scheduling; explicit traversal and compression controls remain available.
+  Finite-rank and seeded results can change with the updated algorithms.
+- Hamiltonian `to_mpo`, `to_pepo`, `to_tree_mpo`, and `to_tree_pepo` default
+  to `compress="term"`. Use `compress="auto"` for workload-selected assembly,
+  `compress="automaton"` for shared state diagrams, or `compress=False` to
+  disable numerical compression. Native tree builders can infer a layout
+  from interaction supports.
+- MPS runtime finite checks and MPI diagnostic collection are opt-in.
+  Tree and stabilizer MPI replay likewise default to `collect_diagnostics=False`.
+  Backend-native norm and fidelity bookkeeping defers host scalar conversion
+  until readout where possible. Explicit diagnostic controls remain available.
+- Stabilizer front ends use `StabilizerMpsSimulator`,
+  `StabilizerTreeSimulator`, and `StabilizerMpsSampler`. Previous names remain
+  deprecated aliases. Hamiltonian `build_mpo` / `build_pepo` wrappers remain
+  deprecated aliases for `to_mpo` / `to_pepo`.
+- Public namespaces load exports lazily and expose them through `dir()`.
+  Internal helpers use their owning modules, optimizer event parsing has a
+  shared owner, and VMC/test extras compose existing dependency profiles.
 
 ### Added
 
-- Added opt-in `MpsOptimizer(mode="exact-batch")`: automatic bounded fusion of
-  one-/two-qubit gates, compact diagonal broadcasting, and reuse of already
-  contracted states without restoring full-state axis order after every gate.
-  Dense replay preserves backend/device and operator scale, with reference
-  fallback for unsupported state types. Long Z/ZZ diagonal runs compact
-  repeated supports before a one- or two-value grouped-bit phase pass;
-  interleaved value classes retain correct mask ordering. Consecutive
-  same-pair RXX/RYY/RZZ or other parity-preserving gates use one two-sector
-  pass on supported NumPy/CuPy states. Numba is optional for CPU execution.
-  `batch-exact` is an accepted alias for `exact-batch`. Existing modes and
-  defaults are unchanged.
-
-- Added an explicit state-aware MPS layout objective. An optimizer-backed
-  `MpsGateStreamLayoutFinder` now jointly evaluates bounded static layout
-  candidates and dependency-safe mountain gate ordering on private copies,
-  reports the event-by-event `max_bond()`/`bond_sizes()` profile, and selects
-  by the measured transient peak without changing the existing locality or
-  compression defaults. Measurement/reset/feed-forward events remain fixed
-  barriers; direct caps are replayed with dynamic lifetime remapping, while
-  conditional caps and trajectory streams remain explicit branching work.
-  Added `MpsGateStreamSchedule` with direct-cap support.
-
-- Added an opt-in `replay_schedule="measure-early"` policy for state-aware MPS
-  layout replay. Measurements and resets may move left across immediately
-  preceding ordinary events on disjoint supports, while shared-site gates,
-  feed-forward, and cap dependencies remain fixed.
-
-- Preserve TreeMPO represented exponents across direct/DM, SRC/SDC, zipup,
-  copies, exact readout, and operator arithmetic, matching FIT target scaling.
-  Retain relative sector exponents and align them before direct-sum addition.
-  Minimal application routes now require unchanged builder-proven exterior
-  identities; re-gauged or externally modified operators use the full tree
-  so scalar factors outside the nominal support are not silently dropped.
-  Native tree statevector readout now unpacks Symmray blocks into numeric
-  arrays and restores declared physical charge sectors removed by contraction
-  or canonicalization, preserving the local Hilbert-space dimensions.
-
-- Clarified TreeOptimizer's distinct direct/DM, SRC/SDC, zipup, and FIT
-  dispatch at `apply_sub_mpotree`. State replacement and caps now invalidate
-  cached operators bound to the old layout. Approximate MPO readout preserves
-  the sampling RNG and reports private-ket rank cuts even with replay history
-  disabled. FIT readout exposes separate approximation diagnostics and warns
-  for multi-node variational fits without claiming that absent edge cuts mean
-  an exact result. FIT diagnostics identify the effective direct/DM local split,
-  independently of the initial guess algorithm.
-
-- Made `TreeOptimizer.apply_sub_mpotree` the primary ordinary-gate and
-  TreeMPO entry point, retaining existing method aliases and adding matching
-  event helpers. Documented explicit `fit_traversal="depth"` / `"depth-first"`
-  for multi-site DMRG operators and automatic path-versus-branch routing.
-  Tree Pauli measurements and coalesced shots now share independently
-  computed Born weights from projected amplitudes: local one-site projectors
-  or lossless parity QR messages on the active subtree. This preserves rare
-  branches without a dense projector or full optimizer copy. Rejected
-  fractional supports no longer address different qubits, and canonicalization
-  resolves stable logical labels correctly after caps.
-
-- Unified TreeOptimizer constructor/run/legacy mode resolution and validated
-  caps, cutoffs, FIT budgets, and initialization settings consistently. Per-call
-  bond/cutoff overrides now reach both DMRG guesses and refinement. Shot options
-  affect only children; invalid replay options preserve configuration and
-  queues, and MPI-only options no longer silently disappear. Clear stale FIT
-  diagnostics after non-FIT updates and state replacement. Keep root arity
-  synchronized after caps/state replacement so copies and shots remain valid;
-  fix direct measurement's logical labels, positive-branch selection, and
-  projection-versus-compression norm accounting.
-
-- TreeOptimizer now defaults to `fit_traversal="auto"`: endpoint FIT sweeps
-  on path-shaped active regions and depth-first traversal on branches for
-  `dmrg` and `dmrg1/2/3`. Align compressed guesses with the first pass and
-  retain advancing block centers through direction and size changes. Direct
-  and DM prepare path operators exactly then compress in one direction, without
-  return QR sweeps. SRC/SDC and zipup also use endpoint path routes. Explicit
-  depth policies retain their FIT block order; finite-cap and seeded results
-  can change. Standalone TreeFIT keeps its existing default.
-  Reuse exterior canonical proofs before direct/SRC/SDC preparation, schedule
-  QR messages incrementally without rescanning pending edges, and limit
-  SRC/SDC/zipup physical-index maps to the active region. Path profiling now
-  includes planning time and distinguishes deferred message merges.
-
-- Cache up to 128 immutable SRC/SDC tree environment plans across calls.
-  Keep numerical messages and consumption counters private to each call;
-  test branch reuse, array release, in-place edits, and failure recovery.
-
-- Audited tree SRC against the paper and unmodified Quimb on layered paths.
-  Reuse one backend random generator, omit unused directed environments,
-  release consumed messages, drop intermediate tags, avoid internal preparatory
-  center moves, and request Q-only QR. Seeded path outputs now
-  match Quimb; seeded tree results change from the earlier seed-offset scheme.
-
-- Tree SRC and SDC now build directed complementary environments and project
-  the original layered target in a second tree sweep. This replaces local
-  randomized SVD and the former direct-sweep alias. Dense SRC uses seeded
-  product-noise sketches; SDC uses deterministic low-rank factors. Native
-  symmetry tensors reject these modes explicitly; native zipup remains a
-  streamed truncating algorithm. SRC warns that cutoff is ignored.
-
-- Cached dense one-site FIT sweeps skip the redundant QR-factor absorption
-  into the next tensor before its effective update overwrites it. NumPy,
-  Torch, and JAX use this shortcut when the bond shape is preserved; native
-  symmetry and shape-reducing QR retain the complete canonicalization path.
-
-- Fixed rare X/Y MPS measurement probabilities and false compression loss
-  using projected amplitudes; dense multi-Pauli probability preparation no
-  longer builds exponential matrices. Control and Kraus ratios preserve
-  extreme represented exponents. Invalid transient-layout options no longer
-  reorder the state, shot replay inherits top-level numerical controls, and
-  mode changes clear stale FIT diagnostics. Reduced branch-copy and support
-  history work; added `norm_diagnostics(include_history=False)` for incremental
-  summary polling with tracked-center norms.
-
-- Aligned `MpoOptimizer` with MPS replay: default `mode="direct"` with
-  `"mpo"`/`"quimb"` aliases, dtype-aware FIT defaults, the DMRG3 two-site
-  transition, and opt-in `finite_check` across modes. Corrected operator
-  rank ceilings to count both physical legs, isolated temporary canonical
-  metadata, and protected transactional recovery against in-place array
-  mutation while reducing repeated copies. Operator scale, ket/bra gate
-  conventions, and deterministic Kraus sums remain unchanged.
-
-- Made `MpsOptimizer(mode="direct")` the constructor default, replacing
-  `"dmrg"`. Prefer `direct` in new code; `"mpo"` and `"quimb"` remain silent
-  compatibility aliases for the same direct compressor. Variational replay
-  now requires an explicit `"dmrg"`, `"fit"`, or named DMRG mode.
-
-- Corrected coalesced MPS reset/leakage branching for permuted and weakly
-  entangled sites, and enforced branch budgets across the whole ensemble.
-  Rare positive measurement outcomes remain selectable with directly
-  contracted small Born weights. DMRG measurement norm accounting now includes
-  the represented exponent. Canonical MPS controls and Kraus probabilities
-  reuse tracked local centers instead of full-chain norm/environment work.
-
-- Fixed conditional MPS gates to inherit the configured DMRG/FIT schedule,
-  guess, and replay options. Trajectory controls now share ordinary branching
-  and cap handling, including nested conditionals and mixed leakage leaves.
-- Fixed dynamic caps to renumber per-trajectory leakage flags and rebase
-  unitary norm accounting without treating physical contraction scale as
-  compression loss. Added mixed-length coalesced terminal samples with `-1`
-  padding and aligned per-row `lengths`, preserving uniform output behavior.
-
-- Added `pepsy.tensors.mps_transfer_spectrum` and `mps_correlation_length`
-  for explicit repeating MPS unit cells and cyclic MPS, with matrix-free
-  non-Hermitian eigensolves, residual checks, and NumPy/Torch/CuPy support.
-  Sparse bosonic Symmray cells support individual neutral and charged sectors
-  without densification. CuPy can use a warned, capability-gated NumPy solve
-  for only the small projected matrix; `projected_solver="native"` forbids it.
-  Site-based open-MPS calls now left-canonicalize a private copy by default
-  before extracting a bulk estimate; `canonicalize="right"` selects the
-  opposite direction. Original arrays, backend/device, and metadata are
-  preserved. Results record the canonical form and report each mode's length.
-  These estimates assume approximately repeating bulk tensors. Supplied-gauge
-  windows use `canonicalize=None, allow_local=True`.
-  Complete cyclic cells also accept a chosen starting site without the opt-in.
-  Spectrum
-  results expose normalized modes, transfer gaps, momenta, mode lengths, and
-  leading degeneracy. GHZ's degenerate modes are retained with infinite
-  length; `mode` selects further scalar lengths. Clustering tolerances no
-  longer close resolved finite gaps; unresolved small gaps return NaN with a
-  mask. Arnoldi grows its basis within `max_ncv` to address restart stagnation;
-  an explicit `ncv` retains a fixed memory budget unless growth is requested.
-  `maxiter=None` uses separate ARPACK/native iteration budgets. ARPACK starts
-  in the working complex precision, seeds its additional RNG when supported,
-  and reports failures without returning partial spectra. Native Arnoldi
-  rechecks accepted residuals against fresh transfer applications. Whole-MPS
-  dtype/backend/device and finiteness checks precede canonicalization.
-  Fermionic parity channels
-  and flat Symmray input remain explicitly unsupported.
-
-- Reduced MpsOptimizer metadata overhead with replay-scoped physical rank
-  ceilings and weak network classification caches, one mixed FIT-window
-  preparation per transaction, and reuse of validated maximum bonds.
-  Sufficient DMRG1 sweep budgets no longer inspect ranks just for validation.
-  Isolated dense SRC/random guesses retain the original state for rollback;
-  direct and native routes keep the required copies. FIT builds layered tag
-  selections lazily and classifies array kinds in one pass. Added cache
-  invalidation, weak ownership, rollback, and replay-equivalence regressions.
-- Made two-site boundary FIT explicitly preserve its own two-site schedule
-  instead of inheriting circuit FIT's block-to-one-site warm-up defaults.
-
-- Added opt-in TreeFIT branch traversal (`fit_traversal="depth-first"`) and
-  capability-gated native blockwise environment contractions
-  (`fit_environment_strategy="native-blockwise"`). Existing execution
-  defaults remain available. TreeOptimizer now solves a one-node FIT region
-  with one exact local projection, skipping disposable guess replay while
-  preserving norms and seeded RNG behavior; disable with
-  `fit_single_node_fast_path=False`.
-
-- Reduced TreeFIT preparation work by stopping canonical-center movement at
-  the active block boundary and reusing fixed traversal orders. Cached tree
-  compression-hook signature checks while preserving legacy overrides and
-  runtime hook replacement. Fixed three-node TreeFIT factorization with an
-  explicitly requested endpoint center.
-  Automatic FIT initialization now chooses SRC for dense states and graded
-  direct compression for native fermionic states. Explicit `guess-direct`
-  now applies/compresses the operator instead of retaining the initial state.
-
-- Aligned TreeOptimizer with the updated MPS FIT workflow: four complete tree
-  iterations by default, a configurable two-node transition in `dmrg3`, and
-  phase-local convergence that preserves pending refinement. Added optional
-  replay-wide `finite_check=True`, including final-state checks in every mode
-  and shot propagation, with one diagnostic-cost warning per replay.
-  Fixed missing graded metric phases on native fermionic FIT environment
-  boundaries, which could corrupt intermediate updates and one-node refinement.
-
-- Made runtime non-finite detection opt-in across all MpsOptimizer modes,
-  including FIT convergence norms and mixed-mode commit checks. Enabling
-  `finite_check=True` warns once per replay and validates final tensor data
-  in every mode. Code comments, API docs, and warnings clarify that this is
-  an optional diagnostic, disabled by default and unnecessary for normal
-  optimization; nested FIT calls do not repeat the warning.
-  Mixed sticky non-finite handling now defaults to False. Convergence/norm
-  calculations, input validation, and explicit diagnostics remain available.
-
-- Reduced gate FIT overhead by reusing environments across 3-to-2 sweeps,
-  skipping unused rank checks for SRC guesses, caching copy capabilities only
-  within a replay, and reading scalar convergence norms without stacked
-  vectors. Preserved SRC initialization and sweep budgets.
-
-- Updated gate FIT defaults to eight alternating RL sweeps with two-site
-  blocks, two warm-up sweeps, dtype-aware convergence tolerance, and disabled
-  split diagnostics. Named `dmrg3` now uses two three-site sweeps, one
-  two-site transition sweep, then one-site refinement within the same sweep
-  budget. `dmrg2` retains its two-site-to-one-site schedule and adjacent-pair
-  shortcut. SRC remains the default optimizer initialization.
-
-- Added opt-in `MpsOptimizer.run(finite_check=True)` validation for DMRG,
-  mixed-mode FIT, and measurement/shot FIT. Per-sweep active-array scans are
-  disabled by default; enabling them emits a performance warning. Scalar
-  convergence/norm calculations and periodic quality checks remain independent.
-- Reduced dense DMRG rollback and SRC-guess copy traffic by isolating array
-  data only in the active window, with independent tensor metadata and
-  read-only exterior sharing. Preserved canonical `left_inds`, Torch gradient
-  connections, and conservative full copies for native symmetry arrays.
-
-- Added `pepsy.tensors.mps_to_ttn` (also `pepsy.mps_to_ttn`) for explicit
-  conversion of an entangled MPS onto a `TreePlan`. `chi=None` uses lossless
-  QR without truncation; finite `chi` imposes a TTN bond cap through
-  sequential environment-aware density-matrix projections without building
-  the full exact TTN first. The converter preserves dense-array backend,
-  device, dtype, physical labels, and represented scale, and returns a tree
-  canonical at its root. A contraction-size guard raises instead of silently
-  approximating. Native Symmray/fermionic input is explicitly unsupported.
-
-- TreeOptimizer now defaults to `fit_rtol="auto"` and `fit_min_iter=2`,
-  matching MpsOptimizer's dtype-aware stopping tolerances alongside the
-  existing automatic cutoff policy. Automatic tolerance stopping is disabled
-  for declared non-unitary updates; `None` retains fixed-iteration behavior.
-  TreeFIT constructs environments incrementally from neighboring messages
-  and invalidates their dependencies without storing full branch-node sets.
-  Tree sweep names are now `inward-outward` / `outward-inward`, with `RL`/`LR`
-  retained as aliases. Disposable FIT guesses avoid copying parent replay
-  histories while preserving its RNG draw sequence; public copies preserve
-  the warm-up budget.
-
-- Added `TreeOptimizer(mode="zipup")` and `fit_init_strategy="guess-zipup"`:
-  layered TreeMPO/state nodes are contracted and truncated incrementally
-  toward a canonical hub, including native fermionic trees. Ordinary DMRG
-  gates now share `apply_subtreempo` and transfer their disposable lazy target
-  directly to TreeFIT. Routine TreeFIT diagnostics no longer contract a
-  doubled target; known `target_norm` values enable normalized local fidelity,
-  and explicit overlap diagnostics use lossless QR when the norm is unknown.
-  `TreeFIT(finite_check=False)` / `TreeOptimizer(fit_finite_check=False)` keep
-  array scans opt-in, and trusted sweeps avoid full isometry revalidation.
-  Optional target-norm diagnostic failures are reported without aborting a
-  successful fit. Local fitting preserves the target's stored exponent even
-  when it differs from the initial guess. The `track_infidelity` default is
-  unchanged.
-  FIT messages resolve live bond names after canonicalization. Odd-parity
-  fermionic FIT inputs now raise explicitly because their local projections
-  are unsupported; native direct and zipup application remain available.
-
-- Added a geometry-aware rank scheduling policy to native `TreePeps` and
-  `TreePEPO` compression. The default `order="rank"` removes the currently
-  cheapest legal leaf branch using live physical/virtual dimensions, while
-  `order="depth"` preserves the previous farthest-first schedule. TreePeps
-  full sweeps now re-score after each completed reduction and batch their
-  expensive whole-network validation to one final canonicality check;
-  localized `TreePepsOptimizer` sweeps re-score sibling branches in the same
-  way. Standalone edge operations retain validation by default.
-
-- Canonicalized tree layout names across the public handoff: TreeMPO,
-  TreeTensorNetwork, and TreeOptimizer accept `map_mode="coarse-*"` for
-  lattice coarsening/traversal, while TreePEPO, TreePeps, and
-  TreePepsOptimizer accept `map_mode="span-up"`, `"span-down"`,
-  `"span-out"`, or `"span-middle"` for bounded-degree physical spanning
-  trees. The selected mode is exposed on the shared plan, state, and operator;
-  historical generic and `inside-out` spellings remain compatibility aliases.
-  TreePEPS legacy `coarse-*` modes also accept the shared `coarse_grain`
-  control through the plan and layout finder.
-
-- Corrected `TreePeps` `span-middle` to use one central horizontal
-  line/plane with an axial chain above and below every backbone site. Central
-  interior sites therefore have four virtual bonds and off-backbone interior
-  sites have two; TreePeps now permits rank-five site tensors. `TreeMPO` also
-  retains optional `TreeLayoutFinder` metadata so `show(layout="both")` can
-  print the physical lattice and term supports above its native tree view.
-
-- Unified the Hamiltonian `to_*` conversion surface around the single
-  strategy-bearing `compress=` control. The public `to_mpo`, `to_pepo`,
-  `to_tree_mpo`, and `to_tree_pepo` builders now default to
-  `compress="term"`, adding and compressing one term at a time.
-  `compress=True`/`"auto"` explicitly select a workload-aware construction:
-  automaton assembly gets one final compression, while the term route
-  compresses after every term. `compress="automaton"` forces
-  shared/state-diagram assembly. `compress=False`, `max_bond=None`, and
-  `max_bond=False` disable numerical compression; `mode=` and
-  `compress_each=` remain compatibility spellings. Automatic native tree
-  conversions also choose a layout from the interaction supports when no plan
-  or mapping is supplied.
-
-- Batched internal `TreePEPO` validation across each full compression sweep.
-  Standalone edge compression still validates by default, while term-by-term
-  and one-shot builder paths avoid repeating the quadratic whole-network
-  topology check after every compressed edge.
-  `TreeMPO.show()` now keeps the clean native ASCII tree as its default, and
-  `TreePEPO` retains its `TreePepsLayoutFinder` metadata through later
-  operations.
-
-- Unified `cutoff="auto"` across MPS, tree, TreePEPS, and Hamiltonian
-  conversion paths: it resolves to `1e-12` for `float64`/`complex128`, `1e-6`
-  for `float32`/`complex64`, and `1e-3` for 16-bit floating-point data.
-
-- Added canonical `ham_tn.to_mpo`, `ham_tn.to_pepo`, `ham_tn.to_tree_mpo`, and
-  `ham_tn.to_tree_pepo` conversions. Native tree conversions preserve the
-  supplied tree geometry and avoid a chain-MPO round trip; `TreePEPO` and
-  `TreeSubPEPO` are now the canonical acronym spellings, with legacy names and
-  `build_*` methods retained as compatibility aliases.
-
-- Made `mode="direct"` the explicit GibbsMps default while retaining
-  `mode="mpo"` as a compatibility alias for the same direct Quimb replay.
-  Added coverage for inferred map ordering, triangular coordinate graphs, and
-  connected one-site term fusion.
-
-- Added `pepsy.fitting.TreeFIT`, a tree-native cached variational fitting
-  engine with directed branch environments, canonical-centre path movement,
-  one-/two-/three-node local blocks, seeded randomized warm starts, and
-  normalized target-overlap diagnostics. Its `run`, `run_eff`, and `run_gate`
-  controls follow the chain FIT calling convention; structural retagging and
-  disposable-target ownership are explicit. Correctly tagged layered targets
-  are grouped by structural node, retaining local layer bonds and multiple
-  inter-node bonds; ambiguous or untagged tensors are rejected. The dedicated
-  path two-layer compressor remains available. `TreeOptimizer` and
-  `TreePepsOptimizer` expose it through `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3`.
-- Aligned tree DMRG scheduling with MPS FIT: generic DMRG supports an adaptive
-  larger-block warm-up followed by one-site refinement, named `dmrg1`/`dmrg2`
-  use two-node growth before one-site updates, and `dmrg3` uses three-node
-  growth. `guess-src` now builds a disposable TreeMPO/TreePEPO-applied tree
-  guess and feeds that guess to TreeFIT while retaining the exact target
-  separately; diagnostics expose the schedule and warm-start backend.
-
-- Added `sdc` and `src` compression modes to `TreeOptimizer` and
-  `TreePepsOptimizer`. Path-shaped `TreePeps` states delegate to Quimb's
-  environment compressors; branching trees use a deterministic successive
-  edge sweep or dense randomized-SVD edge splits, with `compression_seed` for
-  reproducibility. The modes preserve TreePeps plan/index metadata and reject
-  charge-unsafe randomized compression for native fermionic TTNs.
-
-- Added path `TreePeps` two-layer operator-state compression. With
-  `compression_layout="auto"`, Quimb's multi-tensor `sdc`, `src`, and `zipup`
-  kernels can compress the separate PEPO and state layers directly; the
-  original fused application remains available with
-  `compression_layout="fused"`, while `"two_layer"` requires an explicit
-  path topology.
-
-- Made the MPS SDC surface explicit and regression-tested: bare
-  `mode="sdc"` / `mode="sdc-oversample"` aliases normalize to Quimb's
-  successive deterministic compressors, and the same methods are available
-  as `fit_init_strategy="guess-sdc"` / `"guess-sdc-oversample"`, with strict
-  Quimb version gating and no silent fallback.
-
-- Aligned `MpoOptimizer` with the MPS DMRG scheduling and timing APIs. Generic
-  DMRG now uses adaptive block warm-up followed by one-site refinement,
-  `dmrg2` retains the adjacent-pair fast path, timing exposes the MPS-shaped
-  stage/FIT schema, and MPO norm diagnostics retain physical `2**L` scale via
-  explicit squared-norm fields and scale-safe mantissa/exponent event pairs.
-  Dense direct two-site MPO replay also uses Quimb's dagger-aware auto-swap
-  sandwich when available, while local fidelity events now cover compressed
-  multi-site MPO paths. `MpoOptimizer.to_backend(...)` now mirrors the
-  state-derived MPS conversion helper for backend, dtype, and device routing.
-
-- Extended `exp_mpo_cluster`, `exp_mpo_cluster_product`, and the reusable MPO
-  cluster expansion with native bosonic Abelian block-sparse output through
-  `MPOPhysicalSpace` / `symmetry` metadata. Direct assembly now retains sparse
-  virtual blocks and compiles them through the existing Symmray boundary.
-  Streaming assembly also supports directional adaptive TT-SVD through
-  `assembly_cutoff`, `assembly_cutoff_mode`, and `assembly_form`, while
-  preserving fixed-rank backend-autodiff streaming when no cutoff is given.
-
-- Extended `GibbsMps` with the reusable `bell_to_mps` Quimb constructor and
-  configurable tag-wise trace contraction options, while preserving the
-  backend and autodiff paths.
-
-- Added exponent-aware Gibbs-MPS trace bookkeeping and a natural-log
-  `log_partition_function()` readout for stable large-scale partition
-  functions.
-
-- Kept Gibbs-MPS readout on Quimb's native partial-trace path (including
-  Pepsy-rescaled states), and stopped resolving the same Trotter graph
-  ordering twice; randomized ordering metadata now matches the executable
-  replay schedule.
-
-- Updated `GibbsMps` to use Quimb's graph-aware `LocalHamGen` Trotter scheduler
-  for first-, second-, and fourth-order product formulas. Connected one-site
-  terms are combined into incident edges without leaving the selected backend;
-  isolated one-site terms use exact one-site gates. Trotter layer metadata and
-  ordering/fusion controls are now exposed on the Gibbs-MPS object.
-
-- Added `GibbsMps`, a first finite-temperature purification API. It builds an
-  interleaved physical/ancilla MPS from Bell pairs, applies backend-aware
-  second-order imaginary-time Trotter gates through `MpsOptimizer`, supports
-  `MPOBasis` one-dimensional and `OneDMap` lattice terms, and traces ancillas
-  back to a thermal MPO.
-
-- Added bounded graph-cluster assembly controls to `exp_mpo_cluster` and
-  `MPOBasis.compile_graph_cluster_expansion`. The default
-  `graph_assembly="auto"` uses a cutwidth-aware frontier planner before
-  materializing collections, while `graph_assembly="exact"` and
-  `graph_assembly="bounded"` make the exact versus controlled-approximation
-  choice explicit and report the selected strategy.
-
-- Added opt-in streaming graph-path assembly to `exp_mpo_cluster` and
-  `MPOBasis.compile_graph_cluster_expansion`. `assembly="streaming"`
-  inserts local graph-path cores directly into the accumulator in bounded
-  batches, applies a semantic fixed-rank SVD after each batch through
-  `assembly_chi`, and avoids temporary path or batch MPOs while reporting the
-  working compression diagnostics.
-
-- Added the product-named one-shot `exp_mpo_cluster_product(factors, step, ...)`
-  facade for ordered `exp(A) @ exp(B) @ ...` MPO cluster expansions. It shares
-  the term parsing, graph/cyclic, streaming, backend, report, and final
-  compression controls of `exp_mpo_cluster` while making the factor list
-  explicit.
-
-- Fixed exact Torch export/compile log-amplitude evaluation by tracing the
-  scalar contraction directly and making `backend="eager"` use the stable
-  exported/vmapped graph. This prevents PyTorch 2.6 FakeTensor leakage into
-  Metropolis acceptance while preserving real compiler backends.
-
-- Added an opt-in Torch PEPS export pipeline matching the GPU VMC
-  `torch.export -> torch.vmap -> torch.compile` flow. Exact PEPS models can
-  compile a fixed walker batch, including stable log amplitudes; Metropolis
- proposal evaluations pad changing subsets to that batch and discard the
- auxiliary rows, while existing eager/vmap/serial paths remain unchanged.
-
-- Added opt-in compiled boundary-MPS reuse for finite rectangular Torch PEPS.
-  Boundary environments and fixed one-/two-row or one-/two-column geometry
- classes can be exported, vmapped, and compiled; connected local-energy
- targets are grouped across parent walkers and retain the eager fallback for
- unsupported Quimb or Symmray contraction paths.
-
-- Added the backend-neutral `MPOBlock` / `MPOBlockPlan` structural inspection
-  layer. First-degree automata and persistent higher-order block-sparse MPOs
-  now expose virtual-state transitions, stored block counts, recipes, and
-  charge metadata without retaining numerical backend arrays.
-
-- Added charge-aware block validation and sector-wise compression diagnostics
-  for higher-order MPOs. `MPOBlockPlan.validate_charges()` checks virtual
-  charge labels before materialization, `FirstDegreeMPO.validate_charge_flow()`
-  invokes the native Symmray local flow check, and
-  `sector_aware="auto"` records native sector dimensions and block counts
-  around final Quimb compression without densifying symmetric tensors.
-
-- Extended `ham_tn.build_mpo` with compact Pauli term spellings, integer chain
-  locations, and dtype-aware `cutoff="auto"` / `cutoff_mode="auto"` options;
-  existing explicit local-operator terms remain supported. Builders now also
-  accept `to_backend=...` and perform generic MPO accumulation and compression
-  on the selected backend, infer `data_type` from that converter, accept
-  `chi`/Quimb compression options, and expose a shared automaton mode that
-  canonicalizes duplicate and identity-containing terms before compilation;
-  `mode="auto"` selects it only when its structural width is reasonable.
-
-- Extended higher-order `MPOBasis` and `exp_mpo` term input with the same
-  compact Pauli tuple spellings as `ham_tn`, and added final-`chi` compression
-  controls including `cutoff="auto"`, `cutoff_mode="auto"`, `form`, and
-  `compress_opts`.
-
-- Added the shared `shape=` geometry alias to `ham_tn`, supporting 1D, 2D,
-  and 3D layouts while retaining the legacy `Lx`/`Ly`/`Lz` spelling.
-
-- Added `to_backend=` to `exp_mpo` and `MPOBasis` term compilation. Operator
-  blocks and coefficient assembly now use the requested backend before
-  higher-order contractions, and ordinary final MPO output is rechecked with
-  `apply_to_arrays` after optional `chi` compression.
-
-- Added opt-in `progress=True` diagnostics to higher-order MPO exponentials.
-  The color-coded bar is labeled `exp(order=N)`, reports history and
-  analytical Algorithm 1--4 stages, and distinguishes Algorithm 4 analytical
-  compression from final numerical `chi` compression. Timing data and the
-  separate `analytical_compression` / `numerical_compression` metadata are
-  retained on the returned MPO.
-
-- Added canonical higher-order exponential modes: `exact` for Algorithm 3,
-  `folded` for Algorithm 4, `hybrid` for Algorithms 3 and 4, and `auto` for
-  the order-aware exact/folded policy. Historical `algorithm4`, `optimal`,
-  and `approximate` spellings remain compatible aliases.
-
-- Updated Quimb compatibility handling to defer the Symmray `safe_inverse`
-  shim to older builds, accept Quimb's native long-range simple-update path,
-  capability-check generalized-loop options, and adapt loop-series resummation
-  to Quimb's newer `num_tensors` argument.
-
-- Fixed tree-energy Torch policy initialization and protected native complex64
-  QR from stale process-global Autoray registrations.
-
-- Added opt-in Quimb `sdc` and `sdc-oversample` MPS compression mode names
-  with execution-time capability checks; existing compression defaults and
-  modes are unchanged.
-- Added opt-in Quimb `sdcr` and `sdcr-oversample` compression mode names to
-  `MpsOptimizer` and `MpoOptimizer`, including `guess-sdcr` FIT warm starts.
-  Base SDCR uses a rank-only randomized environment with a relative cutoff
-  compatibility policy; existing defaults and seeded SRC/SRCMPS behavior are
-  unchanged.
-- Updated randomized MPS compression to use Quimb's explicit `seed` support
-  when available, while retaining a compatibility fallback for older builds.
-- Added opt-in fourth-order Suzuki-Yoshida gate streams to the symmetric
-  Hamiltonian and fermion helpers. Existing first- and second-order streams
-  retain their public behavior, with overlapping hopping terms now arranged in
-  a symmetric edge-colored half-step schedule before the fourth-order lift.
-- Added a narrow Symmray compatibility path for older Quimb projector
-  compression builds whose `safe_inverse` incorrectly passes an axis to a
-  one-dimensional block vector.
-
-- Added the initial `TreePepsPlan` and `TreePeps` state API for PEPS-like
-  tensor networks with 2D/3D coordinate tags, stable 1D logical tags, and
-  validated spanning-tree virtual bonds, including PEPS-style `show`, tree
-  canonical-center movement, `info_c` synchronization, and compression hooks.
-- Added a hard three-virtual-bond TreePeps rank invariant, explicit local and
-  maximum tensor-rank diagnostics, a workload-aware `TreePepsLayoutFinder`,
-  and Quimb-style 2D Unicode state schematics that show retained tree bonds.
-- Added `left_inds`-backed isometry metadata to `TreePeps`, with canonical
-  region recovery, path-only center movement, QR-free canonical edge moves,
-  and a center-oriented compression sweep that avoids a redundant full QR.
-- Added tree-native `TreePepo` and `TreeSubPepo` operators with separate
-  input/output legs, support/span metadata, exact dense-factorized gates,
-  term sums, tree-bond fusion on application, expectation values, and
-  optional canonical compression.
-- Added `TreePepsOptimizer` with direct tree-geodesic gate replay and
-  `sub_treepepo` span replay, lossless routing, `left_inds`-aware canonical
-  preparation, localized compression, per-update bond reports, persistent
-  `set_gates`/`add_gates` streams, common one-/two-/multi-site aliases, and
-  validated state replacement.
-- Added TreePeps parity helpers for rooted topology traversal, bond-growth
-  estimates and preflight, batched local expectations, dense state-vector
-  conversion, normalization, optimizer state aliases, and truncation reports.
-- Completed TreePeps optimizer parity for state canonicalization aliases,
-  span-local explicit compression, normalization controls, intermediate-bond
-  preflight, profile and transient-bond diagnostics, layout convenience, and
-  chi convergence sweeps with optional dense-reference fidelity.
-- Added `compression_mode="dm"` to the tree, TreePeps, and TreeStab optimizer
-  families. It applies Quimb's density-matrix-equivalent local `svd:eig`
-  decomposition after the complete state/operator network is fused; the
-  existing direct SVD mode remains the default and native fermionic trees keep
-  their graded direct-compression path.
-- Added explicit `TreeOptimizer` `tree_mpo_direct` and `tree_mpo_dm` modes.
-  These build and route a true TreeMPO over the active Steiner subtree rather
-  than lowering gates to a chain sub-MPO; `auto` now promotes gates wider than
-  four qubits to the TreeMPO route, while bounded dense direct gates fail with
-  an actionable mode recommendation.
-- Updated `TreeStabOptimizer` to use true TreeMPO active-span routing for
-  coefficient-frame gates, Pauli sums, projections, localizers, and exact
-  cooling. Its canonical modes are `tree_mpo_direct` and `tree_mpo_dm`, with
-  `tree-mpo-dm` and `tree_mpo_dem` accepted as aliases.
-- Added `OneDMap` center-out/inside-out traversal aliases and independent
-  `TreePepsPlan.tree_order` seeds. Row-major, Hilbert, diagonal, and
-  center-out orders can now guide legal degree-bounded virtual trees, and
-  `TreePepsLayoutFinder` compares those deterministic seeds with weighted
-  growth and reports the selected seed.
-- Centralized execution-time Quimb capability checks for optional MPS
-  compressors and gate transforms. `gate` and `gate_simple` now forward
-  `dagger`/`transpose` to the user gate while leaving routing SWAPs unchanged.
-- Added `gloop_opts` to the scalar and 2-norm loop-cluster entry points so
-  newer Quimb generalized-loop generator controls can be used without
-  changing existing defaults.
-- Added capability-gated BP constructor/run forwarding, Autoray-native random
-  FIT initialization, Quimb `LatticeBondMap` periodic-bond naming, and an
-  explicit opt-in MPO auto-swap wrapper. These integrations preserve existing
-  defaults and fail locally when an optional Quimb capability is unavailable.
+- `GibbsMps` finite-temperature purification, `bell_to_mps`, thermal MPO
+  readout, exponent-aware partition functions, and graph-aware first-, second-,
+  and fourth-order Trotter scheduling. See the
+  [Gibbs-MPS API](docs/api/optimizers/gibbs_mps.md).
+- Tree-native FIT/DMRG, compact `SubTreeMPO` / `TreeSubPEPO` application,
+  zipup and mixed replay, and successive/randomized compression families.
+  `TreePeps` supports coordinate-aware spanning trees, layout selection,
+  canonical-region metadata, and up to four virtual bonds per site. Native
+  symmetry/backend restrictions are explicit in the
+  [tree](docs/api/optimizers/tree.md) and
+  [TreePEPS](docs/api/optimizers/tree_peps.md) APIs.
+- Opt-in SDC, SRC, SDCR, and oversampled compression variants across supported
+  MPS, MPO, tree, and PEPS boundary paths. Intermediate and final compression
+  controls remain independent, with execution-time capability checks and
+  authoritative final bond limits. See
+  [compression options](docs/api/boundary/compression.md).
+- State-aware MPS layout and replay scheduling, including interaction-derived
+  coordinates, site lifetimes, role-aware candidates, and an opt-in
+  `measure-early` schedule that respects control dependencies.
+- `mps_to_ttn` and `mps_to_treepeps` conversions with explicit bond caps;
+  MPS transfer spectra and correlation lengths; MPS and tree entanglement
+  diagnostics; and dense-backend/native-Symmray tree sampling. See
+  [observables](docs/api/tensors/observables.md) and
+  [tree sampling](docs/api/sampling/tree.md).
+- Directional and middle-out flat contractions, layered boundary contraction,
+  additional finite-CTMRG modes, and `preserve_backend=True` scalar returns
+  for differentiable flat contractions. See
+  [boundary metrics](docs/api/boundary/metrics.md).
+- Term-centric and backend-aware Hamiltonian/MPO construction, higher-order
+  exponential policies, structural MPO block inspection, charge-flow
+  validation, bounded/streaming graph-cluster assembly, and ordered products.
+  Inhomogeneous PEPO products support explicit locations and periodic square
+  lattices through order nine. See [operators](docs/api/index.md) and the
+  [exponential API](docs/api/operators/exponentials.md).
+- Fourth-order symmetric Hamiltonian/fermion gate streams, additional BP
+  option forwarding, and capability-gated upstream contraction integrations.
+- Opt-in Torch PEPS export, batching, and compilation for exact amplitudes
+  and reusable rectangular boundary environments, with eager fallbacks for
+  unsupported paths. See [VMC](docs/api/vmc.md).
 
 ### Removed
 
-- Removed `MpsOptimizer(mode="su")` and its optimizer-owned simple-update gauge
-  state. Use the dedicated simple-update gate or PEPS APIs instead.
+- `MpsOptimizer(mode="su")` and its optimizer-owned gauge state. Use
+  `pepsy.operators.gate_simple` or the dedicated PEPS simple-update APIs.
+- MPS `routing="perm"` and composed `perm-*` / `*-perm` solver modes.
+  `mode="perm"` is now a single lazy swap-and-split SVD route; it retains
+  physical order and exposes the logical mapping. Use an explicit solver
+  with a static layout for compression-aware ordering.
 
 ### Fixed
 
-- Optional MPS FIT overlap diagnostics now report non-finite contraction
-  results as diagnostic errors instead of clipping NaN/infinity to a valid
-  fidelity. Default replay performs no additional checks or contractions.
+- Released Quimb compatibility for seeded compression, method/route options,
+  optional compressors, and dtype-specific decomposition failures. Narrow
+  fallbacks retain backend, dtype, and requested truncation semantics.
+- Rare MPS/tree measurement branches, conditional and trajectory controls,
+  dynamic caps, represented exponents, and projection-versus-compression norm
+  accounting. Invalid replay settings preserve state and configuration.
+- Tree entropy now uses physical Schmidt spectra from a canonical copy.
+  Tree state invalidation clears stale isometry metadata, and compact operator
+  application preserves exterior scale and identity semantics.
+- Native Symmray MPO dense readout restores computational-basis order;
+  fermionic FIT, BP overlaps, and cluster bra phases preserve graded
+  conventions. Unsupported odd-parity TreeFIT projections fail explicitly.
+- Torch/JAX/CuPy backend, dtype, device, and gradient preservation in replay,
+  fitting, operator construction, and diagnostics. Complex PEPO coefficients
+  and real-term/complex-prefactor MPO products retain correct promotion.
+- Rectangular and single-slice PEPS boundaries, FIT target/guess ownership and
+  cache reuse, JAX SVD options and derivatives, and Torch export/compile
+  log-amplitude evaluation.
 
-- Fixed TreeMPO DMRG update finalization so explicit `apply_subtreempo` calls
-  close their active norm ledger and record diagnostics. Fixed
-  `TreePepsOptimizer.run(mode=...)` persistence for all route/compression
-  aliases and propagated shorthand compression modes to explicit `TreeSubPepo`
-  stream events.
+### Development
 
-- Fixed backend preservation through higher-order sparse history materialization.
-  Empty sparse virtual tensors now retain a backend reference, backend-native
-  zero/equality operations no longer silently fall back to NumPy, and the
-  `to_backend=` contract is covered through Torch/JAX semantic and final MPO
-  boundaries for all canonical history modes.
-
-- Fixed the native Symmray MPO dense-conversion boundary. Pepsy now supplies
-  the original physical basis-to-charge maps when Quimb contracts fused native
-  sectors, so `to_mpo().to_dense()` and the result of native sector-aware
-  compression use computational-basis order rather than Symmray's packed
-  sector order. The compiled MPO remains block-sparse until dense conversion
-  is explicitly requested.
-- Fixed native DMRG product results to retain Pepsy's MPO dense-conversion
-  boundary after FIT returns a base Quimb MPO. `compress_mpo_product` now
-  records that DMRG refinement uses `FIT.run_eff` and preserves the physical
-  charge maps needed for computational-basis output.
-
-### Changed
-
-- Non-unitary MPS DMRG now keeps the adaptive `fit_rtol="auto"` policy even
-  when the exact FIT target has a non-unit norm. `stabilize_unitary=True` is
-  rejected for non-unitary replay, and exact-mode normalization requests fail
-  explicitly.
-
-- Fixed the higher-order MPO convenience API so `extension_budget` is
-  available consistently on batched and compatibility evolution entry points,
-  while compiled evaluator policy remains fixed at compile time. The
-  compatibility `history_storage="blocks"` alias now shares its compiled cache
-  with the canonical `"block_sparse"` spelling.
-
-- Extended `compress_mpo_product` with `guess_method` and `guess_seed` for
-  DMRG/FIT warm starts. The default deterministic SDC guess is retained;
-  dense-only `src` and `src-oversample` guesses can now initialize the exact
-  lazy target before `FIT.run_eff`. Native Symmray SRC warm starts fail with a
-  clear sector-awareness error rather than attempting unsupported randomized
-  backend operations.
+- Documentation builds now fail on warnings in CI and Read the Docs. Fixed
+  API parameter formatting, heading levels, navigation coverage, and links
+  to repository history so the strict HTML build completes cleanly.
+- CI tests the five direct core dependency minimums and a combined extended
+  profile with a 60% coverage gate, plus MPI, packaging, docs, type checks,
+  and agent guidance. Backend imports and test failure annotations improve
+  diagnostics. MPS/tree tests are split by responsibility.
+- See the [release-readiness review](docs/development/notes/release_readiness_2026_09.md)
+  for validation evidence, merge scope, and decisions required before release.
 
 ## [0.4.1] - 2026-08-27
 

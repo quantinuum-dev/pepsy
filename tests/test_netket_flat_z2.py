@@ -48,6 +48,7 @@ def test_prepare_fermionic_peps_flattens_odd_z2_bond_dimension():
 
 def test_explicit_native_hubbard_terms_compile_to_matching_netket_terms():
     """NetKet uses the supplied native term mapping, not Fermion attributes."""
+    pytest.importorskip("symmray")
     import pepsy as py
     from pepsy.vmc.netket import (
         _native_fermi_hubbard_terms_to_netket,

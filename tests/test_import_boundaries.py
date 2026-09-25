@@ -245,6 +245,23 @@ print(*sorted(
         assert not loaded, (module_name, loaded)
 
 
+def test_symmetric_mapping_does_not_load_core_compatibility_module():
+    """Mapping symmetric chains needs maps, not the compatibility aggregator."""
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.tensors.maps import OneDMap
+from pepsy.tensors.symmetric import _resolve_chain_mapper, _resolve_mpo_mapping
+
+mapper = OneDMap(2, 2)
+assert _resolve_chain_mapper(mapper, {'num_sites': 4}) == mapper.build()[0]
+assert _resolve_mpo_mapping(mapper=mapper)[:2] == mapper.build()
+print(*sorted(name for name in sys.modules if name == 'pepsy.tensors.core'))
+"""
+    )
+    assert not loaded
+
+
 def test_sampling_namespace_is_lazy():
     """Discovering samplers does not import sampler implementations eagerly."""
     loaded = _run_clean_import(

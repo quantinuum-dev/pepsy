@@ -1995,6 +1995,8 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
     return_info : bool, default=False
         If ``True``, return :class:`BoundaryContractResult` with diagnostics.
 
+    Notes
+    -----
     Other parameters match :func:`contract_flat` and
     :func:`contract_boundary` where applicable.
     """
@@ -3438,11 +3440,8 @@ def peps_fidelity(
     return fidelity
 
 
-def normalize(*args, **kwargs):
-    """Compatibility alias for :func:`peps_normalize`."""
-    return peps_normalize(*args, **kwargs)
-
-
-def infidelity(*args, **kwargs):
-    """Compatibility alias for :func:`peps_infidelity`."""
-    return peps_infidelity(*args, **kwargs)
+# Compatibility aliases for the former generic names. The boundary package
+# facade emits the deprecation warning; direct aliases keep one implementation
+# and preserve object identity for callers that introspect the leaf module.
+normalize = peps_normalize
+infidelity = peps_infidelity

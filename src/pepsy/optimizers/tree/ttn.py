@@ -51,6 +51,7 @@ from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
 from ...backends import get_torch_linalg_config, to_float
+from ..._internal.quimb import quimb_safe_split_method
 from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
@@ -2530,7 +2531,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb=absorb,
                 reduced=reduced,
-                method=_compression_method(compression_mode),
+                method=quimb_safe_split_method(
+                    _compression_method(compression_mode), self.node_tensor(a).data,
+                ),
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)

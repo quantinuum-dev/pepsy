@@ -14,6 +14,7 @@ from ..._internal.quimb import (
     quimb_1d_compression_function,
     quimb_1d_compression_cutoff_mode,
     require_quimb_1d_compression_method,
+    run_seeded_quimb,
 )
 from ._compression import (
     iter_tree_compression_order,
@@ -1496,7 +1497,10 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 inplace=False,
             )
         else:
-            result = compressor(temporary, **options)
+            result = run_seeded_quimb(
+                options.pop("seed", None), compressor, temporary,
+                quimb_method=compression_mode, **options,
+            )
 
         for site in order:
             tag = self.site_tag(site)

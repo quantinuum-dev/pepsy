@@ -2,8 +2,9 @@
 
 import importlib
 import importlib.metadata
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 import pytest
 from packaging.requirements import Requirement
@@ -268,7 +269,7 @@ def test_composed_dependency_profiles_preserve_feature_boundaries():
     }
     assert expanded["test-extended"] == set().union(
         *(expanded[name] for name in ("layout", "solvers", "stabilizer", "symmetry", "torch", "viz"))
-    )
+    ) | {"autograd>=1.7"}
 
 
 @pytest.mark.parametrize(

@@ -12,7 +12,7 @@ import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
 from .._internal.cutoff import dtype_auto_cutoff
-from .._internal.quimb import require_quimb_1d_compression_method
+from .._internal.quimb import require_quimb_1d_compression_method, run_seeded_quimb
 from ..tensors.core import tn_fidelity
 from ..fitting.local import FIT
 from ._fit_policy import (
@@ -710,7 +710,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # extra full target copy here: ``tn`` is a disposable local target and
         # the compressor's public ownership contract already protects it.
         compress_kwargs.update(deepcopy(self.fit_compression_opts))
-        return qtn.tensor_network_1d_compress(tn, **compress_kwargs)
+        return run_seeded_quimb(
+            compress_kwargs.pop("seed", None),
+            qtn.tensor_network_1d_compress, tn, **compress_kwargs,
+        )
 
     def _compress_boundary(  # pylint: disable=too-many-locals
         self,
@@ -1002,7 +1005,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             guess_kwargs["seed"] = self.fit_init_seed
         else:
             guess_kwargs["cutoff_mode"] = self.fit_cutoff_mode
-        guess = qtn.tensor_network_1d_compress(tn, **guess_kwargs)
+        guess = run_seeded_quimb(
+            guess_kwargs.pop("seed", None),
+            qtn.tensor_network_1d_compress, tn, **guess_kwargs,
+        )
         guess.view_as_(
             qtn.MatrixProductState,
             L=boundary_mps.L,

@@ -1,4 +1,8 @@
+import pytest
+
+
 def test_transition_plan_matches_live_connections_and_slices():
+    pytest.importorskip("torch")
     torch = __import__("torch")
     from pepsy.vmc.torch import TorchConnections, TorchVMCDriver
 
@@ -40,6 +44,7 @@ def test_transition_plan_matches_live_connections_and_slices():
 
 
 def test_amplitude_cache_reuses_targets_and_invalidates_on_parameter_update():
+    pytest.importorskip("torch")
     torch = __import__("torch")
     from pepsy.vmc.torch import TorchAmplitudeCache, TorchConnections, TorchVMCDriver
 

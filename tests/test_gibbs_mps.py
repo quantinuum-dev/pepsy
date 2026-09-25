@@ -41,6 +41,7 @@ def test_gibbs_mps_uses_interleaved_bell_pairs_and_traces_ancillas():
     assert state.partition_function() == pytest.approx(4.0)
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_trace_options_keep_the_quimb_mpo_path():
     """Explicit Quimb contraction options do not densify the purification."""
     state = GibbsMps([(("ZZ", 0.3), (0, 1))], shape=2)
@@ -59,6 +60,7 @@ def test_gibbs_mps_trace_options_keep_the_quimb_mpo_path():
     assert configured.L == state.length
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_uses_quimb_native_trace_with_stored_scale(monkeypatch):
     """Scaled readout stays on Quimb's native partial-trace path."""
     state = GibbsMps([(("ZZ", 0.3), (0, 1))], shape=2)
@@ -77,6 +79,7 @@ def test_gibbs_mps_uses_quimb_native_trace_with_stored_scale(monkeypatch):
     assert calls[0][1]["keep"] == state.physical_sites
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_reuses_one_resolved_quimb_ordering(monkeypatch):
     """Metadata and execution share the same graph-layer schedule."""
     state = GibbsMps(
@@ -108,6 +111,7 @@ def test_gibbs_mps_reuses_one_resolved_quimb_ordering(monkeypatch):
     assert len(ordering_calls) == 1
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_random_metadata_matches_executable_schedule():
     """Randomized layer metadata and gate replay use one draw."""
     state = GibbsMps(
@@ -134,6 +138,7 @@ def test_gibbs_mps_random_metadata_matches_executable_schedule():
     )
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
     """Second-order imaginary-time replay converges to the exact Gibbs state."""
     terms = [
@@ -160,6 +165,7 @@ def test_gibbs_mps_second_order_trotter_matches_small_exact_reference():
     assert state.optimizer._unitary_previous_norm is None
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_uses_quimb_trotter_schedule_and_physical_mapping():
     """Quimb's schedule metadata survives the purification site mapping."""
     state = GibbsMps(
@@ -195,6 +201,7 @@ def test_gibbs_mps_uses_quimb_trotter_schedule_and_physical_mapping():
 
 
 @pytest.mark.parametrize("order", (1, 4))
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_accepts_quimb_first_and_fourth_order_schedules(order):
     """The public order control follows Quimb's supported product formulas."""
     state = GibbsMps([(("ZZ", 0.2), (0, 1))], shape=2)
@@ -205,6 +212,7 @@ def test_gibbs_mps_accepts_quimb_first_and_fourth_order_schedules(order):
     assert all(gate.where == (0, 1) for gate in state.trotter_gates)
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_applies_disconnected_onsite_terms_exactly():
     """One-site terms outside the interaction graph avoid fake edges."""
     state = GibbsMps(
@@ -226,6 +234,7 @@ def test_gibbs_mps_applies_disconnected_onsite_terms_exactly():
     )
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_forwards_direct_mps_controls_and_normalization():
     """Common MpsOptimizer controls are available without nested kwargs."""
     state = GibbsMps([(("ZZ", 0.7), (0, 1))], shape=2)
@@ -246,6 +255,7 @@ def test_gibbs_mps_forwards_direct_mps_controls_and_normalization():
     assert np.isfinite(float(np.real(state.trace())))
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_tracks_log_partition_function_through_rescaling():
     """Log-Z and normalized readout retain scale-control bookkeeping."""
     terms = [
@@ -308,6 +318,7 @@ def test_gibbs_mps_infers_coordinate_dimension_and_shape():
     assert state.basis.lattice_to_chain[(1, 0)] == 4
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_infers_triangular_coordinate_graph():
     """Graph geometry comes from the supplied triangular edge list."""
     lx, ly = 2, 3
@@ -331,6 +342,7 @@ def test_gibbs_mps_infers_triangular_coordinate_graph():
     assert state.trotter_gates
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_fuses_connected_onsite_terms_into_pair_terms():
     """Onsite terms are combined before the Quimb Trotter schedule."""
     state = GibbsMps(
@@ -373,6 +385,7 @@ def test_gibbs_mps_fuses_connected_onsite_terms_into_pair_terms():
     assert len(state.gates) == 1
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_defaults_to_direct_replay_mode():
     """The public default uses the explicit direct-mode spelling."""
     state = GibbsMps([(("ZZ", 0.2), (0, 1))], shape=2)
@@ -431,6 +444,7 @@ def test_gibbs_mps_rejects_layout_override_during_replay():
         state.prepare(0.1, n_steps=1, run_kwargs={"layout": "quality"})
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_keeps_identity_snapshot_with_inplace_optimizer():
     """The identity accessor remains un evolved even for in-place replay."""
     state = GibbsMps([(("Z", 0.1), 0)], shape=1)
@@ -453,6 +467,7 @@ def test_gibbs_mps_keeps_identity_snapshot_with_inplace_optimizer():
     )
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_keeps_explicit_backend_for_state_and_gates():
     """Explicit ``to_backend`` reaches Bell tensors, gates, and the MPO."""
     torch = pytest.importorskip("torch")
@@ -472,6 +487,7 @@ def test_gibbs_mps_keeps_explicit_backend_for_state_and_gates():
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in rho)
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_preserves_autograd_gate_payloads():
     """Backend placement must not detach differentiable generated gates."""
     torch = pytest.importorskip("torch")
@@ -496,6 +512,7 @@ def test_gibbs_mps_preserves_autograd_gate_payloads():
     assert torch.isfinite(grad_coefficient)
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_gibbs_mps_jax_gate_schedule_preserves_backend_arrays():
     """Unhashable JAX exponents use the native schedule plus Autoray gates."""
     jax = pytest.importorskip("jax")

@@ -1,6 +1,7 @@
 """Focused tests for MPI shot orchestration without requiring mpi4py."""
 
 from copy import deepcopy
+from importlib.util import find_spec
 from types import SimpleNamespace
 
 import numpy as np
@@ -135,6 +136,7 @@ def test_mps_optimizer_run_mpi_keyword_covers_all_modes(mode):
 
 
 def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
+    pytest.importorskip("stim")
     optimizer = pepsy.StabilizerMpsSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=3,
@@ -195,6 +197,7 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
 
 
 def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
+    pytest.importorskip("stim")
     optimizer = pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)])
     result = optimizer.run(
         shots=3,
@@ -222,6 +225,7 @@ def test_tree_optimizer_run_validates_non_integral_shots(shots):
 
 @pytest.mark.parametrize("shots", [True, 1.0])
 def test_tree_stabilizer_run_validates_non_integral_shots(shots):
+    pytest.importorskip("stim")
     optimizer = pepsy.StabilizerTreeSimulator(1)
 
     with pytest.raises(ValueError, match="shots must be a nonnegative integer"):
@@ -241,6 +245,7 @@ def test_tree_run_auto_fault_threshold_dispatches_shots():
 
 
 def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
+    pytest.importorskip("stim")
     optimizer = pepsy.StabilizerTreeSimulator(1)
 
     result = optimizer.run(
@@ -259,7 +264,10 @@ def test_tree_stabilizer_run_auto_fault_threshold_dispatches_shots():
         chi=4,
         run=False,
     ),
-    lambda: pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)]),
+    pytest.param(
+        lambda: pepsy.StabilizerTreeSimulator(1, gates=[("x", 0)]),
+        marks=pytest.mark.skipif(find_spec("stim") is None, reason="requires stim"),
+    ),
 ])
 def test_tree_run_local_progress_is_aggregate(monkeypatch, optimizer_factory):
     import importlib
@@ -756,6 +764,7 @@ def test_mpi_runner_can_use_existing_local_thread_backend():
 
 
 def test_mpi_runner_supports_rank_local_coalesced_batches():
+    pytest.importorskip("stim")
     result = pepsy.MPIShotRunner(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [(np.asarray([[0.0, 1.0], [1.0, 0.0]]), 0)],
@@ -775,6 +784,7 @@ def test_mpi_runner_supports_rank_local_coalesced_batches():
 
 @pytest.mark.parametrize("strategy", ["independent", "coalesced"])
 def test_mpi_importance_reduction_matches_unbiased_result_estimate(strategy):
+    pytest.importorskip("stim")
     identity = np.eye(2)
     flip = np.asarray([[0.0, 1.0], [1.0, 0.0]])
     channel = pepsy.TrajectoryChannel.mixture(
@@ -881,6 +891,8 @@ def test_mpi_failure_is_surfaced_as_one_error():
 def test_mpi_runner_uses_the_common_factory_contract(
     factory, run_kwargs, expected_type
 ):
+    if expected_type in (pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator):
+        pytest.importorskip("stim")
     gate = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
     result = pepsy.MPIShotRunner(
         factory,

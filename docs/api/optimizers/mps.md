@@ -575,6 +575,11 @@ MPO replay; `fit_init_seed` controls randomized disposable FIT guesses. The
 Quimb method spelling is `srcmps` (without a hyphen); `src-mps` is not a
 separate compressor or alias.
 
+Older Quimb SRC implementations generate NumPy-only noise. Explicit non-NumPy
+SRC replay requires a newer backend-native compressor. For ordinary dense
+MPS FIT warm starts, Pepsy warns and uses direct compression on those builds;
+the exact FIT target and final accuracy settings are preserved.
+
 `mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
 convenience modes share the DMRG backend but have distinct schedules:
 `"dmrg1"` uses at most two two-site growth sweeps and then fixed-rank one-site

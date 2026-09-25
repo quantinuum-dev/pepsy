@@ -217,8 +217,9 @@ def test_chain_compression_matches_mps_svd_when_cap_is_sufficient():
 
 
 @pytest.mark.parametrize("compression_mode", ("sdc", "src", "zipup"))
-def test_path_compression_modes_use_seeded_quimb_kernels(compression_mode):
+def test_path_compression_modes_use_seeded_quimb_kernels(compression_mode, quimb_compressor):
     """Path TreePeps exposes Quimb's multi-tensor methods safely."""
+    quimb_compressor(compression_mode)
 
     plan = _path_plan((1, 6))
     state = TreePeps.rand(plan, bond_dim=3, seed=19)
@@ -247,8 +248,9 @@ def test_path_compression_modes_use_seeded_quimb_kernels(compression_mode):
     "compression_mode",
     ("sdc_oversample", "sdcr", "sdcr_oversample", "src_oversample", "zipup_oversample"),
 )
-def test_path_advanced_compression_modes_preserve_treepeps_contract(compression_mode):
+def test_path_advanced_compression_modes_preserve_treepeps_contract(compression_mode, quimb_compressor):
     """The newer Quimb path compressors are exposed without losing metadata."""
+    quimb_compressor(compression_mode)
 
     plan = _path_plan((1, 6))
     state = TreePeps.rand(plan, bond_dim=3, seed=53)
@@ -322,8 +324,9 @@ def test_zipup_oversample_rejects_branching_edge_compression():
 
 
 @pytest.mark.parametrize("compression_mode", ("sdc", "src", "zipup"))
-def test_path_two_layer_and_fused_operator_application_agree(compression_mode):
+def test_path_two_layer_and_fused_operator_application_agree(compression_mode, quimb_compressor):
     """Path compression can retain either the MPO-MPS or fused application."""
+    quimb_compressor(compression_mode)
 
     plan = _path_plan((1, 5))
     state = TreePeps.rand(plan, bond_dim=2, seed=31)
@@ -979,8 +982,9 @@ def test_run_persists_an_explicit_compression_override():
     assert optimizer.compression_mode == "sdc"
 
 
-def test_run_mode_shorthand_applies_to_explicit_sub_treepepo():
+def test_run_mode_shorthand_applies_to_explicit_sub_treepepo(quimb_compressor):
     """Shorthand compression reaches explicit PEPO stream events."""
+    quimb_compressor("sdc")
 
     plan = _path_plan((1, 3))
     subop = TreeSubPepo.from_operator(plan, _cnot(), support=(0, 2))

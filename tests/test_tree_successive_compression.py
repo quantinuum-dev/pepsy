@@ -241,6 +241,10 @@ def test_branched_src_matches_dense_khatri_rao_qb_reference(monkeypatch):
     ("numpy", False), ("numpy", True), ("torch", False), ("jax", False),
 ])
 def test_layered_src_matches_unmodified_quimb_seed_and_work(monkeypatch, backend, reverse):
+    from pepsy._internal.quimb import quimb_1d_compression_method_supports_seed
+
+    if not quimb_1d_compression_method_supports_seed("src"):
+        pytest.skip("Exact noise equivalence requires Quimb's backend-native seeded SRC")
     import quimb.tensor.tn1d.compress as qc
     import pepsy.optimizers.tree.compression as tc
 
@@ -295,7 +299,8 @@ def test_layered_src_matches_unmodified_quimb_seed_and_work(monkeypatch, backend
 
 
 @pytest.mark.parametrize("method", ["src", "sdc", "sdcr"])
-def test_path_reduces_to_quimb_successive_algorithm(monkeypatch, method):
+def test_path_reduces_to_quimb_successive_algorithm(monkeypatch, method, quimb_compressor):
+    quimb_compressor(method)
     import quimb.tensor.tn1d.compress as qc
     import pepsy.optimizers.tree.compression as tc
 
@@ -317,7 +322,7 @@ def test_path_reduces_to_quimb_successive_algorithm(monkeypatch, method):
     if method == "src":
         counter = iter(noise)
 
-        def same_noise(tn, *, Bix, inds, **kwargs):
+        def same_noise(*args, Bix, inds, **kwargs):
             return [qtn.Tensor(next(counter), inds=(Bix, *inds))]
 
         monkeypatch.setattr(qc, "_src_get_local_noise_tensors", same_noise)
@@ -387,6 +392,14 @@ def test_layered_tree_compression_uses_real_algorithm(monkeypatch, method, backe
 
         monkeypatch.setattr(opt, "_install_routed_subtree", install)
         monkeypatch.setattr(opt, "_move_center", move)
+    if method == "sdcr" and backend == "torch":
+        from pepsy._internal.quimb import quimb_callable_option_supported
+        from quimb.tensor.decomp import svd_rand_truncated
+
+        if not quimb_callable_option_supported(svd_rand_truncated, "noise_dist"):
+            with pytest.raises(NotImplementedError, match="Torch SDCR requires"):
+                opt.apply_subtreempo(operator, track_norm=False)
+            return
     opt.apply_subtreempo(operator, track_norm=False)
     actual = opt.to_dense().reshape(-1)
     tol = 2e-4 if backend == "jax" else 1e-10

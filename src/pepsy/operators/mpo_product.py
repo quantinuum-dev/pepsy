@@ -27,6 +27,8 @@ import warnings
 import autoray as ar
 import numpy as np
 
+from .._internal.quimb import run_seeded_quimb
+
 from .mpo_semantic import (
     FirstDegreeMPO,
     MPOLocalOperatorTerm,
@@ -445,7 +447,9 @@ def compress_mpo_product(
         # variational objective passed to FIT, and FIT.run_eff is the only
         # DMRG refinement entry point so its cached sweep environments are
         # reused across the full-chain sweeps.
-        guess = qtn.tensor_network_1d_compress(
+        guess = run_seeded_quimb(
+            guess_kwargs.pop("seed", None),
+            qtn.tensor_network_1d_compress,
             target.copy(),
             **guess_kwargs,
         )
@@ -3496,8 +3500,7 @@ def exp_mpo_cluster(
         ``"rsum2"``.
     assembly_form : {"left", "right"}, default="left"
         Direction of the intermediate semantic TT-SVD sweep.
-    chi, cutoff_mode, compression, differentiable, sector_aware, form,
-    create_bond, compress_opts : optional
+    chi, cutoff_mode, compression, differentiable, sector_aware, form, create_bond, compress_opts : optional
         Optional final numerical MPO compression, using the same semantic
         boundary as :func:`exp_mpo`. ``chi`` is separate from ``max_bond``.
         With ``return_semantic=True``, use ``compression="fixed_rank"`` or

@@ -114,6 +114,11 @@ schedule. `trotter_order=1` and `trotter_order=4` are also available. If `dt`
 is supplied instead, `N` is chosen by ceiling so the actual step does not
 exceed the requested value. With neither argument, one Trotter step is used.
 
+This preparation API requires a Quimb build that provides
+`LocalHamGen.get_trotter_gates` (unavailable in Quimb 1.15.0). Pepsy reports
+that missing capability explicitly; constructing and reading the beta-zero
+purification remain available.
+
 For example, the graph ordering and fusion controls can be made explicit:
 
 ```python

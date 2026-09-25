@@ -13,6 +13,7 @@ from pepsy.optimizers import (
 
 def test_planner_prices_actual_dressed_supports_and_ranks_four_candidates():
     """Clifford-heavy work should expose and benefit from its dressed support."""
+    pytest.importorskip("stim")
     stream = [("h", 0)] * 300 + [
         ("cnot", 0, 1),
         ("cnot", 1, 2),

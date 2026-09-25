@@ -12,7 +12,8 @@ import pepsy as py
     "dmrg", "dmrg1", "dmrg2", "dmrg3", "mix", "mpo", "direct",
     "src", "sdc", "swap", "perm", "svd", "exact",
 ])
-def test_runtime_nonfinite_detection_is_opt_in(monkeypatch, mode):
+def test_runtime_nonfinite_detection_is_opt_in(monkeypatch, mode, quimb_compressor):
+    quimb_compressor(mode)
     original = py.MpsOptimizer._execute_mode
 
     def poison_after_replay(self, *args, **kwargs):

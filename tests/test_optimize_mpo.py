@@ -147,6 +147,14 @@ def test_mpo_optimizer_quimb_mode_preserves_dense_torch_backend():
     mpo.apply_to_arrays(backend)
     gate = backend(qu.CNOT())
 
+    from pepsy._internal.quimb import quimb_src_backend_supported
+
+    if not quimb_src_backend_supported("src", mpo):
+        optimizer = py.MpoOptimizer(mpo, gates=[(gate, (0, 4))], chi=4, mode="src")
+        with pytest.raises(NotImplementedError, match="non-NumPy random arrays"):
+            optimizer.run(cutoff=0.0, compression_seed=37)
+        return
+
     out = py.MpoOptimizer(
         mpo,
         gates=[(gate, (0, 4))],
@@ -1575,6 +1583,8 @@ def test_mpo_mode_complex_gate_pair_sides_match_dense_action():
 
 def test_mpo_mode_bare_two_site_gate_uses_native_dagger_sandwich(monkeypatch):
     """The direct MPO path uses Quimb's dagger-aware auto-swap method."""
+    if not hasattr(qtn.MatrixProductOperator, "gate_sandwich_with_auto_swap"):
+        pytest.skip("Quimb does not provide the MPO gate sandwich")
     calls = []
     original = qtn.MatrixProductOperator.gate_sandwich_with_auto_swap
 
@@ -1724,6 +1734,7 @@ def _native_u1u1_identity_mpo(L=3):
 @pytest.mark.parametrize("mode", ["svd", "mpo", "dmrg"])
 def test_mpo_optimizer_replays_native_graded_mpo_without_dense_fallback(mode):
     """Native graded MPO inputs remain FermionicArray-backed through replay."""
+    pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=True, symmetry="U1U1")
     gates = fermion.strang_gate_stream(
         [(0, 1), (1, 2)],
@@ -1745,6 +1756,7 @@ def test_mpo_optimizer_replays_native_graded_mpo_without_dense_fallback(mode):
 
 def test_mpo_optimizer_native_dmrg_uses_fit_controls(monkeypatch):
     """Native Symmray MPO DMRG must use block-aware FIT, not direct SVD."""
+    pytest.importorskip("symmray")
     calls = []
     original_run_gate = py.FIT.run_gate
 
@@ -1865,6 +1877,7 @@ def test_mpo_optimizer_native_fermion_symmetries_use_direct_modes(
 
 def test_mpo_optimizer_materializes_native_long_range_split_gates():
     """Long-range native split gates are canonicalizable after replay."""
+    pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=True, symmetry="U1U1")
     gates = fermion.strang_gate_stream(
         [(0, 3)],
@@ -1888,6 +1901,7 @@ def test_mpo_optimizer_materializes_native_long_range_split_gates():
 
 def test_mpo_optimizer_adapts_long_range_native_gate_to_jw_symmray_mpo():
     """The current JW MPO path also handles long-range native even gates."""
+    pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=True, symmetry="U1U1")
     mpo = fermion.build_mpo(
         [(0, 3)],
@@ -2046,6 +2060,7 @@ def test_mpo_optimizer_explicit_compress_handles_empty_symmray_stream():
 
 def test_fermion_to_mpo_builds_native_mpo_for_optimizer_replay():
     """The native Fermion.to_mpo path feeds the MPO optimizer directly."""
+    pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=True, symmetry="U1U1")
     hopping = fermion.hopping_operator()
     two_site_mpo = fermion.to_mpo(
@@ -2105,6 +2120,7 @@ def test_fermion_to_mpo_preserves_configured_backend():
 
 def test_fermion_to_mpo_accepts_arbitrary_neutral_term_support():
     """Native MPO conversion supports non-contiguous multi-site terms."""
+    pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=False, symmetry="U1")
     term = fermion.operator_term(
         [(1.0, ((2, "create"), (0, "number"), (3, "annihilate")))],
@@ -2130,6 +2146,7 @@ def test_fermion_to_mpo_accepts_arbitrary_neutral_term_support():
 
 def test_fermion_to_mpo_handles_one_site_native_term():
     """Native MPO construction also handles the no-virtual-bond case."""
+    pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=True, symmetry="U1U1")
     term = fermion.interaction_operator()
     mpo = fermion.to_mpo({(0,): term}, L=1, compress=False)

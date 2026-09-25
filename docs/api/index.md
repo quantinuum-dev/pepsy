@@ -24,6 +24,7 @@ reference when you need every method, property, overload, or source location.
 - [Boundary metrics](boundary/metrics.md)
 - [Boundary states](boundary/states.md)
 - [Boundary sweeps](boundary/sweeps.md)
+- [Boundary compression options](boundary/compression.md)
 - [Tensor maps](tensors/maps.md)
 - [Tensor constructors](tensors/constructors.md)
 - [Tensor contractions](tensors/contractions.md)
@@ -70,6 +71,7 @@ package
 boundary/metrics
 boundary/states
 boundary/sweeps
+boundary/compression
 tensors/maps
 tensors/constructors
 tensors/contractions

@@ -704,7 +704,7 @@ def _resolve_chain_mapper(mapper, summary, *, name="mapper"):
     if mapper is None:
         return None
 
-    from .core import OneDMap  # pylint: disable=import-outside-toplevel
+    from .maps import OneDMap  # pylint: disable=import-outside-toplevel
 
     if not isinstance(mapper, OneDMap):
         raise TypeError(f"{name} must be a pepsy.tensors.OneDMap instance.")
@@ -4847,7 +4847,7 @@ def _resolve_mpo_mapping(*, mapper=None, idx2coo=None, coo2idx=None):
     if mapper is not None:
         if idx2coo is not None or coo2idx is not None:
             raise TypeError("Pass either mapper or idx2coo/coo2idx, not both.")
-        from .core import OneDMap  # pylint: disable=import-outside-toplevel
+        from .maps import OneDMap  # pylint: disable=import-outside-toplevel
 
         if not isinstance(mapper, OneDMap):
             raise TypeError("mapper must be a pepsy.tensors.OneDMap instance.")
@@ -7641,7 +7641,7 @@ class _SymState:
         the operator charge explicitly, e.g. ``charge=1`` for a Z2 parity-flip
         operator or ``charge=-1`` for a U(1) lowering operator.
         """
-        from .core import measure_obs  # pylint: disable=import-outside-toplevel
+        from .observables import measure_obs  # pylint: disable=import-outside-toplevel
 
         if isinstance(obs, (list, tuple)):
             if not isinstance(where, (list, tuple)) or len(obs) != len(where):

@@ -1007,6 +1007,7 @@ def test_streaming_graph_assembly_preserves_backend_autodiff():
 
 def test_cluster_direct_assembly_compiles_native_symmetry_blocks():
     """Cluster MPOs retain native Symmray blocks for neutral terms."""
+    pytest.importorskip("symmray")
     _x, z = _paulis()
     terms = [
         ((0,), (z,), 0.2),
@@ -1043,6 +1044,7 @@ def test_cluster_direct_assembly_compiles_native_symmetry_blocks():
 
 def test_cluster_native_physical_space_and_adaptive_streaming_api():
     """Physical-space metadata and cutoff-aware streaming share one API."""
+    pytest.importorskip("symmray")
     _x, z = _paulis()
     terms = [
         ((0, 1), (z, z), 0.7),

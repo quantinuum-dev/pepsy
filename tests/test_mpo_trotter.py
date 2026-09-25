@@ -18,6 +18,7 @@ def _dense_gate_product(mpo, length):
 
 
 @pytest.mark.parametrize("order", [1, 2, 4])
+@pytest.mark.usefixtures("quimb_trotter")
 def test_exp_trotter_is_public_and_replays_quimb_schedule(order):
     """The MPO has the same ordered product as Quimb's native schedule."""
     terms = [
@@ -86,6 +87,7 @@ def test_exp_trotter_handles_a_single_site_chain():
     assert mpo.bond_sizes() == []
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_exp_trotter_accepts_exp_mpo_parameter_and_dt_surface():
     """Parameter binding and the ``dt`` spelling share the MPO parser."""
     mpo = exp_trotter(
@@ -108,6 +110,7 @@ def test_exp_trotter_accepts_exp_mpo_parameter_and_dt_surface():
     assert max(mpo.bond_sizes()) <= 8
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_exp_trotter_to_backend_reaches_mpo_and_gate_payloads():
     """The explicit Autoray converter is respected through MPO replay."""
     torch = pytest.importorskip("torch")
@@ -132,6 +135,7 @@ def test_exp_trotter_to_backend_reaches_mpo_and_gate_payloads():
     assert torch.isfinite(grad_coefficient)
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_exp_trotter_honors_optimizer_physical_index_formats():
     """Optimizer index customizations also configure the identity MPO."""
     mpo = exp_trotter(
@@ -156,6 +160,7 @@ def test_exp_trotter_rejects_unsupported_many_site_terms():
         )
 
 
+@pytest.mark.usefixtures("quimb_trotter")
 def test_exp_trotter_validates_explicit_ordering_coverage():
     """Explicit layer plans cannot silently drop Hamiltonian terms."""
     terms = [(("ZZ", 0.2), (0, 1)), (("XX", 0.1), (1, 2))]

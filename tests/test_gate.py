@@ -558,9 +558,16 @@ def test_gates_tn_1d_applies_mixed_site_specs():
 @pytest.mark.parametrize("transform", ("dagger", "transpose"))
 def test_gate_forwards_gate_transform_to_quimb(transform):
     """Gate transforms affect the user gate while preserving the route."""
+    from pepsy._internal.quimb import quimb_callable_option_supported
+
     mps = qtn.MPS_computational_state("01", dtype=np.complex128)
     gate = np.arange(16, dtype=float).reshape(2, 2, 2, 2) + 1j
     transform_opts = {transform: True}
+
+    if not quimb_callable_option_supported(qtn.tensor_network_gate_inds, transform):
+        with pytest.raises(NotImplementedError, match="does not support gate option"):
+            apply_gate(mps, gate, (0, 1), **transform_opts)
+        return
 
     actual = apply_gate(
         mps.copy(), gate, (0, 1), contract="split", inplace=True,

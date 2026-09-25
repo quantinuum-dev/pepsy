@@ -10,7 +10,7 @@ projected entangled-pair states while leaving room for PePsY’s broader MPS,
 circuit, sampling, stabilizer, and VMC workflows. Use **PePsY** for the
 project name and `pepsy` for the Python package and import name.
 
-Current package version: `0.4.1` (from `pyproject.toml` / `pepsy.__version__`).
+Current package version: `0.5.0` (from `pyproject.toml` / `pepsy.__version__`).
 See the [changelog](CHANGELOG.md) for release history and versioned changes.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test profiles.
 
@@ -47,6 +47,9 @@ Other repository areas:
 - `tests/`: package tests
 
 ## Install
+
+Requires **Python 3.12 or newer**.
+
 ```bash
 python -m pip install .                 # from this checkout
 # Or choose a feature profile:
@@ -118,7 +121,7 @@ local environment override. Install the docs extra and build locally with:
 
 ```bash
 python -m pip install -e ".[docs]"
-python -m sphinx -b html docs docs/_build/html
+python -m sphinx -W --keep-going -b html docs docs/_build/html
 ```
 
 The generated API pages include signatures, parameter descriptions, class

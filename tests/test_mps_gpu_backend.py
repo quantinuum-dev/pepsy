@@ -170,6 +170,21 @@ def test_unitary_ledger_reads_only_one_boolean_per_replay(mode, monkeypatch):
     gate = torch.tensor(np.array(qu.CNOT()), dtype=torch.complex128)
     opt = MpsOptimizer(state, [(gate, (0, 3))] * 3, chi=2, mode=mode)
     item = torch.Tensor.item
+    tensor_bool = torch.Tensor.__bool__
+    tensor_float = torch.Tensor.__float__
+    import quimb.tensor.decomp as qd
+
+    trim = qd._trim_and_renorm_svd_result
+
+    def select_rank(*args, **kwargs):
+        # Upstream adaptive rank allocation is a separate host boundary.
+        # Only Pepsy's norm/fidelity ledger is constrained by this test.
+        with monkeypatch.context() as rank_patch:
+            rank_patch.setattr(torch.Tensor, "item", item)
+            rank_patch.setattr(torch.Tensor, "__bool__", tensor_bool)
+            rank_patch.setattr(torch.Tensor, "__float__", tensor_float)
+            return trim(*args, **kwargs)
+
     reads = []
 
     def boolean_only(value, *args, **kwargs):
@@ -187,6 +202,7 @@ def test_unitary_ledger_reads_only_one_boolean_per_replay(mode, monkeypatch):
         return to_numpy(value)
 
     with monkeypatch.context() as patch:
+        patch.setattr(qd, "_trim_and_renorm_svd_result", select_rank)
         patch.setattr(torch.Tensor, "item", boolean_only)
         patch.setattr(torch.Tensor, "__float__", forbidden)
         patch.setattr(torch.Tensor, "__bool__", forbidden)

@@ -22,6 +22,7 @@ def _factory(kind):
         return lambda: pepsy.MpsOptimizer(
             qtn.MPS_computational_state("0"), chi=4, mode="mpo"
         )
+    pytest.importorskip("stim")
     return lambda: pepsy.StabilizerMpsSimulator(1, chi=4)
 
 
@@ -695,6 +696,7 @@ def test_leakage_return_unleaks_to_a_computational_branch(kind):
 
 
 def test_leak2depolar_replaces_later_leakage_with_pauli_approximation():
+    pytest.importorskip("stim")
     result = pepsy.run_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [("leak2depolar", True), ("leakage", 1.0, 0), ("measure_leaked", 0)],
@@ -711,6 +713,7 @@ def test_leak2depolar_replaces_later_leakage_with_pauli_approximation():
 
 
 def test_coalesced_leakage_tracks_stateful_branches_and_suppresses_gates():
+    pytest.importorskip("stim")
     result = pepsy.run_coalesced_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [
@@ -734,6 +737,7 @@ def test_coalesced_leakage_tracks_stateful_branches_and_suppresses_gates():
 
 
 def test_coalesced_leakage_return_preserves_return_zero_and_one_branches():
+    pytest.importorskip("stim")
     result = pepsy.run_coalesced_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [("leakage", 1.0, 0), ("leakage_return", 1.0, 0)],
@@ -752,6 +756,7 @@ def test_coalesced_leakage_return_preserves_return_zero_and_one_branches():
 
 
 def test_stateful_leakage_supports_coalesced_and_auto_strategies():
+    pytest.importorskip("stim")
     result = pepsy.run_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [("leakage", 1.0, 0)],
@@ -828,6 +833,7 @@ def test_amplitude_damping_trajectory_replays_and_normalizes_on_both_optimizers(
 
 
 def test_coalesced_native_pauli_channel2_uses_stream_local_noise():
+    pytest.importorskip("stim")
     result = pepsy.run_coalesced_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(2, chi=4),
         [("pauli_channel2", {"XI": 1.0}, 0, 1)],
@@ -846,6 +852,7 @@ def test_coalesced_native_pauli_channel2_uses_stream_local_noise():
 
 
 def test_trajectory_runner_strategy_setting_can_select_coalescing():
+    pytest.importorskip("stim")
     result = pepsy.run_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [("x_error", 1.0, 0)],
@@ -937,6 +944,7 @@ def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state(
 
 
 def test_tree_stab_state_dependent_kraus_branches_use_tree_normalization():
+    pytest.importorskip("stim")
     stream = [
         (_X, 0),
         pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.5), 0),
@@ -956,6 +964,7 @@ def test_tree_stab_state_dependent_kraus_branches_use_tree_normalization():
 
 def test_tree_stab_public_queue_compiles_trajectory_events_and_coalesces():
     """TreeStab's public queue uses the shared local trajectory runner."""
+    pytest.importorskip("stim")
     channel = pepsy.TrajectoryChannel.amplitude_damping(0.5)
     simulator = pepsy.StabilizerTreeSimulator(
         1,
@@ -981,6 +990,7 @@ def test_tree_stab_public_queue_compiles_trajectory_events_and_coalesces():
 
 def test_tree_stab_public_error_model_can_coalesce_clean_stream():
     """The Pauli error-model convenience path shares TreeStab prefixes."""
+    pytest.importorskip("stim")
     simulator = pepsy.StabilizerTreeSimulator(1, gates=[("h", 0)])
     result = simulator.run(
         shots=32,
@@ -995,6 +1005,7 @@ def test_tree_stab_public_error_model_can_coalesce_clean_stream():
 
 def test_tree_stab_norm_ledger_tracks_unitary_coeff_updates_without_spectra():
     """TreeStab keeps norm tracking on when spectrum tracking is off."""
+    pytest.importorskip("stim")
     simulator = pepsy.StabilizerTreeSimulator(1, chi=1, track_truncation=False)
     simulator.apply([("t", 0)])
 
@@ -1009,6 +1020,7 @@ def test_tree_stab_norm_ledger_tracks_unitary_coeff_updates_without_spectra():
 
 def test_tree_stab_known_nonunitary_matrix_does_not_create_norm_event():
     """A physical filter's scale is not a retained-unitary norm event."""
+    pytest.importorskip("stim")
     filter_gate = np.diag([1.0, 0.25]).astype(complex)
     simulator = pepsy.StabilizerTreeSimulator(1, chi=1, track_truncation=False)
     simulator.apply([(filter_gate, (0,))])
@@ -1018,6 +1030,7 @@ def test_tree_stab_known_nonunitary_matrix_does_not_create_norm_event():
 
 
 def test_tree_stab_random_unitary_depolarizing_channel_replays_branches():
+    pytest.importorskip("stim")
     result = pepsy.run_trajectory_shots(
         lambda: pepsy.StabilizerTreeSimulator(1),
         [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.depolarizing(1.0), 0)],
@@ -1031,6 +1044,7 @@ def test_tree_stab_random_unitary_depolarizing_channel_replays_branches():
 
 
 def test_coalesced_tree_stab_measurement_and_terminal_sampling():
+    pytest.importorskip("stim")
     hadamard = np.array(
         [[1.0, 1.0], [1.0, -1.0]], dtype=complex
     ) / np.sqrt(2.0)
@@ -1051,6 +1065,7 @@ def test_coalesced_tree_stab_measurement_and_terminal_sampling():
 
 
 def test_coalesced_feed_forward_replays_per_measurement_leaf():
+    pytest.importorskip("stim")
     hadamard = np.array(
         [[1.0, 1.0], [1.0, -1.0]], dtype=complex
     ) / np.sqrt(2.0)
@@ -1074,6 +1089,7 @@ def test_coalesced_feed_forward_replays_per_measurement_leaf():
 
 
 def test_tree_stab_terminal_sampling_does_not_require_dense_readout():
+    pytest.importorskip("stim")
     optimizer = pepsy.StabilizerTreeSimulator(2, max_dense_sample_qubits=1)
     samples = optimizer.sample_bits(8, seed=3)
     assert samples.shape == (8, 2)
@@ -1081,6 +1097,7 @@ def test_tree_stab_terminal_sampling_does_not_require_dense_readout():
 
 
 def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
+    pytest.importorskip("stim")
     stream = [
         ("rxx", 0.8, 0, 1),
         (_X, 0),
@@ -1199,6 +1216,7 @@ def test_coalesced_tree_trajectory_branches_mid_circuit_measurements_by_count():
 
 
 def test_importance_sampling_records_likelihood_ratios_and_estimates_rare_branch():
+    pytest.importorskip("stim")
     channel = pepsy.TrajectoryChannel.mixture(
         (("I", 0.99, _I), ("X", 0.01, _X))
     )
@@ -1221,6 +1239,7 @@ def test_importance_sampling_records_likelihood_ratios_and_estimates_rare_branch
 
 
 def test_coalesced_importance_sampling_weights_leaves_and_honors_branch_budget():
+    pytest.importorskip("stim")
     channel = pepsy.TrajectoryChannel.mixture(
         (("I", 0.99, _I), ("X", 0.01, _X))
     )
@@ -1251,6 +1270,7 @@ def test_coalesced_importance_sampling_weights_leaves_and_honors_branch_budget()
 
 
 def test_parallel_independent_trajectory_seed_streams_are_worker_count_invariant():
+    pytest.importorskip("stim")
     channel = pepsy.TrajectoryChannel.mixture(
         (("I", 0.8, _I), ("X", 0.2, _X))
     )
@@ -1302,6 +1322,7 @@ def test_stim_importance_sampling_and_parallel_seed_streams():
 
 def test_coalesced_kraus_ensemble_uses_one_copy_per_nonempty_outcome():
     """State-dependent channel probabilities are evaluated once per live node."""
+    pytest.importorskip("stim")
     result = pepsy.run_coalesced_trajectory_shots(
         lambda: pepsy.StabilizerMpsSimulator(1, chi=4),
         [
@@ -1345,6 +1366,7 @@ def test_coalesced_terminal_sampling_reads_each_mps_leaf_in_one_batch():
 
 def test_coalesced_terminal_sampling_uses_stn_tree_sampler_without_probs():
     """STN leaves retain their scalable bit sampler and avoid dense probabilities."""
+    pytest.importorskip("stim")
     result = pepsy.run_coalesced_noisy_shots(
         lambda: pepsy.StabilizerMpsSimulator(2, chi=4),
         [],
@@ -1362,6 +1384,7 @@ def test_coalesced_terminal_sampling_uses_stn_tree_sampler_without_probs():
 @pytest.mark.parametrize("kind", ("mps_stn", "tree_stn"))
 def test_seeded_stn_trajectories_reproduce_structured_measurements(kind):
     """The optimizer and channel RNG streams are both reproducible."""
+    pytest.importorskip("stim")
     optimizer_cls = (
         pepsy.StabilizerMpsSimulator if kind == "mps_stn" else pepsy.StabilizerTreeSimulator
     )
@@ -1389,6 +1412,7 @@ def test_seeded_stn_trajectories_reproduce_structured_measurements(kind):
 @pytest.mark.parametrize("optimizer_cls", (pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator))
 def test_tree_and_mps_stn_kraus_weights_do_not_need_optimizer_copies(optimizer_cls):
     """Kraus probabilities use the exact local Gram path on both STNs."""
+    pytest.importorskip("stim")
     channel = pepsy.TrajectoryChannel.amplitude_damping(0.5)
 
     def factory():
@@ -1412,6 +1436,7 @@ def test_tree_and_mps_stn_kraus_weights_do_not_need_optimizer_copies(optimizer_c
 
 @pytest.mark.parametrize("optimizer_cls", (pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator))
 def test_coalesced_reset_is_trace_preserving_and_does_not_duplicate_leaves(optimizer_cls):
+    pytest.importorskip("stim")
     result = pepsy.run_coalesced_trajectory_shots(
         lambda: optimizer_cls(1),
         [("h", 0), ("reset", 0)],
@@ -1428,6 +1453,7 @@ def test_coalesced_reset_is_trace_preserving_and_does_not_duplicate_leaves(optim
 @pytest.mark.parametrize("optimizer_cls", (pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator))
 def test_immediate_and_deferred_magic_trajectories_match_direct_state(optimizer_cls):
     """MAST-style projection and recycled immediate injection preserve the state."""
+    pytest.importorskip("stim")
     stream = [("h", 0), ("t", 0)]
     direct = pepsy.run_trajectory_shots(
         lambda: optimizer_cls(1), stream, shots=1, seed=23
@@ -1496,6 +1522,7 @@ def test_coherent_crosstalk_helper_is_seeded_and_uses_pepsy_rotation_convention(
 
 @pytest.mark.parametrize("optimizer_cls", (pepsy.StabilizerMpsSimulator, pepsy.StabilizerTreeSimulator))
 def test_stn_truncation_convergence_reports_reference_and_observable(optimizer_cls):
+    pytest.importorskip("stim")
     rows = optimizer_cls.truncation_convergence(
         2,
         [("h", 0), ("cnot", 0, 1), ("t", 0)],
