@@ -1202,7 +1202,9 @@ def test_nevergrad_layout_search_explains_missing_optional_dependency(monkeypatc
     monkeypatch.setitem(sys.modules, "nevergrad", None)
     finder = TreeLayoutFinder([], n=4, max_arity=2)
 
-    with pytest.raises(ImportError, match=r"pepsy\[layout\]"):
+    with pytest.raises(
+        ImportError, match=r"python -m pip install '\.\[layout\]'"
+    ):
         finder.recommend_layered(
             block_sizes=(2,), order=range(4), search="nevergrad"
         )

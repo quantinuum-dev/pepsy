@@ -33,7 +33,6 @@ jobs:
       - name: Check Python lint
         run: python -m ruff check src/pepsy tests
       - name: Run the complete available suite
-        # Empty addopts includes integration and slow tests. VMC/NetKet has a
-        # dedicated CI profile because its dependency set is substantially
-        # larger than the general extended profile.
+        # Empty addopts includes integration and slow tests. Push CI's extended
+        # job also installs VMC/NetKet; this nightly profile omits those extras.
         run: pytest -q -o addopts="" --cov=pepsy --cov-report=term-missing --cov-fail-under=60
