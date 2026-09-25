@@ -49,6 +49,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[${{ matrix.extras }}]"
+      - name: Check optional backend imports
+        if: matrix.profile == 'extended'
+        # Catch incompatible upstream releases before the numerical suite.
+        run: python -c "import jax, netket, symmray, torch; print('Optional backends imported successfully')"
       - name: Validate source syntax
         run: python -m compileall -q -f src tests
       - name: Check Python lint

@@ -41,6 +41,11 @@ intended for contributors, including Autograd for its explicit autodiff tests.
 Composed profiles preserve dependency requirements
 while avoiding duplicate definitions in `pyproject.toml`.
 
+The NetKet profile currently requires JAX below 0.11.1: released NetKet 3.22.x
+fails during import with the newer `ArrayLike` type annotation. This bound
+also applies to the combined `vmc` extra and can be revisited after an upstream
+fix to its [online statistics annotations](https://github.com/netket/netket/blob/v3.22.4/netket/_src/stats/online_stats/operations.py).
+
 Combine extras when needed, and add `-e` for an editable development install:
 
 ```bash

@@ -54,7 +54,15 @@ test-extended = [
 ]
 # Compose feature profiles so each dependency constraint has one owner.
 vmc-torch = ["pepsy[torch]"]
-vmc-netket = ["jax>=0.4", "flax>=0.8", "optax>=0.2", "netket>=3.10", "pepsy[symmetry]"]
+vmc-netket = [
+  # NetKet 3.22.x cannot import with JAX's ArrayLike union from 0.11.1 onward.
+  # Recheck this bound when NetKet fixes its online_statistics annotations.
+  "jax>=0.4,<0.11.1",
+  "flax>=0.8",
+  "optax>=0.2",
+  "netket>=3.10",
+  "pepsy[symmetry]",
+]
 vmc = ["pepsy[vmc-torch,vmc-netket]"]
 
 [tool.setuptools]

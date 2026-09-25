@@ -20,6 +20,9 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- NetKet VMC installations constrain JAX below 0.11.1 to avoid the upstream
+  NetKet 3.22.x import failure. Extended CI checks backend imports before
+  starting numerical tests.
 - Released Quimb compressors receive random seeds through their supported
   API or a shared legacy RNG lock, including MPO, boundary, and tree-PEPS
   paths. Tree edge compression detects the upstream NumPy single-precision

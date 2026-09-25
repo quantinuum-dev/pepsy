@@ -65,7 +65,8 @@ profiles keeps JAX coverage in MPS, tree, and operator tests as well as VMC,
 without a second full-suite VMC job. Optional tests skip only when their
 dependency or required upstream capability is absent. The smoke job checks
 contracts without a whole-package coverage gate.
-The extended job stops at the first failing test and publishes its traceback
+The extended job checks backend imports before the numerical suite, stops at
+the first failing test, and publishes its traceback
 as a GitHub annotation; successful runs still execute the full collection.
 MPI integration CI installs `.[dev,mpi,stabilizer]` to exercise stabilizer
 trajectories as well as ordinary MPS and tree execution.
