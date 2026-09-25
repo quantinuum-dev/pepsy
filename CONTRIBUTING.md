@@ -61,18 +61,31 @@ needed for your change. The full VMC profile requires `.[vmc]` in addition to
 
 ## What CI checks
 
-[CI](.github/workflows/ci.yml) uses Python 3.12:
+[CI](.github/workflows/ci.yml) runs three lightweight jobs on pushes and pull
+requests, using Python 3.12 on Linux:
 
 | Job | Coverage |
 | --- | --- |
-| Core minimums | Smoke and core tests without optional/slow cases; the five direct core dependencies are pinned to minimums read from `pyproject.toml`. |
-| Extended | Full collection with `.[dev,test-extended,contraction,vmc]` and a 60% whole-package coverage gate. |
-| MPI | Two- and three-rank integration, including stabilizer trajectories through `.[dev,mpi,stabilizer]`. |
-| Other checks | Packaging, strict documentation build, type checks, and agent guidance. |
+| Core checks | Smoke and core tests without optional/slow cases, Ruff, focused type checks, and agent guidance. The five direct core dependencies use minimums read from `pyproject.toml`. |
+| Package | Build and validate distributions; test wheel imports and a small numerical example in clean installations. |
+| Docs | Build documentation with warnings treated as errors. |
 
-Development tools and transitive dependencies resolve normally. The extended
-job checks backend imports first, stops at the first failure, and attaches its
-traceback to the run. The smoke job has no whole-package coverage gate.
+Pip downloads are cached, superseded runs on the same ref are cancelled, and
+each job has a ten-minute timeout. Tools and transitive dependencies resolve
+normally. Routine CI does not install Torch, JAX, NetKet, or MPI.
+
+The [nightly workflow](.github/workflows/nightly.yml) runs the full collection
+with `.[test-extended,contraction,vmc]` and a **60% whole-package coverage gate**.
+It checks backend imports first and stops on the first failure. A second job
+runs MPI unit tests, then integration and benchmark smoke tests with two and
+three ranks, sharing one installation. Full tests have a 90-minute timeout;
+MPI has ten minutes.
+
+The nightly schedule is **03:30 UTC** on the repository's default branch.
+To check `develop` or another branch before merging, select **Nightly full
+suite → Run workflow → branch** in GitHub Actions. Both workflows also support
+manual runs. Optional and slow regressions may wait until this full check;
+a green routine CI run does not establish full-suite success.
 
 Reproduce the type check with:
 

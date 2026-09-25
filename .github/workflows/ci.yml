@@ -4,36 +4,20 @@ on:
   push:
     branches: [main, develop]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  agent-guidance:
-    name: Agent guidance
+  core:
+    name: Core checks
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Validate skill catalog
-        run: python .github/skills/pepsy-maintainer/scripts/validate_catalog.py
-
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - python-version: "3.12"
-            profile: core
-            extras: dev
-          - python-version: "3.12"
-            profile: extended
-            # One full run covers optional backends across every domain,
-            # including JAX checks outside the VMC test modules.
-            extras: dev,test-extended,contraction,vmc
-    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
       NUMBA_DISABLE_CACHING: "1"
@@ -44,9 +28,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Generate minimum core constraints
-        if: matrix.profile == 'core'
         # Read floors from package metadata rather than maintain a second list.
         run: |
           python - <<'PY'
@@ -61,104 +46,36 @@ jobs:
               + "\n"
           )
           PY
-      - name: Install package (${{ matrix.profile }})
+      - name: Install core package and check tools
         run: |
           python -m pip install --upgrade pip
-          if [ "${{ matrix.profile }}" = "core" ]; then
-            python -m pip install -c /tmp/pepsy-minimum-core.txt -e ".[${{ matrix.extras }}]"
-          else
-            python -m pip install -e ".[${{ matrix.extras }}]"
-          fi
+          python -m pip install -c /tmp/pepsy-minimum-core.txt -e . pytest ruff mypy
           python -m pip check
-      - name: Check optional backend imports
-        if: matrix.profile == 'extended'
-        # Catch incompatible upstream releases before the numerical suite.
-        run: python -c "import jax, netket, symmray, torch; print('Optional backends imported successfully')"
-      - name: Validate source syntax
-        run: python -m compileall -q -f src tests
+      - name: Validate skill catalog
+        run: python .github/skills/pepsy-maintainer/scripts/validate_catalog.py
       - name: Check Python lint
-        # Ruff's F rules cover the Pyflakes checks and honor noqa markers for
-        # intentional lazy, type-only, and compatibility exports.
+        # Ruff also parses the source and covers the Pyflakes F rules.
         run: python -m ruff check src/pepsy tests
-      - name: Run core contracts and smoke tests
-        if: matrix.profile == 'core'
-        # Whole-package coverage is enforced by the extended suite below.
-        run: python -m pytest -q -o addopts="" -m "smoke or (core and not optional and not slow)"
-      - name: Run extended tests with coverage
-        if: matrix.profile == 'extended'
-        run: python -m pytest -q -o addopts="" --maxfail=1 --cov=pepsy --cov-report=term-missing --cov-fail-under=60
-      - name: Report coverage after failure
-        if: failure() && matrix.profile == 'extended'
-        run: |
-          if [ -f .coverage ]; then
-            coverage_total="$(python -m coverage report --format=total --fail-under=0)"
-            echo "::notice title=Coverage::${coverage_total}% (required: 60%)"
-          fi
-
-  typecheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install type-check dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
       - name: Run focused type checks
         run: python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
-
-  mpi:
-    name: MPI (${{ matrix.ranks }} ranks)
-    strategy:
-      fail-fast: false
-      matrix:
-        ranks: [2, 3]
-    runs-on: ubuntu-latest
-    env:
-      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
-      NUMBA_DISABLE_CACHING: "1"
-      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
-      MPLCONFIGDIR: /tmp/mplconfig_pepsy
-      MPLBACKEND: Agg
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install MPI runtime
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openmpi-bin libopenmpi-dev
-      - name: Install MPI test profile
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,mpi,stabilizer]"
-      - name: Run MPI unit-contract tests
-        run: pytest -q -o addopts="" tests/test_mpi.py
-      - name: Run multi-process MPI integration tests
-        run: |
-          mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
-            python -m pytest -q -o addopts="" \
-            tests/test_mpi_integration.py
-      - name: Run MPI benchmark smoke test
-        run: |
-          mpiexec --oversubscribe --bind-to none -n ${{ matrix.ranks }} \
-            python benchmarks/mpi_shots.py \
-            --shots 8 --qubits 2 --depth 1 --chi 4 --workers auto
+      - name: Run core contracts and smoke tests
+        # Full optional-backend tests and coverage run in nightly.yml.
+        run: python -m pytest -q -o addopts="" -m "smoke or (core and not optional and not slow)"
 
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Build distributions
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          python -m pip install build twine
           python -m build --sdist --wheel
           python -m twine check dist/*
           version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
@@ -193,11 +110,14 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install documentation profile
         run: |
           python -m pip install --upgrade pip
