@@ -49,7 +49,8 @@ def _load_mpi():
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ImportError(
             "MPIShotRunner requires mpi4py; install it with "
-            "'pip install pepsy[mpi]' or pass an MPI-compatible communicator."
+            "python -m pip install '.[mpi]' from a Pepsy checkout, "
+            "or pass an MPI-compatible communicator."
         ) from exc
     return MPI
 

@@ -317,6 +317,3 @@ sample mean and a standard error based on the unbiased sample variance.
 Hopping, pairing, and spin-flip
 operators are not diagonal and require a separate fermionic local-estimator
 calculation.
-
-
-> API details are maintained as handwritten Markdown in this page.

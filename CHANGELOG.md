@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Development
 
+- Import contraction and fidelity helpers directly from their owning modules
+  throughout fitting, boundary sweeps, optimizers, and sampling. Legacy
+  `tensors.core` entry points retain their compatibility hooks.
+- Correct tensor ownership documentation, fill empty API guides with tested
+  examples, and point optional-dependency messages to local checkout extras.
 - Keep release automation limited to GitHub build artifacts; remove unused
   PyPI/TestPyPI publishing jobs and their token permission.
 - Move MPS layout report formatting and FIT timing summaries into the private

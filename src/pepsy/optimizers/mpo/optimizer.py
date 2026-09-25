@@ -78,7 +78,7 @@ from ...backends import (
     to_float as _backend_to_float,
 )
 from ...tensors.contractions import tn_norm
-from ...tensors.core import tn_fidelity
+from ...tensors.observables import tn_fidelity
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 

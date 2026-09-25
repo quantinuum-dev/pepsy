@@ -1,20 +1,21 @@
 # pepsy.tensors
 
-This package contains Pepsy's tensor-network construction, mapping,
-contraction, validation, observable, backend, and symmetric-state helpers.
-Other packages should import these helpers through `pepsy.tensors` or the
-top-level `pepsy` exports rather than old flat modules.
+This package owns tensor-network construction, mapping, contraction,
+observables, validation, and symmetric-state helpers. Applications should
+use `pepsy.tensors`; internal code should import from the owning modules below.
+Backend configuration belongs to `pepsy.backends`.
 
 ## Modules
 
-- `core.py`: main implementations for constructors, `OneDMap`, backend
-  defaults, contraction optimizers, observables, and dense TN utilities.
-- `constructors.py`: facade for product-state, identity, Haar-random, MPS,
-  MPO, PEPS, and PEPO constructors.
-- `contractions.py`: facade for contraction optimizers, `tn_norm`,
-  `tn_fidelity`, and alignment helpers.
-- `maps.py`: facade for `OneDMap`.
-- `observables.py`: facade for observable and MPO expectation helpers.
+- `constructors.py`: product-state, identity, Haar-random, MPS, TTN, MPO,
+  PEPS, and PEPO constructors; `expec_mpo` and `tns_align`.
+- `contractions.py`: contraction optimizers, compressed contraction, and
+  `tn_norm`.
+- `maps.py`: `OneDMap` and regular-lattice traversal.
+- `observables.py`: `measure_obs`, `tn_fidelity`, and MPS entropy.
+- `conversions.py`: explicit MPS-to-TTN and MPS-to-tree-PEPS conversion.
+- `core.py`: compatibility exports and historical contraction/fidelity patch
+  hooks. Internal consumers use the owning modules directly.
 - `mps_transfer.py`: repeating-cell and site-selected local transfer actions,
   dense and bosonic Symmray sector adapters, backend-preserving Arnoldi,
   transfer gaps, momenta, degeneracy, and correlation lengths. Local windows
@@ -25,10 +26,11 @@ top-level `pepsy` exports rather than old flat modules.
   its basis within an explicit memory cap.
 - `symmetric.py`: Symmray-backed `SymMPS`, `SymPEPS`, symmetric Hamiltonian,
   gate-stream, charge-sector, and dense-operator conversion helpers.
+- `symm_fermions.py`: fermion model interfaces and operator construction.
 - `validation.py`: shared PEPS tag and physical-index validation helpers.
 
-Many leaf modules are intentionally thin facades over `core.py`; keep that
-structure unless a change has a strong reason to split implementation.
+The public namespace resolves these implementations lazily. Keep new helpers
+with their owner; do not route them through `core.py`.
 
 ## Main responsibilities
 
@@ -79,7 +81,7 @@ Contraction helpers include:
   compressed contraction tree (one-hot selection; requires `cutoff=0.0`)
 - `tn_norm(...)`, `tn_fidelity(...)`, and `tns_align(...)`
 
-Backend helpers manage package-wide defaults and optional linalg shims:
+`pepsy.backends` manages package-wide defaults and optional linalg shims:
 
 - `set_default_array_backend(...)` / `get_default_array_backend()`
 - `set_default_grad_backend(...)` / `get_default_grad_backend()`

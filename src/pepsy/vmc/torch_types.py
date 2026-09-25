@@ -14,7 +14,7 @@ def _require_torch():
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
             "pepsy.vmc.torch requires optional dependency 'torch'. "
-            "Install it with `pip install pepsy[torch]` or `pip install torch`."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         ) from exc
     return torch
 

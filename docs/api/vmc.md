@@ -1427,6 +1427,3 @@ print(report.energy.split_r_hat, report.energy.tau_max)
 The live progress display is sampling acceptance only. The check uses a
 cloned random stream, leaves the active walker configurations and RNG state
 unchanged, and is intentionally separate from fixed-size production sampling.
-
-
-> API details are maintained as handwritten Markdown in this page.

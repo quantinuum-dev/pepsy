@@ -16,7 +16,7 @@ def matplotlib_modules():
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
             "Layout plotting requires matplotlib. "
-            "Install it with: pip install pepsy[viz]."
+            "From a Pepsy checkout, run: python -m pip install '.[viz]'."
         ) from exc
     return plt, colormaps, ScalarMappable, Normalize, FancyArrowPatch
 

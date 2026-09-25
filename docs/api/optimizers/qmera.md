@@ -467,6 +467,3 @@ the U1U1 SymDMRG2 reference, see
 the shallow qMERA energy is expected to remain above the better-converged DMRG
 energy, while both calculations use the same physical Hubbard terms and
 particle-number sector.
-
-
-> API details are maintained as handwritten Markdown in this page.

@@ -62,12 +62,16 @@ Within implementations, import simple helpers from their owning modules:
 `OneDMap` from `tensors.maps`, state constructors from `tensors.constructors`,
 measurements and entropy from `tensors.observables`, `tn_norm` from
 `tensors.contractions`, and backend configuration from `backends.config`.
-Symmetric tensor mapping and measurement helpers follow these paths. The gate,
-Hamiltonian, and boundary-state modules follow these paths without loading
-`tensors.core`.
-That compatibility aggregator still contains wrappers for contraction and
-fidelity with historical patch hooks. Audit those hooks before migrating
-remaining wrapper callers; a blanket import replacement can change behavior.
+Fitting, boundary sweeps, optimizers, and samplers also use these owning
+modules directly. Internal consumers do not load `tensors.core` or invoke
+its temporary global patch hooks.
+
+`tensors.core` remains available to existing callers. Its contraction and
+fidelity wrappers retain historical patch hooks for calls through that module.
+For instrumentation of internal consumers, patch the owning module or the
+consumer's imported name; a patch on the compatibility module is not a global
+override. Prefer explicit `contraction_opt` or optimizer arguments where the
+API supports them.
 
 ## Maintenance boundaries
 

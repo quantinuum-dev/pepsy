@@ -272,5 +272,3 @@ under `norm_result`, `norm_target_result`, and `overlap_result` (a supplied
 known norm has a corresponding `None`). `peps_fidelity(...)` remains scalar by
 default; use `return_info=True` to receive that same dictionary plus the
 computed `fidelity`. This makes `fit_timing=True` useful on both helpers.
-
-> API details are maintained as handwritten Markdown in this page.

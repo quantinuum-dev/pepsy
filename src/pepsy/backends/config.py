@@ -343,7 +343,7 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "backend_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
 
     def cast_array(x, device=device, dtype=dtype, requires_grad=requires_grad):
@@ -566,7 +566,7 @@ def _install_torch_linalg_config(config):
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "Torch linalg configuration requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -771,7 +771,7 @@ def reg_native_svd_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_native_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -805,7 +805,7 @@ def reg_rel_svd_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_rel_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -825,7 +825,7 @@ def reg_complex_svd_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -850,7 +850,7 @@ def reg_real_svd_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -867,7 +867,7 @@ def reg_complex_qr_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_qr_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -879,7 +879,7 @@ def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_qr_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -939,7 +939,7 @@ def reg_stop_gradient_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_stop_gradient_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 

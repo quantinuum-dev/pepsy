@@ -6743,7 +6743,7 @@ class StabilizerMpsSimulator:
 
     def _fit_overlap_diagnostics_for_target(self, target, fitted):
         """Return the optional target-overlap diagnostic for a FIT update."""
-        from ...tensors.core import tn_fidelity
+        from ...tensors.observables import tn_fidelity
 
         # Contract copies so this optional diagnostic cannot alter the live
         # target or FIT center metadata used by the next replay step.

@@ -1223,6 +1223,3 @@ chain sentence, or other text. The styling follows Quimb's axis-free schematic
 drawings while retaining Pepsy's ordinary `(fig, ax)` return value.
 Pass `show_order_labels=False` to hide the position labels, or use
 `show_chain_label=True` and `show_title=True` for additional annotations.
-
-
-> API details are maintained as handwritten Markdown in this page.

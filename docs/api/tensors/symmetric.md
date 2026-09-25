@@ -1164,7 +1164,6 @@ py.draw_symmray_mps(
 ```
 
 
-> API details are maintained as handwritten Markdown in this page.
 ## PEPS measurement compatibility
 
 `SymPEPS.measure` retains Boolean `normalize` and its scalar return value.

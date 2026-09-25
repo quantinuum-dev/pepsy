@@ -730,6 +730,3 @@ For an end-to-end repeated-check validation, use the public
 `run_stabilizer_tree_stream` APIs directly. Keep performance experiments in
 the external benchmark workspace so the package remains focused on reusable
 simulation APIs.
-
-
-> API details are maintained as handwritten Markdown in this page.

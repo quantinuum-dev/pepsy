@@ -247,6 +247,52 @@ print(*sorted(
         assert not loaded, (module_name, loaded)
 
 
+def test_implementation_imports_bypass_core_compatibility_module():
+    """Numerical consumers work without loading legacy patch-hook wrappers."""
+    loaded = _run_clean_import(
+        """
+import importlib
+import importlib.abc
+import sys
+
+class BlockLegacyCore(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'pepsy.tensors.core':
+            raise ModuleNotFoundError(fullname)
+        return None
+
+sys.meta_path.insert(0, BlockLegacyCore())
+for module_name in (
+    'pepsy.boundary.sweeps', 'pepsy.fitting.local',
+    'pepsy.optimizers.mps.optimizer', 'pepsy.optimizers.mpo.optimizer',
+    'pepsy.optimizers.sweep.optimizer', 'pepsy.optimizers.global_opt',
+    'pepsy.optimizers.stabilizer_tn.mps_stab_optimizer',
+    'pepsy.sampling.samplers',
+):
+    importlib.import_module(module_name)
+
+import quimb.tensor as qtn
+from pepsy.optimizers.mps.optimizer import tn_fidelity
+state = qtn.MPS_computational_state('01')
+assert abs(tn_fidelity(state, state, contraction_opt='greedy') - 1) < 1e-12
+
+# Exercise imports deferred until these diagnostic and sampling paths run.
+from pepsy.optimizers.stabilizer_tn.mps_stab_optimizer import StabilizerMpsSimulator
+simulator = object.__new__(StabilizerMpsSimulator)
+simulator.contraction_opt = 'greedy'
+assert simulator._fit_overlap_diagnostics_for_target(state, state)['fit_overlap_fidelity'] == 1
+
+from pepsy.sampling.samplers import PepsBpSampler
+from pepsy.tensors import contractions
+contractions.build_optimizer = lambda **kwargs: 'greedy'
+sampler = PepsBpSampler(qtn.PEPS.rand(2, 2, 2, seed=7))
+assert sampler._get_optimizer() == 'greedy'
+print(*sorted(name for name in sys.modules if name == 'pepsy.tensors.core'))
+"""
+    )
+    assert not loaded
+
+
 def test_symmetric_mapping_does_not_load_core_compatibility_module():
     """Mapping symmetric chains needs maps, not the compatibility aggregator."""
     loaded = _run_clean_import(

@@ -269,7 +269,7 @@ def guppy_gate_stream(
     program
         A Guppy definition (normally decorated with ``@guppy``) or its HUGR
         ``Package``.  Guppy itself is an optional dependency; install it with
-        ``pip install 'pepsy[guppy]'``.
+        ``python -m pip install '.[guppy]'`` from a Pepsy checkout.
     format : {"matrix", "named"}, default="matrix"
         ``"matrix"`` is accepted by dense MPS/MPO/PEPS optimizers and by
         ``StabilizerMpsSimulator``.  ``"named"`` uses Pepsy's compact named entries

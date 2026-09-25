@@ -56,5 +56,3 @@ boundary sweep into a full environment rebuild at every bond.
 
 `CompBdy.fit_diagnostics` is reset by each public run/move call. Convergence
 metadata is always cheap and available; detailed timers are opt-in.
-
-> API details are maintained as handwritten Markdown in this page.

@@ -7,6 +7,17 @@ Choose how to apply gates and structured operators, then tune compression and ru
 For variational replay, see [TreeFIT and DMRG](tree_fit.md).
 For measurement and shot execution, see [readout](tree_readout.md).
 
+## When replay starts
+
+`TreeOptimizer` runs its supplied gate stream during construction by default
+(`run=True`). To configure it before replay, pass `run=False`, then call
+`optimizer.run(...)` once. Calling `run()` again applies the queued stream
+again to the current state.
+
+`MpsOptimizer` queues its gates at construction and waits for `run()`. Use
+`run=False` on the tree optimizer when comparing the two with the same
+construct-then-run sequence.
+
 ## Replay modes
 
 Gates are absorbed into the tree according to the selected optimizer mode:

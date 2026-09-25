@@ -5653,7 +5653,7 @@ class PepsBpSampler:
 
         global build_optimizer  # pylint: disable=global-statement
         if build_optimizer is None:
-            from ..tensors.core import build_optimizer as _build_optimizer  # pylint: disable=import-outside-toplevel
+            from ..tensors.contractions import build_optimizer as _build_optimizer  # pylint: disable=import-outside-toplevel
 
             build_optimizer = _build_optimizer
 

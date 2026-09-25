@@ -97,6 +97,3 @@ optional; it only pins the recorded `symmetry`/`spinful` labels. Signed
 `amplitudes(...)` follow the same dense basis convention and may differ from the
 graded amplitude ordering by a per-configuration sign, whereas
 `probabilities(...)` are exact.
-
-
-> API details are maintained as handwritten Markdown in this page.
