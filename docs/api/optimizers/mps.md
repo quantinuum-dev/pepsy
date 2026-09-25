@@ -302,10 +302,12 @@ This remains dense statevector evolution, not MPS truncation: `chi` and
 single-qubit gates in consecutive dense blocks with at most four qubits, and
 combines consecutive diagonal gates into broadcast factors with at most twelve
 qubits. A diagonal factor has at most 4096 entries, not a full-system diagonal
-matrix. On large NumPy or CuPy qubit states, equal-value ZZ-like two-qubit
-diagonal runs can instead use one graph-phase pass across any number of
-sites. Consecutive parity-preserving gates on the same pair (including
-RXX/RYY/RZZ) can use one two-sector update. The planner keeps the ordinary
+matrix. On large NumPy or CuPy qubit states, long ZZ-like two-qubit
+diagonal runs with one or two distinct value pairs can use one graph-phase
+pass across any number of sites. The two-value route is selected only when
+the state size and avoided state passes justify its setup cost.
+Consecutive parity-preserving gates on the same pair (including RXX/RYY/RZZ)
+can use one two-sector update. The planner keeps the ordinary
 bounded blocks when these patterns are absent or a backend lacks the optional
 kernel. Gates are not reordered across each other or across measurements,
 resets, caps, feed-forward, or trajectory boundaries. `k_2q_batch` continues
@@ -326,9 +328,9 @@ small nonzero entries are never dropped. The structured CPU kernels use
 optional Numba; without it, NumPy uses the original fused blocks. CuPy uses
 small compiled kernels, while Torch stays on differentiable dense fusion.
 Torch matrices requiring gradients use dense fusion even when currently
-diagonal, preserving off-diagonal derivatives. RZZ runs without a
-sufficiently long equal-value segment keep the existing diagonal blocks
-because the measured general-angle one-pass prototype was slower. Operators
+diagonal, preserving off-diagonal derivatives. RZZ runs with many
+distinct value pairs keep the existing diagonal blocks because a measured
+unrestricted per-edge one-pass prototype was slower. Operators
 are rebuilt on each replay so changed gate payloads and autograd graphs do
 not become stale.
 

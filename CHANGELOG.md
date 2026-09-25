@@ -373,11 +373,11 @@ Changes for the next release should be added here before the version is bumped.
   one-/two-qubit gates, compact diagonal broadcasting, and reuse of already
   contracted states without restoring full-state axis order after every gate.
   Dense replay preserves backend/device and operator scale, with reference
-  fallback for unsupported state types. Large equal-value ZZ layers now use
-  a grouped-bit phase pass, and consecutive same-pair RXX/RYY/RZZ or other
-  parity-preserving gates use one two-sector pass on supported NumPy/CuPy
-  states. Numba is optional for CPU execution. Existing modes and defaults are
-  unchanged.
+  fallback for unsupported state types. Large ZZ layers with one or two
+  distinct value pairs can use a grouped-bit phase pass. Consecutive
+  same-pair RXX/RYY/RZZ or other parity-preserving gates use one two-sector
+  pass on supported NumPy/CuPy states. Numba is optional for CPU execution.
+  Existing modes and defaults are unchanged.
 
 - Added an explicit state-aware MPS layout objective. An optimizer-backed
   `MpsGateStreamLayoutFinder` now jointly evaluates bounded static layout

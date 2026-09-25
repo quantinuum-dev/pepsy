@@ -97,27 +97,45 @@ class ExactStructuredBatch:
     fallback: tuple
 
     def apply(self, tensor):
-        from ._exact_structured import apply_grouped_phase, apply_parity
+        from ._exact_structured import (
+            apply_grouped_phase,
+            apply_grouped_phase_two,
+            apply_parity,
+        )
 
         n = len(tensor.inds)
         if n > 63:
             result = None
         elif self.kind == "phase":
             edges, same, different = self.operator
+            pairs = tuple(dict.fromkeys(zip(same, different)))
             groups = {}
-            for a, b in edges:
+            counts = [0] * len(pairs)
+            for (a, b), values in zip(edges, zip(same, different)):
                 bit_a = n - 1 - tensor.inds.index(a)
                 bit_b = n - 1 - tensor.inds.index(b)
                 low, high = sorted((bit_a, bit_b))
-                groups[high - low] = groups.get(high - low, 0) | (1 << low)
-            offsets = np.asarray(tuple(groups), dtype=np.int32)
+                kind = pairs.index(values)
+                counts[kind] += 1
+                key = (kind, high - low)
+                groups[key] = groups.get(key, 0) | (1 << low)
+            offsets = np.asarray(tuple(key[1] for key in groups), dtype=np.int32)
             masks = np.asarray(tuple(groups.values()), dtype=np.uint64)
-            table = np.asarray(
-                [same[0] ** (len(edges) - k) * different[0] ** k
-                 for k in range(len(edges) + 1)],
-                dtype=same.dtype,
+            tables = tuple(
+                np.asarray(
+                    [values[0] ** (count - k) * values[1] ** k
+                     for k in range(count + 1)],
+                    dtype=same.dtype,
+                )
+                for values, count in zip(pairs, counts)
             )
-            result = apply_grouped_phase(tensor.data, offsets, masks, table)
+            if len(tables) == 1:
+                result = apply_grouped_phase(tensor.data, offsets, masks, tables[0])
+            else:
+                split = sum(key[0] == 0 for key in groups)
+                result = apply_grouped_phase_two(
+                    tensor.data, offsets, masks, tables[0], tables[1], split
+                )
         else:
             mask0, mask1 = (
                 1 << (n - 1 - tensor.inds.index(ix)) for ix in self.inds
@@ -237,6 +255,24 @@ def _structured_batch(kind, entries, matrices, zz_values):
     return ExactStructuredBatch(kind, operator, inds, diagonal, locations, fallback)
 
 
+def _two_class_worthwhile(entries, backend, state_size):
+    """Favor one grouped pass only when it saves enough full-state passes."""
+    support = set()
+    passes = 0
+    for _gate, where, _location in entries:
+        combined = support | set(where)
+        if len(combined) > _DIAGONAL_QUBITS:
+            passes += 1
+            support = set(where)
+        else:
+            support = combined
+    passes += bool(support)
+    if backend == "cupy":
+        # The extra tiny host-to-device tables dominate smaller GPU states.
+        return state_size >= 1 << 22 and passes >= 3
+    return state_size >= 1 << 18 and (passes >= 3 or state_size >= 1 << 21)
+
+
 def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size=0):
     """Fuse ordered gates, selecting structural kernels when worthwhile.
 
@@ -273,14 +309,20 @@ def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size
         while j < len(entries) and zz[j] is not None:
             sites.update(entries[j][1])
             j += 1
-        equal_values = (
-            j > i and all(pair == zz[i] for pair in zz[i:j])
-        )
+        value_classes = set(zz[i:j])
         unique_edges = {
             frozenset(entries[k][1]) for k in range(i, j)
         }
-        if (len(sites) > _DIAGONAL_QUBITS and equal_values
-                and len(unique_edges) == j - i):
+        phase_candidate = (
+            len(sites) > _DIAGONAL_QUBITS and len(unique_edges) == j - i
+        )
+        if phase_candidate and (
+            len(value_classes) == 1
+            or (
+                len(value_classes) == 2
+                and _two_class_worthwhile(entries[i:j], backend, state_size)
+            )
+        ):
             yield from _iter_basic_batches(entries[basic_start:i], matrices[basic_start:i])
             yield _structured_batch("phase", entries[i:j], matrices[i:j], zz[i:j])
             i = basic_start = j

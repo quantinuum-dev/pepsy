@@ -384,6 +384,86 @@ def test_exact_batch_equal_zz_layer_uses_one_phase_pass(backend):
 
 
 @pytest.mark.parametrize("backend", ("numpy", "cupy"))
+def test_exact_batch_two_value_zz_layer_uses_one_phase_pass(backend):
+    if backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if not cp.cuda.runtime.getDeviceCount():
+                pytest.skip("CUDA is unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA is unavailable")
+    else:
+        pytest.importorskip("numba")
+        cp = None
+
+    # The extra two CuPy sites make the full-state traffic large enough for
+    # one grouped pass to beat four ordinary diagonal blocks.
+    nx, ny = 4, 5
+    n = nx * ny + (2 if cp is not None else 0)
+    state = qtn.MPS_product_state(
+        [np.array([1.0, 0.08 + 0.01j * i], dtype=np.complex64)
+         for i in range(n)]
+    )
+    gates_by_class = (
+        np.asarray(rzz(0.17), dtype=np.complex64),
+        np.diag(np.asarray(
+            [1.01 + 0.02j, 0.97 - 0.03j,
+             0.97 - 0.03j, 1.01 + 0.02j],
+            dtype=np.complex64,
+        )),
+    )
+    x_edges = [(x * ny + y, (x + 1) * ny + y)
+               for x in range(nx - 1) for y in range(ny)]
+    y_edges = [(x * ny + y, x * ny + y + 1)
+               for x in range(nx) for y in range(ny - 1)]
+    edges = x_edges + y_edges
+    edges[3] = tuple(reversed(edges[3]))
+    gates = [(gates_by_class[int(i >= len(x_edges))], edge)
+             for i, edge in enumerate(edges)]
+    if cp is not None:
+        state.apply_to_arrays(cp.asarray)
+        gates = [(cp.asarray(gate), edge) for gate, edge in gates]
+
+    def planned(stream, size):
+        return list(batch_module.iter_exact_batches(
+            [gate for gate, _ in stream],
+            [where for _, where in stream],
+            "k{}".format,
+            backend=backend,
+            state_size=size,
+        ))
+
+    blocks = planned(gates, 2**n)
+    assert len(blocks) == 1
+    assert blocks[0].kind == "phase"
+    assert len(blocks[0].locations) == len(edges)
+    small_blocks = planned(gates, 2**17)
+    assert not (len(small_blocks) == 1
+                and getattr(small_blocks[0], "kind", None) == "phase")
+
+    before = ar.to_numpy(state.to_dense()).copy()
+    reference = MpsOptimizer(state, gates, chi=1, mode="exact")
+    optimized = MpsOptimizer(state, gates, chi=1, mode="exact-batch")
+    reference.run()
+    optimized.run()
+    np.testing.assert_allclose(
+        ar.to_numpy(optimized.to_dense()),
+        ar.to_numpy(reference.to_dense()),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    np.testing.assert_array_equal(ar.to_numpy(state.to_dense()), before)
+
+    three_classes = gates + [
+        (cp.asarray(rzz(0.31), dtype=cp.complex64)
+         if cp is not None else np.asarray(rzz(0.31), dtype=np.complex64),
+         (0, n - 1))
+    ]
+    assert all(getattr(block, "kind", None) != "phase"
+               for block in planned(three_classes, 2**n))
+
+
+@pytest.mark.parametrize("backend", ("numpy", "cupy"))
 def test_exact_batch_same_pair_parity_preserves_order_and_scale(backend):
     if backend == "cupy":
         cp = pytest.importorskip("cupy")

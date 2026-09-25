@@ -355,3 +355,62 @@ mode; that exact failure reproduced on an isolated archive of remote
 and three JAX complex64 precision failures; the direct case reproduced on the
 same isolated baseline. The [session handoff](../../../history/2026-09-24-mps-exact-batch-rebase.md)
 records the checks and remaining scope.
+
+## Two-value ZZ layers (2026-09-24)
+
+A follow-up extends the grouped phase pass to consecutive ZZ-like diagonal
+gates with **two exact value pairs**, a common case when horizontal and
+vertical RZZ couplings differ. For each class, it counts disagreeing edges
+with grouped XOR/popcount masks and reads a small power table. The two class
+factors multiply each amplitude in one state-output pass. It preserves
+nonunitary scale, reversed endpoints, original gate order, and input ownership.
+A phase block never contains repeated edges, whose multiplicity an OR mask
+would lose; the planner splits or falls back. Three or more value classes
+retain the existing bounded blocks.
+No gate matrix or full-state diagonal is cached.
+
+The planner estimates the number of ordinary twelve-site diagonal passes.
+For two classes, NumPy needs at least 2^18 amplitudes and either three
+avoided passes or 2^21 amplitudes; CuPy needs at least 2^22 amplitudes and
+three avoided passes. These conservative thresholds avoid measured small-state
+regressions and are heuristics rather than portable performance guarantees.
+The existing equal-value path and same-pair parity path keep their policies.
+The new CPU/CUDA kernels allocate one output array and only small masks/tables;
+unsupported dtype, contiguity, or missing Numba still falls back.
+
+Warm application spot checks (complex64, shared host, no planner construction
+or first-use compilation) compared ordinary bounded diagonal blocks with the
+two-value pass:
+
+| Workload | Ordinary blocks | Two-value pass |
+| --- | ---: | ---: |
+| 4x5 grid on CPU, 20 qubits, 31 edges | 6.17 ms | 2.93 ms |
+| 4x5 grid on A5000, 20 qubits, 31 edges | 0.151 ms | 0.241 ms |
+| 4x5 grid on A5000, 22 qubits including 2 idle sites | 0.424 ms | 0.313 ms |
+| 4x6 grid on A5000, 24 qubits, 38 edges | 1.928 ms | 0.562 ms |
+| 24-qubit chain on A5000, 23 edges | 1.189 ms | 0.624 ms |
+
+The 20-qubit GPU and 17-qubit CPU regressions drove the capability gate.
+Measurements are medians of short local runs, not full optimizer or production
+benchmarks. The largest timed state was 128 MiB; no 30-qubit GPU run was
+attempted.
+
+Upstream audit: the Quimb changelog, Autoray repository, Cotengra docs and
+changelog, Symmray repository, and attempted Abelian-array page were checked
+again. Installed Quimb 1.15.1.dev66, Autoray 0.11.1.dev3, Cotengra
+0.8.3.dev7, Symmray 0.4.1.dev7, Numba 0.67.0, and CuPy 14.1.1 remain
+unchanged. The installed TensorNetwork copy/contract, Tensor.modify,
+MpsOptimizer exact-batch, Autoray NumPy dispatch, and CuPy RawKernel
+constructor/launch were probed. **Adopt:** the two-class kernel behind
+backend and workload checks. **Defer:** general per-edge angles, RXX/RYY
+basis-rotation graph passes, plan caching, in-place mutation, and native
+Symmray specialization pending separate cost/ownership evidence. No
+compatibility shim or dependency change is needed.
+
+Focused exact-batch validation passed 24 tests on NumPy/CuPy and retained the
+Torch, native Symmray, and fallback checks. A separate CuPy complex128 probe
+agreed with four bounded blocks to maximum absolute error 9.43e-16 at 22
+qubits. Adjacent MPS/control/Quimb/API/package tests had 130 passes and the
+known JAX complex64 direct-mode Kraus-probability precision failure, already
+reproduced on the remote baseline. Ruff, the MPS skill validators, and
+whitespace checks passed. See the [follow-up handoff](../../../history/2026-09-24-mps-two-value-phase.md).

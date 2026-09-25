@@ -49,7 +49,22 @@ def _cpu_kernels():
                 disagreements += popcount(bits)
             out[i] = inp[i] * table[disagreements]
 
-    return parity, grouped_phase
+    @njit(nogil=True)
+    def grouped_phase_two(inp, out, offsets, masks, table0, table1,
+                          split, start, stop):
+        for i in range(start, stop):
+            basis = np.uint64(i)
+            disagreements0 = np.uint64(0)
+            disagreements1 = np.uint64(0)
+            for group in range(split):
+                bits = (basis ^ (basis >> offsets[group])) & masks[group]
+                disagreements0 += popcount(bits)
+            for group in range(split, offsets.size):
+                bits = (basis ^ (basis >> offsets[group])) & masks[group]
+                disagreements1 += popcount(bits)
+            out[i] = inp[i] * (table0[disagreements0] * table1[disagreements1])
+
+    return parity, grouped_phase, grouped_phase_two
 
 
 def _run_cpu(kernel, total, *args):
@@ -94,6 +109,25 @@ extern "C" __global__ void grouped_phase(
         disagreements += __popcll((i ^ (i >> offsets[group])) & masks[group]);
     }}
     out[i] = multiply(inp[i], table[disagreements]);
+}}
+
+extern "C" __global__ void grouped_phase_two(
+    const Value* inp, Value* out, const int* offsets,
+    const unsigned long long* masks, const Value* table0,
+    const Value* table1, unsigned long long size, int split, int groups
+) {{
+    unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= size) return;
+    int disagreements0 = 0, disagreements1 = 0;
+    for (int group = 0; group < split; ++group) {{
+        disagreements0 += __popcll((i ^ (i >> offsets[group])) & masks[group]);
+    }}
+    for (int group = split; group < groups; ++group) {{
+        disagreements1 += __popcll((i ^ (i >> offsets[group])) & masks[group]);
+    }}
+    out[i] = multiply(inp[i], multiply(
+        table0[disagreements0], table1[disagreements1]
+    ));
 }}
 
 extern "C" __global__ void parity(
@@ -183,5 +217,36 @@ def apply_grouped_phase(data, offsets, masks, table):
     _cuda_kernel("grouped_phase", data.dtype.name)(
         ((size + 255) // 256,), (256,),
         (data, out, device_offsets, device_masks, device_table, size, len(offsets)),
+    )
+    return out
+
+
+def apply_grouped_phase_two(data, offsets, masks, table0, table1, split):
+    """Apply two ZZ value classes in one output pass, or return None."""
+    if not _supported(data, table0.dtype) or table1.dtype != table0.dtype:
+        return None
+    if isinstance(data, np.ndarray):
+        kernels = _cpu_kernels()
+        if kernels is None:
+            return None
+        out = np.empty_like(data)
+        _run_cpu(
+            kernels[2], data.size, data.reshape(-1), out.reshape(-1),
+            offsets, masks, table0, table1, split,
+        )
+        return out
+
+    import cupy as cp
+
+    out = cp.empty_like(data)
+    device_offsets = cp.asarray(offsets)
+    device_masks = cp.asarray(masks)
+    device_table0 = cp.asarray(table0)
+    device_table1 = cp.asarray(table1)
+    size = int(data.size)
+    _cuda_kernel("grouped_phase_two", data.dtype.name)(
+        ((size + 255) // 256,), (256,),
+        (data, out, device_offsets, device_masks, device_table0, device_table1,
+         size, split, len(offsets)),
     )
     return out
