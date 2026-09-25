@@ -2291,6 +2291,17 @@ def test_symmetric_as_scalar_handles_backend_scalars_before_numpy_conversion():
     assert symmetric_mod._as_scalar(vector) is vector
 
 
+def test_fermionic_scalar_readout_preserves_pending_global_phase():
+    """The optional Symmray stack must agree on all scalar readout routes."""
+    scalar = sr.Z2FermionicArray(
+        indices=(), charge=0, blocks={(): np.asarray(2.0)},
+    ).phase_global()
+    assert scalar.to_dense() == -2.0
+    assert scalar.item() == -2.0
+    assert scalar.sum() == -2.0
+    assert symmetric_mod._as_scalar(scalar) == -2.0
+
+
 def test_symmetric_to_backend_copy_preserves_original_blocks():
     """to_backend(..., inplace=False) should convert a copied wrapper only."""
     torch = pytest.importorskip("torch")
@@ -3958,9 +3969,15 @@ def test_u1u1_fermionic_mps_optimizer_two_site_fit_stays_native():
         progbar=False,
         n_iter=2,
         cutoff=1.0e-10,
+        cutoff_mode="rsum2",
         fit_block_size=2,
         fit_sweep_sequence="RL",
     )
+
+    diagnostics = optimizer.get_fit_diagnostics()
+    assert diagnostics["guess_backend"] == "symmray-svd"
+    assert not diagnostics["native_randomized_guess_used"]
+    assert diagnostics["random_initialization"]["fallback_reason"] == "cumulative_cutoff"
 
     assert all(
         type(tensor.data).__name__ == "U1U1FermionicArray"

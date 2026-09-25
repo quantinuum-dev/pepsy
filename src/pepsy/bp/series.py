@@ -65,6 +65,8 @@ from ._symmray import (
     rank_one_d2_projector as _symmray_rank_one_d2_projector,
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     to_dense as _symmray_to_dense,
+    projector_bra as _symmray_projector_bra,
+    projector_message as _symmray_projector_message,
     uses_symmray as _uses_symmray,
 )
 
@@ -2526,7 +2528,7 @@ def _get_d2_cut_edge_excited(
             bp.index_dual_map.get(index, index): new_index
             for index, new_index in bixmaps[tid].items()
         }
-        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+        local |= _symmray_projector_bra(bp, tid).reindex(bra_reindex)
 
     for index, projector_tids in projector_inds.items():
         tid_left, tid_right = tuple(projector_tids)
@@ -2938,10 +2940,10 @@ def _get_d2_partial_trace_excited(
             bp.index_dual_map.get(index, index): new_index
             for index, new_index in bixmaps[tid].items()
         }
-        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+        local |= _symmray_projector_bra(bp, tid).reindex(bra_reindex)
 
     for index, tid in boundary_inds:
-        data = bp.messages[index, tid]
+        data = _symmray_projector_message(bp.messages[index, tid])
         local |= qtn.Tensor(
             data,
             inds=(bixmaps[tid][index], kixmaps[tid][index]),
@@ -3129,11 +3131,11 @@ def _get_d2_edge_partial_trace_excited(
             bp.index_dual_map.get(index, index): new_index
             for index, new_index in bixmaps[tid].items()
         }
-        local |= bp.tensor_dual_map[tid].reindex(bra_reindex)
+        local |= _symmray_projector_bra(bp, tid).reindex(bra_reindex)
 
     for index, tid in boundary_inds:
         local |= qtn.Tensor(
-            bp.messages[index, tid],
+            _symmray_projector_message(bp.messages[index, tid]),
             inds=(bixmaps[tid][index], kixmaps[tid][index]),
         )
 
@@ -3741,7 +3743,14 @@ def _get_d2_cluster_norm(
             info=None,
             inplace=False,
         )
-    bra = qtn.TensorNetwork(bp.tensor_dual_map[tid] for tid in tids)
+    from ._symmray import d2bp_uses_fermionic_operators
+
+    if ket_base.isfermionic() and d2bp_uses_fermionic_operators():
+        # New D2BP's cached single-site bras phase every leg for local message
+        # updates. A multi-site region instead phases only its outer legs.
+        bra = ket_base.conj().reindex(bp.index_dual_map)
+    else:
+        bra = qtn.TensorNetwork(bp.tensor_dual_map[tid] for tid in tids)
     if partial_trace_map:
         bra.reindex_(partial_trace_map)
     cluster = bra | ket

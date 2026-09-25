@@ -62,6 +62,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ...backends import (
+    to_float,
     backend_infer,
     backend_signatures_compatible,
     infer_backend_converter_from_sample,
@@ -77,6 +78,10 @@ from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
     log_fidelity_from_norms,
+)
+from ._backend import (
+    compression_event, diagnostic_scalar, scalar_to_host,
+    stabilizer_product_eigenstate,
 )
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
@@ -97,8 +102,6 @@ from .operators import (
     pauli_decomposition,
     pauli_matrix,
     pauli_sum_submpo,
-    single_qubit_combo_matrix,
-    single_qubit_rotation_matrix,
 )
 from .dense import _as_gate_matrix, _is_unitary, _tableau_from_exact_unitary
 from .paulis import (
@@ -3097,7 +3100,7 @@ class StabilizerMpsSimulator:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Dispatch noisy replay through the shared MPS/STN runner."""
@@ -3118,7 +3121,7 @@ class StabilizerMpsSimulator:
             resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
         ):
             raise ValueError(
@@ -3565,7 +3568,7 @@ class StabilizerMpsSimulator:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
         timing: bool = False,
         transactional: bool = False,
@@ -3824,6 +3827,9 @@ class StabilizerMpsSimulator:
 
     def get_infidelities(self):
         """Return the cumulative ``infidelity`` trace like ``MpsOptimizer``."""
+        # Preserve the public list identity while materializing its scalars
+        # only when the caller explicitly requests the trace.
+        self.infidelities[:] = scalar_to_host(self.infidelities)
         return self.infidelities
 
     def get_norm_events(self):
@@ -3841,7 +3847,13 @@ class StabilizerMpsSimulator:
         here contains both the local ratio for the update and the cumulative
         ratio within the current boundary-aware ledger.
         """
-        return deepcopy(self._compression_norm_events)
+        events = []
+        for event in scalar_to_host(self._compression_norm_events):
+            if event["valid"]:
+                event["valid"] = True
+                event["step"] = len(events) + 1
+                events.append(event)
+        return events
 
     def get_normalizations(self):
         """Return explicit normalization records.
@@ -4302,6 +4314,51 @@ class StabilizerMpsSimulator:
         """
         return self._norm_snapshot()[1]
 
+    def _compression_norm_snapshot(self):
+        """Keep ordinary replay norms on-device; retain explicit scale policy."""
+        p = self.state.p
+        like = self._state_backend_like()
+        if (self.stabilize_unitary or float(getattr(p, "exponent", 0.)) != 0.
+                or ar.infer_backend(like) not in {"torch", "jax", "cupy"}):
+            return self._norm_snapshot()
+        site = self._canonize_p_single()
+        mantissa = diagnostic_scalar(p[p.site_tag(site)].norm())
+        return mantissa, mantissa * mantissa, ar.do("log10", mantissa)
+
+    def _finish_unitary_compression(self, before_sq, before_log, *, kind="unitary_compression"):
+        """Record a unitary update, deferring device scalar readout to getters."""
+        if not self._infidelity_valid:
+            return None
+        backend = ar.infer_backend(before_log)
+        after_log = (
+            self._compression_norm_snapshot()[2]
+            if backend in {"torch", "jax", "cupy"} else None)
+        if after_log is not None and ar.infer_backend(after_log) == backend:
+            previous = self._current_infidelity
+            if not self._norm_segment_open:
+                # Match the absolute-norm observation used before the first
+                # valid event, including a zero/invalid coefficient state.
+                log_absolute = ar.do("clip", 2. * after_log * _LN10, None, 0.)
+                previous = ar.do("where", ar.do("isnan", log_absolute), 1.,
+                                 -ar.do("expm1", log_absolute))
+            segment, current, event = compression_event(
+                before_log, after_log, self._compression_segment_log_survival,
+                self._norm_log_survival, previous,
+                step=len(self._compression_norm_events) + 1, kind=kind,
+            )
+            self._compression_segment_log_survival = segment
+            self._current_infidelity = current
+            self._norm_segment_open = True
+            self._compression_norm_events.append(event)
+            return current
+        # Stabilization and extracted-exponent transitions have host decisions
+        # already. Preserve their existing Python-double range and validation.
+        observed = self._unitary_infidelity()
+        self._record_compression_norm_event(before_sq, observed, kind=kind,
+                                            before_log_norm=before_log)
+        self._stabilize_unitary_norm(before_sq, observed, target_log_norm=before_log)
+        return self._current_infidelity
+
     def _unitary_infidelity(self) -> Optional[float]:
         """Return cumulative unitary norm loss from the canonical centre."""
         if not self._infidelity_valid:
@@ -4356,6 +4413,8 @@ class StabilizerMpsSimulator:
         raw = self._float_from_log10(raw_log_fidelity / _LN10)
         local_fidelity = float(fidelity_from_log(local_log_fidelity))
         local_infidelity = float(1.0 - local_fidelity)
+        self._compression_segment_log_survival = to_float(
+            self._compression_segment_log_survival, real=True)
         if local_fidelity == 0.0 or self._compression_segment_log_survival == -math.inf:
             self._compression_segment_log_survival = -math.inf
         else:
@@ -4678,9 +4737,10 @@ class StabilizerMpsSimulator:
             None if total_survival is None else float(total_survival ** 0.5)
         )
         state_norm = float(self.norm())
+        compression_events = self.get_compression_norm_events()
         latest_compression = (
-            self._compression_norm_events[-1]
-            if self._compression_norm_events
+            compression_events[-1]
+            if compression_events
             else None
         )
         return {
@@ -4708,8 +4768,8 @@ class StabilizerMpsSimulator:
             "completed_combined_infidelities": [
                 float(1.0 - survival) for survival in completed_survivals
             ],
-            "compression_events": len(self._compression_norm_events),
-            "compression_norm_events": self.get_compression_norm_events(),
+            "compression_events": len(compression_events),
+            "compression_norm_events": compression_events,
             "current_segment_norm": current_norm,
             "current_segment_infidelity": current_loss,
             "current_fidelity": (
@@ -5352,16 +5412,31 @@ class StabilizerMpsSimulator:
 
     def _bk(self, mat):
         """Backend copy of an internally generated gate matrix."""
-        arr = np.asarray(mat, dtype=self.dtype)
+        arr = np.asarray(mat, dtype=self.dtype) if ar.infer_backend(mat) in {"numpy", "builtins"} else mat
         return self._to_state_backend(arr)
 
     def _bk_const(self, tag: str, mat):
         """Backend copy of a *constant* gate matrix, cached by ``tag``."""
+        if infer_backend_signature(self._state_backend_like()) != self._backend_signature:
+            self.backend_info()
         cached = self._bk_cache.get(tag)
         if cached is None:
             cached = self._to_state_backend(np.asarray(mat, dtype=self.dtype))
             self._bk_cache[tag] = cached
         return cached
+
+    def _single_qubit_combo(self, c, coef, axis):
+        """Assemble changing coefficients from cached backend Pauli matrices."""
+        identity = self._bk_const("PI", pauli_matrix("I"))
+        if axis == "Y" and "complex" not in self.dtype:
+            # Casting Y itself to a real dtype discards it, even though
+            # exp(-i theta Y / 2) is a perfectly real rotation. Cache -iY
+            # instead and cast only the complete combination, as before.
+            pauli = self._bk_const("minus_iPY", (-1j * pauli_matrix("Y")).real)
+            matrix = c * identity + (1j * coef) * pauli
+        else:
+            matrix = c * identity + coef * self._bk_const("P" + axis, pauli_matrix(axis))
+        return ar.astype(matrix, self.dtype)
 
     def _bk_mpo(self, mpo, *, warn=True):
         """Return a sub-MPO on the live backend without mutating its source."""
@@ -5936,25 +6011,7 @@ class StabilizerMpsSimulator:
         state. Returning ``(axis, sign)`` means ``sign * axis`` has eigenvalue
         ``+1`` on the vector; otherwise return ``None``.
         """
-        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
-
-        vec = np.array(to_numpy(vector), dtype=complex, copy=True).reshape(-1)
-        if vec.shape != (2,):  # pragma: no cover - guarded by the qubit MPS API
-            return None
-        norm = float(np.linalg.norm(vec))
-        if norm <= tol:
-            return None
-        vec /= norm
-        bloch = {
-            axis: float(np.real(np.vdot(vec, pauli_matrix(axis) @ vec)))
-            for axis in ("X", "Y", "Z")
-        }
-        axis = max(bloch, key=lambda key: abs(bloch[key]))
-        if abs(abs(bloch[axis]) - 1.0) > tol:
-            return None
-        if any(abs(bloch[other]) > tol for other in bloch if other != axis):
-            return None
-        return axis, (1 if bloch[axis] >= 0.0 else -1)
+        return stabilizer_product_eigenstate(vector, tol=tol)
 
     @staticmethod
     def _exact_cooling_basis_tableau(axis: str, sign: int):
@@ -6040,8 +6097,8 @@ class StabilizerMpsSimulator:
             cascade = self._exact_controlled_pauli_tableau(
                 pivot, pivot_axis, pivot_sign, terms
             )
-            local_rotation = single_qubit_rotation_matrix(
-                theta, rotation_axis, sign, self.dtype
+            local_rotation = self._single_qubit_combo(
+                np.cos(theta / 2), -1j * sign * np.sin(theta / 2), rotation_axis
             )
             p.gate_(self._bk(local_rotation), mps_pivot, contract=True)
             # ``absorb_basis_clifford(V)`` sends C -> C V-dagger. Here V = G-dagger,
@@ -6165,7 +6222,7 @@ class StabilizerMpsSimulator:
         if len(support) == 1:
             q = support[0]
             mps_q = self._mps_site(q)
-            umat = single_qubit_rotation_matrix(theta, terms[q], sign, self.dtype)
+            umat = self._single_qubit_combo(np.cos(theta / 2), -1j * sign * np.sin(theta / 2), terms[q])
             # A single-qubit unitary preserves canonical form and the tracked
             # orthogonality centre, so it is applied without touching the tracker.
             self.state.p.gate_(self._bk(umat), mps_q, contract=True)
@@ -6176,7 +6233,8 @@ class StabilizerMpsSimulator:
         c = np.cos(theta / 2)
         coef = -1j * sign * np.sin(theta / 2)
         mps_terms = self._mps_terms(terms)
-        mpo, where = pauli_combo_submpo(c, coef, mps_terms, self.n, dtype=self.dtype)
+        mpo, where = pauli_combo_submpo(c, coef, mps_terms, self.n, dtype=self.dtype,
+                                      like=self._state_backend_like())
         self._record(self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True))
 
     def _evolve_p(
@@ -6196,7 +6254,7 @@ class StabilizerMpsSimulator:
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
         if unitary and self._infidelity_valid:
-            _before_norm, before_norm_sq, before_log_norm = self._norm_snapshot()
+            _before_norm, before_norm_sq, before_log_norm = self._compression_norm_snapshot()
         else:
             before_norm_sq = None
             before_log_norm = None
@@ -6218,24 +6276,8 @@ class StabilizerMpsSimulator:
                 max_bond=None if self.mode == "exact" else self.chi,
                 info=self.state.info,
             )
-        observed_infidelity = self._unitary_infidelity() if unitary else None
-        self._record_compression_norm_event(
-            before_norm_sq,
-            observed_infidelity,
-            kind=norm_event_kind,
-            before_log_norm=before_log_norm,
-        )
-        infidelity = (
-            None
-            if not unitary
-            else self._current_infidelity
-        )
-        if unitary:
-            self._stabilize_unitary_norm(
-                before_norm_sq,
-                observed_infidelity,
-                target_log_norm=before_log_norm,
-            )
+        infidelity = self._finish_unitary_compression(
+            before_norm_sq, before_log_norm, kind=norm_event_kind) if unitary else None
         if renormalize:
             site = self._canonize_p_single()
             projected_norm = self._renorm_p_at(site)
@@ -6288,7 +6330,14 @@ class StabilizerMpsSimulator:
             return p
 
         guess = p.copy(deep=True)
-        rng = np.random.default_rng(self.fit_init_seed)
+        like = guess.tensors[0].data
+        try:
+            ar.get_lib_fn(ar.infer_backend(like), "random.array")
+            ar.get_lib_fn(ar.infer_backend(like), "random.default_rng")
+        except (AttributeError, ImportError, KeyError, LookupError):
+            rng = np.random.default_rng(self.fit_init_seed)
+        else:
+            rng = ar.do("random.default_rng", self.fit_init_seed, like=like)
         if expand:
             bonds = []
             for site, target_size in zip(range(start, stop), active):
@@ -7492,7 +7541,7 @@ class StabilizerMpsSimulator:
             (0.5, {target: "X"}),
             (-0.5, {control: "Z", target: "X"}),
         )
-        return pauli_sum_submpo(branches, self.n, dtype=self.dtype)
+        return pauli_sum_submpo(branches, self.n, dtype=self.dtype, like=self._state_backend_like())
 
     def _apply_localizer_to_p(self, ops) -> None:
         """Apply and track the measurement's localizing Clifford on ``|nu>``."""
@@ -7557,7 +7606,7 @@ class StabilizerMpsSimulator:
         if len(support) == 1:
             q = support[0]
             mps_q = self._mps_site(q)
-            proj = single_qubit_combo_matrix(0.5, coef, terms[q], self.dtype)
+            proj = self._single_qubit_combo(0.5, coef, terms[q])
             self._canonize_p(mps_q)
             self.state.p.gate_(self._bk(proj), mps_q, contract=True, info=self.state.info)
             self.state.info["cur_orthog"] = (int(mps_q), int(mps_q))
@@ -7567,7 +7616,8 @@ class StabilizerMpsSimulator:
             self._record()
             return
         mps_terms = self._mps_terms(terms)
-        mpo, where = pauli_combo_submpo(0.5, coef, mps_terms, self.n, dtype=self.dtype)
+        mpo, where = pauli_combo_submpo(0.5, coef, mps_terms, self.n, dtype=self.dtype,
+                                      like=self._state_backend_like())
         self._evolve_p(
             self._bk_mpo(mpo, warn=False),
             where,
@@ -8622,7 +8672,7 @@ class StabilizerMpsSimulator:
             (weight, self._mps_terms(sites))
             for weight, sites in branches
         )
-        mpo, where = pauli_sum_submpo(mapped, self.n, dtype=self.dtype)
+        mpo, where = pauli_sum_submpo(mapped, self.n, dtype=self.dtype, like=self._state_backend_like())
         if unitary:
             return self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True)
         self._evolve_p(self._bk_mpo(mpo, warn=False), where)
@@ -8650,26 +8700,14 @@ class StabilizerMpsSimulator:
         p = self.state.p
         branches = tuple(branches)
         if unitary and self._infidelity_valid:
-            _before_norm, before_norm_sq, before_log_norm = self._norm_snapshot()
+            _before_norm, before_norm_sq, before_log_norm = self._compression_norm_snapshot()
         else:
             before_norm_sq = None
             before_log_norm = None
         if not branches or self._norm_squared() <= 0.0:
             self._set_zero_coefficient_state()
             if unitary:
-                observed_infidelity = self._unitary_infidelity()
-                self._record_compression_norm_event(
-                    before_norm_sq,
-                    observed_infidelity,
-                    before_log_norm=before_log_norm,
-                )
-                infidelity = self._current_infidelity
-                self._stabilize_unitary_norm(
-                    before_norm_sq,
-                    observed_infidelity,
-                    target_log_norm=before_log_norm,
-                )
-                return infidelity
+                return self._finish_unitary_compression(before_norm_sq, before_log_norm)
             if target_norm is not None:
                 return self._nonunitary_compression_infidelity(target_norm)
             self._invalidate_infidelity()
@@ -8760,19 +8798,7 @@ class StabilizerMpsSimulator:
                 else (0, 0)
             )
         if unitary:
-            observed_infidelity = self._unitary_infidelity()
-            self._record_compression_norm_event(
-                before_norm_sq,
-                observed_infidelity,
-                before_log_norm=before_log_norm,
-            )
-            infidelity = self._current_infidelity
-            self._stabilize_unitary_norm(
-                before_norm_sq,
-                observed_infidelity,
-                target_log_norm=before_log_norm,
-            )
-            return infidelity
+            return self._finish_unitary_compression(before_norm_sq, before_log_norm)
         if target_norm is not None:
             return self._nonunitary_compression_infidelity(target_norm)
         self._invalidate_infidelity()
@@ -8864,7 +8890,10 @@ class StabilizerMpsSimulator:
         """Record a public update and optionally its bond-history sample."""
         if infidelity is not None:
             self._norm_segment_open = True
-            self.infidelities.append(float(infidelity))
+            self.infidelities.append(
+                diagnostic_scalar(infidelity)
+                if ar.infer_backend(infidelity) in {"torch", "jax", "cupy"}
+                else float(infidelity))
         if record_bond:
             self.bond_history.append(self.state.max_bond())
 

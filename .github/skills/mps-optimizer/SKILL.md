@@ -360,11 +360,7 @@ Before changing `optimizer.py`, verify the following ownership boundaries:
 
 ## Validation
 
-Activate the shared environment first:
-
-```bash
-source /Users/rezah/envs/genpy/bin/activate
-```
+Activate the environment selected by `AGENTS.md` and any local override first.
 
 Focused optimizer validation:
 

@@ -440,10 +440,10 @@ selectors are the other actionable warning class.
 Dense and native trees share the direct one-edge contraction, immutable path
 cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the
 thread cap, self-healing tensor-id cache, copy semantics, and
-TreeLayoutFinder objective plumbing intact. The detailed performance and
-non-binary layout contract is in
+TreeLayoutFinder objective plumbing intact. The native QR safeguard, detailed
+performance rules, and non-binary layout contract are in
 [`references/performance-layout.md`](references/performance-layout.md); read
-it before changing those paths.
+it before changing native QR, canonicalization, performance, or layout paths.
 
 ## Gotchas / teaching notes
 - `convergence_sweep` observable `max_drift` can show a **false plateau**: a
@@ -470,7 +470,7 @@ it before changing those paths.
 Activate the shared environment and use temp caches:
 
 ```bash
-source ~/envs/py312/bin/activate
+# Activate the environment selected by AGENTS.md and any local override.
 NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig \
   PYTHONPYCACHEPREFIX=/tmp pytest -q tests/test_optimize_tree.py
 ```

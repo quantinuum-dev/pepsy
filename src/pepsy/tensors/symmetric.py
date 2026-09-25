@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pepsy.boundary._measurements import compute_peps_local_expectation
+from pepsy._internal.quimb import call_quimb_2d
 import hashlib
 import warnings
 from collections.abc import Mapping
@@ -4953,6 +4955,11 @@ def _as_scalar(value):
         shape = tuple(shape)
         if shape != ():
             return value
+        if _is_symmray_array(value):
+            # NumPy can wrap a Symmray scalar in an object array, whose item()
+            # simply returns the original wrapper. Use Symmray's phase-aware
+            # scalar API instead (fixed upstream in the required 0.4 release).
+            return value.item()
         try:
             return ar.to_numpy(value).item()
         except Exception:
@@ -11575,7 +11582,8 @@ class SymPEPS(_SymState):
             plaquette_envs = {}
             for x_bsz, y_bsz in calc_plaquette_sizes(terms.keys(), autogroup):
                 plaquette_envs.update(
-                    norm_tn.compute_plaquette_environments(
+                    call_quimb_2d(
+                        norm_tn.compute_plaquette_environments,
                         x_bsz=x_bsz,
                         y_bsz=y_bsz,
                         max_bond=chi,
@@ -11618,7 +11626,8 @@ class SymPEPS(_SymState):
         final_contract_opts = {"optimize": contraction_opt}
         if mode == "ctmrg":
             return _as_scalar(
-                double_layer.contract_ctmrg(
+                call_quimb_2d(
+                    double_layer.contract_ctmrg,
                     max_bond=chi,
                     cutoff=cutoff,
                     canonize=canonize,
@@ -11631,7 +11640,8 @@ class SymPEPS(_SymState):
                 )
             )
         return _as_scalar(
-            double_layer.contract_boundary(
+            call_quimb_2d(
+                double_layer.contract_boundary,
                 max_bond=chi,
                 cutoff=cutoff,
                 canonize=canonize,
@@ -11759,6 +11769,7 @@ class SymPEPS(_SymState):
         cutoff=1.0e-12,
         cutoff_mode="rsum2",
         mode="mps",
+        route="boundary",
         canonize=True,
         autogroup=True,
         layer_tags=("KET", "BRA"),
@@ -11788,6 +11799,8 @@ class SymPEPS(_SymState):
         _ = (bdy_norm, n_iter, direction, track_boundary_fidelity, fit_mode, visualize)
 
         if bra is not None or len(measurement_terms) != 1:
+            if route != "boundary":
+                raise ValueError("The measurement route option applies to single local terms.")
             return self._measure_quimb_overlap(
                 measurement_terms,
                 bra=bra,
@@ -11807,11 +11820,16 @@ class SymPEPS(_SymState):
 
         obs_i, where_i, charge_i = measurement_terms[0]
         terms = self._single_quimb_term(obs_i, where_i, charge_i)
-        if chi is None and plaquette_envs is None and not (
+        single_line = min(self.psi.Lx, self.psi.Ly) == 1
+        if single_line and not bdy:
+            bdy = None
+        if not single_line and chi is None and plaquette_envs is None and not (
             isinstance(bdy, dict) and bdy.get("plaquette_envs") is not None
         ):
             raise ValueError("Provide chi when quimb plaquette environments are not supplied.")
 
+        if route != "boundary" and (bdy is not None or plaquette_envs is not None):
+            raise ValueError("Precomputed boundary plaquettes require route='boundary'.")
         if bdy is not None or plaquette_envs is not None:
             plaquette_envs, plaquette_map = self._resolve_quimb_plaquette_envs(
                 terms,
@@ -11846,12 +11864,14 @@ class SymPEPS(_SymState):
         if mode_local == "projector" and self._is_symmray_array(next(iter(terms.values()))):
             mode_local = "mps"
 
-        value = self.psi.compute_local_expectation(
+        value = compute_peps_local_expectation(
+            self.psi,
             terms,
             max_bond=chi,
             cutoff=cutoff,
             canonize=canonize,
             mode=mode_local,
+            route=route,
             layer_tags=layer_tags_use,
             normalized=bool(normalize and norm is None),
             autogroup=autogroup,

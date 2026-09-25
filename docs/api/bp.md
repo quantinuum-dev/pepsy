@@ -4,6 +4,26 @@ The BP namespace contains message-passing, loop-expansion, and partitioned
 norm-estimation helpers. It is an advanced extension and is loaded lazily by
 the top-level package.
 
+## PEPS boundary measurements
+
+`compute_boundary_expectation` separates compression `method` from measurement
+`route`. `mode` remains a compatibility alias for `method`; conflicting
+explicit values raise. `route="boundary"` is the default. Newer Quimb builds
+also support `route="envs"`, with a route-appropriate compressor such as
+`method="direct"`; older builds reject that explicit route. Pepsy adapts
+Quimb's legacy `mode` and modern `method` keywords by capability.
+
+`normalized=True` divides each term by its local norm; `False` returns raw
+expectations. `return_all=True` returns a dictionary of those scalars. Use
+`normalized="return", return_all=True` for `(numerator, norm)` pairs. With
+`return_all=False`, `"return"` produces the sum of normalized expectations.
+These results now have the same format on legacy and current Quimb.
+
+A single row or column uses exact operator-inserted contractions without
+building a full state vector or dense reduced density matrix. It needs no 2D
+boundary truncation, so `max_bond` and boundary cutoffs do not affect this
+case. Precomputed 2D plaquette environments cannot be used for this route.
+
 
 > API details are maintained as handwritten Markdown in this page.
 
@@ -290,6 +310,17 @@ messages. If converting D2BP messages to SU form with
 `simple_update_core_and_gauges_from_d2bp`, pass the returned core and gauge
 mapping together so the gauge transformation and boundary messages describe
 the same network.
+
+With newer Quimb/Symmray stacks, D2BP messages represent positive fermionic
+operators. Their raw dense matrices need not be positive semidefinite.
+Pepsy probes that convention and applies the dual-leg parity metric when
+converting to SU gauges. It also validates native pair normalization on a
+private snapshot and repairs only affected solver instances. Cluster bras
+are conjugated jointly so internal virtual legs receive the correct phases.
+Explicit loop projectors use matching matrix messages and physical-leg bra
+conjugation, preserving their existing projector convention.
+See the [Symmray compatibility record](../development/notes/symmray_2026_09.md)
+for tested revisions and compatibility limits.
 
 By default, `B_reduce` is only Hermitianized; it is not eigendecomposed. Set
 `psd_project=True` when an explicit PSD projection is wanted, or set

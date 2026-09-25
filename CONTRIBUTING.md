@@ -49,8 +49,9 @@ Use the smallest relevant optional profile when developing a backend:
 - `.[solvers]` and `.[layout]` for external solver and layout backends.
 
 Keep the stable API small and add new advanced functionality under its
-responsibility-based module or `pepsy.experimental`. Add a regression test for
-observable behavior and update the handwritten Markdown documentation when a
+responsibility-based module. The `pepsy.experimental` namespace provides lazy
+discovery of existing domains; it does not own their implementations. Add a
+regression test for observable behavior and update the handwritten Markdown documentation when a
 public API changes. Deprecated imports should emit `DeprecationWarning` and
 remain functional during the documented compatibility window.
 
@@ -63,3 +64,22 @@ coverage as `integration` or `slow`; do not make it part of the default loop.
 Do not commit generated caches, build output, notebook execution artifacts, or
 local environment files. For numerical changes, include the backend, dtype,
 seed, and tolerance assumptions in the test or documentation.
+
+## Agent guidance validation
+
+After changing agent skills, their catalog, or linked files, run from the
+repository root:
+
+```bash
+python .github/skills/pepsy-maintainer/scripts/validate_catalog.py
+```
+
+This standard-library-only check validates skill names and frontmatter,
+required metadata-file presence, local link targets in `SKILL.md`, and catalog
+and bundle-manifest path coverage. It does not validate instruction meaning or
+links throughout all documentation. See the [skill policy](.github/skills/SKILL_POLICY.md)
+for ownership and review requirements.
+
+The independent **Agent guidance** job in [CI](.github/workflows/ci.yml) runs
+this command on pull requests and pushes to `main` or `develop`, without
+installing Pepsy or its numerical dependencies.

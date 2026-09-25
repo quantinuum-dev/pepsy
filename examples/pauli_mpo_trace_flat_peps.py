@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import quimb.tensor as qtn
 
-import pepsy
+from pepsy.boundary import contract_flat
 from pepsy.operators import PauliMPO
 
 
@@ -108,7 +108,7 @@ def main():
 
     native_value = (operators[0] @ operators[1] @ operators[2] @ operators[3]).trace()
     flat = pauli_product_flat_network(operators)
-    flat_value = pepsy.contract_flat(
+    flat_value = contract_flat(
         flat,
         method="exact",
         contraction_opt="greedy",

@@ -169,7 +169,8 @@ from ..backends.convert import (
     infer_backend_converter_from_sample,
     resolve_backend_sample_data_from_tn,
 )
-from ..tensors.core import OneDMap, add_cycle, id_to_mpo, id_to_pepo
+from ..tensors.maps import OneDMap
+from ..tensors.constructors import add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",

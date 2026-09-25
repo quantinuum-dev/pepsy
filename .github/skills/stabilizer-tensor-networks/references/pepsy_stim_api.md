@@ -5,7 +5,7 @@ versions; keep optional deps optional (`pytest.importorskip("stim")`).
 
 ## Environment
 ```bash
-source ~/envs/py312/bin/activate
+# Activate the environment selected by AGENTS.md and any local override.
 python -c "import stim, quimb, pepsy; print(stim.__version__, quimb.__version__, pepsy.__version__)"
 ```
 If stim is missing: `python -m pip install stim`.

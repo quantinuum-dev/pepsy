@@ -1,12 +1,112 @@
 """Tests for public backend conversion helpers."""
 
 import warnings
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 import quimb.tensor as qtn
 
 import pepsy
+
+
+@pytest.mark.parametrize("legacy", (False, True))
+def test_namespace_device_compatibility_preserves_creation_device(legacy):
+    """Exercise real namespace injection without leaking global registrations."""
+    script = r'''
+import sys
+import inspect
+import autoray as ar
+import autoray.autoray as core
+import quimb.tensor.decomp as decomp
+from pepsy.backends.config import _patch_unhashable_device_namespace_key
+
+class Device:
+    __hash__ = None
+    id = 7
+
+class Array:
+    device = Device()
+    dtype = "complex64"
+
+ar.register_backend(Array, "pepsy_namespace_test")
+creation = lambda shape, dtype=None, device=None: (tuple(shape), dtype, device)
+if "inject_device" in inspect.signature(ar.register_function).parameters:
+    ar.register_function("pepsy_namespace_test", "zeros", creation,
+                         inject_dtype=True, inject_device=True)
+else:
+    ar.register_function("pepsy_namespace_test", "zeros", creation)
+    core.register_creation_routine("pepsy_namespace_test", "zeros",
+                                   inject_dtype=True, inject_device=True)
+legacy = sys.argv[1] == "True"
+if legacy:
+    def get_namespace(like=None, device=None, dtype=None, submodule=None):
+        if like == "bad_backend":
+            raise TypeError("unrelated error")
+        inferred = device if device is not None else getattr(like, "device", None)
+        hash(inferred)  # reproduce the legacy cache-key failure
+        return core.AutoNamespace(like, device, dtype, submodule)
+    core.get_namespace = ar.get_namespace = decomp.get_namespace = get_namespace
+
+original = (core.get_namespace, ar.get_namespace, decomp.get_namespace)
+try:
+    core.get_namespace("numpy", device=[])
+except TypeError:
+    supports_unhashable = False
+else:
+    supports_unhashable = True
+_patch_unhashable_device_namespace_key()
+if supports_unhashable:
+    assert original == (core.get_namespace, ar.get_namespace, decomp.get_namespace)
+installed = ar.get_namespace
+_patch_unhashable_device_namespace_key()
+assert ar.get_namespace is installed
+
+array = Array()
+override = Device()
+for factory in (ar.get_namespace, core.get_namespace, decomp.get_namespace):
+    assert factory(array).zeros((2,)) == ((2,), "complex64", array.device)
+    assert factory(array, device=override, dtype="float32").zeros((3,)) == (
+        (3,), "float32", override,
+    )
+    assert factory("numpy").zeros((2,)).shape == (2,)
+if legacy:
+    try:
+        ar.get_namespace("bad_backend")
+    except TypeError as exc:
+        assert str(exc) == "unrelated error"
+    else:
+        raise AssertionError("unrelated TypeError was hidden")
+'''
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(legacy)],
+        cwd=root, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_cupy_namespace_creation_on_available_device():
+    """Exercise actual CUDA device injection when CuPy and a GPU are present."""
+    cp = pytest.importorskip("cupy")
+    import autoray as ar
+
+    try:
+        count = cp.cuda.runtime.getDeviceCount()
+    except cp.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CUDA runtime unavailable: {exc}")
+    if not count:
+        pytest.skip("No CUDA devices available")
+    array = pepsy.backend_cupy(device=0, dtype="complex64")([1, 2])
+    result = ar.get_namespace(array).zeros((3,))
+    assert result.dtype == array.dtype
+    assert result.device.id == array.device.id
+    cp.testing.assert_array_equal(result, cp.zeros(3, dtype=array.dtype))
 
 
 def _available_torch_devices():

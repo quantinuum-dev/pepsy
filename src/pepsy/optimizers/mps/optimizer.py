@@ -72,6 +72,7 @@ import numpy as np
 import quimb
 import quimb.tensor as qtn
 
+from ..._internal.quimb import quimb_compression_options
 from ...backends import (
     backend_infer,
     backend_signatures_compatible,
@@ -79,6 +80,7 @@ from ...backends import (
     infer_backend_signature,
     to_float as _backend_to_float,
 )
+from ...backends.convert import _array_namespace
 from ...fitting.local import FIT
 from ..._internal.cutoff import dtype_auto_cutoff
 from ..._internal.random import backend_random_array
@@ -1237,6 +1239,7 @@ def _apply_submpo_with_interior_workaround_impl(
     inplace_mpo=False,
     optimize=None,
     seed=None,
+    compression_opts=None,
 ):
     """Apply selected Quimb methods without nested sub-MPO tag permutation.
 
@@ -1247,6 +1250,7 @@ def _apply_submpo_with_interior_workaround_impl(
     partition, but reproduce the documented wrapper stages with
     ``permute_arrays=False`` at every level.
     """
+    compression_opts = dict(compression_opts or {})
     si, sf = min(where), max(where)
     p.canonicalize_((si, sf), info=info)
     p.gate_with_op_lazy_(
@@ -1275,8 +1279,9 @@ def _apply_submpo_with_interior_workaround_impl(
         qtn.tensor_network_1d_compress(
             subp,
             method="zipup",
-            max_bond=2 * chi,
-            cutoff=cutoff,
+            max_bond=compression_opts.get("max_bond_oversample", 2 * chi),
+            cutoff=compression_opts.get("cutoff_oversample", cutoff),
+            cutoff_mode=compression_opts.get("cutoff_mode_oversample", "rel"),
             site_tags=site_tags,
             canonize=True,
             sweep_reverse=True,
@@ -1288,6 +1293,7 @@ def _apply_submpo_with_interior_workaround_impl(
             subp,
             method="direct",
             canonize=False,
+            compress_opts=compression_opts.get("compress_opts_final"),
             **common,
         )
     else:
@@ -1333,6 +1339,7 @@ def _apply_submpo_with_interior_workaround(
     inplace_mpo=False,
     optimize=None,
     seed=None,
+    compression_opts=None,
 ):
     """Apply selected Quimb methods with local tags and optional seeding."""
     seed = seed if method in _MPO_METHODS_USE_SEED else None
@@ -1350,6 +1357,7 @@ def _apply_submpo_with_interior_workaround(
         inplace_mpo=inplace_mpo,
         optimize=optimize,
         seed=seed,
+        compression_opts=compression_opts,
     )
 
 
@@ -1367,6 +1375,7 @@ def _apply_dense_gate_with_method(
     inplace_mpo=True,
     optimize=None,
     seed=None,
+    compression_opts=None,
 ):
     """Apply a dense gate using native Quimb or the interior workaround."""
     if dims is None:
@@ -1395,6 +1404,7 @@ def _apply_dense_gate_with_method(
             # bonds. The projector fit remains valid without that optional
             # pre-gauge and Quimb's own implementation supports this path.
             opts["canonize"] = False
+        opts.update(compression_opts or {})
         quimb_seed = seed if method in _MPO_METHODS_USE_SEED else None
         return _run_seeded_quimb(quimb_seed, p.gate_nonlocal_, gate, where, **opts)
 
@@ -1416,6 +1426,7 @@ def _apply_dense_gate_with_method(
         inplace_mpo=inplace_mpo,
         optimize=optimize,
         seed=seed,
+        compression_opts=compression_opts,
     )
 
 
@@ -5170,6 +5181,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_fit_patience=_DEPRECATED_OPTION,
         mix_sticky_nonfinite=False,
         *,
+        compression_opts=None,
         fit_min_iter=2,
         fit_rtol="auto",
         fit_patience=2,
@@ -5296,6 +5308,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Explicit seed forwarded to randomized Quimb compression methods
             such as ``src``, ``srcmps``, and randomized FIT variants. ``None``
             preserves Quimb's backend-global random state.
+        compression_opts : mapping | None, default=None
+            Independent intermediate/final Quimb compression controls:
+            max_bond_oversample, cutoff_oversample, cutoff_mode_oversample,
+            and compress_opts_final. The latter accepts method, cutoff, and
+            cutoff_mode; chi remains the final bond cap. Unsupported options
+            and native/non-Quimb replay paths reject explicit settings.
         use_layout_finder : bool | str | Mapping, default=False
             Deprecated compatibility path. If enabled, call
             :meth:`layout_finder`, temporarily replay the stream in the
@@ -5982,6 +6000,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
 
         submpo_method = self._resolve_mpo_method(submpo_method)
+        compression_opts = quimb_compression_options(submpo_method, compression_opts)
+        if compression_opts and (not self._is_mpo_mode(self.mode) or self.backend == "symmray"):
+            raise NotImplementedError("compression_opts requires dense Quimb MPS compression replay.")
 
         mode_kwargs = dict(
             n_iter=n_iter,
@@ -5995,6 +6016,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             non_unitary=non_unitary,
             submpo_method=submpo_method,
             compression_seed=compression_seed,
+            compression_opts=compression_opts,
             mix_strict=bool(mix_strict),
             fit_min_iter=int(fit_min_iter),
             fit_rtol=fit_rtol,
@@ -6103,7 +6125,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         This is the single boundary for per-trajectory numerical options.
         """
         names = """n_iter progbar cutoff cutoff_mode k_2q_batch non_unitary
-            normalize_every normalize_final normalize_eps submpo_method compression_seed
+            normalize_every normalize_final normalize_eps submpo_method compression_seed compression_opts
             use_layout_finder layout_order layout_kwargs layout layout_report measure_renormalize
             mix_strict mix_fit_min_iter mix_fit_rtol mix_fit_patience mix_sticky_nonfinite
             fit_min_iter fit_rtol fit_patience fit_block_size fit_adaptive_sweeps
@@ -6364,6 +6386,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary,
         submpo_method,
         compression_seed=None,
+        compression_opts=None,
         mix_strict=False,
         fit_min_iter=2,
         fit_rtol=None,
@@ -6455,6 +6478,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff_mode=cutoff_mode,
                 submpo_method=submpo_method,
                 compression_seed=compression_seed,
+                compression_opts=compression_opts,
                 mix_strict=mix_strict,
                 fit_min_iter=fit_min_iter,
                 fit_rtol=fit_rtol,
@@ -6499,6 +6523,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 non_unitary=non_unitary,
                 submpo_method=submpo_method,
                 compression_seed=compression_seed,
+                compression_opts=compression_opts,
                 stabilize_unitary=stabilize_unitary,
             )
             return self.p
@@ -7846,10 +7871,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _accumulate_norm_survival(self, survival):
         """Accumulate log fidelity without host reads or an autograd history."""
+        xp = _array_namespace(survival)
         # log(0) is valid complete loss. Avoid divide-by-zero warnings on CPU.
         zero = survival == 0.0
-        log_survival = ar.do("where", zero, -math.inf,
-                            ar.do("log", ar.do("where", zero, 1.0, survival)))
+        log_survival = xp.where(zero, -math.inf,
+                                xp.log(xp.where(zero, 1.0, survival)))
         previous = self._norm_log_survival
         backend = ar.infer_backend(log_survival)
         if backend in {"torch", "jax", "cupy"}:
@@ -7857,14 +7883,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 previous = ar.do("full_like", log_survival, self._real_float(previous))
         elif ar.infer_backend(previous) in {"torch", "jax", "cupy"}:
             log_survival = ar.do("full_like", previous, self._real_float(log_survival))
+            xp = _array_namespace(log_survival)
         # Complete loss dominates NaNs in either order, matching the scalar
         # ledger's unconditional survival == 0 branch.
-        complete_loss = ar.do("logical_or", previous == -math.inf, log_survival == -math.inf)
-        self._norm_log_survival = ar.do(
-            "where", complete_loss, -math.inf, previous + log_survival
+        complete_loss = xp.logical_or(previous == -math.inf, log_survival == -math.inf)
+        self._norm_log_survival = xp.where(
+            complete_loss, -math.inf, previous + log_survival
         )
-        cumulative = ar.do("exp", self._norm_log_survival)
-        infidelity = -ar.do("expm1", self._norm_log_survival)
+        cumulative = xp.exp(self._norm_log_survival)
+        infidelity = -xp.expm1(self._norm_log_survival)
         if ar.infer_backend(self._norm_log_survival) in {"numpy", "builtins"}:
             # Keep CPU histories directly serializable, without device reads.
             self._norm_log_survival = self._real_float(self._norm_log_survival)
@@ -7957,10 +7984,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             and ar.infer_backend(observed_norm) in {"torch", "jax", "cupy"}
         )
         if backend_norms:
-            observed_norm = ar.do("stop_gradient", ar.do("abs", observed_norm))
+            xp = _array_namespace(observed_norm)
+            observed_norm = xp.stop_gradient(xp.abs(observed_norm))
             if ar.infer_backend(expected_norm) != ar.infer_backend(observed_norm):
                 expected_norm = ar.do("full_like", observed_norm, expected_norm)
-            expected_norm = ar.do("stop_gradient", ar.do("abs", expected_norm))
+            expected_norm = xp.stop_gradient(xp.abs(expected_norm))
             # Match the old Python-double ledger without promoting MPS data.
             # Metal does not support float64. JAX retains its configured
             # scalar precision (x64 can be disabled).
@@ -7969,10 +7997,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 diagnostic_dtype = "float32" if device_type == "mps" else "float64"
                 observed_norm = ar.astype(observed_norm, diagnostic_dtype)
                 expected_norm = ar.astype(expected_norm, diagnostic_dtype)
-            valid = ar.do("logical_not", expected_norm <= 0.0)
-            safe_expected = ar.do("where", valid, expected_norm, 1.0)
+            valid = xp.logical_not(expected_norm <= 0.0)
+            safe_expected = xp.where(valid, expected_norm, 1.0)
             raw = (observed_norm / safe_expected) ** 2
-            survival = ar.do("clip", raw, 0.0, 1.0)
+            survival = xp.clip(raw, 0.0, 1.0)
             expected_value, observed_value = expected_norm, observed_norm
         else:
             ratio_observed = self._scaled_norm_value(observed_norm, observed_exponent - expected_exponent)
@@ -8025,7 +8053,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ),
         }
         if survival is not None:
-            contribution = ar.do("where", valid, survival, 1.0) if backend_norms else survival
+            contribution = xp.where(valid, survival, 1.0) if backend_norms else survival
             cumulative, cumulative_infidelity = self._accumulate_norm_survival(contribution)
             event["cumulative_fidelity"] = cumulative
             event["cumulative_infidelity"] = cumulative_infidelity
@@ -8642,6 +8670,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         guess_mps = p.copy(deep=True)
         guess_info = {}
+        # Cumulative discarded-weight bounds need the full sector spectra.
+        # Symmray's eager randomized driver cannot honor them. Preserve the
+        # requested accuracy policy using a deterministic native split for
+        # this disposable guess; compatible policies still use randomized SVD.
+        cumulative_cutoff = cutoff_mode in {
+            3, 4, 5, 6, "sum2", "rsum2", "sum1", "rsum1",
+        } and cutoff is not None and cutoff > 0.0
+        split_method = "svd" if cumulative_cutoff else "svd:rand"
         for index, (gate, where) in enumerate(zip(gates, wheres)):
             where = tuple(int(site) for site in where)
             if len(where) == 1:
@@ -8663,8 +8699,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=cutoff_mode,
                     max_bond=self.chi,
                     info=guess_info,
-                    method="svd:rand",
-                    seed=int(seed) + index,
+                    method=split_method,
+                    **({"seed": int(seed) + index} if not cumulative_cutoff else {}),
                 )
             else:
                 raise ValueError(
@@ -8674,7 +8710,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return guess_mps, {
             "backend": "symmray",
-            "method": "svd:rand",
+            "method": split_method,
+            "fallback_reason": "cumulative_cutoff" if cumulative_cutoff else None,
             "seed": int(seed),
             "gate_count": len(gates),
         }
@@ -8942,8 +8979,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 result["guess_method"] = "src"
                 result["guess_used"] = True
                 result["svd_guess_used"] = True
-                result["guess_backend"] = "symmray-svd:rand"
-                result["native_randomized_guess_used"] = True
+                result["guess_backend"] = f"symmray-{native_info['method']}"
+                result["native_randomized_guess_used"] = native_info["method"] == "svd:rand"
                 return result
             if not submpo and requested_strategy in {
                 "guess_direct",
@@ -9421,6 +9458,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode,
         submpo_method,
         compression_seed=None,
+        compression_opts=None,
         stabilize_unitary,
     ):
         """Apply one mixed-mode step with the selected Quimb compressor."""
@@ -9435,6 +9473,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_final=False,
             submpo_method=submpo_method,
             compression_seed=compression_seed,
+            compression_opts=compression_opts,
             stabilize_unitary=stabilize_unitary,
         )
 
@@ -9449,6 +9488,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode,
         submpo_method,
         compression_seed=None,
+        compression_opts=None,
         stabilize_unitary,
     ):
         """Apply a mixed-mode fallback batch with Quimb compression."""
@@ -9463,6 +9503,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_final=False,
             submpo_method=submpo_method,
             compression_seed=compression_seed,
+            compression_opts=compression_opts,
             stabilize_unitary=stabilize_unitary,
         )
         active_where = (
@@ -10105,6 +10146,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode="rsum2",
         submpo_method="direct",
         compression_seed=None,
+        compression_opts=None,
         fit_block_size=1,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
@@ -10148,6 +10190,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 non_unitary=True,
                 submpo_method=submpo_method,
                 compression_seed=compression_seed,
+                compression_opts=compression_opts,
                 stabilize_unitary=False,
             )
             return self.p
@@ -10247,6 +10290,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                         submpo_method=submpo_method,
                         compression_seed=compression_seed,
+                        compression_opts=compression_opts,
                         stabilize_unitary=stabilize_unitary,
                     )
                     mpo_steps += 1
@@ -10388,6 +10432,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff_mode=cutoff_mode,
                             submpo_method=submpo_method,
                             compression_seed=compression_seed,
+                            compression_opts=compression_opts,
                             stabilize_unitary=stabilize_unitary,
                         )
                         self._commit_mix_trial(
@@ -11721,6 +11766,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary=False,
         submpo_method="direct",
         compression_seed=None,
+        compression_opts=None,
         stabilize_unitary=False,
     ):
         """Replay gates/sub-MPOs with Quimb compression (direct by default).
@@ -11748,6 +11794,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
         )
+        mpo_compress_opts.update(compression_opts or {})
         mpo_optimize = mpo_compress_opts.get("optimize")
         stabilize_unitary = bool(stabilize_unitary) and not non_unitary
         if not non_unitary and self._unitary_previous_norm is None:
@@ -11806,6 +11853,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         inplace_mpo=False,
                         optimize=mpo_optimize,
                         seed=compression_seed,
+                        compression_opts=compression_opts,
                     )
                 else:
                     self.canonize_mps(p, (xmin, xmax))
@@ -11886,6 +11934,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         info=self.info_c,
                         optimize=mpo_optimize,
                         seed=compression_seed,
+                        compression_opts=compression_opts,
                     )
                 idx += 1
                 advanced = 1

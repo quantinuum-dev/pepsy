@@ -16,6 +16,27 @@ stabilizer + $n$ destabilizer generators, tracked with **stim**) plus a **coeffi
 state** $|\nu\rangle$ (an $n$-qubit **MPS** in pepsy/quimb). Entanglement lives in the
 basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 
+## Public naming contract
+
+- The canonical public names are `StabilizerMpsSimulator`,
+  `StabilizerTreeSimulator`, and `StabilizerMpsSampler`.
+- `MpsStabOptimizer`, `TreeStabOptimizer`, and `MpsStabSampler` are retained as
+  compatibility aliases and emit `DeprecationWarning` when resolved through
+  their public package namespaces. New implementation, tests, examples, and
+  documentation should use the canonical names; migration tests and the API
+  migration guide should continue to cover the aliases.
+- Do not rename `MpsOptimizer` or `TreeOptimizer` to simulator names. They are
+  ordinary tensor-network optimization engines, while the stabilizer classes
+  are gate-stream simulators that own a tableau plus an MPS or tree
+  coefficient state.
+- Simulator planning returns the canonical stabilizer class names. Its
+  `SimulatorPlan.candidate(...)` lookup continues to accept the legacy names
+  with a deprecation warning.
+- Keep the implementation behavior unchanged when making naming-only edits:
+  the `|psi> = C|nu>` / `|psi> = C|p>` representations, Stim stream contract,
+  compression defaults, backend rules, and trajectory semantics are not
+  changed by this API regularization.
+
 ## Scope boundaries
 - Use stim directly for plain stabilizer-only (Clifford) simulation.
 - Use Pepsy's ordinary gate/optimizer paths for MPS/PEPS simulation with no stabilizer basis.

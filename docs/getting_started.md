@@ -7,33 +7,27 @@ This page gives the shortest path from install to a first contraction run.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+python -m pip install .
 ```
 
-Optional extras:
-
-```bash
-pip install -e .[torch]
-pip install -e .[solvers]
-pip install -e .[viz]
-pip install -e .[symmetry]
-pip install -e .[stabilizer]
-```
+Run these commands from the checkout. For development, use an editable install
+with `python -m pip install -e ".[dev]"`. Add only the optional
+[installation profiles](installation.md) required by your workflow.
 
 ## 2. Build a small test network
 
 ```python
 import quimb.tensor as qtn
-import pepsy
+from pepsy.boundary import BdyMPS, build_bra_ket, contract_boundary
 
 ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
-ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
+ket_tagged, norm = build_bra_ket(ket=ket)
 ```
 
 ## 3. Initialize boundary states
 
 ```python
-bdy = pepsy.BdyMPS(
+bdy = BdyMPS(
     tn_flat=ket_tagged,  # optional single-layer shape/backend reference
     tn_double=norm,      # BRA--KET target used because flat=False
     chi=32,
@@ -44,7 +38,7 @@ bdy = pepsy.BdyMPS(
 ## 4. Contract and inspect diagnostics
 
 ```python
-res = pepsy.contract_boundary(
+res = contract_boundary(
     norm=norm,
     bdy=bdy,
     direction="y",

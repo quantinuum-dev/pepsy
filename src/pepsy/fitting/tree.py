@@ -101,7 +101,14 @@ def _randomize_tree_guess(
         info["reason"] = "native_sector_growth"
         return guess, info
 
-    rng = np.random.default_rng(int(seed))
+    like = tensors[0].data
+    try:
+        ar.get_lib_fn(ar.infer_backend(like), "random.array")
+        ar.get_lib_fn(ar.infer_backend(like), "random.default_rng")
+    except (AttributeError, ImportError, KeyError, LookupError):
+        rng = np.random.default_rng(int(seed))
+    else:
+        rng = ar.do("random.default_rng", int(seed), like=like)
     if expand and target is not None:
         tree_edges = tuple(
             (node0, node1)

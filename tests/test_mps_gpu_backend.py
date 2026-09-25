@@ -253,6 +253,26 @@ def test_device_diagnostic_history_is_detached_and_transactional():
     assert opt._cumulative_fidelity() == pytest.approx(0.64)
 
 
+def test_norm_namespaces_support_older_autoray(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from pepsy.optimizers.tree._diagnostics import diagnostic_to_host, norm_event
+
+    opt = MpsOptimizer(qtn.MPS_computational_state("00"), [], chi=2)
+    before, after = torch.tensor(1.), torch.tensor(.8)
+    active = dict(update=1, kind="gate", support=(0, 1), norm_before=before)
+    expected_log, expected_event = norm_event(active, after, 0.)
+    monkeypatch.delattr(ar, "get_namespace")
+    log, event = norm_event(active, after, 0.)
+    torch.testing.assert_close(log, expected_log)
+    assert diagnostic_to_host(event) == diagnostic_to_host(expected_event)
+    opt._record_norm_event("unitary_compression", expected_norm=before, observed_norm=after)
+    assert opt.get_norm_events()[0]["cumulative_fidelity"] == pytest.approx(.64)
+    # A later host event must switch dispatch back to the device ledger.
+    cumulative, _ = opt._accumulate_norm_survival(.5)
+    assert isinstance(cumulative, torch.Tensor)
+    assert float(cumulative) == pytest.approx(.32)
+
+
 @pytest.mark.parametrize("strict", [False, True])
 def test_zero_norm_still_raises_before_replay_returns(strict):
     torch = pytest.importorskip("torch")

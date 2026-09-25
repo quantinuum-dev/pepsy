@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 
 import autoray as ar
 
+from .._internal.quimb import quimb_2d_options, quimb_compression_options
 from .._internal.quimb import (
     require_quimb_1d_callable_compression,
     require_quimb_ctmrg_mode,
@@ -977,6 +978,8 @@ def _normalize_flat_contraction_method(method, tn):
 
 def _call_with_accepted_kwargs(fn, **kwargs):
     """Call ``fn`` with only the keyword arguments it accepts."""
+    if getattr(fn, "__name__", "") in {"contract_boundary", "contract_ctmrg"}:
+        kwargs = quimb_2d_options(fn, kwargs)
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -1430,6 +1433,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1456,6 +1460,11 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
 ):
     """Contract a double-layer PEPS norm/overlap network by the selected method."""
     method = _normalize_contraction_method(method)
+    if fit_compression_opts and method != "dmrg":
+        raise ValueError("fit_compression_opts requires method='dmrg' with a Quimb fit_mode.")
+    fit_compression_opts = quimb_compression_options(
+        _canonical_fit_mode_selector(fit_mode), fit_compression_opts
+    )
     chi = _validate_chi(chi)
     fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
     fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
@@ -1535,6 +1544,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             fit_sweep_sequence=fit_sweep_sequence,
             fit_cutoff=cutoff,
             fit_cutoff_mode=fit_cutoff_mode,
+            fit_compression_opts=fit_compression_opts,
             fit_min_iter=fit_min_iter,
             fit_rtol=fit_rtol,
             fit_patience=fit_patience,
@@ -1605,6 +1615,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -1834,6 +1845,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -1928,6 +1940,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2019,6 +2032,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2123,6 +2137,7 @@ def contract_boundary(
     fit_sweep_sequence="RL",
     fit_cutoff=1.0e-12,
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2290,6 +2305,7 @@ def contract_boundary(
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff=fit_cutoff,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2344,6 +2360,7 @@ def _contract_state_norm(
     fit_max_bond,
     fit_sweep_sequence,
     fit_cutoff_mode,
+    fit_compression_opts,
     fit_min_iter,
     fit_rtol,
     fit_patience,
@@ -2399,6 +2416,7 @@ def _contract_state_norm(
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2446,6 +2464,7 @@ def peps_normalize(
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2620,6 +2639,7 @@ def peps_normalize(
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2696,6 +2716,7 @@ def boundary_norm(
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2843,6 +2864,7 @@ def boundary_norm(
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -2892,6 +2914,7 @@ def peps_norm(
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -2960,6 +2983,7 @@ def peps_norm(
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -3011,6 +3035,7 @@ def peps_infidelity(
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -3198,6 +3223,7 @@ def peps_infidelity(
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,
@@ -3319,6 +3345,7 @@ def peps_fidelity(
     fit_max_bond=None,
     fit_sweep_sequence="RL",
     fit_cutoff_mode="auto",
+    fit_compression_opts=None,
     fit_min_iter=None,
     fit_rtol=None,
     fit_patience=1,
@@ -3382,6 +3409,7 @@ def peps_fidelity(
         fit_max_bond=fit_max_bond,
         fit_sweep_sequence=fit_sweep_sequence,
         fit_cutoff_mode=fit_cutoff_mode,
+        fit_compression_opts=fit_compression_opts,
         fit_min_iter=fit_min_iter,
         fit_rtol=fit_rtol,
         fit_patience=fit_patience,

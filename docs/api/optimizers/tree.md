@@ -341,6 +341,18 @@ lowered to a chain. The same Tree-native factorization is used by the dense
 term path and by the native Hamiltonian builders (with graded Symmray tensors
 on the fermionic path).
 
+When the term mapping includes a higher-order term, dense factorization and
+direct-sum assembly preserve the input array backend and device. All terms
+must share that backend and device; mixed inputs raise `ValueError`. An
+explicit `dtype=` casts on that backend. Without it, assembly retains the
+first term's dtype, as before. The separate compact one-/two-site Hamiltonian
+automaton remains a host construction path. Upstream SVD rank selection can
+still read scalar decisions during factorization.
+
+Ordinary device norm bookkeeping uses cached Autoray namespaces when
+available, with a dispatch fallback for older Autoray. This reduces Python
+dispatch overhead without changing the existing diagnostic readout boundaries.
+
 For a local gate, use `SubTreeMPO.from_gate(plan, gate, where)`. This compact
 operator stores tensors **only on the connected Steiner subtree**. It retains
 the original logical site labels, node IDs, and configurable tags. Connecting
@@ -595,6 +607,8 @@ use `profile_report()["update_seconds"]` as the envelope total. The
 CuPy or CUDA work, `profile_sync=True` synchronizes the active device at each
 phase boundary so phase durations represent device execution; this is a
 diagnostic mode and adds synchronization overhead.
+With the default `profile=False`, replay does not read update profiling
+clocks; `update_history` stores `elapsed_seconds=None`.
 Path planning is included in `metadata_path`. For layered direct routing,
 `subtree_hub_merge` with `deferred=True` measures queuing the arriving messages;
 their actual contraction is recorded later as `tensor_absorption` with
@@ -1316,6 +1330,20 @@ serial path free of thread-pool overhead, `profile=False` avoids timing overhead
 cheap canonical-centre norm ledger and its progress-bar readout. It does not
 enable spectrum probes.
 
+`fit_finite_check=False` keeps optional FIT finite scans off. MPI shot replay
+also defaults to `collect_diagnostics=False`; pass
+`True` explicitly to request rank timing diagnostics.
+
+For Torch, JAX, and CuPy, ordinary replay retains detached norm and
+log-fidelity scalars on the array backend. `norm()`, `get_norm_events()`,
+`norm_diagnostics()`, diagnostic reports, and progress display are explicit
+host readout boundaries. A nonzero extracted `tn.exponent` retains Python
+double scale bookkeeping to avoid losing its range on float32-only devices.
+Norm tracking remains enabled by default. FIT convergence/local reports,
+measurement decisions, native QR safety checks, and upstream truncation rank
+selection can still synchronize; disabling optional diagnostics does not
+disable these algorithmic decisions.
+
 Warnings are reserved for an actionable behavior change: enabling
 `track_truncation=True` emits one diagnostic-performance warning, while
 legacy mode selectors emit deprecation warnings. Explicit user stream
@@ -2015,6 +2043,14 @@ NumPy-to-NumPy dtype promotion is compatible. A mismatch raises `TypeError` at c
 tensor work. Prepare a payload explicitly with `opt.to_backend(payload)` (or
 the same converter used to build the state). Internal Pauli/projector tensors
 follow the state backend automatically.
+Fixed control matrices are cached by backend/device/dtype; projectors and
+Pauli-sum operators are assembled on that backend. Public
+`TreeMPO.from_pauli_sum(..., like=array)` and
+`SubTreeMPO.from_pauli_sum(..., like=array)` select the construction backend
+and device explicitly; omitting `like` retains NumPy construction.
+Dense local gate factorization also preserves its input backend. One-site
+unitarity certification performs matrix work there and reads only its final
+Boolean result.
 Mixed-backend initial states fail immediately because there is no unambiguous
 safe execution backend.
 

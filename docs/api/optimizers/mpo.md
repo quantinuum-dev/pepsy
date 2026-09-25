@@ -1,5 +1,9 @@
 # `pepsy.optimizers.mpo.optimizer`
 
+Dense Quimb gate replay accepts `run(compression_opts=...)` for both MPO
+physical layers. See [compression stages](../boundary/compression.md) for
+intermediate/final settings and the restrictions on native and channel replay.
+
 `MpoOptimizer` accepts ordinary Quimb MPOs and Symmray block-sparse MPOs. For
 a native graded fermion workflow, use the canonical
 `Fermion.build_mpo(...)` entry point and replay the matching native gate

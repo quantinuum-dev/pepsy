@@ -24,7 +24,8 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ...backends import infer_backend_signature
+from ...backends import infer_backend_signature, to_float
+from ..stabilizer_tn._backend import stabilizer_product_eigenstate
 from ..stabilizer_tn.mps_stab_optimizer import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -1983,7 +1984,7 @@ class StabilizerTreeSimulator:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Replay the queued stabilizer-tree stream through shot orchestration."""
@@ -2002,7 +2003,7 @@ class StabilizerTreeSimulator:
             resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
         ):
             raise ValueError(
@@ -2148,7 +2149,7 @@ class StabilizerTreeSimulator:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Replay queued entries, leaving a failed entry queued for retry.
@@ -2968,25 +2969,7 @@ class StabilizerTreeSimulator:
     @staticmethod
     def _stabilizer_product_eigenstate(vector, *, tol=1e-10):
         """Return ``(axis, sign)`` for a one-qubit stabilizer vector."""
-        from ..stabilizer_tn.operators import pauli_matrix
-
-        vector = np.asarray(ar.to_numpy(vector), dtype=complex).reshape(-1)
-        if vector.shape != (2,):
-            return None
-        norm = float(np.linalg.norm(vector))
-        if norm <= tol:
-            return None
-        vector = vector / norm
-        bloch = {
-            axis: float(np.real(np.vdot(vector, pauli_matrix(axis) @ vector)))
-            for axis in ("X", "Y", "Z")
-        }
-        axis = max(bloch, key=lambda key: abs(bloch[key]))
-        if abs(abs(bloch[axis]) - 1.0) > tol:
-            return None
-        if any(abs(bloch[other]) > tol for other in bloch if other != axis):
-            return None
-        return axis, (1 if bloch[axis] >= 0.0 else -1)
+        return stabilizer_product_eigenstate(vector, tol=tol)
 
     def _tree_product_site_vector(self, q, *, tol=1e-10):
         """Extract a local vector when a TTN leaf is rank-one across its edge."""
@@ -2995,22 +2978,22 @@ class StabilizerTreeSimulator:
             self._tree._move_center(leaf)
             tensor = self.p.node_tensor(leaf)
             physical = self.p.site_ind(int(q))
-            physical_axis = tensor.inds.index(physical)
-            data = ar.to_numpy(tensor.data)
-            data = np.moveaxis(np.asarray(data), physical_axis, 0)
-            matrix = data.reshape(2, -1)
+            data = tensor.transpose(physical, *[ind for ind in tensor.inds if ind != physical]).data
+            matrix = ar.do("reshape", data, (2, -1))
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
         if matrix.shape[1] == 0:
             return None
-        singular_values = np.linalg.svd(matrix, compute_uv=False)
-        scale = float(singular_values[0])
-        if scale <= tol:
+        # One backend SVD supplies both the rank test and candidate vector.
+        # Only the small singular-value decision crosses to the CPU tableau.
+        left, singular_values, _ = ar.do("linalg.svd", matrix, full_matrices=False)
+        scale = singular_values[0]
+        rank_one = scale > tol
+        if len(singular_values) > 1:
+            rank_one = ar.do("logical_and", rank_one, singular_values[1] <= tol * scale)
+        if not bool(to_float(rank_one, real=True)):
             return None
-        if len(singular_values) > 1 and singular_values[1] > tol * scale:
-            return None
-        left = np.linalg.svd(matrix, full_matrices=False)[0][:, 0]
-        return left
+        return left[:, 0]
 
     @staticmethod
     def _exact_cooling_basis_tableau(axis, sign):
@@ -3064,8 +3047,6 @@ class StabilizerTreeSimulator:
         """Apply the constructive tree cooling identity when a pivot exists."""
         if not self.exact_cooling or len(terms) < 2:
             return False
-        from ..stabilizer_tn.operators import pauli_matrix
-
         support = tuple(sorted(int(q) for q in terms))
         pivots = sorted(
             support,
@@ -3090,9 +3071,9 @@ class StabilizerTreeSimulator:
                 pivot, pivot_axis, pivot_sign, terms
             )
             local_rotation = (
-                np.cos(float(theta) / 2.0) * np.eye(2, dtype=complex)
+                np.cos(float(theta) / 2.0) * self._tree._control_tensor("I")
                 - 1j * float(sign) * np.sin(float(theta) / 2.0)
-                * pauli_matrix(rotation_axis)
+                * self._tree._control_tensor(rotation_axis)
             )
             self._apply_tree_gate(local_rotation, pivot)
             # The coefficient state received the local rotation. The

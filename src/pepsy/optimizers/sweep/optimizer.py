@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from ..._internal.quimb import quimb_compression_options
 import time
 import warnings
 import math
@@ -474,6 +476,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_max_bond=None,
         fit_sweep_sequence="RL",
         fit_cutoff_mode="auto",
+        fit_compression_opts=None,
         cutoff="auto",
         fit_min_iter=None,
         fit_rtol=None,
@@ -502,6 +505,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_mode = _canonical_fit_mode_selector(fit_mode)
         fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
         fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
+        fit_compression_opts = quimb_compression_options(fit_mode, fit_compression_opts)
         if (
             fit_layer_mode == "sequential"
             and fit_mode not in _FIT_QUIMB_MODES
@@ -560,6 +564,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             state_target,
             boundaries_supplied=bdy_obj is not None,
         )
+        if fit_compression_opts and self.boundary_engine != "dmrg":
+            raise ValueError("fit_compression_opts requires boundary_engine='dmrg'.")
         if (
             fit_layer_mode == "sequential"
             and self.boundary_engine == "quimb-mps"
@@ -613,6 +619,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.fit_max_bond = fit_max_bond
         self.fit_sweep_sequence = fit_sweep_sequence
         self.fit_cutoff_mode = _canonical_fit_cutoff_mode(fit_cutoff_mode)
+        self.fit_compression_opts = deepcopy(fit_compression_opts)
         self.fit_cutoff = cutoff
         self.fit_min_iter = fit_min_iter
         self.fit_rtol = fit_rtol
@@ -1189,6 +1196,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     "fit_sweep_sequence", self.fit_sweep_sequence
                 ),
                 fit_cutoff_mode=opts.get("fit_cutoff_mode", self.fit_cutoff_mode),
+                fit_compression_opts=opts.get("fit_compression_opts", self.fit_compression_opts),
                 fit_min_iter=opts.get("fit_min_iter", self.fit_min_iter),
                 fit_rtol=opts.get("fit_rtol", self.fit_rtol),
                 fit_patience=opts.get("fit_patience", self.fit_patience),
@@ -1234,6 +1242,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "fit_sweep_sequence", self.fit_sweep_sequence
             ),
             fit_cutoff_mode=opts.get("fit_cutoff_mode", self.fit_cutoff_mode),
+            fit_compression_opts=opts.get("fit_compression_opts", self.fit_compression_opts),
             fit_min_iter=opts.get("fit_min_iter", self.fit_min_iter),
             fit_rtol=opts.get("fit_rtol", self.fit_rtol),
             fit_patience=opts.get("fit_patience", self.fit_patience),
@@ -1287,6 +1296,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_max_bond=_INHERIT_FIT_OPTION,
         fit_sweep_sequence=_INHERIT_FIT_OPTION,
         fit_cutoff_mode=_INHERIT_FIT_OPTION,
+        fit_compression_opts=_INHERIT_FIT_OPTION,
         fit_min_iter=_INHERIT_FIT_OPTION,
         fit_rtol=_INHERIT_FIT_OPTION,
         fit_patience=_INHERIT_FIT_OPTION,
@@ -1399,6 +1409,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 fit_sweep_sequence,
                 self.fit_sweep_sequence,
             ),
+            fit_compression_opts=_resolve_fit_option(fit_compression_opts, self.fit_compression_opts),
             fit_cutoff_mode=_resolve_fit_option(
                 fit_cutoff_mode,
                 self.fit_cutoff_mode,
@@ -2320,6 +2331,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "fit_sweep_sequence": self.fit_sweep_sequence,
             "fit_cutoff": self.fit_cutoff,
             "fit_cutoff_mode": self.fit_cutoff_mode,
+            "fit_compression_opts": deepcopy(self.fit_compression_opts),
             "fit_min_iter": self.fit_min_iter,
             "fit_rtol": self.fit_rtol,
             "fit_patience": self.fit_patience,

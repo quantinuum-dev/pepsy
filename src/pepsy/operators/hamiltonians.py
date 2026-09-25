@@ -20,7 +20,7 @@ from .._internal.formatting import (
     is_xy_sublattice_site,
     resolve_color_mode,
 )
-from ..tensors.core import OneDMap
+from ..tensors.maps import OneDMap
 from ..tensors.bonds import new_native_bond
 from ._structural_compression import (
     _structural_compress_mpo,

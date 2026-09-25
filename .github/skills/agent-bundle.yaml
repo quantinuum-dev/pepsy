@@ -15,9 +15,9 @@ agent:
 references:
   - AGENTS.md
   - README.md
+  - CONTRIBUTING.md
   - pyproject.toml
   - docs/development/package_layout.md
-  - docs/development/notes/symmray.md
   - .github/skills/SKILL_POLICY.md
   - .github/skills/README.md
 
@@ -28,7 +28,7 @@ skills:
   - name: pepsy-maintainer
     path: .github/skills/pepsy-maintainer
     role: router
-    upload: [SKILL.md]
+    upload: [SKILL.md, references/**]
   - name: mps-optimizer
     path: .github/skills/mps-optimizer
     role: core

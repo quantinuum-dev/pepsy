@@ -1,5 +1,6 @@
 """Boundary-MPS sweep utilities for approximate 2D tensor-network contraction."""
 
+from pepsy._internal.quimb import quimb_compression_options, quimb_1d_compression_cutoff_mode
 from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Integral
@@ -195,6 +196,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         fit_sweep_sequence="RL",
         fit_cutoff="auto",
         fit_cutoff_mode="auto",
+        fit_compression_opts=None,
         fit_min_iter=None,
         fit_rtol=None,
         fit_patience=1,
@@ -211,6 +213,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # Validate at construction time rather than after an expensive PEPS
         # boundary has already reached its first local fit.
         self.fit_mode = _canonical_fit_mode_selector(fit_mode)
+        self.fit_compression_opts = quimb_compression_options(self.fit_mode, fit_compression_opts)
         self.fit_layer_mode = _canonical_fit_layer_mode(fit_layer_mode)
         self.fit_layer_order = _canonical_fit_layer_order(fit_layer_order)
         if (
@@ -701,17 +704,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         }:
             compress_kwargs["seed"] = self.fit_init_seed
         if method not in {"src", "srcmps"}:
-            cutoff_mode = self.fit_cutoff_mode
-            # Quimb's randomized ``sdcr`` split only supports absolute or
-            # relative cutoffs, whereas the shared boundary default is the
-            # cumulative ``rsum2`` policy. Keep the public default usable by
-            # selecting the equivalent scale-relative policy for this mode.
-            if method == "sdcr" and cutoff_mode not in {"abs", "rel"}:
-                cutoff_mode = "rel"
+            cutoff_mode = quimb_1d_compression_cutoff_mode(method, self.fit_cutoff_mode)
             compress_kwargs["cutoff_mode"] = cutoff_mode
         # Quimb owns the non-inplace result when ``inplace=False``. Avoid an
         # extra full target copy here: ``tn`` is a disposable local target and
         # the compressor's public ownership contract already protects it.
+        compress_kwargs.update(deepcopy(self.fit_compression_opts))
         return qtn.tensor_network_1d_compress(tn, **compress_kwargs)
 
     def _compress_boundary(  # pylint: disable=too-many-locals

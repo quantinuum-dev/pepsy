@@ -10,13 +10,11 @@ import quimb.tensor as qtn
 from ...backends import to_float
 
 
-def single_pauli_probabilities(tensor, physical, pauli, *, to_backend):
+def single_pauli_probabilities(tensor, physical, pauli, *, control_tensor):
     """Project a normalized canonical tensor before squaring amplitudes."""
     weights = []
     for sign in (1, -1):
-        projector = to_backend(
-            0.5 * (np.eye(2) + sign * pauli)
-        )
+        projector = 0.5 * (control_tensor("I") + sign * control_tensor(pauli))
         amplitude = tensor.gate(projector, physical).norm()
         weights.append(float(abs(to_float(amplitude, real=True))) ** 2)
     total = sum(weights)
@@ -26,22 +24,15 @@ def single_pauli_probabilities(tensor, physical, pauli, *, to_backend):
 
 
 def product_pauli_probabilities(state, axes, where, snodes, order, hub, scale,
-                                *, to_backend):
+                                *, control_tensor):
     """Carry parity through lossless QR messages on a canonical active tree.
 
     The caller validates dense qubits and prepares the hub gauge. Numerical
     messages are local to this call; physical site order is independent of
     the tree peel order. The represented exponent cancels from both weights.
     """
-    hadamard = np.array([[1., 1.], [1., -1.]]) / np.sqrt(2.)
-    copy_data = np.zeros((2, 2, 2), dtype=complex)
-    copy_data[0, 0, 0] = copy_data[1, 1, 1] = 1.
-    xor_data = np.zeros((2, 2, 2), dtype=complex)
-    for a in (0, 1):
-        for b in (0, 1):
-            xor_data[a, b, a ^ b] = 1.
-    copy_data = to_backend(copy_data)
-    xor_data = to_backend(xor_data)
+    copy_data = control_tensor("COPY")
+    xor_data = control_tensor("XOR")
     target_axes = dict(zip(where, axes))
     local, parity = {}, {}
     for nid in snodes:
@@ -53,8 +44,8 @@ def product_pauli_probabilities(state, axes, where, snodes, order, hub, scale,
             physical = state.site_ind(q)
             axis = target_axes[q]
             if axis != "Z":
-                rotation = hadamard if axis == "X" else hadamard @ np.diag([1., -1j])
-                tensor = tensor.gate(to_backend(rotation), physical)
+                rotation = control_tensor("H" if axis == "X" else "HY")
+                tensor = tensor.gate(rotation, physical)
             bit, out = qtn.rand_uuid(), qtn.rand_uuid()
             tensor = qtn.tensor_contract(
                 tensor, qtn.Tensor(copy_data, inds=(out, physical, bit)),

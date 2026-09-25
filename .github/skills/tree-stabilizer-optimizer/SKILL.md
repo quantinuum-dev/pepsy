@@ -99,8 +99,8 @@ For shared trajectory or public API changes, also run the corresponding MPS
 STN and package-layout tests.
 
 ```bash
-source ~/envs/py312/bin/activate
-cd /home/reza.haghshenas@quantinuum.com/pepsy
+# Activate the environment selected by AGENTS.md and any local override.
+# Run from the Pepsy repository root.
 NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig \
   PYTHONPYCACHEPREFIX=/tmp pytest -q -o addopts='' \
   tests/test_optimize_tree_stabilizer.py

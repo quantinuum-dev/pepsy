@@ -6,6 +6,7 @@ import inspect
 import math
 from functools import lru_cache
 
+from ..._internal.quimb import call_quimb_2d, quimb_2d_options
 from ...backends.convert import resolve_backend_sample_data_from_tn
 from ..._internal.cutoff import dtype_auto_cutoff
 
@@ -447,8 +448,7 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
 
         envs = _call_with_accepted_kwargs(
             compute_fn,
-            envs={},
-            **self._compute_kwargs(tn=tn, progress=progress),
+            **quimb_2d_options(compute_fn, dict(envs={}, **self._compute_kwargs(tn=tn, progress=progress))),
         )
         self.clear(axis)
         self.envs.update(envs)
@@ -634,7 +634,8 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
         opts = self._compute_kwargs()
         opts.pop("dense", None)
         opts.pop("envs", None)
-        getattr(pair, f"contract_boundary_from_{direction}_")(
+        call_quimb_2d(
+            getattr(pair, f"contract_boundary_from_{direction}_"),
             xrange=xrange,
             yrange=yrange,
             **opts,

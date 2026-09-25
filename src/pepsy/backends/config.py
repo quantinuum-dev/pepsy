@@ -228,7 +228,7 @@ def get_torch_linalg_config():
     return _ACTIVE_TORCH_LINALG_CONFIG
 
 def _patch_unhashable_device_namespace_key():
-    """Patch autoray namespace cache keys for unhashable backend device objects."""
+    """Bypass broken legacy namespace caching without changing device objects."""
     try:
         import autoray  # pylint: disable=import-outside-toplevel
         import autoray.autoray as ar_core  # pylint: disable=import-outside-toplevel
@@ -238,28 +238,37 @@ def _patch_unhashable_device_namespace_key():
     if getattr(ar_core, "_pepsy_unhashable_device_patch", False):
         return
 
-    original_get_namespace = ar_core.get_namespace
+    original_get_namespace = getattr(ar_core, "get_namespace", None)
+    if original_get_namespace is None:
+        return
+
+    # Only the namespace cache key is exercised; no arrays are allocated.
+    # Modern Autoray normalizes unhashable keys while preserving the device.
+    try:
+        original_get_namespace(like="numpy", device=[])
+    except TypeError:
+        pass
+    else:
+        return
 
     def _safe_get_namespace(like=None, device=None, dtype=None, submodule=None):
-        if (device is None) and (like is not None) and (not isinstance(like, str)):
+        try:
+            return original_get_namespace(
+                like=like, device=device, dtype=dtype, submodule=submodule,
+            )
+        except TypeError:
+            inferred_device = device
+            if inferred_device is None and like is not None and not isinstance(like, str):
+                inferred_device = getattr(like, "device", None)
             try:
-                device = like.device
-            except AttributeError:
-                device = None
-
-        if device is not None:
-            try:
-                hash(device)
+                hash(inferred_device)
             except TypeError:
-                dev_id = getattr(device, "id", None)
-                device = f"device:{dev_id}" if dev_id is not None else str(device)
-
-        return original_get_namespace(
-            like=like,
-            device=device,
-            dtype=dtype,
-            submodule=submodule,
-        )
+                # Use Autoray's public namespace class without its old cache.
+                # A string cache key must never become the creation device.
+                return ar_core.AutoNamespace(
+                    like=like, device=device, dtype=dtype, submodule=submodule,
+                )
+            raise
 
     ar_core.get_namespace = _safe_get_namespace
     autoray.get_namespace = _safe_get_namespace

@@ -22,6 +22,11 @@ _MODULES = {
 __all__ = tuple(_MODULES)
 
 
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
+
+
 def __getattr__(name):
     """Load an advanced domain only when explicitly requested."""
     target = _MODULES.get(name)

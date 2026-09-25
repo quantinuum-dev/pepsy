@@ -10,7 +10,9 @@ only where the quimb API requires a common layout.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import copy
 import inspect
+from types import MethodType
 
 import autoray as ar
 import numpy as np
@@ -41,6 +43,72 @@ def is_symmray_array(value) -> bool:
         getattr(cls, "__module__", "").startswith("symmray")
         or (hasattr(value, "blocks") and hasattr(value, "indices"))
     )
+
+
+_D2BP_MESSAGE_PROBE = None
+
+
+def d2bp_uses_fermionic_operators():
+    """Probe the installed D2BP message convention, including both dualities."""
+    global _D2BP_MESSAGE_PROBE
+    import quimb.tensor as qtn
+    from quimb.tensor.belief_propagation import D2BP
+
+    getter = getattr(D2BP, "get_message", None)
+    if not callable(getter):
+        return False
+    if _D2BP_MESSAGE_PROBE is not None and _D2BP_MESSAGE_PROBE[0] is getter:
+        return _D2BP_MESSAGE_PROBE[1]
+    import symmray as sr
+
+    if not hasattr(sr.Z2FermionicArray, "gram"):
+        return False
+    index = sr.BlockIndex({0: 1, 1: 1})
+    array = sr.Z2FermionicArray(
+        indices=(index, index.conj()), charge=0,
+        blocks={(0, 0): np.asarray([[1.0]]), (1, 1): np.asarray([[2.0]])},
+    )
+    tn = qtn.TensorNetwork([
+        qtn.Tensor(array, inds=("b", "p0")),
+        qtn.Tensor(array.copy(), inds=("p1", "b")),
+    ])
+    bp = D2BP(tn, optimize="greedy")
+    supported = all(
+        bp.messages["b", tid].allclose(expected / expected.norm())
+        for tid, expected in ((0, array.gram(1)), (1, array.gram(0)))
+    )
+    _D2BP_MESSAGE_PROBE = (getter, supported)
+    return supported
+
+
+def fermionic_operator_to_matrix(message):
+    """Convert a positive fermionic message to ordinary block-matrix form.
+
+    A dual first leg needs the parity metric removed before ordinary block
+    eigensolvers can interpret positivity. Keep the array native and apply
+    all pending phases on a copy.
+    """
+    if hasattr(message, "phase_sync"):
+        if message.indices[0].dual:
+            message = message.phase_flip(0)
+        message = message.phase_sync()
+    return message
+
+
+def projector_bra(bp, tid):
+    """Use physical-leg conjugation for Pepsy's explicit bond projectors."""
+    if bp.tn.isfermionic() and d2bp_uses_fermionic_operators():
+        return bp.tn.tensor_map[tid].conj(
+            output_inds=bp.output_inds
+        ).reindex(bp.index_dual_map)
+    return bp.tensor_dual_map[tid]
+
+
+def projector_message(message):
+    """Read an operator message in the explicit projector's matrix convention."""
+    if hasattr(message, "phase_sync") and d2bp_uses_fermionic_operators():
+        return fermionic_operator_to_matrix(message)
+    return message
 
 
 _SAFE_INVERSE_PROBE = None
@@ -397,6 +465,63 @@ def align_d2bp_messages(bp) -> None:
             aligned.fill_missing_blocks()
             bp.messages[index, message_tid] = aligned
 
+    _ensure_fermionic_pair_normalization(bp)
+
+
+def _fermionic_message_overlap(left, right):
+    """Contract one raw message against the opposite positive operator."""
+    return left.phase_flip(0).tensordot(right, axes=((0, 1), (0, 1)))
+
+
+def _normalize_fermionic_message_pairs(bp):
+    """Normalize positive fermionic pairs using their graded scalar overlap."""
+    for index, tids in bp.tn.ind_map.items():
+        if len(tids) != 2:
+            continue
+        a, b = tids
+        left, right = bp.messages[index, a], bp.messages[index, b]
+        overlap = ar.do("sqrt", ar.do("abs", _fermionic_message_overlap(left, right)))
+        ln = ar.do("sqrt", left.norm())
+        rn = ar.do("sqrt", right.norm())
+        bp.messages[index, a] = left / (overlap * ln / rn)
+        bp.messages[index, b] = right / (overlap * rn / ln)
+    # Assignment through the public setter invalidates conditioned copies.
+    bp.messages = dict(bp.messages)
+
+
+def _ensure_fermionic_pair_normalization(bp):
+    """Repair only instances whose upstream pair normalizer loses grading."""
+    if getattr(bp, "_pepsy_pair_normalization_checked", False):
+        return
+    if not bp.tn.isfermionic() or not d2bp_uses_fermionic_operators():
+        return
+    if not all(hasattr(m, "phase_flip") for m in bp.messages.values()):
+        return
+
+    # Exercise the actual callable on a private snapshot, without normalizing
+    # the live solver as a side effect. A future corrected Quimb is untouched.
+    trial = copy.copy(bp)
+    trial._messages_conditioned = {}
+    trial.messages = {key: value.copy() for key, value in bp.messages.items()}
+    supported = True
+    try:
+        bp.normalize_message_pairs.__func__(trial)
+        for index, tids in trial.tn.ind_map.items():
+            if len(tids) != 2:
+                continue
+            a, b = tids
+            overlap = _fermionic_message_overlap(
+                trial.messages[index, a], trial.messages[index, b]
+            )
+            if not np.allclose(ar.to_numpy(overlap), 1.0):
+                supported = False
+                break
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        supported = False
+    if not supported:
+        bp.normalize_message_pairs = MethodType(_normalize_fermionic_message_pairs, bp)
+    bp._pepsy_pair_normalization_checked = True
+
 
 def _bond_endpoint_data(tn, index):
     """Return endpoint data and their live Symmray bond indices."""
@@ -489,8 +614,8 @@ def rank_one_d2_projector(
     tn, index, left_message, right_message, *, layout="pne"
 ):
     """Construct a D2 rank-one projector, native when ``tn`` is Symmray."""
-    left = to_dense(left_message).reshape(-1)
-    right = to_dense(right_message).reshape(-1)
+    left = to_dense(projector_message(left_message)).reshape(-1)
+    right = to_dense(projector_message(right_message)).reshape(-1)
     return rank4_operator_from_dense(
         tn, index, np.outer(left, right), layout=layout
     )

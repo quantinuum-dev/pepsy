@@ -62,7 +62,7 @@ def test_compressed_optimizer_builds_without_cotengrust(monkeypatch):
 
 
 def test_subprocess_build_without_acceleration_modules():
-    """The installed core path works when both acceleration modules are absent."""
+    """The core path searches and contracts without acceleration modules."""
     script = """
 import importlib.abc
 import importlib.util
@@ -91,14 +91,27 @@ class BlockAccelerationModules(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockAccelerationModules())
 from pepsy.tensors.contractions import build_optimizer
+import numpy as np
+import quimb.tensor as qtn
 
 optimizer = build_optimizer(
-    max_time=0,
-    max_repeats=1,
+    max_time=None,
+    max_repeats=4,
     parallel=False,
     progbar=False,
 )
 assert type(optimizer).__name__ == "ReusableHyperOptimizer"
+arrays = [np.arange(6.0).reshape(2, 3), np.arange(12.0).reshape(3, 4),
+          np.arange(8.0).reshape(4, 2)]
+tn = qtn.TensorNetwork([
+    qtn.Tensor(array, inds=inds)
+    for array, inds in zip(arrays, [("a", "b"), ("b", "c"), ("c", "a")])
+])
+expected = np.einsum("ab,bc,ca->", *arrays)
+np.testing.assert_allclose(tn.contract(all, optimize=optimizer), expected)
+np.testing.assert_allclose(tn.contract(all, optimize=optimizer), expected)
+assert "cmaes" not in sys.modules
+assert "cotengrust" not in sys.modules
 """
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")

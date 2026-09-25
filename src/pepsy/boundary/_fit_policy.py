@@ -82,6 +82,7 @@ _FIT_POLICY_KEYS = frozenset(
         "fit_max_bond",
         "fit_sweep_sequence",
         "fit_cutoff_mode",
+        "fit_compression_opts",
         "fit_min_iter",
         "fit_rtol",
         "fit_patience",

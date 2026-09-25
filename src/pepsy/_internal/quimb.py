@@ -9,6 +9,11 @@ detected when used, without making import-time compatibility more fragile.
 from __future__ import annotations
 
 import inspect
+import math
+import warnings
+from collections.abc import Mapping
+from copy import deepcopy
+from numbers import Integral, Real
 
 import quimb.tensor as qtn
 
@@ -52,8 +57,7 @@ def _signature_parameters(function):
         return {}, False
     parameters = signature.parameters
     accepts_kwargs = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
     return parameters, accepts_kwargs
 
@@ -70,6 +74,130 @@ def quimb_filter_options(function, options):
     if accepts_kwargs:
         return dict(options)
     return {key: value for key, value in options.items() if key in parameters}
+
+
+def quimb_2d_options(function, options):
+    """Translate the 2D compression keyword without changing route or policy."""
+    options = dict(options)
+    parameters, _ = _signature_parameters(function)
+    policy_function = function
+    if "method" not in parameters and "mode" not in parameters:
+        owner = getattr(function, "__self__", None)
+        policy_function = getattr(owner, "contract_boundary", function)
+    modern = quimb_callable_option_supported(policy_function, "method")
+    if modern and "mode" in options:
+        mode = options.pop("mode")
+        if "method" in options:
+            if mode == "full-bond":
+                options.setdefault("similarity_method", options.pop("method"))
+            elif options["method"] != mode and mode is not None:
+                raise ValueError("Conflicting boundary compression mode and method.")
+        options.setdefault("method", mode)
+    elif not modern and "method" in options and options.get("mode") != "full-bond":
+        method = options.pop("method")
+        if "mode" in options and options["mode"] != method:
+            raise ValueError("Conflicting boundary compression mode and method.")
+        options["mode"] = method
+    if options.get("route") is not None and not quimb_callable_option_supported(function, "route"):
+        if options["route"] != "boundary":
+            raise NotImplementedError(
+                "This Quimb build does not support the requested measurement route."
+            )
+        options.pop("route")
+    elif options.get("route", False) is None:
+        options.pop("route")
+    return options
+
+
+def call_quimb_2d(function, *args, **options):
+    """Call a 2D boundary API with its installed keyword convention."""
+    return function(*args, **quimb_2d_options(function, options))
+
+
+def quimb_compression_options(method, options):
+    """Validate explicitly requested intermediate/final 1D compression options.
+
+    A catch-all ``**kwargs`` is not evidence of support: older compressors can
+    leak unknown options into contraction or linear-algebra calls.
+    """
+    if options is None:
+        return {}
+    if not isinstance(options, Mapping):
+        raise TypeError("compression_opts must be a mapping or None.")
+    allowed = {
+        "max_bond_oversample",
+        "cutoff_oversample",
+        "cutoff_mode_oversample",
+        "compress_opts_final",
+    }
+    unknown = set(options) - allowed
+    if unknown:
+        raise ValueError(f"Unknown compression_opts: {sorted(unknown)}")
+    result = deepcopy(dict(options))
+    function = quimb_1d_compression_function(method)
+    for key, value in result.items():
+        if not quimb_callable_option_supported(function, key):
+            raise NotImplementedError(
+                f"Quimb compressor {method!r} does not explicitly support {key!r}."
+            )
+        if key == "max_bond_oversample":
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+                raise ValueError("max_bond_oversample must be a positive integer.")
+        elif key == "cutoff_oversample":
+            if value == "auto":
+                parameters, _ = _signature_parameters(function)
+                if parameters[key].default != "auto":
+                    raise ValueError(f"{method!r} requires a numeric cutoff_oversample.")
+            if value != "auto" and (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError("cutoff_oversample must be finite and non-negative or 'auto'.")
+        elif key == "cutoff_mode_oversample":
+            if value not in {1, 2, 3, 4, 5, 6, "abs", "rel", "sum1", "sum2", "rsum1", "rsum2"}:
+                raise ValueError("Invalid cutoff_mode_oversample.")
+            if method == "sdcr-oversample" and value not in {1, 2, "abs", "rel"}:
+                raise ValueError("SDCR intermediate compression requires an abs or rel cutoff.")
+        elif not isinstance(value, Mapping):
+            raise TypeError("compress_opts_final must be a mapping.")
+        else:
+            unknown_final = set(value) - {"method", "cutoff", "cutoff_mode"}
+            if unknown_final:
+                raise ValueError(
+                    "compress_opts_final accepts method, cutoff, and cutoff_mode; "
+                    "the final bond cap is controlled by chi/fit_max_bond."
+                )
+            final_method = value.get("method", "svd")
+            if final_method not in {"svd", "svd:eig", "rsvd"}:
+                raise ValueError("Final compression method must be svd, svd:eig, or rsvd.")
+            if final_method == "rsvd" and value.get("cutoff_mode") not in {1, 2, "abs", "rel"}:
+                raise ValueError("Final rsvd requires an explicit abs or rel cutoff_mode.")
+            final_cutoff = value.get("cutoff", 0.0)
+            if (
+                isinstance(final_cutoff, bool)
+                or not isinstance(final_cutoff, Real)
+                or not math.isfinite(final_cutoff)
+                or final_cutoff < 0
+            ):
+                raise ValueError("Final cutoff must be finite and non-negative.")
+            if value.get("cutoff_mode", "rsum2") not in {
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                "abs",
+                "rel",
+                "sum1",
+                "sum2",
+                "rsum1",
+                "rsum2",
+            }:
+                raise ValueError("Invalid final cutoff_mode.")
+    return result
 
 
 def quimb_bp_class(method):
@@ -90,8 +218,7 @@ def quimb_bp_class(method):
         return getattr(belief_propagation, class_name)
     except AttributeError as exc:
         raise NotImplementedError(
-            f"The installed Quimb build does not provide belief-propagation "
-            f"class {class_name}."
+            f"The installed Quimb build does not provide belief-propagation class {class_name}."
         ) from exc
 
 
@@ -104,9 +231,7 @@ def quimb_bp_constructor_option_supported(method, option):
 
 def quimb_bp_constructor_options(method, options):
     """Forward only constructor-safe options for a Quimb BP class."""
-    return quimb_filter_options(
-        getattr(quimb_bp_class(method), "__init__", None), options
-    )
+    return quimb_filter_options(getattr(quimb_bp_class(method), "__init__", None), options)
 
 
 def quimb_bp_run_options(bp, options):
@@ -120,8 +245,7 @@ def quimb_gloop_options(options):
     parameters, accepts_kwargs = _signature_parameters(function)
     if function is None:
         raise NotImplementedError(
-            "The installed Quimb build does not provide "
-            "TensorNetwork.gen_gloops()."
+            "The installed Quimb build does not provide TensorNetwork.gen_gloops()."
         )
 
     if not accepts_kwargs:
@@ -135,17 +259,13 @@ def quimb_gloop_options(options):
     return dict(options)
 
 
-def quimb_process_loop_series_expansion_weights(
-    weights, *, num_tensors, **options
-):
+def quimb_process_loop_series_expansion_weights(weights, *, num_tensors, **options):
     """Call Quimb's loop-series weight processor across API revisions."""
     from quimb.tensor.belief_propagation.bp_common import (
         process_loop_series_expansion_weights,
     )
 
-    parameters, accepts_kwargs = _signature_parameters(
-        process_loop_series_expansion_weights
-    )
+    parameters, accepts_kwargs = _signature_parameters(process_loop_series_expansion_weights)
     if accepts_kwargs or "num_tensors" in parameters:
         options = {"num_tensors": num_tensors, **options}
     return process_loop_series_expansion_weights(weights, **options)
@@ -179,9 +299,7 @@ def quimb_1d_compression_function(method):
         return function
 
     dispatcher = getattr(qtn, "tensor_network_1d_compress", None)
-    methods = getattr(dispatcher, "__globals__", {}).get(
-        "_TN1D_COMPRESS_METHODS", {}
-    )
+    methods = getattr(dispatcher, "__globals__", {}).get("_TN1D_COMPRESS_METHODS", {})
     return methods.get(method) if hasattr(methods, "get") else None
 
 
@@ -230,6 +348,12 @@ def quimb_1d_compression_cutoff_mode(method, cutoff_mode):
         "rsum1",
         "rsum2",
     }:
+        warnings.warn(
+            f"Quimb sdcr uses cutoff_mode='rel' instead of {cutoff_mode!r}; "
+            "use sdcr-oversample for an independent cumulative final cutoff.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return "rel"
     return cutoff_mode
 
@@ -255,12 +379,8 @@ def _quimb_ag_compression_function(method):
         return function
 
     dispatcher = getattr(qtn, "tensor_network_1d_compress", None)
-    ag_dispatcher = getattr(dispatcher, "__globals__", {}).get(
-        "tensor_network_ag_compress"
-    )
-    methods = getattr(ag_dispatcher, "__globals__", {}).get(
-        "_TNAG_COMPRESS_METHODS", {}
-    )
+    ag_dispatcher = getattr(dispatcher, "__globals__", {}).get("tensor_network_ag_compress")
+    methods = getattr(ag_dispatcher, "__globals__", {}).get("_TNAG_COMPRESS_METHODS", {})
     return methods.get(method) if hasattr(methods, "get") else None
 
 

@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = [
   "numpy>=1.24",
   "quimb>=1.8",
-  "cotengra>=0.6",
+  "cotengra>=0.8.0",
   "autoray>=0.6",
   "tqdm>=4.65",
 ]
@@ -31,7 +31,7 @@ viz = ["matplotlib>=3.7"]
 layout = ["nevergrad>=1.0"]
 mpi = ["mpi4py>=3"]
 guppy = ["guppylang>=1.0,<2"]
-symmetry = ["symmray>=0.1"]
+symmetry = ["symmray>=0.4.0"]
 stabilizer = ["stim>=1.12"]
 dev = [
   "pytest>=8",
@@ -49,17 +49,12 @@ docs = [
   "sphinx-autoapi>=3.8",
 ]
 test-extended = [
-  "matplotlib>=3.7",
-  "nevergrad>=1.0",
-  "nlopt>=2.7",
-  "scipy>=1.10",
-  "stim>=1.12",
-  "symmray>=0.1",
-  "torch>=2.0",
+  "pepsy[layout,solvers,stabilizer,symmetry,torch,viz]",
 ]
-vmc-torch = ["torch>=2.0"]
-vmc-netket = ["jax>=0.4", "flax>=0.8", "optax>=0.2", "netket>=3.10", "symmray>=0.1"]
-vmc = ["torch>=2.0", "jax>=0.4", "flax>=0.8", "optax>=0.2", "netket>=3.10", "symmray>=0.1"]
+# Compose feature profiles so each dependency constraint has one owner.
+vmc-torch = ["pepsy[torch]"]
+vmc-netket = ["jax>=0.4", "flax>=0.8", "optax>=0.2", "netket>=3.10", "pepsy[symmetry]"]
+vmc = ["pepsy[vmc-torch,vmc-netket]"]
 
 [tool.setuptools]
 include-package-data = true

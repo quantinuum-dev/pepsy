@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  agent-guidance:
+    name: Agent guidance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate skill catalog
+        run: python .github/skills/pepsy-maintainer/scripts/validate_catalog.py
+
   test:
     strategy:
       fail-fast: false
@@ -141,6 +155,16 @@ jobs:
           "$smoke_dir/venv/bin/pip" install dist/*.whl
           "$smoke_dir/venv/bin/python" -c \
             "import pepsy; import pepsy.backends, pepsy.boundary, pepsy.fitting, pepsy.interop, pepsy.solvers, pepsy.tensors"
+          "$smoke_dir/venv/bin/python" -I - <<'PY'
+          import numpy as np
+          from pepsy.operators import x
+          from pepsy.tensors import ps_to_mps, tn_norm
+
+          state = ps_to_mps(2)
+          state.gate_(x(), 0, contract=True)
+          np.testing.assert_allclose(state.to_dense().reshape(-1), [0, 0, 1, 0])
+          np.testing.assert_allclose(tn_norm(state, contraction_opt="greedy"), 1.0)
+          PY
           "$smoke_dir/venv/bin/python" -X importtime -c "import pepsy" 2> "$smoke_dir/importtime.txt"
           tail -n 1 "$smoke_dir/importtime.txt"
 

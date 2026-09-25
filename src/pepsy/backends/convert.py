@@ -18,6 +18,12 @@ _NUMPY_DTYPE_MAP = {
 }
 
 
+def _array_namespace(like):
+    """Use Autoray's cached early dispatch, with a late-dispatch fallback."""
+    factory = getattr(ar, "get_namespace", None)
+    return factory(like=like) if callable(factory) else ar.numpy
+
+
 def _backend_scalar(value):
     """Return a Python scalar from scalar-like backend values."""
     shape = getattr(value, "shape", None)

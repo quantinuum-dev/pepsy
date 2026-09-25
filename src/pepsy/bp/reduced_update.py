@@ -3255,12 +3255,12 @@ def _warm_start_core_from_physical_tn(physical_tn, gauges):
                 # Autoray has no generic ``ones`` rule for Symmray.  Build a
                 # charge-preserving block vector in the bond's native charge
                 # layout instead of densifying the warm-start gauge.
-                from .gauges import _symmray_block_vector
+                from .gauges import _symmray_block_vector, _symmray_bond_chargemap
 
                 gauge = _symmray_block_vector(
                     physical_tn,
                     index,
-                    np.ones(physical_tn.ind_size(index)),
+                    np.ones(sum(_symmray_bond_chargemap(physical_tn, index).values())),
                 )
             else:
                 gauge = _ones(physical_tn.ind_size(index), like=sample)

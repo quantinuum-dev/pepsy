@@ -256,6 +256,22 @@ while TreeOptimizer applies the coefficient update on the inferred backend.
 Stim and trajectory-generated matrices are converted by the library before
 they enter this user-stream boundary.
 
+Named coefficient rotations and Pauli sums are constructed on the state
+backend through Autoray. Exact cooling also keeps the leaf matrix on that
+backend: one thin SVD supplies its candidate vector and rank test, followed
+by backend Bloch reductions. Only the Boolean rank decision and three Bloch
+values cross to the CPU tableau. The cooling algorithm remains enabled by
+default and preserves its existing tolerance and canonicalization rules.
+
+The coefficient tree retains norm/log-fidelity scalars on-device during
+ordinary replay. Public diagnostics/readout and explicit extracted-exponent
+bookkeeping materialize host scalars. Profiling, FIT finite/overlap checks,
+and spectrum/bond diagnostics remain off by default. MPI shot replay now
+also defaults to `collect_diagnostics=False`. Measurement decisions, dense
+physical gate classification, native QR safety, and upstream rank selection
+can still synchronize; explicit reporting/injection runners retain their
+existing timing reports.
+
 TreeStab's `norm_diagnostics()` keeps two coefficient-state diagnostics
 separate. `local_fidelity` and `cumulative_fidelity` are cheap
 canonical-centre compression metrics measured from retained norms, controlled by

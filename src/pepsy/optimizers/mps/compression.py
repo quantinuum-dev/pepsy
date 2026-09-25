@@ -1,7 +1,8 @@
-"""MPS compression backends.
+"""Reserved MPS compression module; no implementation is extracted here.
 
-Extraction target for DMRG, MPO, swap, SVD, and exact compression logic now
-implemented on :class:`pepsy.optimizers.mps.optimizer.MpsOptimizer`.
+Current DMRG, MPO, swap, SVD, and exact compression logic lives on
+:class:`pepsy.optimizers.mps.optimizer.MpsOptimizer`. This empty import path
+is retained for compatibility, not as an instruction to move that logic.
 """
 
 __all__ = []

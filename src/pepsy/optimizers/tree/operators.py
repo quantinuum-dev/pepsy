@@ -30,6 +30,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import infer_backend_signature
 from ...operators._structural_compression import _structural_compress_tree
 from .layout import TreeLayoutFinder, TreePlan
 from ._display import ascii_lattice, ascii_tree
@@ -670,6 +671,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         weighted_terms,
         *,
         dtype=complex,
+        like=None,
         site_tag_id="I{}",
         upper_ind_id="k{}",
         lower_ind_id="b{}",
@@ -685,11 +687,14 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
         exterior identities, while ``SubTreeMPO.from_pauli_sum`` omits them
         and makes identity outside the active region implicit. Neither form
         constructs a ``2**n`` dense matrix or a chain MPO.
+        ``like`` optionally selects a dense array backend, device, and dtype
+        for constructing the operator directly on the execution device.
         """
         network, support = _pauli_sum_tree_operator(
             plan,
             weighted_terms,
             dtype=dtype,
+            like=like,
             site_tag_id=site_tag_id,
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
@@ -777,7 +782,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             dims = tuple(int(dim) for dim in dims)
         if len(dims) != len(sites):
             raise ValueError("dims must have one entry per TreePlan site.")
-        if np.prod(dims, dtype=int) ** 2 != np.size(array):
+        if np.prod(dims, dtype=int) ** 2 != ar.size(array):
             raise ValueError("array size does not match the supplied physical dims.")
         network = _tree_operator_from_dense(
             plan,
@@ -2639,7 +2644,9 @@ def _operator_native_channels(
 def _operator_dense_channels(operator, support, *, dtype=None, cutoff=1e-12):
     """Split one ordinary dense two-site term into local channels."""
     support = tuple(sorted(int(site) for site in support))
-    data = _dense_operator_array(operator, dtype=dtype)
+    # The explicit combined-Hamiltonian automaton is assembled on the host.
+    # Ordinary gate replay uses the backend-preserving term TTNO below.
+    data = _as_numpy(_dense_operator_array(operator), dtype=dtype)
     if data.ndim != 4 or data.shape[0] != data.shape[1] or data.shape[0] != data.shape[2]:
         raise ValueError("dense two-site operators must have shape (d, d, d, d).")
     if data.shape[2] != data.shape[3]:
@@ -2720,7 +2727,7 @@ def _combined_tree_operator(
             raise ValueError(f"operator support {support!r} is outside the TreePlan.")
         if len(support) == 1:
             data = (
-                _dense_operator_array(term, dtype=dtype)
+                _as_numpy(_dense_operator_array(term), dtype=dtype)
                 if not fermionic else _as_numpy(term.to_dense(), dtype=dtype)
             )
             if data.ndim != 2 or data.shape[0] != data.shape[1]:
@@ -3311,6 +3318,7 @@ def _pauli_sum_tree_operator(
     weighted_terms,
     *,
     dtype=complex,
+    like=None,
     site_tag_id="I{}",
     upper_ind_id="k{}",
     lower_ind_id="b{}",
@@ -3375,12 +3383,22 @@ def _pauli_sum_tree_operator(
         if neighbor in active_nodes
     }
     rank = len(terms)
-    dtype = np.dtype(dtype or complex)
-    identity = np.eye(2, dtype=dtype)
-    paulis = {
-        axis: np.asarray(pauli_matrix(axis), dtype=dtype)
-        for axis in ("X", "Y", "Z")
-    }
+    dtype = np.dtype(ar.get_dtype_name(like) if like is not None else dtype or complex)
+    on_device = like is not None and ar.infer_backend(like) != "numpy"
+    if on_device:
+        identity = ar.do("eye", 2, like=like)
+        one = ar.do("ones", (), like=like)
+        x = ar.do("flip", identity, 0)
+        z = ar.do("diag", ar.do("stack", (one, -one)))
+        paulis = {"X": x, "Z": z, "Y": 1j * ar.do("matmul", x, z)}
+        branch_vectors = ar.do("eye", rank, like=like) if active_edges else None
+        unit_vector = ar.do("ones", (1,), like=like)
+    else:
+        identity = np.eye(2, dtype=dtype)
+        paulis = {
+            axis: np.asarray(pauli_matrix(axis), dtype=dtype)
+            for axis in ("X", "Y", "Z")
+        }
 
     def edge_name(node, neighbor):
         return f"_pepsy_tnno_{min(node, neighbor)}_{max(node, neighbor)}"
@@ -3397,7 +3415,22 @@ def _pauli_sum_tree_operator(
             *((f"k{qubit}", f"b{qubit}") if qubit is not None else ()),
             *(edge_name(node, neighbor) for neighbor in neighbors),
         ]
-        if node not in active_nodes:
+        if on_device:
+            if node not in active_nodes:
+                local = one if qubit is None else identity
+                data = ar.do("reshape", local, ar.shape(local) + (1,) * len(neighbors))
+            else:
+                data = None
+                for branch, (weight, mapping) in enumerate(terms):
+                    local = one if qubit is None else paulis.get(mapping.get(qubit), identity)
+                    if node == anchor:
+                        local = weight * local
+                    for neighbor in neighbors:
+                        active_edge = frozenset((node, neighbor)) in active_edges
+                        basis = branch_vectors[branch] if active_edge else unit_vector
+                        local = ar.do("tensordot", local, basis, axes=0)
+                    data = local if data is None else data + local
+        elif node not in active_nodes:
             shape = list((2, 2) if qubit is not None else ())
             shape.extend(1 for _ in neighbors)
             data = np.zeros(tuple(shape), dtype=dtype)
@@ -4659,7 +4692,9 @@ def _dense_operator_array(operator, *, dtype=None):
         # Backend arrays expose ``.data`` too, but for CuPy that is the raw
         # MemoryPointer rather than an array that Autoray can convert.
         operator = operator.data
-    return _as_numpy(operator, dtype=dtype)
+    if not hasattr(operator, "shape"):
+        operator = np.asarray(operator)
+    return operator if dtype is None else ar.astype(operator, np.dtype(dtype).name)
 
 
 def _dense_tree_tensor_network_for_term(plan, operator, support, *, dtype=None):
@@ -4687,7 +4722,7 @@ def _dense_tree_tensor_network_for_term(plan, operator, support, *, dtype=None):
         + [f"I{site}" for site in support],
     )]
     support_set = set(support)
-    identity = np.eye(physical_dim, dtype=data.dtype)
+    identity = ar.do("eye", physical_dim, like=data)
     for site in sorted(plan.node_of_qubit):
         if site in support_set:
             continue
@@ -4729,7 +4764,7 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=Fa
         )
     if raw_support != ordered_support:
         order = tuple(sorted(range(rank), key=raw_support.__getitem__))
-        data = data.transpose((*order, *(axis + rank for axis in order)))
+        data = ar.do("transpose", data, (*order, *(axis + rank for axis in order)))
     output_dims = tuple(int(size) for size in data.shape[:rank])
     input_dims = tuple(int(size) for size in data.shape[rank:])
     if output_dims != input_dims:
@@ -4743,7 +4778,7 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=Fa
         f"_pepsy_dense_term_phys_{qtn.rand_uuid()}_{site}"
         for site in ordered_support
     )
-    real_dtype = np.empty((), dtype=data.dtype).real.dtype
+    real_dtype = np.empty((), dtype=ar.get_dtype_name(data)).real.dtype
     if not np.issubdtype(real_dtype, np.inexact):
         real_dtype = np.dtype(float)
     # ``cutoff=0`` in Quimb deliberately retains numerical zero singular
@@ -4752,9 +4787,9 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=Fa
     # information is retained. Remove only machine-precision null sectors;
     # user-requested TreeMPO compression remains a separate later sweep.
     structural_cutoff = 64.0 * np.finfo(real_dtype).eps
-    interleaved = data.transpose(
+    interleaved = ar.do("reshape", ar.do("transpose", data,
         [axis for site in range(rank) for axis in (site, rank + site)]
-    ).reshape(tuple(dim * dim for dim in output_dims))
+    ), tuple(dim * dim for dim in output_dims))
     blob = qtn.Tensor(interleaved, inds=packed_inds)
     site_nodes = tuple(plan.node_of_qubit[site] for site in ordered_support)
     active_nodes = {site_nodes[0]}
@@ -4806,7 +4841,7 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=Fa
             neighbors = tuple(v for v in neighbors if v in active_nodes)
         if node in factors:
             factor = factors[node]
-            tensor_data = np.asarray(ar.to_numpy(factor.data), dtype=dtype)
+            tensor_data = factor.data
             inds = [bond_names.get(index, index) for index in factor.inds]
             if qubit in physical_dims:
                 packed = packed_inds[ordered_support.index(qubit)]
@@ -4818,17 +4853,14 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=Fa
                 inds[axis:axis + 1] = [f"k{qubit}", f"b{qubit}"]
             elif qubit is not None:
                 dim = output_dims[0] if output_dims else 2
-                tensor_data = np.einsum(
-                    "ab,...->ab...",
-                    np.eye(dim, dtype=tensor_data.dtype),
-                    tensor_data,
-                )
+                tensor_data = ar.do("tensordot",
+                    ar.do("eye", dim, like=tensor_data), tensor_data, axes=0)
                 inds = [f"k{qubit}", f"b{qubit}"] + inds
             existing = set(inds)
             for neighbor in neighbors:
                 edge = edge_name(node, neighbor)
                 if edge not in existing:
-                    tensor_data = np.expand_dims(tensor_data, axis=-1)
+                    tensor_data = ar.do("expand_dims", tensor_data, axis=-1)
                     inds.append(edge)
                     existing.add(edge)
             desired = [
@@ -4846,13 +4878,10 @@ def _dense_tree_term_tnno(plan, operator, support, *, dtype=None, active_only=Fa
             for neighbor in neighbors:
                 dims.append(1)
                 inds.append(edge_name(node, neighbor))
-            tensor_data = np.zeros(tuple(dims), dtype=dtype or data.dtype)
             if qubit is None:
-                tensor_data[...] = 1.0
+                tensor_data = ar.do("ones", tuple(dims), like=data)
             else:
-                tensor_data[(slice(None), slice(None)) + (0,) * len(neighbors)] = (
-                    np.eye(dims[0], dtype=tensor_data.dtype)
-                )
+                tensor_data = ar.do("reshape", ar.do("eye", dims[0], like=data), tuple(dims))
             tensor = qtn.Tensor(tensor_data, inds=inds)
         tensor.add_tag(f"N{node}")
         if qubit is not None:
@@ -4887,11 +4916,6 @@ def _direct_sum_dense_tnno(networks, plan, *, dtype=None):
     def edge_name(node, neighbor):
         return edge_names[(min(node, neighbor), max(node, neighbor))]
 
-    edge_sizes = {
-        index: sum(network.ind_size(index) for network in networks)
-        for index in edge_names.values()
-    }
-    offsets = {edge: 0 for edge in edge_names.values()}
     tensors = []
     for node in plan.nodes():
         neighbors = _tree_plan_neighbors(plan, node)
@@ -4901,31 +4925,25 @@ def _direct_sum_dense_tnno(networks, plan, *, dtype=None):
             *((f"k{qubit}", f"b{qubit}") if qubit is not None else ()),
             *(edge_name(node, neighbor) for neighbor in neighbors),
         ]
-        shape = []
-        if qubit is not None:
-            shape.extend((reference.ind_size(f"k{qubit}"), reference.ind_size(f"b{qubit}")))
-        shape.extend(edge_sizes[edge_name(node, neighbor)] for neighbor in neighbors)
-        data = np.zeros(tuple(shape), dtype=dtype or np.asarray(ar.to_numpy(reference.data)).dtype)
+        signature = infer_backend_signature(reference.data)
+        target_dtype = np.dtype(dtype).name if dtype is not None else ar.get_dtype_name(reference.data)
+        combined = None
         for network in networks:
             tensor = network[f"N{node}"].transpose(*desired)
-            local = np.asarray(ar.to_numpy(tensor.data), dtype=data.dtype)
-            slices = []
-            if qubit is not None:
-                slices.extend((slice(None), slice(None)))
-            for neighbor in neighbors:
-                edge = edge_name(node, neighbor)
-                start = offsets[edge]
-                stop = start + network.ind_size(edge)
-                slices.append(slice(start, stop))
-            data[tuple(slices)] += local
-            for neighbor in neighbors:
-                edge = edge_name(node, neighbor)
-                offsets[edge] += network.ind_size(edge)
-        # The per-edge offsets must restart for each node; use cumulative
-        # offsets only inside this tensor construction.
-        for edge in offsets:
-            offsets[edge] = 0
-        tensors.append(qtn.Tensor(data, inds=desired, tags=[f"N{node}"] + (
+            candidate = infer_backend_signature(tensor.data)
+            if candidate[0] != signature[0] or candidate[2] != signature[2]:
+                raise ValueError("Dense TreeMPO terms must share an array backend and device.")
+            local = ar.astype(tensor.data, target_dtype)
+            if combined is None:
+                combined = qtn.Tensor(ar.do("copy", local), inds=desired)
+            else:
+                # Quimb implements the block sum with Autoray padding. This
+                # preserves the device and also works with immutable JAX arrays.
+                combined.direct_product_(
+                    qtn.Tensor(local, inds=desired),
+                    sum_inds=(f"k{qubit}", f"b{qubit}") if qubit is not None else (),
+                )
+        tensors.append(qtn.Tensor(combined.data, inds=desired, tags=[f"N{node}"] + (
             [f"I{qubit}"] if qubit is not None else []
         )))
     network = qtn.TensorNetwork(tensors)

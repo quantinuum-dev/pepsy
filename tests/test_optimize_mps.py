@@ -4815,6 +4815,7 @@ def test_mps_optimizer_native_guess_src_uses_sector_preserving_randomized_guess(
         fit_rtol=None,
         cutoff=1.0e-12,
         fit_init_seed=23,
+        cutoff_mode="rel",
         stabilize_unitary=False,
         **run_kwargs,
     )

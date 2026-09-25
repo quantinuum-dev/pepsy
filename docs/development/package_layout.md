@@ -1,11 +1,11 @@
-# Package Layout Migration
+# Package layout and imports
 
 The package uses responsibility-based namespaces. Implementations live under
 these namespaces, and the obsolete flat module paths were removed in 0.4.
 Top-level convenience symbols such as `pepsy.SweepOptimizer` and `pepsy.rx`
 still work, but new submodule imports should use the canonical layout.
 
-## Target Namespaces
+## Namespace ownership
 
 ```text
 pepsy.backends      backend selection, conversion, and linalg registration
@@ -14,11 +14,12 @@ pepsy.operators     gates, gate application, MPO/PEPO builders, Hamiltonians
 pepsy.boundary      boundary-MPS states, sweeps, metrics
 pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
+pepsy.interop       adapters for external circuit and tensor-network representations
 pepsy.optimizers    high-level MPS, MPO, PEPS, sweep, and global optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
 pepsy.vmc           optional Torch and NetKet/JAX VMC adapters
 pepsy.bp            belief propagation, loop expansions, and PNE methods
-pepsy.experimental  explicit lazy entry points for advanced domains
+pepsy.experimental  lazy discovery facade for existing advanced domains
 pepsy._internal     private formatting and utility helpers
 ```
 
@@ -38,8 +39,9 @@ from pepsy.tensors import (
     ps_to_ttn,
 )
 
-# Optional or advanced domains can be made explicit at the call site.
-from pepsy.experimental import bp, symmetry, vmc
+# Import advanced functionality from its owning namespace too.
+import pepsy.bp as bp
+from pepsy.tensors import SymMPS
 from pepsy.vmc import TorchVMCDriver
 ```
 
@@ -56,17 +58,29 @@ imports from `pepsy.optimizers`; use leaf paths such as
 `pepsy.optimizers.mps.optimizer` only for implementation-level tests or
 internal development.
 
-## Migration Order
+Within implementations, import simple helpers from their owning modules:
+`OneDMap` from `tensors.maps`, state constructors from `tensors.constructors`,
+and backend configuration from `backends.config`. The gate, Hamiltonian, and
+boundary-state modules follow these paths without loading `tensors.core`.
+That compatibility aggregator still contains wrappers for contraction and
+fidelity with historical patch hooks. Audit those hooks before migrating
+remaining wrapper callers; a blanket import replacement can change behavior.
+
+## Maintenance boundaries
 
 1. Keep new packages green with public API tests.
 2. Keep backend conversion and tensor validation under the new namespaces.
 3. Keep the boundary subsystem together: states, sweeps, metrics.
 4. Keep optimizer implementations under `pepsy.optimizers`.
-5. Split `pepsy.tensors.core` into maps, constructors, contractions, and observables.
+5. Keep tensor implementations in maps, constructors, contractions, and
+   observables; `pepsy.tensors.core` remains a compatibility aggregator.
 6. Keep standard gate primitives separate from routing and tensor-network application.
-7. Keep optional/advanced integrations behind `pepsy.experimental` and lazy imports.
+7. Keep public namespace discovery lazy. `pepsy.experimental` provides
+   additional discovery paths, not separate implementations. Optional
+   dependencies do not determine stability; follow the [stability policy](../stability.md).
 
-After each phase, run:
+For changes to imports or ownership, run the public API and package-layout
+checks. Include boundary and gate checks when those behaviors change:
 
 ```bash
 pytest -q tests/test_public_api.py

@@ -37,7 +37,6 @@ canonicalisation, bond compression, tensor splitting, tree path finding) uses
 from __future__ import annotations
 
 import contextlib
-import functools
 import heapq
 from copy import deepcopy
 from collections import Counter
@@ -89,7 +88,7 @@ from .layout import (
 from ._application import (
     _same_tree_plan, operator_local_tensors, peel_order, plan_operator_application,
 )
-from ._diagnostics import norm_event, summarize_update, truncation_event
+from ._diagnostics import diagnostic_to_host, norm_event, summarize_update, truncation_event
 from ._readout import product_pauli_probabilities, single_pauli_probabilities
 from ._policy import (
     COPY_SETTINGS,
@@ -330,6 +329,15 @@ _PAULI_1Q = {
     "X": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
     "Y": np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex),
     "Z": np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
+}
+
+_CONTROL_TENSORS = {
+    **_PAULI_1Q,
+    "I": np.eye(2, dtype=complex),
+    "H": np.array([[1., 1.], [1., -1.]], dtype=complex) / np.sqrt(2.),
+    "HY": np.array([[1., -1j], [1., 1j]], dtype=complex) / np.sqrt(2.),
+    "COPY": np.array([[[1., 0.], [0., 0.]], [[0., 0.], [0., 1.]]], dtype=complex),
+    "XOR": np.array([[[1., 0.], [0., 1.]], [[0., 1.], [1., 0.]]], dtype=complex),
 }
 _RESET_FLIP_AXES = {"X": "Z", "Y": "X", "Z": "X"}
 _DEFAULT_CUTOFF = "auto"
@@ -1107,6 +1115,7 @@ class TreeOptimizer:
         self.track_bond_diagnostics = bool(track_bond_diagnostics)
         self.profile_events = []
         self.measurements = []
+        self._control_tensor_cache = None
         self.truncation_history = []
         self.update_history = []
         self.bond_history = []
@@ -1497,7 +1506,7 @@ class TreeOptimizer:
     def _cumulative_fidelity(self):
         """Return the cumulative retained-norm fidelity for display."""
 
-        return float(fidelity_from_log(self._norm_log_survival))
+        return fidelity_from_log(to_float(self._norm_log_survival, real=True))
 
     def _phys(self, q):
         return self.tn.site_ind(q)
@@ -1579,11 +1588,11 @@ class TreeOptimizer:
         callers can keep data transfer and dtype promotion under their control.
         """
         like = self._state_like()
-        state_info = self.backend_info()
         target_signature = _array_backend_signature(like)
         source_signature = _array_backend_signature(array)
         if source_signature == target_signature:
             return array
+        state_info = self.backend_info()
         # Python sequences/scalars are ordinary convenience inputs rather than
         # a selected numerical backend. Materialize those silently; explicit
         # array backends/dtypes still receive the transfer/cast warning.
@@ -1608,6 +1617,16 @@ class TreeOptimizer:
                 array.copy(), warn=False
             )
         return self._as_state_backend(array, warn=False)
+
+    def _control_tensor(self, name):
+        """Return an owned fixed control tensor on the live device and dtype."""
+        signature = _array_backend_signature(self._state_like())
+        cache = self._control_tensor_cache
+        if cache is None or cache[0] != signature:
+            cache = self._control_tensor_cache = (signature, {})
+        if name not in cache[1]:
+            cache[1][name] = self._as_state_backend(_CONTROL_TENSORS[name], warn=False)
+        return ar.do("copy", cache[1][name])
 
     def _validate_gate_stream_backend(
         self, payloads, event_types, *, path_prefix="stream", paths=None,
@@ -2351,7 +2370,7 @@ class TreeOptimizer:
             default=0.0,
         )
         update_runtime = float(sum(
-            update.get("elapsed_seconds", 0.0)
+            update.get("elapsed_seconds") or 0.0
             for update in trial.update_history
         ))
         return {
@@ -2716,7 +2735,7 @@ class TreeOptimizer:
             "support": tuple(int(q) for q in where),
             "update": update_index,
             "edge_start": len(self.truncation_history),
-            "started_at": time.perf_counter(),
+            "started_at": time.perf_counter() if self.profile else None,
             "live_max_bond_before": live_before,
             "transient_max_bond": live_before,
             "bond_trace": [],
@@ -2732,7 +2751,7 @@ class TreeOptimizer:
             and self._norm_tracking_enabled
             and str(kind) in {"gate", "subtree", "submpo", "subtreempo"}
         ):
-            self._active_update["norm_before"] = float(self.norm())
+            self._active_update["norm_before"] = self._ledger_norm()
         return True
 
     def _record_transient_bond(self, dimension, *, phase, edge=None):
@@ -2765,7 +2784,7 @@ class TreeOptimizer:
         if not active.get("track_norm", True) or active.get("norm_before") is None:
             return
         self._norm_log_survival, event = norm_event(
-            active, float(self.norm()), self._norm_log_survival,
+            active, self._ledger_norm(), self._norm_log_survival,
         )
         self.norm_events.append(event)
 
@@ -2774,7 +2793,10 @@ class TreeOptimizer:
         active = self._active_update
         if active is None:
             return
-        elapsed = time.perf_counter() - active["started_at"]
+        elapsed = (
+            None if active["started_at"] is None
+            else time.perf_counter() - active["started_at"]
+        )
         live_after = (
             int(self.tn.max_bond())
             if self.track_bond_diagnostics else None
@@ -3058,7 +3080,7 @@ class TreeOptimizer:
         target_norm_available = bool(track_norm and self._norm_tracking_enabled)
         norm_pair = (
             None if represented_norm is None
-            else (float(represented_norm), 0.0)
+            else (represented_norm, 0.0)
         )
         fit_rtol = (
             None
@@ -3395,7 +3417,7 @@ class TreeOptimizer:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Replay a tree stream through local or MPI shot orchestration."""
@@ -3413,7 +3435,7 @@ class TreeOptimizer:
             resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
         ):
             raise ValueError(
@@ -3583,7 +3605,7 @@ class TreeOptimizer:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
         retain="all",
     ):
@@ -3743,7 +3765,7 @@ class TreeOptimizer:
             or resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
             or progress != "auto"
         )
@@ -4149,11 +4171,7 @@ class TreeOptimizer:
         else:
             if tuple(ar.shape(gate)) != (d, d):
                 gate = ar.do("reshape", gate, (d, d))
-            gate_np = ar.to_numpy(gate)
-            unitary = np.allclose(
-                gate_np.conj().T @ gate_np, np.eye(d, dtype=gate_np.dtype),
-                rtol=1e-10, atol=1e-12,
-            )
+            unitary = self._is_unitary_matrix(gate, rtol=1e-10, atol=1e-12)
         if self._active_update is not None:
             # A direct one-site call can be non-unitary. Do not report its
             # physical scale change as retained compression loss.
@@ -5714,6 +5732,16 @@ class TreeOptimizer:
                 self.normalize()
         return result
 
+    @staticmethod
+    def _is_unitary_matrix(matrix, *, rtol=0., atol=1e-12):
+        """Certify on the source device, reading only the final Boolean."""
+        adjoint = ar.do("transpose", ar.do("conj", matrix))
+        gram = ar.do("matmul", adjoint, matrix)
+        identity = ar.do("eye", ar.shape(matrix)[0], like=matrix)
+        # Torch allclose returns a Python bool, while JAX/CuPy reduce to a
+        # backend scalar. Both retain the full matrix on its device.
+        return bool(to_float(ar.do("allclose", gram, identity, rtol=rtol, atol=atol), real=True))
+
     def _apply_compact_one_site_unitary(self, operator, application, *, cutoff=None,
                                         max_bond=None, track_norm=True):
         """Absorb a certified local unitary without changing the state gauge.
@@ -5737,15 +5765,14 @@ class TreeOptimizer:
         if _is_symmray_array(gate):
             if getattr(gate, "parity", 0):
                 return False
-            matrix = ar.to_numpy(gate.to_dense())
+            matrix = gate.to_dense()
         else:
-            matrix = ar.to_numpy(gate)
+            matrix = gate
         # The certification tolerance follows arithmetic precision, not the
         # user's truncation cutoff (which can be arbitrarily loose).
-        real_dtype = np.result_type(matrix.real.dtype, np.float32)
+        real_dtype = np.result_type(ar.get_dtype_name(ar.do("real", matrix)), np.float32)
         tolerance = 8 * np.finfo(real_dtype).eps
-        if not np.allclose(matrix.conj().T @ matrix, np.eye(matrix.shape[0]),
-                           rtol=0., atol=tolerance):
+        if not self._is_unitary_matrix(matrix, atol=tolerance):
             return False
         region = self.tn.canonical_region
         left_inds = self.tn.node_tensor(node).left_inds
@@ -6300,6 +6327,7 @@ class TreeOptimizer:
             self.plan,
             [(c, {}), (coef, terms)],
             dtype=self.dtype,
+            like=self._state_like(),
         )
         return self.apply_sub_mpotree(
             tree_mpo,
@@ -6357,6 +6385,7 @@ class TreeOptimizer:
             self.plan,
             resolved_terms,
             dtype=self.dtype,
+            like=self._state_like(),
         )
         return self.apply_sub_mpotree(
             tree_mpo,
@@ -6891,7 +6920,7 @@ class TreeOptimizer:
             numerator = bra_num & ket
             for axis, p in zip(axes, phys):
                 numerator = numerator & qtn.Tensor(
-                    self._as_state_backend(_PAULI_1Q[axis], warn=False),
+                    self._control_tensor(axis),
                     inds=(p + "*", p),
                 )
             num = numerator.contract(output_inds=[])
@@ -6921,16 +6950,15 @@ class TreeOptimizer:
         scale = self._working_norm()
         if scale <= 0.0 or not np.isfinite(scale):
             raise ValueError("Measurement requires a finite nonzero working norm.")
-        to_backend = functools.partial(self._as_state_backend, warn=False)
         if len(where) == 1:
             return single_pauli_probabilities(
                 self.tn.node_tensor(hub) / scale, self._phys(where[0]),
-                _PAULI_1Q[axes[0]], to_backend=to_backend,
+                axes[0], control_tensor=self._control_tensor,
             )
         with self._thread_ctx():
             return product_pauli_probabilities(
                 self.tn, axes, where, snodes, order, hub, scale,
-                to_backend=to_backend,
+                control_tensor=self._control_tensor,
             )
 
     @staticmethod
@@ -7266,7 +7294,7 @@ class TreeOptimizer:
             "max_discarded_weight": max_discarded,
             "max_discarded_fraction": max_fraction,
             "events": events,
-            "updates": deepcopy(self.update_history),
+            "updates": diagnostic_to_host(self.update_history),
         }
 
     def to_dense(self, logical_order=True):
@@ -7342,22 +7370,42 @@ class TreeOptimizer:
         restore Quimb's extracted base-10 ``tn.exponent``; full contractions
         already include it.
         """
+        squared, scale = self._norm_components_backend()
+        return float(np.sqrt(abs(to_float(squared, real=True)))) * scale
+
+    def _ledger_norm(self):
+        # Preserve Python-double exponent range on JAX without x64 and Metal.
+        # Explicit extracted-scale bookkeeping remains a host boundary, as it
+        # is for non-unitary normalization. Ordinary unitary replay has scale 1.
+        if float(getattr(self.tn, "exponent", 0.0)) != 0.0:
+            return self.norm()
+        value = self._norm_backend()
+        return value if ar.infer_backend(value) == "builtins" else ar.do("stop_gradient", value)
+
+    def _norm_backend(self):
+        """Compute the represented norm without materializing a host scalar."""
+        squared, scale = self._norm_components_backend()
+        if ar.infer_backend(squared) in {"numpy", "builtins"}:
+            return float(np.sqrt(abs(to_float(squared, real=True)))) * scale
+        return ar.do("sqrt", ar.do("abs", ar.do("real", squared))) * scale
+
+    def _norm_components_backend(self):
+        """Return a backend norm square and its separate host scale factor."""
         center = self.center
         if self.tn.fermionic:
             with self._thread_ctx():
                 val = self.tn._fermionic_center_norm_squared()
-            nrm = float(np.sqrt(abs(to_float(val, real=True))))
-            if center is not None:
-                nrm *= self._represented_scale()
-            return nrm
+            val = val.data if isinstance(val, qtn.Tensor) else val
+            return val, self._represented_scale() if center is not None else 1.0
         if center is not None:
             t = self.tn.tensor_map[self._tid(center)]
             val = qtn.tensor_contract(t.H, t, output_inds=[])
-            nrm = float(np.sqrt(abs(to_float(val, real=True))))
-            return nrm * self._represented_scale()
+            val = val.data if isinstance(val, qtn.Tensor) else val
+            return val, self._represented_scale()
         with self._thread_ctx():
             val = (self.tn.H & self.tn).contract(output_inds=[])
-        return float(np.sqrt(abs(to_float(val, real=True))))
+        val = val.data if isinstance(val, qtn.Tensor) else val
+        return val, 1.0
 
     def _represented_scale(self):
         """Return Quimb's extracted global base-10 state scale."""
@@ -7520,7 +7568,7 @@ class TreeOptimizer:
         if outcome < 0:
             flip = _RESET_FLIP_AXES[axis]
             self.apply_1q(
-                self._as_state_backend(_PAULI_1Q[flip], warn=False), q
+                self._control_tensor(flip), q
             )
 
     def _apply_control_event(self, name, payload, where):
@@ -7597,9 +7645,7 @@ class TreeOptimizer:
                 )
                 if outcome < 0:
                     self.apply_1q(
-                        self._as_state_backend(
-                            _PAULI_1Q[_RESET_FLIP_AXES[axis]], warn=False
-                        ),
+                        self._control_tensor(_RESET_FLIP_AXES[axis]),
                         q,
                     )
             return self
@@ -7642,8 +7688,7 @@ class TreeOptimizer:
                     raise ValueError(
                         f"forced measure outcome {outcome} has zero probability."
                     )
-            proj = np.zeros((2, 2), dtype=complex)
-            proj[outcome, outcome] = 1.0
+            proj = 0.5 * (self._control_tensor("I") + (1 - 2 * outcome) * self._control_tensor("Z"))
             # Public updates resolve logical labels themselves. Passing the
             # compact position would resolve it twice after a stable-label cap.
             # Projection probability is physical loss, not compression error.
@@ -7903,7 +7948,7 @@ class TreeOptimizer:
         Each event represents the complete gate/subtree path update, whereas
         :meth:`truncation_report` contains optional per-edge spectrum data.
         """
-        return deepcopy(self.norm_events)
+        return diagnostic_to_host(self.norm_events)
 
     def norm_diagnostics(self):
         """Return canonical norm-based compression diagnostics.
@@ -7920,17 +7965,17 @@ class TreeOptimizer:
         ``cumulative_norm`` is instead the square root of
         ``cumulative_fidelity`` and is only a retained-compression proxy.
         """
-        valid = [event for event in self.norm_events if event.get("valid")]
+        valid = [event for event in self.get_norm_events() if event.get("valid")]
         current = valid[-1] if valid else None
         cumulative_fidelity = (
             None
             if not valid
-            else fidelity_from_log(self._norm_log_survival)
+            else fidelity_from_log(to_float(self._norm_log_survival, real=True))
         )
         cumulative_infidelity = (
             None
             if cumulative_fidelity is None
-            else infidelity_from_log(self._norm_log_survival)
+            else infidelity_from_log(to_float(self._norm_log_survival, real=True))
         )
         state_norm = float(self.norm())
         return {
@@ -7996,7 +8041,7 @@ class TreeOptimizer:
     def get_fit_diagnostics(self):
         """Return diagnostics for the latest completed update, or None outside FIT."""
 
-        return None if self.mode != "dmrg" or self._last_fit_diagnostics is None else deepcopy(
+        return None if self.mode != "dmrg" or self._last_fit_diagnostics is None else diagnostic_to_host(
             self._last_fit_diagnostics
         )
 

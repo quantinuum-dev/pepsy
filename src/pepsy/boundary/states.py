@@ -8,7 +8,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ._lattice import infer_lattice_shape
-from ..tensors.core import backend_numpy, get_default_array_backend
+from ..backends.config import backend_numpy, get_default_array_backend
 from .._internal.formatting import (
     ansi_wrap,
     colorize_symbols,

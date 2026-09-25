@@ -2,7 +2,7 @@
 
 ## Source map
 
-Use the checkout at `/Users/rezah/Documents/pepsy`.
+Resolve source paths from the current Pepsy repository root.
 
 - Direct sampler: `src/pepsy/sampling/samplers.py`, class `PepsSampler`.
 - Existing BP sampler: the neighboring class `PepsBpSampler` in the same file.
@@ -15,11 +15,8 @@ Use the checkout at `/Users/rezah/Documents/pepsy`.
 - Design plan: `docs/development/plans/peps_sampler.md`.
 - Reference tests: `tests/test_peps_sampler.py`.
 
-Before Python, tests, or package commands, run:
-
-```bash
-source /Users/rezah/envs/genpy/bin/activate
-```
+Before Python, tests, or package commands, activate the environment selected
+by `AGENTS.md` and any local override.
 
 ## Phase 1: current serial reference path
 

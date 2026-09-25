@@ -1,5 +1,12 @@
 # `pepsy.optimizers.energy`
 
+PEPS boundary energies adapt to Quimb's installed `method`/`mode` API and use
+exact operator-inserted contractions on single-row or single-column states.
+This path preserves the selected Boolean normalization and backend gradients.
+An explicit measurement `route` can be supplied through `compute_kwargs`;
+the default remains boundary contraction. Select a compatible compressor with
+`boundary_mode`, for example `boundary_mode="direct"` with `route="envs"`.
+
 
 > API details are maintained as handwritten Markdown in this page.
 

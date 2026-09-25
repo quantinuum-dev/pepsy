@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pepsy._internal.quimb import call_quimb_2d
 from dataclasses import dataclass
 import math
 from numbers import Integral
@@ -5750,7 +5751,8 @@ class PepsBpSampler:
                 "optimize": optimizer,
                 "strip_exponent": True,
             }
-            result = tn_flat.contract_boundary(
+            result = call_quimb_2d(
+                tn_flat.contract_boundary,
                 max_bond=int(chi),
                 mode="mps",
                 final_contract_opts=opts,
@@ -5762,7 +5764,8 @@ class PepsBpSampler:
             )
             if not scaled_is_finite(result):
                 opts["strip_exponent"] = False
-                result = tn_flat.contract_boundary(
+                result = call_quimb_2d(
+                    tn_flat.contract_boundary,
                     max_bond=int(chi),
                     mode="mps",
                     final_contract_opts=opts,
@@ -5779,7 +5782,8 @@ class PepsBpSampler:
                 "optimize": optimizer,
                 "strip_exponent": True,
             }
-            result = tn_flat.contract_ctmrg(
+            result = call_quimb_2d(
+                tn_flat.contract_ctmrg,
                 max_bond=int(chi),
                 final_contract_opts=opts,
                 max_separation=max_separation,
@@ -5790,7 +5794,8 @@ class PepsBpSampler:
             )
             if not scaled_is_finite(result):
                 opts["strip_exponent"] = False
-                result = tn_flat.contract_ctmrg(
+                result = call_quimb_2d(
+                    tn_flat.contract_ctmrg,
                     max_bond=int(chi),
                     final_contract_opts=opts,
                     max_separation=max_separation,

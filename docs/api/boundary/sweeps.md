@@ -1,5 +1,10 @@
 # `pepsy.boundary.sweeps`
 
+Direct Quimb boundary modes accept `fit_compression_opts` to separate
+intermediate oversampling from final truncation. The same policy passes
+through boundary metrics and PEPS optimizers; see
+[compression stages](compression.md).
+
 `CompBdy(..., fit_mode="dmrg2")` fits the complete boundary interval with
 `FIT.run_gate(block_size=2)`, using two-site warm-up sweeps followed by
 one-site refinement. The legacy `fit_mode="two-site"` remains fixed

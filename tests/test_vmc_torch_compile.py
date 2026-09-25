@@ -3,6 +3,38 @@
 import pytest
 
 
+@pytest.mark.integration
+def test_flat_z2_truncated_boundary_vmap_preserves_values_and_gradients():
+    """Batched flat-array truncation must execute vmap and preserve gradients."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+    from pepsy.vmc.netket import fermionic_peps_rand
+    from pepsy.vmc.torch import TorchPEPSAmplitude
+
+    peps = fermionic_peps_rand(
+        "Z2", 3, 3, 4, seed=403, dtype="float64", flat=True,
+    )
+    configs = torch.randint(
+        4, (8, 9), generator=torch.Generator().manual_seed(52),
+    )
+    outputs, gradients = {}, {}
+    for mode in ("serial", "vmap"):
+        model = TorchPEPSAmplitude(
+            peps, contraction="boundary", chi=4, cutoff=0.0,
+            dtype=torch.float64, amplitude_batching=mode,
+        )
+        outputs[mode] = model.forward(configs, params=list(model.params))
+        assert model.last_amplitude_batching == mode
+        gradients[mode] = torch.autograd.grad(
+            outputs[mode].abs().square().sum(), list(model.params),
+        )
+    assert torch.count_nonzero(outputs["serial"]) > 0
+    torch.testing.assert_close(outputs["vmap"], outputs["serial"])
+    for actual, expected in zip(gradients["vmap"], gradients["serial"]):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=1e-9, rtol=1e-7)
+
+
 @pytest.mark.smoke
 def test_export_compile_matches_eager_and_keeps_parameter_gradients():
     """Export/vmap/compile must preserve values, logs, and derivatives."""

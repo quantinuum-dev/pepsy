@@ -148,6 +148,7 @@ def test_mps_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
     assert isinstance(result, pepsy.MPIShotResult)
     assert len(result.local_result.optimizers) == 3
     assert optimizer.measurements == []
+    assert result.rank_diagnostics == ()
 
 
 def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
@@ -181,6 +182,7 @@ def test_tree_optimizer_run_mpi_keyword_is_fresh_and_seeded():
     assert len(result.local_result.optimizers) == 3
     assert len(optimizer.G) == 1
     assert optimizer._dmrg_mode_alias == "dmrg2"
+    assert result.rank_diagnostics == ()
     assert optimizer.compression_mode == "direct"
     assert optimizer.compression_seed is None and optimizer.track_infidelity
     assert optimizer.rng.bit_generator.state == rng_state
@@ -207,6 +209,7 @@ def test_tree_stabilizer_run_mpi_keyword_is_fresh_and_seeded():
     assert result.local_shots == 3
     assert len(result.local_result.optimizers) == 3
     assert len(optimizer._queue) == 1
+    assert result.rank_diagnostics == ()
 
 
 @pytest.mark.parametrize("shots", [True, 1.0])

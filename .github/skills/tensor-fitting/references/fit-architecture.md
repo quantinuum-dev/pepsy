@@ -178,7 +178,7 @@ reference, not merely for finite values.
 
 ## Focused validation commands
 
-Run with `source /Users/rezah/envs/genpy/bin/activate` first.
+First activate the environment selected by `AGENTS.md` and any local override.
 
 ```bash
 python -m pytest -q -m '' tests/test_optimize_mps.py

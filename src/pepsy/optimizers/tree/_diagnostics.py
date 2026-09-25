@@ -6,9 +6,66 @@ values and records only. They never contract a state or probe a spectrum.
 
 from copy import deepcopy
 
+import autoray as ar
 import numpy as np
 
+from ...backends import to_float
+from ...backends.convert import _array_namespace
 from .._fidelity import fidelity_from_log, infidelity_from_log, log_fidelity_from_norms
+
+
+def diagnostic_to_host(value):
+    """Materialize detached scalar diagnostics at an explicit readout boundary."""
+    if isinstance(value, dict):
+        result = {key: diagnostic_to_host(item) for key, item in value.items()}
+        if not result.pop("_raw_valid", True):
+            result["fidelity_raw"] = None
+        return result
+    if isinstance(value, (list, tuple)):
+        return type(value)(diagnostic_to_host(item) for item in value)
+    if getattr(value, "shape", None) == ():
+        return to_float(value, real=True)
+    return deepcopy(value)
+
+
+def _backend_norm_event(active, observed, log_survival):
+    """Use the tree's existing zero/NaN policy without per-update host reads."""
+    xp = _array_namespace(observed)
+    observed = xp.stop_gradient(observed)
+    expected = active["norm_before"]
+    backend = ar.infer_backend(observed)
+    expected = xp.stop_gradient(expected)
+    if backend in {"torch", "cupy"}:
+        device_type = getattr(getattr(observed, "device", None), "type", None)
+        dtype = "float32" if device_type == "mps" else "float64"
+        expected, observed = ar.astype(expected, dtype), ar.astype(observed, dtype)
+    if ar.infer_backend(log_survival) != backend:
+        log_survival = ar.do("full_like", observed, to_float(log_survival, real=True))
+    finite = xp.logical_and(xp.isfinite(expected), xp.isfinite(observed))
+    safe_expected = xp.where(expected > 0., expected, 1.)
+    safe_observed = xp.where(observed > 0., observed, 1.)
+    log_local = xp.clip(2. * (xp.log(safe_observed) - xp.log(safe_expected)), None, 0.)
+    log_local = xp.where(finite, log_local, xp.where(observed > expected, 0., -np.inf))
+    log_local = xp.where(observed == expected, 0., log_local)
+    invalid = xp.logical_or(observed <= 0., xp.logical_or(xp.isnan(observed), xp.isnan(expected)))
+    log_local = xp.where(invalid, -np.inf, log_local)
+    log_local = xp.where(expected <= 0., xp.where(observed <= 0., 0., -np.inf), log_local)
+    complete_loss = xp.logical_or(log_survival == -np.inf, log_local == -np.inf)
+    log_survival = xp.where(complete_loss, -np.inf, log_survival + log_local)
+    cumulative = xp.exp(log_survival)
+    loss = -xp.expm1(log_survival)
+    return log_survival, {
+        "step": int(active["update"]), "kind": active["kind"],
+        "where": tuple(active["support"]), "valid": True,
+        "expected_norm": xp.abs(expected), "observed_norm": xp.abs(observed),
+        "fidelity_raw": (observed / safe_expected) ** 2,
+        "_raw_valid": xp.logical_and(finite, expected > 0.),
+        "local_fidelity": xp.exp(log_local),
+        "local_infidelity": -xp.expm1(log_local),
+        "cumulative_fidelity": cumulative, "cumulative_infidelity": loss,
+        "cumulative_compression_fidelity": cumulative,
+        "cumulative_compression_infidelity": loss,
+    }
 
 
 def norm_event(active, observed, log_survival):
@@ -16,6 +73,16 @@ def norm_event(active, observed, log_survival):
     expected = active.get("norm_before")
     if expected is None:
         return log_survival, None
+    backend = ar.infer_backend(observed)
+    if backend in {"torch", "jax", "cupy"} and ar.infer_backend(expected) == backend:
+        return _backend_norm_event(active, observed, log_survival)
+    # An operator can introduce or cancel an extracted exponent mid-update.
+    # In that case one norm is a host double and the other a device scalar.
+    # Keep this explicit scale boundary on the host: casting the former to a
+    # float32 device scalar can overflow or underflow its represented norm.
+    expected = to_float(expected, real=True)
+    observed = to_float(observed, real=True)
+    log_survival = to_float(log_survival, real=True)
     log_local = log_fidelity_from_norms(observed, expected)
     raw_local = (
         None
@@ -31,7 +98,7 @@ def norm_event(active, observed, log_survival):
     if log_survival == -np.inf or log_local == -np.inf:
         log_survival = -np.inf
     else:
-        log_survival += float(log_local)
+        log_survival = log_survival + float(log_local)
     cumulative_fidelity = fidelity_from_log(log_survival)
     cumulative_infidelity = infidelity_from_log(log_survival)
     event = {
@@ -112,7 +179,7 @@ def summarize_update(active, edge_events, bond_record, *, elapsed, mode,
         "update": update_index,
         "kind": active["kind"],
         "support": active["support"],
-        "elapsed_seconds": float(elapsed),
+        "elapsed_seconds": None if elapsed is None else float(elapsed),
         "edge_event_indices": list(range(start, start + len(edge_events))),
         "edge_count": len(edge_events),
         "truncated_edges": sum(event["truncated"] for event in edge_events),

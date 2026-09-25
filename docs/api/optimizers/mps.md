@@ -1,12 +1,34 @@
 # `pepsy.optimizers.mps.optimizer`
 
+## Imports and ownership
+
+Import the optimizer from `pepsy.optimizers` and specialized layout helpers
+from `pepsy.optimizers.mps`:
+
+```python
+from pepsy.optimizers import MpsOptimizer
+from pepsy.optimizers.mps import MpsGateStreamLayoutFinder, MpsGateStreamSchedule
+```
+
+The MPS package loads each component when requested. Listing its exports with
+`dir()` loads no numerical implementation. Importing layout helpers does not
+initialize replay, Gibbs preparation, or MPO optimization; the layout helpers
+still use their own numerical dependencies. `GibbsMps` remains available from
+`pepsy.optimizers` and `pepsy.optimizers.mps`.
+
+## Replay options
+
+Quimb replay accepts `run(compression_opts=...)` for independently controlled
+intermediate and final compression. See [compression stages](../boundary/compression.md)
+for supported options, capability checks, and final bond-limit semantics.
+
 `MpsOptimizer` defaults to `mode="direct"`: Quimb's direct compression to
 the requested `chi`. Prefer this algorithm name in new code. `mode="mpo"`
 remains a silent compatibility alias for the same path; an MPO is an operator
 representation, not a distinct replay algorithm.
 
 ```python
-opt = pepsy.MpsOptimizer(state, gates, chi=64)  # mode="direct"
+opt = MpsOptimizer(state, gates, chi=64)  # mode="direct"
 opt.run()
 ```
 
@@ -478,7 +500,13 @@ Randomized Compression, while `fit_init_strategy="guess-src"` uses SRC to
 build the disposable DMRG/FIT initial guess. For native Symmray/fermionic MPS,
 the default and an explicit `fit_init_strategy="guess-src"` use Symmray's
 sector-preserving randomized SVD (`svd:rand`) instead, so the guess remains
-native and never enters dense SRC. The equivalent
+native and never enters dense SRC. With a positive cumulative-error cutoff
+(`sum2`, `rsum2`, `sum1`, or `rsum1`), the native guess uses deterministic SVD
+to honor the requested error policy: randomized eager sector allocation cannot
+enforce it. Diagnostics report `guess_backend="symmray-svd"` and
+`random_initialization["fallback_reason"]="cumulative_cutoff"` in that case.
+Use `cutoff_mode="rel"` or `"abs"` for randomized native guesses; the final
+FIT target and output truncation retain their own existing controls. The equivalent
 `fit_init_strategy="guess_src"` spelling is accepted as a compatibility alias
 and is normalized internally to `guess_src`. Set `compression_seed` for reproducible randomized
 MPO replay; `fit_init_seed` controls randomized disposable FIT guesses. The
@@ -728,8 +756,9 @@ methods selected through `guess-<method>`. Because the default is
 expansion is used unless a random strategy is selected explicitly.
 FIT never copies the target into `fit.p` and never uses a target warm start.
 Native nonlocal gates retain their graded auto-swap/sector-growth preparation;
-the native `guess-src` path adds only sector-preserving randomized SVD on a
-disposable copy and never uses dense random padding.
+the native `guess-src` path uses sector-preserving randomized SVD on a
+disposable copy, falling back to deterministic native SVD for active
+cumulative-error cutoffs. It never uses dense random padding.
 
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
@@ -811,6 +840,13 @@ summary statistics and omits the historical arrays. The default retains the
 full report for compatibility and necessarily scales with the history returned.
 Treat committed norm events as read-only when using incremental summaries.
 Mixed rollback and state replacement invalidate the summary cache.
+
+The device norm ledger uses cached Autoray namespaces when available, with
+a dispatch fallback for older Autoray. Norm and log-fidelity values remain
+on-device until their existing readout boundaries. Namespace caching reduces
+Python dispatch overhead; it does not remove synchronization required by
+measurement or convergence decisions, and does not enable optional timing
+or finite checks.
 
 Repeated gates reuse unchanged immutable active-support snapshots. Internal
 dense trajectory clones preserve isometries in owned arrays without center

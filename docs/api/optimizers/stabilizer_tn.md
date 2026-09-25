@@ -36,6 +36,8 @@ Optional performance diagnostics are disabled by default: `finite_check=False`,
 profiling clock reads and leaves `get_run_timing()` unset. Per-update STN
 norm-survival tracking remains part of the simulator's fidelity contract and
 is independent of these optional diagnostics.
+MPI shot replay also defaults to `collect_diagnostics=False`; enable it
+explicitly to collect rank timing reports.
 
 For DMRG modes, `fit_init_strategy="guess-<method>"` selects an isolated
 native-compressed FIT guess before active bonds reach their `chi` ceilings;
@@ -481,8 +483,13 @@ backend, and user gates/MPOs must be prepared with the same converter before
 they are queued, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on that array backend.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
-cached per backend; expectation/fidelity scalars are converted back to Python
-floats.  `to_basis_statevector()` returns the coefficient vector `|nu>` in
+cached per backend/device/dtype. Ordinary compressed unitary replay keeps
+detached norm/log-fidelity scalars on the backend; `get_infidelities()`,
+`get_compression_norm_events()`, and `norm_diagnostics()` materialize Python
+values at readout. `get_infidelities()` retains the historical public list
+identity. Explicit extracted-exponent bookkeeping and
+`stabilize_unitary=True` retain their validated host scale decisions.
+`to_basis_statevector()` returns the coefficient vector `|nu>` in
 tableau-basis order without applying the tableau. `to_statevector()` returns
 the physical computational-basis vector `C|nu>` and applies a tableau circuit
 without constructing a dense `2**n x 2**n` Clifford matrix.
@@ -503,6 +510,22 @@ coefficient state. Stim gate classification still uses a temporary NumPy view,
 while coefficient contractions remain on the inferred backend. Stim and
 trajectory-generated matrices are converted by the library before they enter
 this user-stream boundary.
+
+Named rotations and projectors assemble their changing coefficients on the
+backend. `pauli_combo_submpo(..., like=array)` and
+`pauli_sum_submpo(..., like=array)` construct the complete coefficient MPO
+there; omitting `like` retains their NumPy defaults. FIT random guesses use
+Autoray's backend generator and `random.array`. Available early-dispatch
+namespaces cache the array operations without fixing the simulator to Torch,
+JAX, or CuPy implementations.
+
+Exact cooling stays enabled by default. It reduces a candidate qubit to three
+Bloch values on the backend and reads those small classical decisions for
+Stim. Arbitrary dense physical gates still require CPU classification and
+Pauli decomposition. Measurements, FIT convergence, upstream truncation rank
+selection, explicit diagnostics, and the reporting/injection runner APIs
+retain their existing host decisions or requested reports. These boundaries
+mean the hybrid simulator is not entirely free of CPU/GPU synchronization.
 
 
 > API details are maintained as handwritten Markdown in this page.

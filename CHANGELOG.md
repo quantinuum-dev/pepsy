@@ -14,6 +14,62 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Lazy public entry namespaces expose advertised names through `dir()` without
+  loading numerical implementations or resolving deprecated aliases. Root
+  typing imports cover the existing compatibility exports. Introductory guides
+  use owning namespaces and distinguish optional installation from API stability.
+
+- PEPS measurements and boundary calls adapt to Quimb's `method`/`route` API.
+  Single-row/column measurements use exact contractions with backend gradients
+  and native fermionic arrays. Boundary measurement dictionaries consistently
+  return normalized/raw scalars, or explicit numerator/norm pairs with
+  `normalized="return"`, across supported Quimb revisions.
+- MPS/MPO Quimb replay and PEPS boundary sweeps expose independent intermediate
+  and final compression options, gated by installed capabilities. Final bond
+  limits remain authoritative; SDCR cumulative-to-relative cutoff adaptation
+  now emits a warning.
+
+- Symmetry extras require Symmray 0.4.0 or newer for correct fermionic scalar
+  phases and fused-charge Torch batching (Python 3.11+ for these extras).
+  Scalar readout uses Symmray's native `item()` instead of returning an
+  unchanged wrapper through a NumPy object array.
+- Native MPS randomized FIT guesses use deterministic SVD for active
+  cumulative-error cutoffs, preserving the requested truncation policy and
+  reporting the fallback in diagnostics.
+- BP-to-SU conversion handles Quimb's positive fermionic message convention.
+  Native BP pair normalization checks the graded overlap and repairs only
+  affected solver instances, leaving the upstream installation untouched.
+  Graded cluster bras are conjugated jointly, and reduced-update warm gauges
+  use the union of endpoint charge sectors. Explicit loop projectors convert
+  messages and bra conjugation together to preserve their graded contractions.
+
+- CuPy backend setup leaves modern Autoray namespace handling intact. The
+  capability-gated legacy workaround preserves actual device objects and
+  bypasses only the failing namespace cache.
+- Random FIT initialization uses the same complex-normal variance on old
+  and new Autoray versions. Omitted dtypes inherit the template dtype;
+  explicit dtype overrides also survive the legacy conversion path.
+
+- Require Cotengra 0.8.0 or newer, matching the built-in `sbplx` optimizer
+  used when the optional CMA-ES acceleration dependency is unavailable.
+
+- Higher-order dense `TreeMPO.from_terms` assembly uses Quimb's
+  Autoray-backed tensor direct products, preserving the input backend and
+  device instead of downloading every term to NumPy. MPS and tree norm
+  ledgers use cached Autoray namespaces when available.
+
+- `StabilizerMpsSimulator` and `StabilizerTreeSimulator` keep generated Pauli
+  operators and exact-cooling tensor calculations on the coefficient backend.
+  Tree cooling uses one backend SVD instead of downloading its leaf matrix
+  and running two NumPy SVDs. MPS stabilizer random FIT guesses use an Autoray
+  backend generator, and ordinary unitary norm/fidelity bookkeeping stays
+  detached on-device until diagnostic readout.
+
+- `TreeOptimizer` keeps ordinary gate factorization and retained-norm
+  bookkeeping on the array backend. One-site unitarity checks transfer only
+  their Boolean result, fixed control tensors are cached per device/dtype,
+  and random FIT initialization uses an Autoray backend generator.
+
 - `MpsOptimizer` preserves array backend, dtype, device, and physical index
   names when rebuilding an MPS after exact replay. Dense random FIT guesses
   use Autoray's backend generator instead of passing a NumPy generator to
@@ -28,6 +84,35 @@ Changes for the next release should be added here before the version is bumped.
   or the live optimizer.
 
 ### Changed
+
+- Optional VMC and extended-test profiles compose existing extras instead of
+  repeating dependency constraints. Feature names and resolved requirements
+  are preserved. Installation guidance separates base, development, and
+  optional profiles; base-wheel CI also exercises a small numerical operation.
+
+- MPO, PEPS, sweep, tree, tree-PEPS, energy, and qMERA entry packages now load
+  exports on demand, preserving public names and direct module paths. qMERA
+  geometry and tree-PEPS plans can be imported without the numerical stack.
+  Gate, Hamiltonian, and boundary-state helpers import direct owning modules
+  instead of the `tensors.core` compatibility aggregator; its contraction and
+  fidelity patch hooks remain unchanged.
+
+- MPS package exports load on demand. Importing its namespace or reserved
+  modules no longer initializes the numerical stack; importing layout helpers
+  no longer pulls in replay, Gibbs preparation, or MPO optimization. Existing
+  export names and implementation objects are preserved.
+
+- Stabilizer MPS/tree MPI replay defaults `collect_diagnostics` to `False`.
+  `pauli_combo_submpo` and `pauli_sum_submpo` accept `like=` for direct
+  construction on a selected array backend/device/dtype.
+
+- `TreeOptimizer` skips update clock reads with the default `profile=False`;
+  untimed update records contain `elapsed_seconds=None`. MPI
+  `collect_diagnostics` now defaults to `False`. Norm/infidelity tracking
+  remains enabled, with scalar conversion deferred to diagnostic readout
+  except for explicit extracted-exponent bookkeeping.
+- `TreeMPO.from_pauli_sum` and `SubTreeMPO.from_pauli_sum` accept `like=`
+  to construct their tensors on a selected array backend/device.
 
 - `MpsOptimizer.run` now defaults MPI `collect_diagnostics` to `False`,
   matching its opt-in finite checks, overlap diagnostics, quality checks,

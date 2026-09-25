@@ -1,5 +1,17 @@
 # Symmetric Tensor States
 
+The optional symmetry and fermionic workflows require Symmray 0.4.0 or
+newer (`pip install -U 'pepsy[symmetry]'`). These extras require Python 3.11
+or newer because of Symmray's Python requirement; Pepsy's core remains
+available on Python 3.10. Version 0.4.0 fixes pending fermionic phases in
+scalar readout and reductions, and fused charge selection under Torch `vmap`.
+
+For flat-Z2 Torch PEPS, `TorchPEPSAmplitude(..., amplitude_batching="auto")`
+already probes batching and keeps a serial fallback. Explicit `"vmap"` is
+also available. This does not make variable-sector U1/U1U1 contractions or
+all compiled boundary environments batchable. See the
+[compatibility and benchmark record](../../development/notes/symmray_2026_09.md).
+
 ## Choosing sectors and charges
 
 Physical sectors are charge maps: ``{charge: sector_size}``. For example,
@@ -1149,3 +1161,12 @@ py.draw_symmray_mps(
 
 
 > API details are maintained as handwritten Markdown in this page.
+## PEPS measurement compatibility
+
+`SymPEPS.measure` retains Boolean `normalize` and its scalar return value.
+Its default `route="boundary"` adapts to Quimb's compression keyword revision.
+Single-row/column states use exact native contractions and do not require
+`chi`; boundary truncation settings do not apply there. A nonempty precomputed
+2D plaquette cache is not supported on this geometry. Explicit `route="envs"`
+is for single local terms on supporting Quimb builds, with a compatible
+compressor selected through `mode`.

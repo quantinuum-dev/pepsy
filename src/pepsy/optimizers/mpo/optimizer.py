@@ -64,6 +64,7 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
+from ..._internal.quimb import quimb_compression_options
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_cutoff_mode,
@@ -4052,6 +4053,7 @@ class MpoOptimizer:
         fit_target_strategy="auto",
         method=None,
         compression_seed=None,
+        compression_opts=None,
     ):
         """Sweep the gate stream with :func:`gate_nonlocal_opt` compression.
 
@@ -4185,6 +4187,7 @@ class MpoOptimizer:
                                 else int(compression_seed) + int(idx)
                             ),
                         )
+                        compress_options.update(compression_opts or {})
                         p = gate_nonlocal_opt(
                             p, g_k, where,
                             which="upper", method=method,
@@ -4204,6 +4207,7 @@ class MpoOptimizer:
                                 else int(compression_seed) + int(idx)
                             ),
                         )
+                        compress_options.update(compression_opts or {})
                         p = gate_nonlocal_opt(
                             p, g_b, where,
                             which="lower", method=method,
@@ -4262,6 +4266,7 @@ class MpoOptimizer:
         *,
         mode=None,
         compression_seed=None,
+        compression_opts=None,
         submpo_method=None,
         progbar=False,
         cutoff="auto",
@@ -4313,6 +4318,12 @@ class MpoOptimizer:
             Deterministic seed forwarded to randomized Quimb compression modes
             such as ``"src"`` and ``"fit"``. The gate position is mixed into
             the per-update seed.
+        compression_opts : mapping | None, default=None
+            Independent intermediate/final Quimb compression controls,
+            applied to both MPO physical layers. Supports max_bond_oversample,
+            cutoff_oversample, cutoff_mode_oversample, and compress_opts_final
+            when named by the installed compressor. chi remains the final cap.
+            Native Symmray replay and channel streams reject explicit settings.
         submpo_method : str | None, default=None
             Optional Quimb compression override for an MPO-mode run. This is
             the MPO analogue of `MpsOptimizer`'s ``submpo_method``; for
@@ -4449,6 +4460,13 @@ class MpoOptimizer:
 
         fit_finite_check = finite_check
 
+        compression_method = self._resolve_mpo_method(submpo_method)
+        compression_opts = quimb_compression_options(compression_method, compression_opts)
+        if compression_opts and (
+            not self._is_mpo_mode(self.mode) or self._has_symmray_data(self.p)
+            or any(isinstance(gate, MpoChannelEvent) for gate in self._execution_stream()[0])
+        ):
+            raise NotImplementedError("compression_opts requires dense Quimb MPO gate replay without channels.")
         if layout is not None and layout is not False:
             requested_layout = layout_order if layout is True else layout
             self.apply_layout(
@@ -4825,6 +4843,7 @@ class MpoOptimizer:
                         else self._mode_mpo_method(self.mode)
                     ),
                     compression_seed=compression_seed,
+                    compression_opts=compression_opts,
                 )
             except Exception as exc:
                 self.last_run_status = "failed"

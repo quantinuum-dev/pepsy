@@ -36,8 +36,18 @@ def backend_random_array(shape, *, like, dtype=None, scale=1.0, rng=None):
     Autoray 0.10's ``random.array`` is used directly, including its backend
     generator handling. Older Autoray releases do not expose that operation,
     so the deterministic NumPy fallback is converted through ``like``.
+    Both routes use ``E[abs(x)**2] = scale**2`` for zero-mean complex samples.
     """
     shape = tuple(int(size) for size in shape)
+    if dtype is None:
+        # Passing dtype=None explicitly disables Autoray's like-based
+        # injection and can turn a complex template into real samples.
+        dtype = ar.get_dtype_name(like)
+    elif not isinstance(dtype, str):
+        try:
+            dtype = np.dtype(dtype).name
+        except TypeError:
+            dtype = str(dtype).rsplit(".", 1)[-1]
     try:
         ar.get_lib_fn(ar.infer_backend(like), "random.array")
     except (AttributeError, ImportError, KeyError, LookupError):
@@ -45,9 +55,12 @@ def backend_random_array(shape, *, like, dtype=None, scale=1.0, rng=None):
         random_data = random_source.normal(size=shape)
         fallback_dtype = _fallback_dtype(dtype or getattr(like, "dtype", None))
         if np.issubdtype(fallback_dtype, np.complexfloating):
-            random_data = random_data + 1j * random_source.normal(size=shape)
+            random_data = (random_data + 1j * random_source.normal(size=shape)) / np.sqrt(2.0)
         random_data = (float(scale) * random_data).astype(fallback_dtype)
-        return ar.do("array", random_data, like=like)
+        return ar.do(
+            "array", random_data, like=like,
+            dtype=ar.to_backend_dtype(dtype, like=like),
+        )
 
     return ar.do(
         "random.array",

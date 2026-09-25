@@ -21,6 +21,64 @@ from pepsy._internal.quimb import (
 from pepsy._internal.random import backend_random_array
 
 
+@pytest.mark.parametrize("backend", ("numpy", "torch"))
+@pytest.mark.parametrize("override_dtype", (False, True))
+def test_complex_random_fallback_matches_native_variance(monkeypatch, backend, override_dtype):
+    """Scale measures total complex variance on both supported code paths."""
+    import autoray as ar
+
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        like = torch.zeros(1, dtype=torch.complex64)
+    else:
+        like = np.zeros(1, dtype=np.complex64)
+
+    kwargs = dict(like=like, scale=0.2, rng=123)
+    if override_dtype:
+        kwargs.update(like=like.real, dtype="complex64")
+    native = backend_random_array((50_000,), **kwargs)
+    get_lib_fn = ar.get_lib_fn
+
+    def without_random_array(name, fn):
+        if fn == "random.array":
+            raise ImportError("simulate pre-0.10 Autoray")
+        return get_lib_fn(name, fn)
+
+    monkeypatch.setattr(ar, "get_lib_fn", without_random_array)
+    fallback = backend_random_array((50_000,), **kwargs)
+    repeated = backend_random_array((50_000,), **kwargs)
+    np.testing.assert_array_equal(ar.to_numpy(fallback), ar.to_numpy(repeated))
+    for value in (native, fallback):
+        assert ar.infer_backend(value) == backend
+        assert value.dtype == like.dtype
+        if backend == "torch":
+            assert value.device == like.device
+        samples = ar.to_numpy(value)
+        assert np.mean(abs(samples) ** 2) == pytest.approx(0.2**2, rel=0.03)
+        assert np.var(samples.real) == pytest.approx(0.2**2 / 2, rel=0.03)
+        assert np.var(samples.imag) == pytest.approx(0.2**2 / 2, rel=0.03)
+
+
+def test_random_fallback_preserves_real_low_precision_dtype(monkeypatch):
+    """The NumPy staging precision must not override the requested dtype."""
+    import autoray as ar
+
+    get_lib_fn = ar.get_lib_fn
+
+    def without_random_array(name, fn):
+        if fn == "random.array":
+            raise ImportError("simulate pre-0.10 Autoray")
+        return get_lib_fn(name, fn)
+
+    monkeypatch.setattr(ar, "get_lib_fn", without_random_array)
+    for kwargs in ({}, {"dtype": np.float16}):
+        like = np.zeros(1, dtype=np.float16 if not kwargs else np.float64)
+        result = backend_random_array((8,), like=like, scale=0.2, rng=123, **kwargs)
+        expected = (0.2 * np.random.default_rng(123).normal(size=8)).astype(np.float16)
+        assert result.dtype == np.float16
+        np.testing.assert_array_equal(result, expected)
+
+
 def test_bp_constructor_capability_probe_keeps_run_options_out_of_ctor():
     """Constructor filtering follows the installed BP signature."""
     options = quimb_bp_constructor_options(

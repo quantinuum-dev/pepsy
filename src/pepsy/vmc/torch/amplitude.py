@@ -10,6 +10,7 @@ from __future__ import annotations
 import warnings
 from contextlib import contextmanager
 
+from ..._internal.quimb import call_quimb_2d, quimb_2d_options
 from ..torch_types import _check_positive_int, _require_torch
 from ..api import ContractionFallbackWarning
 from ...boundary.metrics import (
@@ -888,6 +889,10 @@ class TorchPEPSAmplitude:
     def _contract_approximate(self, fn, *args, close_final=False, **kwargs):
         """Contract with the requested cutoff, retrying empty sparse sectors."""
         kwargs = dict(kwargs)
+        if getattr(fn, "__name__", "") in {
+            "contract_boundary", "compute_x_environments", "compute_y_environments"
+        }:
+            kwargs = quimb_2d_options(fn, kwargs)
         kwargs["cutoff"] = self.cutoff
         if close_final:
             # Close the final small tensor network here rather than inside
@@ -935,7 +940,7 @@ class TorchPEPSAmplitude:
         """Return a CTMRG closure that counts outer contractions."""
         def contract(*args, **kwargs):
             self.ctmrg_calls += 1
-            return tnx.contract_ctmrg(*args, **kwargs)
+            return call_quimb_2d(tnx.contract_ctmrg, *args, **kwargs)
 
         return contract
 
@@ -1558,13 +1563,15 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             tn = self._unpack_tn()
             selected = self._select_config(tn, example_config)
             if axis == "x":
-                example_envs = selected.compute_x_environments(
+                example_envs = call_quimb_2d(
+                    selected.compute_x_environments,
                     max_bond=self.chi,
                     cutoff=self.cutoff,
                     **manifest_options,
                 )
             else:
-                example_envs = selected.compute_y_environments(
+                example_envs = call_quimb_2d(
+                    selected.compute_y_environments,
                     max_bond=self.chi,
                     cutoff=self.cutoff,
                     **manifest_options,
@@ -1584,13 +1591,15 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 for index, ind in enumerate(site_inds)
             })
             if axis == "x":
-                envs = selected.compute_x_environments(
+                envs = call_quimb_2d(
+                    selected.compute_x_environments,
                     max_bond=chi,
                     cutoff=cutoff,
                     **manifest_options,
                 )
             else:
-                envs = selected.compute_y_environments(
+                envs = call_quimb_2d(
+                    selected.compute_y_environments,
                     max_bond=chi,
                     cutoff=cutoff,
                     **manifest_options,
@@ -2155,14 +2164,16 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                             reuse_tn.view_as_(qtn.PEPS, **view_kwargs)
                             if selected_mode in {"boundary", "auto"}:
                                 if selected_direction == "x":
-                                    reuse_tn.contract_boundary_from_xmin_(
+                                    call_quimb_2d(
+                                        reuse_tn.contract_boundary_from_xmin_,
                                         xrange=[selected_indices[0], selected_indices[-1] + 1],
                                         max_bond=chi,
                                         cutoff=cutoff,
                                         **boundary_options,
                                     )
                                 else:
-                                    reuse_tn.contract_boundary_from_ymin_(
+                                    call_quimb_2d(
+                                        reuse_tn.contract_boundary_from_ymin_,
                                         yrange=[selected_indices[0], selected_indices[-1] + 1],
                                         max_bond=chi,
                                         cutoff=cutoff,
@@ -2797,7 +2808,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 qtn.PEPS,
                 **self._boundary_geometry["view_kwargs"],
             )
-            reuse_tn.contract_boundary_from_xmin_(
+            call_quimb_2d(
+                reuse_tn.contract_boundary_from_xmin_,
                 xrange=[first, last + 1],
                 max_bond=self.chi,
                 cutoff=self.cutoff,
@@ -2809,7 +2821,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 qtn.PEPS,
                 **self._boundary_geometry["view_kwargs"],
             )
-            reuse_tn.contract_boundary_from_ymin_(
+            call_quimb_2d(
+                reuse_tn.contract_boundary_from_ymin_,
                 yrange=[first, last + 1],
                 max_bond=self.chi,
                 cutoff=self.cutoff,

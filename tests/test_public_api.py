@@ -1,5 +1,6 @@
 """Basic public API smoke tests for the pepsy package."""
 
+import ast
 import importlib
 import importlib.util
 from pathlib import Path
@@ -66,6 +67,73 @@ def test_top_level_compatibility_surface_matches_manifest():
         *manifest,
     }
     assert set(pepsy.__all__) == expected_all
+
+
+def test_root_typing_imports_cover_public_exports():
+    """Static root declarations agree with the lazy public ownership map."""
+    tree = ast.parse(Path(pepsy.__file__).read_text(encoding="utf-8"))
+    declarations = {}
+    for node in tree.body:
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    declarations[alias.asname or alias.name] = (
+                        "." * statement.level + (statement.module or ""),
+                        alias.name,
+                    )
+    expected = {
+        name: (module, name) for name, module in pepsy._SYMBOL_MODULES.items()
+    }
+    expected.update({name: (".", name) for name in pepsy._MODULE_EXPORTS})
+    assert declarations == expected
+
+
+def test_mps_lazy_exports_preserve_implementation_identity():
+    """Existing MPS symbols, module access, and star imports stay compatible."""
+    import pepsy.optimizers.mps as mps
+
+    owners = {
+        "GibbsMps": "gibbs",
+        "MpsGateStreamLayoutFinder": "layout",
+        "MpsGateStreamSchedule": "layout",
+        "MpsOptimizer": "optimizer",
+        "guess": "optimizer",
+        "is_submpo_event": "optimizer",
+        "normalize_submpo_where": "optimizer",
+        "submpo_event_parts": "optimizer",
+        "svd_guess": "optimizer",
+    }
+    for name, owner in owners.items():
+        direct = importlib.import_module(f"{mps.__name__}.{owner}")
+        assert getattr(mps, name) is getattr(direct, name)
+    assert mps.gibbs is importlib.import_module(f"{mps.__name__}.gibbs")
+    exported = {}
+    exec("from pepsy.optimizers.mps import *", exported)
+    assert set(exported) - {"__builtins__"} == set(mps.__all__)
+    with pytest.raises(AttributeError, match="no attribute"):
+        getattr(mps, "unknown_mps_export")
+
+
+@pytest.mark.parametrize("domain", ("mpo", "peps", "sweep", "tree", "tree_peps", "energy", "qmera"))
+def test_optimizer_package_exports_preserve_identity_and_child_access(domain):
+    """Lazy entry points resolve the same objects as their declared owners."""
+    package = importlib.import_module(f"pepsy.optimizers.{domain}")
+    for name, owner in package._SYMBOL_MODULES.items():
+        direct = importlib.import_module(owner, package.__name__)
+        assert getattr(package, name) is getattr(direct, name)
+    for child in package._SUBMODULES:
+        assert getattr(package, child) is importlib.import_module(f"{package.__name__}.{child}")
+    exported = {}
+    exec(f"from {package.__name__} import *", exported)
+    assert set(exported) - {"__builtins__"} == set(package.__all__)
+    with pytest.raises(AttributeError, match="no attribute"):
+        getattr(package, "unknown_optimizer_export")
 
 
 def test_root_aliases_resolve_from_canonical_namespaces():

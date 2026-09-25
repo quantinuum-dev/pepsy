@@ -11,6 +11,7 @@ from typing import Any
 import autoray as ar
 import quimb.tensor as qtn
 
+from .._internal.quimb import call_quimb_2d
 from ..tensors.core import build_optimizer, contract_hypercompressed_tn
 
 __all__ = ["GlobalOptimizer"]
@@ -428,7 +429,8 @@ class GlobalOptimizer:
         norm = state_h | state
 
         if mode == "mps":
-            return norm.contract_boundary(
+            return call_quimb_2d(
+                norm.contract_boundary,
                 max_bond=chi_norm,
                 mode=mode_,
                 sequence=sequence,
@@ -444,7 +446,8 @@ class GlobalOptimizer:
             )
 
         if mode == "ctmrg":
-            return norm.contract_ctmrg(
+            return call_quimb_2d(
+                norm.contract_ctmrg,
                 max_bond=chi_norm,
                 cutoff=cutoff,
                 canonize=True,
@@ -551,7 +554,8 @@ class GlobalOptimizer:
         norm_ = state_h | state_target
 
         if mode == "mps":
-            val_0 = norm.contract_boundary(
+            val_0 = call_quimb_2d(
+                norm.contract_boundary,
                 max_bond=chi_norm,
                 mode=mode_,
                 final_contract_opts={
@@ -565,7 +569,8 @@ class GlobalOptimizer:
                 sequence=sequence,
                 equalize_norms=equalize_norms,
             )
-            val_1 = norm_.contract_boundary(
+            val_1 = call_quimb_2d(
+                norm_.contract_boundary,
                 max_bond=chi_overlap,
                 mode=mode_,
                 final_contract_opts={
@@ -580,7 +585,8 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
             )
         elif mode == "ctmrg":
-            val_0 = norm.contract_ctmrg(
+            val_0 = call_quimb_2d(
+                norm.contract_ctmrg,
                 max_bond=chi_norm,
                 cutoff=cutoff,
                 canonize=True,
@@ -596,7 +602,8 @@ class GlobalOptimizer:
                 progbar=progbar,
                 inplace=False,
             )
-            val_1 = norm_.contract_ctmrg(
+            val_1 = call_quimb_2d(
+                norm_.contract_ctmrg,
                 max_bond=chi_overlap,
                 cutoff=cutoff,
                 canonize=True,

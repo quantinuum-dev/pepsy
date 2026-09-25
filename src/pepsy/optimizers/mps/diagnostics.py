@@ -1,7 +1,8 @@
-"""MPS optimizer diagnostics.
+"""Reserved MPS diagnostics module; no implementation is extracted here.
 
-Extraction target for fidelity, infidelity, progress, and normalization record
-helpers now implemented on :class:`pepsy.optimizers.mps.optimizer.MpsOptimizer`.
+Current fidelity, infidelity, progress, and normalization record helpers live
+on :class:`pepsy.optimizers.mps.optimizer.MpsOptimizer`. This empty import path
+is retained for compatibility, not as an instruction to move those helpers.
 """
 
 __all__ = []

@@ -178,6 +178,11 @@ _DEPRECATED_ALIASES = {
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
+
+
 def __getattr__(name):
     module_name = _SYMBOL_MODULES.get(name)
     if module_name is not None:
