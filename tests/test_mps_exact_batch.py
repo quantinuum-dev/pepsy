@@ -48,6 +48,27 @@ def test_exact_batch_repeated_replay_preserves_scale_backend_and_input(backend):
     assert set(batched.p.tags) == set(reference.p.tags)
 
 
+def test_batch_exact_alias_uses_exact_batch_replay_and_mode_switch():
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = _stream(4)
+    canonical = MpsOptimizer(state, gates, chi=1, mode="exact-batch")
+    alias = MpsOptimizer(state, gates, chi=1, mode="batch-exact")
+    assert alias.mode == "exact-batch"
+
+    for replay in range(2):
+        canonical.run()
+        alias.run(mode="batch-exact" if replay == 0 else None)
+        np.testing.assert_allclose(alias.to_dense(), canonical.to_dense(), atol=1e-13)
+        assert alias.info_c == {}
+        if replay == 0:
+            alias.set_mode("exact")
+            alias.set_mode("batch-exact")
+            assert alias.mode == "exact-batch"
+
+    alias.set_mode("svd")
+    assert alias.info_c["cur_orthog"] is not None
+
+
 def test_exact_batch_fuses_single_qubit_layers_and_compact_diagonals():
     gates = _stream(7)
     blocks = list(
@@ -229,11 +250,23 @@ def test_exact_batch_rejects_persistent_layout_and_gibbs_replay():
     state = qtn.MPS_computational_state("000")
     opt = MpsOptimizer(state, [], chi=4, mode="svd")
     opt.apply_layout((2, 0, 1), layout_report=False)
-    with pytest.raises(ValueError, match="persistent-layout"):
-        opt.set_mode("exact-batch")
-    assert opt.mode == "svd"
-    with pytest.raises(ValueError, match="ordinary open MPS"):
-        GibbsMps([(("Z", 0.3), 0)], shape=2).prepare(0.1, mode="exact-batch")
+    for mode in ("exact-batch", "batch-exact"):
+        with pytest.raises(ValueError, match="persistent-layout"):
+            opt.set_mode(mode)
+        assert opt.mode == "svd"
+        with pytest.raises(ValueError, match="ordinary open MPS"):
+            GibbsMps([(("Z", 0.3), 0)], shape=2).prepare(0.1, mode=mode)
+
+
+def test_batch_exact_alias_rejected_as_layout_replay_override():
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = MpsOptimizer(state, _stream(4), chi=4, mode="svd")
+    with pytest.raises(RuntimeError, match="fixed-layout MPS compression"):
+        opt.current_gate_stream_layout(
+            objective="replay",
+            replay_candidates=1,
+            replay_kwargs={"mode": "batch-exact"},
+        )
 
 
 def test_exact_batch_cupy_preserves_device_and_state():

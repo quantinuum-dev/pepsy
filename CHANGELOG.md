@@ -391,7 +391,8 @@ Changes for the next release should be added here before the version is bumped.
   interleaved value classes retain correct mask ordering. Consecutive
   same-pair RXX/RYY/RZZ or other parity-preserving gates use one two-sector
   pass on supported NumPy/CuPy states. Numba is optional for CPU execution.
-  Existing modes and defaults are unchanged.
+  `batch-exact` is an accepted alias for `exact-batch`. Existing modes and
+  defaults are unchanged.
 
 - Added an explicit state-aware MPS layout objective. An optimizer-backed
   `MpsGateStreamLayoutFinder` now jointly evaluates bounded static layout

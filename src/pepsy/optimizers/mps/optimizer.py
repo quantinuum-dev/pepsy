@@ -1059,7 +1059,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``"exact"`` contracts the full state without truncation.
         ``"exact-batch"`` is an opt-in dense replay path that automatically
         fuses single-/two-qubit gates and broadcasts compact diagonal blocks.
-        Neither exact mode tracks MPS canonical metadata.
+        ``"batch-exact"`` is an alias for the same mode. Neither exact mode
+        tracks MPS canonical metadata.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
     ind_id : str, default="k{}"
@@ -1136,6 +1137,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "svd",
             "exact",
             "exact-batch",
+            "batch-exact",
         }
         | _MPO_COMPRESSION_METHODS
         | {f"mpo-{method}" for method in _MPO_COMPRESSION_METHODS}
@@ -1158,6 +1160,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _normalize_mode(cls, mode):
         """Validate and normalize execution mode."""
         mode_norm = str(mode).strip().lower()
+        if mode_norm == "batch-exact":
+            mode_norm = "exact-batch"
         # Public ``direct`` names the compression algorithm. Historical
         # ``mpo``/``quimb`` spellings select exactly that same path; retain
         # them as silent aliases, not distinct replay modes.

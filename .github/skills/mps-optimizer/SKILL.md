@@ -95,7 +95,8 @@ than hiding policy in a mode-specific helper.
   needed for compressed MPS scale bookkeeping and is accepted in exact
   trajectory paths for compatibility. Automatic normalization remains an MPS
   canonicalization feature.
-- `exact-batch`: opt-in fully contracted replay that fuses bounded one-/two-site
+- `exact-batch`: opt-in fully contracted replay; `batch-exact` normalizes to
+  this same mode at construction and `set_mode`. It fuses bounded one-/two-site
   gates, compact diagonal blocks, repeated-support Z/ZZ diagonal runs with
   one or two value pairs after compaction, and consecutive parity-preserving
   gates on one pair where the array backend supports them. A mixed Z/ZZ run

@@ -108,8 +108,9 @@ to sweep cleanup.
 ## MPS gate-stream optimizer
 
 `MpsOptimizer` defaults to `direct` compression. Other replay modes include
-`dmrg`, `swap`, `perm`, `svd`, `mix`, `exact`, and `exact-batch`; `mpo` remains a
-compatibility alias for `direct`. For repeated evolution on a graph
+`dmrg`, `swap`, `perm`, `svd`, `mix`, `exact`, and `exact-batch`; `batch-exact`
+normalizes to `exact-batch`, while `mpo` remains a compatibility alias for
+`direct`. For repeated evolution on a graph
 with a useful one-dimensional layout, call `opt.apply_layout("quality")` once.
 The MPS then stays in the selected physical order across `run()` calls and
 logical readout goes through `opt.logical_order`, `opt.remap_sample(...)`, or

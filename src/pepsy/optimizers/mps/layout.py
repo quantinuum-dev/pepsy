@@ -2951,7 +2951,9 @@ class MpsGateStreamLayoutFinder:
         replay_mode = run_kwargs.get("mode", mode)
         if replay_mode is None:
             replay_mode = mode
-        if str(replay_mode).strip().lower() in {"exact", "exact-batch", "perm"}:
+        if str(replay_mode).strip().lower() in {
+            "exact", "exact-batch", "batch-exact", "perm"
+        }:
             raise ValueError(
                 "objective='replay' requires a fixed-layout MPS compression "
                 "mode in replay_kwargs."

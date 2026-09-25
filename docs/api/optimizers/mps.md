@@ -287,7 +287,9 @@ contracted result back to an MPS mode rebuilds an open MPS.
 
 ### Batched exact replay
 
-Use `mode="exact-batch"` for opt-in gate fusion on a fully contracted state:
+Use `mode="exact-batch"` for opt-in gate fusion on a fully contracted state.
+`mode="batch-exact"` is an equivalent spelling; both construction and
+`set_mode("batch-exact")` normalize to `exact-batch`:
 
 ```python
 from pepsy.optimizers import MpsOptimizer
@@ -533,7 +535,7 @@ The practical shot-mode matrix is:
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
 | `dmrg`, `dmrg1/2/3` | opt-in variational compressed replay with the selected FIT schedule |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
-| `exact`, `exact-batch` | exact unitary, mixture, control, and state-dependent Kraus replay |
+| `exact`, `exact-batch` (`batch-exact` alias) | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
 Bare Quimb method names and their `quimb-<method>` qualified forms are passed

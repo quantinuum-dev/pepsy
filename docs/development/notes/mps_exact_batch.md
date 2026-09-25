@@ -504,3 +504,22 @@ parser move, with no numerical compatibility shim. The merged exact-batch,
 dynamic-control, Quimb, public API, package-layout, and import-boundary
 selection had 145 passes and one JAX complex64 direct-mode
 Kraus-probability precision failure, already present before this merge.
+
+## Batch-exact mode spelling (2026-09-24)
+
+The public spelling `mode="batch-exact"` now normalizes to the existing
+`exact-batch` internal mode at construction, `set_mode`, and the `run(mode=...)`
+override. Replay, timing, exact-mode transitions, trajectory handling, and
+fallback behavior therefore use the same code path. Gibbs preparation and
+the layout replay objective reject the alias wherever they already reject
+`exact-batch`. There is no additional kernel or state allocation.
+
+This is a Pepsy API alias with no new upstream numerical call. The upstream
+audit earlier in this active exact-batch task still applies: installed Quimb
+1.15.1.dev66+ge927f06e1, Autoray 0.11.1.dev3+g1b476b305, Cotengra
+0.8.3.dev7+g1d7fd333f, Symmray 0.4.1.dev7+g83fb22865, and CuPy 14.1.1
+were unchanged after the latest Pepsy merge. The installed TensorNetwork
+copy/contract, Tensor.modify, MPS.from_dense, Autoray dispatch, and CuPy
+RawKernel probes remain relevant. **Adopt:** the spelling alias at Pepsy's
+mode-normalization boundary. No compatibility shim, numerical prototype, or
+upstream-dependent algorithm is involved.
