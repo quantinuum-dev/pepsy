@@ -69,7 +69,6 @@ import warnings
 import weakref
 import autoray as ar
 import numpy as np
-import quimb
 import quimb.tensor as qtn
 
 # Retain legacy parser imports; new consumers use the shared owner directly.
@@ -123,7 +122,8 @@ from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_method_available as _quimb_compression_method_available,  # noqa: F401
     quimb_1d_compression_cutoff_mode as _quimb_compression_cutoff_mode,
-    quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
+    run_seeded_quimb as _run_seeded_quimb,
+    quimb_fit_guess_method,
     require_quimb_1d_compression_method as _require_quimb_compression_method,
 )
 from ...tensors.observables import mps_entanglement_entropy as _mps_entanglement_entropy
@@ -208,7 +208,6 @@ _MPO_METHODS_NEED_INTERIOR_WORKAROUND = frozenset(
 # otherwise try to permute a partitioned, non-full-chain site-tag sequence.
 # Combining them would make a valid option for one method family leak into a
 # different family (for example, forwarding a seed as a contraction option).
-_QUIMB_SEED_LOCK = threading.RLock()
 _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
     | {f"guess_{method}" for method in _MPO_COMPRESSION_METHODS}
@@ -712,26 +711,6 @@ def _prepare_gate_stream(gates, *, to_backend=None, backend_sample=None):
 def _is_interior_submpo_span(p, where):
     """Return whether ``where`` omits one or more end sites of ``p``."""
     return min(where) > 0 or max(where) < int(p.L) - 1
-
-
-def _run_seeded_quimb(random_seed, function, *args, **kwargs):
-    """Run a Quimb randomized operation with an isolated reproducibility seed.
-
-    Newer Quimb compressors accept ``seed`` directly and use an autoray random
-    generator that matches the tensor backend. Older releases use Quimb's
-    process-global random generator instead, so retain that fallback without
-    leaking a ``seed`` option into unrelated contraction calls. The lock keeps
-    the fallback deterministic when optimizers run concurrently.
-    """
-    if random_seed is None:
-        return function(*args, **kwargs)
-    method = kwargs.get("method")
-    if _quimb_compression_method_supports_seed(method):
-        kwargs.setdefault("seed", int(random_seed))
-        return function(*args, **kwargs)
-    with _QUIMB_SEED_LOCK:
-        quimb.seed_rand(int(random_seed))
-        return function(*args, **kwargs)
 
 
 def _apply_submpo_with_interior_workaround_impl(
@@ -8064,6 +8043,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed=None,
     ):
         """Build a disposable Quimb-compressed guess from one gate."""
+        method = quimb_fit_guess_method(method, p)
         result = guess(
             self._copy_fit_window_state(p, where),
             gate,

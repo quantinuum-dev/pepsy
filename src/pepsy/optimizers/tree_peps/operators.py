@@ -12,6 +12,7 @@ import quimb.tensor as qtn
 from ..._internal.quimb import (
     quimb_1d_compression_cutoff_mode,
     quimb_1d_compression_function,
+    run_seeded_quimb,
 )
 from ...operators._structural_compression import _structural_compress_tree
 from ..tree._display import ascii_tree
@@ -2002,7 +2003,10 @@ class TreePepo(qtn.TensorNetworkGenOperator):
                 inplace=False,
             )
         else:
-            result = compressor(temporary, **options)
+            result = run_seeded_quimb(
+                options.pop("seed", None), compressor, temporary,
+                quimb_method=compression_mode, **options,
+            )
 
         for site in order:
             tag = work.site_tag(site)

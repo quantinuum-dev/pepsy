@@ -17,6 +17,7 @@ import autoray as ar
 import quimb.tensor as qtn
 
 from ..._internal.random import backend_random_array
+from ..._internal.quimb import quimb_callable_option_supported
 
 
 _SUCCESSIVE_COMPRESSION_MODES = frozenset({
@@ -294,6 +295,14 @@ def successive_tree_compress(local, order, hub, *, method, max_bond,
                 "get": "tensors",
             }
             if method == "sdcr":
+                if ar.infer_backend(tensor.data) == "torch":
+                    from quimb.tensor.decomp import svd_rand_truncated
+
+                    if not quimb_callable_option_supported(svd_rand_truncated, "noise_dist"):
+                        raise NotImplementedError(
+                            "Torch SDCR requires Quimb's dtype-aware random split driver; "
+                            "upgrade Quimb or use SDC/direct compression."
+                        )
                 # Match Quimb's SDCR defaults: the environment is a static
                 # randomized sketch, without oversampling or power iteration.
                 # Pass the seed through unchanged so seeded paths have the

@@ -27,6 +27,8 @@ import warnings
 import autoray as ar
 import numpy as np
 
+from .._internal.quimb import run_seeded_quimb
+
 from .mpo_semantic import (
     FirstDegreeMPO,
     MPOLocalOperatorTerm,
@@ -445,7 +447,9 @@ def compress_mpo_product(
         # variational objective passed to FIT, and FIT.run_eff is the only
         # DMRG refinement entry point so its cached sweep environments are
         # reused across the full-chain sweeps.
-        guess = qtn.tensor_network_1d_compress(
+        guess = run_seeded_quimb(
+            guess_kwargs.pop("seed", None),
+            qtn.tensor_network_1d_compress,
             target.copy(),
             **guess_kwargs,
         )

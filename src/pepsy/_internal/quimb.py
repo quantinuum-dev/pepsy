@@ -9,6 +9,8 @@ detected when used, without making import-time compatibility more fragile.
 from __future__ import annotations
 
 import inspect
+import threading
+from functools import lru_cache
 import math
 import warnings
 from collections.abc import Mapping
@@ -16,6 +18,91 @@ from copy import deepcopy
 from numbers import Integral, Real
 
 import quimb.tensor as qtn
+
+
+_QUIMB_SEED_LOCK = threading.RLock()
+
+
+@lru_cache(maxsize=2)
+def _numpy_eig_split_supported(dtype):
+    """Probe the public split API for the old single-precision Numba bug."""
+    import numpy as np
+    from numba.core.errors import TypingError
+
+    tensor = qtn.Tensor(np.eye(2, 3, dtype=dtype), inds=("a", "b"))
+    try:
+        tensor.split(
+            left_inds=("a",), method="svd:eig", cutoff=1e-6,
+            max_bond=2, absorb=None,
+        )
+    except TypingError:
+        return False
+    return True
+
+
+def quimb_safe_split_method(method, array):
+    """Keep dtype and truncation policy when an upstream eig driver cannot compile."""
+    import autoray as ar
+
+    if method == "svd:eig" and ar.infer_backend(array) == "numpy":
+        dtype = str(array.dtype)
+        if dtype in {"float32", "complex64"} and not _numpy_eig_split_supported(dtype):
+            warnings.warn(
+                f"Quimb's NumPy {dtype} svd:eig driver cannot compile; using "
+                "direct SVD with the same dtype, cutoff, and bond limit.",
+                RuntimeWarning, stacklevel=2,
+            )
+            return "svd"
+    return method
+
+
+def quimb_src_backend_supported(method, like):
+    """Legacy SRC creates NumPy noise; modern seeded SRC follows its input."""
+    import autoray as ar
+
+    method = str(method).strip().lower().replace("_", "-")
+    if not method.startswith("src"):
+        return True
+    arrays = getattr(like, "arrays", None)
+    if arrays is not None:
+        like = arrays[0]
+    return ar.infer_backend(like) == "numpy" or quimb_1d_compression_method_supports_seed(method)
+
+
+def quimb_fit_guess_method(method, like):
+    """Choose a supported disposable warm start without changing the FIT target."""
+    if quimb_src_backend_supported(method, like):
+        return method
+    warnings.warn(
+        "This Quimb build cannot create backend-native SRC noise; using a "
+        "direct FIT warm start while preserving the exact target.",
+        RuntimeWarning, stacklevel=2,
+    )
+    return "direct"
+
+
+def run_seeded_quimb(random_seed, function, *args, quimb_method=None, **kwargs):
+    """Seed a randomized compressor without leaking options into contractions.
+
+    Modern compressors accept a backend-native seed directly. Older releases
+    use Quimb's process-global generator, serialized across Pepsy callers.
+    """
+    method = kwargs.get("method") if quimb_method is None else quimb_method
+    if args and not quimb_src_backend_supported(method, args[0]):
+        raise NotImplementedError(
+            f"Quimb compressor {method!r} needs a newer build for non-NumPy "
+            "random arrays; use direct compression or upgrade Quimb."
+        )
+    if random_seed is None:
+        return function(*args, **kwargs)
+    if quimb_1d_compression_method_supports_seed(method):
+        kwargs.setdefault("seed", int(random_seed))
+        return function(*args, **kwargs)
+    import quimb
+
+    with _QUIMB_SEED_LOCK:
+        quimb.seed_rand(int(random_seed))
+        return function(*args, **kwargs)
 
 
 _OPTIONAL_1D_METHODS = frozenset(

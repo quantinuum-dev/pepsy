@@ -10,6 +10,8 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 
 ## Contents
 
+- [`ci_compatibility_2026_09.md`](ci_compatibility_2026_09.md) — Released versus
+  development dependency failures, seed handling, and CI profile corrections.
 - [`package_simplicity_2026_09.md`](package_simplicity_2026_09.md) — Package,
   alias, dependency, and agent-guidance assessment; proposed cleanup order.
 - [`belief_propagation.md`](belief_propagation.md) — Belief propagation for tensor networks, BP gauging, and the

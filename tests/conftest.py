@@ -3,6 +3,29 @@
 from pathlib import Path
 import sys
 
+import pytest
+
+
+@pytest.fixture
+def quimb_trotter():
+    """Require the native scheduler only for tests that exercise it."""
+    import quimb.tensor as qtn
+
+    if not callable(getattr(qtn.LocalHamGen, "get_trotter_gates", None)):
+        pytest.skip("Quimb does not provide the native Trotter scheduler")
+
+
+@pytest.fixture
+def quimb_compressor():
+    """Require an optional upstream compressor for one parameter value."""
+    from pepsy._internal.quimb import quimb_1d_compression_method_available
+
+    def require(method):
+        if not quimb_1d_compression_method_available(method):
+            pytest.skip(f"Quimb does not provide the {method} compressor")
+
+    return require
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:

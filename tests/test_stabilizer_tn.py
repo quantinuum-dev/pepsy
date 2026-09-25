@@ -1479,8 +1479,9 @@ def test_coefficient_compression_modes_preserve_stn_state(mode):
         "fit-oversample",
     ),
 )
-def test_stn_quimb_compression_methods_preserve_state(method):
+def test_stn_quimb_compression_methods_preserve_state(method, quimb_compressor):
     """Every native Quimb compression method is selectable for coefficient MPOs."""
+    quimb_compressor(method)
     stream = [
         ("h", 0),
         ("cnot", 0, 1),

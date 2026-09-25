@@ -7,7 +7,8 @@ Examples::
     mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
         --strategy coalesced --error-rate 1e-3
 
-The benchmark reports the slowest-rank wall time and the global shot rate.
+The benchmark warms up one serial shot per rank, then reports the slowest-rank
+wall time and the global shot rate for the requested shots.
 It is intentionally a script rather than a pytest benchmark: MPI process
 counts and CPU oversubscription are machine-specific.
 """
@@ -92,6 +93,19 @@ def main():
         None
         if args.error_rate == 0.0
         else pepsy.PauliErrorModel.bit_flip(args.error_rate)
+    )
+    # Initialize optional native libraries and compiled kernels on each rank's
+    # main thread before starting local workers or measuring throughput. Cold
+    # concurrent Stim/NumPy initialization can deadlock in native import locks.
+    runner.run(
+        comm.Get_size(),
+        seed=args.seed,
+        error_model=error_model,
+        strategy=args.strategy,
+        retain="none",
+        local_workers=1,
+        local_backend="serial",
+        progress=False,
     )
     comm.Barrier()
     started = MPI.Wtime()

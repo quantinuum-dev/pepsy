@@ -813,6 +813,10 @@ The latter does not form a global dense state and is currently restricted to
 dense tree tensors; native fermionic trees retain their graded direct
 compression path. `mode="dm"` is the automatic-routing shorthand for
 `mode="auto", compression_mode="dm"`.
+For NumPy single-precision arrays, Pepsy probes the installed Quimb eigensolver
+once per dtype. If its Numba driver cannot compile, tree edge compression
+warns and uses direct SVD with the same dtype, cutoff mode, and bond limit.
+Other backends and working eigensolver builds retain the requested method.
 The combined `tree_mpo_direct` and `tree_mpo_dm` names select both the true
 TreeMPO route and its compression method, so a conflicting explicit
 `compression_mode` is rejected.
@@ -942,6 +946,11 @@ reuse stale numerical environments.
 Intermediate contractions drop tags; final tensors retain their local tags.
 Only the exterior is canonicalized before SRC/SDC/SDCR; the active tensors are
 replaced by the projector sweep without an initial internal center move.
+
+Torch SDCR requires Quimb's dtype-aware randomized split driver (the API with
+`noise_dist`). Older drivers can mix real noise with complex Torch tensors;
+Pepsy reports that missing capability explicitly. Use SDC/direct compression
+or upgrade Quimb for this backend path.
 
 `compression_mode="src-oversample"`, `"sdc-oversample"`, and
 `"sdcr-oversample"` are accuracy-oriented opt-in variants. Each first uses

@@ -35,7 +35,9 @@ sequence to run in full:
 
 `vmc-torch` reuses `torch`; `vmc-netket` includes `symmetry`; `vmc` combines
 both VMC profiles. `test-extended` combines optional test dependencies and is
-intended for contributors. Composed profiles preserve dependency requirements
+intended for contributors, including Autograd for its explicit autodiff tests.
+The development extra includes the TOML reader backport only on Python 3.10.
+Composed profiles preserve dependency requirements
 while avoiding duplicate definitions in `pyproject.toml`.
 
 Combine extras when needed, and add `-e` for an editable development install:

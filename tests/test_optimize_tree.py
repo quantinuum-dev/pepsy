@@ -3754,6 +3754,7 @@ def test_tree_layout_tent_colored_edges_match_child_nodes():
 
 def test_tree_layout_tent_validates_arrow_size():
     """Arrow marker sizing rejects values Matplotlib cannot render usefully."""
+    pytest.importorskip("matplotlib")
     finder = TreeLayoutFinder(
         [(pepsy.cnot(), (0, 1))], n=2, max_arity=2
     )

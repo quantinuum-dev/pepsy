@@ -173,6 +173,12 @@ def _isolated_gates(isolated, *, step, phys_dim):
 def _native_trotter_gates(ham, step, *, order, steps, ordering, fuse_adjacent, alternate):
     """Generate Quimb gates, including the unhashable-backend fallback."""
 
+    if not callable(getattr(ham, "get_trotter_gates", None)):
+        raise NotImplementedError(
+            "exp_trotter requires Quimb's native get_trotter_gates scheduler; "
+            "upgrade Quimb to use interacting Trotter MPOs."
+        )
+
     kwargs = {
         "order": order,
         "steps": steps,

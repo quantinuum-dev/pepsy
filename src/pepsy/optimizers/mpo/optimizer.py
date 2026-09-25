@@ -64,7 +64,7 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
-from ..._internal.quimb import quimb_compression_options
+from ..._internal.quimb import quimb_compression_options, quimb_fit_guess_method, run_seeded_quimb
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_cutoff_mode,
@@ -1947,7 +1947,9 @@ class MpoOptimizer:
                 max_bond=max_bond,
                 seed=seed,
             )
-            p = gate_nonlocal_opt(
+            p = run_seeded_quimb(
+                compress_options.pop("seed", None),
+                gate_nonlocal_opt,
                 p,
                 payload,
                 where,
@@ -1980,6 +1982,7 @@ class MpoOptimizer:
         start, while FIT still receives the uncapped target built by the DMRG
         target path.
         """
+        method = quimb_fit_guess_method(method, p)
         active = [site for where in batch_where for site in where]
         guess = self._copy_working_state(p, (min(active), max(active)))
         active_sites = []
@@ -4189,7 +4192,9 @@ class MpoOptimizer:
                             ),
                         )
                         compress_options.update(compression_opts or {})
-                        p = gate_nonlocal_opt(
+                        p = run_seeded_quimb(
+                            compress_options.pop("seed", None),
+                            gate_nonlocal_opt,
                             p, g_k, where,
                             which="upper", method=method,
                             info=self.info_c, inplace=True,
@@ -4209,7 +4214,9 @@ class MpoOptimizer:
                             ),
                         )
                         compress_options.update(compression_opts or {})
-                        p = gate_nonlocal_opt(
+                        p = run_seeded_quimb(
+                            compress_options.pop("seed", None),
+                            gate_nonlocal_opt,
                             p, g_b, where,
                             which="lower", method=method,
                             info=self.info_c, inplace=True,

@@ -205,6 +205,11 @@ controls the explicit random strategies. `fit_mpo_guess=False` remains a
 compatibility switch that disables the source guess for named
 `dmrg1`/`dmrg2`/`dmrg3` schedules; use the explicit random or direct strategy
 when that legacy switch is disabled.
+
+On older Quimb builds with NumPy-only SRC noise, non-NumPy FIT warm starts
+warn and use direct compression while retaining the exact target. Explicit
+non-NumPy SRC replay reports the missing capability; use direct replay or
+upgrade Quimb for backend-native random compression.
 The replay order is controlled by `fit_mpo_guess_order`, which defaults to
 `"lower_upper"` (bra then ket); `"upper_lower"` (ket then bra) is also
 available. In this API the lower MPO layer is bra and the upper layer is ket.

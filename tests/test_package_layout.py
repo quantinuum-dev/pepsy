@@ -2,8 +2,12 @@
 
 import importlib
 import importlib.metadata
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 import pytest
 from packaging.requirements import Requirement
@@ -268,7 +272,7 @@ def test_composed_dependency_profiles_preserve_feature_boundaries():
     }
     assert expanded["test-extended"] == set().union(
         *(expanded[name] for name in ("layout", "solvers", "stabilizer", "symmetry", "torch", "viz"))
-    )
+    ) | {"autograd>=1.6"}
 
 
 @pytest.mark.parametrize(

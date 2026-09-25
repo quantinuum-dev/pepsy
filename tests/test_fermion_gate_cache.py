@@ -27,6 +27,7 @@ def _dense(gate):
 
 def test_fingerprint_is_content_addressed_not_identity():
     """Equal contents share a fingerprint; different contents do not."""
+    pytest.importorskip("symmray")
     fermion = Fermion(spinful=True, symmetry="U1")
 
     up_a = fermion.hopping_operator(spin="up")
@@ -53,6 +54,7 @@ def test_operator_gate_does_not_alias_distinct_operators_under_id_reuse():
     of different kinds at the same ``theta`` used to let a recycled ``id`` return
     a stale cached gate.  Every gate must match an independent exponential.
     """
+    pytest.importorskip("symmray")
     fermion = Fermion(spinful=True, symmetry="U1")
     theta = 0.10667747
 
@@ -78,6 +80,7 @@ def test_operator_gate_does_not_alias_distinct_operators_under_id_reuse():
 
 def test_operator_gate_cache_hits_return_equivalent_gate():
     """Repeated calls with equal contents reuse a single correct gate."""
+    pytest.importorskip("symmray")
     fermion = Fermion(spinful=True, symmetry="U1")
     theta = 0.37
 

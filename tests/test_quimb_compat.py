@@ -21,6 +21,55 @@ from pepsy._internal.quimb import (
 from pepsy._internal.random import backend_random_array
 
 
+@pytest.mark.parametrize("native_seed", (False, True))
+def test_randomized_compression_seed_support_preserves_reproducibility(monkeypatch, native_seed):
+    """Legacy RNG seeding never becomes a contraction keyword."""
+    import quimb
+    from pepsy._internal import quimb as compat
+
+    def legacy(*, method):
+        return quimb.rand_matrix(3, dtype="complex128")
+
+    def modern(*, method, seed):
+        return np.random.default_rng(seed).normal(size=(3, 3))
+
+    compressor = modern if native_seed else legacy
+    monkeypatch.setattr(compat, "quimb_1d_compression_function", lambda method: compressor)
+    first = compat.run_seeded_quimb(17, compressor, method="src")
+    second = compat.run_seeded_quimb(17, compressor, method="src")
+    different = compat.run_seeded_quimb(18, compressor, method="src")
+    np.testing.assert_array_equal(first, second)
+    assert not np.array_equal(first, different)
+
+
+def test_single_precision_eig_fallback_preserves_truncation_and_dtype(monkeypatch):
+    """A broken upstream driver must not change requested rank or precision."""
+    from pepsy._internal import quimb as compat
+
+    monkeypatch.setattr(compat, "_numpy_eig_split_supported", lambda dtype: False)
+    tensor = qtn.Tensor(np.diag([1.0, 1e-4]).astype("complex64"), inds=("a", "b"))
+    with pytest.warns(RuntimeWarning, match="same dtype, cutoff, and bond limit"):
+        method = compat.quimb_safe_split_method("svd:eig", tensor.data)
+    left, right = tensor.split(
+        left_inds=("a",), method=method, max_bond=1, cutoff=1e-6, cutoff_mode="rsum2",
+    )
+    assert left.dtype == right.dtype == "complex64"
+    assert left.bonds_size(right) == 1
+    np.testing.assert_allclose((left @ right).data, np.diag([1.0, 0.0]), atol=1e-7)
+    assert compat.quimb_safe_split_method("svd:eig", tensor.data.astype("complex128")) == "svd:eig"
+
+
+def test_trotter_facades_report_missing_upstream_scheduler(monkeypatch):
+    """Unavailable interacting schedules fail clearly on supported releases."""
+    monkeypatch.delattr(qtn.LocalHamGen, "get_trotter_gates", raising=False)
+    terms = [(("ZZ", 0.3), (0, 1))]
+    with pytest.raises(NotImplementedError, match="get_trotter_gates"):
+        pepsy.operators.exp_trotter(terms, -0.1j, shape=2)
+    state = pepsy.GibbsMps(terms, shape=2)
+    with pytest.raises(RuntimeError, match="get_trotter_gates"):
+        state.prepare(0.1, n_steps=1)
+
+
 @pytest.mark.parametrize("backend", ("numpy", "torch"))
 @pytest.mark.parametrize("override_dtype", (False, True))
 def test_complex_random_fallback_matches_native_variance(monkeypatch, backend, override_dtype):
@@ -165,7 +214,10 @@ def test_mpo_auto_swap_is_explicit_and_preserves_long_range_identity():
     mpo = qtn.MPO_identity(4, phys_dim=2)
     gate = np.eye(4).reshape(2, 2, 2, 2)
 
-    assert quimb_mpo_auto_swap_function(mpo) is not None
+    if quimb_mpo_auto_swap_function(mpo) is None:
+        with pytest.raises(NotImplementedError, match="Quimb"):
+            pepsy.gate_mpo_auto_swap(mpo, gate, (0, 3))
+        return
     result = pepsy.gate_mpo_auto_swap(
         mpo,
         gate,

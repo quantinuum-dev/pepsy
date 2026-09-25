@@ -33,6 +33,20 @@ The `core and not optional` profile is the dependency-light API contract;
 `core` without the exclusion includes stable APIs exercised through optional
 backends. The full command includes all domain and slow tests.
 
+CI runs the smoke profile on Python 3.12 and the full collection on the other
+core interpreters. Optional tests skip only when their dependency or required
+upstream capability is absent. The extended job enforces whole-package
+coverage; the smoke job checks contracts without a whole-package coverage gate.
+MPI integration CI installs `.[dev,mpi,stabilizer]` to exercise stabilizer
+trajectories as well as ordinary MPS and tree execution.
+
+The type-check job targets its Python 3.12 runtime so installed NumPy stubs
+use the same language version. Reproduce it with:
+
+```bash
+python -m mypy --python-version 3.12 src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
+```
+
 To measure the local import boundary without importing an advanced domain:
 
 ```bash

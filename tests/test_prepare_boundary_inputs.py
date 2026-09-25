@@ -937,8 +937,9 @@ def test_peps_norm_and_infidelity_support_dmrg2_src_boundary_guesses():
         "dm",
     ],
 )
-def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode):
+def test_peps_norm_supports_quimb_boundary_compression_modes(fit_mode, quimb_compressor):
     """Non-variational Quimb boundary compressors should share the API."""
+    quimb_compressor(fit_mode.replace("src-mps", "srcmps"))
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=483, dtype="complex128")
 
     result = pepsy.peps_norm(
@@ -1059,8 +1060,9 @@ def test_max_separation_one_handles_single_slice_axis(
 
 
 @pytest.mark.parametrize("fit_mode", ("direct", "src", "zipup", "sdc", "dm"))
-def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
+def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode, quimb_compressor):
     """Direct compressors can absorb the standard BRA/KET layers separately."""
+    quimb_compressor(fit_mode)
     ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=485, dtype="float64")
 
     result = pepsy.peps_norm(
@@ -1088,8 +1090,10 @@ def test_peps_norm_supports_sequential_direct_layer_compression(fit_mode):
 @pytest.mark.parametrize("fit_layer_order", ("input", "auto"))
 def test_contract_layered_supports_sequential_three_layer_compression(
     fit_layer_order,
+    quimb_compressor,
 ):
     """A tagged BRA--PEPO--KET target uses the multilayer boundary façade."""
+    quimb_compressor("sdc")
 
     def add_unit_layer(tn, layer, *, lx=2, ly=2):
         for x in range(lx):
@@ -1232,8 +1236,9 @@ def test_contract_boundary_rejects_sequential_flat_mode():
         "global",
     ),
 )
-def test_contract_flat_supports_all_fit_modes_for_one_effective_layer(fit_mode):
+def test_contract_flat_supports_all_fit_modes_for_one_effective_layer(fit_mode, quimb_compressor):
     """All FIT and direct modes work on the intended flat single-layer path."""
+    quimb_compressor(fit_mode)
     flat_layer = _make_unit_flat_layer()
     n_iter = 2 if fit_mode == "dmrg2" else 1
 
@@ -1350,8 +1355,9 @@ def test_peps_norm_dmrg2_reports_two_site_warmup_and_one_site_refinement():
 
 
 @pytest.mark.parametrize("fit_init_strategy", ["guess-direct", "guess-sdc"])
-def test_peps_norm_supports_additional_dmrg2_guess_strategies(fit_init_strategy):
+def test_peps_norm_supports_additional_dmrg2_guess_strategies(fit_init_strategy, quimb_compressor):
     """Direct and SDC disposable guesses should feed the same DMRG2 path."""
+    quimb_compressor(fit_init_strategy.removeprefix("guess-"))
     ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=485, dtype="complex128")
 
     result = pepsy.peps_norm(
@@ -3114,6 +3120,9 @@ def test_contract_flat_ctmrg_rejects_incompatible_mode_options(
 )
 def test_contract_flat_unvalidated_ctmrg_rejects_native_symmray(monkeypatch, kwargs):
     """Unvalidated Quimb modes must not claim native Symmray support."""
+    monkeypatch.setattr(
+        pepsy.boundary.metrics, "require_quimb_1d_callable_compression", lambda: None,
+    )
 
     class _FlatTN:
         Lx = 2

@@ -14,6 +14,21 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Released Quimb compressors receive random seeds through their supported
+  API or a shared legacy RNG lock, including MPO, boundary, and tree-PEPS
+  paths. Tree edge compression detects the upstream NumPy single-precision
+  eigensolver compilation failure and warns before using direct SVD with the
+  same dtype and truncation policy.
+- Older Quimb builds reject unsupported non-NumPy SRC and Torch SDCR with
+  explicit capability errors. MPS/MPO FIT uses a warned direct warm start
+  when backend-native SRC noise is unavailable, preserving its exact target.
+- CI separates smoke contracts from extended coverage, supplies MPI's
+  stabilizer dependency, and aligns mypy with the runner's dependency stubs.
+  Tests handle Python 3.10 TOML parsing and declare optional backend and
+  upstream feature requirements explicitly.
+- The MPI throughput benchmark warms one serial shot per rank before timed
+  worker execution, avoiding cold concurrent native-library initialization.
+
 - FIT gate windows again cache only visited target tags and boundary bonds;
   the optional immutable target snapshot is built on demand. Native Symmray
   MPO-product DMRG uses a direct-SVD automatic warm start, avoiding SDC's
