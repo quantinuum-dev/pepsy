@@ -36,10 +36,9 @@ jobs:
             extras: dev
           - python-version: "3.12"
             profile: extended
-            extras: dev,test-extended,contraction
-          - python-version: "3.12"
-            profile: vmc
-            extras: dev,vmc
+            # One full run covers optional backends across every domain,
+            # including JAX checks outside the VMC test modules.
+            extras: dev,test-extended,contraction,vmc
     runs-on: ubuntu-latest
     env:
       NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
@@ -69,9 +68,9 @@ jobs:
       - name: Run extended tests with coverage
         if: matrix.profile == 'extended'
         run: pytest -q -o addopts="" --cov=pepsy --cov-report=term-missing --cov-fail-under=60
-      - name: Run tests
-        if: matrix.profile == 'vmc' || (matrix.profile == 'core' && matrix.python-version != '3.12')
-        run: pytest -q -o addopts=""
+      - name: Run core interpreter contracts
+        if: matrix.profile == 'core' && matrix.python-version != '3.12'
+        run: python -m pytest -q -o addopts="" -m "core and not optional and not slow"
 
   typecheck:
     runs-on: ubuntu-latest

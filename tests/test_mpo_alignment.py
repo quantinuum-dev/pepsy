@@ -10,8 +10,14 @@ from pepsy.fitting import FIT
 
 
 @pytest.mark.parametrize("mode", [None, "direct", "mpo", "quimb"])
+def test_direct_aliases_select_canonical_mode(mode):
+    kwargs = {} if mode is None else {"mode": mode}
+    opt = MpoOptimizer(qtn.MPO_identity(2), chi=4, **kwargs)
+    assert opt.mode == "quimb-direct"
+
+
 @pytest.mark.parametrize("sides", ["both", "ket", "bra", "pair"])
-def test_direct_aliases_preserve_raw_operator_convention(mode, sides):
+def test_direct_preserves_raw_operator_convention(sides):
     rng = np.random.default_rng(927)
     operator, gate, bra = [
         rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
@@ -24,11 +30,9 @@ def test_direct_aliases_preserve_raw_operator_convention(mode, sides):
         expected = gate.T @ expected
     if sides != "ket":
         expected = expected @ (gate if sides == "both" else bra).conj()
-    kwargs = {} if mode is None else {"mode": mode}
     opt = MpoOptimizer(qtn.MatrixProductOperator.from_dense(operator, dims=[2, 2]),
-                       gates=[(payload, (0, 1))], chi=16, **kwargs)
+                       gates=[(payload, (0, 1))], chi=16, mode="direct")
     out = opt.run(cutoff=0.0)
-    assert opt.mode == "quimb-direct"
     np.testing.assert_allclose(out.to_dense(), expected, atol=1e-10)
     assert opt.norm_diagnostics()["norm"] == pytest.approx(np.linalg.norm(expected))
 
