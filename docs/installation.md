@@ -1,5 +1,7 @@
 # Installation
 
+Pepsy requires **Python 3.12 or newer** for the base package and every extra.
+
 From a Pepsy checkout, install the base package in your selected environment:
 
 ```bash
@@ -36,7 +38,6 @@ sequence to run in full:
 `vmc-torch` reuses `torch`; `vmc-netket` includes `symmetry`; `vmc` combines
 both VMC profiles. `test-extended` combines optional test dependencies and is
 intended for contributors, including Autograd for its explicit autodiff tests.
-The development extra includes the TOML reader backport only on Python 3.10.
 Composed profiles preserve dependency requirements
 while avoiding duplicate definitions in `pyproject.toml`.
 

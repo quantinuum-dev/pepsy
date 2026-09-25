@@ -25,12 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python-version: "3.10"
-            profile: core
-            extras: dev
-          - python-version: "3.11"
-            profile: core
-            extras: dev
           - python-version: "3.12"
             profile: core
             extras: dev
@@ -61,16 +55,20 @@ jobs:
         # Ruff's F rules cover the Pyflakes checks and honor noqa markers for
         # intentional lazy, type-only, and compatibility exports.
         run: python -m ruff check src/pepsy tests
-      - name: Run smoke tests
-        if: matrix.python-version == '3.12' && matrix.profile == 'core'
+      - name: Run core contracts and smoke tests
+        if: matrix.profile == 'core'
         # Whole-package coverage is enforced by the extended suite below.
-        run: python -m pytest -q
+        run: python -m pytest -q -o addopts="" -m "smoke or (core and not optional and not slow)"
       - name: Run extended tests with coverage
         if: matrix.profile == 'extended'
-        run: pytest -q -o addopts="" --cov=pepsy --cov-report=term-missing --cov-fail-under=60
-      - name: Run core interpreter contracts
-        if: matrix.profile == 'core' && matrix.python-version != '3.12'
-        run: python -m pytest -q -o addopts="" -m "core and not optional and not slow"
+        run: python -m pytest -q -o addopts="" --maxfail=1 --cov=pepsy --cov-report=term-missing --cov-fail-under=60
+      - name: Report coverage after failure
+        if: failure() && matrix.profile == 'extended'
+        run: |
+          if [ -f .coverage ]; then
+            coverage_total="$(python -m coverage report --format=total --fail-under=0)"
+            echo "::notice title=Coverage::${coverage_total}% (required: 60%)"
+          fi
 
   typecheck:
     runs-on: ubuntu-latest
@@ -84,9 +82,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Run focused type checks
-        # Match the runner and its installed dependency stubs. Python 3.10
-        # compatibility is exercised by the core test matrix.
-        run: python -m mypy --python-version 3.12 src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
+        run: python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
 
   mpi:
     name: MPI (${{ matrix.ranks }} ranks)

@@ -1,7 +1,7 @@
 # Contributing to Pepsy
 
-Pepsy uses a `src/` layout and supports Python 3.10 and newer versions tested
-by CI. Create an isolated environment, install the development profile, and
+Pepsy uses a `src/` layout and requires Python 3.12 or newer. CI runs on
+Python 3.12. Create an isolated environment, install the development profile, and
 run the fast test suite before opening a change:
 
 ```bash
@@ -57,22 +57,24 @@ MPS symmetry tests are marked `optional` because every case requires Symmray.
 Small shared reference builders live in `_mps_test_helpers.py` and
 `_tree_test_helpers.py`; keep setup used by only one suite in that suite.
 
-CI runs the smoke profile on Python 3.12 and
-`-m "core and not optional and not slow"` on the other core interpreters.
+CI runs `-m "smoke or (core and not optional and not slow)"` on Python 3.12
+with the development dependencies, covering the smoke and core contracts.
 One extended job installs `.[dev,test-extended,contraction,vmc]` and runs the
 complete collection with a 60% whole-package coverage gate. Combining optional
 profiles keeps JAX coverage in MPS, tree, and operator tests as well as VMC,
 without a second full-suite VMC job. Optional tests skip only when their
 dependency or required upstream capability is absent. The smoke job checks
 contracts without a whole-package coverage gate.
+The extended job stops at the first failing test and publishes its traceback
+as a GitHub annotation; successful runs still execute the full collection.
 MPI integration CI installs `.[dev,mpi,stabilizer]` to exercise stabilizer
 trajectories as well as ordinary MPS and tree execution.
 
-The type-check job targets its Python 3.12 runtime so installed NumPy stubs
+The type-check configuration targets Python 3.12 so installed NumPy stubs
 use the same language version. Reproduce it with:
 
 ```bash
-python -m mypy --python-version 3.12 src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
+python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
 ```
 
 To measure the local import boundary without importing an advanced domain:

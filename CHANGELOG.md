@@ -12,6 +12,12 @@ PePsY follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+### Changed
+
+- Pepsy now requires Python 3.12 or newer. Python 3.10/3.11 support and the
+  development-only TOML backport are removed. CI, release builds, and static
+  analysis use the Python 3.12 baseline.
+
 ### Fixed
 
 - Released Quimb compressors receive random seeds through their supported
@@ -24,7 +30,7 @@ Changes for the next release should be added here before the version is bumped.
   when backend-native SRC noise is unavailable, preserving its exact target.
 - CI separates smoke contracts from extended coverage, supplies MPI's
   stabilizer dependency, and aligns mypy with the runner's dependency stubs.
-  Tests handle Python 3.10 TOML parsing and declare optional backend and
+  Tests declare optional backend and
   upstream feature requirements explicitly.
 - The MPI throughput benchmark warms one serial shot per rank before timed
   worker execution, avoiding cold concurrent native-library initialization.

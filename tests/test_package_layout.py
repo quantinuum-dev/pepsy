@@ -4,10 +4,7 @@ import importlib
 import importlib.metadata
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
+import tomllib
 
 import pytest
 from packaging.requirements import Requirement

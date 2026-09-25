@@ -47,6 +47,9 @@ Other repository areas:
 - `tests/`: package tests
 
 ## Install
+
+Requires **Python 3.12 or newer**.
+
 ```bash
 python -m pip install .                 # from this checkout
 # Or choose a feature profile:

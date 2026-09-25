@@ -1,9 +1,18 @@
 """Test configuration for local src-layout imports."""
 
 from pathlib import Path
+import os
 import sys
 
 import pytest
+
+
+def pytest_runtest_logreport(report):
+    """Expose CI failures as annotations even when raw job logs are unavailable."""
+    if report.failed and os.environ.get("GITHUB_ACTIONS") == "true":
+        message = f"{report.nodeid}\n{report.longreprtext}"[:12000]
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"\n::error title=pytest failure::{message}")
 
 
 @pytest.fixture
