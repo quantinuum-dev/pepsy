@@ -126,7 +126,7 @@ from ..._internal.quimb import (
     quimb_1d_compression_method_supports_seed as _quimb_compression_method_supports_seed,
     require_quimb_1d_compression_method as _require_quimb_compression_method,
 )
-from ...tensors.core import mps_entanglement_entropy as _mps_entanglement_entropy
+from ...tensors.observables import mps_entanglement_entropy as _mps_entanglement_entropy
 from ...tensors.core import tn_fidelity
 from ...operators.gates import (
     _normalize_gate_entries,

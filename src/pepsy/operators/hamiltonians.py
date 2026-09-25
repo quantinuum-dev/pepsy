@@ -285,7 +285,7 @@ class ham_tn:
         ``pepsy.backend_jax(...)``. Local MPO tensors are placed on this
         backend before term addition and compression, and are converted once
         more at the return boundary for safety.
-    mapper : pepsy.tensors.core.OneDMap | None, default=None
+    mapper : pepsy.tensors.OneDMap | None, default=None
         Optional preconfigured lattice mapper. When omitted, a default
         ``OneDMap(Lx, Ly, Lz=Lz, mode="snake")`` is constructed.
     map_mode : str | None, default=None
@@ -298,7 +298,7 @@ class ham_tn:
         Mapping from 1D chain index to lattice coordinate.
     map_inv : dict[tuple[int, int] | tuple[int, int, int], int]
         Inverse mapping from lattice coordinate to 1D index.
-    mapper : pepsy.tensors.core.OneDMap
+    mapper : pepsy.tensors.OneDMap
         Stored mapping helper instance used to build ``map`` and ``map_inv``.
     map_mode : str
         Canonical name of the stored ``OneDMap`` traversal.
@@ -455,7 +455,7 @@ class ham_tn:
                 mode="snake" if map_mode is None else map_mode,
             )
         elif not isinstance(mapper, OneDMap):
-            raise TypeError("mapper must be a pepsy.tensors.core.OneDMap instance or None.")
+            raise TypeError("mapper must be a pepsy.tensors.OneDMap instance or None.")
 
         if mapper.shape != ((self.L_x, self.L_y) if self.L_z is None else (self.L_x, self.L_y, self.L_z)):
             raise ValueError(
@@ -517,7 +517,7 @@ class ham_tn:
             Used to construct the internal builder instance.
         to_backend : callable | None, default=None
             Optional array converter stored on the internal builder.
-        mapper : pepsy.tensors.core.OneDMap | None, default=None
+        mapper : pepsy.tensors.OneDMap | None, default=None
             Optional mapper forwarded to the internal builder. When omitted,
             the default snake-style mapper is used.
         return_mpo : bool, default=True
@@ -1141,7 +1141,7 @@ class ham_tn:
             Show an MPS-style ``tqdm`` progress bar. Term-by-term builds
             advance once per term and report the current ``chi`` together
             with any temporary pre-compression peak bond.
-        mapper : pepsy.tensors.core.OneDMap | None, default=None
+        mapper : pepsy.tensors.OneDMap | None, default=None
             Optional mapper override used only for this MPO build. When
             omitted, the builder's configured mapper is used.
         map_mode : str | None, default=None

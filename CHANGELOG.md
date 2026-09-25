@@ -94,6 +94,10 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Changed
 
+- Symmetric tensor helpers and MPS/MPO diagnostics import plain helpers from
+  their owning modules. Legacy contraction and fidelity wrappers retain their
+  patch hooks; public exports remain available.
+
 - Shared optimizer event parsing now lives outside the MPS replay module.
   Tree layout can import it without initializing MPS replay or FIT, while
   existing parser import paths remain available.
