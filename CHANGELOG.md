@@ -14,6 +14,9 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Renormalize native Symmray SU gauge vectors over their backend blocks,
+  preserving Torch gradients and stable exponent accounting without densifying
+  the vectors or calling an unsupported Symmray mean.
 - Forward `cutoff_mode` through PEPO gate construction and its fallback
   compression, which also now respects the requested `cutoff`. Expose optional
   cutoff-mode selection for compressed hyper-contraction.

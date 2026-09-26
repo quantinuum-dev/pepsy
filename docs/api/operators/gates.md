@@ -40,6 +40,10 @@ to their largest magnitude, avoiding squares of very large or tiny inputs.
 gauge uses scale one and remains zero, with finite exponent bookkeeping.
 This tracks numerical scale; it does not normalize a physical overlap.
 
+Native Symmray `BlockVector` gauges use the same rule, reducing over backend
+blocks and weighting every singular value equally even when sector sizes
+differ. Blocks remain native, and the scale is detached at the block backend.
+
 ## Native fermionic gates
 
 The gate-to-operator builders accept native Symmray fermionic gates directly;

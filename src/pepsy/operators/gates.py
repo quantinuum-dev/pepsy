@@ -2711,10 +2711,18 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
         )
     ix = next(iter(bond_ix_set))
     s = gauges[ix]
-    magnitudes = ar.do("abs", _stop_gradient(s))
-    peak = ar.do("max", magnitudes)
+    # SU singular values can be Symmray BlockVectors. Reduce their backend
+    # blocks directly: Symmray has no mean, and detaching its wrapper does not
+    # necessarily detach the Torch blocks it contains.
+    blocks = tuple(s.blocks.values()) if hasattr(s, "blocks") else (s,)
+    if not blocks:
+        return
+    magnitudes = tuple(ar.do("abs", _stop_gradient(block)) for block in blocks)
+    peak = ar.do("max", ar.do("stack", [ar.do("max", b) for b in magnitudes]))
     peak_safe = ar.do("where", peak > 0, peak, peak * 0 + 1)
-    norm_s = peak * ar.do("sqrt", ar.do("mean", (magnitudes / peak_safe) ** 2))
+    count = sum(ar.size(b) for b in magnitudes)
+    square_sum = sum(ar.do("sum", (b / peak_safe) ** 2) for b in magnitudes)
+    norm_s = peak * ar.do("sqrt", square_sum / count)
     # A nonzero subnormal RMS can round to zero even after relative scaling.
     norm_s = ar.do("where", norm_s > 0, norm_s, peak_safe)
     scale = ar.do("where", norm_s > smudge, norm_s, norm_s * 0 + smudge)
