@@ -21,6 +21,12 @@ initialize replay, Gibbs preparation, or MPO optimization; the layout helpers
 still use their own numerical dependencies. `GibbsMps` remains available from
 `pepsy.optimizers` and `pepsy.optimizers.mps`.
 
+Standalone `guess` and `svd_guess` helpers can be imported from
+`pepsy.optimizers.mps` without initializing the replay optimizer. Their owner
+is `pepsy.optimizers.mps.compression`; the previous imports from
+`pepsy.optimizers.mps.optimizer` remain compatible. Replay methods, defaults,
+and canonical-state bookkeeping are unchanged by this module separation.
+
 ## Replay options
 
 Quimb replay accepts `run(compression_opts=...)` for independently controlled

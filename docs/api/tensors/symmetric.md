@@ -10,6 +10,13 @@ newer (`python -m pip install ".[symmetry]"` from the checkout) and share Pepsy'
 requirement. Version 0.4.0 fixes pending fermionic phases in
 scalar readout and reductions, and fused charge selection under Torch `vmap`.
 
+Import state wrappers with `from pepsy.tensors import SymMPS, SymPEPS`.
+Import model helpers and diagnostics from the same `pepsy.tensors` namespace.
+The earlier `pepsy.tensors.symmetric` imports remain compatible, including
+class and function references in existing pickled states and models. Internally,
+states, fermion models, and diagnostics have separate implementation modules;
+see the [module map](../../development/modules/tensors.md#symmetric-tensors).
+
 For flat-Z2 Torch PEPS, `TorchPEPSAmplitude(..., amplitude_batching="auto")`
 already probes batching and keeps a serial fallback. Explicit `"vmap"` is
 also available. This does not make variable-sector U1/U1U1 contractions or

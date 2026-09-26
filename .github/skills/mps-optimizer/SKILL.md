@@ -10,6 +10,12 @@ Use this skill for `pepsy.MpsOptimizer` and its implementation in
 [`docs/api/optimizers/mps.md`](../../../docs/api/optimizers/mps.md) and the closest
 tests before editing.
 
+`mps/_streams.py` owns stream snapshots, symbolic gate resolution, and queue
+normalization. `mps/compression.py` owns stateless Quimb compression adapters,
+method option groups, and disposable `guess`/`svd_guess` helpers. Replay, FIT
+targets, rollback, normalization, and canonical-state bookkeeping remain on
+`MpsOptimizer`; old helper imports from `optimizer.py` remain compatible.
+
 ## Decision guide
 
 Make decisions in this order; each choice owns a different invariant:

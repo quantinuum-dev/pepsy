@@ -24,9 +24,16 @@ Backend configuration belongs to `pepsy.backends`.
   `canonicalize=None, allow_local=True`; caller input is preserved. Small unresolved
   gaps are distinct from numerical peripheral modes, and Arnoldi can grow
   its basis within an explicit memory cap.
-- `symmetric.py`: Symmray-backed `SymMPS`, `SymPEPS`, symmetric Hamiltonian,
-  gate-stream, charge-sector, and dense-operator conversion helpers.
-- `symm_fermions.py`: fermion model interfaces and operator construction.
+- `symmetric.py`: symmetric Hamiltonians, MPO builders, legacy Hubbard gate
+  streams, shared charge sectors, and operator conversion. Historical model,
+  state, and diagnostic imports resolve lazily to their owners.
+- `symmetric_diagnostics.py`: native block, MPS/MPO/PEPS, charge, and fermionic
+  ordering summaries and drawings. Plotting libraries load only when drawing.
+- `symmetric_states.py`: `SymMPS`, `SymPEPS`, and their shared state behavior:
+  construction, copying, charge metadata, evolution, and measurement.
+- `symm_fermions.py`: `Fermion`, its compatibility constructors and
+  `SymmFermions` factories, lattice metadata, local observables, parameterized
+  gates, and model-facing term and gate-stream construction.
 - `validation.py`: shared PEPS tag and physical-index validation helpers.
 
 The public namespace resolves these implementations lazily. Keep new helpers
@@ -117,8 +124,16 @@ these conventions for shape inference and layer construction.
 
 ## Symmetric tensors
 
-`symmetric.py` provides Symmray-backed convenience wrappers and charge-sector
-helpers. Symmray remains optional. Code and tests that depend on it should
+`symmetric.py` supplies the shared conversion and Hamiltonian layer to
+`symm_fermions.py`, `symmetric_states.py`, and `symmetric_diagnostics.py`.
+State wrappers also use the diagnostic summaries directly. The shared layer
+does not eagerly import any of those modules; `SymHamiltonian.jw_energy`
+imports the shared state type only when validating a state. Existing imports
+and serialized class/function references through `pepsy.tensors.symmetric`
+continue to resolve to the same objects. Public namespace exports and internal
+state constructors point directly to the owning implementations.
+
+Symmray remains optional. Code and tests that depend on it should
 import lazily or use `pytest.importorskip("symmray")`.
 
 For spinful Fermi-Hubbard states, the named model presets are:

@@ -13,13 +13,21 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 - `mps/`: MPS gate-stream optimization.
   - `__init__.py`: lazy public exports; selecting layout helpers does not load
     replay, Gibbs preparation, or MPO optimization.
-  - `optimizer.py`: `MpsOptimizer`.
+  - `optimizer.py`: `MpsOptimizer`, including replay scheduling, live-state
+    canonical metadata, FIT targets, rollback, and normalization.
+  - `_streams.py`: immutable stream snapshots, symbolic gate resolution, and
+    queue normalization. State/backend validation stays on the optimizer;
+    trajectory grammar stays in the shared noise implementation.
   - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
   - `gibbs.py`: purified finite-temperature `GibbsMps` preparation.
   - `diagnostics.py`: private, dependency-free layout formatting and FIT timing
     summaries. Timing collection and numerical diagnostics remain on the optimizer.
-  - `compression.py`, `normalization.py`: empty reserved import paths;
-    these responsibilities remain on `MpsOptimizer` in `optimizer.py`.
+  - `compression.py`: stateless Quimb compression adapters, method option
+    groups, and disposable `guess` / `svd_guess` construction. These helpers
+    can load without initializing MPS replay or FIT. Historical imports from
+    `optimizer.py` remain aliases to the same objects.
+  - `normalization.py`: empty reserved import path; normalization remains on
+    `MpsOptimizer` alongside its live canonical metadata.
 - `mpo/`: MPO gate-stream optimization.
   - `optimizer.py`: `MpoOptimizer`.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.
@@ -132,9 +140,10 @@ an MPS mode rebuilds and canonicalizes the state.
 
 The `mps`, `mpo`, `peps`, `sweep`, `tree`, `tree_peps`, `energy`, and `qmera`
 entry packages resolve exports lazily. Importing or listing one of these
-namespaces does not load its numerical implementations. Each export still
-comes from its original implementation module; direct child-module imports
-remain available. Accessing an implementation loads its actual dependencies.
+namespaces does not load its numerical implementations. Each export resolves
+directly to its owning implementation; historical child-module imports remain
+available through compatibility aliases. Accessing an implementation loads its
+actual dependencies.
 
 Geometry-only callers can import `QMeraGeometry` from `qmera` or `TreePepsPlan`
 from `tree_peps` without initializing NumPy, Quimb, or an optimizer. This does

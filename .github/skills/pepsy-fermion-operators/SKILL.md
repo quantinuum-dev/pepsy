@@ -15,11 +15,14 @@ gate construction explicit internally.
 - `AGENTS.md` and any nested instructions.
 - `references/design.md` in this skill for the studied basis, charge, and API
   conventions.
-- `src/pepsy/tensors/symmetric.py`, especially the current
-  `SpinfulFermion`, `symm_operator_from_dense`, local fermion helpers, and
-  `SymHamiltonian` model dispatch.
-- `src/pepsy/tensors/symm_fermions.py` and `src/pepsy/tensors/__init__.py` for
-  the model-facing namespace and aliases.
+- `src/pepsy/tensors/symm_fermions.py` for `Fermion`, `SpinfulFermion`, local
+  observables, parameterized gates, and model-facing factories.
+- `src/pepsy/tensors/symmetric.py` for `symm_operator_from_dense`, shared
+  charge helpers, MPO construction, and `SymHamiltonian` dispatch.
+- `src/pepsy/tensors/symmetric_states.py` for state construction and evolution,
+  `symmetric_diagnostics.py` for summaries/drawings, and
+  `src/pepsy/tensors/__init__.py` for lazy public exports. Historical imports
+  from `symmetric.py` are compatibility aliases, not implementation owners.
 - `references/symmray-native.md` for the compact sign, dummy-mode, MPS/PEPS,
   and SymDMRG2 implementation map, including the relevant commit trail and
   the upstream docs/changelog watch protocol.
