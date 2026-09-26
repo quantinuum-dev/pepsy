@@ -14,6 +14,8 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Development
 
+- Extract MPS layout execution into a private module while retaining optimizer
+  method signatures, documentation, subclass hooks, and class hierarchy.
 - Separate native symmetry diagnostics and fermion model helpers from the
   shared Hamiltonian/conversion layer. Move MPS stream preparation and
   stateless compression adapters into focused modules. Preserve public imports,

@@ -27,6 +27,10 @@ is `pepsy.optimizers.mps.compression`; the previous imports from
 `pepsy.optimizers.mps.optimizer` remain compatible. Replay methods, defaults,
 and canonical-state bookkeeping are unchanged by this module separation.
 
+Layout installation, scheduling, and logical readout remain methods of
+`MpsOptimizer`. Their execution helpers live in a private module; callers and
+subclasses continue to use the same methods and layout-finder hooks.
+
 ## Replay options
 
 Quimb replay accepts `run(compression_opts=...)` for independently controlled

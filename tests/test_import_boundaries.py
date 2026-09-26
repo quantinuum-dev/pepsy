@@ -174,6 +174,23 @@ print(*sorted(name for name in sys.modules if name in {
     assert not loaded
 
 
+def test_mps_layout_execution_does_not_import_optimizer():
+    """The layout implementation receives optimizer state without importing it."""
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.optimizers.mps import _layout_execution
+
+assert callable(_layout_execution.apply_layout)
+print(*sorted(name for name in sys.modules if name in {
+    'pepsy.optimizers.mps.optimizer', 'pepsy.optimizers.mps.gibbs',
+    'pepsy.optimizers.noise', 'pepsy.fitting.local',
+}))
+"""
+    )
+    assert not loaded
+
+
 def test_symmetric_model_and_diagnostic_legacy_imports():
     """Either owner imports first and historical pickle globals still load."""
     for first in ("symmetric", "symm_fermions", "symmetric_diagnostics"):

@@ -19,6 +19,12 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     queue normalization. State/backend validation stays on the optimizer;
     trajectory grammar stays in the shared noise implementation.
   - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
+  - `_layout_execution.py`: optimizer layout installation, logical/physical
+    mapping, reordering, schedule installation, and logical readout. Functions
+    receive the live optimizer and call its canonicalization, native-swap,
+    stream-validation, and replay hooks. Public methods retain their signatures
+    and documentation on `MpsOptimizer`; private method aliases preserve
+    descriptor binding and subclass overrides without adding a base class.
   - `gibbs.py`: purified finite-temperature `GibbsMps` preparation.
   - `diagnostics.py`: private, dependency-free layout formatting and FIT timing
     summaries. Timing collection and numerical diagnostics remain on the optimizer.

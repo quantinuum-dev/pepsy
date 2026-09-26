@@ -15,6 +15,11 @@ normalization. `mps/compression.py` owns stateless Quimb compression adapters,
 method option groups, and disposable `guess`/`svd_guess` helpers. Replay, FIT
 targets, rollback, normalization, and canonical-state bookkeeping remain on
 `MpsOptimizer`; old helper imports from `optimizer.py` remain compatible.
+`mps/_layout_execution.py` owns layout installation, mapping, reordering,
+schedule installation, and logical readout. It receives the live optimizer
+explicitly and calls its hooks; preserve subclass dispatch through `self`.
+Keep public signatures/docstrings on `MpsOptimizer` and keep geometry search
+in `mps/layout.py`. Do not introduce a second copy of layout or canonical state.
 
 ## Decision guide
 
