@@ -71,7 +71,7 @@ modification was needed for the spin path. The native Symmray path is
 **deferred** from this change, so its representation is preserved.
 
 Validation is recorded in the
-[session handoff](../../../history/2026-09-25-qmera-1d-retained-registers.md).
+[session handoff](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-25-qmera-1d-retained-registers.md).
 The focused regressions compare the 1D gate stream to a dense Pauli circuit, direct and
 compiled local energies, and Torch gradients, alongside the existing 2D and
 native fermion tests.

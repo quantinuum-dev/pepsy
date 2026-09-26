@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 
 from .._internal.cutoff import dtype_auto_cutoff
 from .._internal.quimb import require_quimb_1d_compression_method, run_seeded_quimb
-from ..tensors.core import tn_fidelity
+from ..tensors.observables import tn_fidelity
 from ..fitting.local import FIT
 from ._fit_policy import (
     _FIT_QUIMB_MODES,

@@ -18,7 +18,7 @@ in the identity future cap used by marginal_chi=None/0 in boundary mode.
 - Autoray 0.11.1.dev3+g1b476b305; Quimb 1.15.1.dev66+ge927f06e1;
   Torch 2.6.0+cu124; RTX A5000 on cuda:0.
 - Reused the unchanged numerical dependency audit from the earlier
-  [PEPS implementation](../../../history/2026-09-26-peps-simple-update-implementation.md).
+  [PEPS implementation](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-26-peps-simple-update-implementation.md).
 - Source: [PepsSampler](../../../src/pepsy/sampling/samplers.py), lines
   4306–5597 at this revision; [public sampler guide](../../api/sampling/samplers.md).
 - Bounded probes: /tmp/peps_sampler_torch_audit.py and its JSON/log;

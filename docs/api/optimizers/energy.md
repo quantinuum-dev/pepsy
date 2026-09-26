@@ -8,7 +8,6 @@ the default remains boundary contraction. Select a compatible compressor with
 `boundary_mode`, for example `boundary_mode="direct"` with `route="envs"`.
 
 
-> API details are maintained as handwritten Markdown in this page.
 
 ## Torch SVD/QR policy
 

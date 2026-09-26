@@ -448,9 +448,9 @@ def ps_to_peps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymPEPS,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymPEPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -810,10 +810,10 @@ def ps_to_mps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymMPS,
             _apply_to_tensor_network_arrays,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymMPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -1579,9 +1579,9 @@ def hrs_to_peps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymPEPS,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymPEPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -1793,9 +1793,9 @@ def hrs_to_mps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymMPS,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymMPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")

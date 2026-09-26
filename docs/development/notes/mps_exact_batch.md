@@ -353,7 +353,7 @@ as did public API/package-layout tests (58). A wider MPS/control/API run had
 mode; that exact failure reproduced on an isolated archive of remote
 `28d9b6c`. The remote exact-reconstruction backend selection had nine passes
 and three JAX complex64 precision failures; the direct case reproduced on the
-same isolated baseline. The [session handoff](../../../history/2026-09-24-mps-exact-batch-rebase.md)
+same isolated baseline. The [session handoff](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-24-mps-exact-batch-rebase.md)
 records the checks and remaining scope.
 
 ## Two-value ZZ layers (2026-09-24)
@@ -414,7 +414,7 @@ agreed with four bounded blocks to maximum absolute error 9.43e-16 at 22
 qubits. Adjacent MPS/control/Quimb/API/package tests had 130 passes and the
 known JAX complex64 direct-mode Kraus-probability precision failure, already
 reproduced on the remote baseline. Ruff, the MPS skill validators, and
-whitespace checks passed. See the [follow-up handoff](../../../history/2026-09-24-mps-two-value-phase.md).
+whitespace checks passed. See the [follow-up handoff](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-24-mps-two-value-phase.md).
 
 ## Mixed Z/ZZ stream compaction (2026-09-24)
 

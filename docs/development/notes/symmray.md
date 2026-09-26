@@ -14,6 +14,65 @@ Phys. Rev. Research 7, 023193 (2025).
 
 ## Upstream audit and current opportunities
 
+### 2026-09-26: symmetric MPO builder extraction
+
+The installed versions remain Symmray `0.4.1.dev8+gc45f91457`, Quimb
+`1.15.1.dev66+ge927f06e1`, Autoray `0.11.1.dev3+g1b476b305`, and Cotengra
+`0.8.3.dev7+g1d7fd333f`. Reused the same-task upstream review below and
+rechecked installed `symmray.utils.from_dense`, `MatrixProductOperator`, and
+`MatrixProductOperator.compress` signatures. Array construction still accepts
+the existing index maps, duals, fermionic flag, and operator charge; compression
+continues to receive the existing cutoff and maximum-bond options.
+
+- **Compatibility shim:** lazy historical builder attributes in
+  `tensors.symmetric` resolve to `operators._symmetric_mpo`. Both import orders
+  and old pickle globals are checked with Symmray unavailable.
+- **Defer:** dependency upgrades and new upstream algorithms. Native grading,
+  Jordan-Wigner strings, compression policy, and backend conversion order are
+  unchanged. Shared charge/basis/mapping helpers remain in `tensors.symmetric`.
+
+### 2026-09-25: model, diagnostic, and MPS helper extraction
+
+Rechecked the installed versions below: all four remain unchanged. Reused
+the same-task Symmray audit and inspected the installed local-element builder,
+`tensor_network_1d_compress`, `gate_nonlocal_`, and `gate_with_submpo_`
+signatures. Reviewed the [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Cotengra changelog](https://cotengra.readthedocs.io/en/latest/changelog.html),
+and [Autoray repository](https://github.com/jcmgray/autoray).
+
+- **Compatibility shim:** lazy historical model and diagnostic attributes in
+  `symmetric.py`; direct aliases for the relocated MPS helpers. Old serialized
+  model and stream-plan class paths still resolve to the same classes.
+- **Defer:** new upstream behavior and dependency upgrades. Existing Quimb
+  cutoff/seed/interior-compression policies and native fermion conventions are
+  retained. AST comparison confirms all 196 non-facade symmetry definitions,
+  all 20 MPS top-level definitions (including the entire optimizer class), and
+  all three previously extracted state classes are unchanged.
+
+### 2026-09-25: state implementation extraction
+
+Installed versions checked for this refactor: Symmray
+`0.4.1.dev8+gc45f91457`, Quimb `1.15.1.dev66+ge927f06e1`, Autoray
+`0.11.1.dev3+g1b476b305`, and Cotengra `0.8.3.dev7+g1d7fd333f`.
+Inspected the installed edge-based and PEPS random-constructor signatures and
+the native local-operator builders/charge-index maps. The state wrappers retain
+their existing backend callbacks, physical sectors, charge patterns, and
+constructor options; their class bodies are unchanged by AST comparison.
+
+Reviewed the official Quimb and Cotengra changelogs, Cotengra documentation,
+Autoray repository, and Symmray repository/metadata. Symmray's Read the Docs
+index, array guide, and changelog were unavailable through the web reader;
+installed source and the official repository supplied the capability boundary.
+No upstream package or numerical policy was changed.
+
+- **Compatibility shim:** historical `symmetric.SymMPS`, `SymPEPS`, and
+  `_SymState` attributes resolve lazily to the extracted state classes. This
+  preserves imports and loading old pickle class paths without an eager cycle.
+- **Defer:** adoption of new upstream constructor, contraction, and conversion
+  behavior. This is an ownership refactor, not a numerical upgrade.
+
+### Earlier capability audit
+
 This note is the human-readable companion to the native fermion skill. Before
 changing native Symmray code, check the [latest
 documentation](https://symmray.readthedocs.io/en/latest/index.html), the

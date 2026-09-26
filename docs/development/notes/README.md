@@ -1,15 +1,14 @@
 # Design and research notes
 
-Conceptual documentation for Pepsy workstreams. These notes explain the ideas
-and intended implementation — the "why" behind the code — so contributors and
-agents share a mental model. They are not auto-generated API docs (those live
-in `docs/api/`).
-
-Keep these in sync as the design firms up; when something is finalized and
-user-facing, promote it into `docs/` (tutorials / how-to).
+These notes record design decisions, compatibility checks, and measurements.
+Read dates and validation limits before applying a finding to current code.
+Document supported public behavior in the [API guides](../../api/index.md)
+and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [Repository organization audit](module_organization_2026_09.md) — Completed
+  sampler, optimizer, and BP splits; remaining design boundaries to review.
 - [`release_readiness_2026_09.md`](release_readiness_2026_09.md) — Release
   compatibility review, migration actions, merge scope, and validation evidence.
 - [`dependency_minimums_2026_09.md`](dependency_minimums_2026_09.md) — Required
@@ -40,11 +39,11 @@ user-facing, promote it into `docs/` (tutorials / how-to).
 
 ## Relationship to other docs
 
-- [`../plans/project.md`](../plans/project.md) — the project roadmap.
+- [Project roadmap](../plans/project.md) — historical progress and proposals.
 - [`../modules/`](../modules/README.md) — concise implementation maps.
 - [Session journal](https://github.com/quantinuum-dev/pepsy/blob/develop/history/README.md) — dated handoffs and validation
   records. Historical findings and proposed next steps are not active policy.
-- `docs/` — the finished, published documentation.
+- [User documentation](../../index.md) — installation, workflows, and APIs.
 
 ```{toctree}
 :hidden:
@@ -72,8 +71,10 @@ gibbs_mps
 mpo_mps_alignment
 mps_dynamic_controls
 mps_entropy_backend
+mps_exact_batch
 mps_final_audit
 mps_fit_copy_validation
+module_organization_2026_09
 mps_gpu_backend_audit
 mps_layout_scheduler
 mps_quimb_compression_audit
@@ -81,9 +82,21 @@ mps_stab_modes_fit
 mps_to_ttn
 mps_transfer
 pepo_backend_dtype
+peps_sampler_api_revision
+peps_sampler_auto_cutoff
+peps_sampler_backend_fix
+peps_sampler_final_sweep_audit
+peps_sampler_performance_assessment
+peps_sampler_performance_implementation
+peps_sampler_torch_audit
+qmera_1d_retained_registers_2026_09
+qmera_2d_retained_hierarchy_2026_09
+qmera_contraction_preflight_2026_09
+qmera_torch_fullgraph_2026_09
 stabilizer_gpu_backend_audit
 torch_export_compile_compatibility
 tree_api_consistency
+tree_alternating_layout
 tree_auto_cutoff
 tree_compact_operators
 tree_entropy

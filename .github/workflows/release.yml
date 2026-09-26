@@ -1,23 +1,13 @@
-name: Release CD (Safe)
+name: Release artifacts
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      publish_to_testpypi:
-        description: "Publish to TestPyPI"
-        type: boolean
-        default: false
-      publish_to_pypi:
-        description: "Publish to PyPI"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,8 +17,7 @@ jobs:
   build_dist:
     name: Build + Validate Artifacts
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -69,37 +58,3 @@ jobs:
         with:
           name: pepsy-dist-${{ steps.meta.outputs.version }}
           path: dist/*
-
-  publish_testpypi:
-    name: Publish to TestPyPI
-    needs: build_dist
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_testpypi }}
-    runs-on: ubuntu-latest
-    environment: testpypi
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: pepsy-dist-${{ needs.build_dist.outputs.version }}
-          path: dist
-
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
-  publish_pypi:
-    name: Publish to PyPI
-    needs: build_dist
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi }}
-    runs-on: ubuntu-latest
-    environment: pypi
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: pepsy-dist-${{ needs.build_dist.outputs.version }}
-          path: dist
-
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1

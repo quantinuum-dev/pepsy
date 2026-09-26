@@ -1,9 +1,17 @@
 # `pepsy.tensors.core`
 
+This module preserves existing imports. For new code, use `pepsy.tensors`
+for [constructors](constructors.md), [contractions](contractions.md), and
+[observables](observables.md), or `pepsy.backends` for backend configuration.
+
+## Backend setup
+
 Use one public setup call for a Torch-autodiff PEPS run:
 
 ```python
-py.register_torch_linalg(
+from pepsy.backends import register_torch_linalg, reset_linalg_registrations
+
+register_torch_linalg(
     mode="real", stabilized=True, quimb_split_drivers=True,
 )
 ```
@@ -16,7 +24,7 @@ automatically from its input dtype.
 
 The Quimb split-driver registration is process-global. Passing
 `quimb_split_drivers=False` does not undo a previous registration; use
-`py.reset_linalg_registrations("torch")` to explicitly restore Quimb's and
+`reset_linalg_registrations("torch")` to explicitly restore Quimb's and
 Autoray's native Torch rules.
 
 `stabilized=True` selects Pepsy's relative-regularized SVD and validated
@@ -51,6 +59,3 @@ real and complex modes use the finite rank-aware QR VJPs; native mode keeps
 Torch's direct QR implementation.
 Calling `reset_linalg_registrations()` restores native Torch/JAX mappings and
 clears Pepsy's registration caches.
-
-
-> API details are maintained as handwritten Markdown in this page.

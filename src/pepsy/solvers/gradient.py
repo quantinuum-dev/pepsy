@@ -70,7 +70,7 @@ def _require_torch() -> None:
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "pepsy.solvers.gradient requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
 
 

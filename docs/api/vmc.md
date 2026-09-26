@@ -1,8 +1,12 @@
 # `pepsy.vmc`
 
-Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can now
+Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can
 wrap a packed PEPS as a Flax model for spin systems, while keeping the
 Fermi-Hubbard helper as a specialization.
+
+Start with the [public workflow](#recommended-public-workflow), or jump to
+[imports](#import-boundaries) and
+[Torch sampling and energy kernels](#torch-sampling-and-local-energy-kernels).
 
 ## Import boundaries
 
@@ -1423,6 +1427,3 @@ print(report.energy.split_r_hat, report.energy.tau_max)
 The live progress display is sampling acceptance only. The check uses a
 cloned random stream, leaves the active walker configurations and RNG state
 unchanged, and is intentionally separate from fixed-size production sampling.
-
-
-> API details are maintained as handwritten Markdown in this page.

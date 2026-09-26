@@ -198,6 +198,3 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
 - `SimpleUpdateGen(update="parallel")` currently supports only direct-neighbor
   terms. Long-range routed terms need route-aware layer scheduling and should
   use `update="sequential"` for now.
-
-
-> API details are maintained as handwritten Markdown in this page.

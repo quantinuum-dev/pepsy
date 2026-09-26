@@ -8,32 +8,79 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
+  NUMBA_DISABLE_CACHING: "1"
+  PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
+  MPLCONFIGDIR: /tmp/mplconfig_pepsy
+  MPLBACKEND: Agg
+
 jobs:
   full:
     name: Full available suite (slow tests included)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
-      NUMBA_DISABLE_CACHING: "1"
-      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
-      MPLCONFIGDIR: /tmp/mplconfig_pepsy
-      MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Cache pip downloads for this job
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py312-${{ github.job }}-${{ hashFiles('pyproject.toml', '.github/workflows/nightly.yml') }}
       - name: Install extended package profile
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,test-extended,contraction]"
-      - name: Validate source syntax
-        run: python -m compileall -q -f src tests
-      - name: Check Python lint
-        run: python -m ruff check src/pepsy tests
+          python -m pip install -e ".[test-extended,contraction,vmc]" pytest pytest-cov
+          python -m pip check
+      - name: Check optional backend imports
+        run: python -c "import jax, netket, symmray, torch; print('Optional backends imported successfully')"
       - name: Run the complete available suite
-        # Empty addopts includes integration and slow tests. VMC/NetKet has a
-        # dedicated CI profile because its dependency set is substantially
-        # larger than the general extended profile.
-        run: pytest -q -o addopts="" --cov=pepsy --cov-report=term-missing --cov-fail-under=60
+        # Empty addopts includes integration and slow tests across all domains.
+        run: python -m pytest -q -ra -o addopts="" --maxfail=1 --cov=pepsy --cov-report=term-missing --cov-fail-under=60
+      - name: Report coverage after failure
+        if: failure()
+        run: |
+          if [ -f .coverage ]; then
+            coverage_total="$(python -m coverage report --format=total --fail-under=0)"
+            echo "::notice title=Coverage::${coverage_total}% (required: 60%)"
+          fi
+
+  mpi:
+    name: MPI (2 and 3 ranks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache pip downloads for this job
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py312-${{ github.job }}-${{ hashFiles('pyproject.toml', '.github/workflows/nightly.yml') }}
+      - name: Install MPI runtime and test profile
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openmpi-bin libopenmpi-dev
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mpi,stabilizer]" pytest
+          python -m pip check
+      - name: Run MPI unit-contract tests
+        run: python -m pytest -q -ra -o addopts="" tests/test_mpi.py
+      - name: Run multi-process integration and benchmark smoke tests
+        run: |
+          for ranks in 2 3; do
+            mpiexec --oversubscribe --bind-to none -n "$ranks" \
+              python -m pytest -q -ra -o addopts="" tests/test_mpi_integration.py
+            mpiexec --oversubscribe --bind-to none -n "$ranks" \
+              python benchmarks/mpi_shots.py \
+              --shots 8 --qubits 2 --depth 1 --chi 4 --workers auto
+          done

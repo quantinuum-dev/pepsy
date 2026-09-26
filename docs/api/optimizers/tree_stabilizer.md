@@ -287,6 +287,3 @@ per-edge singular-spectrum and discarded-weight records returned by
 `truncation_report()` and `get_infidelity_samples()`. Neither metric is a
 physical target-state overlap; the tableau frame does not turn a norm proxy
 into directional fidelity.
-
-
-> API details are maintained as handwritten Markdown in this page.

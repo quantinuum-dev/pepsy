@@ -46,10 +46,10 @@ import numpy as np
 
 import autoray as ar
 
-from .samplers import (
-    FermionConfigurationEncoding,
+from .results import FermionConfigurationEncoding
+from .mps import _fermion_symmray_occupations
+from ._common import (
     _backend_array_to_numpy,
-    _fermion_symmray_occupations,
     _mps_array_backend,
 )
 

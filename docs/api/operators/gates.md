@@ -41,7 +41,6 @@ charge of the sequential gate product. It is opt-in because charged gates
 change the symmetry sector; ordinary charge-preserving evolution should leave
 it disabled.
 
-> API details are maintained as handwritten Markdown in this page.
 
 ## Gate transforms
 

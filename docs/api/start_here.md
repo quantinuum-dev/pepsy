@@ -1,97 +1,28 @@
 # API starting points
 
-This page is the short, task-oriented map of PePsY's public API. Start here
-when you know what you want to accomplish but not which class owns it. The
-linked pages explain the workflow; the generated
-<a href="reference/index.html">API reference</a> contains the complete
-signatures, members, and source links.
+Choose the task you want to perform. Each guide explains the main API and
+its options; the <a href="reference/index.html">generated reference</a> lists
+full signatures and source locations in the built documentation.
 
 ## Choose by task
 
-| Task | Canonical entry point | Detailed guide |
+| Task | Entry point | Guide |
 | --- | --- | --- |
-| Build an MPS or PEPS from a product state | `pepsy.tensors` constructors | [Tensor constructors](tensors/constructors.md) |
-| Prepare and contract a PEPS norm | `pepsy.boundary` | [Boundary metrics](boundary/metrics.md), [boundary states](boundary/states.md) |
-| Apply gates and build operators | `pepsy.operators` | [Gates](operators/gates.md), [Hamiltonians](operators/hamiltonians.md) |
-| Evolve an MPS circuit | `pepsy.optimizers.MpsOptimizer` | [MPS optimization](optimizers/mps.md) |
-| Prepare a Gibbs state with MPS purification | `pepsy.optimizers.GibbsMps` | [GibbsMps](optimizers/gibbs_mps.md) |
-| Evolve or clean up a PEPS | `pepsy.optimizers.PepsOptimizer` | [PEPS optimization](optimizers/peps.md) |
-| Run boundary sweeps | `pepsy.optimizers.SweepOptimizer` | [Sweep optimization](optimizers/sweep.md) |
-| Replay a circuit on a tree | `pepsy.optimizers.TreeOptimizer` | [Tree optimization](optimizers/tree.md) |
-| Sample MPS, PEPS, vector, or tree states | `pepsy.sampling` | [Sampling](sampling/samplers.md) |
-| Use symmetry-aware or fermionic tensors | `pepsy.tensors.SymMPS`, `pepsy.tensors.SymPEPS` | [Symmetric tensors](tensors/symmetric.md) |
-| Run belief propagation | `pepsy.bp` | [Belief propagation](bp.md) |
+| Build an MPS or PEPS | `pepsy.tensors` constructors | [Tensor constructors](tensors/constructors.md) |
+| Contract a PEPS norm or overlap | `build_bra_ket`, `BdyMPS`, `contract_boundary` | [Boundary metrics](boundary/metrics.md) |
+| Apply gates or build operators | `pepsy.operators` | [Gates](operators/gates.md), [Hamiltonians](operators/hamiltonians.md) |
+| Replay an MPS circuit | `MpsOptimizer` | [MPS](optimizers/mps.md) |
+| Prepare a thermal state | `GibbsMps` | [Gibbs MPS](optimizers/gibbs_mps.md) |
+| Evolve a PEPS | `PepsOptimizer` | [PEPS](optimizers/peps.md) |
+| Optimize PEPS boundaries | `SweepOptimizer` | [Sweeps](optimizers/sweep.md) |
+| Replay a circuit on a tree | `TreeOptimizer` | [Tree networks](optimizers/tree.md) |
+| Sample a tensor-network state | `pepsy.sampling` | [MPS/PEPS sampling](sampling/samplers.md), [tree sampling](sampling/tree.md) |
+| Use symmetric or fermionic tensors | `SymMPS`, `SymPEPS`, `Fermion` | [Symmetric tensors](tensors/symmetric.md) |
+| Run belief propagation | `pepsy.bp` | [BP](bp.md) |
 | Run variational Monte Carlo | `pepsy.vmc` | [VMC](vmc.md) |
-| Adapt external circuit representations | `pepsy.interop` | [Package API map](package.md) |
+| Adapt an external circuit | `pepsy.interop` | [Circuit adapters](interop.md) |
 
-## Key classes and functions
-
-### Construct and contract tensor networks
-
-- {py:class}`OneDMap <pepsy.tensors.maps.OneDMap>`,
-  {py:func}`ps_to_mps <pepsy.tensors.constructors.ps_to_mps>`, and
-  {py:func}`ps_to_peps <pepsy.tensors.constructors.ps_to_peps>` create states from product-state
-  data. See [tensor constructors](tensors/constructors.md).
-- {py:func}`build_bra_ket <pepsy.boundary.metrics.build_bra_ket>` prepares a
-  tagged ket and double-layer norm network.
-- {py:class}`BdyMPS <pepsy.boundary.states.BdyMPS>` stores PEPS boundary states,
-  while {py:func}`contract_boundary <pepsy.boundary.metrics.contract_boundary>`
-  performs the boundary contraction and returns diagnostics. See the
-  [boundary API](boundary/metrics.md).
-
-### Optimize states
-
-- {py:class}`MpsOptimizer <pepsy.optimizers.mps.optimizer.MpsOptimizer>` replays
-  one-dimensional gate streams with exact, MPO, FIT,
-  DMRG, and mixed modes. See [MPS optimization](optimizers/mps.md).
-- {py:class}`GibbsMps <pepsy.optimizers.mps.gibbs.GibbsMps>` prepares a
-  finite-temperature purification from Hamiltonian terms and traces ancillas
-  to an MPO. See [GibbsMps](optimizers/gibbs_mps.md).
-- {py:class}`PepsOptimizer <pepsy.optimizers.peps.optimizer.PepsOptimizer>`
-  applies gates to PEPS and optionally performs boundary or
-  global cleanup. See [PEPS optimization](optimizers/peps.md).
-- {py:class}`SweepOptimizer <pepsy.optimizers.sweep.optimizer.SweepOptimizer>`
-  owns PEPS boundary environments and local/global sweep
-  solvers. See [sweep optimization](optimizers/sweep.md).
-- {py:class}`TreeOptimizer <pepsy.optimizers.tree.optimizer.TreeOptimizer>`
-  replays gates on a rooted tree; {py:class}`TreeTensorNetwork
-  <pepsy.optimizers.tree.ttn.TreeTensorNetwork>` is the underlying state
-  container. See [tree optimization](optimizers/tree.md).
-
-### Operators, sampling, and specialized domains
-
-- `gate`, `rx`, and `rzz` are convenient operator constructors; the
-  [operators guide](operators/gates.md) explains the broader gate and MPO API.
-- {py:class}`MpsSampler <pepsy.sampling.samplers.MpsSampler>` and
-  {py:class}`PepsSampler <pepsy.sampling.samplers.PepsSampler>` provide state
-  sampling, with vector and
-  stabilizer variants documented in [sampling](sampling/samplers.md).
-- {py:class}`Fermion <pepsy.tensors.symmetric.Fermion>` is the entry point for
-  symmetry-aware fermionic operators and
-  states. See [symmetric tensors](tensors/symmetric.md).
-- {py:class}`TorchLinalgConfig <pepsy.backends.config.TorchLinalgConfig>` is the
-  single configuration point for PePsY's Torch
-  SVD/QR policy. See the [MPS](optimizers/mps.md) and [PEPS](optimizers/peps.md)
-  guides for usage in optimization workflows.
-
-## Backend compatibility
-
-`pepsy.backends.backend_cupy(...)` uses upstream Autoray namespace handling
-when it supports unhashable device objects. On affected older versions,
-Pepsy bypasses the failing namespace cache while keeping the original device
-object for array creation. No dependency upgrade is required for this fix.
-
-Random FIT initialization inherits the template's backend, device, and dtype
-unless a dtype is explicitly supplied. Complex normal samples use total
-variance `scale**2`, with half in each of the real and imaginary components,
-including the older-Autoray fallback. This corrects that fallback's previous
-factor-of-two variance; existing seeded complex fallback samples therefore
-change in magnitude. Seeds are reproducible within a route, but do not
-promise identical samples across backends or dependency versions.
-
-## Canonical import rule
-
-Prefer responsibility-based namespace imports in application code:
+## Import from the owning namespace
 
 ```python
 from pepsy.boundary import BdyMPS, build_bra_ket, contract_boundary
@@ -100,23 +31,9 @@ from pepsy.sampling import MpsSampler
 from pepsy.tensors import ps_to_mps, ps_to_peps
 ```
 
-The top-level `pepsy` module keeps useful convenience aliases, but the owning
-namespace is the stable place to discover and import a feature. See the
-[package API map](package.md) for the complete namespace ownership table.
-Use `dir(pepsy.optimizers)` or `dir(pepsy.tensors)` to list advertised names
-without loading their implementations. Optional dependencies do not determine
-API stability; see the [stability policy](../stability.md).
+Use the [package map](package.md) for namespace ownership, lazy discovery, and
+backend compatibility. Existing top-level `pepsy` aliases remain available.
 
-## Optional integrations
-
-The core tensor, operator, boundary, optimizer, and sampling paths use the
-base installation. Install only the integration you need:
-
-| Feature | Extra |
-| --- | --- |
-| Torch autodiff and Torch-backed optimization | `.[torch]` |
-| SciPy/NLopt solvers | `.[solvers]` |
-| Tree layout search | `.[layout]` |
-| Symmray symmetry and fermions | `.[symmetry]` |
-| Stabilizer tensor networks | `.[stabilizer]` |
-| NetKet/JAX and Torch VMC | `.[vmc]` |
+Install the [optional features](../installation.md#optional-features) needed
+by your workflow. Optional dependencies and API stability are separate
+concerns; see the [stability policy](../stability.md).

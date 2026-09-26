@@ -1,7 +1,7 @@
-# PLAN.md — pepsy roadmap
+# Pepsy roadmap
 
-Status: living document
-Last updated: 2026-09-14
+Status: historical workstreams and proposals; not a current release checklist
+Workstream snapshot: 2026-09-14; status clarification: 2026-09-25
 Owners: pepsy maintainers + coding agents
 
 This document tracks the planned workstreams for `pepsy` (boundary-MPS tools for
@@ -9,7 +9,11 @@ PEPS norm contraction and DMRG fitting). It is the "what/when" companion to the
 conceptual notes in `../notes/` (the "why/how"), the session journal in
 `history/` (the "what happened"), and the published documentation in `docs/`.
 
-Current package version: `0.4.1` (`pepsy.__version__` / `pyproject.toml`).
+This snapshot was written for version `0.4.1`. The package has since reached
+`0.5.0`; use the [changelog](https://github.com/quantinuum-dev/pepsy/blob/develop/CHANGELOG.md) and
+[migration guide](../api-migration.md) for released changes, and
+`pyproject.toml` for current version and dependency requirements. Completed
+work, prototypes, and deferred proposals below retain their dated context.
 
 Four headline workstreams drive the roadmap:
 

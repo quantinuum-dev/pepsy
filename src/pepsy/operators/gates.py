@@ -3309,7 +3309,7 @@ def _native_gate_stream_info(gate_list, *, allow_charged=False):
 
 def _native_identity_mpo(length, info, *, max_bond, cutoff):
     """Build an identity MPO whose tensors use native fermionic sectors."""
-    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+    from ._symmetric_mpo import (  # pylint: disable=import-outside-toplevel
         _assemble_symmray_mpo,
     )
 

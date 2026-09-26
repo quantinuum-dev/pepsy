@@ -16,8 +16,8 @@ value = tn.contract(all, optimize=optimizer)
 Pepsy requires **Cotengra 0.8.0 or newer**. The default search uses CMA-ES
 when installed; otherwise Pepsy warns and selects Cotengra's built-in
 `sbplx` optimizer, introduced in 0.8.0. Cotengrust is optional: without it,
-Cotengra uses Python pathfinders. Install `pepsy[contraction]` for both
-acceleration dependencies.
+Cotengra uses Python pathfinders. From a Pepsy checkout, run
+`python -m pip install ".[contraction]"` for both acceleration dependencies.
 
 The builder forwards `reconf_opts`, `slicing_opts`, and
 `slicing_reconf_opts` when explicitly supplied. Without these overrides,

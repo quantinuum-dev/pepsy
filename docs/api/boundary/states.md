@@ -11,5 +11,3 @@ wants explicit materialization without touching a key.
 `tn_flat` with `flat=True` means one already-flattened effective lattice layer.
 `tn_double` with `flat=False` is the multi-layer path for tagged BRA--KET or
 BRA--PEPO--KET networks. The `flat` flag does not flatten a stack of layers.
-
-> API details are maintained as handwritten Markdown in this page.

@@ -5,6 +5,8 @@ Concise implementation guides for the main Pepsy package areas:
 - [Boundary](boundary.md)
 - [Tensors](tensors.md)
 - [Optimizers](optimizers.md)
+- [Sampling](sampling.md)
+- [Belief propagation](bp.md)
 - [PEPS optimizer](peps_optimizer.md)
 - [Sweep optimizer](sweep_optimizer.md)
 - [VMC](vmc.md)
@@ -22,6 +24,8 @@ Concise implementation guides for the main Pepsy package areas:
 boundary
 tensors
 optimizers
+sampling
+bp
 peps_optimizer
 sweep_optimizer
 vmc

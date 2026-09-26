@@ -5,20 +5,20 @@ import warnings
 
 
 _SYMBOL_MODULES = {
-    "FermionConfigurationEncoding": ".samplers",
-    "MpsDiagonalEstimate": ".samplers",
-    "MpsBatchSampleResult": ".samplers",
-    "MpsSampleResult": ".samplers",
-    "MpsSampler": ".samplers",
+    "FermionConfigurationEncoding": ".results",
+    "MpsDiagonalEstimate": ".results",
+    "MpsBatchSampleResult": ".results",
+    "MpsSampleResult": ".results",
+    "MpsSampler": ".mps",
     "StabilizerMpsSampler": ".stabilizer",
     "MpsStabSampler": ".stabilizer",
-    "PEPSSampleResult": ".samplers",
-    "PepsSampler": ".samplers",
-    "PepsBpSampler": ".samplers",
+    "PEPSSampleResult": ".results",
+    "PepsSampler": ".peps",
+    "PepsBpSampler": ".bp",
     "TreeBatchSampleResult": ".tree",
     "TreeSampleResult": ".tree",
     "TreeSampler": ".tree",
-    "VecSampler": ".samplers",
+    "VecSampler": ".vector",
 }
 
 __all__ = [*_SYMBOL_MODULES, "tree"]

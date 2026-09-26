@@ -1,22 +1,9 @@
 # API reference
 
-Start with the [API starting points](start_here.md) if you are choosing a
-workflow or looking for the main class to use. The [package API map](package.md)
-explains the core versus advanced namespaces and shows the recommended imports.
-The pages below contain the detailed functions and classes for each area.
-
-When the optional Sphinx build is used, the navigation also contains a
-generated reference for the canonical source modules. It complements these
-curated pages by listing signatures, parameters, class members, and direct
-source links for each public object. The complete generated catalog is
-available as the <a href="reference/index.html">generated API reference</a> in
-the built site.
-
-## Find the right entry point
-
-Use the curated [API starting points](start_here.md) to move from a task to a
-canonical namespace, main object, and detailed guide. Use the generated
-reference when you need every method, property, overload, or source location.
+Choose a workflow in [API starting points](start_here.md), or find imports
+in the [package map](package.md). The guides below explain behavior and options.
+The built site also provides a <a href="reference/index.html">generated
+reference</a> with full signatures, members, and source links.
 
 ## Core
 
@@ -43,7 +30,7 @@ reference when you need every method, property, overload, or source location.
 - [Solvers](solvers/gradient.md), [finite differences](solvers/finite_difference.md)
 - [Sampling](sampling/samplers.md), [tree sampling](sampling/tree.md)
 
-## Advanced domains
+## Optimization and advanced workflows
 
 - [Belief propagation](bp.md)
 - [MPS optimization](optimizers/mps.md)

@@ -21,7 +21,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ..tensors.core import tn_fidelity
+from ..tensors.observables import tn_fidelity
 
 logger = logging.getLogger(__name__)
 

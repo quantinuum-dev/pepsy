@@ -3112,7 +3112,7 @@ class TreeLayoutFinder:
         except ImportError as exc:
             raise ImportError(
                 "Nevergrad tree-layout search requires the optional dependency. "
-                "Install it with `pip install pepsy[layout]`."
+                "From a Pepsy checkout, run: python -m pip install '.[layout]'."
             ) from exc
 
         try:

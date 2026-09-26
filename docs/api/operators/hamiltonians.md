@@ -278,5 +278,3 @@ Both native operator classes expose `ascii_tree()` for a returned drawing and
 draws the retained bonds and their current dimensions while leaving removed
 lattice edges as gaps. Use `tree_pepo.show(layout="tree")` or
 `ascii_tree()` for the native topology view.
-
-> API details are maintained as handwritten Markdown in this page.

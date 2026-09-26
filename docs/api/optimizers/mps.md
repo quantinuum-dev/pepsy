@@ -1,5 +1,10 @@
 # `pepsy.optimizers.mps.optimizer`
 
+Use `MpsOptimizer` to replay gate streams on an MPS. Jump to
+[imports](#imports-and-ownership), [replay options](#replay-options),
+[Torch SVD policy](#torch-svd-policy), or
+[permutation replay](#lazy-permutation-swap-and-split).
+
 ## Imports and ownership
 
 Import the optimizer from `pepsy.optimizers` and specialized layout helpers
@@ -15,6 +20,16 @@ The MPS package loads each component when requested. Listing its exports with
 initialize replay, Gibbs preparation, or MPO optimization; the layout helpers
 still use their own numerical dependencies. `GibbsMps` remains available from
 `pepsy.optimizers` and `pepsy.optimizers.mps`.
+
+Standalone `guess` and `svd_guess` helpers can be imported from
+`pepsy.optimizers.mps` without initializing the replay optimizer. Their owner
+is `pepsy.optimizers.mps.compression`; the previous imports from
+`pepsy.optimizers.mps.optimizer` remain compatible. Replay methods, defaults,
+and canonical-state bookkeeping are unchanged by this module separation.
+
+Layout installation, scheduling, and logical readout remain methods of
+`MpsOptimizer`. Their execution helpers live in a private module; callers and
+subclasses continue to use the same methods and layout-finder hooks.
 
 ## Replay options
 
@@ -1280,6 +1295,3 @@ chain sentence, or other text. The styling follows Quimb's axis-free schematic
 drawings while retaining Pepsy's ordinary `(fig, ax)` return value.
 Pass `show_order_labels=False` to hide the position labels, or use
 `show_chain_label=True` and `show_title=True` for additional annotations.
-
-
-> API details are maintained as handwritten Markdown in this page.

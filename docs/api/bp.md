@@ -4,6 +4,11 @@ The BP namespace contains message-passing, loop-expansion, and partitioned
 norm-estimation helpers. It is an advanced extension and is loaded lazily by
 the top-level package.
 
+Jump to [boundary measurements](#peps-boundary-measurements),
+[fermionic PEPO norms](#native-fermionic-pepo-norm-workflow),
+[loop-cluster compression](#reduced-loop-cluster-compression), or
+[reduced density matrices](#local-reduced-density-matrices).
+
 ## PEPS boundary measurements
 
 `compute_boundary_expectation` separates compression `method` from measurement
@@ -24,8 +29,6 @@ building a full state vector or dense reduced density matrix. It needs no 2D
 boundary truncation, so `max_bond` and boundary cutoffs do not affect this
 case. Precomputed 2D plaquette environments cannot be used for this route.
 
-
-> API details are maintained as handwritten Markdown in this page.
 
 ## Native fermionic PEPO norm workflow
 

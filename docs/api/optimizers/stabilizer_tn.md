@@ -526,6 +526,3 @@ Pauli decomposition. Measurements, FIT convergence, upstream truncation rank
 selection, explicit diagnostics, and the reporting/injection runner APIs
 retain their existing host decisions or requested reports. These boundaries
 mean the hybrid simulator is not entirely free of CPU/GPU synchronization.
-
-
-> API details are maintained as handwritten Markdown in this page.

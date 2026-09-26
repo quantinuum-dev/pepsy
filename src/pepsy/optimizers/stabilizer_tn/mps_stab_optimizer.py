@@ -73,6 +73,7 @@ from ..._internal.cutoff import dtype_auto_cutoff
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     require_quimb_1d_compression_method as _require_quimb_compression_method,
+    run_seeded_quimb as _run_seeded_quimb,
 )
 from .._fidelity import (
     fidelity_from_log,
@@ -83,15 +84,13 @@ from ._backend import (
     compression_event, diagnostic_scalar, scalar_to_host,
     stabilizer_product_eigenstate,
 )
-from ..mps.layout import MpsGateStreamLayoutFinder
-from ..mps.optimizer import (
+from ..mps.compression import (
     _MPO_COMPRESSION_METHODS,
     _MPO_METHODS_IGNORE_CUTOFF_MODE,
     _MPO_METHODS_IGNORE_CUTOFF,
     _MPO_METHODS_NEED_INTERIOR_WORKAROUND,
     _MPO_METHODS_USE_SEED,
     _apply_submpo_with_interior_workaround,
-    _run_seeded_quimb,
 )
 from .._stream_events import (
     _resolve_conditional,
@@ -128,6 +127,44 @@ from .settings import (
 )
 from .stn_state import STNState, _tableau_gate_stream, _validate_bits
 
+from ._stream_helpers import (  # noqa: F401 -- historical aliases
+    _CLIFFORD_NAMES,
+    _ROTATION_AXES,
+    _ROTATION_AXES_2Q,
+    _RESET_FLIP_CLIFFORDS,
+    _RESET_AXIS_ALIASES,
+    _MR_ALIASES,
+    _MR_AXIS_ALIASES,
+    _H_MAT,
+    _I2,
+    _SDG_MAT,
+    _CNOT_MAT,
+    _S_MAT,
+    _TWO_Q_CLIFFORD_REPS,
+    _normalize_event_name,
+    _normalize_sites,
+    _normalize_measurement_order,
+    _unique_ordered,
+    _layout_angle_weight,
+    _operator_schmidt_tail_weight,
+    _dense_operator_schmidt_layout_weight,
+    _submpo_operator_layout_weight,
+    _is_axis_string,
+    _normalize_pauli_axes,
+    _normalize_outcomes,
+    _validate_forced_outcome,
+    _parse_reset_args,
+    _parse_measure_reset_args,
+    _normalize_absorb,
+    _cnot_matrix,
+    _two_qubit_tableau_unitary,
+    _two_qubit_clifford_representatives,
+    _localizing_clifford,
+    _zyz_angles,
+)
+
+from . import _advice, _layout
+
 
 _LN10 = math.log(10.0)
 _LOG10_FLOAT_MAX = math.log10(np.finfo(float).max)
@@ -150,16 +187,6 @@ __all__ = [
     "run_stabilizer_mps_stream",
 ]
 
-_CLIFFORD_NAMES = {
-    "h", "x", "y", "z", "s", "sdg", "sdag", "sqrt_x", "sqrt_x_dag",
-    "cnot", "cx", "cy", "cz", "swap",
-}
-_ROTATION_AXES = {"rx": "X", "ry": "Y", "rz": "Z"}
-_ROTATION_AXES_2Q = {"rxx": "X", "ryy": "Y", "rzz": "Z"}
-_RESET_FLIP_CLIFFORDS = {"X": "z", "Y": "x", "Z": "x"}
-_RESET_AXIS_ALIASES = {"reset_x": "X", "reset_y": "Y", "reset_z": "Z"}
-_MR_ALIASES = {"measure_reset", "mr", "mreset", "measure_and_reset"}
-_MR_AXIS_ALIASES = {"mrx": "X", "mry": "Y", "mrz": "Z"}
 _MAX_PAULI_SUM_SUBMPO_TERMS = 4
 _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
@@ -194,413 +221,6 @@ def _format_tableau_pauli(pauli, *, compact=True):
         if axis != "_"
     ]
     return sign + ("I" if not support else " ".join(support))
-
-# Single-qubit Clifford matrices used to localize a signed Pauli string onto one
-# qubit for the basis-updating measurement (H, S-dagger, CNOT).
-_H_MAT = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
-_SDG_MAT = np.array([[1, 0], [0, -1j]], dtype=complex)
-_CNOT_MAT = np.array(
-    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], dtype=complex
-)
-_S_MAT = np.array([[1, 0], [0, 1j]], dtype=complex)
-
-# Populated lazily by ``_two_qubit_clifford_representatives``.  There are 20
-# two-qubit Cliffords modulo a Clifford acting independently on each *output*
-# qubit.  Such output-local Cliffords leave the Schmidt spectrum invariant, so
-# testing one representative per coset finds the same best entanglement score
-# as testing all 11,520 two-qubit Cliffords.
-_TWO_Q_CLIFFORD_REPS = None
-
-
-def _normalize_event_name(name):
-    """Normalize a named stream event for matching."""
-    return str(name).replace("-", "_").strip().lower()
-
-
-def _normalize_sites(where):
-    """Return ``where`` as a non-empty tuple of integer qubit indices."""
-    if isinstance(where, Integral):
-        return (int(where),)
-    try:
-        sites = tuple(int(site) for site in where)
-    except TypeError as exc:
-        raise TypeError("where must be an integer or a sequence of integers.") from exc
-    if not sites:
-        raise ValueError("where must contain at least one qubit.")
-    return sites
-
-
-def _normalize_measurement_order(order, *, count, targets=None):
-    """Normalize a batch measurement order without touching the MPS."""
-    if isinstance(order, str) or order is None:
-        key = "min_span" if order is None else _normalize_event_name(order)
-        if key in {"auto", "span", "min_span", "shortest"}:
-            return "min_span"
-        if key in {"input", "given", "original"}:
-            return "input"
-        raise ValueError(
-            "measurement order must be 'min_span', 'input', or an explicit "
-            "permutation of the batch entries."
-        )
-    try:
-        requested = tuple(int(index) for index in order)
-    except TypeError as exc:
-        raise TypeError(
-            "measurement order must be a supported string or an entry permutation."
-        ) from exc
-    if len(requested) != int(count) or len(set(requested)) != int(count):
-        raise ValueError(
-            "an explicit measurement order must be a permutation of the batch."
-        )
-    if set(requested) == set(range(int(count))):
-        return requested
-    if targets is not None and len(set(targets)) == int(count):
-        target_to_index = {int(target): index for index, target in enumerate(targets)}
-        if set(requested) == set(target_to_index):
-            return tuple(target_to_index[target] for target in requested)
-    raise ValueError(
-        "an explicit measurement order must contain batch indices or each "
-        "target qubit exactly once."
-    )
-
-
-def _unique_ordered(items):
-    """Return items with duplicates removed while preserving first occurrence."""
-    seen = set()
-    unique = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        unique.append(item)
-    return tuple(unique)
-
-
-def _layout_angle_weight(theta):
-    """Bound an angle-derived layout weight to a simple non-negative scalar."""
-    try:
-        angle = abs(float(theta))
-    except (TypeError, ValueError):
-        return 1.0
-    return min(1.0, max(0.0, angle)) if np.isfinite(angle) else 1.0
-
-
-def _operator_schmidt_tail_weight(theta):
-    """Return the non-leading Schmidt-weight fraction of a Pauli rotation.
-
-    A Pauli rotation has two operator-Schmidt branches, ``I`` and ``P``.
-    The returned value is zero for a product operator and reaches one half
-    for the maximally balanced two-branch case.  The layout event keeps a
-    unit baseline separately so weak rotations still contribute locality
-    pressure while strongly operator-entangling rotations receive priority.
-    """
-    try:
-        theta = float(theta)
-    except (TypeError, ValueError):
-        return 0.0
-    if not np.isfinite(theta):
-        return 0.0
-    weights = np.asarray(
-        [np.cos(theta / 2.0) ** 2, np.sin(theta / 2.0) ** 2],
-        dtype=float,
-    )
-    total = float(weights.sum())
-    if total <= 0.0:
-        return 0.0
-    return float((total - weights.max()) / total)
-
-
-def _dense_operator_schmidt_layout_weight(gate, n_qubits):
-    """Return a baseline-plus-tail weight for a small dense operator.
-
-    The two-qubit case is evaluated exactly from the operator-Schmidt
-    singular values. Wider matrices retain the unit baseline and are handled
-    by their frame supports, avoiding a potentially large dense reshape in
-    the static layout pre-pass.
-    """
-    if int(n_qubits) != 2:
-        return 1.0
-    try:
-        array = np.asarray(ar.to_numpy(gate))
-        if array.shape != (4, 4):
-            return 1.0
-        reshaped = array.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3)
-        singular_values = np.linalg.svd(
-            reshaped.reshape(4, 4),
-            compute_uv=False,
-        )
-        weights = np.abs(singular_values) ** 2
-        total = float(weights.sum())
-        if total <= 0.0:
-            return 1.0
-        tail = (total - float(weights.max())) / total
-    except (TypeError, ValueError, np.linalg.LinAlgError):
-        return 1.0
-    return 1.0 + float(tail)
-
-
-def _submpo_operator_layout_weight(mpo):
-    """Return an MPO-bond-rank proxy for a coefficient-frame sub-MPO."""
-    try:
-        max_bond = int(mpo.max_bond())
-    except (AttributeError, TypeError, ValueError):
-        return 1.0
-    if max_bond < 1:
-        return 1.0
-    # A bond-two Pauli-rotation MPO has one unit of operator cut load. Wider
-    # MPOs receive proportionally more priority in the weighted interaction
-    # graph, while rank-one operators retain the locality baseline.
-    return max(1.0, float(np.log2(max_bond)))
-
-
-def _is_axis_string(value):
-    """Return whether ``value`` is a non-empty X/Y/Z Pauli-basis string."""
-    if not isinstance(value, str):
-        return False
-    axes = [axis for axis in value.upper() if not axis.isspace()]
-    return bool(axes) and all(axis in _RESET_FLIP_CLIFFORDS for axis in axes)
-
-
-def _normalize_pauli_axes(pauli, where, *, event):
-    """Return one X/Y/Z axis per site for reset-like events."""
-    axes = [axis for axis in str(pauli).upper() if not axis.isspace()]
-    if not axes:
-        raise ValueError(f"{event} basis must contain at least one Pauli axis.")
-    invalid = [axis for axis in axes if axis not in _RESET_FLIP_CLIFFORDS]
-    if invalid:
-        raise ValueError(
-            f"{event} basis must use only X, Y, or Z axes, got {pauli!r}."
-        )
-    if len(axes) == 1 and len(where) > 1:
-        axes = axes * len(where)
-    if len(axes) != len(where):
-        raise ValueError(
-            f"{event} basis {pauli!r} has {len(axes)} axis/axes but where "
-            f"{where!r} has {len(where)} site(s)."
-        )
-    return tuple(axes)
-
-
-def _normalize_outcomes(outcome, where, *, event):
-    """Return one optional forced outcome per site."""
-    if outcome is None:
-        return (None,) * len(where)
-    if isinstance(outcome, (tuple, list)):
-        if len(outcome) != len(where):
-            raise ValueError(
-                f"{event} outcome sequence has length {len(outcome)} but where "
-                f"{where!r} has {len(where)} site(s)."
-            )
-        return tuple(_validate_forced_outcome(value) for value in outcome)
-    value = _validate_forced_outcome(outcome)
-    return (value,) * len(where)
-
-
-def _validate_forced_outcome(outcome):
-    """Return one forced Pauli outcome, requiring exactly integer +/-1."""
-    if outcome is None:
-        return None
-    if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
-        raise ValueError(
-            f"outcome must be exactly +1 or -1, got {outcome!r}."
-        )
-    value = int(outcome)
-    if value not in (-1, 1):
-        raise ValueError(
-            f"outcome must be exactly +1 or -1, got {outcome!r}."
-        )
-    return value
-
-
-def _parse_reset_args(params, *, default_axis=None):
-    """Parse ``reset`` stream parameters into ``(axes, where)``."""
-    if not params:
-        raise ValueError('"reset" expects where, optionally with a basis.')
-    if default_axis is not None:
-        if len(params) != 1:
-            raise ValueError("basis-specific reset aliases accept only where.")
-        where = _normalize_sites(params[0])
-        basis = default_axis
-    elif len(params) >= 2 and _is_axis_string(params[0]):
-        if len(params) != 2:
-            raise ValueError('"reset" accepts only basis and where.')
-        basis = params[0]
-        where = _normalize_sites(params[1])
-    else:
-        if len(params) > 2:
-            raise ValueError('"reset" accepts where and optional basis only.')
-        where = _normalize_sites(params[0])
-        basis = params[1] if len(params) == 2 else "Z"
-    return _normalize_pauli_axes(basis, where, event="reset"), where
-
-
-def _parse_measure_reset_args(params, *, default_axis=None):
-    """Parse MR stream parameters into ``(axes, where, outcomes, absorb_basis)``."""
-    if default_axis is None:
-        if len(params) < 2:
-            raise ValueError(
-                '"measure_reset" expects basis, where, optional outcome, '
-                "and optional absorb_basis."
-            )
-        basis = params[0]
-        where = _normalize_sites(params[1])
-        outcome = params[2] if len(params) > 2 else None
-        absorb = bool(params[3]) if len(params) > 3 else False
-        if len(params) > 4:
-            raise ValueError('"measure_reset" accepts at most four arguments.')
-    else:
-        if not params:
-            raise ValueError("basis-specific MR aliases expect where.")
-        where = _normalize_sites(params[0])
-        basis = default_axis
-        outcome = params[1] if len(params) > 1 else None
-        absorb = bool(params[2]) if len(params) > 2 else True
-        if len(params) > 3:
-            raise ValueError("basis-specific MR aliases accept at most three arguments.")
-    axes = _normalize_pauli_axes(basis, where, event="measure_reset")
-    outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
-    return axes, where, outcomes, absorb
-
-
-def _normalize_absorb(absorb):
-    """Validate and normalize a cap absorption direction."""
-    direction = str(absorb).strip().lower()
-    if direction not in {"left", "right"}:
-        raise ValueError("cap absorb direction must be 'left' or 'right'.")
-    return direction
-
-
-def _cnot_matrix(control: int, target: int) -> np.ndarray:
-    """Return the big-endian two-qubit CNOT matrix for local sites 0 and 1."""
-    gate = np.zeros((4, 4), dtype=complex)
-    for x in range(4):
-        bits = [(x >> 1) & 1, x & 1]
-        bits[target] ^= bits[control]
-        y = (bits[0] << 1) | bits[1]
-        gate[y, x] = 1.0
-    return gate
-
-
-def _two_qubit_tableau_unitary(tableau) -> np.ndarray:
-    """Synthesize an exact NumPy unitary for a two-qubit stim tableau.
-
-    ``Tableau.to_unitary_matrix`` currently returns ``complex64``.  The local
-    gauge sweep can run repeatedly, so replay its elimination circuit (H, S,
-    and CX only) using the exact double-precision matrices instead.
-    """
-    unitary = np.eye(4, dtype=complex)
-    for instruction in tableau.to_circuit("elimination"):
-        name = instruction.name
-        targets = [target.value for target in instruction.targets_copy()]
-        if name == "H":
-            for target in targets:
-                gate = np.kron(_H_MAT, _I2) if target == 0 else np.kron(_I2, _H_MAT)
-                unitary = gate @ unitary
-        elif name == "S":
-            for target in targets:
-                gate = np.kron(_S_MAT, _I2) if target == 0 else np.kron(_I2, _S_MAT)
-                unitary = gate @ unitary
-        elif name == "CX":
-            if len(targets) % 2:
-                raise ValueError("stim emitted a CX instruction with an odd target count.")
-            for control, target in zip(targets[::2], targets[1::2]):
-                unitary = _cnot_matrix(control, target) @ unitary
-        else:  # pragma: no cover - stim's documented elimination basis is H/S/CX
-            raise ValueError(f"Unsupported tableau-elimination gate {name!r}.")
-    return unitary
-
-
-_I2 = np.eye(2, dtype=complex)
-
-
-def _two_qubit_clifford_representatives():
-    """Return 20 ``(stim.Tableau, unitary)`` entanglement representatives.
-
-    The representatives are left cosets of the local-Clifford subgroup.  If
-    ``D`` is a representative and ``L`` is local, ``L D`` has the same
-    Schmidt spectrum across the two sites as ``D``.  This keeps a sweep small
-    enough to use at every selected MPS bond while retaining the complete
-    two-qubit Clifford search space for the chosen objective.
-    """
-    global _TWO_Q_CLIFFORD_REPS
-    if _TWO_Q_CLIFFORD_REPS is not None:
-        return _TWO_Q_CLIFFORD_REPS
-
-    import stim
-
-    one_qubit = tuple(stim.Tableau.iter_all(1))
-    local = []
-    for first in one_qubit:
-        for second in one_qubit:
-            tableau = stim.Tableau(2)
-            tableau.append(first, [0])
-            tableau.append(second, [1])
-            local.append(tableau)
-
-    unseen = {str(tableau): tableau for tableau in stim.Tableau.iter_all(2)}
-    identity = stim.Tableau(2)
-    representatives = []
-    while unseen:
-        # Keep I first: a bond that cannot improve avoids needless gate work.
-        tableau = unseen.pop(str(identity), None)
-        if tableau is None:
-            _, tableau = unseen.popitem()
-        representatives.append((tableau, _two_qubit_tableau_unitary(tableau)))
-        # ``D.then(L)`` is the circuit D followed by local L, i.e. L D.
-        for local_tableau in local:
-            unseen.pop(str(tableau.then(local_tableau)), None)
-
-    if len(representatives) != 20:  # pragma: no cover - guards stim API changes
-        raise RuntimeError(
-            "Expected 20 two-qubit Clifford local-equivalence representatives, "
-            f"got {len(representatives)}."
-        )
-    _TWO_Q_CLIFFORD_REPS = tuple(representatives)
-    return _TWO_Q_CLIFFORD_REPS
-
-
-def _localizing_clifford(terms, n, *, site_position=None):
-    """Return ``(ops, v_tableau, pivot)`` for a Clifford ``V`` with ``V M V^dag = +/-Z_k``.
-
-    ``terms`` maps ``site -> 'X'/'Y'/'Z'`` (the support of the signed Pauli ``M``
-    on the coefficient qubits).  ``ops`` is a list of ``(name, targets)`` gates
-    applied to ``|nu>`` in order (``'h'``, ``'sdg'``, ``'cnot'``); ``v_tableau``
-    is the matching :class:`stim.Tableau`; ``pivot`` is the target qubit ``k``.
-    Single-qubit axes are rotated to ``Z`` (``X`` via ``H``; ``Y`` via ``S^dag``
-    then ``H``) and a CNOT ladder (control ``j``, target ``k``) merges every
-    ``Z_j`` onto the pivot ``Z_k``.
-    """
-    import stim
-
-    if site_position is None:
-        site_position = int
-    support = sorted(terms, key=lambda site: (site_position(site), int(site)))
-    # Pivot = median of the support: the CNOT ladder swaps every other support
-    # site next to the pivot, so the median minimises the total MPS swap distance
-    # (sum_j |j - pivot|) versus using an endpoint.
-    pivot = support[len(support) // 2]
-    ops = []
-    for j in support:
-        axis = terms[j]
-        if axis == "X":
-            ops.append(("h", (j,)))
-        elif axis == "Y":
-            ops.append(("sdg", (j,)))  # S^dag then H maps Y -> Z
-            ops.append(("h", (j,)))
-        # 'Z' needs no single-qubit rotation
-    # Merge nearest support sites first so each swap+split spans the shortest gap.
-    pivot_pos = site_position(pivot)
-    for j in sorted(
-        (s for s in support if s != pivot),
-        key=lambda s: (abs(site_position(s) - pivot_pos), site_position(s), int(s)),
-    ):
-        ops.append(("cnot", (j, pivot)))  # control j, target pivot: merge Z_j -> Z_k
-    vsim = stim.TableauSimulator()
-    vsim.set_num_qubits(n)
-    for name, targ in ops:
-        getattr(vsim, "s_dag" if name == "sdg" else name)(*targ)
-    v_tableau = vsim.current_inverse_tableau().inverse()
-    return ops, v_tableau, pivot
 
 
 class StabilizerMpsSimulator:
@@ -1703,66 +1323,9 @@ class StabilizerMpsSimulator:
                     f"are touched by ordinary stream entry {entry!r}."
                 )
 
-    @classmethod
-    def _analysis_matrix_kind(cls, entry) -> str:
-        """Classify a dense matrix entry for stream-level advice."""
-        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
-            return "opaque"
-        try:
-            where = _normalize_sites(entry[1])
-            gate = _as_gate_matrix(entry[0], len(where))
-        except (TypeError, ValueError, IndexError):
-            return "opaque"
-        if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
-            return "opaque"
-        dim = gate.shape[0]
-        nq = int(round(math.log2(dim))) if dim > 0 else -1
-        if nq < 0 or 2 ** nq != dim or len(where) != nq:
-            return "opaque"
-        if not _is_unitary(gate):
-            return "nonunitary_matrix"
-        try:
-            is_clifford = _tableau_from_exact_unitary(gate) is not None
-        except ImportError:
-            return "nonclifford_matrix"
-        return "clifford_matrix" if is_clifford else "nonclifford_matrix"
+    _analysis_matrix_kind = classmethod(_advice._analysis_matrix_kind)
 
-    @classmethod
-    def _analysis_entry_kind(cls, entry) -> str:
-        """Classify one Pepsy stream entry for whole-stream advice."""
-        if submpo_event_parts(entry, normalize_where=True) is not None:
-            return "submpo"
-        if not (isinstance(entry, (list, tuple)) and entry):
-            return "opaque"
-        head = entry[0]
-        if not isinstance(head, str):
-            return cls._analysis_matrix_kind(entry)
-
-        name = _normalize_event_name(head)
-        if name in _CLIFFORD_NAMES:
-            return "clifford"
-        if name == "disentangle":
-            return "control"
-        try:
-            if cls._injectable_rz(entry) is not None:
-                return "injectable"
-        except (IndexError, TypeError, ValueError):
-            return "opaque"
-        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name == "rot":
-            try:
-                theta = float(entry[1])
-            except (IndexError, TypeError, ValueError):
-                return "opaque"
-            return "clifford" if cls._is_clifford_angle(theta) else "nonclifford"
-        if name == "measure":
-            return "measure"
-        if name == "reset" or name in _RESET_AXIS_ALIASES:
-            return "reset"
-        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
-            return "measure_reset"
-        if name == "cap":
-            return "cap"
-        return "opaque"
+    _analysis_entry_kind = classmethod(_advice._analysis_entry_kind)
 
     @classmethod
     def _progress_entry_part(cls, entry) -> str:
@@ -1777,72 +1340,7 @@ class StabilizerMpsSimulator:
             "nonunitary_matrix": "nonunitary",
         }.get(kind, kind)
 
-    @classmethod
-    def _analysis_entry_sites(cls, entry, n_qubits: Optional[int]) -> Optional[set[int]]:
-        """Return touched physical sites for a stream entry, if cheaply known."""
-        parts = submpo_event_parts(entry, normalize_where=True)
-        if parts is not None:
-            _mpo, where = parts
-            return set(_normalize_sites(where))
-
-        if not (isinstance(entry, (list, tuple)) and entry):
-            return None
-        head = entry[0]
-        if not isinstance(head, str):
-            if len(entry) != 2:
-                return None
-            return set(_normalize_sites(entry[1]))
-
-        name = _normalize_event_name(head)
-        if name == "disentangle":
-            if len(entry) <= 1:
-                return None if n_qubits is None else set(range(n_qubits))
-            if len(entry) > 2:
-                return None
-            option = entry[1]
-            if isinstance(option, Mapping):
-                bonds = option.get("bonds")
-            elif isinstance(option, Integral):
-                bonds = None
-            else:
-                return None
-            if n_qubits is None:
-                return None
-            sites = set()
-            for bond in cls._disentangle_bonds(bonds, n_qubits):
-                sites.update((int(bond), int(bond) + 1))
-            return sites
-        if name in _CLIFFORD_NAMES:
-            return {int(site) for site in entry[1:]}
-        if name in _ROTATION_AXES:
-            return {int(entry[2])}
-        if name in _ROTATION_AXES_2Q:
-            return {int(entry[2]), int(entry[3])}
-        if name in ("t", "tdg"):
-            return {int(entry[1])}
-        if name == "rot":
-            return set(_normalize_sites(entry[3]))
-        if name == "measure":
-            if len(entry) < 3:
-                return None
-            return set(_normalize_sites(entry[2]))
-        if name == "reset" or name in _RESET_AXIS_ALIASES:
-            _axes, where = _parse_reset_args(
-                entry[1:],
-                default_axis=_RESET_AXIS_ALIASES.get(name),
-            )
-            return set(where)
-        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
-            _axes, where, _outcomes, _absorb = _parse_measure_reset_args(
-                entry[1:],
-                default_axis=_MR_AXIS_ALIASES.get(name),
-            )
-            return set(where)
-        if name == "cap":
-            if len(entry) < 3:
-                return None
-            return set(_normalize_sites(entry[1]))
-        return None
+    _analysis_entry_sites = classmethod(_advice._analysis_entry_sites)
 
     @classmethod
     def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnalysisRecord:
@@ -1852,219 +1350,9 @@ class StabilizerMpsSimulator:
         same Pepsy entries as :meth:`apply`, counts the design features that
         affect STN settings, and returns a typed mapping-compatible record.
         """
-        if n_qubits is not None:
-            if isinstance(n_qubits, bool) or not isinstance(n_qubits, Integral):
-                raise TypeError("n_qubits must be a nonnegative integer or None.")
-            n_qubits = int(n_qubits)
-            if n_qubits < 0:
-                raise ValueError("n_qubits must be nonnegative.")
+        return _advice.analyze_stream(cls, gates, n_qubits=n_qubits)
 
-        entries = cls._as_entries(gates)
-        counts = {
-            "clifford": 0,
-            "injectable": 0,
-            "nonclifford": 0,
-            "structural": 0,
-            "control": 0,
-            "opaque": 0,
-            "dense_matrix": 0,
-            "unitary_matrix": 0,
-            "nonunitary_matrix": 0,
-            "submpo": 0,
-            "measure": 0,
-            "reset": 0,
-            "measure_reset": 0,
-            "cap": 0,
-        }
-        touched: set[int] = set()
-        unknown_support = 0
-        invalid_sites: list[int] = []
-
-        for entry in entries:
-            kind = cls._analysis_entry_kind(entry)
-            if kind == "clifford" or kind == "clifford_matrix":
-                counts["clifford"] += 1
-            elif kind == "injectable":
-                counts["injectable"] += 1
-            elif kind == "nonclifford" or kind == "nonclifford_matrix":
-                counts["nonclifford"] += 1
-            elif kind in {"measure", "reset", "measure_reset", "cap"}:
-                counts["structural"] += 1
-            elif kind == "control":
-                counts["control"] += 1
-            else:
-                counts["opaque"] += 1
-
-            if kind in {"clifford_matrix", "nonclifford_matrix", "nonunitary_matrix"}:
-                counts["dense_matrix"] += 1
-            if kind in {"clifford_matrix", "nonclifford_matrix"}:
-                counts["unitary_matrix"] += 1
-            if kind == "nonunitary_matrix":
-                counts["nonunitary_matrix"] += 1
-            if kind == "submpo":
-                counts["submpo"] += 1
-            if kind == "measure":
-                counts["measure"] += 1
-            elif kind == "reset":
-                counts["reset"] += 1
-            elif kind == "measure_reset":
-                counts["measure_reset"] += 1
-            elif kind == "cap":
-                counts["cap"] += 1
-
-            try:
-                sites = cls._analysis_entry_sites(entry, n_qubits)
-            except (IndexError, TypeError, ValueError):
-                sites = None
-            if sites is None:
-                unknown_support += 1
-            else:
-                touched.update(sites)
-                invalid_sites.extend(site for site in sites if site < 0)
-
-        if invalid_sites:
-            raise ValueError(
-                f"stream touches negative qubit index/indices "
-                f"{tuple(sorted(set(invalid_sites)))!r}."
-            )
-        max_qubit = max(touched) if touched else None
-        if n_qubits is not None and max_qubit is not None and max_qubit >= n_qubits:
-            raise ValueError(
-                f"stream touches qubit {max_qubit}, outside n_qubits={n_qubits}."
-            )
-        estimated_qubits = n_qubits if n_qubits is not None else (
-            None if max_qubit is None else max_qubit + 1
-        )
-
-        warnings = []
-        if unknown_support:
-            warnings.append(
-                f"{unknown_support} stream entry/entries have unknown qubit support."
-            )
-        if counts["opaque"]:
-            warnings.append(
-                "Opaque entries cannot be fully priced by the advisor; validate "
-                "them with small exact runs."
-            )
-        if counts["dense_matrix"]:
-            warnings.append(
-                "Dense matrix entries use classification and possibly Pauli "
-                "decomposition; keep them few-qubit or decompose into named gates."
-            )
-        if counts["nonunitary_matrix"] or counts["submpo"]:
-            warnings.append(
-                "Non-unitary matrices and coefficient-frame sub-MPOs can change "
-                "normalization physically and suspend the unitary norm-loss proxy."
-            )
-        if counts["nonclifford"] and counts["injectable"]:
-            warnings.append(
-                "Only the T-family subset is injectable; other non-Clifford work "
-                "stays on the direct STN path."
-            )
-        if counts["cap"]:
-            warnings.append(
-                "A cap changes the qubit/MPS length and disables static "
-                "stream-layout assumptions past the cap."
-            )
-
-        nonmagic_work = counts["nonclifford"] + counts["opaque"]
-        is_clifford_t_like = (
-            counts["injectable"] > 0
-            and counts["nonclifford"] == 0
-            and counts["opaque"] == 0
-        )
-        is_clifford_only = (
-            counts["injectable"] == 0
-            and nonmagic_work == 0
-        )
-
-        return StreamAnalysisRecord(
-            total_entries=int(len(entries)),
-            n_qubits=n_qubits,
-            estimated_qubits=estimated_qubits,
-            touched_qubits=tuple(sorted(touched)),
-            max_qubit=None if max_qubit is None else int(max_qubit),
-            clifford_entries=int(counts["clifford"]),
-            injectable_entries=int(counts["injectable"]),
-            other_nonclifford_entries=int(counts["nonclifford"]),
-            structural_entries=int(counts["structural"]),
-            control_entries=int(counts["control"]),
-            opaque_entries=int(counts["opaque"]),
-            dense_matrix_entries=int(counts["dense_matrix"]),
-            unitary_matrix_entries=int(counts["unitary_matrix"]),
-            nonunitary_matrix_entries=int(counts["nonunitary_matrix"]),
-            submpo_entries=int(counts["submpo"]),
-            measurement_entries=int(counts["measure"]),
-            reset_entries=int(counts["reset"]),
-            measure_reset_entries=int(counts["measure_reset"]),
-            cap_entries=int(counts["cap"]),
-            is_clifford_only=bool(is_clifford_only),
-            is_clifford_t_like=bool(is_clifford_t_like),
-            warnings=tuple(_unique_ordered(warnings)),
-        )
-
-    @classmethod
-    def _magic_strategy_entry_kind(cls, entry) -> str:
-        """Classify one stream entry for :meth:`recommend_magic_strategy`."""
-        if not (isinstance(entry, (list, tuple)) and entry):
-            return "opaque"
-        if not isinstance(entry[0], str):
-            # Stim's compiler emits its ideal Clifford operations as float32
-            # matrices. Recognize small unitary matrices without examining the
-            # large/opaque operator forms that this advisory API cannot price.
-            if len(entry) != 2:
-                return "opaque"
-            try:
-                if cls._injectable_rz(entry) is not None:
-                    return "injectable"
-                where = _normalize_sites(entry[1])
-                gate = _as_gate_matrix(entry[0], len(where))
-                dim = gate.shape[0]
-                nq = int(round(math.log2(dim)))
-                if (
-                    gate.ndim != 2
-                    or gate.shape != (dim, dim)
-                    or len(where) != nq
-                    or 2 ** nq != dim
-                    or nq > 2
-                    or not _is_unitary(gate)
-                ):
-                    return "opaque"
-            except (ImportError, IndexError, TypeError, ValueError, RuntimeError):
-                return "nonclifford"
-            try:
-                is_clifford = _tableau_from_exact_unitary(gate) is not None
-            except ImportError:
-                return "nonclifford"
-            return (
-                "clifford"
-                if is_clifford
-                else "nonclifford"
-            )
-
-        name = _normalize_event_name(entry[0])
-        if name in _CLIFFORD_NAMES:
-            return "clifford"
-        if name == "disentangle":
-            return "control"
-        try:
-            if cls._injectable_rz(entry) is not None:
-                return "injectable"
-        except (IndexError, TypeError, ValueError):
-            return "opaque"
-
-        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name == "rot":
-            try:
-                theta = float(entry[1])
-            except (IndexError, TypeError, ValueError):
-                return "opaque"
-            return "clifford" if cls._is_clifford_angle(theta) else "nonclifford"
-        if name in {
-            "measure", "reset", "cap", *(_RESET_AXIS_ALIASES),
-            *(_MR_ALIASES), *(_MR_AXIS_ALIASES),
-        }:
-            return "structural"
-        return "opaque"
+    _magic_strategy_entry_kind = classmethod(_advice._magic_strategy_entry_kind)
 
     @classmethod
     def recommend_magic_strategy(
@@ -2094,106 +1382,12 @@ class StabilizerMpsSimulator:
         :meth:`queued_magic_strategy` before :meth:`run`; it analyzes the queued
         sampled/``stream_transform``-produced Pepsy stream.
         """
-        if ancilla_budget is not None:
-            if isinstance(ancilla_budget, bool) or not isinstance(ancilla_budget, Integral):
-                raise TypeError("ancilla_budget must be a nonnegative integer or None.")
-            ancilla_budget = int(ancilla_budget)
-            if ancilla_budget < 0:
-                raise ValueError("ancilla_budget must be nonnegative.")
-
-        counts = {
-            "clifford": 0,
-            "injectable": 0,
-            "nonclifford": 0,
-            "structural": 0,
-            "control": 0,
-            "opaque": 0,
-        }
-        for entry in cls._as_entries(gates):
-            counts[cls._magic_strategy_entry_kind(entry)] += 1
-
-        injections = counts["injectable"]
-        deferred_feasible = (
-            None if ancilla_budget is None else ancilla_budget >= injections
+        return _advice.recommend_magic_strategy(
+            cls,
+            gates,
+            ancilla_budget=ancilla_budget,
+            prioritize_peak_bond=prioritize_peak_bond,
         )
-        complete_clifford_t = (
-            injections > 0
-            and counts["nonclifford"] == 0
-            and counts["opaque"] == 0
-        )
-        if injections == 0 or ancilla_budget == 0:
-            mode = "direct"
-        elif (
-            prioritize_peak_bond
-            and ancilla_budget is not None
-            and ancilla_budget >= injections
-        ):
-            mode = "deferred"
-        else:
-            mode = "immediate"
-
-        if injections == 0:
-            if counts["nonclifford"]:
-                message = (
-                    f"The stream has {counts['nonclifford']} non-Clifford rotation(s), "
-                    "but none are injectable T-family Rz rotations. Use direct STN "
-                    "execution with exact_cooling=True; schedule greedy cooling only at "
-                    "explicit checkpoints if the coefficient bond grows."
-                )
-            else:
-                message = (
-                    "The stream has no injectable T-family rotations. Use direct STN "
-                    "execution; magic injection is not applicable."
-                )
-        elif ancilla_budget == 0:
-            message = (
-                f"The stream has {injections} injectable T-family rotation(s), but the "
-                "ancilla budget is zero. Use direct STN execution with exact_cooling=True."
-            )
-        elif mode == "deferred":
-            message = (
-                f"The stream has {injections} injectable T-family rotation(s). With "
-                f"{ancilla_budget} available ancilla(s) and peak bond prioritized, use "
-                "deferred MAST: with_deferred_injection(..., "
-                "projection_order='middle_out'). It reserves one ancilla per injected "
-                "gate and moves basis-updating projections to the end."
-            )
-        elif complete_clifford_t:
-            message = (
-                f"The stream is Clifford+T-like with {injections} injectable T-family "
-                "rotation(s). Use immediate injection as the default: "
-                "with_injection(..., n_ancilla=1). It rewrites every eligible rotation, "
-                "measures the ancilla immediately, and reuses it. Deferred MAST is an "
-                f"alternative when {injections} fresh ancillas and lower replay-phase "
-                "peak bond are worth a final projection phase."
-            )
-        else:
-            message = (
-                f"The stream has {injections} injectable T-family rotation(s), "
-                f"{counts['nonclifford']} other non-Clifford rotation(s), and "
-                f"{counts['opaque']} opaque entry/entries. Use immediate injection for "
-                "the eligible subset; the remaining non-Clifford work stays on the "
-                "direct STN path with exact_cooling=True."
-            )
-
-        return {
-            "recommended_mode": mode,
-            "message": message,
-            "total_entries": int(sum(counts.values())),
-            "clifford_entries": int(counts["clifford"]),
-            "injectable_entries": int(injections),
-            "other_nonclifford_entries": int(counts["nonclifford"]),
-            "structural_entries": int(counts["structural"]),
-            "control_entries": int(counts["control"]),
-            "opaque_entries": int(counts["opaque"]),
-            "is_clifford_t_like": bool(complete_clifford_t),
-            "exact_cooling_recommended": True,
-            "immediate_ancillas_required": 1 if injections else 0,
-            "deferred_ancillas_required": int(injections),
-            "ancilla_budget": ancilla_budget,
-            "deferred_feasible": deferred_feasible,
-            "prioritize_peak_bond": bool(prioritize_peak_bond),
-        }
 
     def queued_magic_strategy(self, **kwargs) -> dict:
         """Recommend a mode for the currently queued Pepsy gate stream.
@@ -2202,7 +1396,7 @@ class StabilizerMpsSimulator:
         optional ``stream_transform``. Call it before :meth:`run`, because that
         method consumes successfully executed queue entries.
         """
-        return type(self).recommend_magic_strategy(self._queue, **kwargs)
+        return _advice.queued_magic_strategy(self, **kwargs)
 
     @classmethod
     def recommend_settings(
@@ -2221,142 +1415,22 @@ class StabilizerMpsSimulator:
         and calls :meth:`recommend_magic_strategy` for the direct/immediate/
         deferred injection choice.
         """
-        normalized_goal = _normalize_event_name(goal)
-        if normalized_goal not in {"validate", "run", "benchmark"}:
-            raise ValueError(
-                "goal must be one of 'validate', 'run', or 'benchmark', "
-                f"got {goal!r}."
-            )
-
-        analysis = cls.analyze_stream(gates, n_qubits=n_qubits)
-        magic = cls.recommend_magic_strategy(
+        return _advice.recommend_settings(
+            cls,
             gates,
+            n_qubits=n_qubits,
             ancilla_budget=ancilla_budget,
             prioritize_peak_bond=prioritize_peak_bond,
-        )
-        mode = magic["recommended_mode"]
-        execution_method = {
-            "direct": "apply",
-            "immediate": "with_injection",
-            "deferred": "with_deferred_injection",
-        }[mode]
-
-        nonclifford_pressure = (
-            analysis.injectable_entries
-            + analysis.other_nonclifford_entries
-            + analysis.opaque_entries
-        )
-        settings = {
-            "chi": None,
-            "cutoff": 1e-12,
-            "exact_cooling": True,
-            "stabilize_unitary": False,
-        }
-        if normalized_goal != "validate" and nonclifford_pressure:
-            settings["chi"] = 64
-        if (
-            mode in {"direct", "immediate", "deferred"}
-            and normalized_goal != "validate"
-            and nonclifford_pressure
-            and not analysis.cap_entries
-        ):
-            settings["layout"] = "auto"
-            settings["layout_report"] = False
-
-        warnings = list(analysis.warnings)
-        if settings["chi"] is not None:
-            warnings.append(
-                "chi=64 is a starting cap, not a convergence claim; sweep chi "
-                "for production accuracy."
-            )
-        elif (
-            normalized_goal != "validate"
-            and nonclifford_pressure
-            and analysis.estimated_qubits is not None
-            and analysis.estimated_qubits > 16
-        ):
-            warnings.append(
-                "Exact chi=None can become expensive for larger non-Clifford "
-                "streams; use it first as a correctness reference."
-            )
-        if mode == "immediate" and prioritize_peak_bond and not magic["deferred_feasible"]:
-            warnings.append(
-                "Deferred MAST was requested by priority, but it needs one fresh "
-                "ancilla per injectable gate."
-            )
-        if normalized_goal == "benchmark":
-            warnings.append(
-                "Benchmark direct, immediate, and deferred modes separately before "
-                "drawing performance conclusions."
-            )
-
-        disentangle_recommended = (
-            normalized_goal != "validate"
-            and settings["chi"] is not None
-            and (
-                analysis.other_nonclifford_entries
-                + analysis.opaque_entries
-                + analysis.submpo_entries
-            )
-            >= 4
-        )
-        if disentangle_recommended:
-            warnings.append(
-                "Consider explicit disentangle checkpoints after sizeable "
-                "non-Clifford blocks, not after every gate."
-            )
-
-        message_parts = [
-            f"Use {execution_method} for {normalized_goal} mode "
-            f"({mode} execution)."
-        ]
-        if mode == "immediate":
-            message_parts.append(
-                "Immediate injection uses one reusable clean magic ancilla by default."
-            )
-        elif mode == "deferred":
-            message_parts.append(
-                "Deferred MAST reserves one clean ancilla per injectable gate and "
-                "moves projections to the end."
-            )
-        else:
-            message_parts.append(
-                "Direct execution keeps all non-Clifford work on the coefficient "
-                "MPS path."
-            )
-        message_parts.append(
-            "Constructor settings: "
-            + ", ".join(f"{key}={value!r}" for key, value in settings.items())
-            + "."
-        )
-        if warnings:
-            message_parts.append("Warnings: " + " ".join(warnings))
-
-        return StabilizerMpsSettingsAdvice(
-            goal=normalized_goal,
-            recommended_mode=mode,
-            execution_method=execution_method,
-            settings=settings,
-            analysis=analysis,
-            magic_strategy=magic,
-            immediate_ancillas_required=int(magic["immediate_ancillas_required"]),
-            deferred_ancillas_required=int(magic["deferred_ancillas_required"]),
-            ancilla_budget=magic["ancilla_budget"],
-            deferred_feasible=magic["deferred_feasible"],
-            disentangle_checkpoints_recommended=bool(disentangle_recommended),
-            warnings=tuple(_unique_ordered(warnings)),
-            message=" ".join(message_parts),
+            goal=goal,
         )
 
     def queued_stream_analysis(self, **kwargs) -> StreamAnalysisRecord:
         """Analyze the currently queued Pepsy stream without consuming it."""
-        kwargs.setdefault("n_qubits", self.n)
-        return type(self).analyze_stream(self._queue, **kwargs)
+        return _advice.queued_stream_analysis(self, **kwargs)
 
     def queued_recommend_settings(self, **kwargs) -> StabilizerMpsSettingsAdvice:
         """Recommend settings for the currently queued Pepsy stream."""
-        kwargs.setdefault("n_qubits", self.n)
-        return type(self).recommend_settings(self._queue, **kwargs)
+        return _advice.queued_recommend_settings(self, **kwargs)
 
     def run_queued_stream(self, **kwargs) -> StabilizerMpsRunResult:
         """Replay the currently queued Pepsy stream through the public runner.
@@ -2386,37 +1460,15 @@ class StabilizerMpsSimulator:
     # ------------------------------------------------------------------ #
     # Static STN frame auto-layout
     # ------------------------------------------------------------------ #
-    def _refresh_layout_map(self) -> None:
-        """Refresh the logical-coefficient-site -> MPS-position map."""
-        self._logical_to_mps = {
-            int(logical): int(pos)
-            for pos, logical in enumerate(self.logical_order)
-        }
+    _refresh_layout_map = _layout._refresh_layout_map
 
-    def _layout_is_identity(self) -> bool:
-        """Return whether the coefficient MPS is in logical site order."""
-        return tuple(self.logical_order) == tuple(range(self.n))
+    _layout_is_identity = _layout._layout_is_identity
 
-    def _mps_site(self, logical_site: int) -> int:
-        """Map a logical coefficient qubit to its current MPS site position."""
-        try:
-            return self._logical_to_mps[int(logical_site)]
-        except KeyError as exc:
-            raise ValueError(
-                f"coefficient site {logical_site!r} is not present in the "
-                f"current STN layout {self.logical_order!r}."
-            ) from exc
+    _mps_site = _layout._mps_site
 
-    def _mps_sites(self, logical_sites) -> tuple[int, ...]:
-        """Map logical coefficient support sites to MPS positions."""
-        return tuple(self._mps_site(site) for site in logical_sites)
+    _mps_sites = _layout._mps_sites
 
-    def _mps_terms(self, logical_terms) -> dict[int, str]:
-        """Map a logical coefficient-frame Pauli support to MPS positions."""
-        return {
-            self._mps_site(site): axis
-            for site, axis in logical_terms.items()
-        }
+    _mps_terms = _layout._mps_terms
 
     def current_frame_layout(
         self,
@@ -2449,22 +1501,8 @@ class StabilizerMpsSimulator:
         ``"count"`` for the historical uniform weighting, and ``"angle"`` /
         ``"auto"`` for angle-based weighting.
         """
-        records = self._frame_layout_records(
-            self._queue,
-            weight_mode=weight_mode,
-        )
-        stream = [
-            ("submpo", {"weight": record["weight"]}, record["support"])
-            for record in records
-        ]
-        finder = MpsGateStreamLayoutFinder(stream, L=self.n)
-
-        def weight_fn(payload, _support, _event_type):
-            if isinstance(payload, Mapping):
-                return float(payload.get("weight", 1.0))
-            return 1.0
-
-        plan = finder.run(
+        return _layout.current_frame_layout(
+            self,
             order=order,
             refine_passes=refine_passes,
             refine_numba=refine_numba,
@@ -2475,500 +1513,38 @@ class StabilizerMpsSimulator:
             nevergrad_optimizer=nevergrad_optimizer,
             kahypar_config_path=kahypar_config_path,
             kahypar_seed=kahypar_seed,
-            weight_fn=weight_fn,
-            weight_mode="count",
+            weight_mode=weight_mode,
         )
-        plan = dict(plan)
-        plan["kind"] = "stn_frame_layout"
-        plan["source"] = "queued_frame_supports"
-        plan["frame_events"] = tuple(records)
-        plan["frame_weight_mode"] = weight_mode
-        return plan
 
     find_frame_layout = current_frame_layout
 
-    def _frame_layout_records(self, entries, *, weight_mode="operator_schmidt"):
-        """Return weighted logical frame-support records for a stream."""
-        mode = str(weight_mode).replace("-", "_").strip().lower()
-        if mode in ("unit", "uniform", "none"):
-            mode = "count"
-        if mode not in ("count", "angle", "auto", "operator_schmidt"):
-            raise ValueError(
-                "STN frame layout weight_mode must be 'operator_schmidt', "
-                "'count', 'angle', or 'auto'."
-            )
-        dry = self.copy()
-        dry._queue = []
-        records = []
-        for entry in self._as_entries(entries):
-            dry._frame_layout_trace_entry(entry, records, weight_mode=mode)
-        return tuple(records)
+    _frame_layout_records = _layout._frame_layout_records
 
-    def _frame_layout_weight(
-        self,
-        *,
-        weight_mode,
-        theta=None,
-        coeff=None,
-        support_size=None,
-        operator_weight=None,
-    ):
-        """Return the scalar weight used for one frame-layout record."""
-        if weight_mode == "operator_schmidt":
-            if operator_weight is not None:
-                amplitude = 1.0
-                if coeff is not None:
-                    try:
-                        amplitude = max(abs(complex(coeff)), 1.0e-12)
-                    except (TypeError, ValueError):
-                        amplitude = 1.0
-                return max(1.0e-12, float(operator_weight) * amplitude)
-            if theta is not None:
-                if support_size is not None and int(support_size) < 2:
-                    return 1.0
-                # Keep a unit locality baseline and add the non-leading
-                # operator-Schmidt weight of the I/P rotation branches.
-                return 1.0 + _operator_schmidt_tail_weight(theta)
-            if coeff is not None:
-                try:
-                    return max(abs(complex(coeff)), 1.0e-12)
-                except (TypeError, ValueError):
-                    return 1.0
-            return 1.0
-        if coeff is not None:
-            try:
-                return float(abs(complex(coeff)))
-            except (TypeError, ValueError):
-                return 1.0
-        if weight_mode in ("angle", "auto") and theta is not None:
-            return _layout_angle_weight(theta)
-        return 1.0
+    _frame_layout_weight = _layout._frame_layout_weight
 
-    def _frame_layout_add_pauli(
-        self,
-        pauli,
-        where,
-        records,
-        *,
-        kind,
-        entry,
-        weight_mode,
-        theta=None,
-        weight=None,
-        absorb_basis=False,
-    ):
-        """Record one current frame image and optionally dry-run its basis update."""
-        m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
-        terms, _sign = hermitian_pauli_terms(m_pauli)
-        support = tuple(sorted(terms))
-        if support:
-            if weight is None:
-                weight = self._frame_layout_weight(
-                    weight_mode=weight_mode,
-                    theta=theta,
-                    support_size=len(support),
-                )
-            records.append({
-                "kind": kind,
-                "entry": entry,
-                "support": support,
-                "weight": float(weight),
-                "operator_weight": float(weight),
-                "absorbs_basis": bool(absorb_basis),
-            })
-        if absorb_basis and support:
-            _ops, v_tableau, _k = _localizing_clifford(
-                terms,
-                self.n,
-                site_position=self._mps_site,
-            )
-            self.state.absorb_basis_clifford(v_tableau)
+    _frame_layout_add_pauli = _layout._frame_layout_add_pauli
 
-    def _frame_layout_trace_rotation(self, name, params, records, *, entry, weight_mode):
-        """Trace a rotation entry for layout without changing ``|p>``."""
-        theta, where, axes = self._rotation_spec(name, params)
-        phys = pauli_string(axes, where, self.n)
-        if self._is_clifford_angle(theta):
-            self._apply_clifford_rotation(theta, where, axes)
-            return
-        m_pauli = self.state.frame_pauli(phys)
-        terms, _sign = hermitian_pauli_terms(m_pauli)
-        support = tuple(sorted(terms))
-        if support:
-            weight = self._frame_layout_weight(
-                weight_mode=weight_mode,
-                theta=theta,
-                support_size=len(support),
-            )
-            records.append({
-                "kind": "rotation",
-                "entry": entry,
-                "support": support,
-                "weight": float(weight),
-                "operator_weight": float(weight),
-                "absorbs_basis": False,
-            })
+    _frame_layout_trace_rotation = _layout._frame_layout_trace_rotation
 
-    def _frame_layout_trace_matrix(self, gate, where, records, *, entry, weight_mode):
-        """Trace an explicit physical matrix entry for layout."""
-        where = _normalize_sites(where)
-        gate = _as_gate_matrix(gate, len(where))
-        dim = gate.shape[0]
-        nq = int(round(math.log2(dim)))
-        if 2 ** nq != dim or gate.shape != (dim, dim):
-            raise ValueError(f"Gate matrix must be square 2^k x 2^k, got {gate.shape}.")
-        if len(where) != nq:
-            raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
+    _frame_layout_trace_matrix = _layout._frame_layout_trace_matrix
 
-        dense_operator_weight = (
-            _dense_operator_schmidt_layout_weight(gate, nq)
-            if weight_mode == "operator_schmidt"
-            else None
-        )
+    _frame_layout_trace_entry = _layout._frame_layout_trace_entry
 
-        tableau = _tableau_from_exact_unitary(gate)
-        gate_is_unitary = _is_unitary(gate)
-        if tableau is not None:
-            self.state.do_tableau(tableau, where)
-            return
+    _validate_layout_plan_for_stn = _layout._validate_layout_plan_for_stn
 
-        if nq == 1 and gate_is_unitary:
-            alpha, theta, beta = _zyz_angles(gate)
-            q = where[0]
-            self._frame_layout_trace_rotation(
-                "rz", (beta, q), records, entry=entry, weight_mode=weight_mode
-            )
-            self._frame_layout_trace_rotation(
-                "ry", (theta, q), records, entry=entry, weight_mode=weight_mode
-            )
-            self._frame_layout_trace_rotation(
-                "rz", (alpha, q), records, entry=entry, weight_mode=weight_mode
-            )
-            return
+    _explicit_layout_plan = _layout._explicit_layout_plan
 
-        limit = self.max_pauli_decomposition_qubits
-        if limit is not None and nq > limit:
-            raise ValueError(
-                f"Pauli decomposition of a {nq}-qubit dense gate would enumerate "
-                f"{4**nq} candidate terms, exceeding "
-                f"max_pauli_decomposition_qubits={limit}."
-            )
-        for term_index, (labels, coeff) in enumerate(
-            pauli_decomposition(gate, nq, tol=self.operator_tol), start=1
-        ):
-            if (
-                self.max_pauli_terms is not None
-                and term_index > self.max_pauli_terms
-            ):
-                raise ValueError(
-                    f"dense gate retained more than max_pauli_terms="
-                    f"{self.max_pauli_terms} during layout analysis."
-                )
-            phys = pauli_string(labels, where, self.n)
-            frame_terms, _sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
-            support = tuple(sorted(frame_terms))
-            if support:
-                weight = self._frame_layout_weight(
-                    weight_mode=weight_mode,
-                    coeff=coeff,
-                    operator_weight=dense_operator_weight,
-                )
-                records.append({
-                    "kind": "matrix_branch",
-                    "entry": entry,
-                    "support": support,
-                    "weight": float(weight),
-                    "operator_weight": (
-                        float(dense_operator_weight)
-                        if dense_operator_weight is not None
-                        else float(weight)
-                    ),
-                    "absorbs_basis": False,
-                })
+    _resolve_layout_plan_argument = _layout._resolve_layout_plan_argument
 
-    def _frame_layout_trace_entry(self, entry, records, *, weight_mode):
-        """Trace one queued entry into weighted frame-support records."""
-        conditional = conditional_event_parts(entry)
-        if conditional is not None:
-            raise ValueError(
-                "static STN frame_layout='auto' cannot safely prepass a "
-                "branch-dependent feed-forward action; provide an explicit "
-                "layout or use the ordinary interaction layout."
-            )
-        parts = submpo_event_parts(entry, normalize_where=True)
-        if parts is not None:
-            mpo, where = parts
-            support = tuple(sorted(_unique_ordered(where)))
-            if support:
-                weight = (
-                    _submpo_operator_layout_weight(mpo)
-                    if weight_mode == "operator_schmidt"
-                    else 1.0
-                )
-                records.append({
-                    "kind": "submpo",
-                    "entry": entry,
-                    "support": support,
-                    "weight": float(weight),
-                    "operator_weight": float(weight),
-                    "absorbs_basis": False,
-                })
-            return
+    _product_site_vector = staticmethod(_layout._product_site_vector)
 
-        if not (isinstance(entry, (list, tuple)) and len(entry) >= 1):
-            raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
+    _relabel_product_mps = _layout._relabel_product_mps
 
-        head = entry[0]
-        if not isinstance(head, str):
-            if len(entry) != 2:
-                raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            gate, where = entry
-            self._frame_layout_trace_matrix(
-                self._gate_to_numpy(gate),
-                where,
-                records,
-                entry=entry,
-                weight_mode=weight_mode,
-            )
-            return
+    _format_layout_value = staticmethod(_layout._format_layout_value)
 
-        name = _normalize_event_name(head)
-        if name == "disentangle":
-            return
-        if name in _CLIFFORD_NAMES:
-            self.state.apply_clifford(name, *entry[1:])
-            return
-        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name in (
-            "rot", "t", "tdg",
-        ):
-            self._frame_layout_trace_rotation(
-                name,
-                entry[1:],
-                records,
-                entry=entry,
-                weight_mode=weight_mode,
-            )
-            return
-        if name == "measure":
-            pauli, where = entry[1], entry[2]
-            absorb = bool(entry[4]) if len(entry) > 4 else False
-            self._frame_layout_add_pauli(
-                pauli,
-                where,
-                records,
-                kind="measure",
-                entry=entry,
-                weight_mode=weight_mode,
-                absorb_basis=absorb,
-            )
-            return
-        if name == "reset" or name in _RESET_AXIS_ALIASES:
-            axes, where = _parse_reset_args(
-                entry[1:],
-                default_axis=_RESET_AXIS_ALIASES.get(name),
-            )
-            for axis, q in zip(axes, where):
-                self._frame_layout_add_pauli(
-                    axis,
-                    q,
-                    records,
-                    kind="reset",
-                    entry=entry,
-                    weight_mode=weight_mode,
-                    absorb_basis=True,
-                )
-            return
-        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
-            axes, where, _outcomes, absorb = _parse_measure_reset_args(
-                entry[1:],
-                default_axis=_MR_AXIS_ALIASES.get(name),
-            )
-            for axis, q in zip(axes, where):
-                self._frame_layout_add_pauli(
-                    axis,
-                    q,
-                    records,
-                    kind="measure_reset",
-                    entry=entry,
-                    weight_mode=weight_mode,
-                    absorb_basis=absorb,
-                )
-            return
-        if name == "cap":
-            raise ValueError(
-                "static STN auto-layout is not supported with cap events, "
-                "because cap changes the qubit/MPS length."
-            )
-        raise ValueError(f"Unknown gate name {head!r} in stream entry {entry!r}.")
+    _format_layout_reduction = classmethod(_layout._format_layout_reduction)
 
-    def _validate_layout_plan_for_stn(self, plan) -> None:
-        """Validate that a layout plan is a full permutation of STN qubits."""
-        site_order = tuple(int(site) for site in plan.get("site_order", plan.get("order", ())))
-        if len(site_order) != self.n:
-            raise ValueError(
-                f"layout site_order length must match n={self.n}, got {len(site_order)}."
-            )
-        if sorted(site_order) != list(range(self.n)):
-            raise ValueError(
-                f"layout site_order must be a permutation of range({self.n})."
-            )
-        site_map = plan.get("site_map", plan.get("layout"))
-        if site_map is None:
-            raise ValueError("layout plan must contain a site_map/layout mapping.")
-        expected = {site: pos for pos, site in enumerate(site_order)}
-        if {int(k): int(v) for k, v in dict(site_map).items()} != expected:
-            raise ValueError(
-                "layout site_map must map each logical coefficient site to its "
-                "position in site_order."
-            )
-
-    def _explicit_layout_plan(self, site_order):
-        """Build a minimal STN frame-layout plan from an explicit site order."""
-        site_order = tuple(int(site) for site in site_order)
-        site_map = {site: position for position, site in enumerate(site_order)}
-        return {
-            "kind": "stn_frame_layout",
-            "selected_order": "explicit",
-            "qubit_inds": site_order,
-            "site_order": site_order,
-            "order": site_order,
-            "layout": site_map,
-            "site_map": site_map,
-            "inverse_site_map": {
-                position: site for site, position in site_map.items()
-            },
-            "stats": {},
-            "input_stats": {},
-        }
-
-    def _resolve_layout_plan_argument(self, plan_or_order, layout_kwargs=None):
-        """Resolve a static STN layout request without mutating the simulator."""
-        if isinstance(plan_or_order, Mapping):
-            plan = dict(plan_or_order)
-        elif isinstance(plan_or_order, str):
-            kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
-            plan = self.current_frame_layout(order=plan_or_order, **kwargs)
-        else:
-            try:
-                plan = self._explicit_layout_plan(plan_or_order)
-            except TypeError as exc:
-                raise TypeError(
-                    "plan_or_order must be a layout mapping, an order name, "
-                    "or a permutation of logical coefficient sites."
-                ) from exc
-        self._validate_layout_plan_for_stn(plan)
-        return plan
-
-    @staticmethod
-    def _product_site_vector(p, physical_site):
-        """Extract a local vector from an isolated coefficient-MPS site."""
-        tensor = p[p.site_tag(int(physical_site))]
-        physical_ind = p.site_ind(int(physical_site))
-        try:
-            physical_axis = tensor.inds.index(physical_ind)
-        except ValueError as exc:  # pragma: no cover - defensive quimb guard
-            raise ValueError(
-                "product-state relabeling could not locate a physical site index."
-            ) from exc
-        if any(
-            int(size) != 1
-            for axis, size in enumerate(tensor.shape)
-            if axis != physical_axis
-        ):
-            raise ValueError(
-                "extracting a local product vector requires every virtual dimension "
-                "to be one."
-            )
-        axes = [axis for axis in range(tensor.ndim) if axis != physical_axis]
-        axes.append(physical_axis)
-        data = ar.do("transpose", tensor.data, tuple(axes))
-        return data.reshape(-1)
-
-    def _relabel_product_mps(self, target_order, *, current_order):
-        """Rebuild a bond-one coefficient MPS in a new logical site order."""
-        p = self.state.p
-        if getattr(p, "cyclic", False):
-            raise ValueError(
-                "STN static layout relabeling currently requires an open-boundary MPS."
-            )
-        vectors = {
-            logical_site: self._product_site_vector(p, physical_site)
-            for physical_site, logical_site in enumerate(current_order)
-        }
-        arrays = [vectors[logical_site] for logical_site in target_order]
-        new_p = qtn.MPS_product_state(
-            arrays,
-            site_ind_id=p.site_ind_id,
-            site_tag_id=p.site_tag_id,
-        )
-        if hasattr(p, "exponent") and hasattr(new_p, "exponent"):
-            new_p.exponent = p.exponent
-        self.state.p = new_p
-        self.state.info = {"cur_orthog": None}
-
-    @staticmethod
-    def _format_layout_value(value):
-        """Format one layout diagnostic value compactly."""
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return str(value)
-        if abs(value - round(value)) < 1e-9:
-            return str(int(round(value)))
-        return f"{value:.3g}"
-
-    @classmethod
-    def _format_layout_reduction(cls, before, after):
-        """Format a before/after layout diagnostic compactly."""
-        text = f"{cls._format_layout_value(before)} -> {cls._format_layout_value(after)}"
-        try:
-            before = float(before)
-            after = float(after)
-        except (TypeError, ValueError):
-            return text
-        if before > 0.0:
-            text += f" ({100.0 * (before - after) / before:.1f}% lower)"
-        return text
-
-    @classmethod
-    def _layout_report_text(cls, plan):
-        """Return a concise human-readable STN layout report."""
-        stats = plan.get("stats", {})
-        input_stats = plan.get("input_stats", {})
-        if not input_stats:
-            return None
-        selected = plan.get("selected_order", "<unknown>")
-        site_order = plan.get("site_order", ())
-        lines = [
-            (
-                "StabilizerMpsSimulator frame layout: "
-                f"order={selected}, sites={len(site_order)}, "
-                f"events={stats.get('num_events', input_stats.get('num_events', 0))}"
-            ),
-            (
-                "  frame event span max/mean: "
-                + cls._format_layout_value(input_stats.get("max_event_span", 0))
-                + "/"
-                + cls._format_layout_value(input_stats.get("weighted_mean_event_span", 0.0))
-                + " -> "
-                + cls._format_layout_value(stats.get("max_event_span", 0))
-                + "/"
-                + cls._format_layout_value(stats.get("weighted_mean_event_span", 0.0))
-            ),
-            (
-                "  score: "
-                + cls._format_layout_reduction(
-                    input_stats.get("loss", input_stats.get("score", 0.0)),
-                    stats.get("loss", stats.get("score", 0.0)),
-                )
-                + " | cut L2: "
-                + cls._format_layout_reduction(
-                    input_stats.get("weighted_cut_congestion_l2", 0.0),
-                    stats.get("weighted_cut_congestion_l2", 0.0),
-                )
-            ),
-        ]
-        return "\n".join(lines)
+    _layout_report_text = classmethod(_layout._layout_report_text)
 
     def apply_layout(
         self,
@@ -2986,59 +1562,14 @@ class StabilizerMpsSimulator:
         (including Clifford-entangled stabilizer states), and rejects entangled
         coefficient states before mutation.
         """
-        for entry in self._queue:
-            if isinstance(entry, (list, tuple)) and entry:
-                head = entry[0]
-                if isinstance(head, str) and _normalize_event_name(head) == "cap":
-                    raise ValueError(
-                        "static STN layout cannot be installed for streams with "
-                        "cap events, because cap changes the qubit/MPS length."
-                    )
-        plan = self._resolve_layout_plan_argument(plan_or_order, layout_kwargs)
-        target_order = tuple(int(site) for site in plan["site_order"])
-        current_order = tuple(self.logical_order)
-        if target_order != current_order:
-            if int(self.state.max_bond()) != 1:
-                raise ValueError(
-                    "static STN layout requires a product coefficient MPS "
-                    "(state.max_bond() == 1); got max_bond={} . Apply the "
-                "layout before non-Clifford evolution entangles |p>.".format(
-                        self.state.max_bond()
-                    )
-                )
-            self._relabel_product_mps(target_order, current_order=current_order)
-        self.logical_order = list(target_order)
-        self._refresh_layout_map()
-        self._localizer_cache.clear()
-        self.layout_plan = plan
-        self.last_layout_plan = plan
-        if layout_report:
-            report = self._layout_report_text(plan)
-            if report:
-                print(report)
-        return self
+        return _layout.apply_layout(
+            self,
+            plan_or_order,
+            layout_kwargs=layout_kwargs,
+            layout_report=layout_report,
+        )
 
-    def _apply_layout_from_entries(
-        self,
-        entries,
-        layout,
-        *,
-        layout_kwargs=None,
-        layout_report: bool = True,
-    ) -> None:
-        """Install a static layout found from ``entries`` without queuing them."""
-        if layout is None or layout is False:
-            return
-        old_queue = self._queue
-        self._queue = list(entries)
-        try:
-            self.apply_layout(
-                layout,
-                layout_kwargs=layout_kwargs,
-                layout_report=layout_report,
-            )
-        finally:
-            self._queue = old_queue
+    _apply_layout_from_entries = _layout._apply_layout_from_entries
 
     # ------------------------------------------------------------------ #
     # Execution
@@ -6743,7 +5274,7 @@ class StabilizerMpsSimulator:
 
     def _fit_overlap_diagnostics_for_target(self, target, fitted):
         """Return the optional target-overlap diagnostic for a FIT update."""
-        from ...tensors.core import tn_fidelity
+        from ...tensors.observables import tn_fidelity
 
         # Contract copies so this optional diagnostic cannot alter the live
         # target or FIT center metadata used by the next replay step.
@@ -9172,22 +7703,3 @@ def _looks_like_stream(gates) -> bool:
         return False
     # First element is a str/number -> ``gates`` is a single named entry.
     return False
-
-
-def _zyz_angles(gate: np.ndarray):
-    """Return ``(alpha, theta, beta)`` with ``U ~ Rz(alpha) Ry(theta) Rz(beta)``.
-
-    Up to a global phase, using the convention ``Rz(a) = exp(-i a/2 Z)`` and
-    ``Ry(t) = exp(-i t/2 Y)``.
-    """
-    u = np.asarray(ar.to_numpy(gate), dtype=complex)
-    det = u[0, 0] * u[1, 1] - u[0, 1] * u[1, 0]
-    u = u / np.sqrt(det)  # to SU(2) up to a sign (global phase, irrelevant)
-    c = abs(u[0, 0])
-    s = abs(u[1, 0])
-    theta = 2.0 * math.atan2(s, c)
-    apb = -np.angle(u[0, 0]) if c > 1e-12 else 0.0
-    amb = -np.angle(-u[0, 1]) if s > 1e-12 else 0.0
-    alpha = float(apb + amb)
-    beta = float(apb - amb)
-    return alpha, float(theta), beta

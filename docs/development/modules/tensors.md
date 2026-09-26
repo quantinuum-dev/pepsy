@@ -1,20 +1,21 @@
 # pepsy.tensors
 
-This package contains Pepsy's tensor-network construction, mapping,
-contraction, validation, observable, backend, and symmetric-state helpers.
-Other packages should import these helpers through `pepsy.tensors` or the
-top-level `pepsy` exports rather than old flat modules.
+This package owns tensor-network construction, mapping, contraction,
+observables, validation, and symmetric-state helpers. Applications should
+use `pepsy.tensors`; internal code should import from the owning modules below.
+Backend configuration belongs to `pepsy.backends`.
 
 ## Modules
 
-- `core.py`: main implementations for constructors, `OneDMap`, backend
-  defaults, contraction optimizers, observables, and dense TN utilities.
-- `constructors.py`: facade for product-state, identity, Haar-random, MPS,
-  MPO, PEPS, and PEPO constructors.
-- `contractions.py`: facade for contraction optimizers, `tn_norm`,
-  `tn_fidelity`, and alignment helpers.
-- `maps.py`: facade for `OneDMap`.
-- `observables.py`: facade for observable and MPO expectation helpers.
+- `constructors.py`: product-state, identity, Haar-random, MPS, TTN, MPO,
+  PEPS, and PEPO constructors; `expec_mpo` and `tns_align`.
+- `contractions.py`: contraction optimizers, compressed contraction, and
+  `tn_norm`.
+- `maps.py`: `OneDMap` and regular-lattice traversal.
+- `observables.py`: `measure_obs`, `tn_fidelity`, and MPS entropy.
+- `conversions.py`: explicit MPS-to-TTN and MPS-to-tree-PEPS conversion.
+- `core.py`: compatibility exports and historical contraction/fidelity patch
+  hooks. Internal consumers use the owning modules directly.
 - `mps_transfer.py`: repeating-cell and site-selected local transfer actions,
   dense and bosonic Symmray sector adapters, backend-preserving Arnoldi,
   transfer gaps, momenta, degeneracy, and correlation lengths. Local windows
@@ -23,12 +24,20 @@ top-level `pepsy` exports rather than old flat modules.
   `canonicalize=None, allow_local=True`; caller input is preserved. Small unresolved
   gaps are distinct from numerical peripheral modes, and Arnoldi can grow
   its basis within an explicit memory cap.
-- `symmetric.py`: Symmray-backed `SymMPS`, `SymPEPS`, symmetric Hamiltonian,
-  gate-stream, charge-sector, and dense-operator conversion helpers.
+- `symmetric.py`: symmetric Hamiltonians, legacy Hubbard gate
+  streams, shared charge sectors, and operator conversion. Historical model,
+  state, and diagnostic imports resolve lazily to their owners.
+- `symmetric_diagnostics.py`: native block, MPS/MPO/PEPS, charge, and fermionic
+  ordering summaries and drawings. Plotting libraries load only when drawing.
+- `symmetric_states.py`: `SymMPS`, `SymPEPS`, and their shared state behavior:
+  construction, copying, charge metadata, evolution, and measurement.
+- `symm_fermions.py`: `Fermion`, its compatibility constructors and
+  `SymmFermions` factories, lattice metadata, local observables, parameterized
+  gates, and model-facing term and gate-stream construction.
 - `validation.py`: shared PEPS tag and physical-index validation helpers.
 
-Many leaf modules are intentionally thin facades over `core.py`; keep that
-structure unless a change has a strong reason to split implementation.
+The public namespace resolves these implementations lazily. Keep new helpers
+with their owner; do not route them through `core.py`.
 
 ## Main responsibilities
 
@@ -79,7 +88,7 @@ Contraction helpers include:
   compressed contraction tree (one-hot selection; requires `cutoff=0.0`)
 - `tn_norm(...)`, `tn_fidelity(...)`, and `tns_align(...)`
 
-Backend helpers manage package-wide defaults and optional linalg shims:
+`pepsy.backends` manages package-wide defaults and optional linalg shims:
 
 - `set_default_array_backend(...)` / `get_default_array_backend()`
 - `set_default_grad_backend(...)` / `get_default_grad_backend()`
@@ -115,8 +124,20 @@ these conventions for shape inference and layer construction.
 
 ## Symmetric tensors
 
-`symmetric.py` provides Symmray-backed convenience wrappers and charge-sector
-helpers. Symmray remains optional. Code and tests that depend on it should
+`symmetric.py` supplies the shared conversion and Hamiltonian layer to
+`symm_fermions.py`, `symmetric_states.py`, and `symmetric_diagnostics.py`.
+MPO assembly and local-term factorization live in
+`operators/_symmetric_mpo.py`; Hamiltonian conversion methods load those
+builders when called. Charge, basis, and coordinate mapping helpers remain
+in the shared tensor layer.
+State wrappers also use the diagnostic summaries directly. The shared layer
+does not eagerly import any of those modules; `SymHamiltonian.jw_energy`
+imports the shared state type only when validating a state. Existing imports
+and serialized class/function references through `pepsy.tensors.symmetric`
+continue to resolve to the same objects. Public namespace exports and internal
+state constructors point directly to the owning implementations.
+
+Symmray remains optional. Code and tests that depend on it should
 import lazily or use `pytest.importorskip("symmray")`.
 
 For spinful Fermi-Hubbard states, the named model presets are:

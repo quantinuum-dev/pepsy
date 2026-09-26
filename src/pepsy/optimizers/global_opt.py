@@ -12,7 +12,7 @@ import autoray as ar
 import quimb.tensor as qtn
 
 from .._internal.quimb import call_quimb_2d
-from ..tensors.core import build_optimizer, contract_hypercompressed_tn
+from ..tensors.contractions import build_optimizer, contract_hypercompressed_tn
 
 __all__ = ["GlobalOptimizer"]
 

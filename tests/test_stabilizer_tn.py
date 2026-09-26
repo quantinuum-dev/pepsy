@@ -3259,6 +3259,21 @@ def test_run_with_injection_reset_ancillas_leaves_zero():
     assert sim.expectation("Z", 1) == pytest.approx(1.0, abs=1e-9)
 
 
+def test_extracted_advice_preserves_subclass_classmethod_dispatch():
+    class HookedSimulator(StabilizerMpsSimulator):
+        analyzed = []
+
+        @classmethod
+        def _analysis_entry_kind(cls, entry):
+            cls.analyzed.append(entry)
+            return super()._analysis_entry_kind(entry)
+
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 0)]
+    advice = HookedSimulator.recommend_settings(stream)
+    assert HookedSimulator.analyzed == stream
+    assert advice == StabilizerMpsSimulator.recommend_settings(stream)
+
+
 def test_magic_strategy_recommends_explicit_clifford_t_execution_modes():
     stream = [
         ("h", 0), ("cnot", 0, 1), ("t", 0),

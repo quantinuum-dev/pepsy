@@ -1,5 +1,10 @@
 # `pepsy.sampling.samplers`
 
+Prefer public imports from `pepsy.sampling`. Implementations are organized in
+`sampling.mps`, `sampling.vector`, `sampling.peps`, and `sampling.bp`, with
+shared records in `sampling.results`. Historical `sampling.samplers` imports
+and serialized class references remain compatible.
+
 ## Direct PEPS sampler
 
 `PepsSampler` has an exact reference mode and a compressed boundary-MPS mode.
@@ -316,6 +321,9 @@ needed. `sample_arrays(...)` remains available for direct tuple unpacking, and
 `sample(...)` preserves the original `MpsSampleResult` behavior.
 The native path builds backend-native right environments once, so it does not
 require quimb to canonicalize Torch or CuPy tensors before sampling.
+Complex right environments retain their bra-row/ket-column orientation when
+forming Born weights. This corrects the earlier transposed contraction, which
+could bias native sampling and probability evaluation for complex states.
 It caches those environments for the current MPS tensors: after modifying the
 MPS, call `sampler.refresh()` before sampling again.
 
@@ -546,6 +554,3 @@ sample mean and a standard error based on the unbiased sample variance.
 Hopping, pairing, and spin-flip
 operators are not diagonal and require a separate fermionic local-estimator
 calculation.
-
-
-> API details are maintained as handwritten Markdown in this page.

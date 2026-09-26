@@ -30,7 +30,7 @@ from ...boundary.metrics import build_bra_ket, peps_normalize
 from ...boundary.states import BdyMPS
 from ...boundary.sweeps import CompBdy
 from ...boundary._lattice import infer_lattice_shape
-from ...tensors.core import tn_fidelity
+from ...tensors.observables import tn_fidelity
 from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
 from ...tensors.validation import _PHYS_IND_PATTERN
 from .environments import (

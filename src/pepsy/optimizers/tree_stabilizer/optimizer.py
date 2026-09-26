@@ -4122,7 +4122,7 @@ class StabilizerTreeSimulator:
         # Keep the public basis contract shared with StabilizerMpsSimulator and the
         # standalone stabilizer sampler.  The import is local to avoid making
         # the optimizer module part of the sampling-module import cycle.
-        from ...sampling.samplers import _resolve_measurement_basis
+        from ...sampling.vector import _resolve_measurement_basis
 
         return _resolve_measurement_basis(basis, int(n), rng=rng)
 

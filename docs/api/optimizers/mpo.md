@@ -454,5 +454,3 @@ tensor tuples without crossing the Quimb wrapper boundary. Use
 when available and retain an autodiff-safe fallback loop otherwise. These
 interfaces share structural caches but never cache parameter-dependent tensor
 values.
-
-> API details are maintained as handwritten Markdown in this page.

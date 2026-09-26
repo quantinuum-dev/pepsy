@@ -37,6 +37,38 @@ def test_mps_optimizer_layout_finder_api_is_separate_module():
     assert py.MpsOptimizer.LayoutFinder is LayoutFinder
 
 
+def test_layout_execution_preserves_subclass_state_hooks():
+    """Extracted operations must dispatch through overridden optimizer hooks."""
+    class ObservedOptimizer(py.MpsOptimizer):
+        def _set_site_order(self, order):
+            order = tuple(order)
+            self.observed_orders = getattr(self, "observed_orders", []) + [order]
+            return super()._set_site_order(order)
+
+        def _product_site_vector(self, state, physical_site):
+            self.observed_sites.append(physical_site)
+            return super()._product_site_vector(state, physical_site)
+
+    state = _nonuniform_product_mps()
+    expected = state.to_dense().reshape(-1)
+    opt = ObservedOptimizer(state, gates=[], chi=8, mode="svd")
+    opt.observed_sites = []
+    order = (0, 2, 3, 1)
+
+    assert opt.apply_layout(order, layout_report=False) is opt
+    assert opt.observed_orders[-1] == order
+    assert opt.observed_sites == [0, 1, 2, 3]
+    assert opt.qubits == opt.logical_order == list(order)
+    np.testing.assert_allclose(opt.to_dense().reshape(-1), expected, atol=1e-12)
+    np.testing.assert_array_equal(opt.remap_sample([0, 1, 2, 3]), [0, 3, 1, 2])
+
+    copied = opt.copy()
+    assert type(copied) is ObservedOptimizer
+    assert copied.logical_order == opt.logical_order
+    assert copied.logical_order is not opt.logical_order
+    np.testing.assert_allclose(copied.to_dense().reshape(-1), expected, atol=1e-12)
+
+
 def test_mps_optimizer_gate_stream_layout_remaps_long_range_path():
     """Gate-stream layout should find a short order without changing the stream."""
     gates = [

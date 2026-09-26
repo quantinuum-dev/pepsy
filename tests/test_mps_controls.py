@@ -52,6 +52,34 @@ def _full_network_pauli_expectation(mps, pauli, where, optimize="auto-hq"):
     return float(np.real(complex(numerator / denominator)))
 
 
+def test_extracted_controls_and_norm_preserve_subclass_hooks():
+    class HookedOptimizer(py.MpsOptimizer):
+        def _finish_measurement_center(self, site, *, renormalize):
+            self.finished_sites.append(site)
+            return super()._finish_measurement_center(site, renormalize=renormalize)
+
+        def _canonical_span_norm(self, p, where, *, fallback=True):
+            self.norm_spans.append(where)
+            return super()._canonical_span_norm(p, where, fallback=fallback)
+
+    opt = HookedOptimizer(
+        qtn.MPS_computational_state("00"),
+        [("h", 0), ("measure", "Z", 0, -1), ("reset", 0)],
+        chi=4,
+    )
+    opt.finished_sites = []
+    opt.norm_spans = []
+    opt.run(progbar=False)
+    opt.normalize()
+    assert opt.finished_sites
+    assert opt.norm_spans
+    np.testing.assert_allclose(
+        np.abs(opt.to_dense().reshape(-1)), [1.0, 0.0, 0.0, 0.0], atol=1e-12
+    )
+    assert opt.measurements[0][:3] == ("Z", (0,), -1)
+    assert float(abs(opt.p.norm())) == pytest.approx(1.0)
+
+
 def test_mps_optimizer_measure_forced_outcome_collapses_and_records():
     """A forced measurement should collapse the state and record the result."""
     m = qtn.MPS_rand_state(6, 4, seed=2)

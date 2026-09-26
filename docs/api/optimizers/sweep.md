@@ -44,6 +44,3 @@ are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for
 that diagnostic; omitting `fit_rtol` inherits the constructor value. The same
 omitted-versus-explicit-`None` rule applies to other FIT controls for which
 `None` has an underlying solver meaning.
-
-
-> API details are maintained as handwritten Markdown in this page.

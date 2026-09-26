@@ -43,8 +43,8 @@ def _resolve_optlib(optlib: str | None) -> str | None:
     if optlib == "cmaes" and not _module_available("cmaes"):
         warnings.warn(
             "CMA-ES is unavailable; falling back to Cotengra's built-in "
-            "'sbplx' hyper-optimizer. Install pepsy[contraction] for the "
-            "accelerated CMA-ES search.",
+            "'sbplx' hyper-optimizer. From a Pepsy checkout, run "
+            "python -m pip install '.[contraction]' for accelerated CMA-ES search.",
             RuntimeWarning,
             stacklevel=3,
         )

@@ -94,6 +94,12 @@ The public facades are:
 The older `operators.mpo` and `operators.cluster` modules remain importable
 compatibility facades; they no longer own the large implementation sources.
 
+The private `operators._symmetric_mpo` module owns symmetric MPO assembly,
+native local-term factorization, and charge-sector grouping used by
+`SymHamiltonian.to_mpo`, `SymHamiltonian.to_pepo`, fermion observables, and
+native gate builders. Shared charge and basis helpers live in
+`tensors.symmetric`, which retains historical builder imports lazily.
+
 Every construction/compression report keeps its detailed algorithm-specific
 fields and also exposes `.api_info`. That common summary has the keys
 `family`, `algorithm`, `representation`, `order`, `factor_count`,
