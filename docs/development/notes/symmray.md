@@ -14,6 +14,23 @@ Phys. Rev. Research 7, 023193 (2025).
 
 ## Upstream audit and current opportunities
 
+### 2026-09-26: symmetric MPO builder extraction
+
+The installed versions remain Symmray `0.4.1.dev8+gc45f91457`, Quimb
+`1.15.1.dev66+ge927f06e1`, Autoray `0.11.1.dev3+g1b476b305`, and Cotengra
+`0.8.3.dev7+g1d7fd333f`. Reused the same-task upstream review below and
+rechecked installed `symmray.utils.from_dense`, `MatrixProductOperator`, and
+`MatrixProductOperator.compress` signatures. Array construction still accepts
+the existing index maps, duals, fermionic flag, and operator charge; compression
+continues to receive the existing cutoff and maximum-bond options.
+
+- **Compatibility shim:** lazy historical builder attributes in
+  `tensors.symmetric` resolve to `operators._symmetric_mpo`. Both import orders
+  and old pickle globals are checked with Symmray unavailable.
+- **Defer:** dependency upgrades and new upstream algorithms. Native grading,
+  Jordan-Wigner strings, compression policy, and backend conversion order are
+  unchanged. Shared charge/basis/mapping helpers remain in `tensors.symmetric`.
+
 ### 2026-09-25: model, diagnostic, and MPS helper extraction
 
 Rechecked the installed versions below: all four remain unchanged. Reused

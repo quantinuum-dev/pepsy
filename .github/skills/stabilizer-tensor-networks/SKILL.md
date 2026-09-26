@@ -170,6 +170,13 @@ The concrete pepsy + stim call surface is in
 [references/pepsy_stim_api.md](./references/pepsy_stim_api.md).
 
 ## Implementation status (already built in `src/pepsy/optimizers/stabilizer_tn/`)
+
+`mps_stab_optimizer.py` owns simulator state and replay. `_advice.py` owns
+stream analysis and recommendations, `_layout.py` owns coefficient-frame
+layout tracing/installation, and `_stream_helpers.py` owns shared stream
+parsing and Clifford localizers. Preserve descriptor binding and subclass
+dispatch through the simulator; these helpers do not own a second state.
+
 The simulator is mature and validated against dense/stim (`tests/test_stabilizer_tn.py`):
 `STNState` (tableau + `|p>`), Clifford and
 non-Clifford evolution, constructive exact cooling, explicit greedy Clifford cooling,

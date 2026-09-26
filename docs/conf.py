@@ -118,3 +118,32 @@ def linkcode_resolve(domain: str, info: dict[str, str]) -> str | None:
         "https://github.com/quantinuum-dev/pepsy/blob/"
         f"{ref}/{relative_path}#L{start_line}-L{end_line}"
     )
+
+
+_COMPATIBILITY_API_CLASSES = {
+    "pepsy.sampling.samplers." + name
+    for name in (
+        "FermionConfigurationEncoding", "MpsDiagonalEstimate",
+        "MpsBatchSampleResult", "MpsSampleResult", "MpsSampler",
+        "PEPSSampleResult", "PepsSampler", "PepsBpSampler", "VecSampler",
+    )
+} | {
+    "pepsy.bp.series.LoopSeriesTerm",
+    "pepsy.bp.series.OpenLoopEnumerationLimitError",
+}
+
+
+def _keep_compatibility_api_members(app, what, name, obj, skip, options):
+    """Keep generated deep links for classes moved behind import aliases."""
+    if any(
+        name == owner or name.startswith(owner + ".")
+        for owner in _COMPATIBILITY_API_CLASSES
+    ) and not (
+        obj.is_private_member or obj.is_special_member or obj.is_undoc_member
+    ):
+        return False
+    return None
+
+
+def setup(app):
+    app.connect("autoapi-skip-member", _keep_compatibility_api_members)

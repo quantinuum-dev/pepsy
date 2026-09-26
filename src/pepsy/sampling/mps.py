@@ -1,0 +1,2884 @@
+"""MPS sampling with dense and native symmetric backends."""
+
+from __future__ import annotations
+
+import math
+from numbers import Integral
+import warnings
+import autoray as ar
+import numpy as np
+from .results import (
+    FermionConfigurationEncoding,
+    MpsBatchSampleResult,
+    MpsDiagonalEstimate,
+    MpsSampleResult,
+)
+from ._common import (
+    _backend_array_to_numpy,
+    _mps_array_backend,
+    _validate_one_d_to_two_d,
+)
+
+__all__ = ['MpsSampler']
+
+
+def _normalize_mps_sampler_backend(backend):
+    if backend is None:
+        return "quimb"
+    key = str(backend).strip().lower().replace("-", "_")
+    aliases = {
+        "quimb": "quimb",
+        "cpu": "quimb",
+        "numpy_quimb": "quimb",
+        "auto": "auto",
+        "native": "native",
+        "device": "native",
+        "cuda": "native",
+        "gpu": "native",
+        "numpy": "numpy",
+        "np": "numpy",
+        "torch": "torch",
+        "pytorch": "torch",
+        "cupy": "cupy",
+        "cp": "cupy",
+        "symmray": "symmray",
+        "symmetric": "symmray",
+        "block_sparse": "symmray",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown MpsSampler backend {backend!r}. Expected one of: {allowed}."
+        ) from exc
+
+
+def _normalize_symmray_prefix_strategy(strategy):
+    if strategy is None:
+        return "auto"
+    key = str(strategy).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "prefix": "prefix",
+        "shared_prefix": "prefix",
+        "serial": "serial",
+        "one_by_one": "serial",
+        "dense": "dense",
+        "dense_batch": "dense",
+        "batched_dense": "dense",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            "Unknown Symmray prefix strategy "
+            f"{strategy!r}. Expected one of: {allowed}."
+        ) from exc
+
+
+def _normalize_dense_memory_limit(limit):
+    """Normalize a dense sampling memory budget to bytes."""
+    if limit is None:
+        return None
+    if isinstance(limit, (int, np.integer)):
+        limit = int(limit)
+    else:
+        text = str(limit).strip().upper().replace(" ", "")
+        if text in {"NONE", "UNBOUNDED", "INF", "INFINITY"}:
+            return None
+        units = (
+            ("GIB", 1024**3),
+            ("GB", 1000**3),
+            ("MIB", 1024**2),
+            ("MB", 1000**2),
+            ("KIB", 1024),
+            ("KB", 1000),
+            ("B", 1),
+        )
+        multiplier = 1
+        for suffix, factor in units:
+            if text.endswith(suffix):
+                text = text[:-len(suffix)]
+                multiplier = factor
+                break
+        try:
+            limit = int(float(text) * multiplier)
+        except ValueError as exc:
+            raise TypeError(
+                "dense_memory_limit must be bytes, a size such as '256MiB', "
+                "or None."
+            ) from exc
+    if limit < 1:
+        raise ValueError("dense_memory_limit must be positive or None.")
+    return int(limit)
+
+
+def _fermion_symmray_occupations(charge, offset, fermion):
+    """Decode one Symmray physical code into on-site occupations.
+
+    A physical code is an index into a tensor leg, not a universal fermion
+    label. In particular, collapsed U1/Z2 sectors retain an offset within a
+    charge sector. Keeping this conversion next to the sampler avoids mixing
+    the U1U1 and parity-code conventions at VMC boundaries.
+    """
+    symmetry = str(fermion.symmetry).upper()
+    spinful = bool(fermion.spinful)
+    if not spinful:
+        if symmetry not in {"U1", "Z2"}:
+            raise ValueError(
+                "Spinless fermion sampling requires symmetry='U1' or 'Z2'."
+            )
+        occupation = int(charge)
+        if occupation not in {0, 1} or int(offset) != 0:
+            raise ValueError(
+                f"Unexpected spinless {symmetry} physical sector "
+                f"{(charge, offset)!r}."
+            )
+        return (occupation,)
+
+    offset = int(offset)
+    if symmetry == "Z2":
+        charge = int(charge)
+        if charge == 0:
+            if offset == 0:
+                return (0, 0)
+            if offset == 1:
+                return (1, 1)
+        elif charge == 1:
+            # Symmray's parity-collapsed physical basis is empty, double,
+            # up, down. This differs from the resolved U1/U1U1 ordering.
+            if offset == 0:
+                return (1, 0)
+            if offset == 1:
+                return (0, 1)
+        raise ValueError(
+            "Spinful Z2 physical sectors must be empty/double or up/down "
+            f"pairs; got {(charge, offset)!r}."
+        )
+
+    if symmetry == "U1":
+        occupation = int(charge)
+        if occupation == 0 and offset == 0:
+            return (0, 0)
+        if occupation == 1:
+            if offset == 0:
+                return (0, 1)
+            if offset == 1:
+                return (1, 0)
+        if occupation == 2 and offset == 0:
+            return (1, 1)
+        raise ValueError(
+            "Spinful U1 physical sectors must be empty, down/up, or double; "
+            f"got {(charge, offset)!r}."
+        )
+
+    if symmetry in {"U1U1", "Z2Z2"}:
+        occupation = tuple(int(value) for value in charge)
+        if len(occupation) != 2 or any(value not in {0, 1} for value in occupation):
+            raise ValueError(
+                f"Unexpected spinful {symmetry} physical charge {charge!r}."
+            )
+        if offset != 0:
+            raise ValueError(
+                f"Spinful {symmetry} physical sectors must not be degenerate."
+            )
+        return occupation
+
+    raise ValueError(
+        "Unsupported Fermion symmetry for sampled physical-code decoding: "
+        f"{symmetry!r}."
+    )
+
+
+class MpsSampler:
+    """Sample from an MPS using quimb or a backend-native batched sampler.
+
+    The legacy ``backend="quimb"`` path handles GPU→CPU conversion and calls
+    quimb's canonical-form sampler. ``backend="native"`` keeps dense NumPy,
+    Torch, or CuPy MPS arrays on their current device, builds right
+    environments once, and draws all requested samples with batched conditional
+    contractions.
+
+    Parameters
+    ----------
+    psi : MatrixProductState
+        The MPS to sample from (can be on any backend).
+    one_d_to_two_d : dict[int, tuple[int, int]], optional
+        Mapping from 1D site index to (x, y) lattice coordinate. When omitted,
+        a trivial single-row 1D layout ``{i: (i, 0)}`` inferred from the MPS
+        length is used, so a plain 1D chain can be sampled without a 2D map.
+        backend : {"quimb", "native", "auto", "numpy", "torch", "cupy", "symmray"}
+        Sampling implementation. ``"quimb"`` preserves the historical CPU
+        behavior for dense MPSs. Symmray-backed MPSs are detected and use the
+        native block-sparse sampler rather than being densified. ``"native"``
+        accepts dense NumPy/Torch/CuPy tensors and Symmray tensors, while
+        ``"symmray"`` requires a Symmray MPS explicitly. ``"auto"`` tries a
+        native sampler and falls back to ``"quimb"`` when the MPS layout is
+        unsupported.
+    torch_compile : bool, default=False
+        Opt into ``torch.compile`` for repeated, device-resident, unseeded
+        Torch inference batches. Unsupported compiler environments and calls
+        that need eager-only behavior fall back to eager sampling.
+    strategy : {"auto", "prefix", "serial", "dense"}, optional
+        Preferred name for the Symmray sampling strategy. ``None`` leaves
+        ``prefix_strategy`` in control for backward compatibility.
+    prefix_strategy : {"auto", "prefix", "serial", "dense"}, default="auto"
+        Symmray batch-sampling strategy. ``"prefix"`` shares a normalized
+        block-sparse boundary between equal sampled prefixes; ``"serial"``
+        uses one independent left-to-right sweep per shot. ``"auto"`` uses
+        prefix sharing until ``max_prefix_groups`` is reached, then
+        finishes the remaining branches serially with bounded memory.
+        ``"dense"`` creates a temporary dense view of the source MPS and
+        uses the backend-native fully batched sampler. ``"auto"`` selects
+        dense batching when the sample count and memory budget permit it.
+        Dense batching can use more memory than the sparse routes.
+    max_prefix_groups : int or None, default=256
+        Maximum active Symmray prefix groups before the ``"auto"`` strategy
+        switches the remaining suffixes to serial sampling. ``None`` permits
+        all distinct prefixes. This has no effect on dense MPS backends.
+    dense_memory_limit : int, str, or None, default="256MiB"
+        Maximum estimated dense MPS storage allowed by ``strategy="auto"`` or
+        ``strategy="dense"``. Strings such as ``"256MiB"`` and ``"1GB"`` are
+        accepted. ``None`` disables the guard.
+    dense_min_samples : int, default=1024
+        Minimum batch size for ``strategy="auto"`` to select dense batching.
+    fermion : pepsy.tensors.Fermion, optional
+        Fermionic physical-space convention associated with this sampler. When
+        supplied, :meth:`sample_batch` attaches its symmetry-aware
+        configuration encoding by default, and the fermionic diagonal helpers
+        can omit the repeated ``fermion`` argument. A per-call ``fermion=``
+        argument remains supported and takes precedence.
+
+    Notes
+    -----
+    Dense native right environments and Symmray right-canonical copies are
+    cached. The Symmray route retains the source physical-code map before
+    canonicalization, then samples by slicing one charge-aware local state and
+    absorbing it into a block-sparse boundary. Its batched route shares each
+    distinct sampled prefix, including when a physical charge sector has
+    degeneracy greater than one (for example spinful fermionic Z2 or U1).
+    Call :meth:`refresh` after changing the source MPS; otherwise the sampler
+    continues to represent its previous tensor data.
+    """
+
+    def __init__(
+        self,
+        psi,
+        one_d_to_two_d: dict[int, tuple[int, int]] | None = None,
+        *,
+        backend: str | None = "quimb",
+        torch_compile: bool = False,
+        strategy: str | None = None,
+        prefix_strategy: str = "auto",
+        max_prefix_groups: int | None = 256,
+        dense_memory_limit: int | str | None = 256 * 1024**2,
+        dense_min_samples: int = 1024,
+        fermion=None,
+    ):
+        if one_d_to_two_d is None:
+            inferred_L = getattr(psi, "L", None)
+            if inferred_L is None:
+                raise ValueError(
+                    "one_d_to_two_d is required when the MPS does not expose an "
+                    "'L' attribute to infer the 1D chain length."
+                )
+            # Default to a trivial single-row 1D chain layout.
+            one_d_to_two_d = {site: (site, 0) for site in range(int(inferred_L))}
+        self._L = _validate_one_d_to_two_d(
+            one_d_to_two_d,
+            expected_L=getattr(psi, "L", None),
+        )
+        self.one_d_to_two_d = one_d_to_two_d
+        self.Lx = max(x for x, y in one_d_to_two_d.values()) + 1
+        self.Ly = max(y for x, y in one_d_to_two_d.values()) + 1
+        self.backend = _normalize_mps_sampler_backend(backend)
+        if not isinstance(torch_compile, (bool, np.bool_)):
+            raise TypeError("torch_compile must be a boolean.")
+        self.torch_compile = bool(torch_compile)
+        if strategy is not None:
+            if prefix_strategy not in (None, "auto"):
+                raise ValueError(
+                    "Pass either strategy= or prefix_strategy=, not both."
+                )
+            prefix_strategy = strategy
+        self.prefix_strategy = _normalize_symmray_prefix_strategy(prefix_strategy)
+        if max_prefix_groups is not None:
+            if not isinstance(max_prefix_groups, (int, np.integer)):
+                raise TypeError("max_prefix_groups must be a positive integer or None.")
+            if int(max_prefix_groups) < 1:
+                raise ValueError(
+                    "max_prefix_groups must be a positive integer or None."
+                )
+            max_prefix_groups = int(max_prefix_groups)
+        self.max_prefix_groups = max_prefix_groups
+        self.dense_memory_limit = _normalize_dense_memory_limit(dense_memory_limit)
+        if not isinstance(dense_min_samples, (int, np.integer)):
+            raise TypeError("dense_min_samples must be a positive integer.")
+        if int(dense_min_samples) < 1:
+            raise ValueError("dense_min_samples must be a positive integer.")
+        self.dense_min_samples = int(dense_min_samples)
+        # ``strategy`` is the preferred public spelling; retain the old
+        # attribute for callers that inspect prefix_strategy directly.
+        self.strategy = self.prefix_strategy
+        self.fermion = fermion
+        self.resolved_backend = None
+        self._source_psi = None
+        self._native_arrays = None
+        self._native_site_ops = None
+        self._native_inference_site_ops = None
+        self._native_amplitude_site_ops = None
+        self._evaluation_backend = None
+        self._evaluation_arrays = None
+        self._evaluation_site_ops = None
+        self._symmray_state = None
+        self._last_symmray_sampling_stats = None
+        self._psi = None
+        self._torch_compiled_sample_fns = {}
+        self._torch_compile_disabled = False
+
+        self.refresh(psi)
+
+    def _resolve_fermion(self, fermion):
+        """Use a call-specific Fermion or the sampler's bound convention."""
+        fermion = self.fermion if fermion is None else fermion
+        if fermion is None:
+            raise TypeError(
+                "fermion is required. Pass fermion=... when constructing "
+                "MpsSampler or to this call."
+            )
+        if not all(hasattr(fermion, name) for name in ("spinful", "symmetry")):
+            raise TypeError(
+                "fermion must be a pepsy.tensors.Fermion instance or expose "
+                "spinful and symmetry attributes."
+            )
+        return fermion
+
+    def refresh(self, psi=None):
+        """Refresh cached state from ``psi`` or the original source MPS.
+
+        The native sampler caches tensor views and right environments for
+        repeated sampling. Call this method after an MPS is changed in place
+        or its tensors are replaced with ``Tensor.modify(...)``. Supplying
+        ``psi`` also changes the source MPS, provided its length matches the
+        sampler's fixed site map.
+
+        Returns
+        -------
+        MpsSampler
+            This sampler, with all derived state rebuilt lazily on its next
+            sampling or evaluation call.
+        """
+        if psi is None:
+            psi = self._source_psi
+        if psi is None:
+            raise ValueError("refresh requires an MPS before sampler initialization.")
+
+        source_L = getattr(psi, "L", None)
+        if source_L is not None and int(source_L) != self._L:
+            raise ValueError(
+                "Cannot refresh MpsSampler with an MPS of length "
+                f"{int(source_L)}; its site map has length {self._L}."
+            )
+        self._source_psi = psi
+
+        self._native_arrays = None
+        self._native_site_ops = None
+        self._native_inference_site_ops = None
+        self._native_amplitude_site_ops = None
+        self._evaluation_backend = None
+        self._evaluation_arrays = None
+        self._evaluation_site_ops = None
+        self._symmray_state = None
+        self._last_symmray_sampling_stats = None
+        self._psi = None
+        self._torch_compiled_sample_fns.clear()
+        self._torch_compile_disabled = False
+
+        source_backends = {
+            _mps_array_backend(psi[site].data)
+            for site in range(int(psi.L))
+        }
+        if "symmray" in source_backends:
+            if source_backends != {"symmray"}:
+                raise ValueError(
+                    "MPS tensors use mixed dense and Symmray array backends."
+                )
+            if self.backend in {"quimb", "native", "auto", "symmray"}:
+                self._symmray_state = self._prepare_symmray_state(psi)
+                self.resolved_backend = "symmray"
+                return self
+            raise ValueError(
+                f"MpsSampler backend={self.backend!r} requested for a Symmray "
+                "MPS. Use backend='symmray', 'native', or 'auto'."
+            )
+        if self.backend == "symmray":
+            raise ValueError(
+                "MpsSampler backend='symmray' requires Symmray tensor data."
+            )
+
+        if self.backend != "quimb":
+            try:
+                native_backend, native_arrays = self._prepare_native_arrays(psi)
+                if (
+                    self.backend in {"numpy", "torch", "cupy"}
+                    and native_backend != self.backend
+                ):
+                    raise ValueError(
+                        f"MpsSampler backend={self.backend!r} requested, but "
+                        f"the MPS tensors use backend {native_backend!r}."
+                    )
+                self.resolved_backend = native_backend
+                self._native_arrays = native_arrays
+                return self
+            except Exception as exc:
+                if self.backend != "auto":
+                    raise
+                warnings.warn(
+                    "MpsSampler backend='auto' could not prepare the native "
+                    "sampler and is falling back to Quimb: "
+                    f"{type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        self.resolved_backend = "quimb"
+        # Convert to numpy for quimb sampling compatibility
+        self._psi = psi.copy()
+        self._psi.apply_to_arrays(
+            lambda x: ar.to_numpy(x)
+        )
+        return self
+
+    def entanglement_entropy(self, cut=None, *, method="svd"):
+        """Measure entropy across one bond of the captured source MPS.
+
+        The source state is not mutated. The calculation is delegated to the
+        backend-native tensor observable, so selecting ``backend="quimb"`` for
+        sampling does not force this diagnostic through the sampler's legacy
+        GPU-to-CPU compatibility copy.
+        """
+        from ..tensors.observables import (  # pylint: disable=import-outside-toplevel
+            mps_entanglement_entropy,
+        )
+
+        return mps_entanglement_entropy(
+            self._source_psi,
+            cut=cut,
+            method=method,
+        )
+
+    @property
+    def physical_code_maps(self):
+        """Per-site Symmray ``physical_code -> (charge, sector_offset)`` maps.
+
+        The maps describe the source MPS physical basis, including charge
+        sectors pruned from the private canonical sampling copy. They are
+        ``None`` for a dense MPS, whose physical codes are already ordinary
+        positional indices. A fresh set of dictionaries is returned on each
+        access so callers cannot mutate sampler state.
+        """
+        if self._symmray_state is None:
+            return None
+        return tuple(
+            dict(code_map)
+            for code_map in self._symmray_state["physical_code_maps"]
+        )
+
+    @property
+    def symmray_sampling_stats(self):
+        """Diagnostics from the most recent Symmray sampling call, if any.
+
+        ``conditional_evaluations`` counts distinct local distributions built,
+        which is the useful work reduced by prefix sharing. ``None`` means the
+        sampler has not yet taken the Symmray route.
+        """
+        if self._last_symmray_sampling_stats is None:
+            return None
+        return dict(self._last_symmray_sampling_stats)
+
+    def _get_evaluation_arrays(self):
+        if self._native_arrays is not None:
+            return self.resolved_backend, self._native_arrays
+        if self._evaluation_arrays is None:
+            self._evaluation_backend, self._evaluation_arrays = (
+                self._prepare_native_arrays(self._psi)
+            )
+        return self._evaluation_backend, self._evaluation_arrays
+
+    def _get_native_site_ops(self, *, track_grad=True):
+        if self.resolved_backend == "torch" and not track_grad:
+            if self._native_inference_site_ops is None:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                arrays = tuple(array.detach() for array in self._native_arrays)
+                with torch.no_grad():
+                    self._native_inference_site_ops = self._prepare_site_ops(
+                        self.resolved_backend,
+                        arrays,
+                    )
+            return self.resolved_backend, self._native_inference_site_ops
+        if self._native_site_ops is None:
+            self._native_site_ops = self._prepare_site_ops(
+                self.resolved_backend,
+                self._native_arrays,
+            )
+        return self.resolved_backend, self._native_site_ops
+
+    def _get_evaluation_site_ops(self):
+        if self._native_arrays is not None:
+            return self._get_native_site_ops(track_grad=True)
+        backend, arrays = self._get_evaluation_arrays()
+        if self._evaluation_site_ops is None:
+            self._evaluation_site_ops = self._prepare_site_ops(backend, arrays)
+        return backend, self._evaluation_site_ops
+
+    @staticmethod
+    def _site_array_lr_phys_r(psi, site):
+        tensor = psi[site]
+        site_ind = psi.site_ind(site)
+        left_ind = psi.bond(site - 1, site) if site > 0 else None
+        right_ind = psi.bond(site, site + 1) if site < psi.L - 1 else None
+        if left_ind is None and right_ind is None:
+            data = tensor.transpose(site_ind).data
+            return data.reshape((1, data.shape[0], 1))
+        if left_ind is None:
+            data = tensor.transpose(site_ind, right_ind).data
+            return data.reshape((1, data.shape[0], data.shape[1]))
+        if right_ind is None:
+            data = tensor.transpose(left_ind, site_ind).data
+            return data.reshape((data.shape[0], data.shape[1], 1))
+        return tensor.transpose(left_ind, site_ind, right_ind).data
+
+    def _prepare_native_arrays(self, psi):
+        arrays = tuple(
+            self._site_array_lr_phys_r(psi, site)
+            for site in range(psi.L)
+        )
+        if not arrays:
+            raise ValueError("Cannot sample an empty MPS.")
+        backends = {_mps_array_backend(array) for array in arrays}
+        if len(backends) != 1:
+            raise ValueError(f"MPS tensors use mixed backends {sorted(backends)!r}.")
+        backend = next(iter(backends))
+        if backend not in {"numpy", "torch", "cupy"}:
+            raise ValueError(
+                "backend-native MPS sampling currently supports dense NumPy, "
+                f"Torch, or CuPy arrays, not {backend!r}."
+            )
+        return backend, arrays
+
+    @staticmethod
+    def _prepare_symmray_state(psi):
+        """Cache a canonical Symmray MPS without altering its physical basis."""
+        if getattr(psi, "cyclic", False):
+            raise ValueError("Symmray MPS sampling currently requires an open chain.")
+
+        try:
+            import symmray as sr  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:  # pragma: no cover - guarded by data type
+            raise ImportError(
+                "Symmray tensor data requires the optional 'symmray' package."
+            ) from exc
+
+        source_data = tuple(psi[site].data for site in range(psi.L))
+        block_backends = {str(data.backend) for data in source_data}
+        if len(block_backends) != 1:
+            raise ValueError(
+                "Symmray MPS tensors must use one common underlying block backend; "
+                f"got {sorted(block_backends)!r}."
+            )
+        array_backend = next(iter(block_backends))
+        if array_backend not in {"numpy", "torch", "cupy"}:
+            raise ValueError(
+                "Symmray MPS sampling currently supports NumPy, Torch, or CuPy "
+                f"blocks, not {array_backend!r}."
+            )
+
+        # Quimb's canonicalization runs Symmray QR/SVD blockwise. It can prune
+        # identically-zero physical charge sectors, so retain the source basis
+        # map below and never expose the canonical copy as the input state.
+        canonical = psi.right_canonicalize(normalize=True)
+        sites = []
+        physical_code_maps = []
+        for site in range(psi.L):
+            source_tensor = psi[site]
+            tensor = canonical[site]
+            source_phys_ind = psi.site_ind(site)
+            phys_ind = canonical.site_ind(site)
+            source_axis = source_tensor.inds.index(source_phys_ind)
+            phys_axis = tensor.inds.index(phys_ind)
+            source_index = source_tensor.data.indices[source_axis]
+            phys_index = tensor.data.indices[phys_axis]
+
+            source_offsets = {}
+            source_code_metadata = []
+            offset = 0
+            for charge, size in source_index.chargemap.items():
+                source_offsets[charge] = offset
+                for sector_offset in range(int(size)):
+                    source_code_metadata.append((charge, sector_offset))
+                offset += int(size)
+
+            code_map = []
+            for charge, size in phys_index.chargemap.items():
+                try:
+                    source_size = int(source_index.chargemap[charge])
+                except KeyError as exc:
+                    raise ValueError(
+                        "Canonical Symmray MPS changed a physical charge sector "
+                        f"at site {site}: {charge!r}."
+                    ) from exc
+                size = int(size)
+                if size > source_size:
+                    raise ValueError(
+                        "Canonical Symmray MPS enlarged a physical charge sector "
+                        f"at site {site}: {charge!r}."
+                    )
+                code_map.extend(range(source_offsets[charge], source_offsets[charge] + size))
+            if len(code_map) != int(tensor.data.shape[phys_axis]):
+                raise ValueError(
+                    "Could not reconstruct the physical code map for canonical "
+                    f"Symmray site {site}."
+                )
+
+            left_axis = None
+            if site:
+                remaining_inds = tuple(ind for ind in tensor.inds if ind != phys_ind)
+                left_axis = remaining_inds.index(canonical.bond(site - 1, site))
+
+            # Physical selection on a fermionic Symmray array must happen
+            # before absorbing the left boundary: selecting it afterwards can
+            # lose the dummy-mode ordering needed for an odd physical leg.
+            # Cache these immutable local branch tensors once, so every
+            # sampled prefix shares both the slices and their block metadata.
+            locals_ = []
+            local_left_charges = []
+            nonempty_local_codes = []
+            for local_code in range(int(tensor.data.shape[phys_axis])):
+                item = [slice(None)] * tensor.data.ndim
+                item[phys_axis] = local_code
+                local = tensor.data[tuple(item)]
+                locals_.append(local)
+                blocks = getattr(local, "blocks", None)
+                if isinstance(blocks, dict):
+                    nonempty = bool(blocks)
+                else:
+                    nonempty = True
+                if nonempty:
+                    nonempty_local_codes.append(local_code)
+
+                charges = None
+                if left_axis is not None:
+                    if isinstance(blocks, dict):
+                        charges = frozenset(
+                            sector[left_axis] for sector in blocks
+                        )
+                    else:
+                        try:
+                            charges = frozenset(
+                                local.indices[left_axis].chargemap
+                            )
+                        except (AttributeError, IndexError, TypeError):
+                            charges = None
+                local_left_charges.append(charges)
+            sites.append(
+                {
+                    "data": tensor.data,
+                    "phys_axis": phys_axis,
+                    "left_axis": left_axis,
+                    "codes": tuple(code_map),
+                    "code_metadata": tuple(
+                        source_code_metadata[code] for code in code_map
+                    ),
+                    "code_to_local": {code: local for local, code in enumerate(code_map)},
+                    "locals": tuple(locals_),
+                    "nonempty_local_codes": tuple(nonempty_local_codes),
+                    "local_left_charges": tuple(local_left_charges),
+                }
+            )
+            physical_code_maps.append(dict(enumerate(source_code_metadata)))
+
+        template = source_data[0].get_any_array()
+        # Keep the import local so Symmray remains optional for ordinary MPSs.
+        return {
+            "sr": sr,
+            "mps": canonical,
+            "source_mps": psi,
+            "sites": tuple(sites),
+            "physical_code_maps": tuple(physical_code_maps),
+            "array_backend": array_backend,
+            "template": template,
+            "dense_site_data": None,
+            "dense_code_maps": None,
+        }
+
+    @staticmethod
+    def _symmray_weight(value, state):
+        """Return ``||value||**2`` without converting an array to dense.
+
+        Symmray returns an ordinary scalar/block when a contraction has no
+        remaining charge structure. This is common for the final local branch
+        of fermionic Z2 and U1 MPSs with degenerate physical sectors. Such a
+        block is already a selected sector rather than a densified state.
+        """
+        blocks = getattr(value, "blocks", None)
+        if isinstance(blocks, dict) and not blocks:
+            return 0.0
+        if np.isscalar(value):
+            return abs(value) ** 2
+        backend = _mps_array_backend(value)
+        if backend == "torch":
+            return (value.conj() * value).sum().real
+        if backend == "cupy":
+            return (value.conj() * value).sum().real
+        if backend == "numpy":
+            return np.sum(np.abs(value) ** 2).real
+        return state["sr"].linalg.norm(value) ** 2
+
+    @staticmethod
+    def _symmray_scalar(value):
+        """Extract a scalar after a fully contracted Symmray MPS branch."""
+        blocks = getattr(value, "blocks", None)
+        if isinstance(blocks, dict) and not blocks:
+            return 0.0
+        if hasattr(value, "get_scalar_element"):
+            return value.phase_sync().get_scalar_element()
+        return value
+
+    @staticmethod
+    def _symmray_distribution(weights, state):
+        """Normalize scalar weights on the backend of the Symmray blocks."""
+        backend = state["array_backend"]
+        template = state["template"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            dtype = template.real.dtype
+            values = torch.stack([
+                torch.as_tensor(weight, dtype=dtype, device=template.device).real
+                for weight in weights
+            ])
+            values = values.clamp_min(0.0)
+            total = values.sum()
+            if not bool(torch.isfinite(total).detach().cpu().item()) or not bool(
+                (total > 0).detach().cpu().item()
+            ):
+                raise ValueError("MPS has a zero or non-finite conditional norm.")
+            return values / total
+
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            values = cp.stack([
+                cp.asarray(weight, dtype=template.real.dtype).real
+                for weight in weights
+            ])
+            values = cp.maximum(values, 0.0)
+            total = values.sum()
+            if not bool(cp.isfinite(total).item()) or not bool((total > 0).item()):
+                raise ValueError("MPS has a zero or non-finite conditional norm.")
+            return values / total
+
+        values = np.asarray(weights, dtype=np.asarray(template).real.dtype).real
+        values = np.maximum(values, 0.0)
+        total = values.sum()
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("MPS has a zero or non-finite conditional norm.")
+        return values / total
+
+    @staticmethod
+    def _symmray_draw(probs, state, rng):
+        """Draw one local code, leaving probabilities on their native backend."""
+        backend = state["array_backend"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            choice = int(torch.multinomial(probs, 1, generator=rng).reshape(()).item())
+        elif backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            cdf = cp.cumsum(probs)
+            choice = int(cp.sum(rng.random() > cdf).item())
+            choice = min(choice, int(probs.shape[0]) - 1)
+        else:
+            choice = int(rng.choice(len(probs), p=probs))
+        return choice, probs[choice]
+
+    @staticmethod
+    def _symmray_draw_many(probs, n_draws, state, rng):
+        """Draw a prefix group and return its local choices on the host.
+
+        The probability vector and random-number generation stay on the
+        Symmray block backend. Only the integer decisions cross to Python so
+        that one block-sparse boundary can be retained for every distinct
+        prefix, rather than once per requested shot.
+        """
+        n_draws = int(n_draws)
+        if n_draws < 1:  # pragma: no cover - internal guard
+            raise ValueError("n_draws must be positive.")
+        if n_draws == 1:
+            choice, _ = MpsSampler._symmray_draw(probs, state, rng)
+            return np.asarray((choice,), dtype=np.int64)
+
+        backend = state["array_backend"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            choices = torch.multinomial(
+                probs,
+                n_draws,
+                replacement=True,
+                generator=rng,
+            )
+            return np.asarray(ar.to_numpy(choices), dtype=np.int64)
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            cdf = cp.cumsum(probs)
+            draws = rng.random(n_draws)
+            choices = cp.searchsorted(cdf, draws, side="right")
+            choices = cp.minimum(choices, int(probs.shape[0]) - 1)
+            return np.asarray(ar.to_numpy(choices), dtype=np.int64)
+        return np.asarray(
+            rng.choice(len(probs), size=n_draws, p=probs),
+            dtype=np.int64,
+        )
+
+    @staticmethod
+    def _symmray_rng(state, seed):
+        """Create the random generator associated with the block backend."""
+        backend = state["array_backend"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            if seed is None:
+                return None
+            generator = torch.Generator(device=state["template"].device)
+            generator.manual_seed(int(seed))
+            return generator
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            return cp.random.default_rng(seed)
+        return np.random.default_rng(seed)
+
+    @staticmethod
+    def _symmray_sqrt(value, state):
+        backend = state["array_backend"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            return torch.sqrt(value)
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            return cp.sqrt(value)
+        return np.sqrt(value)
+
+    @staticmethod
+    def _symmray_positive(value, state):
+        """Test a scalar branch norm without moving tensor data to dense CPU."""
+        backend = state["array_backend"]
+        if backend == "torch":
+            positive = value > 0
+            return bool(
+                positive.detach().cpu().item()
+                if hasattr(positive, "detach")
+                else positive
+            )
+        if backend == "cupy":
+            positive = value > 0
+            return bool(positive.item() if hasattr(positive, "item") else positive)
+        return bool(value > 0)
+
+    @staticmethod
+    def _symmray_one(state, *, complex_value=False):
+        backend = state["array_backend"]
+        template = state["template"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            dtype = template.dtype if complex_value else template.real.dtype
+            return torch.ones((), dtype=dtype, device=template.device)
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            dtype = template.dtype if complex_value else template.real.dtype
+            return cp.ones((), dtype=dtype)
+        dtype = np.asarray(template).dtype
+        if not complex_value:
+            dtype = np.asarray(template).real.dtype
+        return np.ones((), dtype=dtype)
+
+    @classmethod
+    def _symmray_sample_one(cls, state, rng):
+        """Draw one configuration by slice-and-absorb on a canonical MPS."""
+        boundary = None
+        config = []
+        probability = cls._symmray_one(state)
+        for site, site_state in enumerate(state["sites"]):
+            site_state, local_codes, candidates, weights = cls._symmray_candidates(
+                state,
+                site,
+                boundary,
+            )
+            probs = cls._symmray_distribution(weights, state)
+            choice_index, choice_prob = cls._symmray_draw(probs, state, rng)
+            local_code = local_codes[choice_index]
+            config.append(site_state["codes"][local_code])
+            probability = probability * choice_prob
+            if site < len(state["sites"]) - 1:
+                boundary = candidates[choice_index] / cls._symmray_sqrt(
+                    weights[choice_index],
+                    state,
+                )
+        return config, probability
+
+    @staticmethod
+    def _symmray_boundary_charges(boundary):
+        """Return the possible outgoing charge labels of a prefix boundary."""
+        if boundary is None:
+            return None
+        blocks = getattr(boundary, "blocks", None)
+        if isinstance(blocks, dict):
+            return frozenset(sector[0] for sector in blocks)
+        try:
+            return frozenset(boundary.indices[0].chargemap)
+        except (AttributeError, IndexError, TypeError):
+            return None
+
+    @classmethod
+    def _symmray_candidate_codes(cls, site_state, boundary):
+        """Skip cached local branches incompatible with the prefix charge."""
+        local_codes = site_state["nonempty_local_codes"]
+        if boundary is None or site_state["left_axis"] is None:
+            return local_codes
+        boundary_charges = cls._symmray_boundary_charges(boundary)
+        if not boundary_charges:
+            return local_codes
+        return tuple(
+            local_code
+            for local_code in local_codes
+            if (
+                site_state["local_left_charges"][local_code] is None
+                or boundary_charges
+                & site_state["local_left_charges"][local_code]
+            )
+        )
+
+    @classmethod
+    def _symmray_candidates(cls, state, site, boundary):
+        """Build one charge-pruned conditional from cached local branches."""
+        site_state = state["sites"][site]
+        local_codes = cls._symmray_candidate_codes(site_state, boundary)
+        candidates = []
+        weights = []
+        for local_code in local_codes:
+            local = site_state["locals"][local_code]
+            if boundary is None:
+                candidate = local
+            else:
+                candidate = state["sr"].tensordot(
+                    boundary,
+                    local,
+                    axes=((0,), (site_state["left_axis"],)),
+                )
+            candidates.append(candidate)
+            weights.append(cls._symmray_weight(candidate, state))
+        return site_state, local_codes, candidates, weights
+
+    @staticmethod
+    def _dense_array_nbytes(array):
+        """Estimate dense storage for a backend array without copying it."""
+        nbytes = getattr(array, "nbytes", None)
+        if nbytes is not None:
+            return int(nbytes)
+        try:
+            return int(array.numel()) * int(array.element_size())
+        except (AttributeError, TypeError, ValueError):
+            return int(np.asarray(array).nbytes)
+
+    @classmethod
+    def _symmray_estimate_dense_site_bytes(cls, state):
+        """Estimate dense MPS storage from shapes without materializing it."""
+        template = state["template"]
+        if hasattr(template, "element_size"):
+            itemsize = int(template.element_size())
+        else:
+            itemsize = int(np.dtype(getattr(template, "dtype", template)).itemsize)
+        total = 0
+        source_mps = state["source_mps"]
+        for site in range(len(state["sites"])):
+            array = cls._site_array_lr_phys_r(source_mps, site)
+            total += int(np.prod(array.shape)) * itemsize
+        return int(total)
+
+    def _resolve_symmray_sampling_strategy(self, n_samples):
+        """Resolve the requested strategy before any dense allocation."""
+        requested = self.prefix_strategy
+        state = self._require_symmray_state()
+        symmetry = str(state["sites"][0]["data"].symmetry).upper()
+        dense_supported = symmetry in {"U1", "U1U1"}
+        if not dense_supported:
+            if requested == "dense":
+                raise ValueError(
+                    "Dense Symmray sampling is supported only for resolved "
+                    f"U1/U1U1 states, not symmetry={symmetry!r}. Use "
+                    "strategy='prefix' for charge-aware sampling."
+                )
+            if requested == "auto":
+                return "auto", "auto_sparse_unsupported_symmetry", None
+            return requested, "explicit_sparse", None
+        estimated_bytes = self._symmray_estimate_dense_site_bytes(state)
+        if requested == "dense":
+            if (
+                self.dense_memory_limit is not None
+                and estimated_bytes > self.dense_memory_limit
+            ):
+                raise ValueError(
+                    "Dense Symmray sampling requires an estimated "
+                    f"{estimated_bytes} bytes, above the configured limit of "
+                    f"{self.dense_memory_limit} bytes. Increase "
+                    "dense_memory_limit or use strategy='prefix'."
+                )
+            return "dense", "explicit_dense", estimated_bytes
+        if requested == "auto":
+            if (
+                int(n_samples) >= self.dense_min_samples
+                and (
+                    self.dense_memory_limit is None
+                    or estimated_bytes <= self.dense_memory_limit
+                )
+            ):
+                return "dense", "auto_dense_within_budget", estimated_bytes
+            return "auto", "auto_sparse_fallback", estimated_bytes
+        return requested, "explicit_sparse", estimated_bytes
+
+    @classmethod
+    def _symmray_dense_site_data(cls, state):
+        """Prepare cached dense site operators for explicit dense batching.
+
+        This route is deliberately opt-in. It keeps the source and canonical
+        Symmray states intact, materializing only a private sampling view so
+        the dense native sampler can contract every shot in one backend batch.
+        """
+        cached = state.get("dense_site_data")
+        if cached is not None:
+            return cached
+
+        arrays = []
+        source_mps = state["source_mps"]
+        for site in range(len(state["sites"])):
+            # Use the source MPS rather than the private canonical copy here.
+            # Symmray's fermionic bond orientations can have different dense
+            # positional layouts on dual virtual legs even though sparse
+            # charge-aware contractions remain valid. The source chain has
+            # matching virtual dimensions, so its dense view is unambiguous.
+            array = cls._site_array_lr_phys_r(source_mps, site)
+            if hasattr(array, "to_dense"):
+                array = array.to_dense()
+            arrays.append(array)
+
+        backends = {_mps_array_backend(array) for array in arrays}
+        if len(backends) != 1:
+            raise ValueError(
+                "Dense Symmray sampling requires one common dense backend; "
+                f"got {sorted(backends)!r}."
+            )
+        backend = next(iter(backends))
+        if backend == "torch":
+            site_data = cls._torch_site_ops(tuple(arrays))
+        elif backend in {"numpy", "cupy"}:
+            site_data = cls._array_namespace_site_ops(
+                tuple(arrays),
+                backend=backend,
+            )
+        else:
+            raise ValueError(
+                "Dense Symmray sampling produced unsupported arrays "
+                f"with backend {backend!r}."
+            )
+
+        dense_bytes = sum(cls._dense_array_nbytes(array) for array in arrays)
+        code_maps = tuple(
+            tuple(range(int(array.shape[1])))
+            for array in arrays
+        )
+        cached = (backend, site_data, int(dense_bytes))
+        state["dense_site_data"] = cached
+        state["dense_code_maps"] = code_maps
+        return cached
+
+    @staticmethod
+    def _symmray_map_dense_configs(configs, state):
+        """Map canonical dense physical choices back to source code labels."""
+        backend = state["array_backend"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            mapped = torch.empty_like(configs)
+            for site, code_map in enumerate(state["dense_code_maps"]):
+                lookup = torch.as_tensor(
+                    code_map,
+                    dtype=torch.long,
+                    device=configs.device,
+                )
+                mapped[:, site] = lookup[configs[:, site]]
+            return mapped
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            mapped = cp.empty_like(configs)
+            for site, code_map in enumerate(state["dense_code_maps"]):
+                lookup = cp.asarray(code_map, dtype=cp.int64)
+                mapped[:, site] = lookup[configs[:, site]]
+            return mapped
+
+        mapped = np.empty_like(configs)
+        for site, code_map in enumerate(state["dense_code_maps"]):
+            mapped[:, site] = np.asarray(code_map, dtype=np.int64)[
+                configs[:, site]
+            ]
+        return mapped
+
+    @classmethod
+    def _symmray_sample_arrays_dense(
+        cls,
+        state,
+        n_samples,
+        seed,
+        *,
+        to_numpy,
+    ):
+        """Sample a Symmray MPS with the dense native batched kernels."""
+        backend, site_data, dense_bytes = cls._symmray_dense_site_data(state)
+        if backend == "torch":
+            canonical_configs, probabilities = cls._torch_sample(
+                site_data,
+                int(n_samples),
+                seed,
+                to_numpy=False,
+            )
+        else:
+            canonical_configs, probabilities = cls._array_namespace_sample(
+                site_data,
+                int(n_samples),
+                seed,
+                backend=backend,
+                to_numpy=False,
+            )
+        configs = cls._symmray_map_dense_configs(canonical_configs, state)
+        stats = {
+            "strategy": "dense",
+            "n_samples": int(n_samples),
+            "conditional_evaluations": len(state["sites"]),
+            "candidate_contractions": sum(
+                len(site_state["codes"]) for site_state in state["sites"]
+            ),
+            "static_pruned_branches": 0,
+            "charge_pruned_branches": 0,
+            "cached_local_slices": False,
+            "max_active_prefix_groups": 1,
+            "serial_fallback": False,
+            "adaptive_serial_fallback": False,
+            "dense_site_bytes": int(dense_bytes),
+            "dense_batch_width": int(n_samples),
+        }
+        if to_numpy:
+            configs = _backend_array_to_numpy(configs)
+            probabilities = _backend_array_to_numpy(probabilities)
+        return configs, probabilities, stats
+
+    @staticmethod
+    def _symmray_note_candidates(stats, site_state, local_codes):
+        """Record the sparse branch work avoided by cache/pruning."""
+        if stats is None:
+            return
+        stats["candidate_contractions"] += len(local_codes)
+        stats["static_pruned_branches"] += (
+            len(site_state["codes"]) - len(site_state["nonempty_local_codes"])
+        )
+        stats["charge_pruned_branches"] += (
+            len(site_state["nonempty_local_codes"]) - len(local_codes)
+        )
+
+    @staticmethod
+    def _symmray_stack(values, state, *, integer=False, complex_value=False):
+        """Stack scalar results using the backend of the Symmray blocks."""
+        backend = state["array_backend"]
+        template = state["template"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            if integer:
+                return torch.as_tensor(values, dtype=torch.long, device=template.device)
+            dtype = template.dtype if complex_value else template.real.dtype
+            return torch.stack([
+                torch.as_tensor(value, dtype=dtype, device=template.device)
+                for value in values
+            ])
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            dtype = (
+                cp.int64
+                if integer
+                else (template.dtype if complex_value else template.real.dtype)
+            )
+            return cp.asarray(values, dtype=dtype)
+        dtype = (
+            np.int64
+            if integer
+            else (
+                np.asarray(template).dtype
+                if complex_value
+                else np.asarray(template).real.dtype
+            )
+        )
+        return np.asarray(values, dtype=dtype)
+
+    @classmethod
+    def _symmray_sample_from_prefix(
+        cls,
+        state,
+        rng,
+        config,
+        probability,
+        boundary,
+        start_site,
+        stats,
+    ):
+        """Complete one shot from an already sampled normalized prefix."""
+        for site in range(start_site, len(state["sites"])):
+            site_state, local_codes, candidates, weights = cls._symmray_candidates(
+                state,
+                site,
+                boundary,
+            )
+            stats["conditional_evaluations"] += 1
+            cls._symmray_note_candidates(stats, site_state, local_codes)
+            probs = cls._symmray_distribution(weights, state)
+            choice_index, choice_prob = cls._symmray_draw(probs, state, rng)
+            local_code = local_codes[choice_index]
+            config.append(site_state["codes"][local_code])
+            probability = probability * choice_prob
+            if site < len(state["sites"]) - 1:
+                if not cls._symmray_positive(weights[choice_index], state):
+                    raise ValueError(
+                        "MPS sampler selected a zero-norm conditional branch."
+                    )
+                boundary = candidates[choice_index] / cls._symmray_sqrt(
+                    weights[choice_index],
+                    state,
+                )
+        return config, probability
+
+    @classmethod
+    def _symmray_sample_arrays_serial(cls, state, n_samples, seed, *, to_numpy):
+        """Sample independently, using constant block-sparse boundary memory."""
+        rng = cls._symmray_rng(state, seed)
+        configs = []
+        probabilities = []
+        stats = {
+            "strategy": "serial",
+            "n_samples": int(n_samples),
+            "conditional_evaluations": 0,
+            "candidate_contractions": 0,
+            "static_pruned_branches": 0,
+            "charge_pruned_branches": 0,
+            "cached_local_slices": True,
+            "max_active_prefix_groups": 1,
+            "serial_fallback": False,
+            "adaptive_serial_fallback": False,
+        }
+        for _ in range(int(n_samples)):
+            config, probability = cls._symmray_sample_from_prefix(
+                state,
+                rng,
+                [],
+                cls._symmray_one(state),
+                None,
+                0,
+                stats,
+            )
+            configs.append(config)
+            probabilities.append(probability)
+        return cls._symmray_finalize_samples(
+            configs,
+            probabilities,
+            state,
+            stats,
+            to_numpy=to_numpy,
+        )
+
+    @staticmethod
+    def _symmray_boundary_storage_cost(boundary):
+        """Estimate block-resident boundary storage without densifying it."""
+        blocks = getattr(boundary, "blocks", None)
+        if not isinstance(blocks, dict):
+            return 1
+        cost = 0
+        for block in blocks.values():
+            size = getattr(block, "size", None)
+            if callable(size):
+                size = size()
+            if size is None or not np.isscalar(size):
+                size = int(np.prod(getattr(block, "shape", (1,))))
+            cost += int(size)
+        return max(cost, 1)
+
+    @classmethod
+    def _symmray_select_prefix_groups(
+        cls,
+        branches,
+        *,
+        max_prefix_groups,
+        adaptive,
+    ):
+        """Keep prefix boundaries only while they amortize their storage.
+
+        A group with one walker cannot share a future conditional, so the
+        auto strategy finishes it serially immediately. For the remaining
+        groups, ``max_prefix_groups`` is a hard count cap and also defines a
+        per-level block-storage budget relative to the median boundary size.
+        This avoids treating a large multi-sector boundary as equal to a tiny
+        one-sector boundary.
+        """
+        if not branches:
+            return (), (), None
+
+        costs = [cls._symmray_boundary_storage_cost(branch[1]) for branch in branches]
+        if max_prefix_groups is None:
+            count_limit = None
+            storage_budget = None
+        else:
+            count_limit = int(max_prefix_groups)
+            baseline = int(np.median(costs))
+            storage_budget = max(count_limit * max(baseline, 1), 1)
+
+        kept_ids = set()
+        used_storage = 0
+        # Retain the groups with the greatest prospective reuse first. Ties
+        # favor smaller block boundaries, then preserve sample order.
+        ranked = sorted(
+            range(len(branches)),
+            key=lambda index: (
+                -len(branches[index][0]),
+                costs[index],
+                int(branches[index][0][0]),
+            ),
+        )
+        for index in ranked:
+            positions = branches[index][0]
+            if adaptive and len(positions) == 1:
+                continue
+            if count_limit is not None and len(kept_ids) >= count_limit:
+                continue
+            if (
+                storage_budget is not None
+                and kept_ids
+                and used_storage + costs[index] > storage_budget
+            ):
+                continue
+            kept_ids.add(index)
+            used_storage += costs[index]
+
+        kept = tuple(branch for index, branch in enumerate(branches) if index in kept_ids)
+        dropped = tuple(branch for index, branch in enumerate(branches) if index not in kept_ids)
+        return kept, dropped, storage_budget
+
+    @classmethod
+    def _symmray_sample_arrays_prefix(
+        cls,
+        state,
+        n_samples,
+        seed,
+        *,
+        max_prefix_groups,
+        adaptive,
+        to_numpy,
+    ):
+        """Share boundaries between prefixes, with an optional memory bound."""
+        rng = cls._symmray_rng(state, seed)
+        n_samples = int(n_samples)
+        configs = np.empty((n_samples, len(state["sites"])), dtype=np.int64)
+        probabilities = [None] * n_samples
+        positions = np.arange(n_samples, dtype=np.int64)
+        stats = {
+            "strategy": "prefix",
+            "n_samples": n_samples,
+            "conditional_evaluations": 0,
+            "candidate_contractions": 0,
+            "static_pruned_branches": 0,
+            "charge_pruned_branches": 0,
+            "cached_local_slices": True,
+            "max_active_prefix_groups": 1,
+            "serial_fallback": False,
+            "adaptive_serial_fallback": False,
+            "max_prefix_storage_budget": None,
+        }
+        # A group stores the shared selected prefix, its normalized boundary,
+        # and its probability. Only current-depth groups are retained.
+        groups = [(positions, None, cls._symmray_one(state))]
+
+        for site in range(len(state["sites"])):
+            stats["max_active_prefix_groups"] = max(
+                stats["max_active_prefix_groups"],
+                len(groups),
+            )
+
+            is_final_site = site == len(state["sites"]) - 1
+            branches = []
+            for group_positions, boundary, prefix_probability in groups:
+                site_state, local_codes, candidates, weights = cls._symmray_candidates(
+                    state,
+                    site,
+                    boundary,
+                )
+                stats["conditional_evaluations"] += 1
+                cls._symmray_note_candidates(stats, site_state, local_codes)
+                probs = cls._symmray_distribution(weights, state)
+                choices = cls._symmray_draw_many(
+                    probs,
+                    len(group_positions),
+                    state,
+                    rng,
+                )
+                for choice_index, local_code in enumerate(local_codes):
+                    selected = group_positions[choices == choice_index]
+                    if not len(selected):
+                        continue
+                    code = site_state["codes"][local_code]
+                    configs[selected, site] = code
+                    selected_probability = prefix_probability * probs[choice_index]
+                    if is_final_site:
+                        for sample in selected:
+                            probabilities[int(sample)] = selected_probability
+                        continue
+                    if not cls._symmray_positive(weights[choice_index], state):
+                        raise ValueError(
+                            "MPS sampler selected a zero-norm conditional branch."
+                        )
+                    next_boundary = candidates[choice_index] / cls._symmray_sqrt(
+                        weights[choice_index],
+                        state,
+                    )
+                    branches.append((selected, next_boundary, selected_probability))
+
+            if is_final_site:
+                groups = ()
+                continue
+
+            groups, serial_branches, storage_budget = cls._symmray_select_prefix_groups(
+                branches,
+                max_prefix_groups=max_prefix_groups,
+                adaptive=adaptive,
+            )
+            if storage_budget is not None:
+                previous_budget = stats["max_prefix_storage_budget"]
+                stats["max_prefix_storage_budget"] = (
+                    storage_budget
+                    if previous_budget is None
+                    else max(previous_budget, storage_budget)
+                )
+            if serial_branches:
+                stats["serial_fallback"] = True
+            for selected, next_boundary, selected_probability in serial_branches:
+                if adaptive and len(selected) == 1:
+                    stats["adaptive_serial_fallback"] = True
+                for sample in selected:
+                    config, probability = cls._symmray_sample_from_prefix(
+                        state,
+                        rng,
+                        configs[int(sample), : site + 1].tolist(),
+                        selected_probability,
+                        next_boundary,
+                        site + 1,
+                        stats,
+                    )
+                    configs[int(sample)] = config
+                    probabilities[int(sample)] = probability
+
+        if any(probability is None for probability in probabilities):  # pragma: no cover
+            raise RuntimeError("Symmray prefix sampler did not assign every shot.")
+        return cls._symmray_finalize_samples(
+            configs,
+            probabilities,
+            state,
+            stats,
+            to_numpy=to_numpy,
+        )
+
+    @classmethod
+    def _symmray_finalize_samples(
+        cls,
+        configs,
+        probabilities,
+        state,
+        stats,
+        *,
+        to_numpy,
+    ):
+        configs = cls._symmray_stack(configs, state, integer=True)
+        probabilities = cls._symmray_stack(probabilities, state)
+        if to_numpy:
+            configs = _backend_array_to_numpy(configs)
+            probabilities = _backend_array_to_numpy(probabilities)
+        return configs, probabilities, stats
+
+    @classmethod
+    def _symmray_sample_arrays(
+        cls,
+        state,
+        n_samples,
+        seed,
+        *,
+        strategy,
+        max_prefix_groups,
+        to_numpy,
+    ):
+        if strategy == "dense":
+            return cls._symmray_sample_arrays_dense(
+                state,
+                n_samples,
+                seed,
+                to_numpy=to_numpy,
+            )
+        if strategy == "serial":
+            return cls._symmray_sample_arrays_serial(
+                state,
+                n_samples,
+                seed,
+                to_numpy=to_numpy,
+            )
+        return cls._symmray_sample_arrays_prefix(
+            state,
+            n_samples,
+            seed,
+            max_prefix_groups=max_prefix_groups,
+            adaptive=(strategy == "auto"),
+            to_numpy=to_numpy,
+        )
+
+    @staticmethod
+    def _symmray_config_rows(configs, *, L):
+        """Validate discrete configurations for Symmray MPS evaluation."""
+        configs = np.asarray(_backend_array_to_numpy(configs), dtype=np.int64)
+        if configs.ndim != 2 or configs.shape[1] != int(L):
+            raise ValueError(
+                f"configs must have shape (batch, L={int(L)}); "
+                f"got {tuple(configs.shape)}."
+            )
+        return configs
+
+    @classmethod
+    def _symmray_amplitude_one(cls, state, config):
+        """Contract one selected configuration without densifying the MPS."""
+        boundary = None
+        for site, code in enumerate(config):
+            site_state = state["sites"][site]
+            try:
+                local_code = site_state["code_to_local"][int(code)]
+            except KeyError:
+                return cls._symmray_one(state, complex_value=True) * 0.0
+            local = site_state["locals"][local_code]
+            if boundary is None:
+                boundary = local
+            else:
+                boundary = state["sr"].tensordot(
+                    boundary,
+                    local,
+                    axes=((0,), (site_state["left_axis"],)),
+                )
+        return cls._symmray_scalar(boundary)
+
+    @classmethod
+    def _symmray_probability_one(cls, state, config):
+        """Evaluate one Born probability with canonical slice-and-absorb."""
+        boundary = None
+        probability = cls._symmray_one(state)
+        for site, code in enumerate(config):
+            site_state = state["sites"][site]
+            try:
+                choice = site_state["code_to_local"][int(code)]
+            except KeyError:
+                return cls._symmray_one(state) * 0.0
+
+            site_state, local_codes, candidates, weights = cls._symmray_candidates(
+                state,
+                site,
+                boundary,
+            )
+            try:
+                choice_index = local_codes.index(choice)
+            except ValueError:
+                return cls._symmray_one(state) * 0.0
+            probs = cls._symmray_distribution(weights, state)
+            probability = probability * probs[choice_index]
+            if site < len(state["sites"]) - 1:
+                if not cls._symmray_positive(weights[choice_index], state):
+                    return cls._symmray_one(state) * 0.0
+                boundary = candidates[choice_index] / cls._symmray_sqrt(
+                    weights[choice_index],
+                    state,
+                )
+        return probability
+
+    def _symmray_amplitudes(self, configs):
+        state = self._require_symmray_state()
+        rows = self._symmray_config_rows(configs, L=len(state["sites"]))
+        values = [self._symmray_amplitude_one(state, row) for row in rows]
+        return self._symmray_stack(values, state, complex_value=True)
+
+    def _symmray_probabilities(self, configs):
+        state = self._require_symmray_state()
+        rows = self._symmray_config_rows(configs, L=len(state["sites"]))
+        values = [self._symmray_probability_one(state, row) for row in rows]
+        return self._symmray_stack(values, state)
+
+    def _require_symmray_state(self):
+        if self._symmray_state is None:  # pragma: no cover - internal guard
+            raise RuntimeError("Symmray sampler state has not been initialized.")
+        return self._symmray_state
+
+    def fermion_configuration_encoding(self, fermion=None) -> FermionConfigurationEncoding:
+        """Return the physical-code/occupation contract for a fermionic MPS.
+
+        This is the explicit bridge from MPS Born samples to a VMC walker or
+        local-estimator configuration. It is intentionally derived from the
+        source physical-sector maps retained by the Symmray sampler, rather
+        than assuming a dense-basis or VMC-specific code convention.
+        """
+        fermion = self._resolve_fermion(fermion)
+        state = self._require_symmray_state()
+        state_symmetry = str(state["sites"][0]["data"].symmetry).upper()
+        symmetry = str(fermion.symmetry).upper()
+        if state_symmetry != symmetry:
+            raise ValueError(
+                "The Fermion symmetry must match the sampled Symmray MPS; "
+                f"got {symmetry!r} for a {state_symmetry!r} state."
+            )
+
+        expected_dim = 4 if bool(fermion.spinful) else 2
+        tables = []
+        for site, code_map in enumerate(state["physical_code_maps"]):
+            if tuple(code_map) != tuple(range(len(code_map))):
+                raise ValueError(
+                    "Symmray physical codes must be contiguous at site "
+                    f"{site}; got {sorted(code_map)!r}."
+                )
+            if len(code_map) != expected_dim:
+                raise ValueError(
+                    "The sampled Symmray MPS physical dimension is incompatible "
+                    f"with this {'spinful' if fermion.spinful else 'spinless'} "
+                    "Fermion."
+                )
+            tables.append(tuple(
+                _fermion_symmray_occupations(charge, offset, fermion)
+                for charge, offset in code_map.values()
+            ))
+        return FermionConfigurationEncoding(
+            symmetry=symmetry,
+            spinful=bool(fermion.spinful),
+            code_to_occupations=tuple(tables),
+        )
+
+    @staticmethod
+    def _normalize_fermion_diagonal_observable(observable):
+        aliases = {
+            "n": "occupation",
+            "number": "occupation",
+            "occupation": "occupation",
+            "density": "occupation",
+            "total_charge": "total_charge",
+            "total_number": "total_charge",
+            "total_occupation": "total_charge",
+            "doublon": "doublon",
+            "double": "doublon",
+            "double_occupancy": "doublon",
+            "density_correlation": "density_correlation",
+            "density_correlator": "density_correlation",
+            "ninj": "density_correlation",
+            "n_i_n_j": "density_correlation",
+        }
+        key = str(observable).strip().lower().replace("-", "_")
+        try:
+            return aliases[key]
+        except KeyError as exc:
+            allowed = ", ".join(sorted(set(aliases.values())))
+            raise ValueError(
+                "Unknown fermion diagonal observable "
+                f"{observable!r}. Expected one of: {allowed}."
+            ) from exc
+
+    def _normalize_fermion_sites(self, sites):
+        if sites is None:
+            return tuple(range(self._L))
+        if isinstance(sites, (int, np.integer)):
+            sites = (int(sites),)
+        else:
+            try:
+                sites = tuple(int(site) for site in sites)
+            except TypeError as exc:
+                raise TypeError("sites must be an integer or an iterable of integers.") from exc
+        if not sites:
+            raise ValueError("sites must contain at least one physical site.")
+        if len(set(sites)) != len(sites):
+            raise ValueError("sites must not contain duplicates.")
+        invalid = [site for site in sites if not 0 <= site < self._L]
+        if invalid:
+            raise ValueError(
+                f"sites contain values outside the MPS range 0..{self._L - 1}: "
+                f"{invalid!r}."
+            )
+        return sites
+
+    def _normalize_fermion_pairs(self, pairs):
+        if pairs is None:
+            raise ValueError("density_correlation requires pairs=((i, j), ...).")
+        if (
+            isinstance(pairs, tuple)
+            and len(pairs) == 2
+            and all(isinstance(site, (int, np.integer)) for site in pairs)
+        ):
+            pairs = (pairs,)
+        try:
+            pairs = tuple(tuple(int(site) for site in pair) for pair in pairs)
+        except TypeError as exc:
+            raise TypeError("pairs must be an (i, j) pair or iterable of pairs.") from exc
+        if not pairs:
+            raise ValueError("pairs must contain at least one physical pair.")
+        for pair in pairs:
+            if len(pair) != 2:
+                raise ValueError("Each density-correlation pair must have two sites.")
+            if pair[0] == pair[1]:
+                raise ValueError("Density-correlation pairs must contain distinct sites.")
+            self._normalize_fermion_sites(pair)
+        return pairs
+
+    @staticmethod
+    def _fermion_symmray_diagonal_values(charge, offset, fermion):
+        """Decode standard Fermion occupations from one Symmray sector code."""
+        occupations = _fermion_symmray_occupations(charge, offset, fermion)
+        if not bool(fermion.spinful):
+            return float(occupations[0]), 0.0
+        return float(sum(occupations)), float(occupations == (1, 1))
+
+    def _fermion_diagonal_tables(self, fermion):
+        """Build physical-code lookup tables for occupation and doublon values."""
+        fermion = self._resolve_fermion(fermion)
+
+        if self._symmray_state is None:
+            try:
+                number = np.real(
+                    np.diag(_backend_array_to_numpy(fermion.dense_operator("number")))
+                ).astype(float, copy=False)
+                double = (
+                    np.real(
+                        np.diag(_backend_array_to_numpy(fermion.dense_operator("double")))
+                    ).astype(float, copy=False)
+                    if bool(fermion.spinful)
+                    else np.zeros_like(number, dtype=float)
+                )
+            except AttributeError as exc:
+                raise TypeError(
+                    "fermion must expose dense_operator(name) for dense MPS sampling."
+                ) from exc
+            return tuple((number, double) for _ in range(self._L))
+
+        state_symmetry = str(self._symmray_state["sites"][0]["data"].symmetry)
+        fermion_symmetry = str(fermion.symmetry)
+        if state_symmetry != fermion_symmetry:
+            raise ValueError(
+                "The Fermion symmetry must match the sampled Symmray MPS; "
+                f"got {fermion_symmetry!r} for a {state_symmetry!r} state."
+            )
+        expected_dim = 4 if bool(fermion.spinful) else 2
+        tables = []
+        for code_map in self._symmray_state["physical_code_maps"]:
+            if len(code_map) != expected_dim:
+                raise ValueError(
+                    "The sampled Symmray MPS physical dimension is incompatible "
+                    f"with this {'spinful' if fermion.spinful else 'spinless'} Fermion."
+                )
+            number = np.empty(len(code_map), dtype=float)
+            double = np.empty(len(code_map), dtype=float)
+            for code, (charge, offset) in code_map.items():
+                number[code], double[code] = self._fermion_symmray_diagonal_values(
+                    charge,
+                    offset,
+                    fermion,
+                )
+            tables.append((number, double))
+        return tuple(tables)
+
+    def fermion_diagonal_values(
+        self,
+        configs,
+        fermion=None,
+        observable=None,
+        *,
+        sites=None,
+        pairs=None,
+    ):
+        """Evaluate a diagonal fermionic observable on configurations.
+
+        This supports spinful and spinless :class:`pepsy.tensors.Fermion`
+        conventions. ``"occupation"`` returns the mean local occupation on
+        ``sites`` (all sites by default), ``"total_charge"`` its sum,
+        ``"doublon"`` the mean ``n_up n_down`` on ``sites``, and
+        ``"density_correlation"`` the mean ``n_i n_j`` across ``pairs``.
+        Symmray physical codes are decoded from the source charge map, so the
+        spinful Z2 even-sector ordering remains correct.
+        """
+        if observable is None:
+            observable, fermion = fermion, None
+        if observable is None:
+            raise TypeError("observable is required.")
+        fermion = self._resolve_fermion(fermion)
+        observable = self._normalize_fermion_diagonal_observable(observable)
+        configs = self._symmray_config_rows(configs, L=self._L)
+        tables = self._fermion_diagonal_tables(fermion)
+        occupations = np.empty(configs.shape, dtype=float)
+        doublons = np.empty(configs.shape, dtype=float)
+        for site, (number, double) in enumerate(tables):
+            codes = configs[:, site]
+            invalid = (codes < 0) | (codes >= len(number))
+            if np.any(invalid):
+                raise ValueError(
+                    f"configs contain invalid physical index for site {site}."
+                )
+            occupations[:, site] = number[codes]
+            doublons[:, site] = double[codes]
+
+        if observable == "density_correlation":
+            if sites is not None:
+                raise ValueError("density_correlation uses pairs= rather than sites=.")
+            pairs = self._normalize_fermion_pairs(pairs)
+            return np.mean(
+                [occupations[:, i] * occupations[:, j] for i, j in pairs],
+                axis=0,
+            )
+
+        if pairs is not None:
+            raise ValueError(f"{observable} does not accept pairs=.")
+        sites = self._normalize_fermion_sites(sites)
+        if observable == "occupation":
+            return occupations[:, sites].mean(axis=1)
+        if observable == "total_charge":
+            return occupations[:, sites].sum(axis=1)
+        if not bool(fermion.spinful):
+            raise ValueError("doublon requires a spinful Fermion.")
+        return doublons[:, sites].mean(axis=1)
+
+    def estimate_fermion_diagonal(
+        self,
+        fermion=None,
+        observable=None,
+        n_samples: int = 1024,
+        seed: int | None = None,
+        *,
+        sites=None,
+        pairs=None,
+    ) -> MpsDiagonalEstimate:
+        """Estimate a diagonal fermionic observable from Born samples.
+
+        The returned uncertainty uses the unbiased sample variance. This
+        sampler deliberately covers diagonal observables only;
+        hopping, pairing, and spin-flip observables require a fermionic local
+        estimator based on amplitude ratios.
+        """
+        if observable is None:
+            observable, fermion = fermion, None
+        if observable is None:
+            raise TypeError("observable is required.")
+        fermion = self._resolve_fermion(fermion)
+        configs, _ = self.sample_arrays(
+            n_samples,
+            seed=seed,
+            to_numpy=True,
+        )
+        observable = self._normalize_fermion_diagonal_observable(observable)
+        values = self.fermion_diagonal_values(
+            configs,
+            fermion,
+            observable,
+            sites=sites,
+            pairs=pairs,
+        )
+        n_samples = int(values.size)
+        standard_error = (
+            float(np.std(values, ddof=1) / math.sqrt(n_samples))
+            if n_samples > 1
+            else math.nan
+        )
+        return MpsDiagonalEstimate(
+            mean=float(np.mean(values)),
+            standard_error=standard_error,
+            n_samples=n_samples,
+            observable=observable,
+            sites=(
+                ()
+                if observable == "density_correlation"
+                else self._normalize_fermion_sites(sites)
+            ),
+            pairs=(
+                self._normalize_fermion_pairs(pairs)
+                if observable == "density_correlation"
+                else ()
+            ),
+        )
+
+    @staticmethod
+    def _torch_site_ops(arrays):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device = arrays[0].device
+        dtype = arrays[0].dtype
+        if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
+            dtype = torch.float64
+        arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        right_envs = [None] * (len(arrays) + 1)
+        right_envs[-1] = torch.ones((1, 1), dtype=dtype, device=device)
+        for i in range(len(arrays) - 1, -1, -1):
+            array = arrays[i]
+            right_envs[i] = torch.einsum(
+                "asb,bc,dsc->ad",
+                array.conj(),
+                right_envs[i + 1],
+                array,
+            )
+        norm = right_envs[0].reshape(()).real
+        if (
+            (not bool(torch.isfinite(norm).detach().cpu().item()))
+            or float(norm.detach().cpu().item()) <= 0.0
+        ):
+            raise ValueError("MPS must have a finite non-zero norm.")
+        site_ops = tuple(
+            (
+                array.reshape(array.shape[0], array.shape[1] * array.shape[2])
+                .contiguous(),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return device, dtype, site_ops, tuple(right_envs), norm
+
+    @staticmethod
+    def _array_namespace_site_ops(arrays, *, backend):
+        xp = np
+        if backend == "cupy":
+            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
+        if dtype.kind not in {"f", "c"}:
+            dtype = np.dtype(np.float64)
+        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+        right_envs = [None] * (len(arrays) + 1)
+        right_envs[-1] = xp.ones((1, 1), dtype=dtype)
+        for i in range(len(arrays) - 1, -1, -1):
+            array = arrays[i]
+            right_envs[i] = xp.einsum(
+                "asb,bc,dsc->ad",
+                xp.conjugate(array),
+                right_envs[i + 1],
+                array,
+            )
+        norm = right_envs[0].reshape(()).real
+        norm_value = float(norm.get()) if backend == "cupy" else float(norm)
+        if (not np.isfinite(norm_value)) or norm_value <= 0.0:
+            raise ValueError("MPS must have a finite non-zero norm.")
+        site_ops = tuple(
+            (
+                xp.ascontiguousarray(
+                    array.reshape((array.shape[0], array.shape[1] * array.shape[2]))
+                ),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return xp, dtype, site_ops, tuple(right_envs), norm
+
+    @staticmethod
+    def _prepare_site_ops(backend, arrays):
+        if backend == "torch":
+            return MpsSampler._torch_site_ops(arrays)
+        return MpsSampler._array_namespace_site_ops(arrays, backend=backend)
+
+    @staticmethod
+    def _torch_amplitude_site_ops(arrays):
+        """Prepare amplitude contractions without retaining right environments."""
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device = arrays[0].device
+        dtype = arrays[0].dtype
+        if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
+            dtype = torch.float64
+        arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        right_env = torch.ones((1, 1), dtype=dtype, device=device)
+        for array in reversed(arrays):
+            right_env = torch.einsum(
+                "asb,bc,dsc->ad",
+                array.conj(),
+                right_env,
+                array,
+            )
+        norm = right_env.reshape(()).real
+        if (
+            (not bool(torch.isfinite(norm).detach().cpu().item()))
+            or float(norm.detach().cpu().item()) <= 0.0
+        ):
+            raise ValueError("MPS must have a finite non-zero norm.")
+        site_ops = tuple(
+            (
+                array.reshape(array.shape[0], array.shape[1] * array.shape[2])
+                .contiguous(),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return device, dtype, site_ops, (), norm
+
+    @staticmethod
+    def _array_namespace_amplitude_site_ops(arrays, *, backend):
+        """Prepare NumPy/CuPy amplitudes without retaining right environments."""
+        xp = np
+        if backend == "cupy":
+            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
+        if dtype.kind not in {"f", "c"}:
+            dtype = np.dtype(np.float64)
+        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+        right_env = xp.ones((1, 1), dtype=dtype)
+        for array in reversed(arrays):
+            right_env = xp.einsum(
+                "asb,bc,dsc->ad",
+                xp.conjugate(array),
+                right_env,
+                array,
+            )
+        norm = right_env.reshape(()).real
+        norm_value = float(norm.get()) if backend == "cupy" else float(norm)
+        if (not np.isfinite(norm_value)) or norm_value <= 0.0:
+            raise ValueError("MPS must have a finite non-zero norm.")
+        site_ops = tuple(
+            (
+                xp.ascontiguousarray(
+                    array.reshape((array.shape[0], array.shape[1] * array.shape[2]))
+                ),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return xp, dtype, site_ops, (), norm
+
+    def _get_native_amplitude_site_ops(self, *, track_grad=False):
+        """Return amplitude-only site data, caching only inference data."""
+        if not track_grad and self._native_amplitude_site_ops is not None:
+            return self.resolved_backend, self._native_amplitude_site_ops
+
+        arrays = self._native_arrays
+        if self.resolved_backend == "torch":
+            if not track_grad:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                arrays = tuple(array.detach() for array in arrays)
+                with torch.no_grad():
+                    site_data = self._torch_amplitude_site_ops(arrays)
+            else:
+                site_data = self._torch_amplitude_site_ops(arrays)
+        else:
+            site_data = self._array_namespace_amplitude_site_ops(
+                arrays,
+                backend=self.resolved_backend,
+            )
+        if not track_grad:
+            self._native_amplitude_site_ops = site_data
+        return self.resolved_backend, site_data
+
+    @staticmethod
+    def _torch_sample(site_data, n_samples, seed, *, to_numpy):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device, dtype, site_ops, right_envs, _norm = site_data
+        vec = torch.ones((int(n_samples), 1), dtype=dtype, device=device)
+        probs_total = torch.ones((int(n_samples),), dtype=torch.float64, device=device)
+        batch = torch.arange(int(n_samples), device=device)
+        configs = []
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+
+        for branch_mat, phys_dim, right_dim in site_ops:
+            site = len(configs)
+            right_env = right_envs[site + 1]
+            amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
+            # Environments carry bra rows and ket columns: conjugate the
+            # vector entering the row index, including complex off-diagonals.
+            weights = ((amps.conj() @ right_env) * amps).sum(dim=2).real
+            weights = weights.clamp_min(0.0)
+            probs = weights / weights.sum(dim=1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
+            if phys_dim == 2:
+                draws = torch.rand(
+                    (int(n_samples),),
+                    dtype=probs.dtype,
+                    device=device,
+                    generator=generator,
+                )
+                choices = (draws >= probs[:, 0]).to(dtype=torch.long)
+            else:
+                choices = torch.multinomial(probs, 1, generator=generator).reshape(-1)
+            selected_weights = weights[batch, choices]
+            selected_probs = probs[batch, choices]
+            vec = amps[batch, choices, :] / torch.sqrt(selected_weights).clamp_min(
+                torch.finfo(selected_weights.dtype).tiny
+            ).reshape(-1, 1).to(dtype=dtype)
+            probs_total = probs_total * selected_probs.to(dtype=torch.float64)
+            configs.append(choices)
+
+        configs = torch.stack(configs, dim=1)
+        if to_numpy:
+            configs = np.asarray(ar.to_numpy(configs))
+            probs_total = np.asarray(ar.to_numpy(probs_total))
+        return configs, probs_total
+
+    @staticmethod
+    def _array_namespace_sample(site_data, n_samples, seed, *, backend, to_numpy):
+        xp, dtype, site_ops, right_envs, _norm = site_data
+        vec = xp.ones((int(n_samples), 1), dtype=dtype)
+        probs_total = xp.ones((int(n_samples),), dtype=np.float64)
+        batch = xp.arange(int(n_samples))
+        configs = []
+        rng = xp.random.default_rng(seed)
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            right_env = right_envs[site + 1]
+            amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
+            weights = xp.sum((xp.conjugate(amps) @ right_env) * amps, axis=2).real
+            weights = xp.maximum(weights, 0.0)
+            probs = weights / xp.maximum(
+                weights.sum(axis=1, keepdims=True),
+                np.finfo(float).tiny,
+            )
+            draws = rng.random(int(n_samples))
+            if phys_dim == 2:
+                # Keep NumPy's historical CDF tie behavior while preserving
+                # CuPy's existing direct-Bernoulli convention.
+                if backend == "cupy":
+                    compare = draws >= probs[:, 0]
+                else:
+                    compare = draws > probs[:, 0]
+                choices = compare.astype(np.int64)
+            else:
+                cdf = xp.cumsum(probs, axis=1)
+                choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
+                choices = xp.minimum(choices, probs.shape[1] - 1)
+            selected_weights = weights[batch, choices]
+            selected_probs = probs[batch, choices]
+            vec = amps[batch, choices, :] / xp.sqrt(
+                xp.maximum(selected_weights, np.finfo(float).tiny)
+            )[:, None]
+            probs_total = probs_total * selected_probs
+            configs.append(choices)
+
+        configs = xp.stack(configs, axis=1)
+        if to_numpy:
+            configs = np.asarray(ar.to_numpy(configs))
+            probs_total = np.asarray(ar.to_numpy(probs_total))
+        return configs, probs_total
+
+    @staticmethod
+    def _torch_compile_supported(torch):
+        """Check whether the local Torch compiler has its Python headers."""
+        if not hasattr(torch, "compile"):
+            return False
+        import sysconfig  # pylint: disable=import-outside-toplevel
+        from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+        include_dir = sysconfig.get_path("include")
+        return include_dir is None or (Path(include_dir) / "Python.h").is_file()
+
+    def _compiled_torch_sample(self, site_data, n_samples, *, track_grad):
+        """Run a cached compiled Torch inference batch when available."""
+        if (
+            not self.torch_compile
+            or track_grad
+            or self._torch_compile_disabled
+        ):
+            return None
+
+        import torch  # pylint: disable=import-outside-toplevel
+
+        if not self._torch_compile_supported(torch):
+            self._torch_compile_disabled = True
+            return None
+
+        key = (id(site_data), int(n_samples))
+        compiled = self._torch_compiled_sample_fns.get(key)
+        if compiled is None:
+            def run():
+                return self._torch_sample(
+                    site_data,
+                    n_samples,
+                    None,
+                    to_numpy=False,
+                )
+
+            try:
+                compiled = torch.compile(
+                    run,
+                    fullgraph=False,
+                    dynamic=False,
+                    mode="reduce-overhead",
+                )
+                result = compiled()
+            except Exception:  # pragma: no cover - compiler/version dependent
+                self._torch_compile_disabled = True
+                return None
+            self._torch_compiled_sample_fns[key] = compiled
+            return result
+
+        try:
+            return compiled()
+        except Exception:  # pragma: no cover - compiler/version dependent
+            self._torch_compiled_sample_fns.pop(key, None)
+            self._torch_compile_disabled = True
+            return None
+
+    def _native_sample_arrays(self, n_samples, seed, *, to_numpy, track_grad):
+        backend, site_data = self._get_native_site_ops(track_grad=track_grad)
+        if backend == "torch":
+            if seed is None and not to_numpy:
+                compiled = self._compiled_torch_sample(
+                    site_data,
+                    n_samples,
+                    track_grad=track_grad,
+                )
+                if compiled is not None:
+                    return compiled
+            return self._torch_sample(
+                site_data,
+                n_samples,
+                seed,
+                to_numpy=to_numpy,
+            )
+        return self._array_namespace_sample(
+            site_data,
+            n_samples,
+            seed,
+            backend=backend,
+            to_numpy=to_numpy,
+        )
+
+    @staticmethod
+    def _torch_configs(configs, *, device, L):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        configs = torch.as_tensor(configs, dtype=torch.long, device=device)
+        if configs.ndim != 2 or configs.shape[1] != int(L):
+            raise ValueError(
+                f"configs must have shape (batch, L={int(L)}); "
+                f"got {tuple(configs.shape)}."
+            )
+        return configs
+
+    @staticmethod
+    def _array_namespace_configs(configs, *, backend, L):
+        xp = np
+        if backend == "cupy":
+            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+        configs = xp.asarray(configs, dtype=np.int64)
+        if configs.ndim != 2 or configs.shape[1] != int(L):
+            raise ValueError(
+                f"configs must have shape (batch, L={int(L)}); "
+                f"got {tuple(configs.shape)}."
+            )
+        return configs
+
+    @staticmethod
+    def _torch_amplitudes(site_data, configs, *, L):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device, dtype, site_ops, _right_envs, norm = site_data
+        configs = MpsSampler._torch_configs(configs, device=device, L=L)
+        vec = torch.ones((configs.shape[0], 1), dtype=dtype, device=device)
+        batch = torch.arange(configs.shape[0], device=device)
+
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            choices = configs[:, site]
+            if bool(((choices < 0) | (choices >= phys_dim)).any().item()):
+                raise ValueError(
+                    f"configs contain invalid physical index for site {site}."
+                )
+            amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
+            vec = amps[batch, choices, :]
+            if vec.shape[0] != batch.shape[0]:  # pragma: no cover - sanity guard
+                raise RuntimeError(
+                    "Batched MPS amplitude contraction changed batch size."
+                )
+        scale = torch.sqrt(norm.clamp_min(torch.finfo(norm.dtype).tiny)).to(dtype=dtype)
+        return vec.reshape(-1) / scale
+
+    @staticmethod
+    def _array_namespace_amplitudes(site_data, configs, *, backend, L):
+        xp, dtype, site_ops, _right_envs, norm = site_data
+        configs = MpsSampler._array_namespace_configs(configs, backend=backend, L=L)
+        vec = xp.ones((configs.shape[0], 1), dtype=dtype)
+        batch = xp.arange(configs.shape[0])
+
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            choices = configs[:, site]
+            invalid = (choices < 0) | (choices >= phys_dim)
+            invalid = (
+                bool(invalid.any().get())
+                if backend == "cupy"
+                else bool(invalid.any())
+            )
+            if invalid:
+                raise ValueError(
+                    f"configs contain invalid physical index for site {site}."
+                )
+            amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
+            vec = amps[batch, choices, :]
+        scale = xp.sqrt(xp.maximum(norm, np.finfo(float).tiny)).astype(dtype)
+        return vec.reshape(-1) / scale
+
+    @staticmethod
+    def _torch_probabilities(site_data, configs, *, L):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device, dtype, site_ops, right_envs, _norm = site_data
+        configs = MpsSampler._torch_configs(configs, device=device, L=L)
+        vec = torch.ones((configs.shape[0], 1), dtype=dtype, device=device)
+        probs_total = torch.ones(
+            (configs.shape[0],),
+            dtype=torch.float64,
+            device=device,
+        )
+        batch = torch.arange(configs.shape[0], device=device)
+
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            right_env = right_envs[site + 1]
+            amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
+            weights = ((amps.conj() @ right_env) * amps).sum(dim=2).real
+            weights = weights.clamp_min(0.0)
+            probs = weights / weights.sum(dim=1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
+            choices = configs[:, site]
+            if bool(((choices < 0) | (choices >= phys_dim)).any().item()):
+                raise ValueError(
+                    f"configs contain invalid physical index for site {site}."
+                )
+            selected_weights = weights[batch, choices]
+            selected_probs = probs[batch, choices]
+            vec = amps[batch, choices, :] / torch.sqrt(selected_weights).clamp_min(
+                torch.finfo(selected_weights.dtype).tiny
+            ).reshape(-1, 1).to(dtype=dtype)
+            probs_total = probs_total * selected_probs.to(dtype=torch.float64)
+        return probs_total
+
+    @staticmethod
+    def _array_namespace_probabilities(site_data, configs, *, backend, L):
+        xp, dtype, site_ops, right_envs, _norm = site_data
+        configs = MpsSampler._array_namespace_configs(configs, backend=backend, L=L)
+        vec = xp.ones((configs.shape[0], 1), dtype=dtype)
+        probs_total = xp.ones((configs.shape[0],), dtype=np.float64)
+        batch = xp.arange(configs.shape[0])
+
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            right_env = right_envs[site + 1]
+            amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
+            weights = xp.sum((xp.conjugate(amps) @ right_env) * amps, axis=2).real
+            weights = xp.maximum(weights, 0.0)
+            probs = weights / xp.maximum(
+                weights.sum(axis=1, keepdims=True),
+                np.finfo(float).tiny,
+            )
+            choices = configs[:, site]
+            invalid = (choices < 0) | (choices >= phys_dim)
+            invalid = (
+                bool(invalid.any().get())
+                if backend == "cupy"
+                else bool(invalid.any())
+            )
+            if invalid:
+                raise ValueError(
+                    f"configs contain invalid physical index for site {site}."
+                )
+            selected_weights = weights[batch, choices]
+            selected_probs = probs[batch, choices]
+            vec = amps[batch, choices, :] / xp.sqrt(
+                xp.maximum(selected_weights, np.finfo(float).tiny)
+            )[:, None]
+            probs_total = probs_total * selected_probs
+        return probs_total
+
+    @staticmethod
+    def _to_numpy_backend_array(array, backend):
+        return _backend_array_to_numpy(array)
+
+    def amplitudes(
+        self,
+        configs,
+        *,
+        to_numpy: bool = True,
+        track_grad: bool = False,
+    ):
+        """Return batched MPS amplitudes for ``configs``.
+
+        ``configs`` should have shape ``(batch, L)``. Dense NumPy, Torch, and
+        CuPy MPS tensors are contracted in one batched backend-native pass.
+        Symmray MPSs use block-sparse contractions on the underlying NumPy,
+        Torch, or CuPy backend. Set ``to_numpy=False`` to keep Torch/CuPy
+        outputs on their device. Measurement calls default to inference mode;
+        pass ``track_grad=True`` to retain a Torch autograd graph.
+        """
+        if self._symmray_state is not None:
+            out = self._symmray_amplitudes(configs)
+            backend = self._symmray_state["array_backend"]
+            return self._to_numpy_backend_array(out, backend) if to_numpy else out
+
+        if self._native_arrays is None:
+            backend, site_data = self._get_evaluation_site_ops()
+        else:
+            backend, site_data = self._get_native_amplitude_site_ops(
+                track_grad=bool(track_grad)
+            )
+        if backend == "torch":
+            if track_grad:
+                out = self._torch_amplitudes(site_data, configs, L=self._L)
+            else:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                with torch.no_grad():
+                    out = self._torch_amplitudes(site_data, configs, L=self._L)
+        else:
+            out = self._array_namespace_amplitudes(
+                site_data,
+                configs,
+                backend=backend,
+                L=self._L,
+            )
+        return self._to_numpy_backend_array(out, backend) if to_numpy else out
+
+    def single_site_flip_amplitude_ratios(
+        self,
+        configs,
+        *,
+        to_numpy: bool = True,
+        block_size: int = 16,
+    ):
+        """Return ``psi(x with site flipped) / psi(x)`` for binary MPSs.
+
+        This dense-native helper is intended for local-energy estimators. It
+        evaluates all one-site flips with prefix/suffix contractions instead
+        of making one complete MPS amplitude sweep per flipped configuration.
+        The returned array has shape ``(batch, L)``. Native NumPy, Torch, and
+        CuPy MPSs are supported; Symmray and legacy Quimb samplers should use
+        :meth:`amplitudes` on explicitly connected configurations instead.
+
+        ``block_size`` limits the prefix workspace retained while forming the
+        ratios. Smaller values reduce peak memory at the cost of a little more
+        backend work.
+        """
+        if not isinstance(block_size, Integral) or int(block_size) < 1:
+            raise ValueError("block_size must be a positive integer.")
+        if self._symmray_state is not None or self._native_arrays is None:
+            raise NotImplementedError(
+                "single-site flip ratios require a dense native MPS sampler."
+            )
+
+        backend, _site_data = self._get_native_amplitude_site_ops(
+            track_grad=False
+        )
+        arrays = self._native_arrays
+        L = len(arrays)
+        if any(int(array.shape[1]) != 2 for array in arrays):
+            raise NotImplementedError(
+                "single-site flip ratios require binary physical dimensions."
+            )
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            with torch.no_grad():
+                ratios = self._single_site_flip_ratios_native(
+                    arrays,
+                    configs,
+                    backend=backend,
+                    block_size=int(block_size),
+                    L=L,
+                )
+        else:
+            ratios = self._single_site_flip_ratios_native(
+                arrays,
+                configs,
+                backend=backend,
+                block_size=int(block_size),
+                L=L,
+            )
+        return self._to_numpy_backend_array(ratios, backend) if to_numpy else ratios
+
+    @staticmethod
+    def _single_site_flip_ratios_native(
+        arrays,
+        configs,
+        *,
+        backend,
+        block_size,
+        L,
+    ):
+        """Form dense-native single-site flip ratios with bounded workspace."""
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            device = arrays[0].device
+            dtype = arrays[0].dtype
+            configs = MpsSampler._torch_configs(configs, device=device, L=L)
+            xp = torch
+        else:
+            xp = np
+            if backend == "cupy":
+                import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+            configs = MpsSampler._array_namespace_configs(
+                configs,
+                backend=backend,
+                L=L,
+            )
+            dtype = arrays[0].dtype
+
+        invalid = (configs < 0) | (configs > 1)
+        if backend == "torch":
+            invalid = bool(invalid.any().item())
+        elif backend == "cupy":
+            invalid = bool(invalid.any().get())
+        else:
+            invalid = bool(invalid.any())
+        if invalid:
+            raise ValueError("configs contain non-binary physical indices.")
+
+        n_samples = int(configs.shape[0])
+        block_size = min(int(block_size), L)
+        block_starts = tuple(range(0, L, block_size))
+
+        def contract_left(left, choices, array):
+            mask_zero = choices == 0
+            mask_one = ~mask_zero
+            if backend == "torch":
+                output = xp.empty(
+                    (n_samples, int(array.shape[2])),
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                output = xp.empty(
+                    (n_samples, int(array.shape[2])),
+                    dtype=dtype,
+                )
+            if backend == "torch":
+                output[mask_zero] = left[mask_zero] @ array[:, 0, :]
+                output[mask_one] = left[mask_one] @ array[:, 1, :]
+            else:
+                output[mask_zero] = xp.einsum(
+                    "nl,lr->nr", left[mask_zero], array[:, 0, :]
+                )
+                output[mask_one] = xp.einsum(
+                    "nl,lr->nr", left[mask_one], array[:, 1, :]
+                )
+            return output
+
+        def contract_right(choices, array, right):
+            mask_zero = choices == 0
+            mask_one = ~mask_zero
+            if backend == "torch":
+                output = xp.empty(
+                    (n_samples, int(array.shape[0])),
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                output = xp.empty(
+                    (n_samples, int(array.shape[0])),
+                    dtype=dtype,
+                )
+            if backend == "torch":
+                output[mask_zero] = right[mask_zero] @ array[:, 0, :].transpose(0, 1)
+                output[mask_one] = right[mask_one] @ array[:, 1, :].transpose(0, 1)
+            else:
+                output[mask_zero] = xp.einsum(
+                    "lr,nr->nl", array[:, 0, :], right[mask_zero]
+                )
+                output[mask_one] = xp.einsum(
+                    "lr,nr->nl", array[:, 1, :], right[mask_one]
+                )
+            return output
+
+        def contract_site(left, array, choices, right):
+            if backend == "torch":
+                values = contract_left(left, choices, array)
+                return (values * right).sum(dim=1)
+            values = contract_left(left, choices, array)
+            return xp.sum(values * right, axis=1)
+
+        def ones(width):
+            if backend == "torch":
+                return xp.ones((n_samples, width), dtype=dtype, device=configs.device)
+            return xp.ones((n_samples, width), dtype=dtype)
+
+        # The parent amplitude is shared by every local ratio and is therefore
+        # evaluated once, independently of the block workspace below.
+        prefix = ones(1)
+        for site in range(L):
+            choices = configs[:, site]
+            prefix = contract_left(
+                prefix,
+                choices,
+                arrays[site],
+            )
+        parent = prefix[:, 0]
+
+        # Save only suffixes at block boundaries. Prefixes inside one block
+        # are retained briefly, keeping peak workspace independent of L.
+        suffix_boundaries = {L: ones(1)}
+        suffix = suffix_boundaries[L]
+        block_start_set = set(block_starts[1:])
+        for site in range(L - 1, -1, -1):
+            choices = configs[:, site]
+            suffix = contract_right(
+                choices,
+                arrays[site],
+                suffix,
+            )
+            if site in block_start_set:
+                suffix_boundaries[site] = suffix
+
+        prefix = ones(1)
+        if backend == "torch":
+            ratios = xp.empty((n_samples, L), dtype=dtype, device=device)
+        else:
+            ratios = xp.empty((n_samples, L), dtype=dtype)
+        for start in block_starts:
+            stop = min(start + block_size, L)
+            block_prefixes = [prefix]
+            for site in range(start, stop):
+                choices = configs[:, site]
+                prefix = contract_left(
+                    prefix,
+                    choices,
+                    arrays[site],
+                )
+                block_prefixes.append(prefix)
+
+            suffix = suffix_boundaries[stop]
+            for offset in range(stop - start - 1, -1, -1):
+                site = start + offset
+                choices = configs[:, site]
+                flipped = 1 - choices
+                numerator = contract_site(
+                    block_prefixes[offset],
+                    arrays[site],
+                    flipped,
+                    suffix,
+                )
+                ratios[:, site] = numerator / parent
+                suffix = contract_right(
+                    choices,
+                    arrays[site],
+                    suffix,
+                )
+
+        return ratios
+
+    def probabilities(self, configs, *, to_numpy: bool = True):
+        """Return normalized Born probabilities for batched ``configs``.
+
+        This follows the same conditional-probability sweep as sampling, but
+        with user-supplied physical indices. Dense MPSs avoid looping over
+        configurations and run on Torch/CuPy when the tensors do. Symmray MPSs
+        use charge-aware block-sparse conditionals without densifying state
+        tensors.
+        """
+        if self._symmray_state is not None:
+            out = self._symmray_probabilities(configs)
+            backend = self._symmray_state["array_backend"]
+            return self._to_numpy_backend_array(out, backend) if to_numpy else out
+
+        backend, site_data = self._get_evaluation_site_ops()
+        if backend == "torch":
+            out = self._torch_probabilities(site_data, configs, L=self._L)
+        else:
+            out = self._array_namespace_probabilities(
+                site_data,
+                configs,
+                backend=backend,
+                L=self._L,
+            )
+        return self._to_numpy_backend_array(out, backend) if to_numpy else out
+
+    def sample_arrays(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        to_numpy: bool = False,
+        track_grad: bool = False,
+    ):
+        """Draw samples and return raw ``(configs, probs)`` arrays.
+
+        With ``backend="native"`` or ``backend="symmray"``, this returns
+        backend-native arrays by default: Torch tensors stay on Torch and CuPy
+        arrays stay on CuPy. Symmray inputs retain block-sparse state tensors;
+        only the returned discrete configurations and probabilities are dense.
+        The returned ``configs`` have shape ``(n_samples, L)`` and ``probs``
+        has shape ``(n_samples,)``. Set ``to_numpy=True`` to force CPU NumPy
+        arrays, matching the legacy :meth:`sample` result conversion.
+        Sampling is inference-only by default; set ``track_grad=True`` to
+        retain a Torch autograd graph for the sampled Born probabilities.
+        """
+        if int(n_samples) < 1:
+            raise ValueError("n_samples must be a positive integer.")
+        if not isinstance(track_grad, (bool, np.bool_)):
+            raise TypeError("track_grad must be a boolean.")
+        if self._symmray_state is not None:
+            def sample_symmray():
+                strategy, selection, estimated_bytes = (
+                    self._resolve_symmray_sampling_strategy(int(n_samples))
+                )
+                configs, probs, stats = self._symmray_sample_arrays(
+                    self._symmray_state,
+                    int(n_samples),
+                    seed,
+                    strategy=strategy,
+                    max_prefix_groups=self.max_prefix_groups,
+                    to_numpy=to_numpy,
+                )
+                stats.update(
+                    {
+                        "requested_strategy": self.prefix_strategy,
+                        "strategy_selection": selection,
+                        "estimated_dense_site_bytes": (
+                            None
+                            if estimated_bytes is None
+                            else int(estimated_bytes)
+                        ),
+                        "dense_memory_limit_bytes": self.dense_memory_limit,
+                    }
+                )
+                return configs, probs, stats
+
+            if (
+                self._symmray_state["array_backend"] == "torch"
+                and not track_grad
+            ):
+                import torch  # pylint: disable=import-outside-toplevel
+
+                with torch.no_grad():
+                    configs, probs, stats = sample_symmray()
+                self._last_symmray_sampling_stats = stats
+                return configs, probs
+            configs, probs, stats = sample_symmray()
+            self._last_symmray_sampling_stats = stats
+            return configs, probs
+        if self._native_arrays is not None:
+            return self._native_sample_arrays(
+                int(n_samples),
+                seed,
+                to_numpy=to_numpy,
+                track_grad=bool(track_grad),
+            )
+
+        configs = []
+        probs = []
+        for config, prob in self._psi.sample(int(n_samples), seed=seed):
+            configs.append(config)
+            probs.append(prob)
+        return np.asarray(configs, dtype=np.int64), np.asarray(probs, dtype=float)
+
+    def sample_batch(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        to_numpy: bool = False,
+        track_grad: bool = False,
+        fermion=None,
+    ) -> MpsBatchSampleResult:
+        """Draw samples and return a named batched result.
+
+        This is the preferred API for fast downstream workflows. With
+        ``backend="native"`` and ``to_numpy=False``, Torch/CuPy arrays stay on
+        their current device. Use :meth:`sample_arrays` when tuple unpacking is
+        more convenient, or :meth:`sample` when the legacy Python-list/grid
+        result is needed. Pass ``fermion=...`` for a Symmray fermionic MPS to
+        attach a :class:`FermionConfigurationEncoding`; downstream code can
+        then call :meth:`MpsBatchSampleResult.occupations` without guessing the
+        physical-code convention.
+        """
+        configs, probs = self.sample_arrays(
+            n_samples,
+            seed=seed,
+            to_numpy=to_numpy,
+            track_grad=track_grad,
+        )
+        backend = (
+            "numpy"
+            if to_numpy
+            else (
+                self._symmray_state["array_backend"]
+                if self._symmray_state is not None
+                else (self.resolved_backend if self._native_arrays is not None else "numpy")
+            )
+        )
+        return MpsBatchSampleResult(
+            configs=configs,
+            probs=probs,
+            Lx=self.Lx,
+            Ly=self.Ly,
+            one_d_to_two_d=dict(self.one_d_to_two_d),
+            backend=backend,
+            configuration_encoding=(
+                self.fermion_configuration_encoding(
+                    self.fermion if fermion is None else fermion
+                )
+                if (self.fermion is not None or fermion is not None)
+                else None
+            ),
+        )
+
+    def sample(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        track_grad: bool = False,
+    ) -> MpsSampleResult:
+        """Draw ``n_samples`` configurations from the MPS.
+
+        The dense native backend uses batched conditional contractions on the
+        MPS tensor device. The Symmray backend caches a right-canonical copy
+        and sweeps block-sparse physical slices left-to-right. The quimb
+        backend uses ``MatrixProductState.sample()``, which internally
+        right-canonicalizes the MPS and sweeps left-to-right.
+
+        Returns
+        -------
+        pepsy.sampling.results.MpsSampleResult
+            Contains 1D configs, 2D grids, and Born probabilities.
+        """
+        return self.sample_batch(
+            n_samples,
+            seed=seed,
+            to_numpy=True,
+            track_grad=track_grad,
+        ).to_sample_result()

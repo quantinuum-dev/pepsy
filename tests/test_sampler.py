@@ -3,6 +3,7 @@
 from itertools import product
 
 import numpy as np
+from pepsy.sampling import bp as bp_sampler_mod, vector as vector_sampler_mod
 import pytest
 import quimb.tensor as qtn
 
@@ -70,8 +71,8 @@ def test_sampler_exact_method_collects_configs_and_scalars(monkeypatch):
         }
         return config, DummyFlatTN(idx), 0.0123 * (idx + 1)
 
-    monkeypatch.setattr(sampler_mod, "sample_d2bp", fake_sample_d2bp)
-    monkeypatch.setattr(sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
+    monkeypatch.setattr(bp_sampler_mod, "sample_d2bp", fake_sample_d2bp)
+    monkeypatch.setattr(bp_sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
 
     sampler = sampler_mod.PepsBpSampler(DummyTN())
     result = sampler.sample(samples=2, method="exact", seed=10)
@@ -97,8 +98,8 @@ def test_sampler_contraction_methods(monkeypatch):
         config = {"k0,0": 0, "k0,1": 0, "k1,0": 1, "k1,1": 1}
         return config, DummyFlatTN(0), 1.0
 
-    monkeypatch.setattr(sampler_mod, "sample_d2bp", fake_sample_d2bp)
-    monkeypatch.setattr(sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
+    monkeypatch.setattr(bp_sampler_mod, "sample_d2bp", fake_sample_d2bp)
+    monkeypatch.setattr(bp_sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
 
     sampler = sampler_mod.PepsBpSampler(DummyTN())
     mps_result = sampler.sample(samples=1, chi=7, method="mps")
@@ -115,8 +116,8 @@ def test_sampler_rejects_unknown_contraction_method(monkeypatch):
         config = {"k0,0": 0, "k0,1": 0, "k1,0": 0, "k1,1": 0}
         return config, DummyFlatTN(0), 1.0
 
-    monkeypatch.setattr(sampler_mod, "sample_d2bp", fake_sample_d2bp)
-    monkeypatch.setattr(sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
+    monkeypatch.setattr(bp_sampler_mod, "sample_d2bp", fake_sample_d2bp)
+    monkeypatch.setattr(bp_sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
 
     with pytest.raises(ValueError, match="Unknown contraction method"):
         sampler_mod.PepsBpSampler(DummyTN()).sample(method="bad")
@@ -232,6 +233,36 @@ def test_mps_sampler_native_numpy_sample_arrays_returns_arrays():
     assert probs.shape == (4,)
     np.testing.assert_array_equal(configs, np.array([[1, 0, 1]] * 4))
     np.testing.assert_allclose(probs, np.ones(4))
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("phys_dim", [2, 3])
+def test_native_complex_mps_born_probabilities_match_dense(backend, phys_dim):
+    """Complex right environments must contract bra and ket indices correctly."""
+    psi = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=phys_dim, seed=7, dtype="complex128"
+    )
+    dense = psi.to_dense().reshape(-1)
+    expected = np.abs(dense) ** 2
+    expected /= expected.sum()
+    original = [tensor.data.copy() for tensor in psi]
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        psi.apply_to_arrays(pepsy.backend_torch(dtype=torch.complex128, device="cpu"))
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = np.asarray(list(product(range(phys_dim), repeat=3)))
+    actual = sampler.probabilities(configs, to_numpy=True)
+    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-12)
+    assert actual.sum() == pytest.approx(1.0)
+
+    batch = sampler.sample_batch(64, seed=4).to_numpy()
+    indices = batch.configs @ np.array([phys_dim**2, phys_dim, 1])
+    np.testing.assert_allclose(batch.probs, expected[indices], rtol=1e-11, atol=1e-12)
+    repeated = sampler.sample_batch(64, seed=4).to_numpy()
+    np.testing.assert_array_equal(batch.configs, repeated.configs)
+    for tensor, before in zip(psi, original):
+        data = tensor.data.detach().numpy() if backend == "torch" else tensor.data
+        np.testing.assert_array_equal(data, before)
 
 
 def test_mps_sampler_native_numpy_sample_batch_result_helpers():
@@ -1924,7 +1955,7 @@ def test_vec_sampler_native_torch_keeps_vector_and_batch_on_torch():
 def test_vec_sampler_torch_large_category_fallback(monkeypatch):
     """Large Torch categorical vectors use the backend-native CDF path."""
     torch = pytest.importorskip("torch")
-    monkeypatch.setattr(sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
+    monkeypatch.setattr(vector_sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
     state = torch.ones(8, dtype=torch.complex64) / torch.sqrt(
         torch.tensor(8.0)
     )

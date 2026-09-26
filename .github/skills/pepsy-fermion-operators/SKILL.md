@@ -18,7 +18,10 @@ gate construction explicit internally.
 - `src/pepsy/tensors/symm_fermions.py` for `Fermion`, `SpinfulFermion`, local
   observables, parameterized gates, and model-facing factories.
 - `src/pepsy/tensors/symmetric.py` for `symm_operator_from_dense`, shared
-  charge helpers, MPO construction, and `SymHamiltonian` dispatch.
+  charge helpers, and `SymHamiltonian` dispatch.
+- `src/pepsy/operators/_symmetric_mpo.py` for MPO assembly, local-term
+  factorization, and charge-sector grouping. Keep native graded construction
+  separate from the Jordan-Wigner compatibility path.
 - `src/pepsy/tensors/symmetric_states.py` for state construction and evolution,
   `symmetric_diagnostics.py` for summaries/drawings, and
   `src/pepsy/tensors/__init__.py` for lazy public exports. Historical imports

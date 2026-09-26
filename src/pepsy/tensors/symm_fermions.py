@@ -1,7 +1,8 @@
 """Native fermion models, observables, parameterized gates, and factory helpers.
 
 ``Fermion`` owns local-space and model behavior. Shared charge conversion,
-Hamiltonian, and MPO construction live in :mod:`pepsy.tensors.symmetric`.
+and Hamiltonian definitions live in :mod:`pepsy.tensors.symmetric`; MPO
+assembly lives in :mod:`pepsy.operators._symmetric_mpo`.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ..operators._symmetric_mpo import _build_factorized_pair_mpo
 from .symmetric import (
     SymGateStream,
     SymHamiltonian,
@@ -22,7 +24,6 @@ from .symmetric import (
     _as_edges,
     _as_spin_pair,
     _as_term_where,
-    _build_factorized_pair_mpo,
     _charge_add,
     _coupling_is_active,
     _edge_angle_parameter,

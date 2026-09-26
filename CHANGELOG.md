@@ -12,8 +12,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct the bra/ket orientation in native MPS sampling and probability
+  evaluation with complex right environments. NumPy, Torch, and CuPy use
+  the corrected Born-weight contraction; complex-state sample distributions
+  can change compared with earlier versions.
+
 ### Development
 
+- Separate sampler engines and records, MPS controls and norm bookkeeping,
+  stabilizer advice and layout planning, and BP loop geometry into their
+  owning modules. Preserve public APIs, historical serialization paths, and
+  numerical implementations.
+- Move symmetric MPO assembly and local-term factorization into a private
+  operator module, preserving Hamiltonian APIs and historical helper imports.
 - Extract MPS layout execution into a private module while retaining optimizer
   method signatures, documentation, subclass hooks, and class hierarchy.
 - Separate native symmetry diagnostics and fermion model helpers from the

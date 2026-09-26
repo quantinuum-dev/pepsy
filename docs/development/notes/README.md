@@ -7,6 +7,8 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [Repository organization audit](module_organization_2026_09.md) — Completed
+  sampler, optimizer, and BP splits; remaining design boundaries to review.
 - [`release_readiness_2026_09.md`](release_readiness_2026_09.md) — Release
   compatibility review, migration actions, merge scope, and validation evidence.
 - [`dependency_minimums_2026_09.md`](dependency_minimums_2026_09.md) — Required
@@ -71,6 +73,7 @@ mps_dynamic_controls
 mps_entropy_backend
 mps_final_audit
 mps_fit_copy_validation
+module_organization_2026_09
 mps_gpu_backend_audit
 mps_layout_scheduler
 mps_quimb_compression_audit

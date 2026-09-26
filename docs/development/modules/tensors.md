@@ -24,7 +24,7 @@ Backend configuration belongs to `pepsy.backends`.
   `canonicalize=None, allow_local=True`; caller input is preserved. Small unresolved
   gaps are distinct from numerical peripheral modes, and Arnoldi can grow
   its basis within an explicit memory cap.
-- `symmetric.py`: symmetric Hamiltonians, MPO builders, legacy Hubbard gate
+- `symmetric.py`: symmetric Hamiltonians, legacy Hubbard gate
   streams, shared charge sectors, and operator conversion. Historical model,
   state, and diagnostic imports resolve lazily to their owners.
 - `symmetric_diagnostics.py`: native block, MPS/MPO/PEPS, charge, and fermionic
@@ -126,6 +126,10 @@ these conventions for shape inference and layer construction.
 
 `symmetric.py` supplies the shared conversion and Hamiltonian layer to
 `symm_fermions.py`, `symmetric_states.py`, and `symmetric_diagnostics.py`.
+MPO assembly and local-term factorization live in
+`operators/_symmetric_mpo.py`; Hamiltonian conversion methods load those
+builders when called. Charge, basis, and coordinate mapping helpers remain
+in the shared tensor layer.
 State wrappers also use the diagnostic summaries directly. The shared layer
 does not eagerly import any of those modules; `SymHamiltonian.jw_energy`
 imports the shared state type only when validating a state. Existing imports

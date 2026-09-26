@@ -7,7 +7,7 @@
 - `src/pepsy/optimizers/mps/optimizer.py`: public FIT controls, target/layer
   construction, transaction fallback, infidelity, stabilization, and profiling.
 - `src/pepsy/optimizers/mpo/optimizer.py`: MPO use of the shared FIT class.
-- `src/pepsy/sampling/samplers.py`: full-chain `run_eff` consumer.
+- `src/pepsy/sampling/peps.py`: full-chain `run_eff` consumer.
 - `docs/api/optimizers/mps.md`: public behavior and algorithm choices.
 - `tests/test_optimize_mps.py`: dense correctness, timing, growth, and
   complex64 regression coverage.

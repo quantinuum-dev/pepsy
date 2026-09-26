@@ -567,6 +567,10 @@ ham_torch = ham.to_backend(to_backend, inplace=False)
 
 ## Symmetric MPO mapping
 
+`SymHamiltonian.to_mpo()` and `to_pepo()` remain the public conversion methods.
+Their internal assembly helpers live in `pepsy.operators._symmetric_mpo`;
+existing imports through `pepsy.tensors.symmetric` remain compatible.
+
 Symmetric Hamiltonians can be flattened into an MPS-chain MPO with
 ``SymHamiltonian.to_mpo(...)``. Coordinate edges from a 2D or 3D lattice can be
 mapped with an explicit ``OneDMap`` path. The mapping is required for

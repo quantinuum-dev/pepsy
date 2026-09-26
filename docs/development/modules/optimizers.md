@@ -14,7 +14,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `__init__.py`: lazy public exports; selecting layout helpers does not load
     replay, Gibbs preparation, or MPO optimization.
   - `optimizer.py`: `MpsOptimizer`, including replay scheduling, live-state
-    canonical metadata, FIT targets, rollback, and normalization.
+    canonical metadata, FIT targets, and rollback.
+  - `_controls.py`: measurement, reset, cap, and conditional control execution.
+  - `_norm.py`: represented scale, local normalization, and norm diagnostics.
+    Both receive the live optimizer and call its hooks; canonical state remains
+    on the optimizer. Public methods retain their signatures and documentation.
   - `_streams.py`: immutable stream snapshots, symbolic gate resolution, and
     queue normalization. State/backend validation stays on the optimizer;
     trajectory grammar stays in the shared noise implementation.
@@ -32,8 +36,8 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     groups, and disposable `guess` / `svd_guess` construction. These helpers
     can load without initializing MPS replay or FIT. Historical imports from
     `optimizer.py` remain aliases to the same objects.
-  - `normalization.py`: empty reserved import path; normalization remains on
-    `MpsOptimizer` alongside its live canonical metadata.
+  - `normalization.py`: empty compatibility import path with no numerical
+    imports; internal normalization execution is in `_norm.py`.
 - `mpo/`: MPO gate-stream optimization.
   - `optimizer.py`: `MpoOptimizer`.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.
@@ -61,7 +65,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `traces.py`: extraction target for sweep traces and progress summaries.
 - `stabilizer_tn/`: `StabilizerMpsSimulator` / `MpsStabOptimizer`, `STNState`,
   and typed STN diagnostic records for the Stim-tableau plus coefficient-MPS
-  simulator. See `../plans/stabilizer_tn.md` for its implementation record and
+  simulator. `_advice.py` owns stream analysis and recommendations; `_layout.py`
+  owns coefficient-frame layout tracing and installation; `_stream_helpers.py`
+  owns shared parsing and Clifford localizers. The simulator retains execution
+  state and method contracts, including classmethod/subclass dispatch.
+  See `../plans/stabilizer_tn.md` for its implementation record and
   `docs/howto/stabilizer_tn_magic.md` for exact cooling, greedy checkpoints,
   and immediate versus deferred MAST injection.
 - `planning.py`: non-executing physical-versus-stabilizer and

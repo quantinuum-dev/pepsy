@@ -131,6 +131,94 @@ print(*sorted(
     assert not loaded
 
 
+def test_sampling_engines_and_legacy_pickle_globals():
+    """Each sampler owns its class, while historical serialization still loads."""
+    for first in ("mps", "vector", "peps", "bp", "results", "samplers"):
+        loaded = _run_clean_import(
+            f"""
+import importlib
+import pickle
+import sys
+importlib.import_module('pepsy.sampling.{first}')
+import pepsy
+from pepsy import sampling
+from pepsy.sampling import samplers
+owners = {{
+    'MpsSampler': 'mps', 'VecSampler': 'vector',
+    'PepsSampler': 'peps', 'PepsBpSampler': 'bp',
+    'PEPSSampleResult': 'results', 'MpsSampleResult': 'results',
+    'MpsBatchSampleResult': 'results', 'MpsDiagonalEstimate': 'results',
+    'FermionConfigurationEncoding': 'results',
+}}
+for name, owner in owners.items():
+    value = getattr(importlib.import_module('pepsy.sampling.' + owner), name)
+    assert value is getattr(samplers, name)
+    assert value is getattr(sampling, name) is getattr(pepsy, name)
+    legacy = ('cpepsy.sampling.samplers\\n' + name + '\\n.').encode()
+    assert pickle.loads(legacy) is value
+print(*sorted(name for name in sys.modules if name in {{
+    'torch', 'jax', 'symmray', 'stim', 'pepsy.optimizers.mps.optimizer',
+}}))
+"""
+        )
+        assert not loaded
+
+
+def test_vector_sampling_does_not_load_other_engines():
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.sampling import VecSampler
+assert VecSampler.__module__ == 'pepsy.sampling.vector'
+print(*sorted(name for name in sys.modules if name in {
+    'pepsy.sampling.mps', 'pepsy.sampling.peps', 'pepsy.sampling.bp',
+    'pepsy.sampling.samplers', 'quimb',
+}))
+"""
+    )
+    assert not loaded
+
+
+def test_extracted_execution_and_geometry_helpers_import_independently():
+    loaded = _run_clean_import(
+        """
+import sys
+from pepsy.optimizers.mps import _controls, _norm
+from pepsy.optimizers.stabilizer_tn import _advice, _layout
+from pepsy.bp import _series_geometry
+assert _series_geometry.LoopSeriesTerm(('a',)).degree == 1
+print(*sorted(name for name in sys.modules if name in {
+    'pepsy.optimizers.mps.optimizer', 'pepsy.bp.series',
+    'pepsy.optimizers.stabilizer_tn.mps_stab_optimizer', 'stim', 'symmray',
+}))
+"""
+    )
+    assert not loaded
+
+
+def test_loop_geometry_legacy_serialization():
+    loaded = _run_clean_import(
+        """
+import pickle
+from pepsy.bp import series, _series_geometry
+for name in ('LoopSeriesTerm', 'OpenLoopEnumerationLimitError'):
+    value = getattr(_series_geometry, name)
+    assert value is getattr(series, name)
+    legacy = ('cpepsy.bp.series\\n' + name + '\\n.').encode()
+    assert pickle.loads(legacy) is value
+term_type = _series_geometry.LoopSeriesTerm
+original_module = term_type.__module__
+try:
+    term_type.__module__ = 'pepsy.bp.series'
+    payload = pickle.dumps(term_type(('a', 'b'), frozenset((0, 1))))
+finally:
+    term_type.__module__ = original_module
+assert pickle.loads(payload) == term_type(('a', 'b'), frozenset((0, 1)))
+"""
+    )
+    assert not loaded
+
+
 def test_mps_namespace_and_support_modules_do_not_import_numerical_stack():
     """MPS discovery and reporting helpers must not initialize numerical code."""
     loaded = _run_clean_import(
@@ -225,6 +313,49 @@ for owner in (symm_fermions, symmetric_diagnostics):
 assert symmetric.SpinfulFermionHubbard is symm_fermions.SpinfulFermion
 print(*sorted(name for name in sys.modules if name in {{
     'symmray', 'matplotlib.pyplot', 'pepsy.tensors.symmetric_states',
+}}))
+"""
+        )
+        assert not loaded
+
+
+def test_symmetric_mpo_legacy_imports_without_symmray():
+    """Both import orders preserve old helper globals without optional arrays."""
+    for first in ("pepsy.tensors.symmetric", "pepsy.operators._symmetric_mpo"):
+        loaded = _run_clean_import(
+            f"""
+import importlib
+import importlib.abc
+import pickle
+import sys
+
+class BlockSymmray(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'symmray' or fullname.startswith('symmray.'):
+            raise ModuleNotFoundError(fullname)
+        return None
+
+sys.meta_path.insert(0, BlockSymmray())
+importlib.import_module({first!r})
+from pepsy.tensors import symmetric
+from pepsy.operators import _symmetric_mpo
+
+for name in (
+    '_term_dense_and_phys_maps', '_term_dense_and_phys_map',
+    '_svd_rank_cutoff', '_decompose_neutral_two_site_term',
+    '_fermion_parity_operator', '_charged_op_needs_fermion_string',
+    '_add_local_transition', '_assemble_symmray_mpo',
+    '_build_factorized_pair_mpo', '_build_fermionic_model_mpo',
+    '_add_native_term_to_mpo', '_native_local_term_mpo',
+    '_generic_symhamiltonian_to_mpo', '_group_symhamiltonian_terms_by_charge',
+):
+    value = getattr(_symmetric_mpo, name)
+    assert value is getattr(symmetric, name)
+    legacy = ('cpepsy.tensors.symmetric\\n' + name + '\\n.').encode()
+    assert pickle.loads(legacy) is value
+print(*sorted(name for name in sys.modules if name in {{
+    'symmray', 'pepsy.tensors.symm_fermions',
+    'pepsy.tensors.symmetric_states', 'pepsy.tensors.symmetric_diagnostics',
 }}))
 """
         )
