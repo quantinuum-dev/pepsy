@@ -22,6 +22,12 @@ Quimb. A raw gate `G` on operator `X` produces `X @ G.T`; request
 the applied MPO; it still applies it. The separate `inplace` flag controls
 whether the target network is mutated.
 
+## Truncation policy
+
+`build_pepo_from_gates(..., cutoff_mode="rsum2")` applies the requested
+truncation policy to both gate splits and fallback compression. The fallback
+also uses the supplied `cutoff`, rather than a separate hard-coded threshold.
+
 ## Gauge scale extraction
 
 `renorm_gauge(network, gauges, where, smudge=1e-12)` divides a bond's weights

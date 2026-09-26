@@ -3413,6 +3413,7 @@ def build_pepo_from_gates(
     ind_id="k{},{}",
     mapper=None,
     allow_charged=False,
+    cutoff_mode="rsum2",
 ):
     """Build a PEPO from gate-style input on top of a PEPO identity.
 
@@ -3456,6 +3457,8 @@ def build_pepo_from_gates(
     allow_charged : bool, default=False
         Allow native gates with nonzero operator charge. The returned PEPO
         then carries the accumulated charge of the sequential gate product.
+    cutoff_mode : str, default="rsum2"
+        Truncation policy used for gate splits and fallback compression.
 
     Returns
     -------
@@ -3526,6 +3529,7 @@ def build_pepo_from_gates(
             pepo, gate_op, where_norm,
             max_bond=max_bond, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id=ind_id,
             inplace=True,
         )
@@ -3535,7 +3539,8 @@ def build_pepo_from_gates(
                 inplace=True,
                 max_bond=max_bond,
                 canonize_distance=4,
-                cutoff=1e-14,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
 
     return pepo

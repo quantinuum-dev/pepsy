@@ -14,6 +14,9 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Forward `cutoff_mode` through PEPO gate construction and its fallback
+  compression, which also now respects the requested `cutoff`. Expose optional
+  cutoff-mode selection for compressed hyper-contraction.
 - Preserve simple-update gauge values and first derivatives when extracting
   their RMS scale: divide and restore the same detached positive scale, avoid
   overflow/underflow in norm evaluation, and keep zero gauges finite.
