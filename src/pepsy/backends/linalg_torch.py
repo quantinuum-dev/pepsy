@@ -105,6 +105,28 @@ def safe_inverse_2(x, eps):
     return x.clamp_min(eps).reciprocal()
 
 
+def _svd_reciprocal(x, scale, *, rtol=_SVD_EPS_REL):
+    """Exact reciprocal outside a compact, relative stabilization region.
+
+    Broadening every denominator biases even well-resolved SVD derivatives.
+    Modify only ``|x| < rtol * scale``. The default retains the existing gap
+    threshold; inverse singular values supply a numerical-rank tolerance.
+    Inside, ``(2*y - y**3) / threshold`` with ``y=x/threshold`` joins ``1/x``
+    with matching value and slope at both boundaries and is zero at zero.
+    This is a bounded surrogate at degeneracies, not their exact derivative.
+
+    Avoid squaring the spectrum (overflow/underflow) and never evaluate an
+    unguarded reciprocal at zero, even in an unselected ``where`` branch.
+    ``scale`` has a trailing singleton axis for each spectral axis of ``x``.
+    """
+    threshold = (scale * rtol).clamp_min(torch.finfo(x.dtype).tiny)
+    resolved = x.abs() >= threshold
+    denominator = torch.where(resolved, x, torch.ones_like(x))
+    y = x.clamp(min=-threshold, max=threshold) / threshold
+    regularized = (2 * y - y**3) / threshold
+    return torch.where(resolved, denominator.reciprocal(), regularized)
+
+
 def _scipy_svd(A, lapack_driver="gesvd", exc=None):
     """Compute a thin CPU SVD through an explicit SciPy LAPACK driver."""
     if scipy_linalg is None:
@@ -311,10 +333,10 @@ class SVD(torch.autograd.Function):
     """Torch SVD with a relative-regularized reverse-mode rule.
 
     The rectangular real-SVD terms follow Townsend's reverse update, with the
-    singular-gap and inverse-singular-value reciprocals regularized as
-    ``x / (x**2 + eps)``. The scale-aware ``eps`` keeps the stabilizer relative
-    to the current singular spectrum, which is the Lorentzian broadening used in
-    differentiable tensor-network SVDs. Complex inputs additionally include the
+    singular-gap and inverse-singular-value reciprocals exact outside a compact
+    relative stabilization region (see :func:`_svd_reciprocal`). Near zero they
+    use a bounded, continuously differentiable extension. This protects singular
+    cases without damping resolved derivatives. Complex inputs also include the
     phase/gauge term from the complex-valued SVD backward formula.
     """
 
@@ -341,7 +363,6 @@ class SVD(torch.autograd.Function):
         m = u.size(-2)
         n = vh.size(-1)
         k = sigma.size(-1)
-        eps_abs = torch.finfo(sigma.dtype).tiny
         sigma_scale = sigma.detach().amax(dim=-1, keepdim=True)
         pair_scale = sigma_scale.unsqueeze(-1)
 
@@ -367,31 +388,22 @@ class SVD(torch.autograd.Function):
                 print(f"{diagnostics} {sigma_term.abs().max()} {sigma.max()}")
             return sigma_term
 
-        sigma_inv = safe_inverse(
-            sigma.clone(),
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=sigma_scale,
+        # The rectangular/phase terms need the pseudoinverse of the spectrum,
+        # not an eigenvector-gap stabilizer. Treat numerical rank using the
+        # usual matrix-size * machine-epsilon criterion; a small but resolved
+        # singular value still has an exact reciprocal.
+        sigma_inv = _svd_reciprocal(
+            sigma, sigma_scale, rtol=max(m, n) * torch.finfo(sigma.dtype).eps,
         )
 
         # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
-        # 1/(s_i + s_j), with relative Lorentzian broadening.
+        # 1/(s_i + s_j), stabilized only near unresolved denominators.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = safe_inverse(
-            F,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        F = _svd_reciprocal(F, pair_scale)
         F.diagonal(0, -2, -1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = safe_inverse(
-            G,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        G = _svd_reciprocal(G, pair_scale)
         G.diagonal(0, -2, -1).fill_(0)
 
         uh = u.conj().transpose(-2, -1)
@@ -445,7 +457,7 @@ class SVD_real(torch.autograd.Function):
 
     This is the real-only counterpart of :class:`SVD`. It shares the robust
     forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
-    fallback) and the scale-aware Lorentzian broadening of the singular-gap and
+    fallback) and the compact relative stabilization of the singular-gap and
     inverse-singular-value reciprocals, and it supports rectangular and batched
     inputs. Only the complex phase/gauge term of :class:`SVD` is dropped, since
     real orthogonal factors carry no gauge freedom.
@@ -474,7 +486,6 @@ class SVD_real(torch.autograd.Function):
         m = u.size(-2)
         n = vh.size(-1)
         k = sigma.size(-1)
-        eps_abs = torch.finfo(sigma.dtype).tiny
         sigma_scale = sigma.detach().amax(dim=-1, keepdim=True)
         pair_scale = sigma_scale.unsqueeze(-1)
 
@@ -498,31 +509,22 @@ class SVD_real(torch.autograd.Function):
         if (gu is None) and (gvh is None):
             return sigma_term
 
-        sigma_inv = safe_inverse(
-            sigma.clone(),
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=sigma_scale,
+        # The rectangular/phase terms need the pseudoinverse of the spectrum,
+        # not an eigenvector-gap stabilizer. Treat numerical rank using the
+        # usual matrix-size * machine-epsilon criterion; a small but resolved
+        # singular value still has an exact reciprocal.
+        sigma_inv = _svd_reciprocal(
+            sigma, sigma_scale, rtol=max(m, n) * torch.finfo(sigma.dtype).eps,
         )
 
         # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
-        # 1/(s_i + s_j), with relative Lorentzian broadening.
+        # 1/(s_i + s_j), stabilized only near unresolved denominators.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = safe_inverse(
-            F,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        F = _svd_reciprocal(F, pair_scale)
         F.diagonal(0, -2, -1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = safe_inverse(
-            G,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        G = _svd_reciprocal(G, pair_scale)
         G.diagonal(0, -2, -1).fill_(0)
 
         ut = u.transpose(-2, -1)

@@ -801,8 +801,8 @@ def reg_rel_svd_torch():
     """Advanced compatibility helper for stabilized Torch SVD.
 
     The registered autoray ``torch`` SVD uses Townsend's rectangular SVD
-    reverse-mode update, Lorentzian broadening of singular-value denominators
-    from differentiable tensor-network practice, and the complex phase/gauge
+    reverse-mode update, compact relative stabilization of near-zero spectral
+    denominators (exact reciprocals outside that region), and the phase/gauge
     correction for complex-valued SVDs.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
@@ -846,7 +846,7 @@ def reg_real_svd_torch():
     This is the real counterpart of :func:`reg_rel_svd_torch`. It shares the
     robust forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
     fallback), the same Townsend rectangular reverse-mode update, and the
-    scale-aware Lorentzian broadening of the singular-value denominators, while
+    compact relative stabilization of the singular-value denominators, while
     dropping the complex phase/gauge correction. It supports rectangular and
     batched real inputs.
     """

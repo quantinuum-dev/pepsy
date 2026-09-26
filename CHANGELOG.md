@@ -14,6 +14,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Preserve resolved Torch SVD derivatives under `stabilized=True`: replace
+  global Lorentzian damping with compact relative stabilization, retaining
+  the same gap threshold and finite singular-case extension. Use the
+  dtype/shape numerical-rank threshold for inverse singular values, separately
+  from the singular-gap threshold.
+  Applies to both real/complex Autoray and native Symmray split paths.
 - Renormalize native Symmray SU gauge vectors over their backend blocks,
   preserving Torch gradients and stable exponent accounting without densifying
   the vectors or calling an unsupported Symmray mean.

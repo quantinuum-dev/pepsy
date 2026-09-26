@@ -71,6 +71,8 @@ gibbs_mps
 mpo_mps_alignment
 operator_conventions_2026_09
 pepo_gradients_scale_2026_09
+2026-09-26-native-su-gauge-scales
+2026-09-26-compact-svd-backward
 mps_dynamic_controls
 mps_entropy_backend
 mps_final_audit

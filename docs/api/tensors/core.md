@@ -45,8 +45,18 @@ selected during forward even after the configuration context exits. Existing
 `warn`, `native`, and `error` policies remain available.
 
 Adaptive QR is a finite first-order extension at singular charts, not proof
-that a factorization is differentiable there. Stabilized SVD also regularizes
-singular-gap reciprocals. Check directional derivatives of the complete
+that a factorization is differentiable there. Stabilized SVD uses exact
+reciprocals for singular sums and gaps of magnitude at least
+`1e-6 * max(singular_values)` per matrix/block. The inverse singular values
+in the rectangular and complex-phase terms use a numerical-rank threshold
+`max(m, n) * finfo(dtype).eps * max(singular_values)` instead: a small but
+resolved singular value must not be treated as a degenerate gap.
+Below each threshold it uses a bounded cubic extension, with matching value
+and slope at the boundary and value zero at zero. Unlike the previous
+Lorentzian rule, it does not damp resolved spectral derivatives. The gap
+threshold is unchanged; derivatives inside either stabilization region
+remain surrogate derivatives.
+Check directional derivatives of the complete
 truncated calculation; rank changes and ties across a retained/discarded
 boundary can be nonsmooth.
 
