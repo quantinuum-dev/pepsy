@@ -26,7 +26,7 @@ _SVD_FORWARD_OPTIONS = contextvars.ContextVar(
 _SVD_DRIVERS = {"auto", "gesvdj", "gesvda", "gesvd"}
 _CPU_SVD_BACKENDS = {"torch", "scipy_gesdd", "scipy_gesvd"}
 _SVD_FALLBACKS = {"auto", "none", "scipy_gesdd", "scipy_gesvd"}
-_QR_RANK_POLICIES = {"warn", "native", "error"}
+_QR_RANK_POLICIES = {"warn", "native", "adaptive", "error"}
 _QR_RANK_POLICY = "warn"
 _QR_RANK_TOL_FACTOR = 1.0
 
@@ -567,6 +567,7 @@ class QR_real(torch.autograd.Function):
     def forward(self, A):
         if A.is_complex():
             raise TypeError("QR_real requires a real Torch tensor.")
+        self.rank_policy = _QR_RANK_POLICY
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
@@ -591,8 +592,10 @@ class QR_real(torch.autograd.Function):
     @staticmethod
     def backward(self, dq, dr):
         A, q, r, rank_deficient = self.saved_tensors
+        if self.rank_policy == "adaptive":
+            return _adaptive_qr_backward(A, q, r, dq, dr, rank_deficient)
         if bool(rank_deficient.any().item()):
-            if _QR_RANK_POLICY == "native":
+            if self.rank_policy == "native":
                 return _native_qr_backward(A, dq, dr)
             return _regularized_qr_backward(A, q, r, dq, dr, rank_deficient)
         m, _n = r.shape[-2:]
@@ -634,6 +637,7 @@ class QR_real_safe(torch.autograd.Function):
     def forward(ctx, A):
         if A.is_complex():
             raise TypeError("QR_real_safe requires a real Torch tensor.")
+        ctx.rank_policy = _QR_RANK_POLICY
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
@@ -646,8 +650,10 @@ class QR_real_safe(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
+        if ctx.rank_policy == "adaptive":
+            return _adaptive_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if bool(rank_deficient.any().item()):
-            if _QR_RANK_POLICY == "native":
+            if ctx.rank_policy == "native":
                 return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if R.shape[-1] > R.shape[-2]:
@@ -660,6 +666,7 @@ class QR_complex_safe(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
+        ctx.rank_policy = _QR_RANK_POLICY
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
@@ -673,8 +680,10 @@ class QR_complex_safe(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
+        if ctx.rank_policy == "adaptive":
+            return _adaptive_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if bool(rank_deficient.any().item()):
-            if _QR_RANK_POLICY == "native":
+            if ctx.rank_policy == "native":
                 return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         return _native_qr_backward(A, dQ, dR)
@@ -804,6 +813,50 @@ def _regularized_qr_backward(a, q, r, dq, dr, singular_pivot):
             gradient = gradient + q @ dr
 
     return torch.where(zero_block[..., None, None], torch.zeros_like(gradient), gradient)
+
+
+def _adaptive_qr_backward(a, q, r, dq, dr, singular_pivot):
+    """Preserve finite native derivatives, regularizing only failing blocks.
+
+    A small QR pivot alone does not imply that its composed tensor-network
+    VJP needs regularization. Conversely a nonfinite native VJP cannot be
+    passed to an optimizer. The fallback is an explicit finite extension at
+    a singular chart, not a claim of differentiability there.
+    """
+    result = torch.zeros_like(a)
+    active = torch.zeros(a.shape[:-2], dtype=torch.bool, device=a.device)
+    for cotangent in (dq, dr):
+        if cotangent is not None:
+            active = active | (cotangent != 0).any(dim=(-2, -1))
+    # Do not enter an undefined native backward at an exactly zero pivot,
+    # including when anomaly detection would raise before a fallback is possible.
+    zero_pivot = (r.diagonal(0, -2, -1) == 0).any(dim=-1)
+    candidate = active & ~zero_pivot
+    if bool(candidate.any()):
+        result[candidate] = _native_qr_backward(
+            a[candidate],
+            None if dq is None else dq[candidate],
+            None if dr is None else dr[candidate],
+        )
+    bad = active & (zero_pivot | ~torch.isfinite(result).all(dim=(-2, -1)))
+    if not bool(bad.any()):
+        return result
+    warnings.warn(
+        "Torch QR adaptive backward used a regularized VJP for a singular "
+        "or nonfinite native derivative; verify gradients near this chart.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    fallback = _regularized_qr_backward(
+        a[bad], q[bad], r[bad],
+        None if dq is None else dq[bad],
+        None if dr is None else dr[bad],
+        torch.ones_like(singular_pivot[bad]),
+    )
+    if not bool(torch.isfinite(fallback).all()):
+        raise RuntimeError("Torch QR adaptive backward could not produce a finite VJP")
+    result[bad] = fallback
+    return result
 
 
 def _native_qr_backward(A, dq, dr):

@@ -14,6 +14,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Preserve simple-update gauge values and first derivatives when extracting
+  their RMS scale: divide and restore the same detached positive scale, avoid
+  overflow/underflow in norm evaluation, and keep zero gauges finite.
+- Capture Torch QR rank policy during forward so backward remains consistent
+  after a scoped configuration exits. Add opt-in `qr_rank_policy="adaptive"`
+  to preserve finite native VJPs and warn when a singular/nonfinite block
+  needs the regularized fallback.
 - Build dense MPO/PEPO gate streams in Quimb's operator convention: upper
   `k...` indices are outputs, lower `b...` indices are inputs, and later gates
   multiply on the left. Remove the legacy per-gate transpose. `tns_align`

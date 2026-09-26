@@ -66,11 +66,14 @@ class TorchLinalgConfig:
         for native SVD and ``"scipy_gesvd"`` for stabilized SVD.
     allow_approximate : bool, default=False
         Safety acknowledgement required for CUDA's approximate ``gesvda``.
-    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+    qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
         Rank-deficiency response for stabilized QR VJPs. ``"warn"`` reports
         the condition and uses the finite regularized rule, ``"native"``
         accepts Torch's native fallback silently, and ``"error"`` stops the
-        optimization.
+        optimization. ``"adaptive"`` preserves finite native VJPs and uses
+        a warned regularized fallback for exactly singular pivots or
+        nonfinite native results.
+        The policy is captured during the forward pass.
     qr_rank_tol_factor : float, default=1.0
         Scale-relative multiplier used by the stabilized real QR rule.
     quimb_split_drivers : bool, default=False
@@ -132,8 +135,8 @@ class TorchLinalgConfig:
                 "svd_driver='gesvda' is approximate; pass "
                 "allow_approximate=True to enable it explicitly."
             )
-        if self.qr_rank_policy not in {"warn", "native", "error"}:
-            raise ValueError("qr_rank_policy must be one of: warn, native, error")
+        if self.qr_rank_policy not in {"warn", "native", "adaptive", "error"}:
+            raise ValueError("qr_rank_policy must be one of: warn, native, adaptive, error")
         try:
             qr_factor = float(self.qr_rank_tol_factor)
         except (TypeError, ValueError) as exc:
@@ -672,7 +675,7 @@ def register_torch_linalg(
         ``"scipy_gesvd"`` for stabilized SVD.
     allow_approximate : bool, default=False
         Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
-    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+    qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
         Response to rank-deficient inputs when stabilized QR is active.
     qr_rank_tol_factor : float, default=1.0
         Multiplier for the scale-aware real-QR rank threshold.

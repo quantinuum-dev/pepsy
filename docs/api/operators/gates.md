@@ -22,6 +22,18 @@ Quimb. A raw gate `G` on operator `X` produces `X @ G.T`; request
 the applied MPO; it still applies it. The separate `inplace` flag controls
 whether the target network is mutated.
 
+## Gauge scale extraction
+
+`renorm_gauge(network, gauges, where, smudge=1e-12)` divides a bond's weights
+by a detached positive scale and adds the logarithm of **that same scale**
+to `network.exponent`. It preserves the represented operator and the first
+derivative of its reconstructed weights. RMS evaluation uses weights relative
+to their largest magnitude, avoiding squares of very large or tiny inputs.
+
+`smudge` is a nonnegative finite floor on a nonzero RMS scale. An all-zero
+gauge uses scale one and remains zero, with finite exponent bookkeeping.
+This tracks numerical scale; it does not normalize a physical overlap.
+
 ## Native fermionic gates
 
 The gate-to-operator builders accept native Symmray fermionic gates directly;

@@ -70,6 +70,7 @@ fit_one_site_qr
 gibbs_mps
 mpo_mps_alignment
 operator_conventions_2026_09
+pepo_gradients_scale_2026_09
 mps_dynamic_controls
 mps_entropy_backend
 mps_final_audit

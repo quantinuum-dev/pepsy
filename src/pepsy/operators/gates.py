@@ -2676,8 +2676,10 @@ def _gate_simple_one_with_current_site_ind_id(
 def renorm_gauge(tn, gauges, where, smudge=1e-12):
     """Renormalize the simple-update gauge on the bond between sites in *where*.
 
-    Divides the gauge vector by its RMS norm (with *smudge* for safety)
-    and accumulates the extracted scale into ``tn.exponent`` (if present).
+    Divides the gauge vector by a positive, detached RMS scale and accumulates
+    exactly that scale into ``tn.exponent`` (if present). The RMS is evaluated
+    relative to the largest magnitude to avoid squaring extreme weights.
+    An all-zero gauge uses scale one, preserving its reconstruction derivative.
 
     Works for 1D/2D/3D — finds the bond index between the two site tensors.
 
@@ -2691,8 +2693,11 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
         Pair of site coordinates, e.g. ``(3, 4)`` for 1D,
         ``((0,1), (1,1))`` for 2D, ``((0,0,0), (0,0,1))`` for 3D.
     smudge : float
-        Small value for numerical safety.
+        Nonnegative finite floor for a nonzero RMS scale.
     """
+    smudge = float(smudge)
+    if not np.isfinite(smudge) or smudge < 0:
+        raise ValueError("smudge must be nonnegative and finite")
     site_a, site_b = where
     tag_a = tn.site_tag(site_a)
     tag_b = tn.site_tag(site_b)
@@ -2706,12 +2711,17 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
         )
     ix = next(iter(bond_ix_set))
     s = gauges[ix]
-    norm_s = ar.do("sqrt", ar.do("mean", ar.do("abs", s) ** 2))
-    # Stop gradient on the scalar norm — only tensor data carries AD info.
-    norm_s = _stop_gradient(norm_s)
+    magnitudes = ar.do("abs", _stop_gradient(s))
+    peak = ar.do("max", magnitudes)
+    peak_safe = ar.do("where", peak > 0, peak, peak * 0 + 1)
+    norm_s = peak * ar.do("sqrt", ar.do("mean", (magnitudes / peak_safe) ** 2))
+    # A nonzero subnormal RMS can round to zero even after relative scaling.
+    norm_s = ar.do("where", norm_s > 0, norm_s, peak_safe)
+    scale = ar.do("where", norm_s > smudge, norm_s, norm_s * 0 + smudge)
+    scale = ar.do("where", peak > 0, scale, peak * 0 + 1)
     if hasattr(tn, "exponent"):
-        tn.exponent = tn.exponent + ar.do("log10", norm_s)
-    gauges[ix] = s / (norm_s + smudge)
+        tn.exponent = tn.exponent + ar.do("log10", scale)
+    gauges[ix] = s / scale
 
 
 def _apply_gate_2d(
