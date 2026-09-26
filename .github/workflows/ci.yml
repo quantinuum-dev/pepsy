@@ -63,7 +63,7 @@ jobs:
         run: python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
       - name: Run core contracts and smoke tests
         # Full optional-backend tests and coverage run in nightly.yml.
-        run: python -m pytest -q -o addopts="" -m "smoke or (core and not optional and not slow)"
+        run: python -m pytest -q -ra -o addopts="" -m "smoke or (core and not optional and not slow)"
 
   package:
     runs-on: ubuntu-latest

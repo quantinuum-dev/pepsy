@@ -37,6 +37,11 @@ python -m pip install -e ".[dev,test-extended]"
 The `core` marker alone includes some tests that need optional backends.
 Tests skip when a required dependency or upstream capability is unavailable;
 a skipped test is not validation of that path.
+CI prints skip reasons with `-ra`. Add that flag locally when investigating
+coverage gaps; check whether each skip requires a dependency, upstream
+capability, multiple MPI ranks, or hardware unavailable on the runner before
+changing the test. Installing optional packages alone does not provide GPU
+or multi-process coverage.
 
 MPS and tree tests are split by responsibility:
 

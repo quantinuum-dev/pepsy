@@ -43,7 +43,7 @@ jobs:
         run: python -c "import jax, netket, symmray, torch; print('Optional backends imported successfully')"
       - name: Run the complete available suite
         # Empty addopts includes integration and slow tests across all domains.
-        run: python -m pytest -q -o addopts="" --maxfail=1 --cov=pepsy --cov-report=term-missing --cov-fail-under=60
+        run: python -m pytest -q -ra -o addopts="" --maxfail=1 --cov=pepsy --cov-report=term-missing --cov-fail-under=60
       - name: Report coverage after failure
         if: failure()
         run: |
@@ -74,12 +74,12 @@ jobs:
           python -m pip install -e ".[mpi,stabilizer]" pytest
           python -m pip check
       - name: Run MPI unit-contract tests
-        run: python -m pytest -q -o addopts="" tests/test_mpi.py
+        run: python -m pytest -q -ra -o addopts="" tests/test_mpi.py
       - name: Run multi-process integration and benchmark smoke tests
         run: |
           for ranks in 2 3; do
             mpiexec --oversubscribe --bind-to none -n "$ranks" \
-              python -m pytest -q -o addopts="" tests/test_mpi_integration.py
+              python -m pytest -q -ra -o addopts="" tests/test_mpi_integration.py
             mpiexec --oversubscribe --bind-to none -n "$ranks" \
               python benchmarks/mpi_shots.py \
               --shots 8 --qubits 2 --depth 1 --chi 4 --workers auto

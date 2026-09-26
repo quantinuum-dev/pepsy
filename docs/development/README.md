@@ -47,6 +47,10 @@ publication to PyPI and TestPyPI was cancelled by the maintainer. The earlier
 registry setup handoff is historical and does not authorize a retry.
 The release workflow builds and validates GitHub artifacts on version tags
 or manual dispatch. It has no registry-publishing jobs.
+These are GitHub Actions artifacts; the workflow does not create a GitHub
+Release entry. Commits after a version tag are development changes until a
+new version is selected and tagged. Do not move an existing release tag to
+include subsequent cleanup.
 
 ```{toctree}
 :hidden:
