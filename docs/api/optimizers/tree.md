@@ -1697,6 +1697,48 @@ three-virtual-bond root convention described above. `TreePlan.max_arity()` and
 `TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
 strict two-child-at-every-internal-node predicate.
 
+### Alternating spatial x/y hierarchy
+
+Use `order="alternating-xy"` (or `map_mode="alternating-xy"`) to pair
+neighboring blocks along x, then y, and repeat until one root remains:
+
+```python
+plan = TreeLayoutFinder(
+    gates, n=90, lattice_shape=(9, 10), order="alternating-xy",
+).run()
+optimizer = TreeOptimizer(gates, tree=plan, chi=512, run=False)
+
+# The same fixed geometry without a gate stream:
+plan = TreePlan.from_alternating_lattice((9, 10))
+```
+
+The block-grid sizes are:
+
+```text
+9×10 → 5×10 → 5×5 → 3×5 → 3×3 → 2×3 → 2×2 → 1×2 → 1×1
+```
+
+Each merge creates a binary internal node. An unpaired edge block carries
+forward without a unary node; axes already of length one are skipped. All
+90 physical sites remain separate leaves. This mode builds the hierarchy
+itself, not just an ordering followed by balanced bisection. In particular,
+odd edge blocks need not have the same leaf depth as interior blocks.
+
+The hierarchy is 2D-only and requires scalar `max_arity=2`, no `root_qubit`,
+and `top_arity` omitted, `None`, or `2`. Its root is binary, an explicit
+exception to the ordinary finder's default ternary virtual root.
+`structure`, `coarse_grain`, and refinement/search options do not change this
+fixed geometry. Existing finder and `TreeOptimizer` defaults are unchanged.
+
+Default site labels are `x * Ly + y`. Supply `lattice_site=lambda x, y: ...`
+to the finder, or `site=` to `from_alternating_lattice`, to retain an existing
+logical labeling. The mapper must cover `0..n-1` exactly once.
+`TreeLayoutFinder.lattice_order(Lx, Ly, "alternating-xy", site=...)` returns
+only the leaf traversal; rebuilding with `TreePlan.from_order` does **not**
+in general preserve this topology. Pass the plan itself to the optimizer.
+
+### Regular-lattice leaf traversals
+
 `TreeLayoutFinder` also provides the same regular-lattice baseline vocabulary
 as `OneDMap`. Pass `lattice_shape=(Lx, Ly)` or
 `lattice_shape=(Lx, Ly, Lz)` once, then use named `order` presets for exact

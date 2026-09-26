@@ -6,7 +6,9 @@
 The exact mode is:
 
 ```python
-sampler = pepsy.PepsSampler(peps)
+from pepsy.sampling import PepsSampler
+
+sampler = PepsSampler(peps)
 result = sampler.sample(samples=16, seed=0)
 ```
 
@@ -14,17 +16,170 @@ The boundary-MPS mode separates the conditioned ket boundary from the future
 double-layer environment:
 
 ```python
-sampler = pepsy.PepsSampler(
+sampler = PepsSampler(
     peps,
-    sample_chi=32,
-    marginal_chi=64,             # None or 0 disables the future environment
-    boundary_engine="dmrg",      # or "quimb-mps"
+    chi=64,                     # χ: future double-layer environment
+    chi_prime=32,               # χ′: conditioned single-layer ket
+    boundary_engine="dmrg",     # or "quimb-mps"; "auto" picks DMRG here
     ket_compression="quimb",    # or "fit", or None
-    cutoff=1.0e-12,
+    cutoff="auto",              # Resolve from the working tensor dtype
+    cutoff_mode="auto",         # Relative discarded squared weight (rsum2)
 )
 ```
 
-`sample_chi` caps the conditioned single-layer ket boundary. `marginal_chi`
+### Mode selection and compatible names
+
+| Construction | Selected behavior |
+| --- | --- |
+| `PepsSampler(peps)` | Exact full-network conditionals |
+| `PepsSampler(peps, chi=64, chi_prime=32)` | DMRG future boundaries, Quimb ket compression |
+| `PepsSampler(peps, chi_prime=32)` | Conditioned ket compression with identity future caps |
+| `PepsSampler(peps, chi=64, ket_compression=None)` | DMRG future boundaries, uncompressed conditioned ket |
+| `PepsSampler(peps, boundary_engine="quimb-mps", ket_compression=None)` | Identity future caps and uncompressed ket |
+
+The default `boundary_engine="auto"` (also `None`) selects DMRG when either
+positive bond cap is supplied, otherwise exact contraction. A positive `chi`
+alone therefore requires `chi_prime` or explicit `ket_compression=None`.
+Explicit `boundary_engine="exact"` rejects positive bond caps. A zero `chi`
+disables future environments in boundary mode; it does not by itself select
+boundary sampling. `chi_prime` must be positive when supplied.
+
+Existing names remain supported: `marginal_chi` is an alias for `chi`, and
+`sample_chi` is an alias for `chi_prime`. If both spellings are non-None,
+they must agree; conflicting values raise `ValueError`. A `None` value lets
+the other spelling supply the value. Read-only `sampler.chi` and
+`sampler.chi_prime` expose the resolved caps. Construct a new sampler to
+change contraction options; `refresh()` rebuilds it after source tensors change.
+
+### Automatic truncation policy
+
+`cutoff="auto"` and `cutoff_mode="auto"` are the defaults, following ordinary
+`MpsOptimizer` state compression:
+
+| Working tensor dtype | Resolved cutoff | Resolved mode |
+| --- | --- | --- |
+| `complex64` / `float32` | `1e-6` | `rsum2` |
+| `complex128` / `float64` | `1e-12` | `rsum2` |
+
+The shared policy uses `1e-3` for 16-bit data, although dense linear algebra
+support for those dtypes depends on the selected backend. Resolution happens
+**after `to_backend` conversion** and repeats on `refresh()`. Inspect
+`sampler.cutoff` and `sampler.cutoff_mode` for resolved values.
+
+`rsum2` thresholds relative discarded squared singular-value weight. It is a
+local truncation rule, not a bound on the total sampling or observable error.
+`cutoff_mode=None` also selects `rsum2`. Explicit modes `rel`, `abs`, `sum1`,
+`sum2`, `rsum1`, and `rsum2` override the policy. A numeric `cutoff` stays fixed
+across dtype changes; use `cutoff=0.0` to disable cutoff-driven rank reduction.
+The independent χ/χ′ bond caps still apply.
+
+Both options reach Quimb future-environment compression and the conditioned
+ket compressor, including the compressed initial guess used by `"fit"`.
+They are also forwarded to the DMRG future provider. Its current one-site FIT
+updates retain fixed bond dimensions: χ controls that rank and there is no
+singular-value thresholding during those one-site updates. Exact contraction
+and `ket_compression=None` perform no ket truncation.
+
+### Sequential sweep and the two cutoffs
+
+Boundary mode defaults to the simple conditioned-boundary sweep:
+
+1. Cache only future double-layer environments, from the last row toward the
+   first, using `chi` (**χ**).
+2. Combine the current row, its cached future, and the previously sampled
+   single-layer ket boundary.
+3. Form a local `d × d` conditional rho, sample its normalized real diagonal,
+   and fix that physical value on both ket and bra. Continue across the row.
+4. After the whole row is fixed, absorb its **single ket layer** into the
+   conditioned boundary and compress with `chi_prime` (**χ′**).
+5. Continue to the next row. Accumulate the conditional log probabilities and
+   contract the original private ket for the final sampled amplitude.
+
+| Quantity | Dimension / role |
+| --- | --- |
+| Current physical rho | `d × d` (`2 × 2` for qubits) |
+| Conditioned ket boundary | One outgoing PEPS bond per site; MPS bond capped by χ′ when compression is enabled |
+| Future double-layer boundary | Ket and bra outgoing bonds; compressed environment bonds controlled by χ |
+| Joint row probability | Product of site conditionals given the preceding sampled rows |
+
+Sampling sites successively implements a joint row draw without materializing
+its exponentially large density matrix. The current indexing fixes `y` and
+advances `x` within a row, then advances `y`. Describing these slices as columns
+is the same construction after exchanging axes. Future environments are cached
+in the direction opposite to sampling. They are reused unchanged across samples;
+the conditioned ket boundary is different for different sampled prefixes.
+
+`ket_compression=None` leaves the conditioned boundary uncompressed, so χ′
+does not cap its represented bonds. `chi=0` or `None` uses identity
+future caps, an explicitly different approximate proposal. Quimb can retain the
+outermost future row as exact factored PEPS tensors before its first compression;
+χ caps the compressed bonds, not every original bond in that factored row.
+The DMRG provider builds only the requested future boundary MPSs lazily.
+
+The final row needs no further boundary update. Temporary boundary normalization
+does not change the original PEPS or its returned amplitudes. This sampler uses
+Pepsy's standard `X*`, `Y*`, and `I*` lattice tags; incompatible custom tag schemes
+are rejected by the norm-network builder. Boundary mode rejects periodic edges;
+the full-contraction exact mode can handle them.
+
+### Array backend and conversion
+
+By default, the sampler infers the backend, dtype, and device from the PEPS
+arrays. NumPy, Torch (CPU or CUDA), and JAX arrays use their own contractions,
+identity caps, local density matrices, conditional probabilities, and random
+draws. The public `sampler.backend` reports the inferred array backend;
+`boundary_engine` independently selects the contraction algorithm.
+
+Supply a callable `to_backend` to convert a private copy explicitly:
+
+```python
+import torch
+from pepsy.backends import backend_torch
+from pepsy.sampling import PepsSampler
+
+sampler = PepsSampler(torch_peps)  # infer the existing dtype and device
+
+sampler = PepsSampler(
+    numpy_peps,
+    to_backend=backend_torch(device="cuda:0", dtype=torch.complex128),
+    chi_prime=32,
+    chi=64,
+    boundary_engine="dmrg",
+)
+
+# For a NumPy PEPS, a JAX converter can be supplied similarly:
+# sampler = PepsSampler(numpy_peps, to_backend=jax.numpy.asarray)
+```
+
+The source PEPS is preserved, including when a converter modifies its argument
+in place. `refresh()` repeats an explicit conversion, or re-infers the source
+backend if no override was supplied. Mixed backends/devices and incompatible
+dtypes require a converter that makes the tensors consistent. The sampler
+currently requires dense floating or complex tensors. Integer arrays require
+an explicit converter to a floating or complex dtype.
+
+Seeded draws are reproducible for a given backend, device, and sampling method.
+Sequences can differ between NumPy, Torch, JAX, serial sampling, and grouped
+sampling. Grouped sampling uses native uniform draws and inverse cumulative
+probabilities; its seeded sequences can differ from earlier releases that
+called categorical sampling separately for each prefix group. Local-rho
+validation uses the real dtype's precision and clips only roundoff-scale
+negative diagonals; larger negative values and invalid traces raise an error.
+Hermiticity diagnostics scale the matrix before taking norms, avoiding
+complex64 overflow while preserving `norm(rho - rho.H) / max(norm(rho), 1)`.
+
+Quimb projection and prefix grouping still use Python/NumPy indices. In
+`sample_batch`, all active prefix groups at a site share one native probability
+validation and draw operation, with one validation-scalar read and one integer
+choice-array transfer per site. Serial sampling validates each conditional
+separately. The existing result lists contain host scalars. `rho_diagnostics`
+converts its cached scalar diagnostics when accessed. This is an eager sampler;
+it does not provide a fully compiled JAX or Torch sampling loop, and contractions
+and boundary compression still run separately for distinct prefix groups.
+
+### Boundary and result semantics
+
+`chi_prime` caps the conditioned single-layer ket boundary. `chi`
 caps the optional future double-layer environment. The `dmrg` engine prepares
 future boundaries with Pepsy `BdyMPS`/`CompBdy`; `quimb-mps` uses Quimb's MPS
 environment cache. Ket compression is performed separately with Quimb MPS
@@ -32,32 +187,106 @@ compression or Pepsy `FIT`.
 
 `result.configs` contains row-major physical-index configurations, while
 `result.omegas` and `result.ps` contain proposal probabilities and projected
-PEPS amplitudes in mantissa/exponent form. For multiple shots,
+PEPS amplitudes as `(mantissas, exponents)`, representing `m * 10**e`. For multiple shots,
 `sample_batch(...)` shares a local Quimb conditional network until shot
 prefixes diverge:
 
 ```python
 batch = sampler.sample_batch(samples=256, seed=0)
+log_q = batch.log_probabilities        # natural log of proposal q(S)
+log_abs_psi = batch.log_abs_amplitudes # natural log of |Psi(S)|
+log_w = batch.log_weights             # 2 * log_abs_psi - log_q
 print(sampler.batch_stats)
 print(sampler.rho_diagnostics)
 ```
 
+These log properties return one-dimensional NumPy arrays, computed directly
+from the scaled pairs without forming `10**e`. They copy backend scalars to
+the host when accessed and preserve the existing `configs`, `omegas`, and
+`ps` fields. Weights are unnormalized and use the original PEPS amplitudes.
+A zero amplitude has `log_abs_amplitudes = -inf` and, for positive proposal
+probability, `log_weights = -inf`. Sampling produces positive-probability
+configurations; manually constructed zero-probability results retain ordinary
+logarithmic division semantics (infinity or undefined `0/0`).
+
 This uses prefix groups rather than adding a shared batch index to PEPS
 tensors, because a repeated Quimb index would be contracted as an ordinary
-bond. The batch still contracts final amplitudes from the original PEPS for
-importance weights.
+bond. The batch contracts each distinct final configuration's amplitude once from
+the private PEPS for importance weights.
 
-For compact boundary centers, each row also uses a Quimb transfer cache: its
+An optional optimization for compact boundary centers uses a Quimb transfer cache: its
 right suffixes are contracted once, while the conditioned left prefix is
-updated immediately after each sampled site. `sampler.row_cache_stats` exposes
-the number of cached row suffixes and prefix updates. Larger centers with a
-collapsed future MPS, or highly fragmented large batches, adaptively retain
-the reference local-center contractions because dense column transfers would
-be slower and use more memory.
+updated immediately after each sampled site. Traced transfers reuse the local
+column contraction. Row bonds and identity future caps are reused until
+`refresh()`.
 
-For the 4x4 D=4 observable comparison used during development, run
-`examples/peps_sampler_d4_observables.py`; it reports exact density-matrix
-values, raw proposal estimates, and importance-weighted estimates.
+`row_cache_max_bytes` defaults to **0**, selecting the simple sweep above.
+Supply a positive budget, for example 64 MiB (`64 * 2**20`), to opt into dense
+transfers. Before allocation, the sampler estimates row storage and workspace from the actual
+PEPS/future bonds, conditioned-boundary bond bounds, dtype, and maximum number
+of live prefix groups. Estimates above the budget use the existing local-center
+contractions. Setting the budget to zero disables dense row caches. Larger
+centers with collapsed future MPSs and highly fragmented batches can also use
+the reference route even when they fit the budget. This option bounds the
+estimated cache allocation; it is **not** a cap on total process/device memory,
+contraction-planner workspace, or all retained boundary states.
+
+```python
+sampler = PepsSampler(
+    peps, chi_prime=32, chi=64, boundary_engine="dmrg",
+    row_cache_max_bytes=64 * 2**20,
+)
+batch = sampler.sample_batch(samples=64, seed=0)
+print(sampler.row_cache_stats)
+print(sampler.batch_stats["conditional_batches"])
+```
+
+`row_cache_stats` reports the selected `mode`, suffix builds, prefix updates,
+`estimated_cache_bytes` (`None` when caching is disabled), `cache_budget_bytes`, and `cache_decision`
+(`within-budget`, `memory-budget`, `disabled`, `prefix-count`, or `large-future`).
+`batch_stats["conditional_batches"]` counts the site-level validation/draw
+batches. Amplitudes still come from the original private PEPS, and reported
+proposal probabilities still follow the selected boundary approximation.
+
+### Likelihoods, zero branches, and truncation limits
+
+The sampler accumulates **sums of log conditional probabilities**. Internally
+it uses base-10 logs for the result's mantissa/exponent format. The public
+`log_probability(config)` returns the **natural log**:
+
+```python
+log_q = sampler.log_probability(config)
+q = sampler.probability(config)  # exp(log_q), if representable as a float
+```
+
+Exact and default boundary likelihood queries use exponent-stripped local
+contractions. This protects rare-configuration likelihoods against intermediate
+underflow; the common rho scale cancels from each normalized conditional.
+`rho_diagnostics` describes the rho actually evaluated, so traces from these
+queries are scaled. Sampling diagnostics retain their usual contraction scale.
+An opt-in dense transfer cache still materializes ordinary tensors and does not
+provide the same scaling protection. Log bookkeeping also does not guarantee
+that arbitrary ill-scaled input contractions or final raw amplitudes cannot
+overflow/underflow.
+
+A genuine zero branch returns `log_q = -inf` and `q = 0`. A finite log likelihood
+can also produce `q = 0` when the final value underflows a Python float. All
+configuration entries are validated before an early zero-branch return.
+Non-finite traces and materially negative diagonals remain errors. Missing
+requested future boundaries raise an error instead of silently using identities.
+
+With boundary truncation, `q(S)` can differ from the PEPS Born probability.
+Importance weights `abs(Psi(S))**2 / q(S)` require nonzero proposal probability
+wherever the PEPS amplitude is nonzero. A small χ′ can remove this support:
+a tested two-row state with two equally likely target configurations gives
+proposal probabilities `(1, 0)` at χ′ = 1 and `(1/2, 1/2)` at χ′ = 2.
+Reweighting cannot restore a configuration that is never sampled. Check cutoff
+convergence and support on tractable reference cases; no probability floor or
+uniform mixture is inserted implicitly.
+
+Run the small [sampling example](../../../examples/peps_sampling.py) with
+`python examples/peps_sampling.py`. It demonstrates χ/χ′, batch log results,
+and a comparison to exact proposal probabilities on a 2×3 PEPS.
 
 ## MPS sampler quick API
 

@@ -2971,10 +2971,10 @@ def test_qmera_draw_schematic_builds_quimb_drawing():
 
 
 def test_qmera_clean_schematic_shows_periodic_gate_rounds_and_retained_wires():
-    """A seam gate should be an arc, not a patch across unrelated sites."""
+    """The circuit follows gate order and routes a seam around other wires."""
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg", force=True)
-    from matplotlib.patches import Circle
+    from matplotlib.patches import Circle, PathPatch
     from matplotlib.colors import to_rgba
     from quimb import schematic
 
@@ -2983,28 +2983,41 @@ def test_qmera_clean_schematic_shows_periodic_gate_rounds_and_retained_wires():
     layer = schedule.layers[0]
     drawing = schedule.draw_schematic(rg_step=0, scale_figsize=False)
     labels = {item.get_text() for item in drawing.ax.texts}
-    assert {"D[r0]", "W[r0]", "W[r1]", "fine"} <= labels
+    assert {"L0 · W", "L0 · D", "fine output"} <= labels
     by_label = {item.get_text(): item.get_position() for item in drawing.ax.texts}
-    assert by_label["W[r0]"][1] > by_label["W[r1]"][1] > by_label["D[r0]"][1]
+    assert by_label["L0 · W"][0] < by_label["L0 · D"][0]
 
-    # The periodic (0, 1) disentangler is drawn above the stage row.
-    assert any(
-        tuple(line.get_xdata()) == (0.0, 6.0)
-        and len(set(line.get_ydata())) == 1
-        for line in drawing.ax.lines
+    gate_artists = [
+        artist for artist in (*drawing.ax.lines, *drawing.ax.patches)
+        if (artist.get_gid() or "").startswith("qmera-gate:")
+    ]
+    assert {artist.get_gid() for artist in gate_artists} == {
+        f"qmera-gate:{placement.gate_id}" for placement in layer.placements
+    }
+    seam = next(
+        placement for placement in layer.disentanglers
+        if set(placement.where) == {0, 1}
     )
+    seam_artist = next(
+        artist for artist in gate_artists
+        if artist.get_gid() == f"qmera-gate:{seam.gate_id}"
+    )
+    assert isinstance(seam_artist, PathPatch)
+    vertices = seam_artist.get_path().vertices
+    assert max(point[0] for point in vertices) > vertices[0][0]
+
     circles = [patch for patch in drawing.ax.patches if isinstance(patch, Circle)]
-    coarse_y = max(circle.center[1] for circle in circles)
-    coarse = [circle for circle in circles if circle.center[1] == coarse_y]
-    x_by_site = {site: pos for pos, site in enumerate(layer.input_sites)}
-    assert {circle.center[0] for circle in coarse} == set(x_by_site.values())
+    inputs = [circle for circle in circles if circle.center[0] == 0.10]
+    assert len(inputs) == len(layer.input_sites)
+    y_by_site = {site: -0.86 * pos for pos, site in enumerate(layer.input_sites)}
     green = to_rgba(schematic.get_color("green"))
-    assert {circle.center[0] for circle in coarse if circle.get_facecolor() == green} == {
-        x_by_site[site] for site in layer.output_sites
+    assert {circle.center[1] for circle in inputs if circle.get_facecolor() == green} == {
+        y_by_site[site] for site in layer.output_sites
     }
     all_steps = schedule.draw_schematic(scale_figsize=False)
-    step_labels = {item.get_text(): item.get_position()[1] for item in all_steps.ax.texts}
-    assert step_labels["L1 coarse"] > step_labels["L0 coarse"]
+    step_labels = {item.get_text(): item.get_position()[0] for item in all_steps.ax.texts}
+    assert step_labels["L1 · W"] < step_labels["L0 · W"]
+    assert sum(item.get_text() == "input" for item in all_steps.ax.texts) == 1
 
 
 def test_qmera_clean_2d_schematic_marks_odd_grid_retained_sites():

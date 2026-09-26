@@ -288,7 +288,7 @@ _EXPECTED_IN_ALL = [
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "backend_infer", "to_float", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "MpoChannelEvent", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
-    "PepsBpSampler", "MpsSampler", "MpsStabSampler", "StabilizerMpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp", "tn_fidelity", "tn_norm",
+    "PepsSampler", "PepsBpSampler", "MpsSampler", "MpsStabSampler", "StabilizerMpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "MpsStabOptimizer", "StabilizerMpsSimulator", "STNState",
     "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
@@ -369,7 +369,7 @@ _CALLABLE_EXPORTS = [
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
-    "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "NoisyResult", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_mpi_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
+    "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsSampler", "PepsBpSampler", "CoherentCrosstalkModel", "NoisyResult", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_mpi_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeMPO", "TreePEPO", "TreeSubPEPO", "TreeOptimizer", "build_tree_operator",
@@ -497,3 +497,10 @@ def test_optional_linalg_registrations_resolve():
         assert callable(pepsy.tensors.reg_native_svd_jax)
         assert callable(pepsy.tensors.core.register_jax_linalg)
         assert callable(pepsy.tensors.register_jax_linalg)
+
+
+def test_direct_peps_sampler_owning_namespace_exports():
+    from pepsy.sampling import PEPSSampleResult, PepsSampler
+
+    assert PepsSampler is pepsy.PepsSampler
+    assert PEPSSampleResult is pepsy.PEPSSampleResult

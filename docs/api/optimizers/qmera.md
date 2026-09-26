@@ -327,18 +327,22 @@ interface even when all retained layers are drawn in preparation order:
 drawing = schedule.draw_schematic(
     rg_step=0,
     style="clean",            # or "register" for the older wiring view
-    figsize=(10, 8),
+    figsize=(13, 6),
     label_sites=True,
     label_blocks=True,
     scale_figsize=False,
 )
 ```
 
-In 1D, green brackets show covering isometry blocks; colored patches show
-actual pair-gate positions in each round. A long periodic seam gate is drawn
-as an arc, so it does not appear to cover the wires between its endpoints.
-Green coarse wires are retained from the preceding scale; gray wires enter in
-the product state. In 2D, colored windows show covering blocks, and dark links show the exact
+In 1D, the clean view is one continuous circuit: time runs left to right,
+with each RG scale's W and D stages shown in execution order. Dashed green
+windows show covering isometry blocks, while colored links and labeled gate
+markers show the actual pair supports. Gates share a round column only when
+their drawn spans do not overlap. A long periodic seam gate curves around
+intervening wires. Green input markers identify the retained core; gray
+markers identify product-state wires. Explicit-mode wires show `site:mode`
+labels. In 2D, colored windows show covering
+blocks, and dark links show the exact
 scheduled pair gates in each round. Long pairs, including periodic seams,
 curve around intervening sites. The coarse panel groups retained wires by
 parent register (`R0`, `R1`, …); arrows point in the schedule's gate direction.
