@@ -1362,8 +1362,8 @@ def test_build_pepo_from_gates_forwards_smart_max_bond_api(monkeypatch):
     assert kwargs["ind_id"] == "k{},{}"
 
 
-def test_build_pepo_from_gates_preserves_k_input_and_b_output_families():
-    """PEPO builders should leave upper/input k and lower/output b legs visible."""
+def test_build_pepo_from_gates_preserves_k_output_and_b_input_families():
+    """PEPO builders leave upper/output k and lower/input b legs visible."""
     x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
     pepo = build_pepo_from_gates(x_gate, where=((1, 1),), max_bond=8)
 

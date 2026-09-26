@@ -1,5 +1,16 @@
 # Tensor constructors
 
+## Lazy operator alignment
+
+`tns_align(state, operator)` joins labelled tensor networks without flattening
+them or mutating either input. State physical indices use `k...`; operator
+outputs use `k...` and inputs use `b...`. The result retains the state's
+physical output names. Both networks must carry their lattice/site tags.
+
+`transpose=True` instead connects the state to the operator's `k...` legs,
+applying the transposed operator. Use it only for an intentionally transposed
+representation; it does not repair ordering errors in older gate streams.
+
 ## Explicit MPS-to-TTN conversion
 
 `pepsy.tensors.mps_to_ttn` (also `pepsy.mps_to_ttn`) converts an existing

@@ -286,12 +286,12 @@ def id_to_mpo(L, phys_dim=2, dtype="complex128", cyclic=False, chi=1, rand_stren
     return mpo
 
 
-def tns_align(p, pepo):
+def tns_align(p, pepo, *, transpose=False):
     r"""Apply a PEPO operator to a PEPS ket: :math:`\hat{O}|\psi\rangle`.
 
-    The PEPO ``k``-indices contract with the PEPS ``k``-indices on join.
-    The PEPO ``b``-indices (output legs) are renamed to ``k``-indices so
-    the result has the same physical index convention as a standard PEPS.
+    The PEPO lower/input ``b`` indices contract with the PEPS ``k`` indices.
+    Its upper/output ``k`` indices become the result's physical indices,
+    matching Quimb's operator convention. Neither input is modified.
 
     Parameters
     ----------
@@ -302,6 +302,9 @@ def tns_align(p, pepo):
         PEPO operator :math:`\hat{O}`.  Outer indices must follow the
         ``k<int>[,<int>...]`` and ``b<int>[,<int>...]`` convention.
         This matches :func:`pepsy.operators.gates.build_pepo_from_gates` output.
+    transpose : bool, optional
+        Apply the transpose instead, contracting operator ``k`` inputs and
+        exposing ``b`` outputs. Use explicitly for legacy transposed operators.
 
     Returns
     -------
@@ -313,29 +316,19 @@ def tns_align(p, pepo):
     validate_tensor_network_tags(p)
     validate_tensor_network_tags(pepo)
 
-    tn = p & pepo
-    # Only randomize the physical k-indices (shared between p and pepo).
-    # Virtual bond indices must NOT be renamed — they must stay stable so
-    # the Y-cut outer indices of the double-layer TN match the stored
-    # boundary MPS across repeated calls to _prepare_current_double_layers.
-    # Use non-mutating reindex to avoid modifying the original p/pepo tensors
-    # (quimb's & shares tensor objects, so reindex_ would mutate the originals).
-    contracted_k = {
-        idx: qtn.rand_uuid()
-        for idx in tn.inner_inds()
-        if isinstance(idx, str) and idx.startswith("k")
-    }
-    if contracted_k:
-        tn.reindex_(contracted_k)
-    # Rename PEPO output b-indices -> k-indices (physical convention)
-    b_to_k = {
-        idx: f"k{idx[1:]}"
-        for idx in tn.outer_inds()
-        if idx.startswith("b")
-    }
-    if b_to_k:
-        tn.reindex_(b_to_k)
-    return tn
+    # Keep generic labelled TN inputs supported, and change only physical
+    # indices. All remapping happens on copies before joining the networks.
+    state_map = {}
+    operator_map = {}
+    input_prefix, output_prefix = ("k", "b") if transpose else ("b", "k")
+    for ind in p.outer_inds():
+        if isinstance(ind, str) and ind.startswith("k"):
+            suffix = ind[1:]
+            inner = qtn.rand_uuid()
+            state_map[ind] = inner
+            operator_map[f"{input_prefix}{suffix}"] = inner
+            operator_map[f"{output_prefix}{suffix}"] = ind
+    return p.reindex(state_map) & pepo.reindex(operator_map)
 
 
 

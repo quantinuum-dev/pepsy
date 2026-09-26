@@ -14,6 +14,14 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Build dense MPO/PEPO gate streams in Quimb's operator convention: upper
+  `k...` indices are outputs, lower `b...` indices are inputs, and later gates
+  multiply on the left. Remove the legacy per-gate transpose. `tns_align`
+  now applies this convention by default, with `transpose=True` available
+  for explicitly transposed operators. Rebuild old general gate streams;
+  transposing their final operator alone may not fix their order.
+- Apply lazy sub-MPOs when `gate_with_submpo(..., inplace_mpo=False)`;
+  this flag controls the applied operator's defensive copy, not application.
 - Correct the bra/ket orientation in native MPS sampling and probability
   evaluation with complex right environments. NumPy, Torch, and CuPy use
   the corrected Born-weight contraction; complex-state sample distributions

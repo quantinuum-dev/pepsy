@@ -1,5 +1,29 @@
 # `pepsy.operators.gates`
 
+## Operator convention
+
+Dense MPO/PEPO builders consume gates in application order: a stream
+`[A, B]` represents `B @ A`. Gates can be matrices or tensors with all output
+axes followed by all input axes. Operators use Quimb's native convention:
+upper `k...` indices are outputs and lower `b...` indices are inputs.
+This agrees with Quimb's `to_dense`, operator application, and lazy composition.
+
+Use `pepsy.tensors.tns_align(state, operator)` for lazy application in this
+convention. Its explicit `transpose=True` option applies the operator's
+transpose, for callers that knowingly hold a transposed representation.
+Earlier dense builders transposed each gate individually. Rebuild saved
+operators from their original streams: a final transpose alone cannot in
+general repair both their orientation and ordering.
+
+Raw lower-leg gates and lazy lower-leg operators have different meanings in
+Quimb. A raw gate `G` on operator `X` produces `X @ G.T`; request
+`transpose=True` to obtain `X @ G`. A lazy lower-leg sub-MPO `A` produces
+`X @ A` directly. `gate_with_submpo(..., inplace_mpo=False)` defensively copies
+the applied MPO; it still applies it. The separate `inplace` flag controls
+whether the target network is mutated.
+
+## Native fermionic gates
+
 The gate-to-operator builders accept native Symmray fermionic gates directly;
 they do not convert them through dense arrays. Charge-neutral gates work by
 default, such as `Fermion.hopping_gate(...)`:

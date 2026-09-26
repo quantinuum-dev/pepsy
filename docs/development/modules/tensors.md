@@ -119,7 +119,8 @@ PEPS-like networks should carry lattice and site tags:
 - `I...` for site identity tags such as `I0,1`.
 
 Physical outer indices conventionally use `k...` for ket legs and `b...` for
-bra or operator-output legs. The boundary and optimizer packages depend on
+bra legs. For operators, upper `k...` legs are outputs and lower `b...` legs
+are inputs. The boundary and optimizer packages depend on
 these conventions for shape inference and layer construction.
 
 ## Symmetric tensors
