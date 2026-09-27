@@ -194,6 +194,7 @@ def _normalize_layout_order(order):
         "auto": "quality",
         "best": "quality",
         "best_quality": "quality",
+        "alternating_xy": "alternating-xy",
         "row": "row-major",
         "row_major": "row-major",
         "col": "col-major",
@@ -237,7 +238,7 @@ def _normalize_layout_order(order):
         "coarse_hilbert_row_major": "coarse-hilbert-row-major",
     }
     name = aliases.get(name, name)
-    if name == "quality":
+    if name in {"quality", "alternating-xy"}:
         return name
     geometric = {
         "row_major": "row-major",
@@ -268,7 +269,7 @@ def _normalize_layout_order(order):
     if name in geometric:
         return geometric[name]
     raise ValueError(
-        "order must be None, 'quality', a geometric lattice preset "
+        "order must be None, 'quality', 'alternating-xy', a geometric lattice preset "
         "('row-major', 'col-major', 'snake', 'alternate-x', "
         "'alternate-y', 'alternate-z', 'folded-snake', 'hilbert', "
         "or a coarse-* variant), "
@@ -1208,6 +1209,70 @@ class TreePlan:
             map_mode=map_mode,
         )
 
+    @classmethod
+    def from_alternating_lattice(cls, lattice_shape, *, site=None):
+        """Pair neighboring blocks along x, then y, repeatedly to one root.
+
+        ``lattice_shape`` is ``(Lx, Ly)``. All physical sites remain separate
+        leaves, labeled by ``site(x, y)`` (default: ``x * Ly + y``). Each
+        level halves one axis, rounding up; an unpaired edge block carries
+        forward without a unary parent. Axes of length one are skipped.
+        Every internal node, including the root, has exactly two children.
+
+        Unlike a ``coarse-*`` traversal followed by balanced bisection, this
+        constructs the spatial hierarchy itself. It has no tunable grain.
+        """
+        shape = _normalize_lattice_shape(lattice_shape)
+        if shape is None or len(shape) != 2:
+            raise ValueError("alternating-xy requires lattice_shape=(Lx, Ly).")
+        lx, ly = shape
+        labels = _lattice_site_order(lx, ly, "row-major", site=site)
+        children = {node: () for node in range(lx * ly)}
+        qubit_of_leaf = dict(enumerate(labels))
+        grid = {(x, y): x * ly + y for x in range(lx) for y in range(ly)}
+        axis = 0
+        while len(grid) > 1:
+            if shape[axis] == 1:
+                axis = 1 - axis
+                continue
+            groups = {}
+            for coord, node in grid.items():
+                coarse_coord = list(coord)
+                coarse_coord[axis] //= 2
+                groups.setdefault(tuple(coarse_coord), []).append(node)
+            grid = {}
+            for coord, group in groups.items():
+                if len(group) == 1:
+                    grid[coord] = group[0]
+                else:
+                    node = len(children)
+                    children[node] = tuple(group)
+                    grid[coord] = node
+            shape = tuple(
+                (size + 1) // 2 if dim == axis else size
+                for dim, size in enumerate(shape)
+            )
+            axis = 1 - axis
+
+        root = grid[(0, 0)]
+        # mpo_order uses leaf-node IDs. Number in preorder so every spatial
+        # subtree is a contiguous interval in that public traversal.
+        numbering = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            numbering[node] = len(numbering)
+            stack.extend(reversed(children[node]))
+        return cls.from_children(
+            {
+                numbering[node]: tuple(numbering[child] for child in group)
+                for node, group in children.items()
+            },
+            {numbering[node]: qubit for node, qubit in qubit_of_leaf.items()},
+            root=numbering[root],
+            map_mode="alternating-xy",
+        )
+
     #: Fixed number of legs on the top tensor of a :meth:`build_layered` tree.
     LAYERED_ROOT_ARITY = 3
 
@@ -1721,13 +1786,15 @@ class TreeLayoutFinder:
         `"alternate-y"`, `"alternate-z"`, `"folded-snake"`, and
         `"hilbert"`, plus their supported `coarse-*` variants) require
         `lattice_shape=` and build an exact balanced tree over that traversal.
+        `"alternating-xy"` instead builds a fixed 2D spatial hierarchy by
+        pairing x neighbors, then y neighbors, repeatedly, with a binary root.
         Omitted keeps the fast deterministic objective selected by `objective`.
         An explicit site permutation builds a fixed tree without refinement.
     map_mode : str, optional
         Alias for a named geometric ``order``. For a tree tensor network use
-        the canonical ``coarse-*`` spelling, for example
-        ``map_mode="coarse-alternate-x"``. It cannot be combined with
-        ``order``.
+        ``"alternating-xy"`` for recursive x/y pairing, or a ``coarse-*``
+        spelling such as ``"coarse-alternate-x"`` for a coarse traversal.
+        It cannot be combined with ``order``.
     lattice_shape : pair or triple of int, optional
         The `(Lx, Ly)` or `(Lx, Ly, Lz)` shape used by named geometric `order`
         presets. The product must equal `n`.
@@ -1741,6 +1808,7 @@ class TreeLayoutFinder:
         `(gx, gy)` is accepted as `(gx, gy, 1)`. The default groups two
         neighboring x sites. Edge blocks are allowed to be smaller. This
         changes only the leaf traversal order; it never merges tensors.
+        Ignored by ``"alternating-xy"``, whose pairing is always two-to-one.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -1803,6 +1871,7 @@ class TreeLayoutFinder:
             if order is not None:
                 raise TypeError("map_mode and order cannot both be supplied")
             order = map_mode
+        order = _normalize_layout_order(order)
         if (
             _looks_like_tree_tensor_network(gates)
             or _looks_like_tree_tensor_network(supports)
@@ -1896,6 +1965,7 @@ class TreeLayoutFinder:
         self.max_arity, self.arity_candidates = _normalize_arity_candidates(
             max_arity
         )
+        self._top_arity_explicit = top_arity is not _DEFAULT_TOP_ARITY
         if top_arity is _DEFAULT_TOP_ARITY:
             top_arity = (
                 3
@@ -1903,6 +1973,7 @@ class TreeLayoutFinder:
                     root_qubit is None
                     and self.max_arity == 2
                     and len(self.leaf_qubits) >= 3
+                    and order != "alternating-xy"
                 )
                 else None
             )
@@ -1934,10 +2005,12 @@ class TreeLayoutFinder:
         self.objective = _normalize_layout_objective(objective)
         self.hybrid_weights = _normalize_hybrid_weights(hybrid_weights)
         self.weight_mode = _normalize_weight_mode(weight_mode)
-        self.order = _normalize_layout_order(order)
+        self.order = order
         self.map_mode = (
             self.order
-            if isinstance(self.order, str) and self.order.startswith("coarse-")
+            if isinstance(self.order, str) and (
+                self.order.startswith("coarse-") or self.order == "alternating-xy"
+            )
             else None
         )
         if self.order == "quality":
@@ -2047,6 +2120,9 @@ class TreeLayoutFinder:
             ``"col-major"``, ``"snake"``, ``"snake-row-major"``,
             ``"alternate-x"``, ``"alternate-y"``, and ``"alternate-z"``.
             The corresponding supported `coarse-*` modes are also available.
+            ``"alternating-xy"`` returns the 2D alternating hierarchy's leaf
+            traversal only; use :meth:`TreePlan.from_alternating_lattice` or
+            the finder to preserve its topology, especially for odd sizes.
         grain : int or pair/triple of int, optional
             Fine sites per coarse block. Used only by `coarse-*` modes;
             defaults to `(2, 1)` in 2D and `(2, 1, 1)` in 3D.
@@ -2085,6 +2161,8 @@ class TreeLayoutFinder:
         shape = _normalize_lattice_shape(
             (Lx, Ly) if Lz is None else (Lx, Ly, Lz)
         )
+        if normalized == "alternating-xy":
+            return TreePlan.from_alternating_lattice(shape, site=site).mpo_order()
         return _lattice_site_order(
             shape[0], shape[1], normalized,
             Lz=shape[2] if len(shape) == 3 else None,
@@ -3618,11 +3696,26 @@ class TreeLayoutFinder:
         An explicit site permutation can also be passed as ``order``. This
         returns the corresponding fixed tree immediately, without layout
         refinement or offline search.
+
+        ``order="alternating-xy"`` instead constructs fixed spatial x/y
+        pairing levels on a 2D lattice. It requires scalar ``max_arity=2``
+        and no physical root qubit, and uses a binary root. ``coarse_grain``
+        and the search/refinement controls do not affect this hierarchy.
         """
         if order is _DEFAULT_ORDER:
             order = self.order
         else:
             order = _normalize_layout_order(order)
+        if order == "alternating-xy":
+            if self.root_qubit is not None:
+                raise ValueError("alternating-xy does not support root_qubit.")
+            if self.arity_candidates is not None or self.max_arity != 2:
+                raise ValueError("alternating-xy requires scalar max_arity=2.")
+            if self._top_arity_explicit and self.top_arity not in (None, 2):
+                raise ValueError("alternating-xy requires top_arity=2 or None.")
+            return TreePlan.from_alternating_lattice(
+                self.lattice_shape, site=self.lattice_site
+            )
         geometric_order = isinstance(order, str) and order != "quality"
         map_mode = order if isinstance(order, str) and order.startswith("coarse-") else None
         if geometric_order:
@@ -4858,13 +4951,15 @@ class TreeLayoutFinder:
             "n_interacting_pairs": n_pairs,
             "objective": self.objective,
             "order": self.order,
-            "map_mode": (
+            "map_mode": plan.map_mode or (
                 self.order
                 if isinstance(self.order, str) and self.order.startswith("coarse-")
                 else None
             ),
             "lattice_shape": self.lattice_shape,
-            "coarse_grain": self.coarse_grain,
+            "coarse_grain": (
+                None if plan.map_mode == "alternating-xy" else self.coarse_grain
+            ),
             "weight_mode": self.weight_mode,
             "time_decay": self.time_decay,
             "time_window": self.time_window,

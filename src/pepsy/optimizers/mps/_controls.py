@@ -519,7 +519,7 @@ def _scaled_norm_value(norm, exponent=0.0):
 
 def _control_state_norm(self, *, include_exponent=True):
     """Read the represented control-state norm from its tracked center."""
-    if self.mode == "exact":
+    if self.mode in {"exact", "exact-batch"}:
         raw_state = self.p.copy()
         raw_state.exponent = 0.0
         norm = self._real_float(ar.do("abs", raw_state.norm()))

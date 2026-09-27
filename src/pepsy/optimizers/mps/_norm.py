@@ -35,7 +35,7 @@ def normalize(self, eps=1e-15, insert=None):
         ``self.p.norm()`` continues to report the represented norm while
         the raw data norm becomes one.
     """
-    track_canonical_center = self.mode != "exact"
+    track_canonical_center = self.mode not in {"exact", "exact-batch"}
     if track_canonical_center:
         previous_span = self._current_orthog(self.p)
         if insert is None:

@@ -26,6 +26,9 @@ class QMeraContractionPathCache:
 
     optimizer_options: Mapping[str, Any] = field(default_factory=dict)
     _optimizers: dict[Any, Any] = field(default_factory=dict, init=False, repr=False)
+    _paths: dict[Any, tuple[Any, tuple[tuple[int, int], ...]]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def optimizer_for(self, key=None):
         """Return the reusable optimizer associated with ``key``."""
@@ -42,8 +45,26 @@ class QMeraContractionPathCache:
         """Number of topology-specific reusable optimizers created so far."""
         return len(self._optimizers)
 
+    @property
+    def num_primed_paths(self):
+        """Number of explicit unsliced paths prepared for later compilation."""
+        return len(self._paths)
+
+    def prime_path(self, key, path, *, optimize):
+        """Store an unsliced path for a canonical cone topology and optimizer."""
+        self._paths[key] = (optimize, tuple(tuple(pair) for pair in path))
+
     def resolve(self, optimize, *, key=None):
-        """Resolve an ``optimize`` setting, reusing paths for auto settings."""
+        """Resolve an ``optimize`` setting, reusing prepared paths when possible."""
+        cached = self._paths.get(key)
+        if cached is not None:
+            original, path = cached
+            if original is optimize or (
+                isinstance(original, str)
+                and isinstance(optimize, str)
+                and original == optimize
+            ):
+                return path
         if optimize is None or str(optimize).lower() in {"auto", "auto-hq"}:
             return self.optimizer_for(key)
         return optimize

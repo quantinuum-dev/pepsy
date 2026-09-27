@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 import autoray as ar
 import numpy as np
@@ -68,6 +69,10 @@ class PEPSSampleResult:
         Pair ``(mantissas, exponents)`` for proposal probabilities.
     ps
         Pair ``(mantissas, exponents)`` for sampled PEPS amplitudes.
+    log_probabilities, log_abs_amplitudes, log_weights
+        Natural-log NumPy arrays computed from the scaled pairs without
+        materializing their powers of ten. Access copies any backend scalars
+        to the host. ``log_weights`` represents ``log(|Psi|**2 / q)``.
     """
 
     configs: list[list[int]]
@@ -77,6 +82,35 @@ class PEPSSampleResult:
     def __len__(self):
         """Return the number of sampled configurations."""
         return len(self.configs)
+
+    @staticmethod
+    def _scaled_logs(pair, *, absolute=False):
+        mantissas, exponents = pair
+        values = np.asarray([
+            _backend_array_to_numpy(value).item() for value in mantissas
+        ])
+        powers = np.asarray([
+            _backend_array_to_numpy(value).item() for value in exponents
+        ], dtype=float)
+        if absolute:
+            values = np.abs(values)
+        with np.errstate(divide="ignore"):
+            return np.log(values) + powers * math.log(10.0)
+
+    @property
+    def log_probabilities(self):
+        """Natural logs of the sampled proposal probabilities, as a NumPy array."""
+        return self._scaled_logs(self.omegas)
+
+    @property
+    def log_abs_amplitudes(self):
+        """Natural logs of the absolute PEPS amplitudes, as a NumPy array."""
+        return self._scaled_logs(self.ps, absolute=True)
+
+    @property
+    def log_weights(self):
+        """Natural logs of unnormalized importance weights ``|Psi|**2 / q``."""
+        return 2.0 * self.log_abs_amplitudes - self.log_probabilities
 
 
 @dataclass

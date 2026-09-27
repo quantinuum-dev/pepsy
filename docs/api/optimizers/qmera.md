@@ -1,8 +1,177 @@
 # `pepsy.optimizers.qmera`
 
-Pepsy's optimizer surface is qMERA-only: parameterized gate families are
-placed by a static RG schedule, and local Hamiltonian terms are evaluated by
-rebuilding only their reverse lightcones.
+Pepsy's qMERA API places parameterized gate families on a static RG
+schedule. It evaluates local Hamiltonian terms through their reverse
+lightcones, without building the full state for each energy call.
+
+## 1D spin qMERA
+
+`QMeraBuilder(system_size=N)` uses `N` spatial sites and the retained-register
+1D circuit. The older `shape=N` spelling remains accepted; multidimensional
+geometries use `shape=(Lx, Ly)` or `geometry=`. Each isometry block covers
+adjacent child registers; a boundary disentangler connects the
+edges of neighboring blocks. With the default block length 2, an odd final
+group has three children, so no one-site block is left behind. At each scale,
+`bond_qubits` wires are retained for the next coarser register (or all wires
+when the block is smaller). The default `retention="right"` selects the
+rightmost wires in block order. `"left"`, `"balanced"`, and `"explicit"`
+are also available; explicit retention uses a mapping from `(scale, block)`
+to an ordered tuple of child wire indices. The schedule records those choices
+in `layer.retained_registers` and executes gates from coarse to fine.
+
+```python
+from pepsy.optimizers.qmera import QMeraBuilder
+
+N = 7
+builder = QMeraBuilder(
+    system_size=N,
+    boundary="periodic",
+    isometry={"block_size": 2, "circuit_depth": 1},
+    disentangler={"block_size": 2, "circuit_depth": 1},
+    bond_qubits=2,
+    retention="right",
+    spin_symmetry="z2",
+    initial_state="zero",
+)
+schedule = builder.build_schedule()
+assert schedule.layers[0].isometry_blocks[-1] == (5, 6, 0)
+assert schedule.layers[0].retained_registers[-1] == (6, 0)
+```
+
+### Pair circuit structure and depth
+
+`isometry=` and `disentangler=` each accept `structure="brickwall"` (the
+default) or `structure="ladder"` for unmoded spin 1D. The structure orders
+**pair placements within each block**; `pair_ansatz=` determines the
+rotations applied at each placement.
+
+For ordered block wires `(0, 1, 2)`, one `brickwall` sweep applies pairs
+`(0,1) → (1,2)`. One `ladder` sweep applies
+`(0,1) → (1,2) → (2,0)`. On a longer block, ladder walks all adjacent
+pairs and then closes from the last wire to the first. A two-wire ladder uses
+its one pair once. This closure is **inside the block even when the whole
+chain has open boundaries**. `circuit_depth=2` repeats the entire chosen
+sweep twice, with separate parameters per placement by default; it does not
+add an RG scale. Isometry and disentangler stages may choose their own
+structure and depth.
+
+```python
+builder = QMeraBuilder(
+    system_size=3,
+    isometry={"structure": "ladder", "circuit_depth": 2},
+    disentangler={"circuit_depth": 0},
+)
+schedule = builder.build_schedule()
+assert [gate.where for gate in schedule.placements] == [
+    (0, 1), (1, 2), (2, 0), (0, 1), (1, 2), (2, 0),
+]
+```
+
+The ml4mb reference uses brickwall pair rounds; ladder is a Pepsy
+extension. Existing 2D and explicit-mode fermion schedules support only
+`brickwall`; they reject `ladder` rather than silently using a different
+gate order.
+
+### Pair ansatz and symmetry
+
+`pair_ansatz=` selects the ordered rotation template used on every scheduled
+pair in the 1D spin circuit. `spin_symmetry=` chooses or checks its global-X
+symmetry class. Both apply only to unmoded spin 1D geometries.
+
+| `spin_symmetry` | Default `pair_ansatz` | Circuit guarantee |
+| --- | --- | --- |
+| `"z2"` (default) | `"z2_zz_yy_rx"` | Every pair gate commutes with global `X⊗X⊗…⊗X` |
+| `"unrestricted"` | `"all_paulis"` | No global-X symmetry guarantee |
+
+The preferred names say which Pauli rotations are present. The older ml4mb
+names remain accepted aliases; they retain their original gate-family and
+metadata names when used explicitly.
+
+| Preferred `pair_ansatz` | Old alias | Logical rotations in time order | Angles per pair |
+| --- | --- | --- | ---: |
+| `"z2_zz_yy_rx"` | `"minimal"` | `RZZ(0,1) → RYY(0,1) → RX(0) → RX(1)` | 4 |
+| `"z2_rx_zz_yy_xx_rx"` | `"extended"` | `RX(0) → RX(1) → RZZ(0,1) → RYY(0,1) → RXX(0,1) → RX(0) → RX(1)` | 7 |
+| `"z2_zz_rx"` | `"ising"` | `RZZ(0,1) → RX(0) → RX(1)` | 3 |
+| `"z2_yz_zy"` | `"real_z2"` | `RYZ(0,1) → RZY(0,1)` | 2 |
+| `"z2_all_paulis"` | `"pauli_z2"` | `RX(0) → RX(1) → RXX → RYY → RYZ → RZY → RZZ` (two-wire gates on `0,1`) | 7 |
+| `"all_paulis"` | `"unrestricted"` | `RX(0), RX(1), RY(0), RY(1), RZ(0), RZ(1)`, then `RXX, RXY, RXZ, RYX, RYY, RYZ, RZX, RZY, RZZ` on `0,1` | 15 |
+
+Wires `0` and `1` mean the first and second wires of each scheduled pair.
+Every listed rotation has its own trainable angle, including both occurrences
+of `RX` on the same wire in the seven-angle family. The first five families
+preserve global-X Z₂; `"all_paulis"` can break it. `"z2_all_paulis"` contains
+all seven nonidentity two-qubit Pauli words commuting with `X⊗X`.
+
+`RYZ` and `RZY` are logical Pauli rotations. ml4mb lowers each to a fixed
+`RX(+π/2)`, a trainable `RZZ`, and a fixed `RX(-π/2)` on the relevant wire.
+Pepsy composes the listed rotations into one differentiable pair tensor per
+placement; its schedule records one pair gate, not each physical rotation.
+Mixed-Pauli rotations in `"all_paulis"` are also composed directly.
+
+```python
+from pepsy.optimizers.qmera import (
+    QMeraBuilder,
+    QMeraPairSpec,
+    available_qmera_pair_ansatzes,
+    get_qmera_pair_ansatz,
+)
+
+names = available_qmera_pair_ansatzes()       # six preferred names
+all_names = available_qmera_pair_ansatzes(include_aliases=True)
+extended = get_qmera_pair_ansatz("z2_rx_zz_yy_xx_rx")
+assert extended.rotation_sequence == (
+    ("RX", (0,)), ("RX", (1,)), ("RZZ", (0, 1)),
+    ("RYY", (0, 1)), ("RXX", (0, 1)), ("RX", (0,)), ("RX", (1,)),
+)
+assert extended.num_params == 7
+
+z2_builder = QMeraBuilder(
+    system_size=8, spin_symmetry="z2", pair_ansatz="z2_rx_zz_yy_xx_rx",
+    initial_state="plus",
+)
+general_builder = QMeraBuilder(
+    system_size=8, spin_symmetry="unrestricted", initial_state="zero"
+)
+assert z2_builder.spin_symmetry == "global-X-Z2"
+assert general_builder.spin_symmetry == "unrestricted"
+
+repeated = get_qmera_pair_ansatz("z2_rx_zz_yy_xx_rx", repetitions=2)
+repeated_builder = QMeraBuilder(system_size=8, pair_ansatz=repeated)
+custom = QMeraPairSpec(
+    ("ZI", "XX", "IZ"), name="my-pair", symmetry="unrestricted"
+)
+custom_builder = QMeraBuilder(system_size=8, pair_ansatz=custom)
+```
+
+`ansatz=` remains an alias for `pair_ansatz=`; supply only one. The older
+`available_qmera_pair_ansatze()` function continues to list the legacy names;
+`available_qmera_pair_ansatzes()` lists the preferred names. Supplying both
+`spin_symmetry` and a pair
+ansatz checks that they agree; Pepsy does not infer symmetry from the
+Hamiltonian. Each occurrence of a Pauli word has an independent trainable
+angle. The `"z2_zz_yy_rx"` template starts its four angles at one shared
+random value, matching ml4mb's initialization policy while keeping them
+separately trainable. Other templates start their angles independently. A
+custom `QMeraPairSpec` defaults to `symmetry="global-X-Z2"` and rejects
+generators that break it; declare `symmetry="unrestricted"` to allow them.
+Explicit `spin_symmetry=` or `pair_ansatz=` controls both isometry and boundary
+pair gates and cannot be combined with conflicting `gate_family` overrides.
+The lower-level gate registry remains available for other spin gate families;
+`builder.spin_symmetry` is `None` when overrides prevent Pepsy from certifying
+a single pair-ansatz contract.
+
+The input is a **separate choice**: `initial_state="zero"` (the default)
+starts from `|0…0⟩`, which is not an eigenstate of global X.
+`initial_state="plus"` starts from `|+…+⟩`, the +1 global-X sector, while
+leaving the gate ansatz unchanged. A Z₂-preserving circuit keeps a definite
+sector only when its input is in one. `initial_hadamards=True` remains an
+alias for the plus input, and a `product_state_factory` can supply another
+input state.
+
+Explicit-mode fermion geometries keep their native Symmray gate and state
+conventions; retained-register spin layouts and initial Hadamards do not
+apply to them. The default 2D layout remains the existing site-retention
+schedule. An opt-in 2D spin hierarchy is described below.
 
 ```python
 import numpy as np
@@ -12,7 +181,7 @@ h2 = np.kron(zz, zz).reshape(2, 2, 2, 2)
 from pepsy.optimizers import QMeraBuilder, build_qmera_contraction_optimizer
 
 builder = QMeraBuilder(
-    shape=8,
+    system_size=8,
     gate_family="rxx",
     isometry_gate_family="rzz",
     seed=2,
@@ -31,21 +200,59 @@ energy = builder.parametric_loss(
 )
 ```
 
-For repeated optimization, compile static qMERA local-cone contractions once and
-reuse them from NumPy, Torch, or JAX-compatible parameter dictionaries:
+For repeated optimization, estimate the forward cost before running and
+reuse its searched paths with a matching backend and optimizer:
 
 ```python
+report = builder.estimate_contraction_cost(
+    schedule=schedule, chunks=chunks,
+    contraction_opt=optimize, normalized=False, element_bytes=16,
+)
+print(report.summary())
 compiled = builder.compile_parametric_lightcones(
-    schedule=schedule,
-    chunks=chunks,
-    contraction_opt=optimize,
+    schedule=schedule, chunks=chunks,
+    contraction_opt=report.contraction_opt, path_cache=report.path_cache,
 )
 loss_fn = builder.compiled_parametric_loss_fn(
-    schedule=schedule,
-    compiled_chunks=compiled,
+    schedule=schedule, compiled_chunks=compiled, normalized=False,
 )
 energy = loss_fn(params)
 ```
+
+`report.log10_flops` is the base-10 logarithm of complex-arithmetic
+work summed over the evaluated local cones. `report.log2_peak_bytes` is the largest estimated live tensor size in
+one cone, using `element_bytes` per element. These forward estimates exclude
+autodiff and optimizer storage. Only evaluated paths are planned: denominator contractions are included when
+`normalized=True`. Unsliced Cotengra paths are primed for compilation; native
+Symmray block costs need a separate estimator.
+
+For dense spin gates, `torch_fullgraph=True` freezes Cotengra paths and uses
+Torch operations to build each scheduled gate once per energy evaluation. Pass
+Torch parameters; use `array_backend=backend_torch(dtype=torch.complex128)`
+when preparing the cones. The built-in qMERA pair ansatzes and `rxx`, `ryy`,
+`rzz` carry the required `GateSpec.torch_pauli_words` metadata:
+
+```python
+import torch
+from pepsy.backends import backend_torch
+
+torch_array = backend_torch(dtype=torch.complex128)
+torch_params = builder.cast_params(params, backend="torch", dtype=torch.float64)
+torch_cones = builder.compile_parametric_lightcones(
+    {(0, 1): h2}, schedule=schedule, array_backend=torch_array,
+)
+torch_loss = builder.compiled_parametric_loss_fn(
+    schedule=schedule, compiled_chunks=torch_cones,
+    array_backend=torch_array, torch_fullgraph=True, normalized=False,
+)
+fullgraph_loss = torch.compile(torch_loss, backend="aot_eager", fullgraph=True)
+energy = fullgraph_loss(torch_params)
+```
+
+The returned callable is also a faster eager Torch loss for repeated local
+terms. Native Symmray arrays and gate families without Pauli-rotation metadata
+continue to use the standard compiled path. AOT eager checks complete graph
+capture; Inductor performance depends on the local compiler installation.
 
 Native Symmray qMERA uses the same compiled API, but the builder must receive
 the graded product-state factory. The compiled object then reports
@@ -102,31 +309,59 @@ param_opt = builder.parametric_optimizer(
 result = param_opt.run(solver="torch-adam", n_steps=10, compiled=True)
 ```
 
+For dense spin gates, the same optimizer exposes the Torch-only cost through
+`param_opt.compiled_loss_fn(torch_fullgraph=True)`. Its
+`run(solver="torch-adam", compiled=True, torch_fullgraph=True)` path uses that
+cost for training. The callable can also be passed to
+`torch.compile(..., backend="aot_eager", fullgraph=True)`.
+
 ## qMERA schematics
 
 `QMeraSchedule.draw_schematic()` uses Quimb's manual `schematic.Drawing`
-primitives. The default `style="clean"` view separates the input sites,
-disentangler (`D`), isometry (`W`), and coarse-output stages, with colored
-patches and arrows for the RG flow:
+primitives. The default `style="clean"` follows the schedule's gate direction.
+Retained-register circuits read **coarse → W → D → fine**; site-retention
+schedules read **fine → D → W → coarse**. `rg_step=0` selects the finest RG
+interface even when all retained layers are drawn in preparation order:
 
 ```python
 drawing = schedule.draw_schematic(
-    rg_step=0,                # inspect one bottom-to-top RG step
-    style="clean",             # or "register" for the low-level wiring view
-    figsize=(16, 5),
+    rg_step=0,
+    style="clean",            # or "register" for the older wiring view
+    figsize=(13, 6),
     label_sites=True,
     label_blocks=True,
     scale_figsize=False,
 )
 ```
 
-The clean view is ordered as input → disjoint disentangler subrounds →
-covering isometry subrounds → coarse output. Disentangler windows overlap the
-neighboring isometry blocks by design, but blocks in the same executable
-subround are disjoint. Set `rg_step=1` (or another valid scale) to inspect a
-later step; use `rg_step=None` to draw all steps. The older `layer=` selector
-remains an alias. `schedule.schematic_blocks()` remains the machine-readable
-placement audit.
+In 1D, the clean view is one continuous circuit: time runs left to right,
+with each RG scale's W and D stages shown in execution order. Dashed green
+windows show covering isometry blocks, while colored links and labeled gate
+markers show the actual pair supports. Gates share a round column only when
+their drawn spans do not overlap. A long periodic seam gate curves around
+intervening wires. Green input markers identify the retained core; gray
+markers identify product-state wires. Explicit-mode wires show `site:mode`
+labels. In 2D, colored windows show covering
+blocks, and dark links show the exact
+scheduled pair gates in each round. Long pairs, including periodic seams,
+curve around intervening sites. The coarse panel groups retained wires by
+parent register (`R0`, `R1`, …); arrows point in the schedule's gate direction.
+The drawings show structure and support, while `schedule.placements` gives the
+exact gate sequence. The older `style="register"` view is a structural
+fine-to-coarse wiring view, including for preparation schedules. Omit
+`rg_step` to draw all scales. `layer=` remains an alias, and
+`schedule.schematic_blocks()` remains the machine-readable block audit.
+
+For an odd 2D retained hierarchy, the same API shows boundary disentanglers,
+covering isometry cells, and retained parent registers:
+
+```python
+odd_grid = QMeraBuilder(
+    shape=(3, 4), hierarchy="retained", bond_qubits=2,
+    isometry={"block_size": (2, 2)},
+)
+odd_grid.draw_schematic(rg_step=0, style="clean", figsize=(16, 5))
+```
 
 ## qMERA layout search and prototype comparison
 
@@ -222,6 +457,56 @@ above for that conversion.
 For a larger native Torch workflow, use the corresponding examples maintained
 in the separate `pepsy_examples` repository; the package API is demonstrated
 by the builder flow above.
+
+## 2D spin retained hierarchy
+
+Set `hierarchy="retained"` for an unmoded spin lattice. Each scale tiles the
+current *coarse grid*, applies two-qubit gates within each covering isometry
+block, and retains up to `bond_qubits` physical wires as the next cell's
+register. Boundary disentanglers pair matching register wires across both x
+and y block faces. With odd dimensions, a final one-cell tail joins the
+preceding block along that axis: a length 5 axis blocked by 2 becomes
+`2 + 3`; length 7 blocked by 3 becomes `3 + 4`.
+
+```python
+from pepsy.optimizers.qmera import QMeraBuilder
+
+builder = QMeraBuilder(
+    shape=(5, 7),
+    hierarchy="retained",
+    isometry={"block_size": (2, 3), "circuit_depth": 1},
+    disentangler={"block_size": 2, "circuit_depth": 1},
+    bond_qubits=2,
+    retention="balanced",
+    pair_ansatz="z2_zz_yy_rx",
+)
+schedule = builder.build_schedule()
+assert [(layer.input_grid_shape, layer.output_grid_shape)
+        for layer in schedule.layers] == [
+    ((5, 7), (2, 2)), ((2, 2), (1, 1)),
+]
+assert len(schedule.top_sites) == 2
+```
+
+`(3, 3)` and `(4, 4)` covering blocks use the same grid rule.
+`layer.isometry_cell_blocks` records child-cell coordinates at that scale;
+`layer.isometry_blocks` records their physical wire indices; and
+`layer.retained_registers` records the selected parent wires. The
+`"balanced"` policy spreads retained wires across each block's ordered child
+registers; explicit retention uses the same `(scale, block)` keys as 1D.
+State preparation runs
+coarse to fine, applying each block's unitary-completion circuit before the
+boundary disentanglers. Its adjoint gives the fine-to-coarse disentangler,
+then isometry, order. The compiled local-energy, Torch, and JAX paths use the
+same schedule.
+
+This option currently supports spin qubits, brickwall isometry circuits, and
+`placement="boundary-faces"` with `disentangler.block_size=2` on both
+axes. A covering
+block is a circuit of local two-qubit gates, not a dense multi-qubit unitary.
+The default `hierarchy="site"` 2D path and explicit-mode fermion schedules
+also absorb odd one-cell tails, while preserving their one-site-per-block
+retention.
 
 ## 2D multimode RG schedules
 

@@ -76,10 +76,10 @@ def select_layout_for_compression(
     run_kwargs=None,
 ):
     """Implement the public ``MpsOptimizer.select_layout_for_compression`` operation."""
-    if self.mode == "exact":
+    if self.mode in {"exact", "exact-batch"}:
         raise ValueError(
             "compression layout pilots require an MPS compression mode, "
-            "not mode='exact'."
+            "not mode='exact' or mode='exact-batch'."
         )
     if self._persistent_layout_plan is not None:
         raise ValueError(
@@ -132,10 +132,10 @@ def select_layout_for_compression(
             "compression layout pilots require a fixed-layout compression "
             "mode; mode='perm' changes the order during replay."
         )
-    if self._normalize_mode(pilot_mode) == "exact":
+    if self._normalize_mode(pilot_mode) in {"exact", "exact-batch"}:
         raise ValueError(
             "compression layout pilots require an MPS compression mode, "
-            "not mode='exact'."
+            "not mode='exact' or mode='exact-batch'."
         )
 
     kwargs = dict(layout_kwargs or {})
@@ -367,7 +367,7 @@ def _resolve_run_layout(self, layout, layout_order, layout_kwargs):
     self.last_layout_plan = None
     if not self._layout_request_enabled(layout):
         return None, None
-    if self.mode == "exact":
+    if self.mode in {"exact", "exact-batch"}:
         raise ValueError("layout-aware replay requires an MPS mode, not exact.")
 
     if isinstance(layout, Mapping):
@@ -516,7 +516,7 @@ def apply_layout(
     layout_report=True,
 ):
     """Implement the public ``MpsOptimizer.apply_layout`` operation."""
-    if self.mode == "exact":
+    if self.mode in {"exact", "exact-batch"}:
         raise ValueError("persistent layouts require an MPS execution mode, not exact.")
     if self.mode == "perm":
         raise ValueError(

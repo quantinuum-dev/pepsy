@@ -22,6 +22,8 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `_streams.py`: immutable stream snapshots, symbolic gate resolution, and
     queue normalization. State/backend validation stays on the optimizer;
     trajectory grammar stays in the shared noise implementation.
+  - `_exact_batch.py`, `_exact_structured.py`: bounded dense gate fusion and
+    structured exact replay on supported arrays.
   - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
   - `_layout_execution.py`: optimizer layout installation, logical/physical
     mapping, reordering, schedule installation, and logical readout. Functions
@@ -77,7 +79,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   chi-scaled work proxies.
 - `qmera/`: schedule-first qMERA local-energy objectives, parameter
   dictionaries, compiled lightcone contractions, schematics, and
-  Symmray-native fermion helpers.
+  Symmray-native fermion helpers. The main spin 1D builder uses retained
+  registers, boundary disentanglers, brickwall or cyclic ladder pair rounds,
+  and explicit Z₂ or unrestricted Pauli pair templates selected by
+  `pair_ansatz=`. `system_size=N` names the 1D
+  site count; 2D and explicit-mode fermions retain their existing schedules.
 - `global_opt.py`: whole-network variational optimization helpers.
 
 Entries described as extraction targets are proposals, not implemented
@@ -129,8 +135,9 @@ to sweep cleanup.
 ## MPS gate-stream optimizer
 
 `MpsOptimizer` defaults to `direct` compression. Other replay modes include
-`dmrg`, `swap`, `perm`, `svd`, `mix`, and `exact`; `mpo` remains a
-compatibility alias for `direct`. For repeated evolution on a graph
+`dmrg`, `swap`, `perm`, `svd`, `mix`, `exact`, and `exact-batch`; `batch-exact`
+normalizes to `exact-batch`, while `mpo` remains a compatibility alias for
+`direct`. For repeated evolution on a graph
 with a useful one-dimensional layout, call `opt.apply_layout("quality")` once.
 The MPS then stays in the selected physical order across `run()` calls and
 logical readout goes through `opt.logical_order`, `opt.remap_sample(...)`, or
@@ -149,6 +156,17 @@ Local expectation and norm diagnostics should move from this tracked range,
 not rescan or contract the full MPS. Any target MPS copy needs isolated
 metadata. Exact mode intentionally has no canonical cache; switching back to
 an MPS mode rebuilds and canonicalizes the state.
+
+`exact-batch` is opt-in fully contracted replay with automatic one-/two-qubit
+fusion and compact diagonal broadcasting. Large mixed Z/ZZ diagonal runs
+compact repeated supports before a one- or two-value graph-phase pass.
+Same-pair parity-preserving gates have separate bounded-memory NumPy/Numba
+and CuPy kernels; a pass-count and state-size check limits two-value runs
+and GPU runs containing one-qubit factors. Other gate streams retain the original
+fusion. It shares exact-mode restrictions, does not restore full-state
+storage order between gates, and
+falls back to the reference kernel for unsupported array/state types. See the
+[implementation and upstream audit](../notes/mps_exact_batch.md).
 
 ## Import style
 

@@ -25,6 +25,106 @@ releases remain backwards-compatible. From 1.0 onward:
   materialization, returning an unnormalized `TensorNetwork2D` with preserved
   NumPy/Torch/JAX values. `trace_nbytes` reports its dense site storage.
 
+- `PepsSampler` exposes `chi` (future double-layer cap) and `chi_prime`
+  (conditioned ket cap); `marginal_chi` and `sample_chi` remain compatible
+  aliases with conflict checks. Automatic mode selection keeps uncapped calls
+  exact and selects boundary sampling when caps are supplied. Explicit
+  `ket_compression=None` permits an uncapped ket boundary. `PEPSSampleResult`
+  adds natural-log `log_probabilities`, `log_abs_amplitudes`, and `log_weights`
+  NumPy views of its scaled values.
+
+- `PepsSampler(..., to_backend=callable)` converts a private PEPS copy;
+  omitting the converter infers the source array backend, dtype, and device.
+  Local density matrices, identity caps, probabilities, and categorical draws
+  now stay on NumPy, Torch, or JAX. This fixes mixed NumPy/Torch identity caps
+  when `marginal_chi=0`, respects float32 roundoff in conditional validation,
+  and reuses the final amplitude for identical batch configurations.
+  JAX array creation and RNG use a scoped source-device context.
+
+- `QMeraBuilder.estimate_contraction_cost(...)` reports pre-run complex FLOPs
+  and peak forward contraction bytes for dense qMERA local cones, with log10
+  and log2 summaries. Its cache reuses unsliced Cotengra paths at compilation.
+
+- `QMeraBuilder.compiled_parametric_loss_fn(torch_fullgraph=True)` now returns
+  a Torch-only dense-spin energy callable with frozen Cotengra paths. It
+  reuses each scheduled gate across local terms and supports
+  `torch.compile(..., fullgraph=True)` with AOT eager. The
+  `QMeraEnergyOptimizer` compiled loss and Torch solver can use the same mode.
+
+- Opt-in `QMeraBuilder(hierarchy="retained")` builds a 2D spin qMERA
+  hierarchy with retained qubit registers, x/y boundary disentanglers,
+  inspectable coarse-grid blocks, and coarse-to-fine preparation order.
+  Rectangular and square covering blocks absorb odd one-cell edge tails.
+
+- `TreePlan.from_alternating_lattice((Lx, Ly))` and the
+  `TreeLayoutFinder(order="alternating-xy")` / `map_mode` preset build an
+  actual x-then-y recursive pairing hierarchy, preserving physical labels
+  and odd edge blocks with a strictly binary root. Existing layout defaults
+  and `coarse-*` traversal semantics are unchanged.
+
+- Added opt-in `MpsOptimizer(mode="exact-batch")` (`batch-exact` is an alias).
+  It fuses bounded one- and two-qubit gate runs, compacts repeated Z/ZZ
+  supports, and applies one- or two-value diagonal phases in grouped passes.
+  Supported NumPy/CuPy states also fuse consecutive same-pair parity-preserving
+  gates. Dense replay preserves backend, device, and operator scale; unsupported
+  states use the reference path. Numba acceleration is optional.
+
+### Changed
+
+- `PepsSampler` defaults to `cutoff="auto", cutoff_mode="auto"`, sharing
+  the MPS dtype policy (complex64: `1e-6`, complex128: `1e-12`) and `rsum2`
+  truncation convention. Resolution follows conversion and refresh; explicit
+  numeric cutoffs and Quimb modes remain available. Both policies are passed
+  to future-boundary preparation and conditioned ket compression.
+
+- `PepsSampler` now defaults to the simple conditioned-boundary sweep
+  (`row_cache_max_bytes=0`). Positive budgets opt into dense row transfers with
+  a memory estimate and reference-contraction fallback. Future preparation builds
+  only the required side; DMRG boundaries are initialized lazily. The new
+  `log_probability(config)` returns a natural-log likelihood, with scaled
+  contractions for exact/default-boundary evaluation. Configuration values,
+  finite cutoffs, missing future caches, and unsupported periodic boundary
+  sweeps are validated explicitly. Prefix batches validate probabilities and draw all active groups
+  together once per site, reducing host readbacks. Local-rho contractions copy
+  only the tensors that need reindexing; row bonds, identity caps, and traced
+  column contractions are reused. Scaled Hermiticity diagnostics avoid
+  complex64 norm overflow. Grouped seeded sequences can differ from previous
+  releases; same-backend/device/method reproducibility is preserved.
+
+- The downstream roughening PEPS runner now defaults to initial SU gauge
+  equilibration only (`--peps-gauge-every 0`). Periodic equilibration remains
+  available with `--peps-gauge-every N`; gate updates still update bond gauges.
+
+- The 1D qMERA clean schematic now draws a single left-to-right circuit
+  across RG scales. It separates stage headings from gate markers, outlines
+  isometry blocks, curves long pair links around intervening wires, and keeps
+  explicit-mode wire labels distinct.
+
+- The qMERA `draw_schematic(style="clean")` view now follows actual gate
+  direction: retained circuits show coarse-to-fine W then D, while site
+  schedules show fine-to-coarse D then W. It marks 1D periodic seams,
+  isometry blocks, retained/product wires, and 2D parent registers. The 2D
+  panels now mark each scheduled pair gate within its covering block;
+  `style="register"` remains available.
+
+- Existing 2D site-retention qMERA schedules now absorb a trailing one-cell
+  axis segment into the previous covering block when a lattice dimension is
+  odd; the default 2D hierarchy remains site retention.
+
+- The main spin 1D `QMeraBuilder` uses retained-register blocks, ternary odd
+  tails, boundary disentanglers, and coarse-to-fine gate execution. It accepts
+  bond width and retention policy, with `system_size=N` as the 1D site count
+  (`shape=N` remains accepted). `structure="ladder"` closes each isometry or
+  disentangler block and repeats the complete pair sequence at each
+  `circuit_depth`. The 2D and explicit-mode fermion schedules retain their
+  existing behavior.
+- Spin 1D qMERA exposes `pair_ansatz` with five global-X Z₂-preserving
+  templates and an unrestricted Pauli template. `spin_symmetry` declares the
+  symmetry contract separately from `initial_state`; descriptive ansatz names
+  such as `z2_zz_yy_rx` and `z2_rx_zz_yy_xx_rx` identify gate order, while
+  old names remain accepted. `QMeraPairSpec.rotation_sequence` reports the
+  ordered rotations and pair wires.
+
 ### Fixed
 
 - Reduce complete traces of located exact Pauli-history PEPOs to certified

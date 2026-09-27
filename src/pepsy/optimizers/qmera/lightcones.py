@@ -383,10 +383,17 @@ def _apply_local_gate(state, operator, where, *, contract, inplace):
     raise TypeError("state must provide gate() or gate_inds().")
 
 
-def _product_state_on_sites(sites, *, physical_dim=2, array_backend=None):
+def _product_state_on_sites(
+    sites, *, physical_dim=2, array_backend=None, initial_hadamards=False,
+):
     tensors = []
     base = np.zeros((int(physical_dim),), dtype=np.complex128)
-    base[0] = 1.0
+    if initial_hadamards:
+        if int(physical_dim) != 2:
+            raise ValueError("Hadamard initialization requires qubits.")
+        base[:] = 1.0 / np.sqrt(2.0)
+    else:
+        base[0] = 1.0
     for site in tuple(sites):
         data = base if array_backend is None else array_backend(base)
         tensors.append(qtn.Tensor(data, inds=(_site_ind(site),), tags=(f"I{site}",)))
@@ -406,6 +413,7 @@ def _product_state_for_schedule(
             sites,
             physical_dim=physical_dim,
             array_backend=array_backend,
+            initial_hadamards=schedule.initial_hadamards,
         )
     return product_state_factory(
         schedule,
