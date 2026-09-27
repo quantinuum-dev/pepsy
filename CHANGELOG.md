@@ -14,6 +14,31 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Boundary PepsSampler now defaults to FIT-style factored numerical row
+  environments with a 64 MiB estimated cache budget and independent auto-hq
+  local contractions. Right suffixes are reused and left prefixes advance
+  after each draw. Explicit zero-budget reference and dense modes remain.
+
+- PEPS full-network contractions now default to Pepsy's reusable Cotengra
+  `build_optimizer(parallel=False)`; cached-row steps use `auto-hq`. Explicit
+  full/row optimizer overrides remain supported. Optional exact-amplitude
+  intermediate-size/cost limits reject oversized plans before execution,
+  with estimates exposed through `amplitude_plan_info`.
+
+- Direct PEPS sampling supports `iter_samples` and optional `sample_batch`
+  chunking to bound live prefix states, stable normalized weights/ESS and
+  compact rho diagnostics, reusable scaled exact-amplitude plans, and
+  factored row suffix caches. A reproducible evolved-state CPU/GPU benchmark
+  reports stage costs and memory. Factored caches are the boundary default,
+  retain an explicit reference fallback, and do not truncate amplitudes.
+
+- `PepsSampler(..., rho_positivity="clip" | "absolute")` optionally repairs
+  the Hermitian local proposal spectrum. Default sampling explicitly uses
+  the Hermitian part with its existing diagonal policy. Qubit repairs use a
+  batched 2×2 formula; larger physical dimensions use native `eigh`. All paths
+  record repaired proposal probabilities and report the relative correction,
+  while preserving original PEPS amplitudes and rejecting NaN/Inf input.
+
 - `PepsSampler` exposes `chi` (future double-layer cap) and `chi_prime`
   (conditioned ket cap); `marginal_chi` and `sample_chi` remain compatible
   aliases with conflict checks. Automatic mode selection keeps uncapped calls
@@ -66,12 +91,12 @@ releases remain backwards-compatible. From 1.0 onward:
   numeric cutoffs and Quimb modes remain available. Both policies are passed
   to future-boundary preparation and conditioned ket compression.
 
-- `PepsSampler` now defaults to the simple conditioned-boundary sweep
-  (`row_cache_max_bytes=0`). Positive budgets opt into dense row transfers with
-  a memory estimate and reference-contraction fallback. Future preparation builds
+- `PepsSampler` retains the simple conditioned-boundary reference sweep
+  (`row_cache_max_bytes=0`) and explicit dense row transfers, alongside the
+  default factored environment cache and its memory fallback. Future preparation builds
   only the required side; DMRG boundaries are initialized lazily. The new
   `log_probability(config)` returns a natural-log likelihood, with scaled
-  contractions for exact/default-boundary evaluation. Configuration values,
+  contractions for exact/reference-boundary evaluation. Configuration values,
   finite cutoffs, missing future caches, and unsupported periodic boundary
   sweeps are validated explicitly. Prefix batches validate probabilities and draw all active groups
   together once per site, reducing host readbacks. Local-rho contractions copy
@@ -115,6 +140,24 @@ releases remain backwards-compatible. From 1.0 onward:
   ordered rotations and pair wires.
 
 ### Fixed
+
+- PEPS amplitude cache initialization can be retried after preparation fails.
+  Sample-result log and weight accessors reject mismatched field lengths rather
+  than silently broadcasting; weight diagnostics avoid duplicate host transfers.
+  Sampler API comments clarify cache ownership and diagnostic lifetimes.
+
+- `PepsSampler` rescales within-row transfers and running prefixes/
+  suffixes, fixing rare-configuration log probabilities that could underflow
+  inside the cache. It reuses the initial-row cache until `refresh()`, counts
+  that retained memory in the budget estimate, releases unused center networks,
+  and skips terminal prefix contractions. Later rows remain conditioned on
+  each incoming sampled prefix; the default factored-cache budget is 64 MiB.
+
+- `PepsSampler` rescales private boundaries before relative-cutoff compression
+  and equalizes Quimb future sweeps, preventing complex64 squared-singular-value
+  overflow from spuriously collapsing retained ranks. This covers conditioned
+  Quimb compression and FIT guesses while preserving absolute-cutoff semantics,
+  source tensors, physical amplitudes, and cached-future reuse.
 
 - Correct the bra/ket orientation in native MPS sampling and probability
   evaluation with complex right environments. NumPy, Torch, and CuPy use

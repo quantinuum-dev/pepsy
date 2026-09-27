@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import nullcontext
 import math
 
@@ -57,18 +58,45 @@ class PepsSampler:
         modes (``"rel"``, ``"abs"``, ``"sum1"``, ``"sum2"``, ``"rsum1"``,
         ``"rsum2"``) override it. Fixed-rank one-site FIT does not truncate
         singular values; the cutoff controls its compressed ket guess.
+        Relative modes rescale private Quimb future and conditioned ket
+        boundaries before compression to protect squared singular values.
+        Absolute modes preserve the original compression scale.
+    rho_positivity : {None, "clip", "absolute"}, default=None
+        Sampling uses the Hermitian part of each local rho. ``None`` keeps
+        its diagonal, clipping only negative roundoff. ``"clip"`` replaces
+        negative Hermitian eigenvalues with zero; ``"absolute"`` takes their
+        absolute values, equivalent to sqrt(H.H @ H) for the Hermitian part H.
+        Both repairs change the proposal and are included in returned log
+        probabilities and importance weights. Non-finite rhos still raise.
     fit_n_iter : int, default=2
         Number of local FIT sweeps used by the ``"fit"`` ket compressor and
         by the ``"dmrg"`` future-environment preparation.
     contraction_opt : object, optional
-        Quimb contraction optimizer passed to ``TensorNetwork.contract``.
-        The default ``"auto-hq"`` uses the high-quality Cotengra path when
-        available.
-    row_cache_max_bytes : int, default=0
-        Zero selects the simple conditioned-boundary sweep. A positive budget
-        opts into estimated dense row-cache storage and workspace across live
-        prefix groups. Oversized caches use the reference contraction. This
-        is not a total process-memory cap.
+        Full-network optimizer. None constructs one reusable Cotengra optimizer
+        with ``pepsy.tensors.build_optimizer(parallel=False)`` (formerly named
+        ``build_contraction``). Explicit optimizer objects/strings are retained.
+    row_contraction_opt : object, optional
+        Optimizer for cached-row prefix/suffix/local contractions, default
+        ``"auto-hq"`` independently of the full-network optimizer. Explicit
+        None inherits ``contraction_opt``.
+    amplitude_max_intermediate_bytes : int, optional
+        Reject an exact amplitude plan before execution if its largest tensor
+        exceeds this byte count. None disables the check. Not a peak-memory cap.
+    amplitude_max_cost : float, optional
+        Optional maximum Cotengra estimated exact contraction cost. Exceeding
+        it raises before execution; no approximate amplitude is substituted.
+    row_cache_max_bytes : int, default=67108864
+        Budget for estimated row-environment storage and workspace across live
+        prefix groups, including the initial row retained until ``refresh()``.
+        The default is 64 MiB. Zero explicitly selects the reference sweep;
+        oversized caches also fall back to it. This is not a total process-
+        memory cap. Use chunked sampling to bound simultaneous prefix groups.
+    row_cache_mode : {"dense", "factored"}, default="factored"
+        Boundary sampling defaults to FIT-style numerical environment reuse:
+        build right suffixes once per conditioned row and update the left
+        prefix after each draw. Local factors stay separate, avoiding dense
+        two-interface transfers. ``"dense"`` retains the legacy alternative.
+        Neither cache adds truncation or changes the selected proposal.
     sample_chi, marginal_chi : int, optional
         Compatible aliases for ``chi_prime`` and ``chi``, respectively.
         If both spellings are non-None, their values must agree. ``None``
@@ -94,9 +122,14 @@ class PepsSampler:
         ket_compression="quimb",
         cutoff="auto",
         cutoff_mode="auto",
+        rho_positivity=None,
         fit_n_iter=2,
-        contraction_opt="auto-hq",
-        row_cache_max_bytes=0,
+        contraction_opt=None,
+        row_contraction_opt="auto-hq",
+        amplitude_max_intermediate_bytes=None,
+        amplitude_max_cost=None,
+        row_cache_max_bytes=64 * 2**20,
+        row_cache_mode="factored",
         sample_chi=None,
         marginal_chi=None,
     ):
@@ -138,6 +171,9 @@ class PepsSampler:
         self.cutoff_mode = _canonical_cutoff_mode(
             "auto" if cutoff_mode is None else cutoff_mode
         )
+        if rho_positivity not in (None, "clip", "absolute"):
+            raise ValueError("rho_positivity must be None, 'clip', or 'absolute'.")
+        self.rho_positivity = rho_positivity
         if (
             isinstance(fit_n_iter, (bool, np.bool_))
             or not isinstance(fit_n_iter, (int, np.integer))
@@ -145,7 +181,29 @@ class PepsSampler:
         ):
             raise ValueError("fit_n_iter must be a positive integer.")
         self.fit_n_iter = int(fit_n_iter)
+        if contraction_opt is None:
+            from ..tensors import build_optimizer  # noqa: PLC0415
+
+            # Own one structural plan cache per sampler. Parallel path search
+            # is opt-in through a caller-supplied optimizer, not hidden workers.
+            contraction_opt = build_optimizer(parallel=False)
         self.contraction_opt = contraction_opt
+        self.row_contraction_opt = (
+            contraction_opt if row_contraction_opt is None else row_contraction_opt
+        )
+        if amplitude_max_intermediate_bytes is not None:
+            amplitude_max_intermediate_bytes = self._positive_sample_count(
+                amplitude_max_intermediate_bytes, "amplitude_max_intermediate_bytes"
+            )
+        if amplitude_max_cost is not None:
+            if (isinstance(amplitude_max_cost, (bool, np.bool_))
+                    or not isinstance(amplitude_max_cost, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(amplitude_max_cost))
+                    or amplitude_max_cost <= 0):
+                raise ValueError("amplitude_max_cost must be positive and finite, or None.")
+            amplitude_max_cost = float(amplitude_max_cost)
+        self.amplitude_max_intermediate_bytes = amplitude_max_intermediate_bytes
+        self.amplitude_max_cost = amplitude_max_cost
         if (
             isinstance(row_cache_max_bytes, bool)
             or not isinstance(row_cache_max_bytes, (int, np.integer))
@@ -153,6 +211,9 @@ class PepsSampler:
         ):
             raise ValueError("row_cache_max_bytes must be a non-negative integer.")
         self.row_cache_max_bytes = int(row_cache_max_bytes)
+        if row_cache_mode not in {"dense", "factored"}:
+            raise ValueError("row_cache_mode must be 'dense' or 'factored'.")
+        self.row_cache_mode = row_cache_mode
         self._source_peps = self.peps
         self._future_environments = {}
         self._future_boundary = None
@@ -325,8 +386,15 @@ class PepsSampler:
         self._xp = ar.get_namespace(template)
         self._real_xp = ar.get_namespace(self._xp.real(template))
         self._ket, self._norm = build_bra_ket(ket=ket)
+        self._amplitude_tree = None
+        self._amplitude_plan_info = None
+        self._amplitude_specs = None
+        self._amplitude_leaves = None
+        self._amplitude_stats = {"plan_builds": 0, "contractions": 0}
         self._row_bond_cache = {}
         self._identity_future_cache = {}
+        self._initial_row_cache = None
+        self._initial_row_cache_estimate_bytes = 0
         self._row_cache_estimate_per_group = None
         self._last_cache_decision = {}
         self._grouped_draw_count = 0
@@ -392,11 +460,14 @@ class PepsSampler:
                 canonize=True,
                 mode="mps",
                 layer_tags=("KET", "BRA"),
+                equalize_norms=self.cutoff_mode in {"rel", "rsum1", "rsum2"},
             )
+            norm = self._norm.copy()
+            self._rescale_proposal_boundary_(norm)
             # Quimb owns this boundary sweep and returns the native ``ymax``
             # MPS objects. Keep the cache separate from the shot-conditioned
             # ket boundary because this network still sums over future rows.
-            store.start_sweep(self._norm, "y", update_side="left")
+            store.start_sweep(norm, "y", update_side="left")
             self._future_store = store
             self._future_environments = {
                 y: store.envs[("ymax", y)]
@@ -478,15 +549,70 @@ class PepsSampler:
         """Start a fresh local-rho diagnostic trace."""
         self._last_rho_diagnostics = {}
 
-    def _scaled(self, value):
-        """Represent a real or complex value as mantissa times 10**exponent."""
-        value = self._scalar(value)
-        magnitude = abs(value)
-        if magnitude == 0:
-            return 0.0 if not np.iscomplexobj(value) else 0.0j, 0
-        exponent = math.floor(math.log10(magnitude))
-        mantissa = value / (10.0 ** exponent)
-        return mantissa, exponent
+    @property
+    def amplitude_stats(self):
+        """Exact amplitude plan builds and calls since construction/refresh."""
+        return dict(self._amplitude_stats)
+
+    @property
+    def amplitude_plan_info(self):
+        """Last exact plan estimate, including one rejected by a limit.
+
+        Largest intermediate bytes and Cotengra contraction cost are estimates,
+        not a bound on process/device memory or a wall-time prediction.
+        Cleared by refresh; inspecting this property does not plan a contraction.
+        """
+        return None if self._amplitude_plan_info is None else dict(self._amplitude_plan_info)
+
+    def _check_amplitude_plan(self, tree):
+        info = {
+            "largest_intermediate_bytes": int(tree.max_size()) * self._array_itemsize,
+            "contraction_cost": float(tree.contraction_cost()),
+        }
+        self._amplitude_plan_info = info
+        if (self.amplitude_max_intermediate_bytes is not None
+                and info["largest_intermediate_bytes"] > self.amplitude_max_intermediate_bytes):
+            raise MemoryError(
+                f"Exact amplitude plan needs a largest intermediate of "
+                f"{info['largest_intermediate_bytes']} bytes, exceeding "
+                f"amplitude_max_intermediate_bytes={self.amplitude_max_intermediate_bytes}. "
+                "Choose a better or exactly sliced contraction plan, or raise the explicit limit."
+            )
+        if (self.amplitude_max_cost is not None
+                and info["contraction_cost"] > self.amplitude_max_cost):
+            raise RuntimeError(
+                f"Exact amplitude plan cost {info['contraction_cost']} exceeds "
+                f"amplitude_max_cost={self.amplitude_max_cost}."
+            )
+
+    @property
+    def diagnostics(self):
+        """Host summary of rho, batch, and cumulative amplitude diagnostics.
+
+        Rho values describe the latest query, serial draw, or complete batch.
+        Batch counts describe the latest batch; amplitude counts last until
+        refresh. Chunked collected batches aggregate rho counts and maxima.
+        Access synchronizes backend scalars. Neither small corrections nor
+        a high effective sample size establish that proposal support is intact.
+        """
+        values = tuple(self.rho_diagnostics.values())
+        return {
+            "boundary_engine": self.boundary_engine,
+            "rho_positivity": self.rho_positivity,
+            "conditional_evaluations": sum(d["evaluation_count"] for d in values),
+            "max_hermiticity_defect": max(
+                (d["max_hermiticity_defect"] for d in values), default=0.0
+            ),
+            "max_relative_positivity_correction": max(
+                (d["max_relative_positivity_correction"] for d in values), default=0.0
+            ),
+            "max_negative_diagonal_mass": max(
+                (d["max_negative_diagonal_mass"] for d in values), default=0.0
+            ),
+            "batch": self.batch_stats,
+            "amplitudes": self.amplitude_stats,
+            "amplitude_plan": self.amplitude_plan_info,
+        }
 
     def _local_rho(self, working, site, *, strip_exponent=False):
         """Contract a local rho, copying only tensors whose bra index changes."""
@@ -526,6 +652,66 @@ class PepsSampler:
         """Normalize one local rho using the same kernel as grouped draws."""
         return self._conditional_probabilities_batch(rho[None, ...], site=site)[0]
 
+    def _proposal_rho_diagonal(self, scaled, finite):
+        """Return the Hermitian/positive proposal diagonal and repair size."""
+        xp = self._xp
+        real_xp = self._real_xp
+        # Scale first and halve before adding, including at large finite rho.
+        hermitian = 0.5 * scaled + 0.5 * xp.transpose(xp.conj(scaled), (0, 2, 1))
+        if self.rho_positivity is None:
+            diagonal = xp.real(xp.diagonal(hermitian, axis1=-2, axis2=-1))
+            return diagonal, real_xp.zeros_like(diagonal[:, 0])
+
+        # Do not send NaN/Inf to an eigensolver. Invalid groups are masked here
+        # and rejected by the common validation below, with no extra host sync.
+        hermitian = xp.where(finite[:, None, None], hermitian, xp.zeros_like(hermitian))
+        diagonal_h = xp.real(xp.diagonal(hermitian, axis1=-2, axis2=-1))
+        if hermitian.shape[-1] == 2:
+            # Qubit spectral projectors directly: avoid a tiny eigensolver,
+            # including its CUDA synchronization. All operations are batched.
+            mean = 0.5 * (diagonal_h[:, 0] + diagonal_h[:, 1])
+            delta = 0.5 * (diagonal_h[:, 0] - diagonal_h[:, 1])
+            offdiag2 = xp.abs(hermitian[:, 0, 1])**2
+            radius2 = delta**2 + offdiag2
+            safe_radius = real_xp.sqrt(real_xp.where(
+                radius2 > 0, radius2, real_xp.ones_like(radius2)
+            ))
+            radius = real_xp.where(radius2 > 0, safe_radius, real_xp.zeros_like(radius2))
+            # Obtain the small root from the determinant, avoiding mean-radius
+            # cancellation for e.g. diag(-1e-20, 1) in complex64.
+            large = mean + real_xp.where(mean >= 0, radius, -radius)
+            determinant = diagonal_h[:, 0] * diagonal_h[:, 1] - offdiag2
+            small = determinant / real_xp.where(large != 0, large, real_xp.ones_like(large))
+            eigenvalues = real_xp.stack((real_xp.where(mean >= 0, small, large),
+                                        real_xp.where(mean >= 0, large, small)), axis=-1)
+            # The minor projector weight also needs a cancellation-free form.
+            magnitude_delta = real_xp.abs(delta)
+            major = 0.5 * (1.0 + real_xp.clip(magnitude_delta / safe_radius, 0.0, 1.0))
+            minor = 0.5 * (offdiag2 / safe_radius) / (safe_radius + magnitude_delta)
+            minus = real_xp.where(delta >= 0, minor, major)
+            plus = real_xp.where(delta >= 0, major, minor)
+            weights = real_xp.stack((real_xp.stack((minus, plus), axis=-1),
+                                    real_xp.stack((plus, minus), axis=-1)), axis=-2)
+        else:
+            eigenvalues, vectors = xp.linalg.eigh(hermitian)
+            weights = xp.abs(vectors)**2
+        if self.rho_positivity == "clip":
+            positive = real_xp.maximum(eigenvalues, real_xp.zeros_like(eigenvalues))
+        else:
+            positive = real_xp.abs(eigenvalues)
+        # diag(V f(Lambda) V.H) only: no full reconstruction or rho.H @ rho.
+        diagonal = real_xp.sum(weights * positive[:, None, :], axis=-1)
+        if hermitian.shape[-1] == 2:
+            # Keep the exact linear map (and its gradient) at repeated positive
+            # or negative eigenvalues, where individual projectors are undefined.
+            diagonal = real_xp.where((eigenvalues[:, 0] >= 0)[:, None], diagonal_h, diagonal)
+            if self.rho_positivity == "absolute":
+                diagonal = real_xp.where((eigenvalues[:, 1] <= 0)[:, None], -diagonal_h, diagonal)
+        norm = real_xp.linalg.norm(eigenvalues, axis=-1)
+        correction = real_xp.linalg.norm(positive - eigenvalues, axis=-1)
+        correction = correction / real_xp.where(norm > 0, norm, real_xp.ones_like(norm))
+        return diagonal, correction
+
     def _conditional_probabilities_batch(self, rhos, *, site):
         """Validate all active prefix rhos with one scalar synchronization."""
         xp = self._xp
@@ -545,6 +731,8 @@ class PepsSampler:
             magnitude > 0, magnitude, real_xp.ones_like(magnitude)
         )
         scaled = rhos / safe_magnitude[:, None, None]
+        finite = xp.all(xp.isfinite(rhos), axis=(-2, -1))
+        proposal_diagonal, correction = self._proposal_rho_diagonal(scaled, finite)
         norm = xp.linalg.norm(scaled, axis=(-2, -1))
         defect = xp.linalg.norm(
             scaled - xp.transpose(xp.conj(scaled), (0, 2, 1)),
@@ -560,12 +748,16 @@ class PepsSampler:
         previous = self._last_rho_diagnostics.get(site)
         max_hermiticity = real_xp.max(hermiticity)
         max_negative_mass = real_xp.max(negative_mass)
+        max_correction = real_xp.max(correction)
         if previous is not None:
             max_hermiticity = real_xp.maximum(
                 previous["max_hermiticity_defect"], max_hermiticity
             )
             max_negative_mass = real_xp.maximum(
                 previous["max_negative_diagonal_mass"], max_negative_mass
+            )
+            max_correction = real_xp.maximum(
+                previous["max_relative_positivity_correction"], max_correction
             )
         diagnostics = {
             "trace": trace[-1],
@@ -579,12 +771,22 @@ class PepsSampler:
             ),
             "max_hermiticity_defect": max_hermiticity,
             "max_negative_diagonal_mass": max_negative_mass,
+            "relative_positivity_correction": correction[-1],
+            "max_relative_positivity_correction": max_correction,
         }
         self._last_rho_diagnostics[site] = diagnostics
 
-        finite = xp.all(xp.isfinite(rhos), axis=(-2, -1)) & xp.isfinite(trace)
-        valid_trace = trace > tolerance
-        valid_negative = negative_max <= tolerance
+        # Validate and normalize the scale-free proposal diagonal. Raw rho
+        # diagnostics above retain their original scale and anti-Hermitian part.
+        proposal_trace = real_xp.sum(proposal_diagonal, axis=-1)
+        proposal_scale = real_xp.maximum(
+            real_xp.abs(proposal_trace),
+            real_xp.max(real_xp.abs(proposal_diagonal), axis=-1),
+        )
+        proposal_tolerance = 256.0 * np.finfo(ar.get_dtype_name(diagonal)).eps * proposal_scale
+        finite = finite & xp.all(xp.isfinite(proposal_diagonal), axis=-1)
+        valid_trace = proposal_trace > proposal_tolerance
+        valid_negative = real_xp.min(proposal_diagonal, axis=-1) >= -proposal_tolerance
         if not self._scalar(xp.all(finite & valid_trace & valid_negative)):
             if not self._scalar(xp.all(finite)):
                 raise ValueError(
@@ -600,9 +802,12 @@ class PepsSampler:
                 f"Conditional density matrix at site {site!r} has a "
                 "substantially negative diagonal."
             )
-        diagonal = real_xp.maximum(diagonal, real_xp.zeros_like(diagonal))
-        diagnostics["clipped_negative_mass"] = negative_mass[-1]
-        probabilities = diagonal / real_xp.sum(diagonal, axis=-1, keepdims=True)
+        proposal_diagonal = real_xp.maximum(
+            proposal_diagonal, real_xp.zeros_like(proposal_diagonal)
+        )
+        if self.rho_positivity is None:
+            diagnostics["clipped_negative_mass"] = negative_mass[-1]
+        probabilities = proposal_diagonal / real_xp.sum(proposal_diagonal, axis=-1, keepdims=True)
         return probabilities / real_xp.sum(probabilities, axis=-1, keepdims=True)
 
     def _draw_grouped_choices(self, rng, rhos, groups, *, site):
@@ -763,6 +968,22 @@ class PepsSampler:
                     ordered.append(ind)
         return tuple(ordered)
 
+    def _unit_row_array(self, data):
+        """Remove a positive scale from a proposal-only cached array."""
+        xp = self._xp
+        scale = xp.max(xp.abs(data))
+        scale = xp.where(scale > 0, scale, xp.ones_like(scale))
+        if ar.get_dtype_name(data).startswith("complex"):
+            # Component-wise real division also handles subnormal scales:
+            # some complex division kernels overflow their reciprocal first.
+            return xp.real(data) / scale + 1j * (xp.imag(data) / scale)
+        return data / scale
+
+    def _unit_row_tensor(self, tensor):
+        """Normalize a newly created cache tensor without changing its phase."""
+        tensor.modify(data=self._unit_row_array(tensor.data))
+        return tensor
+
     def _contract_row_tensors(self, tensors, output_inds):
         """Contract a small row transfer network with the shared optimizer."""
         import quimb.tensor as qtn  # noqa: PLC0415
@@ -775,11 +996,12 @@ class PepsSampler:
         return qtn.tensor_contract(
             *tensors,
             output_inds=tuple(output_inds),
-            optimize=self.contraction_opt,
+            preserve_tensor=True,
+            optimize=self.row_contraction_opt,
         )
 
     def _estimate_row_cache_bytes(self):
-        """Conservatively bound dense row outputs before any cache is built."""
+        """Estimate retained row factors/environments before building a cache."""
         if self._row_cache_estimate_per_group is not None:
             return self._row_cache_estimate_per_group
         largest_row = 0
@@ -810,12 +1032,40 @@ class PepsSampler:
                     size *= rank**2
                 interfaces.append(size)
             row_elements = 0
+            if self.row_cache_mode == "factored":
+                row_elements = sum(t.data.size if self.backend == "numpy" else
+                                   math.prod(t.shape) for t in center.tensors)
+                if bottom_sizes:
+                    # Two copies of the conditioned ket, bounded by the
+                    # represented row bond and physical dimensions.
+                    ranks = [1]
+                    for x in range(self.Lx - 1):
+                        rank = math.prod(
+                            self._ket.ind_size(self._ket.bond((x, row), (x + 1, row)))
+                            for row in range(y)
+                        )
+                        if self.ket_compression is not None:
+                            rank = min(rank, self.sample_chi,
+                                       math.prod(bottom_sizes[:x + 1]),
+                                       math.prod(bottom_sizes[x + 1:]))
+                        ranks.append(rank)
+                    ranks.append(1)
+                    row_elements += 2 * sum(
+                        d * ranks[x] * ranks[x + 1] for x, d in enumerate(bottom_sizes)
+                    )
             for x in range(self.Lx):
                 left = interfaces[x - 1] if x else 1
                 right = interfaces[x] if x < self.Lx - 1 else 1
                 physical = self._ket.ind_size(self._site_inds[x, y])
                 # Local transfer, traced transfer, and suffix/prefix storage.
-                row_elements += (physical**2 + 1) * left * right + left + right
+                if self.row_cache_mode == "factored":
+                    row_elements += left + right + physical**2
+                else:
+                    row_elements += (physical**2 + 1) * left * right + left + right
+            if y == 0:
+                # Retained between calls, in addition to the current row's
+                # live groups. Include it even before the first cache build.
+                self._initial_row_cache_estimate_bytes = row_elements * self._array_itemsize
             # Allow extra simultaneous intermediates and contraction workspace.
             largest_row = max(largest_row, 4 * row_elements * self._array_itemsize)
         self._row_cache_estimate_per_group = largest_row
@@ -824,7 +1074,7 @@ class PepsSampler:
     def _use_row_cache(self, samples):
         """Select dense transfers only when their estimated work/storage fits."""
         estimated = (
-            self._estimate_row_cache_bytes() * samples
+            self._estimate_row_cache_bytes() * samples + self._initial_row_cache_estimate_bytes
             if self.row_cache_max_bytes else None
         )
         group_limit = 32 if self.Lx * self.Ly <= 9 else 4
@@ -832,18 +1082,29 @@ class PepsSampler:
             reason = "disabled"
         elif estimated > self.row_cache_max_bytes:
             reason = "memory-budget"
-        elif samples > group_limit:
+        elif self.row_cache_mode == "dense" and samples > group_limit:
             reason = "prefix-count"
-        elif self.marginal_chi not in (None, 0) and self.Lx * self.Ly > 9:
+        elif (self.row_cache_mode == "dense" and self.marginal_chi not in (None, 0)
+              and self.Lx * self.Ly > 9):
             reason = "large-future"
         else:
             reason = "within-budget"
         self._last_cache_decision = {
             "estimated_cache_bytes": estimated,
             "cache_budget_bytes": self.row_cache_max_bytes,
+            "cache_representation": self.row_cache_mode,
             "cache_decision": reason,
         }
         return reason == "within-budget"
+
+    def _get_row_transfer_cache(self, y, phi):
+        """Reuse only the row with no sampled predecessor; return cache, built."""
+        if y == 0 and phi is None and self._initial_row_cache is not None:
+            return self._initial_row_cache, False
+        cache = self._build_row_transfer_cache(y, phi)
+        if y == 0 and phi is None:
+            self._initial_row_cache = cache
+        return cache, True
 
     def _build_row_transfer_cache(self, y, phi):
         """Build local row transfers and all right-to-left suffixes.
@@ -856,6 +1117,8 @@ class PepsSampler:
         chi cutoff: ``marginal_chi`` has already controlled the future
         double-layer boundary attached to ``center``.
         """
+        if self.row_cache_mode == "factored":
+            return self._build_factored_row_cache(y, phi)
         center = self._boundary_center(y, phi)
         columns = [
             center.select(f"X{x}", "any")
@@ -896,37 +1159,77 @@ class PepsSampler:
             physical.append((ket_ind, bra_ind))
 
             split = column.copy()
+            # Each factor contributes only a common positive scalar to rho.
+            # Scale before contracting so a cached column cannot overflow just
+            # because the original PEPS carries a large overall normalization.
+            split.apply_to_arrays(self._unit_row_array)
             split.select([site_tag, "BRA"], which="all").reindex_(
                 {ket_ind: bra_ind}
             )
             local.append(
-                split.contract(
+                self._unit_row_tensor(split.contract(
                     all,
                     output_inds=(ket_ind, bra_ind, *left_inds, *right_inds),
                     optimize=self.contraction_opt,
-                )
+                ))
             )
             # Trace the already-contracted local tensor instead of
             # contracting the whole column a second time.
-            trace.append(local[-1].trace(ket_ind, bra_ind, preserve_tensor=True))
+            trace.append(self._unit_row_tensor(
+                local[-1].trace(ket_ind, bra_ind, preserve_tensor=True)
+            ))
 
         right = [None] * self.Lx
         if self.Lx > 1:
             suffix = trace[-1]
             right[-2] = suffix
             for x in range(self.Lx - 2, 0, -1):
-                suffix = self._contract_row_tensors(
+                suffix = self._unit_row_tensor(self._contract_row_tensors(
                     (trace[x], suffix), interfaces[x][0]
-                )
+                ))
                 right[x - 1] = suffix
 
         return {
-            "center": center,
             "local": tuple(local),
             "right": tuple(right),
             "interfaces": tuple(interfaces),
             "physical": tuple(physical),
         }
+
+    def _build_factored_row_cache(self, y, phi):
+        """Cache suffixes while keeping each column's local factors separate.
+
+        No approximation is introduced here: only the configured future and
+        conditioned-ket compression truncate. A dense transfer with both
+        horizontal interfaces open is never materialized.
+        """
+        center = self._boundary_center(y, phi)
+        columns = [tuple(center.select(f"X{x}", "any").tensors) for x in range(self.Lx)]
+        ordered = [tuple(dict.fromkeys(i for t in ts for i in t.inds)) for ts in columns]
+        index_sets = [set(inds) for inds in ordered]
+        local, interfaces, physical, traced = [], [], [], []
+        for x, tensors in enumerate(columns):
+            left = tuple(i for i in ordered[x] if x and i in index_sets[x - 1])
+            right = tuple(i for i in ordered[x] if x + 1 < self.Lx and i in index_sets[x + 1])
+            interfaces.append((left, right))
+            ki = self._site_inds[x, y]
+            bi = f"{ki}__pepsy_row_bra"
+            tag = self._site_tags[x, y]
+            physical.append((ki, bi))
+            factors = tuple(self._unit_row_tensor(t.copy()) for t in tensors)
+            traced.append(factors)
+            local.append(tuple(t.reindex({ki: bi}) if tag in t.tags and "BRA" in t.tags
+                               else t for t in factors))
+        right = [None] * self.Lx
+        suffix = None
+        for x in range(self.Lx - 1, 0, -1):
+            suffix = self._unit_row_tensor(self._contract_row_tensors(
+                (*traced[x], suffix), interfaces[x][0]
+            ))
+            right[x - 1] = suffix
+        return {"local": tuple(local), "right": tuple(right),
+                "interfaces": tuple(interfaces), "physical": tuple(physical),
+                "factored": True}
 
     def _row_local_rho(self, row_cache, x, y, left):
         """Contract one cached row transfer with its prefix and suffix."""
@@ -936,7 +1239,8 @@ class PepsSampler:
         rho = self._contract_row_tensors(
             (
                 left,
-                row_cache["local"][x],
+                *(row_cache["local"][x] if row_cache.get("factored")
+                  else (row_cache["local"][x],)),
                 row_cache["right"][x],
             ),
             (ket_ind, bra_ind),
@@ -951,18 +1255,24 @@ class PepsSampler:
 
     def _advance_row_prefix(self, row_cache, x, value, left):
         """Fix one local transfer and return the conditioned left prefix."""
-        import quimb.tensor as qtn  # noqa: PLC0415
-
+        # No later site consumes the completed row's scalar prefix.
+        if x == self.Lx - 1:
+            return None
+        if row_cache.get("factored"):
+            physical = dict.fromkeys(row_cache["physical"][x], int(value))
+            projected = tuple(t.isel({i: physical[i] for i in t.inds if i in physical})
+                              for t in row_cache["local"][x])
+            return self._unit_row_tensor(self._contract_row_tensors(
+                (left, *projected), row_cache["interfaces"][x][1]
+            ))
         local = row_cache["local"][x].copy()
         ket_ind, bra_ind = row_cache["physical"][x]
         local.isel_({ket_ind: int(value), bra_ind: int(value)})
         if left is None:
-            return local
-        return qtn.tensor_contract(
-            left, local,
-            output_inds=row_cache["interfaces"][x][1],
-            optimize=self.contraction_opt,
-        )
+            return self._unit_row_tensor(local)
+        return self._unit_row_tensor(self._contract_row_tensors(
+            (left, local), row_cache["interfaces"][x][1]
+        ))
 
     def _projected_row_network(self, y, row_config):
         """Build a projected row as an MPS or MPO for boundary updates."""
@@ -1015,11 +1325,36 @@ class PepsSampler:
         # compression is deliberately a separate policy choice below.
         return mpo.apply(phi, contract=True, inplace=False)
 
+    def _rescale_proposal_boundary_(self, network):
+        """Bound private proposal tensors before scale-invariant compression.
+
+        Relative cutoffs are unchanged by a positive overall network scalar.
+        Remove it before Quimb squares singular values (which can overflow in
+        complex64). Absolute cutoffs must see their original tensor scales.
+        This helper must never be applied to the amplitude ket or norm oracle.
+        """
+        if self.cutoff_mode not in {"rel", "rsum1", "rsum2"}:
+            return
+
+        def rescale(data):
+            # Divide before taking a Euclidean norm: even the tensor norm can
+            # overflow on finite complex64 data. Keep zero arrays unchanged.
+            largest = self._xp.max(self._xp.abs(data))
+            data = data / self._xp.where(largest == 0, 1.0, largest)
+            norm = self._xp.linalg.norm(self._xp.reshape(data, (-1,)))
+            return data / self._xp.where(norm == 0, 1.0, norm)
+
+        network.apply_to_arrays(rescale)
+        # Only a normalized conditional uses this private network; its scalar
+        # cancels. Physical amplitudes are contracted separately from _ket.
+        network.exponent = 0.0
+
     def _compress_conditioned_boundary(self, phi):
         """Compress a conditioned boundary with the selected backend."""
         if self.ket_compression is None:
             return phi
 
+        self._rescale_proposal_boundary_(phi)
         if self.ket_compression == "quimb":
             # Quimb is the direct, deterministic SVD/truncation path.
             maybe_compressed = phi.compress(
@@ -1101,10 +1436,20 @@ class PepsSampler:
         phi = None
         config_pos = 0
         cache_builds = 0
+        cache_hits = 0
+        self._last_row_cache_stats = {
+            "rows": self.Ly, "suffix_cache_builds": 0,
+            "site_prefix_updates": 0, "initial_row_cache_hits": 0,
+            "mode": "factored" if self.row_cache_mode == "factored" else "transfer",
+        }
 
         for y in range(self.Ly):
-            row_cache = self._build_row_transfer_cache(y, phi)
-            cache_builds += 1
+            row_cache, built = self._get_row_transfer_cache(y, phi)
+            cache_builds += int(built)
+            cache_hits += int(not built)
+            self._last_row_cache_stats.update(
+                suffix_cache_builds=cache_builds, initial_row_cache_hits=cache_hits,
+            )
             left = None
             row_config = []
             for x in range(self.Lx):
@@ -1132,14 +1477,16 @@ class PepsSampler:
                 # Fix immediately, then carry only the contracted prefix into
                 # the next x-site. The cached suffix is never mutated.
                 left = self._advance_row_prefix(row_cache, x, value, left)
+                self._last_row_cache_stats["site_prefix_updates"] += int(x < self.Lx - 1)
             phi = self._update_conditioned_boundary(y, row_config, phi)
 
         self._last_boundary_mps = None if phi is None else phi.copy()
         self._last_row_cache_stats = {
             "rows": self.Ly,
             "suffix_cache_builds": cache_builds,
-            "site_prefix_updates": len(self.site_order),
-            "mode": "transfer",
+            "site_prefix_updates": self.Ly * (self.Lx - 1),
+            "initial_row_cache_hits": cache_hits,
+            "mode": "factored" if self.row_cache_mode == "factored" else "transfer",
         }
         omega = self._log10_to_scaled(log10_probability)
         return sampled, omega
@@ -1205,6 +1552,71 @@ class PepsSampler:
         )
         return projected.contract(all, optimize=self.contraction_opt)
 
+    def _projected_amplitude_scaled(self, config):
+        """Contract the original ket with one reusable exact, scaled plan.
+
+        Projected leaves and intermediate contractions are rescaled before
+        magnitudes leave the dtype range. Removed positive factors are added
+        to the returned base-10 exponent; phase and the physical scale remain.
+        Normalized physical slices are cached until refresh(); evaluated
+        amplitudes and sampled configurations are not retained between calls.
+        """
+        if self._amplitude_tree is None:
+            site_positions = {self._site_inds[site]: i for i, site in enumerate(self.site_order)}
+            specs = tuple(
+                tuple(site_positions.get(ind) for ind in tensor.inds)
+                for tensor in self._ket.tensors
+            )
+            projected = self._ket.isel({ind: int(config[pos])
+                                        for ind, pos in site_positions.items()})
+            tree = projected.contraction_tree(
+                optimize=self.contraction_opt, output_inds=()
+            )
+            # Refuse oversized work before allocating scaled leaves or running
+            # the tree. The estimator does not include all live input/workspace.
+            self._check_amplitude_plan(tree)
+            # Every site's physical slices are immutable until refresh. Scale
+            # them together once, retaining at most one extra ket's array data,
+            # instead of launching max/divide/log kernels for every shot.
+            leaves = []
+            for tensor, spec in zip(self._ket.tensors, specs):
+                axes = tuple(i for i, pos in enumerate(spec) if pos is None)
+                magnitude = self._xp.abs(tensor.data)
+                largest = self._real_xp.max(magnitude, axis=axes, keepdims=True) if axes else magnitude
+                scale = self._real_xp.where(largest > 0, largest, self._real_xp.ones_like(largest))
+                if ar.get_dtype_name(tensor.data).startswith("complex"):
+                    data = self._xp.real(tensor.data) / scale + 1j * (self._xp.imag(tensor.data) / scale)
+                else:
+                    data = tensor.data / scale
+                leaves.append((data, self._real_xp.log10(scale)))
+            # Publish only a complete cache: failed preparation must be safe
+            # to retry without refresh or partially initialized state.
+            self._amplitude_specs = specs
+            self._amplitude_leaves = tuple(leaves)
+            self._amplitude_tree = tree
+            self._amplitude_stats["plan_builds"] += 1
+        # Recheck cached plans too, including limits adjusted between batches.
+        self._check_amplitude_plan(self._amplitude_tree)
+        arrays, powers = [], []
+        for (data, scale), spec in zip(self._amplitude_leaves, self._amplitude_specs):
+            selectors = tuple(slice(None) if pos is None else int(config[pos]) for pos in spec)
+            arrays.append(data[selectors])
+            powers.append(self._real_xp.reshape(scale[selectors], ()))
+        exponent = self._real_xp.sum(self._real_xp.stack(powers))
+        mantissa, power = self._amplitude_tree.contract(
+            arrays, strip_exponent=True, check_zero=True, backend=self.backend,
+            autojit=False,
+        )
+        self._amplitude_stats["contractions"] += 1
+        mantissa = self._scalar(mantissa)
+        if mantissa == 0:
+            return 0.0j, 0
+        # Return fractional exponents directly: the public pair/log convention
+        # supports them and never needs to reconstruct an unscaled amplitude.
+        # Network exponent metadata is a Python float: do not round it through
+        # float32 array arithmetic before adding a small slice exponent.
+        return mantissa, float(self._scalar(exponent) + self._scalar(power) + self._ket.exponent)
+
     def _validate_config(self, config):
         """Validate the whole configuration before a zero branch can exit early."""
         config = tuple(config)
@@ -1259,8 +1671,8 @@ class PepsSampler:
             )
             working.isel_({ket_ind: value})
 
-        amplitude = self._projected_amplitude(config)
-        return config, self._log10_to_scaled(log10_proposal), self._scaled(amplitude)
+        amplitude = self._projected_amplitude_scaled(config)
+        return config, self._log10_to_scaled(log10_proposal), amplitude
 
     def _sample_one(self, rng):
         """Draw one configuration from the selected proposal backend."""
@@ -1268,8 +1680,7 @@ class PepsSampler:
             return self._sample_one_exact(rng)
 
         config, omega = self._boundary_sample_or_probability(rng=rng)
-        amplitude = self._projected_amplitude(config)
-        return config, omega, self._scaled(amplitude)
+        return config, omega, self._projected_amplitude_scaled(config)
 
     def _log10_to_scaled(self, log10_probability):
         """Convert a base-10 log probability to mantissa/exponent form."""
@@ -1314,10 +1725,9 @@ class PepsSampler:
 
     def _sample_batch_boundary(self, rng, samples):
         """Sample boundary proposals with one row cache per prefix group."""
-        # Once almost every shot has a different post-row prefix, constructing
-        # a dense transfer cache per group costs more than the original local
-        # center contractions. Keep large production batches on that stable
-        # path; small batches still exercise and benefit from row-cache reuse.
+        # Default factored environments are numerical caches tied to each
+        # incoming prefix. Bound their estimated live storage before building;
+        # the explicit legacy dense mode has additional fallback heuristics.
         if not self._use_row_cache(samples):
             return self._sample_batch_boundary_reference(rng, samples)
 
@@ -1334,17 +1744,18 @@ class PepsSampler:
         ]
         max_groups = 1
         cache_builds = 0
+        cache_hits = 0
         prefix_updates = 0
 
         for y in range(self.Ly):
             for group in groups:
                 # A group represents one shared prefix, hence it has one
                 # conditioned lower boundary and one reusable row suffix.
-                group["row_cache"] = self._build_row_transfer_cache(
-                    y,
-                    group["phi"],
+                group["row_cache"], built = self._get_row_transfer_cache(
+                    y, group["phi"],
                 )
-                cache_builds += 1
+                cache_builds += int(built)
+                cache_hits += int(not built)
                 group["left"] = None
                 group["row_config"] = []
 
@@ -1367,7 +1778,7 @@ class PepsSampler:
                             int(value),
                             group["left"],
                         )
-                        prefix_updates += 1
+                        prefix_updates += int(x < self.Lx - 1)
                         next_groups.append(
                             {
                                 "indices": shot_indices,
@@ -1400,7 +1811,8 @@ class PepsSampler:
             "rows": self.Ly,
             "suffix_cache_builds": cache_builds,
             "site_prefix_updates": prefix_updates,
-            "mode": "transfer",
+            "initial_row_cache_hits": cache_hits,
+            "mode": "factored" if self.row_cache_mode == "factored" else "transfer",
         }
         return groups, max_groups
 
@@ -1472,11 +1884,7 @@ class PepsSampler:
         }
         return groups, max_groups
 
-    def sample_batch(
-        self,
-        samples: int = 1,
-        seed: int | None = None,
-    ) -> PEPSSampleResult:
+    def _sample_batch(self, rng, samples):
         """Draw a prefix-grouped batch of independent PEPS samples.
 
         Groups share a local conditional network until their sampled prefixes
@@ -1497,8 +1905,6 @@ class PepsSampler:
         samples = int(samples)
         self._reset_rho_diagnostics()
         self._grouped_draw_count = 0
-        rng = self._make_rng(seed)
-
         if self.boundary_engine == "exact":
             groups, max_groups = self._sample_batch_exact(rng, samples)
         else:
@@ -1509,7 +1915,7 @@ class PepsSampler:
         amplitudes = [None] * samples
         for group in groups:
             omega = self._log10_to_scaled(group["log10"])
-            amplitude = self._scaled(self._projected_amplitude(group["config"]))
+            amplitude = self._projected_amplitude_scaled(group["config"])
             for index in group["indices"]:
                 index = int(index)
                 configs[index] = group["config"]
@@ -1545,6 +1951,74 @@ class PepsSampler:
                 [value[1] for value in amplitudes],
             ),
         )
+
+    @staticmethod
+    def _positive_sample_count(value, name):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(f"{name} must be a positive integer.")
+        return int(value)
+
+    def iter_samples(
+        self, samples: int, *, chunk_size: int = 128, seed: int | None = None,
+    ) -> Iterator[PEPSSampleResult]:
+        """Yield bounded prefix batches with one continuous backend RNG.
+
+        Reproducible for a fixed seed and chunk size; changing chunk size can
+        change draw order. Each yielded result and diagnostics describe that
+        chunk. Consume/discard results to bound memory; retained results still
+        require output storage. Boundary caches are reused until refresh().
+        """
+        samples = self._positive_sample_count(samples, "samples")
+        chunk_size = self._positive_sample_count(chunk_size, "chunk_size")
+        rng = self._make_rng(seed)
+        for start in range(0, samples, chunk_size):
+            yield self._sample_batch(rng, min(chunk_size, samples - start))
+
+    def sample_batch(
+        self, samples: int = 1, seed: int | None = None, *, chunk_size: int | None = None,
+    ) -> PEPSSampleResult:
+        """Sample with shared prefixes and optional bounded working batches.
+
+        ``chunk_size`` bounds live prefix states, not the returned output or
+        exact-contraction workspace. Omit it to preserve the original single
+        batch draw order. Use :meth:`iter_samples` to stream the output too.
+        """
+        samples = self._positive_sample_count(samples, "samples")
+        if chunk_size is None:
+            return self._sample_batch(self._make_rng(seed), samples)
+        chunk_size = self._positive_sample_count(chunk_size, "chunk_size")
+        result = PEPSSampleResult([], ([], []), ([], []))
+        stats = {"samples": samples, "chunks": 0, "chunk_size": chunk_size,
+                 "max_prefix_groups": 0, "conditional_batches": 0,
+                 "final_prefix_groups": 0, "boundary_engine": self.boundary_engine}
+        diagnostics = {}
+        for batch in self.iter_samples(samples, chunk_size=chunk_size, seed=seed):
+            result.configs.extend(batch.configs)
+            for target, source in ((result.omegas, batch.omegas), (result.ps, batch.ps)):
+                target[0].extend(source[0])
+                target[1].extend(source[1])
+            stats["chunks"] += 1
+            current = self.batch_stats
+            stats["max_prefix_groups"] = max(stats["max_prefix_groups"], current["max_prefix_groups"])
+            for key in ("conditional_batches", "final_prefix_groups", "suffix_cache_builds",
+                        "site_prefix_updates"):
+                stats[key] = stats.get(key, 0) + current.get(key, 0)
+            for site, values in self._last_rho_diagnostics.items():
+                # Public diagnostics are host scalars, not differentiable
+                # outputs. Do not retain every chunk's Torch autograd graph
+                # through a chain of maxima when the source requires grad.
+                merged = {key: value.detach() if hasattr(value, "detach") else value
+                          for key, value in values.items()}
+                if site in diagnostics:
+                    previous = diagnostics[site]
+                    merged["evaluation_count"] += previous["evaluation_count"]
+                    for key in ("max_hermiticity_defect", "max_negative_diagonal_mass",
+                                "max_relative_positivity_correction"):
+                        merged[key] = self._real_xp.maximum(previous[key], merged[key])
+                diagnostics[site] = merged
+        self._last_batch_stats = stats
+        self._last_rho_diagnostics = diagnostics
+        return result
 
     @staticmethod
     def _scaled_to_float(value):
@@ -1583,12 +2057,7 @@ class PepsSampler:
 
     def sample(self, samples: int = 1, seed: int | None = None) -> PEPSSampleResult:
         """Draw independent configurations from the selected proposal."""
-        if (
-            isinstance(samples, (bool, np.bool_))
-            or not isinstance(samples, (int, np.integer))
-            or int(samples) < 1
-        ):
-            raise ValueError("samples must be a positive integer.")
+        samples = self._positive_sample_count(samples, "samples")
         rng = self._make_rng(seed)
         configs = []
         omegas_mantissa = []

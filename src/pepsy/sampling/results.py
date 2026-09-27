@@ -73,6 +73,8 @@ class PEPSSampleResult:
         Natural-log NumPy arrays computed from the scaled pairs without
         materializing their powers of ten. Access copies any backend scalars
         to the host. ``log_weights`` represents ``log(|Psi|**2 / q)``.
+        Both parts of each scaled pair must match the number of configurations;
+        these accessors raise ``ValueError`` when lengths differ.
     """
 
     configs: list[list[int]]
@@ -83,9 +85,12 @@ class PEPSSampleResult:
         """Return the number of sampled configurations."""
         return len(self.configs)
 
-    @staticmethod
-    def _scaled_logs(pair, *, absolute=False):
+    def _scaled_logs(self, pair, *, absolute=False):
         mantissas, exponents = pair
+        if len(mantissas) != len(self) or len(exponents) != len(self):
+            raise ValueError(
+                "Scaled values must contain one mantissa and exponent per configuration."
+            )
         values = np.asarray([
             _backend_array_to_numpy(value).item() for value in mantissas
         ])
@@ -111,6 +116,52 @@ class PEPSSampleResult:
     def log_weights(self):
         """Natural logs of unnormalized importance weights ``|Psi|**2 / q``."""
         return 2.0 * self.log_abs_amplitudes - self.log_probabilities
+
+    @property
+    def normalized_weights(self):
+        """Stable host self-normalized weights; not a support certificate.
+
+        Zero target amplitudes receive zero weight. Empty, all-zero, NaN,
+        or positive-infinite weights raise instead of inventing a measure.
+        """
+        return self._normalize_log_weights(self.log_weights)
+
+    @staticmethod
+    def _normalize_log_weights(logs):
+        """Normalize validated log weights without repeating backend transfers."""
+        if not len(logs) or np.any(np.isnan(logs) | np.isposinf(logs)):
+            raise ValueError("Importance weights need nonempty finite positive mass.")
+        largest = np.max(logs)
+        if not np.isfinite(largest):
+            raise ValueError("All importance weights are zero.")
+        weights = np.exp(logs - largest)
+        return weights / weights.sum()
+
+    @property
+    def effective_sample_size(self):
+        """Importance-weight ESS; cannot certify missing proposal support."""
+        return float(1.0 / np.sum(self.normalized_weights**2))
+
+    @property
+    def weight_diagnostics(self):
+        """Weight concentration and log mean weight, as host scalars.
+
+        With exact amplitudes, mean unnormalized weight estimates the squared
+        PEPS norm when the proposal covers its support. ESS does not establish
+        convergence or unbiased self-normalized observables.
+        """
+        logs = self.log_weights
+        weights = self._normalize_log_weights(logs)
+        largest = np.max(logs)
+        ess = float(1.0 / np.sum(weights**2))
+        return {
+            "samples": len(weights),
+            "effective_sample_size": ess,
+            "ess_fraction": ess / len(weights),
+            "max_normalized_weight": float(np.max(weights)),
+            "zero_weights": int(np.count_nonzero(np.isneginf(logs))),
+            "log_mean_weight": float(largest + np.log(np.exp(logs - largest).mean())),
+        }
 
 
 @dataclass

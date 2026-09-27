@@ -7,6 +7,26 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [PEPS reusable planner and row-cache policy](peps_sampler_planner_policy.md)
+
+- [9×9 and 10×10 D=4 sampler resource probes](peps_sampler_large_corner_cases.md)
+
+- [PEPS sampler efficiency and bounded batches](peps_sampler_efficiency.md)
+
+- [Real 4×4 D=4 OBC sampler validation](peps_sampler_4x4_validation.md)
+  — 8,192 draws against the full state, truncation, weights, and cache lifecycle.
+
+- [PEPS sampler cache audit](peps_sampler_cache_audit.md)
+  — Boundary/row reuse, rare-prefix scaling, and bounded performance checks.
+
+- [PEPS sampler rho repair and speed](peps_sampler_rho_repair.md)
+  — Optional positive proposals, qubit formula, and measured overhead.
+
+- [PEPS sampler relative-cutoff scaling fix](peps_sampler_boundary_scaling.md)
+  — Follow-up to the maturity audit; backend, scale, and cache regressions.
+
+- [PEPS sampler maturity and Verstraete comparison](peps_sampler_maturity_comparison.md)
+  — Current validation, measured throughput, and complex64 truncation limits.
 - [Repository organization audit](module_organization_2026_09.md) — Completed
   sampler, optimizer, and BP splits; remaining design boundaries to review.
 - [`release_readiness_2026_09.md`](release_readiness_2026_09.md) — Release
@@ -86,6 +106,12 @@ peps_sampler_api_revision
 peps_sampler_auto_cutoff
 peps_sampler_backend_fix
 peps_sampler_final_sweep_audit
+peps_sampler_maturity_comparison
+peps_sampler_boundary_scaling
+peps_sampler_rho_repair
+peps_sampler_cache_audit
+peps_sampler_4x4_validation
+peps_sampler_efficiency
 peps_sampler_performance_assessment
 peps_sampler_performance_implementation
 peps_sampler_torch_audit

@@ -154,6 +154,7 @@ def test_peps_sampler_row_cache_matches_full_center_reference(engine):
         marginal_chi=2,
         boundary_engine=engine,
         row_cache_max_bytes=64 * 2**20,
+        row_cache_mode="dense",
     )
 
     for config in product(range(2), repeat=4):
@@ -166,11 +167,15 @@ def test_peps_sampler_row_cache_matches_full_center_reference(engine):
 
     assert sampler.row_cache_stats == {
         "rows": 2,
-        "suffix_cache_builds": 2,
-        "site_prefix_updates": 4,
+        "suffix_cache_builds": 1,
+        "site_prefix_updates": 2,
+        "initial_row_cache_hits": 1,
         "mode": "transfer",
-        "estimated_cache_bytes": sampler._estimate_row_cache_bytes(),
+        "estimated_cache_bytes": (
+            sampler._estimate_row_cache_bytes() + sampler._initial_row_cache_estimate_bytes
+        ),
         "cache_budget_bytes": 64 * 2**20,
+        "cache_representation": "dense",
         "cache_decision": "within-budget",
     }
 
@@ -207,7 +212,7 @@ def test_peps_sampler_prefix_batch_and_rho_diagnostics(kwargs):
         seed=67,
         dtype="complex128",
     )
-    sampler = pepsy.PepsSampler(peps, **kwargs)
+    sampler = pepsy.PepsSampler(peps, row_cache_max_bytes=0, **kwargs)
     first = sampler.sample_batch(samples=8, seed=13)
     second = sampler.sample_batch(samples=8, seed=13)
 
@@ -427,15 +432,16 @@ def test_peps_sampler_reference_batch_and_duplicate_amplitudes(array_backend, mo
     sampler = pepsy.PepsSampler(
         state, to_backend=convert, sample_chi=2, marginal_chi=0,
         boundary_engine="quimb-mps", contraction_opt="greedy",
+        row_cache_max_bytes=0,
     )
     calls = []
-    original = sampler._projected_amplitude
+    original = sampler._projected_amplitude_scaled
 
     def amplitude(config):
         calls.append(config)
         return original(config)
 
-    monkeypatch.setattr(sampler, "_projected_amplitude", amplitude)
+    monkeypatch.setattr(sampler, "_projected_amplitude_scaled", amplitude)
     result = sampler.sample_batch(40, seed=2)
     assert result.configs == [[0, 0, 0, 0]] * 40
     assert len(calls) == 1
@@ -445,7 +451,8 @@ def test_peps_sampler_reference_batch_and_duplicate_amplitudes(array_backend, mo
     assert sampler.probability([1, 0, 0, 0]) == 0.0
 
 
-def test_peps_sampler_jax_nondefault_device(monkeypatch):
+@pytest.mark.parametrize("cache_budget", [0, 64 * 2**20])
+def test_peps_sampler_jax_nondefault_device(monkeypatch, cache_budget):
     """Run with two CPU devices to catch default-device identity/RNG creation."""
     jax = pytest.importorskip("jax")
     devices = jax.devices("cpu")
@@ -455,7 +462,7 @@ def test_peps_sampler_jax_nondefault_device(monkeypatch):
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex64", seed=53)
     state.apply_to_arrays(lambda x: jax.device_put(x, device))
     sampler = pepsy.PepsSampler(
-        state, sample_chi=2, marginal_chi=0,
+        state, sample_chi=2, marginal_chi=0, row_cache_max_bytes=cache_budget,
         boundary_engine="quimb-mps", contraction_opt="greedy",
     )
     with jax.default_device(devices[0]):
@@ -495,7 +502,7 @@ def test_peps_sampler_large_cache_uses_reference_before_allocation(monkeypatch):
     state = qtn.PEPS.rand(3, 3, bond_dim=4, dtype="complex128", seed=101)
     options = dict(sample_chi=16, marginal_chi=32, boundary_engine="quimb-mps",
                    contraction_opt="greedy")
-    sampler = pepsy.PepsSampler(state, row_cache_max_bytes=64 * 2**20, **options)
+    sampler = pepsy.PepsSampler(state, row_cache_max_bytes=64 * 2**20, row_cache_mode="dense", **options)
     reference = pepsy.PepsSampler(state, row_cache_max_bytes=0, **options)
 
     def forbidden_cache(*args, **kwargs):
@@ -602,11 +609,13 @@ def test_peps_sampler_grouped_draws_distribution_and_zeros(array_backend):
     dict(sample_chi=2, boundary_engine="quimb-mps", row_cache_max_bytes=64 * 2**20),
     dict(sample_chi=2, boundary_engine="quimb-mps"),
 ])
-def test_peps_sampler_grouped_readbacks_per_site(kwargs, monkeypatch):
+@pytest.mark.parametrize("rho_positivity", [None, "clip", "absolute"])
+def test_peps_sampler_grouped_readbacks_per_site(kwargs, rho_positivity, monkeypatch):
     import autoray as ar
 
     sampler = pepsy.PepsSampler(
-        qtn.PEPS.rand(2, 2, bond_dim=2, seed=31), contraction_opt="greedy", **kwargs
+        qtn.PEPS.rand(2, 2, bond_dim=2, seed=31), contraction_opt="greedy",
+        rho_positivity=rho_positivity, **kwargs,
     )
     validations = []
     choices = []
@@ -638,6 +647,7 @@ def test_peps_sampler_cache_estimate_bounds_represented_bonds(compression):
         qtn.PEPS.rand(2, 4, bond_dim=2, dtype="complex128", seed=41),
         sample_chi=2, ket_compression=compression, boundary_engine="quimb-mps",
         contraction_opt="greedy",
+        row_cache_mode="dense",
     )
     estimate = sampler._estimate_row_cache_bytes()
     phi = None
@@ -658,6 +668,7 @@ def test_peps_sampler_simple_sweep_dimensions_and_born(shape, engine, monkeypatc
         state, sample_chi=8, marginal_chi=8, boundary_engine=engine,
         ket_compression="fit" if engine == "dmrg" else "quimb",
         fit_n_iter=1, contraction_opt="greedy",
+        row_cache_max_bytes=0,
     )
     future_snapshots = {
         y: [(t.inds, tuple(t.tags), t.data.copy()) for t in network]
@@ -672,7 +683,7 @@ def test_peps_sampler_simple_sweep_dimensions_and_born(shape, engine, monkeypatc
     born = abs(dense)**2 / np.vdot(dense, dense).real
 
     def forbidden_cache(*args, **kwargs):
-        pytest.fail("The default simple sweep must not construct dense row caches")
+        pytest.fail("The explicit reference sweep must not construct row caches")
 
     monkeypatch.setattr(sampler, "_build_row_transfer_cache", forbidden_cache)
     configs = list(product(range(2), repeat=len(sampler.site_order)))
@@ -1039,3 +1050,501 @@ def test_peps_sampler_auto_cutoff_reaches_future_environment(dtype):
         assert automatic.log_probability(rare) == -np.inf
     else:
         np.testing.assert_allclose(automatic.probability(rare), expected, rtol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_peps_sampler_future_relative_cutoff_is_scale_invariant(array_backend, dtype):
+    """Finite large/small singular values must not change relative truncation."""
+    from contextlib import nullcontext
+    import autoray as ar
+    from pepsy.backends import infer_backend_signature
+
+    backend, convert = array_backend
+    context = nullcontext()
+    if backend == "jax":
+        import jax
+        enable_x64 = getattr(jax, "enable_x64", None)
+        if enable_x64 is None:
+            from jax.experimental import enable_x64
+        context = enable_x64()
+    with context:
+        for scale in (1.0, 1e5, 1e-5):
+            # Weighted GHZ, with all scale on the first cached future row.
+            state = qtn.PEPS.rand(2, 3, bond_dim=2, dtype=dtype, seed=197)
+            for x, y in product(range(2), range(3)):
+                tensor = state[x, y]
+                data = np.zeros(tensor.shape, dtype=dtype)
+                data[(0,) * tensor.ndim] = 1.0
+                data[(1,) * tensor.ndim] = 0.5 if (x, y) == (0, 2) else 1.0
+                tensor.modify(data=convert(data * (scale if y == 2 else 1.0)))
+            originals = [ar.to_numpy(t.data).copy() for t in state]
+            sampler = pepsy.PepsSampler(
+                state, chi=16, chi_prime=4, boundary_engine="quimb-mps",
+                cutoff="auto", cutoff_mode="auto", contraction_opt="greedy",
+            )
+            tolerance = 3e-5 if dtype == "complex64" else 1e-11
+            np.testing.assert_allclose(
+                [sampler.probability([v] * 6) for v in (0, 1)],
+                [0.8, 0.2], rtol=tolerance,
+            )
+            batch = sampler.sample_batch(4, seed=23)
+            for config, log_q, amplitude, exponent in zip(
+                batch.configs, batch.log_probabilities, *batch.ps,
+            ):
+                assert len(set(config)) == 1
+                value = config[0]
+                np.testing.assert_allclose(log_q, np.log([0.8, 0.2][value]),
+                                           rtol=tolerance)
+                # Proposal rescaling must not leak into physical amplitudes.
+                np.testing.assert_allclose(amplitude * 10.0**exponent,
+                                           scale**2 * [1.0, 0.5][value],
+                                           rtol=tolerance, atol=0)
+            signature = infer_backend_signature(state.tensors[0].data)
+            for env in sampler._future_environments.values():
+                assert all(infer_backend_signature(t.data) == signature for t in env)
+            for tensor, original in zip(state, originals):
+                np.testing.assert_array_equal(ar.to_numpy(tensor.data), original)
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+@pytest.mark.parametrize("compression", ["quimb", "fit"])
+def test_peps_sampler_conditioned_relative_cutoff_is_scale_invariant(
+    array_backend, dtype, compression,
+):
+    """The ket compressor and FIT guess retain a known two-value spectrum."""
+    from contextlib import nullcontext
+    import autoray as ar
+    from pepsy.backends import infer_backend_signature
+
+    backend, convert = array_backend
+    context = nullcontext()
+    if backend == "jax":
+        import jax
+        enable_x64 = getattr(jax, "enable_x64", None)
+        if enable_x64 is None:
+            from jax.experimental import enable_x64
+        context = enable_x64()
+    with context:
+        state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype=dtype, seed=199)
+        state.apply_to_arrays(convert)
+        sampler = pepsy.PepsSampler(
+            state, chi=0, chi_prime=2, boundary_engine="quimb-mps",
+            ket_compression=compression, cutoff="auto", cutoff_mode="auto",
+            contraction_opt="greedy",
+        )
+        expected = np.array([1.0, 0.0, 0.0, 0.5]) / np.sqrt(1.25)
+        for scale in (1.0, 1e20, 1e-20):
+            phi = qtn.MatrixProductState([
+                convert(np.diag([1.0, 0.5]).astype(dtype) * scale),
+                convert(np.eye(2, dtype=dtype)),
+            ], shape="lrp", site_tag_id="X{}")
+            result = sampler._compress_conditioned_boundary(phi)
+            assert result.max_bond() == 2
+            actual = np.array(ar.to_numpy(result.to_dense()), copy=True).ravel()
+            # Remove the physically irrelevant phase chosen by the decompositions.
+            actual *= np.exp(-1j * np.angle(actual[0]))
+            tolerance = 3e-5 if dtype == "complex64" else 1e-11
+            np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+            signature = infer_backend_signature(state.tensors[0].data)
+            assert all(infer_backend_signature(t.data) == signature for t in result)
+
+
+@pytest.mark.parametrize("mode", ["abs", "sum1", "sum2"])
+@pytest.mark.parametrize("compression", ["quimb", "fit"])
+def test_peps_sampler_absolute_cutoff_keeps_scale_dependence(mode, compression):
+    """Absolute singular-value/weight thresholds retain their physical scale."""
+    sampler = pepsy.PepsSampler(
+        qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex64", seed=211),
+        chi_prime=2, boundary_engine="quimb-mps", ket_compression=compression,
+        cutoff=0.75, cutoff_mode=mode, contraction_opt="greedy",
+    )
+    for scale, expected_rank in ((1.0, 1), (10.0, 2)):
+        phi = qtn.MatrixProductState([
+            np.diag([1.0, 0.5]).astype("complex64") * scale,
+            np.eye(2, dtype="complex64"),
+        ], shape="lrp", site_tag_id="X{}")
+        result = sampler._compress_conditioned_boundary(phi)
+        assert result.max_bond() == expected_rank
+        expected = np.array([1.0, 0, 0, 0 if expected_rank == 1 else 0.5])
+        expected /= np.linalg.norm(expected)
+        np.testing.assert_allclose(abs(result.to_dense().ravel()), expected,
+                                   rtol=3e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("engine", ["quimb-mps", "dmrg"])
+def test_peps_sampler_reuses_future_until_explicit_refresh(engine, monkeypatch):
+    """Draws and likelihood queries share one future sweep per source refresh."""
+    prepare = pepsy.PepsSampler._prepare_future_environments
+    preparations = []
+
+    def counted_prepare(sampler):
+        preparations.append(sampler)
+        return prepare(sampler)
+
+    monkeypatch.setattr(pepsy.PepsSampler, "_prepare_future_environments", counted_prepare)
+    state = qtn.PEPS.rand(2, 3, bond_dim=2, dtype="complex128", seed=223)
+    sampler = pepsy.PepsSampler(
+        state, chi=16, chi_prime=4, boundary_engine=engine,
+        cutoff="auto", contraction_opt="greedy",
+    )
+    cached = dict(sampler._future_environments)
+    configs = list(product(range(2), repeat=6))
+    previous = np.array([sampler.probability(c) for c in configs])
+    sampler.sample_batch(4, seed=41)
+    sampler.sample_batch(4, seed=43)
+    sampler.sample(samples=2, seed=47)
+    assert len(preparations) == 1
+    assert all(sampler._future_environments[y] is env for y, env in cached.items())
+
+    # A physical filter changes the Born distribution of the source.
+    state.gate_(np.diag([1.0, 2.0]), where=(0, 2), contract=True)
+    sampler.refresh()
+    assert len(preparations) == 2
+    assert all(sampler._future_environments[y] is not env for y, env in cached.items())
+    dense = state.to_dense([state.site_ind(*site) for site in sampler.site_order]).ravel()
+    born = abs(dense)**2
+    born /= born.sum()
+    assert np.max(abs(previous - born)) > 1e-3
+    np.testing.assert_allclose([sampler.probability(c) for c in configs], born,
+                               rtol=1e-10, atol=1e-12)
+
+
+def test_peps_sampler_boundary_rescaling_preserves_torch_gradient():
+    """Rescaling and compression preserve the derivative of a normalized state."""
+    torch = pytest.importorskip("torch")
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=227)
+    sampler = pepsy.PepsSampler(
+        state, chi_prime=2, boundary_engine="quimb-mps",
+        to_backend=lambda a: torch.as_tensor(a, device="cpu"),
+        cutoff="auto", contraction_opt="greedy",
+    )
+    amplitude = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+    diagonal = torch.stack((torch.ones_like(amplitude), amplitude)).to(torch.complex128)
+    phi = qtn.MatrixProductState([
+        torch.diag(diagonal) * 1e20,
+        torch.eye(2, dtype=torch.complex128),
+    ], shape="lrp", site_tag_id="X{}")
+    result = sampler._compress_conditioned_boundary(phi)
+    probability = result.to_dense().reshape(-1)[-1].abs().square()
+    probability.backward()
+    np.testing.assert_allclose(probability.detach().numpy(), 0.2, rtol=1e-12)
+    np.testing.assert_allclose(amplitude.grad.numpy(), 0.64, rtol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+@pytest.mark.parametrize("policy", [None, "clip", "absolute"])
+@pytest.mark.parametrize("phys_dim", [2, 3])
+def test_peps_sampler_rho_policy_matches_spectral_reference(array_backend, dtype, policy, phys_dim):
+    """Hermitian/PSD conditionals agree with an independent spectral oracle."""
+    from contextlib import nullcontext
+    import autoray as ar
+    from pepsy.backends import infer_backend_signature
+
+    backend, convert = array_backend
+    context = nullcontext()
+    if backend == "jax":
+        import jax
+        enable_x64 = getattr(jax, "enable_x64", None)
+        if enable_x64 is None:
+            from jax.experimental import enable_x64
+        context = enable_x64()
+    with context:
+        h = np.array([[0.1, 0.4 + 0.3j, 0],
+                      [0.4 - 0.3j, 0.7, 0.1j], [0, -0.1j, 0.2]])
+        skew = np.array([[0.1j, 0.12 - 0.2j, 0.1],
+                         [-0.12 - 0.2j, -0.2j, 0], [-0.1, 0, 0.3j]])
+        raw = np.asarray((h + skew)[:phys_dim, :phys_dim], dtype=dtype)
+        reference_h = (raw.astype("complex128") + raw.conj().T.astype("complex128")) / 2
+        eigenvalues, vectors = np.linalg.eigh(reference_h)
+        assert eigenvalues[0] < -0.1
+        if policy is None:
+            fixed = reference_h
+            correction = 0.0
+        else:
+            positive = np.maximum(eigenvalues, 0) if policy == "clip" else abs(eigenvalues)
+            fixed = (vectors * positive) @ vectors.conj().T
+            correction = np.linalg.norm(fixed - reference_h) / np.linalg.norm(reference_h)
+            np.testing.assert_allclose(fixed, fixed.conj().T, atol=1e-15)
+            assert np.linalg.eigvalsh(fixed).min() >= -1e-15
+        expected = fixed.diagonal().real
+        expected = expected / expected.sum()
+        data = np.stack([raw * scale for scale in (1e24, 1.0, 1e-24)])
+        native = convert(data)
+        sampler = pepsy.PepsSampler(
+            qtn.PEPS.rand(1, 1, bond_dim=1, phys_dim=phys_dim, dtype=dtype, seed=229),
+            to_backend=convert, rho_positivity=policy,
+        )
+        probabilities = sampler._conditional_probabilities_batch(native, site=(0, 0))
+        tolerance = 3e-6 if dtype == "complex64" else 1e-12
+        np.testing.assert_allclose(ar.to_numpy(probabilities), np.tile(expected, (3, 1)),
+                                   rtol=tolerance, atol=tolerance)
+        assert infer_backend_signature(probabilities) == infer_backend_signature(ar.do("real", native))
+        np.testing.assert_array_equal(ar.to_numpy(native), data)
+        diagnostic = sampler.rho_diagnostics[(0, 0)]
+        assert diagnostic["max_hermiticity_defect"] > 0.1
+        np.testing.assert_allclose(diagnostic["relative_positivity_correction"],
+                                   correction, rtol=tolerance, atol=tolerance)
+        np.testing.assert_allclose(diagnostic["max_relative_positivity_correction"],
+                                   correction, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("policy", ["clip", "absolute"])
+def test_peps_sampler_rho_repair_rejects_nonfinite_and_empty(array_backend, policy):
+    """PSD repair handles finite negativity but cannot recover NaN/Inf or zero."""
+    import autoray as ar
+    _, convert = array_backend
+    sampler = pepsy.PepsSampler(
+        qtn.PEPS.rand(1, 1, bond_dim=1, dtype="complex64", seed=233),
+        to_backend=convert, rho_positivity=policy,
+    )
+    for bad, message in [
+        ([[1, np.nan], [0, 1]], "non-finite"),
+        ([[np.inf, 0], [0, 1]], "non-finite"),
+        ([[0, 0], [0, 0]], "invalid trace"),
+        ([[1j, 0], [0, -1j]], "invalid trace"),
+    ]:
+        matrices = np.stack([np.eye(2), np.asarray(bad), np.eye(2)]).astype("complex64")
+        with np.errstate(invalid="ignore", over="ignore"):
+            with pytest.raises(ValueError, match=message):
+                sampler._conditional_probabilities_batch(convert(matrices), site=(0, 0))
+    diagonal = convert(np.diag(np.array([-1.0, 2.0], dtype="complex64")))
+    p = sampler._conditional_probabilities(diagonal, site=(0, 0))
+    np.testing.assert_allclose(ar.to_numpy(p), [0, 1] if policy == "clip" else [1/3, 2/3],
+                               rtol=1e-6)
+    negative = convert(-np.eye(2, dtype="complex64"))
+    if policy == "clip":
+        with pytest.raises(ValueError, match="invalid trace"):
+            sampler._conditional_probabilities(negative, site=(0, 0))
+    else:
+        np.testing.assert_allclose(ar.to_numpy(sampler._conditional_probabilities(negative, site=(0, 0))),
+                                   [0.5, 0.5])
+
+
+@pytest.mark.parametrize("policy", ["clip", "absolute"])
+@pytest.mark.parametrize("options", [
+    {},
+    dict(chi=4, chi_prime=2, boundary_engine="quimb-mps"),
+    dict(chi=4, chi_prime=2, boundary_engine="quimb-mps", row_cache_max_bytes=2**20),
+])
+def test_peps_sampler_repaired_draws_queries_and_weights_agree(policy, options, monkeypatch):
+    """All routes use the repaired conditional in the actual sampled log q."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=239)
+    sampler = pepsy.PepsSampler(
+        state, rho_positivity=policy, contraction_opt="greedy", **options,
+    )
+    conditional = sampler._conditional_probabilities_batch
+
+    def indefinite(rhos, *, site):
+        # Controlled finite contraction error with one negative eigenvalue.
+        trace = np.trace(rhos, axis1=-2, axis2=-1).real
+        return conditional(rhos - 0.6 * trace[:, None, None] * np.eye(2), site=site)
+
+    monkeypatch.setattr(sampler, "_conditional_probabilities_batch", indefinite)
+    configs = list(product(range(2), repeat=4))
+    probabilities = np.array([sampler.probability(c) for c in configs])
+    np.testing.assert_allclose(probabilities.sum(), 1.0, atol=1e-12)
+    dense = state.to_dense([state.site_ind(*site) for site in sampler.site_order]).ravel()
+    for method in (sampler.sample, sampler.sample_batch):
+        result = method(8, seed=251)
+        assert result.configs == method(8, seed=251).configs
+        indices = [configs.index(tuple(config)) for config in result.configs]
+        expected_q = probabilities[indices]
+        np.testing.assert_allclose(result.log_probabilities, np.log(expected_q), atol=1e-12)
+        amplitudes = np.asarray(result.ps[0]) * 10.0**np.asarray(result.ps[1])
+        np.testing.assert_allclose(amplitudes, dense[indices], rtol=1e-12)
+        np.testing.assert_allclose(result.log_weights,
+                                   2 * np.log(abs(dense[indices])) - np.log(expected_q), atol=1e-12)
+        assert max(d["max_relative_positivity_correction"]
+                   for d in sampler.rho_diagnostics.values()) > 0.1
+
+
+@pytest.mark.parametrize("policy", ["invalid", "none", True, 1])
+def test_peps_sampler_validates_rho_positivity(policy):
+    with pytest.raises(ValueError, match="rho_positivity"):
+        pepsy.PepsSampler(qtn.PEPS.rand(1, 1, bond_dim=1), rho_positivity=policy)
+
+
+@pytest.mark.parametrize("policy", ["clip", "absolute"])
+def test_peps_sampler_qubit_rho_repair_gradient(policy):
+    """The qubit formula preserves gradients, including a repeated spectrum."""
+    torch = pytest.importorskip("torch")
+    sampler = pepsy.PepsSampler(
+        qtn.PEPS.rand(1, 1, bond_dim=1, dtype="complex128", seed=241),
+        to_backend=lambda a: torch.as_tensor(a, device="cpu"), rho_positivity=policy,
+    )
+    for base, expected in ((1.0, 0.5), (-1.0, 0.0 if policy == "clip" else -2.0 / 9.0)):
+        variable = torch.tensor(0.0, dtype=torch.float64, requires_grad=True)
+        entries = torch.stack((base + variable, 1.0 - variable if base == 1 else 2.0 + 0 * variable))
+        rho = torch.diag(entries).to(torch.complex128)
+        probability = sampler._conditional_probabilities(rho, site=(0, 0))[0]
+        probability.backward()
+        np.testing.assert_allclose(variable.grad.numpy(), expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("policy", ["clip", "absolute"])
+def test_peps_sampler_qubit_repair_retains_small_spectral_weight(array_backend, policy):
+    """The 2x2 shortcut must not cancel representable small eigenvalues/weights."""
+    import autoray as ar
+    _, convert = array_backend
+    sampler = pepsy.PepsSampler(
+        qtn.PEPS.rand(1, 1, bond_dim=1, dtype="complex64", seed=257),
+        to_backend=convert, rho_positivity=policy,
+    )
+    for rho in (np.diag([-1e-20, 1]), np.array([[0, 1e-10j], [-1e-10j, 1]])):
+        raw = rho.astype("complex64")
+        w, v = np.linalg.eigh(raw.astype("complex128"))
+        positive = np.maximum(w, 0) if policy == "clip" else abs(w)
+        diagonal = np.sum(abs(v)**2 * positive[None, :], axis=-1)
+        expected = diagonal / diagonal.sum()
+        actual = sampler._conditional_probabilities(convert(raw), site=(0, 0))
+        np.testing.assert_allclose(ar.to_numpy(actual), expected, rtol=2e-5, atol=0)
+
+
+@pytest.mark.parametrize("dtype,width,rare", [
+    ("complex64", 5, 1e-6), ("complex128", 12, 1e-20),
+])
+@pytest.mark.parametrize("cache_mode", ["dense", "factored"])
+def test_peps_sampler_cached_rare_prefix_log_probability(array_backend, dtype, width, rare, cache_mode):
+    """Normalize cached prefixes before their product can underflow to zero."""
+    from contextlib import nullcontext
+    import autoray as ar
+    from pepsy.backends import infer_backend_signature
+
+    backend, convert = array_backend
+    context = nullcontext()
+    if backend == "jax":
+        import jax
+        enable_x64 = getattr(jax, "enable_x64", None)
+        if enable_x64 is None:
+            from jax.experimental import enable_x64
+        context = enable_x64()
+    with context:
+        state = qtn.PEPS.product_state([
+            [np.array([1.0, rare], dtype=dtype)] for _ in range(width)
+        ])
+        originals = [t.data.copy() for t in state]
+        sampler = pepsy.PepsSampler(
+            state, chi_prime=1, to_backend=convert, row_cache_max_bytes=64 * 2**20,
+            row_cache_mode=cache_mode,
+            boundary_engine="quimb-mps", contraction_opt="greedy",
+        )
+        value = sampler.log_probability([1] * width)
+        expected = -width * np.log1p(rare**-2)
+        np.testing.assert_allclose(value, expected, rtol=2e-6 if dtype == "complex64" else 1e-12)
+        assert sampler.row_cache_stats["mode"] == ("transfer" if cache_mode == "dense" else "factored")
+        signature = infer_backend_signature(sampler._ket.tensors[0].data)
+        local = sampler._initial_row_cache["local"]
+        if cache_mode == "factored":
+            local = [tensor for factors in local for tensor in factors]
+        for tensor in (*local, *sampler._initial_row_cache["right"]):
+            if tensor is not None:
+                assert infer_backend_signature(tensor.data) == signature
+                assert np.all(np.isfinite(ar.to_numpy(tensor.data)))
+        for tensor, original in zip(state, originals):
+            np.testing.assert_array_equal(tensor.data, original)
+
+
+@pytest.mark.parametrize("engine", ["quimb-mps", "dmrg"])
+def test_peps_sampler_row_cache_sharing_and_refresh(engine, monkeypatch):
+    """Only the initial row persists; later rows depend on complete prefixes."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=251)
+    sampler = pepsy.PepsSampler(
+        state, chi=8, chi_prime=4, boundary_engine=engine,
+        row_cache_max_bytes=64 * 2**20, contraction_opt="greedy",
+        row_cache_mode="dense",
+    )
+    builds = []
+    build = sampler._build_row_transfer_cache
+
+    def counted_build(y, phi):
+        builds.append(y)
+        return build(y, phi)
+
+    monkeypatch.setattr(sampler, "_build_row_transfer_cache", counted_build)
+    batch = sampler.sample_batch(16, seed=51)
+    row_prefixes = {tuple(config[:2]) for config in batch.configs}
+    assert len(row_prefixes) > 1
+    assert builds.count(0) == 1
+    assert builds.count(1) == len(row_prefixes)
+    initial = sampler._initial_row_cache
+    snapshots = [(t, t.inds, t.data.copy()) for t in (*initial["local"], *initial["right"])
+                 if t is not None]
+    dense = state.to_dense([state.site_ind(*site) for site in sampler.site_order]).ravel()
+    born = abs(dense)**2 / np.vdot(dense, dense).real
+    configs = list(product(range(2), repeat=4))
+    for config, log_q, log_psi in zip(batch.configs, batch.log_probabilities, batch.log_abs_amplitudes):
+        index = configs.index(tuple(config))
+        np.testing.assert_allclose(log_q, np.log(born[index]), atol=1e-12)
+        np.testing.assert_allclose(log_psi, np.log(abs(dense[index])), atol=1e-12)
+    np.testing.assert_allclose([sampler.probability(c) for c in configs], born, atol=1e-12)
+    sampler.sample_batch(8, seed=53)
+    sampler.sample(samples=2, seed=57)
+    assert builds.count(0) == 1
+    assert sampler._initial_row_cache is initial
+    for tensor, inds, data in snapshots:
+        assert tensor.inds == inds
+        np.testing.assert_array_equal(tensor.data, data)
+
+    state.gate_(np.diag([1.0, 2.0]), where=(0, 1), contract=True)
+    sampler.refresh()
+    assert sampler._initial_row_cache is None
+    assert sampler._initial_row_cache_estimate_bytes == 0
+    dense = state.to_dense([state.site_ind(*site) for site in sampler.site_order]).ravel()
+    new_born = abs(dense)**2 / np.vdot(dense, dense).real
+    assert np.max(abs(new_born - born)) > 1e-3
+    np.testing.assert_allclose([sampler.probability(c) for c in configs], new_born, atol=1e-12)
+    assert builds.count(0) == 2
+    assert sampler._initial_row_cache is not initial
+
+
+def test_peps_sampler_cached_zero_branch_and_memory_budget(monkeypatch):
+    """Impossible queries exit cleanly; the retained row counts toward budget."""
+    state = qtn.PEPS.product_state([[np.array([1.0, 0.0])] for _ in range(3)])
+    sampler = pepsy.PepsSampler(
+        state, chi_prime=1, row_cache_max_bytes=64 * 2**20,
+        boundary_engine="quimb-mps", contraction_opt="greedy",
+        row_cache_mode="dense",
+    )
+    per_group = sampler._estimate_row_cache_bytes()
+    retained = sampler._initial_row_cache_estimate_bytes
+    assert retained > 0
+    assert sampler.log_probability([0, 0, 0]) == 0.0
+    cache = sampler._initial_row_cache
+    actual = sum(t.data.nbytes for t in (*cache["local"], *cache["right"]) if t is not None)
+    assert retained >= actual
+    assert sampler.log_probability([1, 0, 0]) == -np.inf
+    assert sampler.row_cache_stats["suffix_cache_builds"] == 0
+    assert sampler.row_cache_stats["initial_row_cache_hits"] == 1
+    assert sampler.row_cache_stats["site_prefix_updates"] == 0
+    assert sampler.log_probability([0, 0, 1]) == -np.inf
+    assert sampler.row_cache_stats["site_prefix_updates"] == 2
+
+    # Excluding the retained first row would incorrectly enable this cache.
+    sampler.row_cache_max_bytes = per_group
+
+    def forbidden_cache(*args, **kwargs):
+        pytest.fail("The retained initial row must count toward the budget")
+
+    monkeypatch.setattr(sampler, "_get_row_transfer_cache", forbidden_cache)
+    assert sampler.probability([0, 0, 0]) == 1.0
+    assert sampler.row_cache_stats["cache_decision"] == "memory-budget"
+    assert sampler.row_cache_stats["estimated_cache_bytes"] == per_group + retained
+
+
+def test_peps_sampler_cached_rho_preserves_torch_gradient():
+    """Private positive cache scaling cancels from a normalized conditional."""
+    torch = pytest.importorskip("torch")
+    amplitude = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+    vector = torch.stack((torch.ones_like(amplitude), amplitude)).to(torch.complex128)
+    state = qtn.PEPS.product_state([[vector], [vector], [vector]])
+    sampler = pepsy.PepsSampler(
+        state, chi_prime=1, row_cache_max_bytes=64 * 2**20,
+        boundary_engine="quimb-mps", contraction_opt="greedy",
+    )
+    cache, _ = sampler._get_row_transfer_cache(0, None)
+    prefix = sampler._advance_row_prefix(cache, 0, 1, None)
+    rho, _, _ = sampler._row_local_rho(cache, 1, 0, prefix)
+    probability = sampler._conditional_probabilities(rho, site=(1, 0))[1]
+    probability.backward()
+    np.testing.assert_allclose(probability.detach().numpy(), 0.2, rtol=1e-12)
+    np.testing.assert_allclose(amplitude.grad.numpy(), 0.64, rtol=1e-12)

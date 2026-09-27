@@ -85,16 +85,30 @@ updates retain fixed bond dimensions: χ controls that rank and there is no
 singular-value thresholding during those one-site updates. Exact contraction
 and `ket_compression=None` perform no ket truncation.
 
+For relative modes (`rel`, `rsum1`, `rsum2`), private Quimb future inputs and
+conditioned ket boundaries are rescaled before compression. Quimb's future
+sweep also equalizes intermediate boundary tensor norms. This prevents large
+finite complex64 singular values from overflowing when squared for `rsum2`.
+The positive scalar cancels from normalized conditionals; the source PEPS and
+returned physical amplitudes keep their original scale. Absolute modes (`abs`,
+`sum1`, `sum2`) retain their original compression scale and threshold semantics.
+This does not guarantee arbitrary-scale contractions or eliminate finite-χ/χ′
+proposal error.
+
 ### Sequential sweep and the two cutoffs
 
-Boundary mode defaults to the simple conditioned-boundary sweep:
+Boundary mode defaults to a conditioned-boundary sweep with FIT-style numerical
+row-environment caching:
 
-1. Cache only future double-layer environments, from the last row toward the
+1. Cache future double-layer environments, from the last row toward the
    first, using `chi` (**χ**).
 2. Combine the current row, its cached future, and the previously sampled
    single-layer ket boundary.
-3. Form a local `d × d` conditional rho, sample its normalized real diagonal,
-   and fix that physical value on both ket and bra. Continue across the row.
+3. Select local factors by site/column tags and build right suffix environments
+   once. Form a local `d × d` rho from those factors, the right suffix, and the
+   conditioned left prefix. Sample and fix that value on both ket and bra,
+   update the left prefix, and continue across the row using `auto-hq` for
+   these small contractions.
 4. After the whole row is fixed, absorb its **single ket layer** into the
    conditioned boundary and compress with `chi_prime` (**χ′**).
 5. Continue to the next row. Accumulate the conditional log probabilities and
@@ -113,6 +127,9 @@ advances `x` within a row, then advances `y`. Describing these slices as columns
 is the same construction after exchanging axes. Future environments are cached
 in the direction opposite to sampling. They are reused unchanged across samples;
 the conditioned ket boundary is different for different sampled prefixes.
+Construction prepares that future cache once. Repeated `sample`, `sample_batch`,
+and probability queries reuse it; call `refresh()` after changing the source
+PEPS to rebuild the cache explicitly.
 
 `ket_compression=None` leaves the conditioned boundary uncompressed, so χ′
 does not cap its represented bonds. `chi=0` or `None` uses identity
@@ -168,8 +185,9 @@ Sequences can differ between NumPy, Torch, JAX, serial sampling, and grouped
 sampling. Grouped sampling uses native uniform draws and inverse cumulative
 probabilities; its seeded sequences can differ from earlier releases that
 called categorical sampling separately for each prefix group. Local-rho
-validation uses the real dtype's precision and clips only roundoff-scale
-negative diagonals; larger negative values and invalid traces raise an error.
+validation uses the real dtype's precision. By default it clips only
+roundoff-scale negative diagonals; larger negative values and invalid traces
+raise an error. Optional positive repair is described below.
 Hermiticity diagnostics scale the matrix before taking norms, avoiding
 complex64 overflow while preserving `norm(rho - rho.H) / max(norm(rho), 1)`.
 
@@ -182,13 +200,73 @@ converts its cached scalar diagnostics when accessed. This is an eager sampler;
 it does not provide a fully compiled JAX or Torch sampling loop, and contractions
 and boundary compression still run separately for distinct prefix groups.
 
+### Hermitian and positive local proposals
+
+Sampling uses `H = (rho + rho.H) / 2` at every site. The contraction is scaled
+before this addition and before probability normalization. Hermitian
+symmetrization alone leaves `real(diag(rho))` unchanged; it does not guarantee
+positive eigenvalues or repair NaN/Inf.
+
+`rho_positivity` controls an additional, explicit spectral repair:
+
+| Value | Matrix whose diagonal defines the conditional |
+| --- | --- |
+| `None` (default) | `H`, with only roundoff-scale negative diagonal clipping |
+| `"clip"` | `V diag(max(lambda, 0)) V.H`, where `H = V diag(lambda) V.H` |
+| `"absolute"` | `V diag(abs(lambda)) V.H = sqrt(H.H @ H)` |
+
+The square root is a **matrix** square root. For a non-Hermitian raw rho,
+`sqrt(rho.H @ rho)` generally differs from this Hermitize-then-repair policy.
+`"clip"` is the nearest positive semidefinite matrix to `H` in Frobenius norm
+before trace normalization; `"absolute"` reflects negative eigenvalues to
+positive values. See [Higham's PSD projection explanation](https://nhigham.com/2021/01/26/what-is-the-nearest-positive-semidefinite-matrix/)
+and [polar decomposition](https://nhigham.com/2020/07/28/what-is-the-polar-decomposition/).
+
+For the absolute-value repair requested in the sampling workflow:
+
+```python
+sampler = PepsSampler(
+    peps, chi=64, chi_prime=32,
+    rho_positivity="absolute",  # Optional; default is None
+)
+result = sampler.sample_batch(samples=128, seed=0)
+```
+
+Both repairs change the finite-cap proposal. All serial, grouped, cached, and
+probability-query paths use the same repaired conditional, so reported
+`log_probabilities` and importance weights use the actual sampling proposal.
+PEPS amplitudes still come from the original private ket. These repairs do not
+guarantee full target support or remove finite-χ/χ′ bias in the proposal.
+NaN/Inf input and a zero repaired trace raise errors; no uniform fallback or
+probability floor is introduced.
+
+For qubits, a batched 2×2 spectral formula avoids a general eigensolver and
+preserves small spectral weights using cancellation-resistant roots and
+projector weights. Larger physical dimensions use native batched `eigh`.
+Only the diagonal of the repaired matrix is computed; neither `H.H @ H` nor
+a full positive matrix is formed. Array operations preserve backend, dtype,
+and device. Prefix grouping still performs one explicit validation scalar
+read per site; an upstream eigensolver for larger local dimensions can add
+its own synchronization.
+
+`rho_diagnostics` retains diagnostics of the **raw** contracted rho, including
+its Hermiticity defect, trace, and negative diagonal mass. It also reports
+`relative_positivity_correction = norm(f(H) - H) / norm(H)` and its per-site
+maximum `max_relative_positivity_correction`. These correction fields are zero
+when repair is disabled; they do not certify positivity in that mode.
+`clipped_negative_mass` records the default diagonal roundoff clipping;
+spectral repairs are recorded by the new correction fields.
+
 ### Boundary and result semantics
 
 `chi_prime` caps the conditioned single-layer ket boundary. `chi`
 caps the optional future double-layer environment. The `dmrg` engine prepares
 future boundaries with Pepsy `BdyMPS`/`CompBdy`; `quimb-mps` uses Quimb's MPS
 environment cache. Ket compression is performed separately with Quimb MPS
-compression or Pepsy `FIT`.
+compression or Pepsy `FIT`. The Quimb future sweep can also truncate temporary
+boundaries between ket and bra layers. A cap large enough for the final boundary
+rank does not by itself establish exact sampling; check convergence against an
+independent reference and account for the cutoff as well.
 
 `result.configs` contains row-major physical-index configurations, while
 `result.omegas` and `result.ps` contain proposal probabilities and projected
@@ -219,39 +297,188 @@ tensors, because a repeated Quimb index would be contracted as an ordinary
 bond. The batch contracts each distinct final configuration's amplitude once from
 the private PEPS for importance weights.
 
-An optional optimization for compact boundary centers uses a Quimb transfer cache: its
-right suffixes are contracted once, while the conditioned left prefix is
-updated immediately after each sampled site. Traced transfers reuse the local
-column contraction. Row bonds and identity future caps are reused until
-`refresh()`.
+The default factored environment cache reuses actual numerical tensors: its
+right suffixes are contracted once per row and incoming prefix group, while
+the conditioned left prefix is updated after each sampled site that has a
+successor in the row. Descendant groups share immutable suffixes but keep their
+own conditioned prefixes. The initial row has no sampled predecessor, so its
+transfer cache is reused across calls until `refresh()`. Later rows depend on
+the sampled preceding rows and are rebuilt for each distinct incoming prefix;
+they are released after that row. Local factors stay separate instead of
+forming dense two-interface column transfers. The cache does not retain its
+temporary center network. This is numerical environment reuse, distinct from
+reusing Cotengra contraction plans.
 
-`row_cache_max_bytes` defaults to **0**, selecting the simple sweep above.
-Supply a positive budget, for example 64 MiB (`64 * 2**20`), to opt into dense
-transfers. Before allocation, the sampler estimates row storage and workspace from the actual
-PEPS/future bonds, conditioned-boundary bond bounds, dtype, and maximum number
-of live prefix groups. Estimates above the budget use the existing local-center
-contractions. Setting the budget to zero disables dense row caches. Larger
-centers with collapsed future MPSs and highly fragmented batches can also use
-the reference route even when they fit the budget. This option bounds the
-estimated cache allocation; it is **not** a cap on total process/device memory,
-contraction-planner workspace, or all retained boundary states.
+Private transfer factors, suffixes, and prefixes are rescaled by positive
+scalars. These common factors cancel from normalized conditionals, preventing
+rare-prefix products from underflowing without changing the PEPS amplitudes or
+boundary truncation policy. Row bonds, identity future caps, and the independent
+future boundary MPS cache are also reused until `refresh()`. Call `refresh()`
+after changing the source PEPS to invalidate all these caches together.
+
+`row_cache_max_bytes` defaults to **64 MiB** (`64 * 2**20`) and
+`row_cache_mode` defaults to **"factored"**. Before allocation, the sampler
+estimates storage and workspace from PEPS/future bonds, conditioned-boundary
+bond bounds, dtype, live prefix groups, and the retained initial row. An
+estimate above the budget falls back to reference local-center contractions.
+Set the budget to zero to explicitly disable row environments, or choose
+`row_cache_mode="dense"` for the legacy materialized-transfer path. That dense
+mode has additional prefix-count/large-future fallback rules. The budget is
+**not** a cap on total process/device memory or exact contraction workspace.
+Use `chunk_size` to keep live prefix groups small enough for the cache budget.
 
 ```python
 sampler = PepsSampler(
     peps, chi_prime=32, chi=64, boundary_engine="dmrg",
     row_cache_max_bytes=64 * 2**20,
 )
-batch = sampler.sample_batch(samples=64, seed=0)
+batch = sampler.sample_batch(samples=64, seed=0, chunk_size=4)
 print(sampler.row_cache_stats)
 print(sampler.batch_stats["conditional_batches"])
 ```
 
-`row_cache_stats` reports the selected `mode`, suffix builds, prefix updates,
+`row_cache_stats` reports the selected `mode`, actual suffix builds, nonterminal
+prefix updates, initial-row reuse (`initial_row_cache_hits` in transfer mode),
 `estimated_cache_bytes` (`None` when caching is disabled), `cache_budget_bytes`, and `cache_decision`
 (`within-budget`, `memory-budget`, `disabled`, `prefix-count`, or `large-future`).
 `batch_stats["conditional_batches"]` counts the site-level validation/draw
 batches. Amplitudes still come from the original private PEPS, and reported
 proposal probabilities still follow the selected boundary approximation.
+
+### Reusable plans, cached rows, and amplitude limits
+
+With `contraction_opt=None` (default), `PepsSampler` constructs one
+`pepsy.tensors.build_optimizer(parallel=False)` for full-network contractions.
+This is the maintained name for `build_contraction`. The reusable Cotengra
+optimizer caches plans by network structure and dimensions, not tensor values.
+It survives `refresh()`; physical boundaries, row environments, normalized
+amplitude leaves, and the selected amplitude tree are rebuilt after refresh.
+
+Cached-row contractions default to `row_contraction_opt="auto-hq"`, independently
+of the full-network optimizer. Set a different row optimizer explicitly, or
+pass `row_contraction_opt=None` to inherit the full optimizer. For an external
+reusable plan cache:
+
+```python
+from pepsy.tensors import build_optimizer
+from pepsy.sampling import PepsSampler
+
+optimizer = build_optimizer(parallel=False, directory="/tmp/peps-paths")
+sampler = PepsSampler(
+    peps, chi=16, chi_prime=8,
+    contraction_opt=optimizer, row_contraction_opt="auto-hq",
+    row_cache_mode="factored", row_cache_max_bytes=64 * 2**20,
+    amplitude_max_intermediate_bytes=512 * 2**20,
+    amplitude_max_cost=5e10,
+)
+batch = sampler.sample_batch(8, chunk_size=2, seed=1)
+print(sampler.amplitude_plan_info)
+```
+
+The row cache selects columns using their `X{x}` tags, builds right suffixes
+once for a conditioned row, and updates the left prefix after each measured
+site. The bottom ket boundary advances after the row and depends on the sampled
+prefix. Tags identify regions; they do not make contraction values reusable
+across different prefixes or evolved states. This is the same directional
+reuse principle as FIT/DMRG environments, separate from Cotengra plan caching.
+
+Optional amplitude limits check the estimated largest intermediate bytes and
+Cotengra contraction cost **before** scaled-leaf allocation and exact execution,
+and recheck an existing amplitude plan before reuse. A rejected plan remains
+inspectable through `amplitude_plan_info`; no approximate amplitudes replace it.
+Both limits default to `None`. They do not bound total process/GPU memory,
+planner memory, all simultaneous inputs, or wall time. Better paths or exact
+slicing can reduce intermediates; prefix chunking alone cannot. A rejected
+public batch raises rather than returning partial samples.
+
+### Bounded batches, exact amplitudes, and weight diagnostics
+
+Use `chunk_size` to bound the number of live sample-prefix states while still
+returning a complete result, or consume `iter_samples` to bound output storage:
+
+```python
+batch = sampler.sample_batch(8192, seed=17, chunk_size=64)
+weights = batch.normalized_weights
+print(batch.effective_sample_size)
+print(batch.weight_diagnostics)
+print(sampler.diagnostics)
+
+for chunk in sampler.iter_samples(8192, chunk_size=64, seed=17):
+    # Consume/write each chunk; do not retain it for bounded output storage.
+    consume(chunk.configs, chunk.log_weights)
+```
+
+Both interfaces use one continuous backend random stream. The same seed and
+chunk size reproduce the same configurations and probabilities; changing the
+chunk size can change draw order. Omitting `chunk_size` preserves the original
+single-batch proposal/draw order. Prefix groups never exceed the current chunk
+size. Caches and exact-contraction workspace are additional memory; this is
+not a hard process/GPU memory limit.
+
+`sample_batch(..., chunk_size=...)` aggregates conditional counts and maximum
+rho defects/repairs across chunks. `iter_samples` exposes statistics and rho
+diagnostics for the most recently yielded chunk. `row_cache_stats` describes
+the latest chunk. `batch_stats["final_prefix_groups"]` for a collected chunked
+batch sums distinct configurations within each chunk, not globally deduplicated
+configurations. `sampler.diagnostics` copies a compact summary to the host;
+`amplitude_stats` reports exact contraction calls and plan builds since refresh.
+A subsequent likelihood query replaces the rho diagnostics but leaves the last
+batch counts intact. Serial `sample` rho diagnostics describe its last draw.
+Each scaled result field must contain one mantissa and exponent per configuration;
+log and weight accessors reject mismatched lengths instead of broadcasting them.
+
+`normalized_weights` computes `exp(log_w - max(log_w))` and normalizes the sum.
+`effective_sample_size` is `1 / sum(normalized_weights**2)`.
+`weight_diagnostics` adds ESS/N, maximum normalized weight, zero-weight count,
+and the log mean unnormalized weight. With full proposal support, the latter
+estimates the log of a Monte Carlo estimate of the squared PEPS norm; it is
+not an unbiased estimator of the logarithm itself. Empty, all-zero, NaN, or
+positive-infinite weight sets raise `ValueError` instead of yielding a uniform
+fallback. Zero-amplitude shots receive zero weight. High observed ESS does not
+establish proposal support or convergence.
+
+Weights normalized separately in separate chunks are **not** globally
+normalized weights. Combine chunks using their unnormalized log weights with
+stable accumulated sums, or use the collected `sample_batch` result for global
+normalization. Self-normalized observable estimates generally have finite-sample
+bias. No generic statistical error bar is inferred from ESS alone.
+
+Exact sampled amplitudes now share a Cotengra contraction plan until `refresh()`.
+A private cache rescales every physical slice once, retains its logarithmic
+scale, and uses exponent stripping for intermediate contractions. This keeps
+phase and original PEPS scale, including amplitudes beyond the raw dtype range.
+It retains at most one additional ket's array data plus small scale arrays and
+contraction metadata. Result exponents may be fractional. No sampled amplitude
+values or configurations are retained between batches. Full exact amplitude
+contractions remain mandatory and are not capped by χ or χ′; the stable path
+adds arithmetic and can cost more than raw contraction on small networks.
+
+The default factored suffix cache avoids forming dense column transfer tensors
+with both horizontal interfaces open. Its settings can be made explicit:
+
+```python
+sampler = PepsSampler(
+    peps, chi=16, chi_prime=8, boundary_engine="quimb-mps",
+    row_cache_mode="factored", row_cache_max_bytes=64 * 2**20,
+)
+batch = sampler.sample_batch(256, seed=17, chunk_size=8)
+```
+
+This caches unmeasured row suffixes and updates the conditioned prefix after
+every sampled site, with no additional truncation. It respects the estimated
+memory budget and uses the reference path when oversized. The initial-row cache
+is reused until refresh; later rows are conditioned on their incoming prefix.
+It can reduce repeated contractions on wider lattices but be slower on small
+lattices. The numerical-reuse policy is the default; zero budget explicitly
+selects the reference path, and dense transfers require `row_cache_mode="dense"`.
+`row_cache_stats` reports `cache_representation` and mode `factored` when used.
+
+A reproducible evolved-state CPU/GPU benchmark is
+[`benchmarks/peps_sampling.py`](../../../benchmarks/peps_sampling.py). It separates
+setup, batch throughput, synchronized stage timings, and memory measurements,
+and checks amplitudes against a dense oracle for at most 16 sites. See the
+[dated efficiency study](../../development/notes/peps_sampler_efficiency.md)
+for measured benefits and limits.
 
 ### Likelihoods, zero branches, and truncation limits
 
@@ -264,15 +491,18 @@ log_q = sampler.log_probability(config)
 q = sampler.probability(config)  # exp(log_q), if representable as a float
 ```
 
-Exact and default boundary likelihood queries use exponent-stripped local
+Exact and reference boundary likelihood queries use exponent-stripped local
 contractions. This protects rare-configuration likelihoods against intermediate
 underflow; the common rho scale cancels from each normalized conditional.
+The optional transfer route instead rescales its cached factors and running
+prefix/suffix tensors, so it also avoids multiplying full-prefix probabilities.
 `rho_diagnostics` describes the rho actually evaluated, so traces from these
-queries are scaled. Sampling diagnostics retain their usual contraction scale.
-An opt-in dense transfer cache still materializes ordinary tensors and does not
-provide the same scaling protection. Log bookkeeping also does not guarantee
-that arbitrary ill-scaled input contractions or final raw amplitudes cannot
-overflow/underflow.
+queries are scaled. Transfer-cache diagnostics also use the rescaled proposal
+tensors. The cache materializes ordinary arrays, so scaling and log bookkeeping
+do not guarantee that arbitrary ill-scaled input contractions cannot lose
+precision or overflow/underflow. Sampled amplitudes use the separately scaled
+contraction described above; reconstructing raw amplitudes from their scaled
+pairs can still exceed the destination dtype range.
 
 A genuine zero branch returns `log_q = -inf` and `q = 0`. A finite log likelihood
 can also produce `q = 0` when the final value underflows a Python float. All
