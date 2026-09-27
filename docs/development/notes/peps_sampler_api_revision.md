@@ -28,9 +28,8 @@ dependency changes, sibling edits, or production-job changes were made.
   from the shared BP result container as well. They do not materialize powers
   of ten or normalize the importance weights. Existing fields are preserved.
 - Updated [API documentation](../../api/sampling/samplers.md), changelog,
-  owning/root export checks, and a runnable
-  [small example](../../../examples/peps_sampling.py). Removed a reference to
-  an absent development example.
+  owning/root export checks, and a runnable small example. That standalone
+  example was removed later; its behavior remains covered by focused tests.
 
 The upstream audit from the preceding same-task review was reused in the
 unchanged environment. This revision adds no upstream compatibility shim;

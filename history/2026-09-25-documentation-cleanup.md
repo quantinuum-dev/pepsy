@@ -36,7 +36,8 @@
   configuration settings were checked.
 - **Seven documentation/example smoke checks passed** using the selected
   Python 3.12 environment: the getting-started PEPS contraction, the first
-  Gibbs-MPS example, and all five scripts under `examples/operators/`.
+  Gibbs-MPS example, and all five then-current scripts under
+  `examples/operators/`. Those standalone operator scripts were removed later.
   Additional checks verified a finite positive contraction/partition function,
   normalized thermal trace, and consistent partition/log-partition readout.
 - Build dependencies were reused from the temporary documentation overlay;

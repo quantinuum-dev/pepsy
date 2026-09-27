@@ -75,12 +75,9 @@ jobs:
           python -m pip check
       - name: Run MPI unit-contract tests
         run: python -m pytest -q -ra -o addopts="" tests/test_mpi.py
-      - name: Run multi-process integration and benchmark smoke tests
+      - name: Run multi-process integration tests
         run: |
           for ranks in 2 3; do
             mpiexec --oversubscribe --bind-to none -n "$ranks" \
               python -m pytest -q -ra -o addopts="" tests/test_mpi_integration.py
-            mpiexec --oversubscribe --bind-to none -n "$ranks" \
-              python benchmarks/mpi_shots.py \
-              --shots 8 --qubits 2 --depth 1 --chi 4 --workers auto
           done

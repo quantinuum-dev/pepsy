@@ -76,11 +76,11 @@ reindexing ket/bra legs.  ``to_mpo()`` is still the explicit conversion
 boundary: it applies the local map ``P[p, upper, lower]`` and produces a
 standard Quimb MPO with two dimension-two physical legs.
 
-For a 2D contraction example, see
-`examples/pauli_mpo_trace_flat_peps.py`. It builds a four-row, vertically
-periodic flat network for ``trace(A @ B @ C @ D)`` directly from native
-PauliMPO cores. The basis map is applied locally at each site; no dense global
-operator or intermediate Quimb MPO is formed.
+A four-row, vertically periodic flat network for ``trace(A @ B @ C @ D)`` can
+be built directly from native `PauliMPO` cores. Apply the basis map locally at
+each site so that no dense global operator or intermediate Quimb MPO is
+formed. The Pauli-MPO tests exercise this construction against dense
+references.
 
 Canonicalization combines equal Pauli words, orders them deterministically,
 and can prune small coefficients without leaving the Pauli basis:

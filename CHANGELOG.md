@@ -216,6 +216,9 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Development
 
+- Remove obsolete standalone operator, PEPS-sampling, MPI-launcher, and MPS
+  compression benchmark scripts. Current guides now point to maintained APIs
+  and regression tests, and nightly MPI validation uses its integration suite.
 - Separate sampler engines and records, MPS controls and norm bookkeeping,
   stabilizer advice and layout planning, and BP loop geometry into their
   owning modules. Preserve public APIs, historical serialization paths, and

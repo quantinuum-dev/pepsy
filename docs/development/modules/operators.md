@@ -194,26 +194,12 @@ guard for this decision is [`test_operator_api_contract.py`](../../../tests/test
 | Pauli sparse algebra/trace | `PauliMPO` | Treating it as a second unrelated exponential engine |
 | PEPS/PEPO contraction corrections | `pepsy.bp` loop/cluster APIs | Operator cluster expansion; BP acts on contractions/environments |
 
-## Example smoke set
+## Maintained smoke coverage
 
-The five small scripts in
-[`examples/operators`](https://github.com/quantinuum-dev/pepsy/tree/develop/examples/operators)
-are the canonical smoke examples:
-
-1. [`higher_order_mpo.py`](../../../examples/operators/higher_order_mpo.py)
-   — compile and materialize a higher-order MPO.
-2. [`fixed_channel_pepo.py`](../../../examples/operators/fixed_channel_pepo.py)
-   — evaluate sparse fixed-channel PEPO blocks and materialize explicitly.
-3. [`dense_cluster_pepo.py`](../../../examples/operators/dense_cluster_pepo.py)
-   — build a finite dense connected-cluster PEPO.
-4. [`ordered_pepo_product.py`](../../../examples/operators/ordered_pepo_product.py)
-   — build an ordered `exp(A) @ exp(B)` product through one joint topology.
-5. [`ordered_mpo_product.py`](../../../examples/operators/ordered_mpo_product.py)
-   — build the MPO analogue through the joint local-residual path.
-
-They intentionally use small systems, public namespace imports, and no
-notebook output. They are examples of API selection, not performance
-benchmarks.
+`tests/test_operator_comparison.py` is the maintained comparison matrix for
+higher-order MPOs, fixed-channel and dense-cluster PEPOs, and ordered MPO/PEPO
+products. It uses small dense references and public APIs. The focused tests
+for each owning module cover construction details and materialization.
 
 ## Review rule for future additions
 

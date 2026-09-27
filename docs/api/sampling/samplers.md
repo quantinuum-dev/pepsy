@@ -519,9 +519,9 @@ Reweighting cannot restore a configuration that is never sampled. Check cutoff
 convergence and support on tractable reference cases; no probability floor or
 uniform mixture is inserted implicitly.
 
-Run the small [sampling example](../../../examples/peps_sampling.py) with
-`python examples/peps_sampling.py`. It demonstrates χ/χ′, batch log results,
-and a comparison to exact proposal probabilities on a 2×3 PEPS.
+For small systems, compare `batch.log_probabilities` with values returned by
+an exact `PepsSampler(peps)` before increasing χ and χ′. This checks proposal
+support and truncation error without relying on a repository example script.
 
 ## MPS sampler quick API
 

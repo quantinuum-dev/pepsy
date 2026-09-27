@@ -475,32 +475,16 @@ rank-zero aggregate bar for independent ordinary, streaming, and checkpointed
 runs; coalesced runs intentionally suppress shot-level progress because their
 work is branch-based rather than one optimizer per shot.
 
-For rank-scaling measurements, use the repository benchmark script and vary
-only the MPI process count between runs:
+For rank-scaling measurements, call `MPIShotRunner.run` from the workload you
+intend to measure and vary only the MPI process count between runs. Record the
+slowest-rank wall time and global completed-shot count. Use
+`local_workers=1` for a process-only baseline and compare independent and local
+coalesced execution separately; coalescing is not rank-count invariant.
 
-```bash
-mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
-  --shots 10000 --qubits 16 --depth 8
-```
-
-The script defaults to `--workers auto` and reports the slowest-rank wall time
-and global shots per second. Pass `--workers 1` for a process-only baseline.
-Compare independent and local coalesced execution separately; coalescing is
-not rank-count invariant.
-
-For a multi-node Slurm allocation, the repository includes a launcher smoke
-template:
-
-```bash
-sbatch benchmarks/mpi_slurm.sh
-```
-
-It uses `srun` and the cluster's configured PMI/PMIx transport. Set
-`PEPSY_MPI_SHOTS`, `PEPSY_MPI_QUBITS`, `PEPSY_MPI_DEPTH`,
-`PEPSY_MPI_WORKERS`, or `PEPSY_MPI_STRATEGY` in the batch environment to adjust
-the workload; the
-script assumes Pepsy and its MPI-enabled Python environment are already
-available on every node.
+On a scheduler, launch that workload with the site's supported MPI transport
+and ensure Pepsy and its MPI-enabled Python environment are available on every
+node. The repository's multi-process integration tests validate the API
+contract without prescribing a cluster-specific launcher.
 
 ### Resuming a streaming run
 

@@ -312,8 +312,10 @@ Status: complete.
   representation-specific fields.
 - Add a small comparison matrix covering exact dense results, MPO, PEPO,
   cluster, and ordered-product results on the same two- and three-site models.
-- Put reusable examples under `pepsy/examples/operators/`; keep notebooks in
-  sibling example repositories focused on experiments and visualization.
+- Keep reusable comparisons in focused tests; keep experiment and
+  visualization notebooks in sibling example repositories. The temporary
+  standalone operator smoke scripts were removed after their coverage moved
+  into the test matrix.
 
 The comparison matrix in `tests/test_operator_comparison.py` covers exact
 two- and three-site references for MPO clusters, ordered MPO products,

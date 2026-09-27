@@ -23,9 +23,9 @@ No commits, publishing, shared-environment changes, or production-job changes.
   singular-value truncation; chi determines the represented future rank.
   The conditioned FIT ket rank is set by its compressed guess. Passing
   cutoff options does not silently change FIT block size or iteration policy.
-- Updated the [API](../../api/sampling/samplers.md), changelog, and
-  [example](../../../examples/peps_sampling.py). Source PEPS tensors, backend,
-  dtype, and device remain preserved in the numerical regressions.
+- Updated the [API](../../api/sampling/samplers.md), changelog, and the then
+  current standalone example, which was removed later. Source PEPS tensors,
+  backend, dtype, and device remain preserved in the numerical regressions.
 
 ## Numerical cases
 
