@@ -20,6 +20,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Reduce complete traces of located exact Pauli-history PEPOs to certified
+  identity-subtree sectors before dense allocation. Preserve the full PEPO,
+  coefficient gradients, and parameter-independent trace topology; rank-capped
+  and uncertified builders retain all sectors.
 - Inspect active PEPO dense-storage size with differentiable Torch blocks
   without converting them to NumPy. Use Python integer products for dense
   size estimates so large virtual dimensions cannot overflow a machine integer.

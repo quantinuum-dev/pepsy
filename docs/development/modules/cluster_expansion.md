@@ -23,9 +23,14 @@ materialization boundary for square tensors, while graph blocks use
 `to_tensor_network()`.
 
 Square `ActivePEPOBlocks.to_trace_network()` traces each physical block before
-dense site allocation. It preserves the fixed history sectors, including
-zero-trace blocks, and returns an unnormalized bosonic `TensorNetwork2D`.
-`trace_nbytes` is `dense_nbytes / physical_dim**2`; both estimates use Python
+dense site allocation and returns an unnormalized bosonic `TensorNetwork2D`.
+Located exact Pauli trees certify their identity-subtree sectors through
+`trace_sectors`; the complete trace removes other sectors before allocation.
+This structural reduction never inspects coefficients or changes the full
+PEPO/lower-cluster subtraction. Allowed numerical zeros remain. Rank-capped
+trees and uncertified builders keep all sectors; `compact()` drops the
+certificate conservatively when relabeling sectors.
+`trace_nbytes` is at most `dense_nbytes / physical_dim**2`; both estimates use Python
 integers and backend dtype metadata without detaching differentiable arrays.
 These estimates exclude active construction and contraction/backward memory.
 

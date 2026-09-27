@@ -1211,6 +1211,11 @@ class PauliPEPOBasis:
                         sector_by_direction,
                         paulis[pauli_index],
                     )
+        # Tracing a nonroot selector kills X/Y/Z. Inductively, the subtree
+        # history on every parent leg must be all-I (index zero). At the root
+        # this selects the identity coefficient. This certificate applies to
+        # the closed trace only, never to lower-support operator subtraction.
+        return {sector[0] for sector in sectors.values()}
 
     def _build_inhomogeneous_active(self, factor_sources):
         """Build an occurrence-aware finite-lattice connected-cluster PEPO."""
@@ -1257,6 +1262,7 @@ class PauliPEPOBasis:
             for site_index, site in enumerate(self._sites)
         }
         allocator = _SectorAllocator()
+        trace_sectors = {0}
         for cluster_order in range(2, min(self.order, len(self._sites)) + 1):
             # Residuals at one order subtract the completed lower-order PEPO,
             # never another correction from the same level.
@@ -1281,12 +1287,17 @@ class PauliPEPOBasis:
                     record.edges,
                 )
                 residual = ar.do("subtract", exact, lower)
-                self._add_localized_pauli_tree(
+                allowed = self._add_localized_pauli_tree(
                     blocks,
                     allocator,
                     record,
                     residual,
                 )
+                if allowed is None:
+                    # A rank-capped SVD does not have fixed Pauli selectors.
+                    trace_sectors = None
+                elif trace_sectors is not None:
+                    trace_sectors.update(allowed)
 
         self._build_count += 1
         return ActivePEPOBlocks(
@@ -1297,6 +1308,7 @@ class PauliPEPOBasis:
             physical_dim=2,
             site_directions=self.site_directions,
             blocks=blocks,
+            trace_sectors=None if trace_sectors is None else frozenset(trace_sectors),
         )
 
     @staticmethod

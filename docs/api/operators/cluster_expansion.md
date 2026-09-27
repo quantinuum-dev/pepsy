@@ -362,9 +362,18 @@ normalized_trace = trace / 2**(active.lx * active.ly)
 ```
 
 The returned `TensorNetwork2D` is an **unnormalized** trace of the same PEPO.
-It uses `physical_dim**2` fewer dense site entries than materializing both
-physical legs. All structural channels remain, including zero trace blocks;
-there is no value-based pruning or detached coefficient graph. This is a
+It uses at most `dense_nbytes / physical_dim**2` bytes. Located exact
+Pauli-history builders additionally certify which sectors survive a complete
+physical trace: each nonroot selector must carry identity on every site in
+its subtree. Removing the other sectors is algebraic and independent of
+coefficient values, backend, or gradient tracking. Allowed channels remain
+even when their current coefficient is zero. The full operator and the
+lower-cluster operator subtraction retain every history.
+
+`trace_sectors` records this optional builder certificate. It is not valid
+for partial traces or after arbitrary edits to physical blocks. Builders
+without a certificate, including rank-capped SVD trees, retain all sectors.
+There is no value-based pruning or detached coefficient graph. This is a
 dense bosonic trace, not a graded fermionic trace. Boundary contraction adds
 its own approximation and workspace beyond these storage estimates.
 

@@ -176,6 +176,10 @@ class ActivePEPOBlocks:
     charge_symmetry: str | None = None
     physical_sectors: dict | None = None
     virtual_sector_charges: dict | None = None
+    # Optional structural certificate for the *complete physical trace*.
+    # Fixed Pauli-history trees can only transmit identity histories once
+    # every physical leg is closed. Never infer this set from tensor values.
+    trace_sectors: frozenset[int] | None = None
 
     @property
     def active_block_count(self):
@@ -207,21 +211,30 @@ class ActivePEPOBlocks:
     @property
     def trace_nbytes(self):
         """Dense site storage after closing physical legs, excluding workspace."""
-        return self.dense_nbytes // self.physical_dim**2
+        return replace(self, blocks=self._trace_blocks()).dense_nbytes // self.physical_dim**2
+
+    def _trace_blocks(self):
+        """Restrict only structurally certified histories, retaining live zeros."""
+        if self.trace_sectors is None:
+            return self.blocks
+        return {site: {key: block for key, block in blocks.items()
+                       if all(sector in self.trace_sectors for sector in key)}
+                for site, blocks in self.blocks.items()}
 
     def to_trace_network(self):
         """Return an unnormalized scalar TensorNetwork2D without dense PEPO legs.
 
         Trace each active physical block before site materialization. For
-        physical dimension d this needs d**2 fewer dense site entries. Keep
-        every structural history channel, including zero trace blocks, so
-        coefficient changes do not select a different autodiff topology.
+        physical dimension d this needs at most 1/d**2 the dense entries. Keep
+        every coefficient-dependent channel, including numerical zeros.
+        When the builder certifies trace-only sectors, eliminate the other
+        histories algebraically, independently of parameter/backend values.
         This dense bosonic trace is not a native graded fermionic trace.
         """
         traced = replace(self, physical_dim=1, blocks={
             site: {key: ar.do("reshape", ar.do("trace", block), (1, 1))
                    for key, block in blocks.items()}
-            for site, blocks in self.blocks.items()
+            for site, blocks in self._trace_blocks().items()
         }).to_pepo()
         for site in self.blocks:
             traced[traced.site_tag(*site)].trace(

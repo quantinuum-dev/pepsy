@@ -92,3 +92,55 @@ def test_batched_local_exponentials_match_analytic_onsite_values_and_gradients()
     want, = torch.autograd.grad(expected, theta)
     torch.testing.assert_close(actual, expected, atol=3e-14, rtol=3e-14)
     torch.testing.assert_close(got, want, atol=3e-13, rtol=3e-13)
+
+
+@pytest.mark.optional
+@pytest.mark.integration
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_fixed_history_trace_reduction_is_structural_and_preserves_all_gradients(cyclic):
+    import numpy as np
+
+    torch = pytest.importorskip("torch")
+    from pepsy.operators import PauliPEPOTerm, PEPOClusterProductExpansion
+
+    basis = PauliPEPOBasis.compile(2, 2, [PauliPEPOTerm("onsite", "X"),
+        PauliPEPOTerm("edge", "ZZ"), PauliPEPOTerm("onsite", "Y", where=(0, 0))],
+        cyclic=cyclic, order=4)
+    expansion = PEPOClusterProductExpansion.from_bases((basis, basis), coefficients=(-.17j, .11j)).compile_exp()
+    sectors = None
+    shapes = None
+    for values in ([0., 0., 0.], [.21, -.37, .13], [-.09, .16, .08]):
+        theta = torch.tensor(values, dtype=torch.float64, requires_grad=True)
+        active = expansion.exp(1., coefficients=(theta, theta.flip(0)), materialize=False)
+        assert active.trace_sectors is not None
+        if sectors is None:
+            sectors = active.trace_sectors
+        assert sectors == active.trace_sectors
+        full = torch.trace(active.to_pepo().to_dense())
+        # Disable the certificate to retain the original trace representation.
+        untrimmed = replace(active, trace_sectors=None).to_trace_network().contract(all, optimize="greedy")
+        network = active.to_trace_network()
+        if shapes is None:
+            shapes = tuple(t.shape for t in network)
+        assert shapes == tuple(t.shape for t in network)
+        actual = network.contract(all, optimize="greedy")
+        torch.testing.assert_close(actual, full, atol=3e-12, rtol=3e-12)
+        torch.testing.assert_close(actual, untrimmed, atol=3e-12, rtol=3e-12)
+        expected_grad, = torch.autograd.grad(full.real + .3*full.imag, theta, retain_graph=True)
+        gradient, = torch.autograd.grad(actual.real + .3*actual.imag, theta)
+        torch.testing.assert_close(gradient, expected_grad, atol=3e-12, rtol=3e-12)
+        assert active.trace_nbytes < active.dense_nbytes // 4
+        assert active.trace_nbytes == sum(t.data.numel()*t.data.element_size() for t in network)
+        numeric = expansion.exp(1., coefficients=(np.array(values), np.array(values)[::-1]), materialize=False)
+        assert numeric.trace_sectors == sectors
+        np.testing.assert_allclose(numeric.to_trace_network().contract(all, optimize="greedy"),
+                                   actual.detach(), atol=3e-12, rtol=3e-12)
+
+
+def test_rank_truncation_has_no_fixed_history_trace_certificate():
+    from pepsy.operators import PauliPEPOTerm
+
+    active = PauliPEPOBasis.compile(2, 2, [PauliPEPOTerm("onsite", "X", where=(0, 0)),
+        PauliPEPOTerm("edge", "ZZ")], order=3, max_tree_rank=2).exp(-.1j, coefficients=[.2, .4])
+    assert active.trace_sectors is None
+    assert active.trace_nbytes == active.dense_nbytes // 4
