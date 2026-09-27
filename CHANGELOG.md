@@ -39,6 +39,17 @@ releases remain backwards-compatible. From 1.0 onward:
   record repaired proposal probabilities and report the relative correction,
   while preserving original PEPS amplitudes and rejecting NaN/Inf input.
 
+- Opt-in `contract_flat(..., method="mps", mps_factorization="projector")`
+  for dense 2D direct boundary compression. A composed isometric-factor Torch
+  VJP handles redundant virtual directions without singular QR inverses or
+  regularized singular-vector derivatives. It supports first-order,
+  gauge-invariant losses on locally fixed-rank, spectrally gapped subspaces;
+  unsupported singular charts raise instead of returning a surrogate.
+
+- `ActivePEPOBlocks.to_trace_network()` closes physical blocks before dense
+  materialization, returning an unnormalized `TensorNetwork2D` with preserved
+  NumPy/Torch/JAX values. `trace_nbytes` reports its dense site storage.
+
 - `PepsSampler` exposes `chi` (future double-layer cap) and `chi_prime`
   (conditioned ket cap); `marginal_chi` and `sample_chi` remain compatible
   aliases with conflict checks. Automatic mode selection keeps uncapped calls
@@ -159,6 +170,45 @@ releases remain backwards-compatible. From 1.0 onward:
   Quimb compression and FIT guesses while preserving absolute-cutoff semantics,
   source tensors, physical amplitudes, and cached-future reuse.
 
+- Reduce complete traces of located exact Pauli-history PEPOs to certified
+  identity-subtree sectors before dense allocation. Preserve the full PEPO,
+  coefficient gradients, and parameter-independent trace topology; rank-capped
+  and uncertified builders retain all sectors.
+- Inspect active PEPO dense-storage size with differentiable Torch blocks
+  without converting them to NumPy. Use Python integer products for dense
+  size estimates so large virtual dimensions cannot overflow a machine integer.
+- Batch located equal-size cluster products, preserving factor order and
+  coefficient gradients while avoiding repeated scalar exponential dispatch.
+  This also avoids measured small-matrix Torch exponential inaccuracies in
+  the covered batches; local targets and cluster orders are unchanged.
+
+- Preserve resolved Torch SVD derivatives under `stabilized=True`: replace
+  global Lorentzian damping with compact relative stabilization, retaining
+  the same gap threshold and finite singular-case extension. Use the
+  dtype/shape numerical-rank threshold for inverse singular values, separately
+  from the singular-gap threshold.
+  Applies to both real/complex Autoray and native Symmray split paths.
+- Renormalize native Symmray SU gauge vectors over their backend blocks,
+  preserving Torch gradients and stable exponent accounting without densifying
+  the vectors or calling an unsupported Symmray mean.
+- Forward `cutoff_mode` through PEPO gate construction and its fallback
+  compression, which also now respects the requested `cutoff`. Expose optional
+  cutoff-mode selection for compressed hyper-contraction.
+- Preserve simple-update gauge values and first derivatives when extracting
+  their RMS scale: divide and restore the same detached positive scale, avoid
+  overflow/underflow in norm evaluation, and keep zero gauges finite.
+- Capture Torch QR rank policy during forward so backward remains consistent
+  after a scoped configuration exits. Add opt-in `qr_rank_policy="adaptive"`
+  to preserve finite native VJPs and warn when a singular/nonfinite block
+  needs the regularized fallback.
+- Build dense MPO/PEPO gate streams in Quimb's operator convention: upper
+  `k...` indices are outputs, lower `b...` indices are inputs, and later gates
+  multiply on the left. Remove the legacy per-gate transpose. `tns_align`
+  now applies this convention by default, with `transpose=True` available
+  for explicitly transposed operators. Rebuild old general gate streams;
+  transposing their final operator alone may not fix their order.
+- Apply lazy sub-MPOs when `gate_with_submpo(..., inplace_mpo=False)`;
+  this flag controls the applied operator's defensive copy, not application.
 - Correct the bra/ket orientation in native MPS sampling and probability
   evaluation with complex right environments. NumPy, Torch, and CuPy use
   the corrected Born-weight contraction; complex-state sample distributions

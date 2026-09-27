@@ -11,5 +11,12 @@
   CUDA was hidden for tests. Full numerical suite was not rerun.
 - Gaugy fast-forwarded from `e9a7dad` to `04629ce` (42 incoming commits),
   with a clean working tree matching `origin/develop`.
-- Pepsy fetched ten incoming commits through `bd7a4bf`; pending work is to be
-  committed before merging upstream. No push requested or performed.
+- Pepsy committed pending work as `9ec5b4a`, then pulled ten incoming commits
+  through `bd7a4bf`. Additive conflicts in CHANGELOG.md and the development
+  notes index were resolved by retaining both sets of entries.
+- No push requested or performed. The patch tool failed during sandbox setup;
+  exact-match checked replacements resolved the documentation markers.
+- Post-merge validation: the same focused selection produced 108 passed and
+  the same installed 0.4.1 versus checkout 0.5.0 metadata failure (116.64 s).
+  Ruff, notes-index local links, conflict-marker and whitespace checks passed.
+  Incoming Gaugy code and the full Pepsy numerical suite were not tested.

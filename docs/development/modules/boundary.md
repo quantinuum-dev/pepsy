@@ -12,6 +12,13 @@ changes here should be made carefully because downstream packages such as
 - `states.py`: `BdyMPS`, the reusable boundary-MPS store.
 - `sweeps.py`: `CompBdy`, the FIT/DMRG-style boundary update engine.
 
+`contract_flat(..., method="mps", mps_factorization="projector")` routes all
+direct-boundary canonicalization, reductions, and compression through the
+paired-factor driver owned by `pepsy.backends.projector_split`. Keep all
+three stages on that path: leaving a raw singular QR/SVD-vector backward in
+the chain reintroduces the failure. It is a dense NumPy/Torch first-order
+option, not a change to FIT/DMRG, CTMRG, SU, or native symmetry policies.
+
 ## Core flow
 
 The standard Pepsy boundary path is:

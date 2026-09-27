@@ -7,6 +7,7 @@ work. For application code, start with the [API guides](../api/index.md).
 
 | Need | Read |
 | --- | --- |
+| Track cluster PEPO and Gaugy optimization work | [Published status, tests and limitations](cluster_optimization_status.md) |
 | Upgrade existing code | [API migration](api-migration.md) |
 | Find source ownership and imports | [Package layout](package_layout.md) and [module maps](modules/README.md) |
 | Understand compatibility aliases | [Public API surface](api-surface.md) |
@@ -65,4 +66,5 @@ plot_policy
 api-migration
 api-surface
 import-weight
+cluster_optimization_status
 ```

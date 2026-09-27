@@ -1,5 +1,51 @@
 # `pepsy.operators.gates`
 
+## Operator convention
+
+Dense MPO/PEPO builders consume gates in application order: a stream
+`[A, B]` represents `B @ A`. Gates can be matrices or tensors with all output
+axes followed by all input axes. Operators use Quimb's native convention:
+upper `k...` indices are outputs and lower `b...` indices are inputs.
+This agrees with Quimb's `to_dense`, operator application, and lazy composition.
+
+Use `pepsy.tensors.tns_align(state, operator)` for lazy application in this
+convention. Its explicit `transpose=True` option applies the operator's
+transpose, for callers that knowingly hold a transposed representation.
+Earlier dense builders transposed each gate individually. Rebuild saved
+operators from their original streams: a final transpose alone cannot in
+general repair both their orientation and ordering.
+
+Raw lower-leg gates and lazy lower-leg operators have different meanings in
+Quimb. A raw gate `G` on operator `X` produces `X @ G.T`; request
+`transpose=True` to obtain `X @ G`. A lazy lower-leg sub-MPO `A` produces
+`X @ A` directly. `gate_with_submpo(..., inplace_mpo=False)` defensively copies
+the applied MPO; it still applies it. The separate `inplace` flag controls
+whether the target network is mutated.
+
+## Truncation policy
+
+`build_pepo_from_gates(..., cutoff_mode="rsum2")` applies the requested
+truncation policy to both gate splits and fallback compression. The fallback
+also uses the supplied `cutoff`, rather than a separate hard-coded threshold.
+
+## Gauge scale extraction
+
+`renorm_gauge(network, gauges, where, smudge=1e-12)` divides a bond's weights
+by a detached positive scale and adds the logarithm of **that same scale**
+to `network.exponent`. It preserves the represented operator and the first
+derivative of its reconstructed weights. RMS evaluation uses weights relative
+to their largest magnitude, avoiding squares of very large or tiny inputs.
+
+`smudge` is a nonnegative finite floor on a nonzero RMS scale. An all-zero
+gauge uses scale one and remains zero, with finite exponent bookkeeping.
+This tracks numerical scale; it does not normalize a physical overlap.
+
+Native Symmray `BlockVector` gauges use the same rule, reducing over backend
+blocks and weighting every singular value equally even when sector sizes
+differ. Blocks remain native, and the scale is detached at the block backend.
+
+## Native fermionic gates
+
 The gate-to-operator builders accept native Symmray fermionic gates directly;
 they do not convert them through dense arrays. Charge-neutral gates work by
 default, such as `Fermion.hopping_gate(...)`:

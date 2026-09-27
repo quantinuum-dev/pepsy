@@ -31,6 +31,16 @@ combines `reg_*_torch` helpers or `register_torch_linalg(...)` arguments.
   decomposition, not `complex64`/`complex128` promotion. Add a focused
   reconstruction or gradient test when changing a backend route.
 
+The dense boundary option `mps_factorization="projector"` is a separate
+composed-factor algorithm, registered under the package-owned Quimb name
+`pepsy:projector`; it must not replace the existing QR/SVD drivers. It honors
+the scoped policy's forward SVD choices and supplies a first-order VJP for
+gauge-invariant paired factors. Keep canonicalization, reductions, and actual
+truncation on the same path. Preserve locally fixed-rank/gapped-chart limits
+and explicit rejection of unsupported cotangents. Validate complete compressed
+contractions, not only individual matrix factors. This option does not extend
+to native symmetry, JAX, or SU automatically.
+
 ## Cyclic CTMRG compatibility
 
 - Use `pepsy.boundary.quimb_ctmrg_projector_compat` around Quimb CTMRG calls

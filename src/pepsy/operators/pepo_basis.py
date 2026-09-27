@@ -976,6 +976,28 @@ class PauliPEPOBasis:
             )
         return result
 
+    def _localized_ordered_products(self, localized, records, *, like, batch_size=8):
+        """Batch equal-size finite-cluster targets, preserving factor order.
+
+        Actual finite embeddings share matrix size, but not coefficients.
+        Batching avoids per-cluster backend dispatch and uses Torch's batched
+        exponential path, which is more accurate than its low-degree scalar
+        shortcut for small onsite matrices in tested Torch versions.
+        """
+        results = []
+        for start in range(0, len(records), batch_size):
+            chunk = records[start:start + batch_size]
+            result = None
+            for basis, beta, site_components, edge_components in localized:
+                hamiltonians = ar.do("stack", tuple(
+                    basis._localized_cluster_hamiltonian(
+                        record, site_components, edge_components, like=like)
+                    for record in chunk), axis=0)
+                local_exp = _backend_expm(ar.do("multiply", -beta, hamiltonians))
+                result = local_exp if result is None else ar.do("matmul", result, local_exp)
+            results.extend(result[i] for i in range(len(chunk)))
+        return tuple(results)
+
     @staticmethod
     def _localized_tree_topology(edges, nsites):
         """Choose a deterministic spanning tree and a low-width root."""
@@ -1189,6 +1211,11 @@ class PauliPEPOBasis:
                         sector_by_direction,
                         paulis[pauli_index],
                     )
+        # Tracing a nonroot selector kills X/Y/Z. Inductively, the subtree
+        # history on every parent leg must be all-I (index zero). At the root
+        # this selects the identity coefficient. This certificate applies to
+        # the closed trace only, never to lower-support operator subtraction.
+        return {sector[0] for sector in sectors.values()}
 
     def _build_inhomogeneous_active(self, factor_sources):
         """Build an occurrence-aware finite-lattice connected-cluster PEPO."""
@@ -1227,14 +1254,7 @@ class PauliPEPOBasis:
             for basis, beta, site_components, edge_components in localized
         ]
         cluster_records = self._localized_cluster_records()
-        one_exps = tuple(
-            self._localized_ordered_product(
-                localized,
-                record,
-                like=reference,
-            )
-            for record in cluster_records[1]
-        )
+        one_exps = self._localized_ordered_products(localized, cluster_records[1], like=reference)
         blocks = {
             site: {
                 (0,) * len(self.site_directions[site]): one_exps[site_index]
@@ -1242,6 +1262,7 @@ class PauliPEPOBasis:
             for site_index, site in enumerate(self._sites)
         }
         allocator = _SectorAllocator()
+        trace_sectors = {0}
         for cluster_order in range(2, min(self.order, len(self._sites)) + 1):
             # Residuals at one order subtract the completed lower-order PEPO,
             # never another correction from the same level.
@@ -1257,24 +1278,26 @@ class PauliPEPOBasis:
                     for site, site_blocks in blocks.items()
                 },
             )
-            for record in cluster_records[cluster_order]:
-                exact = self._localized_ordered_product(
-                    localized,
-                    record,
-                    like=reference,
-                )
+            records = cluster_records[cluster_order]
+            exact_products = self._localized_ordered_products(localized, records, like=reference)
+            for record, exact in zip(records, exact_products):
                 lower = _contract_active_support_backend(
                     lower_active,
                     record.sites,
                     record.edges,
                 )
                 residual = ar.do("subtract", exact, lower)
-                self._add_localized_pauli_tree(
+                allowed = self._add_localized_pauli_tree(
                     blocks,
                     allocator,
                     record,
                     residual,
                 )
+                if allowed is None:
+                    # A rank-capped SVD does not have fixed Pauli selectors.
+                    trace_sectors = None
+                elif trace_sectors is not None:
+                    trace_sectors.update(allowed)
 
         self._build_count += 1
         return ActivePEPOBlocks(
@@ -1285,6 +1308,7 @@ class PauliPEPOBasis:
             physical_dim=2,
             site_directions=self.site_directions,
             blocks=blocks,
+            trace_sectors=None if trace_sectors is None else frozenset(trace_sectors),
         )
 
     @staticmethod

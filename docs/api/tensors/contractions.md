@@ -25,6 +25,13 @@ Cotengra 0.8's automatic subtree reconfiguration remains active. Persistent
 tree caching is available through `directory=...`; the default cache is
 in memory.
 
+## Compressed contraction
+
+`contract_hypercompressed_tn(..., cutoff_mode="abs")` forwards the selected
+singular-value truncation policy to Quimb's compressed contraction. Omitting
+`cutoff_mode` preserves Quimb's default. This option controls compression;
+it does not change contraction-path optimization.
+
 ## Memory diagnostics
 
 Exact contraction trees expose `peak_size()` (modeled concurrently live

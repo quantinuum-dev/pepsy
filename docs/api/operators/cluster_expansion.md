@@ -347,6 +347,40 @@ Pass `materialize=False` to `product.exp(...)` or `compiled.exp(...)` to
 receive `ActivePEPOBlocks` before allocating dense Quimb site tensors. This is
 useful for checking `bond_dimensions` and `dense_nbytes`; `compress=True`
 requires materialization.
+Storage estimates inspect shape/dtype metadata without detaching or converting
+Torch blocks, so they can guard dense allocation during autodiff. The estimate
+covers dense site tensors, not the contraction or backward graph.
+
+For a trace-only observable, close the active physical blocks first:
+
+```python
+active = compiled.exp(0.01, materialize=False)
+print(active.dense_nbytes, active.trace_nbytes)
+trace_network = active.to_trace_network()
+trace = trace_network.contract(all, optimize="greedy")
+normalized_trace = trace / 2**(active.lx * active.ly)
+```
+
+The returned `TensorNetwork2D` is an **unnormalized** trace of the same PEPO.
+It uses at most `dense_nbytes / physical_dim**2` bytes. Located exact
+Pauli-history builders additionally certify which sectors survive a complete
+physical trace: each nonroot selector must carry identity on every site in
+its subtree. Removing the other sectors is algebraic and independent of
+coefficient values, backend, or gradient tracking. Allowed channels remain
+even when their current coefficient is zero. The full operator and the
+lower-cluster operator subtraction retain every history.
+
+`trace_sectors` records this optional builder certificate. It is not valid
+for partial traces or after arbitrary edits to physical blocks. Builders
+without a certificate, including rank-capped SVD trees, retain all sectors.
+There is no value-based pruning or detached coefficient graph. This is a
+dense bosonic trace, not a graded fermionic trace. Boundary contraction adds
+its own approximation and workspace beyond these storage estimates.
+
+Located cluster targets are evaluated in bounded batches of equal matrix
+size. Each batch keeps the complete ordered factor sequence and independent
+coefficients; it does not imply translation symmetry or split noncommuting
+generators.
 
 The order `p` controls local dimension: for physical dimension `d`, each
 `p`-site target is a `(d**p) x (d**p)` matrix, or `d**(2*p)` coefficients.

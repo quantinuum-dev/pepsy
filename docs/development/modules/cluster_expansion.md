@@ -22,6 +22,18 @@ store only nonzero virtual-sector blocks; `to_pepo()` is the explicit dense
 materialization boundary for square tensors, while graph blocks use
 `to_tensor_network()`.
 
+Square `ActivePEPOBlocks.to_trace_network()` traces each physical block before
+dense site allocation and returns an unnormalized bosonic `TensorNetwork2D`.
+Located exact Pauli trees certify their identity-subtree sectors through
+`trace_sectors`; the complete trace removes other sectors before allocation.
+This structural reduction never inspects coefficients or changes the full
+PEPO/lower-cluster subtraction. Allowed numerical zeros remain. Rank-capped
+trees and uncertified builders keep all sectors; `compact()` drops the
+certificate conservatively when relabeling sectors.
+`trace_nbytes` is at most `dense_nbytes / physical_dim**2`; both estimates use Python
+integers and backend dtype metadata without detaching differentiable arrays.
+These estimates exclude active construction and contraction/backward memory.
+
 `generate_connected_cluster_shapes()` is the value-independent geometry
 inventory for the next implementation stage. It recursively enumerates
 translation-canonical connected site sets, records nearest-neighbour and
@@ -129,6 +141,13 @@ An explicit `max_tree_rank` below the exact history rank switches that cluster
 to the backend SVD truncation path. Global history ids are compacted per
 physical bond only when materializing the Quimb PEPO, keeping the active
 representation and autodiff topology stable.
+
+Located evaluations batch up to eight equal-size cluster products per backend
+matrix-exponential call. Factor order and complete generators are unchanged;
+each cluster order still subtracts the frozen lower-order active network.
+Besides reducing dispatch overhead, batching improves measured small-matrix
+Torch exponential accuracy. The analytic onsite and independent downstream
+polymer-gradient regressions cover this behavior without relaxing tolerances.
 
 `PEPOClusterProductExpansion` is the joint ordered-residual path. It retains
 the supplied `A`, `B`, `C`, ... objects as local Hamiltonian sources, and for

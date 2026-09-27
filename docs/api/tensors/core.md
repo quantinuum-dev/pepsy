@@ -37,6 +37,29 @@ compatibility use; ordinary applications should not combine them. The
 stabilized SVD CPU forward path falls back to SciPy `gesvd` if
 `torch.linalg.svd` fails.
 
+`TorchLinalgConfig(stabilized=True, qr_rank_policy="adaptive")` retains native
+QR VJPs when finite, rather than automatically regularizing every small pivot.
+Exactly singular pivots and nonfinite native VJPs use a warned regularized
+fallback, separately for each batch member. Backward retains the policy
+selected during forward even after the configuration context exits. Existing
+`warn`, `native`, and `error` policies remain available.
+
+Adaptive QR is a finite first-order extension at singular charts, not proof
+that a factorization is differentiable there. Stabilized SVD uses exact
+reciprocals for singular sums and gaps of magnitude at least
+`1e-6 * max(singular_values)` per matrix/block. The inverse singular values
+in the rectangular and complex-phase terms use a numerical-rank threshold
+`max(m, n) * finfo(dtype).eps * max(singular_values)` instead: a small but
+resolved singular value must not be treated as a degenerate gap.
+Below each threshold it uses a bounded cubic extension, with matching value
+and slope at the boundary and value zero at zero. Unlike the previous
+Lorentzian rule, it does not damp resolved spectral derivatives. The gap
+threshold is unchanged; derivatives inside either stabilization region
+remain surrogate derivatives.
+Check directional derivatives of the complete
+truncated calculation; rank changes and ties across a retained/discarded
+boundary can be nonsmooth.
+
 The Torch QR split driver uses the zero-safe phase convention `phase(0)=1`.
 This preserves a lossless QR/LQ reconstruction even for rank-deficient dense
 or Symmray blocks. A pivot at or below the scale-relative QR epsilon uses a

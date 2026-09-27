@@ -53,6 +53,7 @@ shows how to collect fidelity diagnostics.
 | Upgrade from 0.4.1 | [Migration guide](docs/development/api-migration.md) |
 | Check compatibility guarantees | [API stability](docs/stability.md) |
 | Contribute or run tests | [Contributing](CONTRIBUTING.md) |
+| Track cluster PEPO / downstream optimization | [Development status](docs/development/cluster_optimization_status.md) |
 | Find implementation notes | [Development documentation](docs/development/README.md) |
 
 Prefer imports from the owning namespace, such as `pepsy.tensors` or

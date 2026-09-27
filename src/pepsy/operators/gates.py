@@ -2676,8 +2676,10 @@ def _gate_simple_one_with_current_site_ind_id(
 def renorm_gauge(tn, gauges, where, smudge=1e-12):
     """Renormalize the simple-update gauge on the bond between sites in *where*.
 
-    Divides the gauge vector by its RMS norm (with *smudge* for safety)
-    and accumulates the extracted scale into ``tn.exponent`` (if present).
+    Divides the gauge vector by a positive, detached RMS scale and accumulates
+    exactly that scale into ``tn.exponent`` (if present). The RMS is evaluated
+    relative to the largest magnitude to avoid squaring extreme weights.
+    An all-zero gauge uses scale one, preserving its reconstruction derivative.
 
     Works for 1D/2D/3D — finds the bond index between the two site tensors.
 
@@ -2691,8 +2693,11 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
         Pair of site coordinates, e.g. ``(3, 4)`` for 1D,
         ``((0,1), (1,1))`` for 2D, ``((0,0,0), (0,0,1))`` for 3D.
     smudge : float
-        Small value for numerical safety.
+        Nonnegative finite floor for a nonzero RMS scale.
     """
+    smudge = float(smudge)
+    if not np.isfinite(smudge) or smudge < 0:
+        raise ValueError("smudge must be nonnegative and finite")
     site_a, site_b = where
     tag_a = tn.site_tag(site_a)
     tag_b = tn.site_tag(site_b)
@@ -2706,12 +2711,25 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
         )
     ix = next(iter(bond_ix_set))
     s = gauges[ix]
-    norm_s = ar.do("sqrt", ar.do("mean", ar.do("abs", s) ** 2))
-    # Stop gradient on the scalar norm — only tensor data carries AD info.
-    norm_s = _stop_gradient(norm_s)
+    # SU singular values can be Symmray BlockVectors. Reduce their backend
+    # blocks directly: Symmray has no mean, and detaching its wrapper does not
+    # necessarily detach the Torch blocks it contains.
+    blocks = tuple(s.blocks.values()) if hasattr(s, "blocks") else (s,)
+    if not blocks:
+        return
+    magnitudes = tuple(ar.do("abs", _stop_gradient(block)) for block in blocks)
+    peak = ar.do("max", ar.do("stack", [ar.do("max", b) for b in magnitudes]))
+    peak_safe = ar.do("where", peak > 0, peak, peak * 0 + 1)
+    count = sum(ar.size(b) for b in magnitudes)
+    square_sum = sum(ar.do("sum", (b / peak_safe) ** 2) for b in magnitudes)
+    norm_s = peak * ar.do("sqrt", square_sum / count)
+    # A nonzero subnormal RMS can round to zero even after relative scaling.
+    norm_s = ar.do("where", norm_s > 0, norm_s, peak_safe)
+    scale = ar.do("where", norm_s > smudge, norm_s, norm_s * 0 + smudge)
+    scale = ar.do("where", peak > 0, scale, peak * 0 + 1)
     if hasattr(tn, "exponent"):
-        tn.exponent = tn.exponent + ar.do("log10", norm_s)
-    gauges[ix] = s / (norm_s + smudge)
+        tn.exponent = tn.exponent + ar.do("log10", scale)
+    gauges[ix] = s / scale
 
 
 def _apply_gate_2d(
@@ -3403,6 +3421,7 @@ def build_pepo_from_gates(
     ind_id="k{},{}",
     mapper=None,
     allow_charged=False,
+    cutoff_mode="rsum2",
 ):
     """Build a PEPO from gate-style input on top of a PEPO identity.
 
@@ -3438,7 +3457,7 @@ def build_pepo_from_gates(
         Gate contraction mode. The default uses quimb's reduced two-site split
         path, which is usually cheaper than ``"split"`` for PEPO/PEPS tensors.
     ind_id : str, default="k{},{}"
-        Physical index format used for PEPO ket-family indices.
+        Physical output index format. Gates act on this family in list order.
     mapper : OneDMap | None, optional
         Optional lattice-to-chain mapping used when native Symmray gates are
         supplied. PEPO conversion supports ``snake`` and
@@ -3446,6 +3465,8 @@ def build_pepo_from_gates(
     allow_charged : bool, default=False
         Allow native gates with nonzero operator charge. The returned PEPO
         then carries the accumulated charge of the sequential gate product.
+    cutoff_mode : str, default="rsum2"
+        Truncation policy used for gate splits and fallback compression.
 
     Returns
     -------
@@ -3512,16 +3533,11 @@ def build_pepo_from_gates(
             tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = (
-            gate_op
-            if native_info is not None
-            else _to_ket_gate_layout(gate_op, len(where_norm))
-        )
-
         gate(
-            pepo, gate_use, where_norm,
+            pepo, gate_op, where_norm,
             max_bond=max_bond, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id=ind_id,
             inplace=True,
         )
@@ -3531,35 +3547,11 @@ def build_pepo_from_gates(
                 inplace=True,
                 max_bond=max_bond,
                 canonize_distance=4,
-                cutoff=1e-14,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
 
     return pepo
-
-
-def _to_ket_gate_layout(gate, n_sites):
-    """Map input gate to ket-side index ordering used by PEPO/MPO builders."""
-    if n_sites == 1:
-        return ar.do("transpose", gate, (1, 0))
-
-    if n_sites == 2:
-        shape = getattr(gate, "shape", ())
-        if len(shape) == 2:
-            din, dout = shape
-            if int(din) != int(dout):
-                raise ValueError(
-                    "Two-site gate matrix must be square with shape (d**2, d**2)."
-                )
-            return ar.do("transpose", gate, (1, 0))
-
-        if len(shape) == 4:
-            return ar.do("transpose", gate, (2, 3, 0, 1))
-
-        raise ValueError(
-            "Two-site gate must have shape (d**2, d**2) or (d, d, d, d)."
-        )
-
-    raise ValueError("Each gate location must have one or two sites.")
 
 
 def build_mpo_from_gates(
@@ -3605,7 +3597,7 @@ def build_mpo_from_gates(
         Gate contraction mode. The default uses quimb's reduced two-site split
         path, which is usually cheaper than ``"split"`` for MPO tensors.
     ind_id : str, default="k{}"
-        Physical index format used for MPO ket-family indices.
+        Physical output index format. Gates act on this family in list order.
     allow_charged : bool, default=False
         Allow native gates with nonzero operator charge. The returned MPO
         then carries the accumulated charge of the sequential gate product.
@@ -3650,15 +3642,9 @@ def build_mpo_from_gates(
             tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = (
-            gate_op
-            if native_info is not None
-            else _to_ket_gate_layout(gate_op, len(where_norm))
-        )
-
         gate(
             mpo,
-            gate_use,
+            gate_op,
             where_norm,
             ind_id=ind_id,
             cutoff=cutoff,
@@ -3934,7 +3920,9 @@ def gate_with_submpo(
     inplace : bool, default=False
         Whether to modify ``p`` in place.
     inplace_mpo : bool, default=True
-        Whether to modify ``submpo`` in place during absorption.
+        Whether the applied sub-MPO may be reused without a defensive copy.
+        This does not control whether the operator is applied. The target's
+        mutation is controlled solely by ``inplace``.
     ind_id_k : str, default="k{}"
         Format string for ket-family physical index names.
     ind_id_b : str, default="b{}"
@@ -3957,13 +3945,15 @@ def gate_with_submpo(
     # make the region canonical
     p.canonicalize_((si, sf), info=info)
 
-    # lazily absorb the sub-MPO into the selected layer
+    # Quimb's lazy method's inplace flag refers to the target, not submpo.
+    # Always absorb into our already selected working target.
+    submpo_work = submpo if inplace_mpo else submpo.copy()
     if which_norm == "upper":
-        p.gate_upper_with_op_lazy_(submpo, transpose=transpose, inplace=inplace_mpo)
+        p.gate_upper_with_op_lazy_(submpo_work, transpose=transpose)
         ind_id = ind_id_k
         other_prefix = ind_id_b.replace("{}", "").rstrip("{}")
     else:
-        p.gate_lower_with_op_lazy_(submpo, transpose=transpose, inplace=inplace_mpo)
+        p.gate_lower_with_op_lazy_(submpo_work, transpose=transpose)
         ind_id = ind_id_b
         other_prefix = ind_id_k.replace("{}", "").rstrip("{}")
 

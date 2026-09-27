@@ -11,7 +11,8 @@ but the active containers do not depend on the cluster planner.
 from __future__ import annotations
 
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import prod
 
 import autoray as ar
 import numpy as np
@@ -27,6 +28,10 @@ _DIRECTION_VECTORS = {"u": (1, 0), "r": (0, 1), "d": (-1, 0), "l": (0, -1)}
 
 
 def _backend_dtype_itemsize(value):
+    # Torch dtype objects are not NumPy dtypes. Inspect scalar storage metadata
+    # without converting differentiable blocks (or transferring device data).
+    if hasattr(value, "element_size"):
+        return int(value.element_size())
     try:
         return np.dtype(value.dtype).itemsize
     except (TypeError, ValueError):
@@ -171,6 +176,10 @@ class ActivePEPOBlocks:
     charge_symmetry: str | None = None
     physical_sectors: dict | None = None
     virtual_sector_charges: dict | None = None
+    # Optional structural certificate for the *complete physical trace*.
+    # Fixed Pauli-history trees can only transmit identity histories once
+    # every physical leg is closed. Never infer this set from tensor values.
+    trace_sectors: frozenset[int] | None = None
 
     @property
     def active_block_count(self):
@@ -184,15 +193,8 @@ class ActivePEPOBlocks:
         itemsize = _backend_dtype_itemsize(reference)
         sector_maps = _local_bond_sector_maps(self)
         return sum(
-            int(
-                np.prod(
-                    [
-                        len(sector_maps[(site, direction)])
-                        for direction in self.site_directions[site]
-                    ],
-                    dtype=int,
-                )
-            )
+            prod(len(sector_maps[(site, direction)])
+                 for direction in self.site_directions[site])
             * self.physical_dim**2
             * itemsize
             for site in self.blocks
@@ -205,6 +207,42 @@ class ActivePEPOBlocks:
             leg: len(mapping)
             for leg, mapping in _local_bond_sector_maps(self).items()
         }
+
+    @property
+    def trace_nbytes(self):
+        """Dense site storage after closing physical legs, excluding workspace."""
+        return replace(self, blocks=self._trace_blocks()).dense_nbytes // self.physical_dim**2
+
+    def _trace_blocks(self):
+        """Restrict only structurally certified histories, retaining live zeros."""
+        if self.trace_sectors is None:
+            return self.blocks
+        return {site: {key: block for key, block in blocks.items()
+                       if all(sector in self.trace_sectors for sector in key)}
+                for site, blocks in self.blocks.items()}
+
+    def to_trace_network(self):
+        """Return an unnormalized scalar TensorNetwork2D without dense PEPO legs.
+
+        Trace each active physical block before site materialization. For
+        physical dimension d this needs at most 1/d**2 the dense entries. Keep
+        every coefficient-dependent channel, including numerical zeros.
+        When the builder certifies trace-only sectors, eliminate the other
+        histories algebraically, independently of parameter/backend values.
+        This dense bosonic trace is not a native graded fermionic trace.
+        """
+        traced = replace(self, physical_dim=1, blocks={
+            site: {key: ar.do("reshape", ar.do("trace", block), (1, 1))
+                   for key, block in blocks.items()}
+            for site, blocks in self._trace_blocks().items()
+        }).to_pepo()
+        for site in self.blocks:
+            traced[traced.site_tag(*site)].trace(
+                traced.upper_ind(*site), traced.lower_ind(*site), inplace=True)
+        traced.view_as_(qtn.TensorNetwork2D, Lx=traced.Lx, Ly=traced.Ly,
+                        site_tag_id=traced.site_tag_id,
+                        x_tag_id=traced.x_tag_id, y_tag_id=traced.y_tag_id)
+        return traced
 
     @property
     def active_nbytes(self):

@@ -111,6 +111,39 @@ The layer policy applies to the package `method="dmrg"` path. Quimb's native
 `method="mps"` path already handles `layer_tags` itself and rejects
 `fit_layer_mode="sequential"` rather than silently ignoring the option.
 
+## Differentiating rank-deficient boundary MPS contractions
+
+For a closed dense 2D NumPy/Torch network, select the composed-factor path:
+
+```python
+value = pepsy.contract_flat(
+    flat, method="mps", chi=16, cutoff=1e-12,
+    compression_mode="direct", mps_factorization="projector",
+    preserve_backend=True,
+)
+```
+
+This replaces QR canonicalization, QR/LQ reductions, and truncated splits
+with isometric factors `A -> (Q, B)`. Torch differentiates their retained
+subspace jointly, avoiding inverse zero QR pivots and arbitrary rotations
+within repeated retained singular values. The existing chi/cutoff policy is
+applied, followed by numerical-null removal at `max(m, n) * eps * s_max`.
+This is a numerical factorization, distinct from structural Pauli-history
+pruning. Pepsy's compatibility default remains `mps_factorization="qr"`.
+
+The first-order rule requires a gauge-invariant loss of both factors, a
+locally fixed retained rank, and a resolved kept/discarded singular-value gap.
+Backward rejects a closed gap or noninvariant factor observable. At the zero
+matrix it returns zero only for zero incoming cotangents; otherwise it raises.
+It does not guarantee derivatives across rank/cutoff changes. Test the full
+approximate contraction against finite differences at representative parameters.
+Dense NumPy/Torch, direct compression, and left/right absorption are supported;
+native Symmray, JAX, higher derivatives, and split renormalization are not.
+The global QR/SVD policies, SU, and CTMRG are unchanged. See the
+[derivation and regressions](../../development/notes/2026-09-26-projector-boundary-gradients.md).
+The [development ledger](../../development/cluster_optimization_status.md)
+records published commits, downstream Gaugy defaults, and test scopes.
+
 ## CTMRG boundary modes
 
 With `method="ctmrg"`, `ctmrg_mode` selects the finite-boundary compressor:

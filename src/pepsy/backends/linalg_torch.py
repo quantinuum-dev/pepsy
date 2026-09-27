@@ -26,7 +26,7 @@ _SVD_FORWARD_OPTIONS = contextvars.ContextVar(
 _SVD_DRIVERS = {"auto", "gesvdj", "gesvda", "gesvd"}
 _CPU_SVD_BACKENDS = {"torch", "scipy_gesdd", "scipy_gesvd"}
 _SVD_FALLBACKS = {"auto", "none", "scipy_gesdd", "scipy_gesvd"}
-_QR_RANK_POLICIES = {"warn", "native", "error"}
+_QR_RANK_POLICIES = {"warn", "native", "adaptive", "error"}
 _QR_RANK_POLICY = "warn"
 _QR_RANK_TOL_FACTOR = 1.0
 
@@ -103,6 +103,28 @@ def safe_inverse(x, eps_abs=1.0e-12, *, eps_rel=0.0, eps_scale=None):
 def safe_inverse_2(x, eps):
     """Clamped reciprocal for real nonnegative values."""
     return x.clamp_min(eps).reciprocal()
+
+
+def _svd_reciprocal(x, scale, *, rtol=_SVD_EPS_REL):
+    """Exact reciprocal outside a compact, relative stabilization region.
+
+    Broadening every denominator biases even well-resolved SVD derivatives.
+    Modify only ``|x| < rtol * scale``. The default retains the existing gap
+    threshold; inverse singular values supply a numerical-rank tolerance.
+    Inside, ``(2*y - y**3) / threshold`` with ``y=x/threshold`` joins ``1/x``
+    with matching value and slope at both boundaries and is zero at zero.
+    This is a bounded surrogate at degeneracies, not their exact derivative.
+
+    Avoid squaring the spectrum (overflow/underflow) and never evaluate an
+    unguarded reciprocal at zero, even in an unselected ``where`` branch.
+    ``scale`` has a trailing singleton axis for each spectral axis of ``x``.
+    """
+    threshold = (scale * rtol).clamp_min(torch.finfo(x.dtype).tiny)
+    resolved = x.abs() >= threshold
+    denominator = torch.where(resolved, x, torch.ones_like(x))
+    y = x.clamp(min=-threshold, max=threshold) / threshold
+    regularized = (2 * y - y**3) / threshold
+    return torch.where(resolved, denominator.reciprocal(), regularized)
 
 
 def _scipy_svd(A, lapack_driver="gesvd", exc=None):
@@ -311,10 +333,10 @@ class SVD(torch.autograd.Function):
     """Torch SVD with a relative-regularized reverse-mode rule.
 
     The rectangular real-SVD terms follow Townsend's reverse update, with the
-    singular-gap and inverse-singular-value reciprocals regularized as
-    ``x / (x**2 + eps)``. The scale-aware ``eps`` keeps the stabilizer relative
-    to the current singular spectrum, which is the Lorentzian broadening used in
-    differentiable tensor-network SVDs. Complex inputs additionally include the
+    singular-gap and inverse-singular-value reciprocals exact outside a compact
+    relative stabilization region (see :func:`_svd_reciprocal`). Near zero they
+    use a bounded, continuously differentiable extension. This protects singular
+    cases without damping resolved derivatives. Complex inputs also include the
     phase/gauge term from the complex-valued SVD backward formula.
     """
 
@@ -341,7 +363,6 @@ class SVD(torch.autograd.Function):
         m = u.size(-2)
         n = vh.size(-1)
         k = sigma.size(-1)
-        eps_abs = torch.finfo(sigma.dtype).tiny
         sigma_scale = sigma.detach().amax(dim=-1, keepdim=True)
         pair_scale = sigma_scale.unsqueeze(-1)
 
@@ -367,31 +388,22 @@ class SVD(torch.autograd.Function):
                 print(f"{diagnostics} {sigma_term.abs().max()} {sigma.max()}")
             return sigma_term
 
-        sigma_inv = safe_inverse(
-            sigma.clone(),
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=sigma_scale,
+        # The rectangular/phase terms need the pseudoinverse of the spectrum,
+        # not an eigenvector-gap stabilizer. Treat numerical rank using the
+        # usual matrix-size * machine-epsilon criterion; a small but resolved
+        # singular value still has an exact reciprocal.
+        sigma_inv = _svd_reciprocal(
+            sigma, sigma_scale, rtol=max(m, n) * torch.finfo(sigma.dtype).eps,
         )
 
         # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
-        # 1/(s_i + s_j), with relative Lorentzian broadening.
+        # 1/(s_i + s_j), stabilized only near unresolved denominators.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = safe_inverse(
-            F,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        F = _svd_reciprocal(F, pair_scale)
         F.diagonal(0, -2, -1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = safe_inverse(
-            G,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        G = _svd_reciprocal(G, pair_scale)
         G.diagonal(0, -2, -1).fill_(0)
 
         uh = u.conj().transpose(-2, -1)
@@ -445,7 +457,7 @@ class SVD_real(torch.autograd.Function):
 
     This is the real-only counterpart of :class:`SVD`. It shares the robust
     forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
-    fallback) and the scale-aware Lorentzian broadening of the singular-gap and
+    fallback) and the compact relative stabilization of the singular-gap and
     inverse-singular-value reciprocals, and it supports rectangular and batched
     inputs. Only the complex phase/gauge term of :class:`SVD` is dropped, since
     real orthogonal factors carry no gauge freedom.
@@ -474,7 +486,6 @@ class SVD_real(torch.autograd.Function):
         m = u.size(-2)
         n = vh.size(-1)
         k = sigma.size(-1)
-        eps_abs = torch.finfo(sigma.dtype).tiny
         sigma_scale = sigma.detach().amax(dim=-1, keepdim=True)
         pair_scale = sigma_scale.unsqueeze(-1)
 
@@ -498,31 +509,22 @@ class SVD_real(torch.autograd.Function):
         if (gu is None) and (gvh is None):
             return sigma_term
 
-        sigma_inv = safe_inverse(
-            sigma.clone(),
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=sigma_scale,
+        # The rectangular/phase terms need the pseudoinverse of the spectrum,
+        # not an eigenvector-gap stabilizer. Treat numerical rank using the
+        # usual matrix-size * machine-epsilon criterion; a small but resolved
+        # singular value still has an exact reciprocal.
+        sigma_inv = _svd_reciprocal(
+            sigma, sigma_scale, rtol=max(m, n) * torch.finfo(sigma.dtype).eps,
         )
 
         # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
-        # 1/(s_i + s_j), with relative Lorentzian broadening.
+        # 1/(s_i + s_j), stabilized only near unresolved denominators.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = safe_inverse(
-            F,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        F = _svd_reciprocal(F, pair_scale)
         F.diagonal(0, -2, -1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = safe_inverse(
-            G,
-            eps_abs=eps_abs,
-            eps_rel=_SVD_EPS_REL,
-            eps_scale=pair_scale,
-        )
+        G = _svd_reciprocal(G, pair_scale)
         G.diagonal(0, -2, -1).fill_(0)
 
         ut = u.transpose(-2, -1)
@@ -567,6 +569,7 @@ class QR_real(torch.autograd.Function):
     def forward(self, A):
         if A.is_complex():
             raise TypeError("QR_real requires a real Torch tensor.")
+        self.rank_policy = _QR_RANK_POLICY
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
@@ -591,8 +594,10 @@ class QR_real(torch.autograd.Function):
     @staticmethod
     def backward(self, dq, dr):
         A, q, r, rank_deficient = self.saved_tensors
+        if self.rank_policy == "adaptive":
+            return _adaptive_qr_backward(A, q, r, dq, dr, rank_deficient)
         if bool(rank_deficient.any().item()):
-            if _QR_RANK_POLICY == "native":
+            if self.rank_policy == "native":
                 return _native_qr_backward(A, dq, dr)
             return _regularized_qr_backward(A, q, r, dq, dr, rank_deficient)
         m, _n = r.shape[-2:]
@@ -634,6 +639,7 @@ class QR_real_safe(torch.autograd.Function):
     def forward(ctx, A):
         if A.is_complex():
             raise TypeError("QR_real_safe requires a real Torch tensor.")
+        ctx.rank_policy = _QR_RANK_POLICY
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
@@ -646,8 +652,10 @@ class QR_real_safe(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
+        if ctx.rank_policy == "adaptive":
+            return _adaptive_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if bool(rank_deficient.any().item()):
-            if _QR_RANK_POLICY == "native":
+            if ctx.rank_policy == "native":
                 return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if R.shape[-1] > R.shape[-2]:
@@ -660,6 +668,7 @@ class QR_complex_safe(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
+        ctx.rank_policy = _QR_RANK_POLICY
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
@@ -673,8 +682,10 @@ class QR_complex_safe(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
+        if ctx.rank_policy == "adaptive":
+            return _adaptive_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if bool(rank_deficient.any().item()):
-            if _QR_RANK_POLICY == "native":
+            if ctx.rank_policy == "native":
                 return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         return _native_qr_backward(A, dQ, dR)
@@ -804,6 +815,50 @@ def _regularized_qr_backward(a, q, r, dq, dr, singular_pivot):
             gradient = gradient + q @ dr
 
     return torch.where(zero_block[..., None, None], torch.zeros_like(gradient), gradient)
+
+
+def _adaptive_qr_backward(a, q, r, dq, dr, singular_pivot):
+    """Preserve finite native derivatives, regularizing only failing blocks.
+
+    A small QR pivot alone does not imply that its composed tensor-network
+    VJP needs regularization. Conversely a nonfinite native VJP cannot be
+    passed to an optimizer. The fallback is an explicit finite extension at
+    a singular chart, not a claim of differentiability there.
+    """
+    result = torch.zeros_like(a)
+    active = torch.zeros(a.shape[:-2], dtype=torch.bool, device=a.device)
+    for cotangent in (dq, dr):
+        if cotangent is not None:
+            active = active | (cotangent != 0).any(dim=(-2, -1))
+    # Do not enter an undefined native backward at an exactly zero pivot,
+    # including when anomaly detection would raise before a fallback is possible.
+    zero_pivot = (r.diagonal(0, -2, -1) == 0).any(dim=-1)
+    candidate = active & ~zero_pivot
+    if bool(candidate.any()):
+        result[candidate] = _native_qr_backward(
+            a[candidate],
+            None if dq is None else dq[candidate],
+            None if dr is None else dr[candidate],
+        )
+    bad = active & (zero_pivot | ~torch.isfinite(result).all(dim=(-2, -1)))
+    if not bool(bad.any()):
+        return result
+    warnings.warn(
+        "Torch QR adaptive backward used a regularized VJP for a singular "
+        "or nonfinite native derivative; verify gradients near this chart.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    fallback = _regularized_qr_backward(
+        a[bad], q[bad], r[bad],
+        None if dq is None else dq[bad],
+        None if dr is None else dr[bad],
+        torch.ones_like(singular_pivot[bad]),
+    )
+    if not bool(torch.isfinite(fallback).all()):
+        raise RuntimeError("Torch QR adaptive backward could not produce a finite VJP")
+    result[bad] = fallback
+    return result
 
 
 def _native_qr_backward(A, dq, dr):

@@ -184,6 +184,7 @@ def contract_hypercompressed_tn(
     tree_gauge_distance=4,
     progbar=False,
     cutoff=1.0e-12,
+    cutoff_mode=None,
     equalize_norms=False,
     inplace=False,
     do_full_simplify=True,
@@ -212,6 +213,8 @@ def contract_hypercompressed_tn(
         Whether to show progress during compressed contraction.
     cutoff : float, optional
         Truncation cutoff passed to ``contract_compressed_``.
+    cutoff_mode : str | None, optional
+        Singular-value truncation policy. None preserves Quimb's default.
     equalize_norms : bool | float, optional
         Norm equalization option passed to ``contract_compressed_``.
     inplace : bool, optional
@@ -253,6 +256,7 @@ def contract_hypercompressed_tn(
         tree_gauge_distance=tree_gauge_distance,
         equalize_norms=equalize_norms,
         cutoff=cutoff,
+        compress_opts={} if cutoff_mode is None else {"cutoff_mode": cutoff_mode},
         progbar=progbar,
     )
     return tn_out

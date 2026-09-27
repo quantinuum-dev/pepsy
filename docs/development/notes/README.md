@@ -27,6 +27,15 @@ and [tutorials](../../tutorials/index.md).
 
 - [PEPS sampler maturity and Verstraete comparison](peps_sampler_maturity_comparison.md)
   — Current validation, measured throughput, and complex64 truncation limits.
+
+- [Cluster optimization status](../cluster_optimization_status.md) — Current
+  published backend/downstream capabilities, validation scopes and limitations.
+- [Composed boundary-factor derivatives](2026-09-26-projector-boundary-gradients.md)
+  — Rank-deficient MPS correction, mathematical contract, and regressions.
+- [PEPO product traces](2026-09-26-pepo-product-trace.md) — Product-expansion
+  trace construction and contraction options.
+- [Structural PEPO trace reduction](2026-09-26-structural-pepo-trace.md) —
+  Parameter-independent identity-history reduction and its validation.
 - [Repository organization audit](module_organization_2026_09.md) — Completed
   sampler, optimizer, and BP splits; remaining design boundaries to review.
 - [`release_readiness_2026_09.md`](release_readiness_2026_09.md) — Release
@@ -89,6 +98,13 @@ contract_flat_backend_scalars
 fit_one_site_qr
 gibbs_mps
 mpo_mps_alignment
+operator_conventions_2026_09
+pepo_gradients_scale_2026_09
+2026-09-26-native-su-gauge-scales
+2026-09-26-compact-svd-backward
+2026-09-26-projector-boundary-gradients
+2026-09-26-pepo-product-trace
+2026-09-26-structural-pepo-trace
 mps_dynamic_controls
 mps_entropy_backend
 mps_exact_batch
