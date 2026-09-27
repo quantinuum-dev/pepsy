@@ -1192,6 +1192,7 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
     ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
+    mps_factorization="qr",
 ):
     """Contract an already-built double-layer TN with a quimb-style method."""
     if method == "exact":
@@ -1227,6 +1228,18 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
             equalize_norms=equalize_norms,
             inplace=False,
         )
+        if mps_factorization == "projector":
+            from ..backends.projector_split import register_projector_split
+
+            split_method = register_projector_split()
+            # Use the same composed-factor derivative in canonicalization,
+            # both reductions, and the actual truncated split. Leaving one
+            # QR/SVD-vector backward in the chain reintroduces singular charts.
+            kwargs["canonize_opts"] = {"method": split_method}
+            kwargs["compress_opts"] = {
+                "method": split_method,
+                "reduce_opts": {"method": split_method},
+            }
         if around is not None:
             kwargs["around"] = around
             kwargs["final_contract"] = False
@@ -1457,6 +1470,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
+    mps_factorization="qr",
 ):
     """Contract a double-layer PEPS norm/overlap network by the selected method."""
     method = _normalize_contraction_method(method)
@@ -1584,6 +1598,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         ctmrg_compress_opts=ctmrg_compress_opts,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
+        mps_factorization=mps_factorization,
     )
     return BoundaryContractResult(
         cost=cost,
@@ -1627,6 +1642,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     preserve_backend=False,
     mode_=None,
     compression_mode=None,
+    mps_factorization="qr",
     sequence=None,
     boundary_direction=None,
     middle_slices=None,
@@ -1724,6 +1740,13 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         Compression kernel for ``method="mps"``, such as ``"direct"``,
         ``"dm"``, or ``"sdc"``. This is the readable spelling of the
         compatibility argument ``mode_``; do not supply both.
+    mps_factorization : {"qr", "projector"}, default="qr"
+        The projector route replaces singular QR charts and SVD-vector VJPs
+        with a composed isometric-factor derivative. Dense NumPy/Torch 2D
+        direct boundary contraction only; first derivatives, locally fixed
+        retained rank and an open kept/discarded spectral gap are required.
+        Numerical null directions are removed at matrix-size times machine
+        precision. This does not change chi, cutoff, or the cost formula.
     boundary_direction : str | None, default=None
         Readable contraction schedule. One-sided choices are ``"bottom-up"``,
         ``"top-down"``, ``"left-to-right"``, and ``"right-to-left"``;
@@ -1777,6 +1800,18 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         if method != "mps":
             raise ValueError("compression_mode applies only to method='mps'.")
         mode_ = compression_mode
+
+    if mps_factorization not in ("qr", "projector"):
+        raise ValueError("mps_factorization must be 'qr' or 'projector'")
+    if mps_factorization == "projector":
+        if method != "mps" or _infer_lattice_ndim(tn) != 2:
+            raise ValueError("projector factorization requires 2D method='mps'")
+        if mode_ not in (None, "mps", "direct"):
+            raise ValueError("projector factorization requires direct boundary compression")
+        if _uses_symmray_arrays(tn) or any(
+            ar.infer_backend(t.data) not in {"numpy", "torch"} for t in tn
+        ):
+            raise TypeError("projector factorization supports dense NumPy/Torch networks only")
 
     if boundary_direction is not None and sequence is not None:
         raise ValueError("Supply only one of boundary_direction and sequence.")
@@ -1869,6 +1904,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         ctmrg_compress_opts=ctmrg_compress_opts,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
+        mps_factorization=mps_factorization,
     )
     if middle_axis is not None:
         result = replace(result, direction=f"middle-out-{middle_axis}")

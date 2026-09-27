@@ -99,6 +99,11 @@ Contraction helpers include:
   Symmray split drivers. `register_torch_linalg(...)` remains a compatibility
   constructor for this class.
 - `reset_default_backends()`
+- `projector_split.py` owns the named Quimb `pepsy:projector` driver and
+  cutoff/rank compatibility boundary. `linalg_torch_projector.py` owns its
+  composed, first-order VJP for gauge-invariant paired factors. The dense
+  boundary opt-in uses it without replacing existing split drivers. See
+  [the contract and derivation](../notes/2026-09-26-projector-boundary-gradients.md).
 - torch and JAX linalg/stop-gradient registrations. Use
   `register_torch_linalg(...)` as the canonical public setup. Its explicit
   `quimb_split_drivers=True` option also configures Quimb's raw Symmray-block

@@ -14,6 +14,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Opt-in `contract_flat(..., method="mps", mps_factorization="projector")`
+  for dense 2D direct boundary compression. A composed isometric-factor Torch
+  VJP handles redundant virtual directions without singular QR inverses or
+  regularized singular-vector derivatives. It supports first-order,
+  gauge-invariant losses on locally fixed-rank, spectrally gapped subspaces;
+  unsupported singular charts raise instead of returning a surrogate.
+
 - `ActivePEPOBlocks.to_trace_network()` closes physical blocks before dense
   materialization, returning an unnormalized `TensorNetwork2D` with preserved
   NumPy/Torch/JAX values. `trace_nbytes` reports its dense site storage.
