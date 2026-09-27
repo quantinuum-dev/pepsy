@@ -38,6 +38,11 @@ Use existing session authorization; do not add redundant approval steps.
 | Installed upstream source and signatures | Capabilities of the environment actually executing this task |
 
 A plan or changelog does not prove that a feature is integrated or validated.
+For cluster-PEPO/Gaugy work, use the
+[current status ledger](docs/development/cluster_optimization_status.md) to
+locate published commits, owning API guides and scoped validation records.
+Update that ledger when this implementation changes; preserve dated evidence
+and distinguish post-merge focused checks from earlier full-suite results.
 Distinguish **implemented**, **proposed**, **measured**, and **unverified** claims.
 When code, tests, and documentation disagree, investigate the discrepancy;
 do not silently rewrite numerical behavior to match a stale note or weaken a

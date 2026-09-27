@@ -1,5 +1,10 @@
 # 2026-09-26 — Joint PEPO products: trace storage and backend accuracy
 
+> Historical measurements before structural trace reduction and the composed
+> boundary-factor derivative correction. For current supported behavior and
+> remaining limits, see [cluster optimization status](../cluster_optimization_status.md).
+> The original measurements below have not been rerun for this documentation update.
+
 This supports Gaugy's local exponential-product PEPO evaluator. The existing
 Pepsy joint residual definition and physical operator convention are unchanged.
 

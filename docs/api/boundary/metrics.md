@@ -141,6 +141,8 @@ Dense NumPy/Torch, direct compression, and left/right absorption are supported;
 native Symmray, JAX, higher derivatives, and split renormalization are not.
 The global QR/SVD policies, SU, and CTMRG are unchanged. See the
 [derivation and regressions](../../development/notes/2026-09-26-projector-boundary-gradients.md).
+The [development ledger](../../development/cluster_optimization_status.md)
+records published commits, downstream Gaugy defaults, and test scopes.
 
 ## CTMRG boundary modes
 

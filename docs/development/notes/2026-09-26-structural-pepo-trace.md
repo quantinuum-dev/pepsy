@@ -1,5 +1,10 @@
 # Structural reduction of complete located PEPO traces
 
+> This implementation record predates the composed boundary-factor derivative
+> correction. Its measured MPS discrepancies describe that earlier baseline;
+> see [cluster optimization status](../cluster_optimization_status.md) for
+> the later correction, validation scope, and remaining limits.
+
 ## Scope and algebra
 
 The located `PauliPEPOBasis` path used by `PEPOClusterProductExpansion`

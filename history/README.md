@@ -9,6 +9,13 @@ Git records committed file changes; this journal explains decisions, checks,
 and unfinished work. A journal entry does not commit the work it describes.
 Uncommitted entries and code are absent from Git's committed history.
 
+For cluster-PEPO/Gaugy development, the
+[current status ledger](../docs/development/cluster_optimization_status.md)
+links the backend correction, downstream API and publication. The original
+correction journal's "no push" describes that earlier session; the later
+merge `b4c4631` was pushed successfully. Preserve both facts rather than
+rewriting the original entry or treating it as current branch status.
+
 To inspect the instruction history from the repository root:
 
 ```bash

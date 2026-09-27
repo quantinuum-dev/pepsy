@@ -1,5 +1,10 @@
 # Composed boundary-factor derivatives — 2026-09-26
 
+Published correction: `cf1d84c`, included in `develop` merge `b4c4631`.
+See the [current status ledger](../cluster_optimization_status.md) for the
+downstream API, merge validation and remaining limits. Measurements below
+retain their original scope.
+
 The failing Gaugy order-3 OBC contraction contained a 35×35 QR input of
 numerical rank 7, with nine exactly zero QR pivots. Native QR backward is
 undefined there; a regularized derivative was finite but biased. Increasing
